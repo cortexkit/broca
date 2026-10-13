@@ -1,0 +1,587 @@
+{
+  "catalog_version": 1,
+  "models": {
+    "anthropic/claude-opus-4-8": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.family": "claude-opus",
+      "model.open_weights": false,
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3000000000
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 37500000000
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 30000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 150000000000
+      }
+    },
+    "anthropic/claude-sonnet-4-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 64000,
+      "model.family": "claude-sonnet",
+      "model.open_weights": false,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 300000000
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3750000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3000000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 15000000000
+      }
+    },
+    "anyapi/anthropic/claude-opus-4-6": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "max": 127999,
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.family": "claude-opus",
+      "model.open_weights": false,
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3000000000
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 37500000000
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 30000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 150000000000
+      }
+    },
+    "fireworks-ai/accounts/fireworks/models/kimi-k2-instruct": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 32768,
+      "rate.cache_read.mode.priority": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 40000000
+      },
+      "rate.cache_write.mode.priority": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 500000000
+      },
+      "rate.input.mode.priority": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 400000000
+      },
+      "rate.output.mode.priority": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2400000000
+      }
+    },
+    "google/gemini-3.5-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 64000,
+      "model.family": "claude-sonnet",
+      "model.open_weights": false,
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3000000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 15000000000
+      }
+    },
+    "openai/gpt-5.4-mini": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 400000,
+      "limit.output": 128000,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20000000
+      },
+      "rate.cache_read.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 40000000
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 40000000
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 250000000
+      },
+      "rate.cache_write.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 500000000
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 500000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 200000000
+      },
+      "rate.input.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 400000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1200000000
+      },
+      "rate.output.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1800000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2400000000
+      }
+    },
+    "openai/gpt-5.6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 400000,
+      "limit.output": 128000,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20000000
+      },
+      "rate.cache_read.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 40000000
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 40000000
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 250000000
+      },
+      "rate.cache_write.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 500000000
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 500000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 200000000
+      },
+      "rate.input.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 400000000
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 400000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1200000000
+      },
+      "rate.output.above_context.272000": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1800000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2400000000
+      }
+    },
+    "xai/grok-4": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 64000,
+      "model.family": "claude-sonnet",
+      "model.open_weights": false,
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3000000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 15000000000
+      }
+    }
+  },
+  "resolved_at_ms": -1,
+  "source": "models.dev"
+}

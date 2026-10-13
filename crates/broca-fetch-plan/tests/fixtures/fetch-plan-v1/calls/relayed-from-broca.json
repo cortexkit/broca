@@ -1,0 +1,15 @@
+{
+  "name": "browser_use",
+  "arguments": {
+    "action": "navigate",
+    "url": "https://example.com/"
+  },
+  "call_key": "pf:01JB3Y5Q8N6V2D4K7M9P0R1S2T",
+  "origin": {
+    "carrier": {
+      "kind": "reserved",
+      "module_id": "broca"
+    },
+    "call_key": "lin_7f3a9c2e:42"
+  }
+}

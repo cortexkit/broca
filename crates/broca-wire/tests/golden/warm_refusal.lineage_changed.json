@@ -1,0 +1,1 @@
+{"code":"lineage_changed","message":"the session's lineage is not 'lin-old'; re-read it from the tail","detail":{"kind":"lineage_changed","requested":"lin-old"}}

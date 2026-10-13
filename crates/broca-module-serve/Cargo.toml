@@ -1,0 +1,106 @@
+[package]
+name = "broca-module-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The broca subc MODULE serve binary: HELLO-registers broca as a management surface, then dispatches inbound session.*/run.* route requests to the broca-module coordinator (ServeHandler), streaming session.subscribe as StreamData frames. The thin wire adapter; the dispatch logic lives in broca-module (transport-agnostic)."
+
+[[bin]]
+name = "ck-broca"
+path = "src/main.rs"
+
+# The management-surface CLIENT driver: route.binds the broca module surface and drives
+# session.send/subscribe/status/cancel/retract over the wire. The neutral binary cortexkit-e2e
+# spawns to act as a client (≥2 instances for the multi-client ship-gate), and the single-turn
+# real-module test's client.
+[[bin]]
+name = "broca-session"
+path = "src/bin/broca-session.rs"
+
+[dependencies]
+broca-owner-only.workspace = true
+broca-diagnostics = { path = "../broca-diagnostics" }
+broca-protocol = { path = "../broca-protocol" }
+broca-wire = { path = "../broca-wire" }
+broca-core = { path = "../broca-core" }
+broca-module = { path = "../broca-module" }
+# Fetch-plan admission: checks a send's plan and builds the manifest its first episode freezes.
+broca-fetch-plan = { path = "../broca-fetch-plan" }
+cortexkit-role-step-transform-provider = { workspace = true }
+broca-provider = { path = "../broca-provider" }
+# The real executor's tool plane (consumer connection → subc → aft) + the catalog→live
+# provider resolver + the SQLite-backed durable run index. These make the binary drive a
+# real model + real tools (replacing the placeholder), so they are the module binary's
+# real-deployment deps, not just the wire adapter's.
+broca-subc = { path = "../broca-subc" }
+broca-catalog = { path = "../broca-catalog", features = ["live"] }
+broca-store = { path = "../broca-store" }
+# The executor reads a run's terminal WAL record (its auth-error status) to report a
+# wire-auth failure back to the vault — so the WAL record types are a runtime dep, not
+# just the dev-only wire-test dep below.
+broca-wal = { path = "../broca-wal" }
+# The wire adapter and broca-subc share the workspace's registry releases.
+subc-protocol = { workspace = true }
+subc-transport = { workspace = true }
+# The launch-nonce accessor `main` calls first and HELLO reads; see broca-subc's entry for why
+# every reader goes through it.
+subc-os = { workspace = true }
+# The fleet logger this module installs as its process-global tracing subscriber.
+# Default features stay on: `store-paths` is what supplies `init_from_env`.
+cortexkit-log = { workspace = true }
+sha2.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Offline cache selection reads the run index without creating or migrating it.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+url = "2"
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+# Re-raising SIGTERM after the seal needs the default disposition restored first, which is an
+# unsafe libc call; this crate forbids unsafe, and signal-hook's `emulate_default_handler` is
+# the safe wrapper the fleet settled on for exactly this contract.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4"
+
+[dev-dependencies]
+broca-owner-only = { workspace = true, features = ["test-support"] }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+# `test-known-feature` lets a test play a build that predates a WAL feature this one knows, to
+# prove such a build refuses a session holding it. Test builds only; see that feature.
+broca-wal = { path = "../broca-wal", features = ["test-known-feature"] }
+    # The wire tests drive serve_connection over an in-memory duplex with a fake-executor
+    # registry (no live daemon, no live LLM) — the streaming/teardown logic is proven there.
+tokio = { workspace = true, features = ["test-util"] }
+async-trait.workspace = true
+# The executor's vault tests stand up an in-process subc daemon stand-in that answers the
+# catalog and route-open control requests; these are the typed shapes of those messages.
+# Same workspace pin as broca-subc, so the control types unify.
+subc-control = { workspace = true }
+# The role's own wire types and checks, so the role-surface tests decode broca's answers the way
+# a consumer of the role does rather than against broca's own types.
+cortexkit-role-llm-runner = { workspace = true }
+# The catalog and declaration wire types the fetch-plan tests answer with.
+cortexkit-role-tool-provider = { workspace = true }
+# The role's conformance suite and the crash harness it drives, run against the real ck-broca
+# (tests/llm_runner_conformance.rs). Its scripted tool provider registers with the rig's daemon
+# as a module from inside the test process, through the module SDK.
+cortexkit-role-llm-runner-conformance = { workspace = true }
+cortexkit-role-harness = { workspace = true }
+subc-client-rs = { workspace = true }
+
+# The launch-nonce tests fstat descriptor 3 to tell whether the nonce pipe is still there. Going
+# through /dev/fd does not work for this: on macOS a stat of /dev/fd/N reports a different inode
+# than fstat on the descriptor itself.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[features]
+test-clock = ["broca-module/test-clock", "broca-core/test-clock"]

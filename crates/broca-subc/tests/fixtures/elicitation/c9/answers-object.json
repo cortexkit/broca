@@ -1,0 +1,17 @@
+{
+  "tag": "elicitation-records-v1",
+  "method": "elicitation.answers",
+  "request": {
+    "since": {
+      "provider_incarnation": "core-incarnation-2",
+      "seq": 7
+    }
+  },
+  "reply": {
+    "records": [],
+    "cursor": {
+      "provider_incarnation": "core-incarnation-2",
+      "seq": 7
+    }
+  }
+}

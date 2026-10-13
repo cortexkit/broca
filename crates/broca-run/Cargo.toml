@@ -1,0 +1,33 @@
+[package]
+name = "broca-run"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca-run: the harness CLI seed — drives the run_loop as a consumer of a running subc daemon + an OpenAI-compatible provider, with catalog-derived tools and greppable per-turn output. The neutral binary cortexkit-e2e orchestrates."
+
+[[bin]]
+name = "broca-run"
+path = "src/main.rs"
+
+[dependencies]
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-subc = { path = "../broca-subc" }
+# The live OpenAI-compatible transport (LiveProvider<OpenAiChat>) lives behind the
+# provider's `live` feature.
+broca-provider = { path = "../broca-provider", features = ["live"] }
+# Catalog model resolution: `--model <provider/model>` resolves the wire family +
+# base_url + auth kind from the vendored models.dev snapshot (the bundled catalog).
+broca-catalog = { path = "../broca-catalog", features = ["live"] }
+# For the fusiform catalog poller. Reused rather than reimplemented: a second fetch path would
+# be a second place for the request shape, the LKG format, and the refusal rules to drift.
+broca-module-serve = { path = "../broca-module-serve" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

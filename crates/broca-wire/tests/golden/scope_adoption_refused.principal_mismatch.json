@@ -1,0 +1,1 @@
+{"code":"scope_adoption_refused","message":"this session was recorded without a scope under principal 'reserved:prefrontal-core', which is not the stamped scope's owner, so it cannot adopt the scope; start a new session under the scope","detail":{"kind":"principal_mismatch","recorded":"reserved:prefrontal-core"}}

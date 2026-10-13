@@ -1,0 +1,43 @@
+[package]
+name = "broca-subc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The real subc tool-plane: a SubcToolPlane (2nd ToolPlane impl) that dispatches the loop's tool calls runner->subc->AFT over an authenticated direct consumer connection."
+
+[dependencies]
+broca-diagnostics = { path = "../broca-diagnostics" }
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+# Fetch-plan admission: the fetcher here carries its provider calls over subc.
+broca-fetch-plan = { path = "../broca-fetch-plan" }
+cortexkit-role-tool-provider = { workspace = true }
+cortexkit-role-step-transform-provider = { workspace = true }
+# Share the exact registry releases with the daemon adapter and benchmark.
+subc-protocol = { workspace = true }
+subc-transport = { workspace = true }
+subc-control = { workspace = true }
+# The launch-nonce accessor. The daemon hands a module its nonce over an inherited pipe that
+# can be read only once, so every reader in the process (HELLO here in broca-module-serve,
+# route opens here) must share this crate's one cached read.
+subc-os = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+cortexkit-role-tool-provider-conformance.workspace = true
+subc-client-rs = { workspace = true }
+broca-wal = { path = "../broca-wal" }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+# The dogfood test spawns the real subc-core daemon + fake-aft-stub binaries.
+tokio = { workspace = true, features = ["test-util"] }
+# The live e2e demo drives a real Anthropic model through the loop.
+broca-provider = { path = "../broca-provider", features = ["live"] }

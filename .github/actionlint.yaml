@@ -1,0 +1,14 @@
+self-hosted-runner:
+  # Linux jobs run on Latchkey's managed runners; only these labels are allowed.
+  labels:
+    - latchkey-small
+    - latchkey-medium
+
+# Configuration variables in array of strings defined in your repository or
+# organization. `null` means disabling configuration variables check.
+# Empty array means no configuration variable is allowed.
+config-variables: null
+
+paths:
+#  .github/workflows/**/*.yml:
+#    ignore: []

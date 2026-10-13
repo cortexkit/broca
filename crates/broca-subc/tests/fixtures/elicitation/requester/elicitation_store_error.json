@@ -1,0 +1,19 @@
+{
+  "error": {
+    "code": "elicitation_store_error",
+    "message": "prefrontal-core store: storage backend: Invalid parameter name: elicitation_invalid_execution"
+  },
+  "method": "elicitation.report_execution",
+  "request": {
+    "params": {
+      "elicitation_id": "@ELICITATION_ID@",
+      "execution": "executed"
+    },
+    "route": {
+      "operator": false,
+      "principal": "reserved:plexus",
+      "session": "provider-session"
+    }
+  },
+  "tag": "elicitation-requester-v1"
+}

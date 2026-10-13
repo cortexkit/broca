@@ -1,0 +1,17 @@
+{
+  "plan": "plans/text-only-and-hook-only.json",
+  "composition": "compositions/text-only-and-hook-only.json",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": true
+  },
+  "expected": {
+    "admitted": false,
+    "code": "invalid_params",
+    "detail": {
+      "field": "plan.step_transform_items"
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, fleet #1684–#1685"
+}

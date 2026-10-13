@@ -1,0 +1,1 @@
+{"code":"invalid_params","message":"joining steer cannot change the active run's frozen model","detail":{"field":"model"}}

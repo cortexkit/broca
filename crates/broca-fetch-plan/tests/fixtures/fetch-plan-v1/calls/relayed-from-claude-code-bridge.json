@@ -1,0 +1,14 @@
+{
+  "name": "computer_use",
+  "arguments": {
+    "action": "screenshot"
+  },
+  "call_key": "pf:01JB3Y6B2C3D4E5F6G7H8J9K0M",
+  "origin": {
+    "carrier": {
+      "kind": "reserved",
+      "module_id": "subc-mcp"
+    },
+    "call_key": "cc:toolu_01A2B3C4D5E6F7G8H9J0K1L2M3"
+  }
+}

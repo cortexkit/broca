@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+# Place a staged ck-broca over the live one ATOMICALLY, or refuse.
+#
+# This existed only as a hand-typed `cp` after every release, which is how a real hazard ran
+# unnoticed for a day: A COPY OVER A LIVE BINARY IS A TRUNCATE-THEN-WRITE. For the duration of
+# the write the on-disk image is PARTIAL, and anything that execs it in that window gets a
+# corrupt binary. Nothing did, which is not the same as it being safe.
+#
+# rename(2) within one filesystem is atomic: a reader sees either the whole old image or the
+# whole new one, never a half. That is the only correct primitive here.
+#
+# The inode consequence is downstream of that choice and worth stating, because it silently
+# invalidates a check used everywhere else: `cp` PRESERVES THE INODE (it rewrites in place), so
+# a post-place inode comparison passes whether or not the new bytes landed. Placement by rename
+# gives a NEW inode, which is what makes the running-vs-disk inode check discriminate at all.
+# Verify with sha and a behavioural probe regardless; the inode check is only meaningful as a
+# consequence of doing placement the safe way.
+#
+# Usage:
+#   scripts/place-release.sh --staged /tmp/ck-broca-065 [--dest <path>] [--skip-gate] [--restart]
+#   scripts/place-release.sh --restart-only [--dest <path>]
+#
+# A plain placement (--staged <path> without --restart) places the staged binary at --dest
+# atomically using rename(2). Because rename preserves the running process's existing inode,
+# placement alone does not cut live runs and proceeds even when runs are live, printing one
+# line noting that runs are live and that the placed binary is not loaded until a restart,
+# which re-checks the gate.
+#
+# The live-run gate only refuses when this invocation will restart (--restart, --restart-only).
+#
+# --restart waits up to 90 seconds for a NEW pid running the placed inode before returning.
+# It loads the placed binary too, and is the way to place a live module. The restart runs
+# only if the placement succeeded AND a second live-run check, taken just before the restart,
+# is still clear. Without it the operator types the restart by hand, creating a race window:
+# if a run starts in the seconds after placement, a hand-typed restart cuts the run to reload
+# the same binary. A later restart must check the gate again, even when the bytes are already on disk.
+#
+# --restart-only rechecks the live-run gate and loads bytes already at --dest, without placing.
+# Exit codes: 0 placed or restarted, 1 refused on a checked condition,
+# 2 cannot compare / bad invocation, 3 placed but NOT restarted because a run went live after
+# the first check (use --restart-only when the gate is clear; the new bytes are on disk),
+# 4 restart requested but the new on-disk image was not observed before timeout.
+#
+# Test seams: PLACE_RELEASE_GATE_CMD replaces the live-run check (a shell command whose exit
+# code means 0 clear / 1 live / other cannot tell), PLACE_RELEASE_CK replaces the `ck` binary.
+# PLACE_RELEASE_WAIT_SECONDS and PLACE_RELEASE_POLL_SECONDS shorten the wait in tests.
+# PLACE_RELEASE_RUN_SECONDS bounds each run of the candidate binary (default 30).
+# BROCA_STATE_ROOT moves the state root, and with it the WAL feature floor file.
+#
+# THE PLACEMENT GATE refuses, naming the check and the file it read, unless the signed temp copy
+# (the exact bytes the rename will publish) passes all of:
+#   hardened-downgrade  the deployed binary is hardened and the copy is not
+#   runtime-flag        the copy's code signature carries the hardened-runtime flag
+#   get-task-allow      the copy's entitlements let a debugger attach
+#   smoke-run           the copy fails to start: `--version` must exit 0 and name a version
+#   wal-feature-floor   the copy cannot read feature names this machine's WALs already use
+
+set -euo pipefail
+
+DEST="${HOME}/.local/share/cortexkit/bin/ck-broca"
+STAGED=""
+SKIP_GATE=0
+RESTART=0
+RESTART_ONLY=0
+STAGED_PROVIDED=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --staged) STAGED="${2:-}"; STAGED_PROVIDED=1; shift 2 ;;
+    --dest)   DEST="${2:-}"; shift 2 ;;
+    --skip-gate) SKIP_GATE=1; shift ;;
+    --restart) RESTART=1; shift ;;
+    --restart-only) RESTART_ONLY=1; shift ;;
+    *) echo "place-release: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$RESTART_ONLY" -eq 1 ]; then
+  if [ "$STAGED_PROVIDED" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$SKIP_GATE" -eq 1 ]; then
+    echo "place-release: --restart-only cannot be combined with --staged, --restart or --skip-gate" >&2
+    exit 2
+  fi
+else
+  [ -n "$STAGED" ] || { echo "place-release: --staged is required" >&2; exit 2; }
+  [ -f "$STAGED" ] || { echo "place-release: staged binary not found: $STAGED" >&2; exit 2; }
+fi
+[ -f "$DEST" ] || { echo "place-release: destination not found: $DEST" >&2; exit 2; }
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/signing-posture.sh"
+source "$REPO_ROOT/scripts/wal-floor.sh"
+source "$REPO_ROOT/scripts/running-image.sh"
+
+# The live-run gate answers "is any run live RIGHT NOW". It only refuses when this invocation
+# will restart (--restart, --restart-only), because placement alone is an atomic rename that
+# keeps the running process on its existing inode without cutting live work.
+# Its own exit codes are load-bearing: 1 means a live run, 2 means it could not tell.
+run_gate() {
+  set +e
+  if [ -n "${PLACE_RELEASE_GATE_CMD:-}" ]; then
+    bash -c "$PLACE_RELEASE_GATE_CMD" >/tmp/place-gate.txt 2>&1
+  else
+    python3 "$REPO_ROOT/scripts/live-runs.py" >/tmp/place-gate.txt 2>&1
+  fi
+  gate_rc=$?
+  set -e
+}
+
+# The live-run gate applies only when this invocation will restart (--restart, --restart-only).
+# A plain placement proceeds with runs live, and prints one line saying N runs are live and
+# that the binary is NOT loaded until a restart, which re-checks.
+if [ "$SKIP_GATE" -eq 0 ]; then
+  run_gate
+  if [ "$RESTART" -eq 1 ] || [ "$RESTART_ONLY" -eq 1 ]; then
+    case "$gate_rc" in
+      0) echo "== gate: no live runs" ;;
+      1) echo "place-release: REFUSING -- a run is live. Restart cuts it." >&2
+         grep -aE "live runs|session" /tmp/place-gate.txt | head -3 >&2 || true
+         exit 1 ;;
+      *) echo "place-release: REFUSING -- gate could not determine live runs (exit $gate_rc)." >&2
+         echo "  A gate that cannot tell must not be read as a clear gate." >&2
+         exit 2 ;;
+    esac
+  else
+    case "$gate_rc" in
+      0) echo "== gate: no live runs" ;;
+      1) live_count=$(grep -aE "live runs" /tmp/place-gate.txt 2>/dev/null | sed -E 's/.*live runs[^0-9]*([0-9]+).*/\1/' | head -1 || true)
+         # The gate said a run is live but its count did not parse: say so rather than invent one.
+         if ! [[ "$live_count" =~ ^[0-9]+$ ]]; then
+           runs_str="runs are live (count unreadable)"
+         elif [ "$live_count" -eq 1 ]; then
+           runs_str="1 run is live"
+         else
+           runs_str="$live_count runs are live"
+         fi
+         echo "== gate: $runs_str -- binary is NOT loaded until a restart, which re-checks" ;;
+      *) echo "== gate: live runs could not be determined (exit $gate_rc) -- binary is NOT loaded until a restart, which re-checks" ;;
+    esac
+  fi
+fi
+
+# Require a new process running the inode currently on disk, not just a new pid.
+restart_and_wait() {
+  local expected_inode="$1" expected_sha="$2"
+  local old_pid old_inode new_pid new_inode wait_seconds poll_seconds deadline
+  old_pid="$(broca_pid_for_binary "$DEST")" || { echo "place-release: REFUSING -- unknown process identity" >&2; return 2; }
+  old_inode="$(broca_running_inode "$old_pid" || true)"
+  if [ -n "$old_pid" ] && [ -z "$old_inode" ]; then
+    echo "place-release: REFUSING -- unknown running-image identity (pid $old_pid)" >&2
+    return 2
+  fi
+  "${PLACE_RELEASE_CK:-ck}" module restart broca
+  wait_seconds="${PLACE_RELEASE_WAIT_SECONDS:-90}"
+  poll_seconds="${PLACE_RELEASE_POLL_SECONDS:-1}"
+  deadline=$((SECONDS + wait_seconds))
+  new_pid=""
+  new_inode=""
+  while :; do
+    new_pid="$(broca_pid_for_binary "$DEST" || true)"
+    new_inode="$(broca_running_inode "$new_pid" || true)"
+    if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] &&
+       [ -n "$new_inode" ] && [ "$new_inode" = "$expected_inode" ]; then
+      break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "place-release: TIMED OUT waiting for placed image (old pid=${old_pid:-none} inode=${old_inode:-unknown}; latest pid=${new_pid:-none} inode=${new_inode:-unknown}; placed inode=$expected_inode)" >&2
+      return 4
+    fi
+    sleep "$poll_seconds"
+  done
+  echo "== restarted at $(date -u +%H:%M:%SZ) (pid $new_pid)"
+  echo "   Verify:  scripts/verify-deploy.sh --sha $expected_sha --marker <new> --control <known>"
+}
+
+if [ "$RESTART_ONLY" -eq 1 ]; then
+  disk_inode="$(broca_file_inode "$DEST")"
+  disk_sha="$(shasum -a 256 "$DEST" | awk '{print $1}')"
+  restart_and_wait "$disk_inode" "$disk_sha"
+  exit $?
+fi
+
+# FILE KIND, before anything is copied or signed. A staged path is just a path: a text file, a
+# script, a truncated download and a Mach-O binary all sit there identically, and every arm below
+# this point would happily process the wrong one -- cat copies it, chmod makes it executable,
+# codesign on this host refuses a non-binary but that is a property of THIS host's codesign, not a
+# check. PLEX put a plain text file through their own staging gate this week; mine would have been
+# stopped by the signing posture, which is an accident rather than an arm.
+#
+# Both sides, not just the staged one: comparing kinds catches a staged artifact built for another
+# architecture as well as one that is not a binary at all, and it states what the deployed image
+# actually is rather than assuming.
+# First line only: for a universal binary `file -b` adds one line per architecture, and those
+# lines carry the file's own path, so two files of the same kind would never compare equal.
+dest_kind="$(broca_release_kind "$DEST" || true)"
+if ! staged_kind="$(broca_release_kind "$STAGED")"; then
+  if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+    echo "place-release: REFUSING -- the staged artifact is not a Mach-O binary." >&2
+  else
+    echo "place-release: REFUSING -- the staged artifact is not a native executable ($BROCA_DEPLOY_HOST)." >&2
+  fi
+    echo "  staged   $STAGED" >&2
+    echo "           $staged_kind" >&2
+    echo "  deployed $dest_kind" >&2
+    exit 1
+fi
+if [ "$staged_kind" != "$dest_kind" ]; then
+  echo "place-release: REFUSING -- staged and deployed are different kinds of file." >&2
+  echo "  staged   $staged_kind" >&2
+  echo "  deployed $dest_kind" >&2
+  echo "  An architecture or format change is a deploy decision, not something to discover after" >&2
+  echo "  the rename. Place it deliberately if that is what you mean." >&2
+  exit 1
+fi
+
+# Same-directory temp is REQUIRED, not tidiness: rename(2) is only atomic within one filesystem,
+# and /tmp is frequently a different one.
+TMP="$(mktemp "${DEST}.place.XXXXXX")"
+trap 'rm -f "$TMP"' EXIT
+
+cat "$STAGED" >"$TMP"
+chmod 755 "$TMP"
+
+# Sign the TEMP, before it becomes reachable at the destination path. Signing after the rename
+# would mutate the live binary in place -- reintroducing exactly the partial-image window this
+# script exists to close.
+#
+# --identifier is not optional: without it codesign derives an identifier from the output
+# filename (here a mktemp name), and a changing identifier silently revokes macOS TCC grants.
+#
+# `-o runtime` is not optional either. `codesign -f` REPLACES the signature whole, so the
+# hardened runtime stage-release signed in is gone unless this line asks for it again. It once
+# did not, so every placed build ran unhardened whatever staging did. The gate below reads the
+# flag back from these bytes rather than trusting this line.
+#
+# codesign is required, not skipped when absent: the file-kind check above only admits Mach-O,
+# which only runs on macOS, and a copy that cannot be signed cannot have its posture checked.
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+if ! command -v codesign >/dev/null 2>&1; then
+  echo "place-release: REFUSING -- codesign is not available, so the copy cannot be signed or" >&2
+  echo "  its hardened runtime checked. file: $TMP" >&2
+  exit 1
+fi
+codesign -f -s - -o runtime --identifier ck-broca "$TMP" >/dev/null 2>&1 \
+  || { echo "place-release: REFUSING -- codesign failed. file: $TMP" >&2; exit 1; }
+fi
+
+BEFORE_SHA="$(shasum -a 256 "$DEST" | awk '{print $1}')"
+STAGED_SHA="$(shasum -a 256 "$TMP" | awk '{print $1}')"
+
+if [ "$BEFORE_SHA" = "$STAGED_SHA" ]; then
+  echo "place-release: REFUSING -- staged and deployed are byte-identical; nothing to place." >&2
+  echo "  This usually means the wrong artifact was staged." >&2
+  exit 1
+fi
+
+# ==== THE PLACEMENT GATE ======================================================================
+#
+# Every check below reads $TMP: the signed copy whose bytes the rename will publish, after the
+# last step that changes them. Never the staged file. The re-sign above is exactly the step that
+# made a staged-artifact check worthless (it silently replaced a hardened signature with an
+# unhardened one), so a check on anything but these bytes answers a question about a different
+# file. Each refusal names its check and the file, and leaves the deployed binary untouched.
+gate_refuse() { # <check> <file> <detail lines...>
+  local check="$1" file="$2"
+  shift 2
+  echo "place-release: REFUSING -- placement gate check '$check' failed." >&2
+  echo "  file  $file" >&2
+  local line
+  for line in "$@"; do
+    echo "  $line" >&2
+  done
+  echo "  Nothing has been placed; the deployed binary is unchanged." >&2
+  exit 1
+}
+
+# Run the candidate with a hard time limit, so a build that wedges at startup cannot hang the
+# placement. perl's alarm survives exec, so the process that runs IS the temp binary -- the one
+# whose signature is being tested, not a wrapper around it -- and SIGALRM ends it at the limit.
+run_candidate() {
+  perl -e 'alarm shift; exec @ARGV or exit 127' "${PLACE_RELEASE_RUN_SECONDS:-30}" "$@" </dev/null
+}
+
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+PLACED_FLAGS="$(broca_codesign_flags "$TMP" || true)"
+DEPLOYED_FLAGS="$(broca_codesign_flags "$DEST" || true)"
+
+# hardened-downgrade FIRST, because it is the more specific diagnosis of the same symptom as
+# runtime-flag: when the running binary is hardened, an unhardened replacement is a regression
+# of a property production already has, not merely a build that lacks it.
+if broca_flags_have_runtime "$DEPLOYED_FLAGS" && ! broca_flags_have_runtime "$PLACED_FLAGS"; then
+  gate_refuse hardened-downgrade "$TMP" \
+    "the deployed binary is hardened (flags=$DEPLOYED_FLAGS, $DEST)" \
+    "and the copy that would replace it is not (flags=${PLACED_FLAGS:-unreadable})."
+fi
+
+if ! broca_flags_have_runtime "$PLACED_FLAGS"; then
+  gate_refuse runtime-flag "$TMP" \
+    "codesign -dv reports flags=${PLACED_FLAGS:-unreadable}, without 'runtime'." \
+    "Without the hardened runtime any same-user process can attach a debugger and read the" \
+    "secret launch nonce the daemon gives the module."
+fi
+
+if ! PLACED_ENTITLEMENTS="$(broca_codesign_entitlements "$TMP")"; then
+  gate_refuse get-task-allow "$TMP" \
+    "codesign could not read the copy's entitlements, so their absence cannot be confirmed."
+fi
+if broca_entitlements_allow_debugger "$PLACED_ENTITLEMENTS"; then
+  gate_refuse get-task-allow "$TMP" \
+    "the entitlements contain com.apple.security.get-task-allow, which lets a debugger attach" \
+    "whatever the hardened runtime says."
+fi
+fi
+
+# smoke-run: the smallest real start. A signature that does not validate, or a hardened runtime
+# the binary cannot live under, shows up here as the kernel killing it at exec -- a failure no
+# flag check can see. Requiring the version line, not just exit 0, also refuses a file that runs
+# but is not ck-broca.
+set +e
+SMOKE_OUT="$(run_candidate "$TMP" --version 2>/dev/null)"
+smoke_rc=$?
+set -e
+SMOKE_LINE="${SMOKE_OUT%%$'\n'*}"
+smoke_re='^ck-broca [0-9]+\.[0-9]+\.[0-9]+'
+if [ "$smoke_rc" -ne 0 ] || ! [[ $SMOKE_LINE =~ $smoke_re ]]; then
+  gate_refuse smoke-run "$TMP" \
+    "'--version' exited $smoke_rc and printed '${SMOKE_LINE}'; expected exit 0 and 'ck-broca <version>'." \
+    "An exit status above 128 is a signal: macOS kills a binary whose signature does not validate."
+fi
+
+# wal-feature-floor: the floor lists the WAL feature names already written on this machine, and a
+# build whose reader does not know one of them would refuse those WALs. Placing it would roll the
+# machine back to a reader that cannot read its own data. See scripts/wal-floor.sh.
+WAL_FLOOR_FILE="$(broca_wal_floor_path)"
+if ! FLOOR_NAMES="$(broca_wal_floor_names "$WAL_FLOOR_FILE")"; then
+  echo "place-release: REFUSING -- placement gate check 'wal-feature-floor' cannot read the floor." >&2
+  echo "  file  $WAL_FLOOR_FILE" >&2
+  echo "  A floor nobody can read is not an empty floor. Nothing has been placed." >&2
+  exit 2
+fi
+set +e
+KNOWN_FEATURES="$(run_candidate "$TMP" --wal-known-features 2>/dev/null)"
+known_rc=$?
+set -e
+if [ "$known_rc" -eq 0 ]; then
+  # Exact whole-line membership, done in the shell: a `grep -q` fed by a pipe would exit on its
+  # first match and could kill the writer with SIGPIPE under pipefail.
+  missing=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case $'\n'"$KNOWN_FEATURES"$'\n' in
+      *$'\n'"$name"$'\n'*) : ;;
+      *) missing="${missing:+$missing, }$name" ;;
+    esac
+  done <<<"$FLOOR_NAMES"
+  if [ -n "$missing" ]; then
+    gate_refuse wal-feature-floor "$TMP" \
+      "the floor at $WAL_FLOOR_FILE lists feature(s) this build does not know: $missing" \
+      "WALs on this machine were written with them, and this build would refuse to read them."
+  fi
+  FLOOR_VERDICT="covered by the copy's --wal-known-features"
+elif [ -n "$FLOOR_NAMES" ]; then
+  # A build older than the flag cannot say what it knows. With a non-empty floor, that is a build
+  # that predates every gated feature, so it cannot read what the floor lists.
+  gate_refuse wal-feature-floor "$TMP" \
+    "'--wal-known-features' exited $known_rc, so this build cannot report which WAL features it" \
+    "reads, and the floor at $WAL_FLOOR_FILE is not empty."
+else
+  # No floor, or an empty one: no WAL frame on this machine names a feature, so any build can read
+  # every WAL here and an older one is as placeable as it always was.
+  FLOOR_VERDICT="empty, not checked (the copy predates --wal-known-features)"
+fi
+
+# ROLLBACK SNAPSHOT, in SUBC's naming rather than ours. Both seats place broca, and a
+# rollback sweep that greps one prefix cannot see the other's snapshots -- SUBC read this
+# tree and concluded no 0.3.85 rollback existed when it was sitting in the bin dir under
+# `.bak-*`. The two properties that make our paths indistinguishable to a later reader:
+# the `ck-<module>.rollback-<UTC>` prefix, so one sweep finds both; and the .sha256 sidecar,
+# so the snapshot is verifiable without trusting its filename.
+#
+# UTC, not local: the old name used `date +...` with no zone, so two placements two hours
+# apart across a DST edge could sort wrong. The sidecar is written in `shasum -c` format
+# (two spaces, basename) so `cd <dir> && shasum -c <file>.sha256` works unmodified.
+ROLLBACK_DIR="${ROLLBACK_DIR:-$HOME/.local/share/cortexkit/staging}"
+mkdir -p "$ROLLBACK_DIR"
+# CLAIM THE NAME EXCLUSIVELY. A plain `cp` to a second-resolution timestamp silently
+# overwrote the PREVIOUS snapshot when two placements landed in the same UTC second, and
+# the verify below could not see it: it hashes the newly written snapshot against the
+# newly written sidecar, so the pair agrees and the arm passes while an earlier rollback
+# is gone. A true answer about the wrong pair -- the exact shape this script's other arms
+# exist to catch. Found by an audit 40 minutes after this convention shipped.
+#
+# `set -C` makes the redirect fail if the path exists, so the loop cannot race a concurrent
+# creator the way a test-then-copy would. The prefix is preserved either way, so SUBC's
+# `ck-<module>.rollback-*` sweeps still see both.
+BACKUP_BASE="${ROLLBACK_DIR}/$(basename "$DEST").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP="$BACKUP_BASE"
+attempt=0
+until ( set -C; : > "$BACKUP" ) 2>/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -gt 50 ]; then
+    echo "place-release: REFUSING -- cannot claim a rollback name under $BACKUP_BASE" >&2
+    echo "  50 candidates were already taken. Nothing has been placed." >&2
+    exit 2
+  fi
+  BACKUP="${BACKUP_BASE}.${attempt}"
+done
+cp "$DEST" "$BACKUP"
+chmod 700 "$BACKUP"
+( cd "$ROLLBACK_DIR" && shasum -a 256 "$(basename "$BACKUP")" > "$(basename "$BACKUP").sha256" )
+if ! ( cd "$ROLLBACK_DIR" && shasum -c "$(basename "$BACKUP").sha256" >/dev/null 2>&1 ); then
+  echo "place-release: REFUSING -- the rollback sidecar does not verify its own snapshot." >&2
+  echo "  A rollback nobody can verify is not a rollback. Nothing has been placed." >&2
+  exit 2
+fi
+
+BEFORE_INODE="$(broca_file_inode "$DEST")"
+
+mv -f "$TMP" "$DEST"
+trap - EXIT
+
+AFTER_INODE="$(broca_file_inode "$DEST")"
+AFTER_SHA="$(shasum -a 256 "$DEST" | awk '{print $1}')"
+
+echo "== placed atomically"
+echo "   dest      $DEST"
+echo "   backup    $BACKUP"
+echo "   sha       ${BEFORE_SHA:0:16} -> ${AFTER_SHA:0:16}"
+echo "   inode     ${BEFORE_INODE} -> ${AFTER_INODE}"
+echo "   version   ${SMOKE_LINE}"
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+  echo "   signing   flags=${PLACED_FLAGS}, no get-task-allow (read from the placed copy)"
+else
+  echo "   signing   not applicable on Linux; ELF is unsigned (no macOS debugger-attachment protection claimed)"
+fi
+echo "   floor     $(broca_wal_floor_summary "$WAL_FLOOR_FILE") -- ${FLOOR_VERDICT}"
+echo "             ($WAL_FLOOR_FILE)"
+
+if [ "$AFTER_SHA" != "$STAGED_SHA" ]; then
+  echo "place-release: PLACED BYTES DO NOT MATCH THE STAGED ARTIFACT." >&2
+  echo "  Restore: mv '$BACKUP' '$DEST'" >&2
+  exit 1
+fi
+
+# A same-inode result after a rename means the rename did not happen as understood -- most
+# likely the temp and destination were on different filesystems and something fell back to a
+# copy. Report it rather than let a later inode check inherit a false premise.
+if [ "$BEFORE_INODE" = "$AFTER_INODE" ]; then
+  echo "place-release: WARNING -- inode unchanged across a rename." >&2
+  echo "  Placement may have degraded to a copy; do not trust a post-place inode check." >&2
+fi
+
+if [ "$RESTART" -eq 0 ]; then
+  echo
+  echo "   NOT YET RUNNING. Load it with --restart next time, or by hand ONLY after re-checking"
+  echo "   that no run is live:  ck module restart broca"
+  echo "   Then verify:  scripts/verify-deploy.sh --sha $AFTER_SHA --marker <new> --control <known>"
+  exit 0
+fi
+
+# THE SECOND CHECK. The first gate ran before the copy, the signing and the rollback snapshot, so
+# a run can have started since. That window is exactly how the 2026-09-24 run was cut. Re-check
+# immediately before the restart: if a run is live now, leave the new bytes on disk unloaded,
+# which harms nothing, and say so.
+if [ "$SKIP_GATE" -eq 0 ]; then
+  run_gate
+  if [ "$gate_rc" -ne 0 ]; then
+    echo "place-release: PLACED but NOT restarted -- the live-run gate is no longer clear (exit $gate_rc)." >&2
+    grep -aE "live runs|session" /tmp/place-gate.txt | head -3 >&2 || true
+    echo "  The new binary is on disk and not loaded. Restart when the gate is clear:" >&2
+    echo "    scripts/place-release.sh --restart-only --dest '$DEST'" >&2
+    exit 3
+  fi
+fi
+
+restart_and_wait "$AFTER_INODE" "$AFTER_SHA"

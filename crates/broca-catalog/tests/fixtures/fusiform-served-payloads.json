@@ -1,0 +1,232 @@
+{
+  "catalog.get — a model whose reasoning capability is unknown": {
+    "request": {
+      "arguments": {
+        "model_id": "unknown-reasoning",
+        "provider_id": "synthetic"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "synthetic/unknown-reasoning": {
+          "capability.attachment": null,
+          "capability.input_modalities": null,
+          "capability.output_modalities": null,
+          "capability.reasoning": null,
+          "capability.tool_call": null,
+          "existence": "present",
+          "limit.context": 128000,
+          "limit.output": 8192
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — inside a corrected interval": {
+    "request": {
+      "arguments": {
+        "at_ms": 5000,
+        "model_id": "claude-sonnet-4-5",
+        "provider_id": "anthropic"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "anthropic/claude-sonnet-4-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 64000,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 3750000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 15000000000
+          }
+        }
+      },
+      "resolved_at_ms": 5000,
+      "source": "models.dev",
+      "withheld": [
+        {
+          "corrections": [
+            {
+              "affected_from_ms": 3000,
+              "affected_until_ms": 9000,
+              "fields": [
+                {
+                  "class": "input",
+                  "field": "rate"
+                }
+              ],
+              "reason": "normalizer scaled tiered rates by 1000x"
+            }
+          ],
+          "fact_key": "rate.input",
+          "model": "anthropic/claude-sonnet-4-5"
+        }
+      ]
+    }
+  },
+  "catalog.get — one model, current": {
+    "request": {
+      "arguments": {
+        "model_id": "claude-sonnet-4-5",
+        "provider_id": "anthropic"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "anthropic/claude-sonnet-4-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 64000,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 3750000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 3000000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 15000000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.history — a corrected fact": {
+    "request": {
+      "arguments": {
+        "fact_key": "rate.input",
+        "model_id": "claude-sonnet-4-5",
+        "provider_id": "anthropic"
+      },
+      "name": "catalog.history"
+    },
+    "response": {
+      "eras": [
+        {
+          "boundary_at_ms": 1000,
+          "boundary_kind": "seed",
+          "value": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 3000000000
+          }
+        },
+        {
+          "boundary_at_ms": 9000,
+          "boundary_kind": "corrected",
+          "correction": {
+            "affected_from_ms": 3000,
+            "affected_until_ms": 9000,
+            "fields": [
+              {
+                "class": "input",
+                "field": "rate"
+              }
+            ],
+            "reason": "normalizer scaled tiered rates by 1000x"
+          },
+          "value": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "units": 3000000000
+          }
+        }
+      ],
+      "fact_key": "rate.input",
+      "model_id": "claude-sonnet-4-5",
+      "provider_id": "anthropic",
+      "source": "models.dev"
+    }
+  },
+  "catalog.status": {
+    "request": {
+      "arguments": {
+        "polls": 3
+      },
+      "name": "catalog.status"
+    },
+    "response": {
+      "catalog_version": 0,
+      "era_count": 164,
+      "model_count": 15,
+      "models_priced": 9,
+      "recent_polls": [
+        {
+          "detail": "upstream returned 503",
+          "duration_ms": 87,
+          "failure_class": "http_status",
+          "observed_at_ms": 2000,
+          "outcome": "failed"
+        },
+        {
+          "duration_ms": 12,
+          "observed_at_ms": 1000,
+          "outcome": "seeded"
+        }
+      ],
+      "source": "models.dev"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "broca-replay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared (A)-bench replay fixture: a cross-process monotonic clock + the deterministic delta schedule/encoding, so the bench consumer and the provider --bench-replay producer agree byte-for-byte on the measurement contract."
+
+[dependencies]
+subc-protocol.workspace = true
+# The two-lane frame codec (src/frame.rs) wraps broca-protocol ids/payloads in a subc
+# envelope for the direct bench socket.
+broca-protocol = { path = "../broca-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Safe, absolute CLOCK_MONOTONIC without nix's unconditional libc/extra_traits.
+# Only the time API is needed; rustix is already a transitive dependency. Windows
+# uses the process-relative fallback in src/clock.rs instead.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

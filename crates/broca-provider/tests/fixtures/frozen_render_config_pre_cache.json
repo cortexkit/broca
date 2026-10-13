@@ -1,0 +1,18 @@
+{
+  "family_id": "anthropic_messages",
+  "renderer_version": 1,
+  "wire_model_id": "claude-opus-4-8",
+  "max_output_tokens": 2048,
+  "reasoning": {
+    "mode": "anthropic_interleaved",
+    "budget_tokens": 1024,
+    "last_turn_only": true
+  },
+  "tool_id": "passthrough",
+  "system_prompt": {
+    "mode": "required_identity_lead",
+    "identity": "You are Claude Code, Anthropic's official CLI for Claude."
+  },
+  "usage": "anthropic_usage",
+  "token_limit_field": "max_tokens"
+}

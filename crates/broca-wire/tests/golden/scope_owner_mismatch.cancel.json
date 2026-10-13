@@ -1,0 +1,1 @@
+{"code":"scope_owner_mismatch","message":"this session accepts cancellation and retraction only from 'reserved:basal' or 'reserved:prefrontal-core', on any route and at any scope epoch","detail":{"kind":"scoped","owner":"reserved:prefrontal-core","ref":"head-e2e","scope_epoch":7,"presented_principal":"reserved:broca-e2e-other-carrier"}}

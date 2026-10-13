@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-same-index","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"chatcmpl-same-index","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_function_ipikj74rf9tr_1","type":"function","function":{"name":"search_token","arguments":"{\"query\":\"token refresh\"}"}}]}}]}
+
+data: {"id":"chatcmpl-same-index","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_function_ipikj74rf9tr_2","type":"function","function":{"name":"acquire_lease","arguments":"{\"query\":\"lease acquisition\"}"}}]}}]}
+
+data: {"id":"chatcmpl-same-index","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]

@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "elicitation_not_found",
+    "message": "elicitation is absent or no longer retained"
+  },
+  "method": "elicitation.get",
+  "request": {
+    "elicitation_id": "@ELICITATION_ID@"
+  },
+  "tag": "elicitation-requester-v1"
+}

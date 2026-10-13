@@ -1,0 +1,41 @@
+[package]
+name = "broca-module"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca as a subc module: the session-lineage coordinator (one actor per session over the durable WAL/lease/store), fan-out + per-subscriber backpressure, and the session.*/run.* serve surface. The coordinator + serve types live here; subc owns the wire mechanics."
+
+[dependencies]
+broca-diagnostics = { path = "../broca-diagnostics" }
+broca-protocol = { path = "../broca-protocol" }
+broca-wire = { path = "../broca-wire" }
+broca-core = { path = "../broca-core" }
+broca-wal = { path = "../broca-wal" }
+broca-store = { path = "../broca-store" }
+# Fetch-plan admission: the refusals a plan meets and the baseline a frozen manifest answers.
+broca-fetch-plan = { path = "../broca-fetch-plan" }
+# The `llm-runner/v1` role's steer delivery receipt, which a retried steer's answer carries.
+cortexkit-role-llm-runner = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# CancellationToken: cooperative cancel of a run + per-subscriber fan-out tasks.
+tokio-util.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+broca-store = { path = "../broca-store", features = ["test-conformance"] }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+tokio = { workspace = true, features = ["test-util"] }
+# The shutdown seal's in-flight attempt record is proven against the real HTTP transport,
+# streaming from a local server, rather than an in-process imitation of it.
+broca-provider = { path = "../broca-provider", features = ["live"] }
+sha2.workspace = true
+
+[features]
+test-clock = ["broca-core/test-clock"]

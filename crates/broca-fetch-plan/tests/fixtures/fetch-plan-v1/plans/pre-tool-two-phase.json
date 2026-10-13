@@ -1,0 +1,79 @@
+{
+  "tool_items": [],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "worker",
+      "params": {
+        "role": "mason"
+      }
+    }
+  ],
+  "compaction_item": {
+    "provider": "magic-context",
+    "preset": "worker",
+    "params": {}
+  },
+  "step_transform_items": [
+    {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "subscriptions": [
+        {
+          "hook": "pre_tool",
+          "phase": "mutate",
+          "ops": [],
+          "on_unavailable": "pass",
+          "budget_ms": 1000
+        },
+        {
+          "hook": "pre_tool",
+          "phase": "validate",
+          "ops": [],
+          "on_unavailable": "pass",
+          "budget_ms": 1000
+        }
+      ]
+    }
+  ],
+  "composition": {
+    "providers": [
+      {
+        "provider": "magic-context",
+        "tools": []
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": []
+      }
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    },
+    "step_transform_items": [
+      {
+        "provider": "magic-context",
+        "preset": "worker",
+        "params": {},
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "mutate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          },
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    ]
+  },
+  "composition_digest": "269eea6f25a2e32d586de78e255fa49aa6debe8ce3d5545a6be2052298e59745"
+}

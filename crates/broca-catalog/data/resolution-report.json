@@ -1,0 +1,1556 @@
+[
+  {
+    "provider_id": "302ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "abacus",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "abliteration-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "above",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "agentrouter",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "agnes",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ai-router",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ai21",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "aiand",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "aihubmix",
+    "npm": "@aihubmix/ai-sdk-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "aihubmix: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "ainetcafe",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "aixy",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "aki-io",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "alibaba",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "alibaba-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "alibaba-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "alibaba-coding-plan-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "alibaba-token-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "alibaba-token-plan-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "amazon-bedrock",
+    "npm": "@ai-sdk/amazon-bedrock",
+    "resolved_family": "bedrock_converse",
+    "resolution_source": "provider_id",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ambient",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "amd",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "anthropic",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "provider_id",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "anyapi",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "arcee",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "atomic-chat",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "auriko",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "azure",
+    "npm": "@ai-sdk/azure",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "azure: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "azure-cognitive-services",
+    "npm": "@ai-sdk/azure",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "azure-cognitive-services: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "bailing",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "baseten",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "berget",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "blueclaw",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "bothub",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "cerebras",
+    "npm": "@ai-sdk/cerebras",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "chutes",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "clarifai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "claudinio",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "cline-pass",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "cloudferro-sherlock",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "cloudflare-ai-gateway",
+    "npm": "ai-gateway-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "cloudflare-ai-gateway: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "cloudflare-workers-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "cohere",
+    "npm": "@ai-sdk/cohere",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "cohere: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "coralbricks",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "cortecs",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "crof",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "crossmodel",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "crusoe",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "daoxe",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "databricks",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "deepinfra",
+    "npm": "@ai-sdk/deepinfra",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "deepinfra: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "deepseek",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "digitalocean",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "dinference",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "drun",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ebcloud",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "echo",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "edenai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "empiriolabs",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "evroc",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "fastrouter",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "fireworks-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "freemodel",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "friendli",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "frogbot",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "github-copilot",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "gitlab",
+    "npm": "gitlab-ai-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "gitlab: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "gmicloud",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "google",
+    "npm": "@ai-sdk/google",
+    "resolved_family": "gemini",
+    "resolution_source": "provider_id",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "google-vertex",
+    "npm": "@ai-sdk/google-vertex",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "google-vertex: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "google-vertex-anthropic",
+    "npm": "@ai-sdk/google-vertex/anthropic",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "google-vertex-anthropic: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "greenpt",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "groq",
+    "npm": "@ai-sdk/groq",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "groq: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "helicone",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "hetzner",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "hpc-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "huggingface",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "hyper",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "iflowcn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "impossibl",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "inception",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "inceptron",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "inco",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "infer",
+    "npm": "@ai-sdk/openai",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "inference",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "inferx",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "infomaniak",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "io-net",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "iteracompute",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "jalapeno",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "jiekou",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "kenari",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "kilo",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "kimi-code-plan-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "kimi-code-plan-global",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "klokintegration",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "kosmik",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "kuae-cloud-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "lilac",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "llama",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "llmgateway",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "llmgateway-providers",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "llmtech",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "llmtr",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "lmstudio",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "longcat",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "lucidquery",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "lynkr",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "meganova",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "melious",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "merge-gateway",
+    "npm": "merge-gateway-ai-sdk-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "merge-gateway: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "meta",
+    "npm": "@ai-sdk/openai",
+    "resolved_family": "openai_responses",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "minimax",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "minimax-cn",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "minimax-cn-coding-plan",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "minimax-coding-plan",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "mistral",
+    "npm": "@ai-sdk/mistral",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "mistral: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "mixlayer",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "moark",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "modal",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "model-oracle-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "modelis",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "modelscope",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "moonshotai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "moonshotai-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "morph",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "nan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "nano-gpt",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "nearai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "nebius",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "neon",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "neosmith",
+    "npm": "@ai-sdk/openai",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "neuralwatt",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "nova",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "novita-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "nvidia",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "oci",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ofox",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ollama-cloud",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "openai",
+    "npm": "@ai-sdk/openai",
+    "resolved_family": "openai_chat",
+    "resolution_source": "provider_id",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "opencode",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "opencode-go",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "openreason",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "openrouter",
+    "npm": "@openrouter/ai-sdk-provider",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "opper",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "orcarouter",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "ovhcloud",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "pendra",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "perplexity",
+    "npm": "@ai-sdk/perplexity",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "perplexity: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "perplexity-agent",
+    "npm": "@ai-sdk/openai",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "pioneer",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "poe",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "poolside",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "privatemode-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "qihang-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "qiniu-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "qvac",
+    "npm": "@qvac/ai-sdk-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "qvac: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "regolo-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "requesty",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "routing-run",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "runinfra",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "sakana",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "salad-cloud",
+    "npm": "@saladtechnologies-oss/ai-sdk-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "salad-cloud: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "sap-ai-core",
+    "npm": "@jerome-benoit/sap-ai-provider-v2",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "sap-ai-core: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "sarvam",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "scaleway",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "scnet-token-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "scx-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "sensenova",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "siliconflow",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "siliconflow-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "snowflake-cortex",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "stackit",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "standardcompute",
+    "npm": "@openrouter/ai-sdk-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "standardcompute: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "stepfun",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "stepfun-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "stepfun-ai-step-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "stepfun-step-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "subconscious",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "submodel",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "synthetic",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "tencent-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "tencent-token-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "tencent-tokenhub",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "tensorx",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "the-grid-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "thinkingmachines",
+    "npm": "@ai-sdk/anthropic",
+    "resolved_family": "anthropic_messages",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "tinfoil",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "togetherai",
+    "npm": "@ai-sdk/togetherai",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "togetherai: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "tokengo",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "tokenrouter",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "trustedrouter",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "umans-ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "umans-ai-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "unorouter",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "upstage",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "v0",
+    "npm": "@ai-sdk/vercel",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "v0: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "vancine",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "venice",
+    "npm": "venice-ai-sdk-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "venice: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "vercel",
+    "npm": "@ai-sdk/gateway",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "vercel: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "vispark",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "vivgrid",
+    "npm": "@ai-sdk/openai",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "volcengine",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "volcengine-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "vultr",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "wafer.ai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "wallaby",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "wandb",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "watsonx",
+    "npm": "watsonx-ai-provider",
+    "resolved_family": null,
+    "resolution_source": "pending",
+    "pending_reason": "watsonx: no overlay wire_family pin and no provider-id hand-table entry"
+  },
+  {
+    "provider_id": "xai",
+    "npm": "@ai-sdk/xai",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "xiaomi",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "xiaomi-token-plan-ams",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "xiaomi-token-plan-cn",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "xiaomi-token-plan-sgp",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "xpersona",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zai-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zeldoc",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zenifra",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zenmux",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zhipuai",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  },
+  {
+    "provider_id": "zhipuai-coding-plan",
+    "npm": "@ai-sdk/openai-compatible",
+    "resolved_family": "openai_chat",
+    "resolution_source": "overlay",
+    "pending_reason": ""
+  }
+]

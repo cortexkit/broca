@@ -1,0 +1,123 @@
+{
+  "cases": [
+    {
+      "name": "windows_all_homes_use_separate_xdg_variables",
+      "platform": "windows",
+      "env": {"XDG_DATA_HOME": "C:\\data", "XDG_CONFIG_HOME": "C:\\config", "APPDATA": "C:\\roaming", "USERPROFILE": "C:\\profile", "HOME": "C:\\home"},
+      "state": "C:\\data\\cortexkit\\broca",
+      "config": "C:\\config\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_appdata_beats_profile_and_home_with_spaces",
+      "platform": "windows",
+      "env": {"APPDATA": "C:\\Users\\Golden User\\AppData\\Roaming", "USERPROFILE": "C:\\profile", "HOME": "C:\\home"},
+      "state": "C:\\Users\\Golden User\\AppData\\Roaming\\cortexkit\\broca",
+      "config": "C:\\Users\\Golden User\\AppData\\Roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_profile_beats_home",
+      "platform": "windows",
+      "env": {"USERPROFILE": "C:\\Users\\Golden User", "HOME": "C:\\home"},
+      "state": "C:\\Users\\Golden User\\AppData\\Roaming\\cortexkit\\broca",
+      "config": "C:\\Users\\Golden User\\AppData\\Roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_empty_xdg_and_appdata_use_profile",
+      "platform": "windows",
+      "env": {"XDG_DATA_HOME": "", "XDG_CONFIG_HOME": "", "APPDATA": "", "USERPROFILE": "C:\\profile", "HOME": "C:\\home"},
+      "state": "C:\\profile\\AppData\\Roaming\\cortexkit\\broca",
+      "config": "C:\\profile\\AppData\\Roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_empty_homes_use_distinct_home_tails",
+      "platform": "windows",
+      "env": {"BROCA_STATE_ROOT": "", "XDG_DATA_HOME": "", "XDG_CONFIG_HOME": "", "APPDATA": "", "USERPROFILE": "", "HOME": "C:\\home"},
+      "state": "C:\\home\\.local\\share\\cortexkit\\broca",
+      "config": "C:\\home\\.config\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_unset_homes_refuse",
+      "platform": "windows",
+      "env": {},
+      "state_error": "unresolvable",
+      "config": null
+    },
+    {
+      "name": "windows_relative_appdata_refuses_state_but_preserves_config",
+      "platform": "windows",
+      "env": {"APPDATA": "relative\\roaming", "USERPROFILE": "C:\\profile", "HOME": "C:\\home"},
+      "state_error": "APPDATA",
+      "config": "relative\\roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_drive_relative_profile_is_not_absolute_data",
+      "platform": "windows",
+      "env": {"USERPROFILE": "C:profile", "HOME": "C:\\home"},
+      "state_error": "USERPROFILE",
+      "config": "C:profile\\AppData\\Roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_relative_config_wins_without_affecting_data",
+      "platform": "windows",
+      "env": {"XDG_CONFIG_HOME": "relative\\config", "APPDATA": "C:\\roaming"},
+      "state": "C:\\roaming\\cortexkit\\broca",
+      "config": "relative\\config\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_data_xdg_is_not_config_xdg",
+      "platform": "windows",
+      "env": {"XDG_DATA_HOME": "C:\\data", "APPDATA": "C:\\roaming"},
+      "state": "C:\\data\\cortexkit\\broca",
+      "config": "C:\\roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_unc_appdata",
+      "platform": "windows",
+      "env": {"APPDATA": "\\\\server\\share\\roaming"},
+      "state": "\\\\server\\share\\roaming\\cortexkit\\broca",
+      "config": "\\\\server\\share\\roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "windows_explicit_state_is_taken_as_given",
+      "platform": "windows",
+      "env": {"BROCA_STATE_ROOT": "relative\\state", "APPDATA": "C:\\roaming"},
+      "state": "relative\\state",
+      "config": "C:\\roaming\\cortexkit\\broca"
+    },
+    {
+      "name": "unix_ignores_windows_variables",
+      "platform": "unix",
+      "env": {"APPDATA": "/roaming", "USERPROFILE": "/profile", "HOME": "/home/golden"},
+      "state": "/home/golden/.local/share/cortexkit/broca",
+      "config": "/home/golden/.config/cortexkit/broca"
+    },
+    {
+      "name": "unix_distinct_xdg_homes",
+      "platform": "unix",
+      "env": {"XDG_DATA_HOME": "/data", "XDG_CONFIG_HOME": "/config", "HOME": "/home/golden"},
+      "state": "/data/cortexkit/broca",
+      "config": "/config/cortexkit/broca"
+    },
+    {
+      "name": "relative_explicit_and_relative_config_remain_supported",
+      "platform": "any",
+      "env": {"BROCA_STATE_ROOT": "relative-state", "XDG_CONFIG_HOME": "relative-config"},
+      "state": "relative-state",
+      "config": "relative-config/cortexkit/broca"
+    },
+    {
+      "name": "relative_xdg_data_refuses",
+      "platform": "any",
+      "env": {"XDG_DATA_HOME": "relative-data", "XDG_CONFIG_HOME": "relative-config"},
+      "state_error": "XDG_DATA_HOME",
+      "config": "relative-config/cortexkit/broca"
+    },
+    {
+      "name": "all_empty_is_unresolvable",
+      "platform": "any",
+      "env": {"BROCA_STATE_ROOT": "", "XDG_DATA_HOME": "", "XDG_CONFIG_HOME": "", "APPDATA": "", "USERPROFILE": "", "HOME": ""},
+      "state_error": "unresolvable",
+      "config": null
+    }
+  ]
+}

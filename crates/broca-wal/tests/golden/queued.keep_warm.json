@@ -1,0 +1,1 @@
+{"type":"queued","keep_warm":"auto","submission_id":"sub-run-8","request":{"keep_warm":"auto","model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}

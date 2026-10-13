@@ -1,0 +1,28 @@
+{
+  "name": "web_search",
+  "arguments": {
+    "query": "RFC 8785 canonical JSON",
+    "max_results": 5,
+    "include_domains": [
+      "rfc-editor.org"
+    ],
+    "recency": "year",
+    "agent_assertion": {
+      "claims": {
+        "v": 1,
+        "agent_id": "example-head",
+        "surface": "github",
+        "handle": "example",
+        "installation_id": null,
+        "scope": [],
+        "binding_generation": 1,
+        "jti": "example-jti",
+        "iat": 1700000000,
+        "exp": 1700000300
+      },
+      "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 1
+    }
+  },
+  "call_key": "pf:01JB3Y8A2B3C4D5E6F7G8H9J0K"
+}

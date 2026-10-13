@@ -1,0 +1,1 @@
+{"input":[{"content":"firstsecond+hook","role":"assistant","type":"message"},{"arguments":"{\"path\":\"a\"}","call_id":"call_1","name":"read","type":"function_call"},{"content":"tail","role":"assistant","type":"message"}],"max_output_tokens":2048,"model":"gpt-4.1","stream":true}

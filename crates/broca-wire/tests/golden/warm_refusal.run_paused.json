@@ -1,0 +1,1 @@
+{"code":"run_paused","message":"run 'run-1' is paused (auth_required); nothing is warmed until it resumes or ends","detail":{"kind":"run_paused","run_id":"run-1","reason":"auth_required"}}

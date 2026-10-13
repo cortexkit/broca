@@ -1,0 +1,26 @@
+{
+  "design": "D 4.5 'One deadline covers all fetches'; D 10.6 Refusals",
+  "plan": "plans/broca-worker-unknown-provider.json",
+  "composition": "compositions/broca-worker-unknown-provider.json",
+  "fetches": [
+    {
+      "provider": "no-such-module",
+      "route_open": "unknown_module"
+    }
+  ],
+  "expected": {
+    "admitted": false,
+    "code": "fetch_unavailable",
+    "detail": {
+      "provider": "no-such-module",
+      "reason": "unknown_module"
+    },
+    "class": "transient",
+    "writes": "nothing"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false
+  }
+}

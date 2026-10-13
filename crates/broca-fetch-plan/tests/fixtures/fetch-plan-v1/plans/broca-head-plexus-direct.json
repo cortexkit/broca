@@ -1,0 +1,151 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "head",
+      "params": {
+        "behavior": "interactive",
+        "scope": "all",
+        "tool_descs": "full",
+        "host": "broca"
+      }
+    },
+    {
+      "provider": "magic-context",
+      "preset": "head",
+      "params": {}
+    },
+    {
+      "provider": "plexus",
+      "preset": "head",
+      "params": {}
+    },
+    {
+      "provider": "prefrontal-core",
+      "preset": "head",
+      "params": {
+        "exclude": [
+          "web_search"
+        ]
+      }
+    }
+  ],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "head",
+      "params": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-5",
+          "variant": "max"
+        }
+      }
+    },
+    {
+      "provider": "aft",
+      "preset": "head",
+      "params": {}
+    },
+    {
+      "provider": "magic-context",
+      "preset": "head",
+      "params": {}
+    }
+  ],
+  "step_transform_items": [],
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "bash_status",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "magic-context",
+        "tools": [
+          {
+            "name": "ctx_memory",
+            "capabilities": [
+              "magic-context:memory.write/v1"
+            ]
+          },
+          {
+            "name": "ctx_note",
+            "capabilities": [
+              "magic-context:notes/v1"
+            ]
+          },
+          {
+            "name": "ctx_search",
+            "capabilities": [
+              "magic-context:archive.search/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "plexus",
+        "tools": [
+          {
+            "name": "github",
+            "capabilities": [
+              "plexus:github.facade/v1"
+            ]
+          },
+          {
+            "name": "web_search",
+            "capabilities": [
+              "plexus:web.search/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": [
+          {
+            "name": "browser_use",
+            "capabilities": [
+              "browser.use/v1",
+              "cerebellum:browser.use/v1"
+            ]
+          },
+          {
+            "name": "computer_use",
+            "capabilities": [
+              "cerebellum:computer.use/v1",
+              "computer.use/v1"
+            ]
+          }
+        ]
+      }
+    ],
+    "step_transform_items": []
+  },
+  "composition_digest": "9ce573eb40d0f5915ad1b1dd25a3e69c5c07713cefbdeac92f1135192367afd1"
+}

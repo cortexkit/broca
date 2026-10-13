@@ -1,0 +1,41 @@
+{
+  "plan": "plans/pre-tool-declared.json",
+  "composition": "compositions/pre-tool-declared.json",
+  "declarations": [
+    {
+      "provider": "magic-context",
+      "preset": "other",
+      "params": {},
+      "answer": {
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "admitted": false,
+    "code": "plan_stale",
+    "detail": {
+      "differences": [
+        {
+          "kind": "preset_missing",
+          "provider": "magic-context",
+          "preset": "worker"
+        }
+      ]
+    },
+    "writes": "nothing"
+  },
+  "settled": "Extensibility room, 2026-10-01 #912–#916; BROCA #915",
+  "runner_declaration": {
+    "hooks": true,
+    "compaction": true
+  }
+}

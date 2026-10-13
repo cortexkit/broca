@@ -1,0 +1,139 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "head",
+      "params": {
+        "behavior": "interactive",
+        "scope": "all",
+        "tool_descs": "full",
+        "host": "broca"
+      }
+    },
+    {
+      "provider": "magic-context",
+      "preset": "head",
+      "params": {}
+    },
+    {
+      "provider": "prefrontal-core",
+      "preset": "head",
+      "params": {
+        "exclude": [
+          "web_search"
+        ]
+      }
+    }
+  ],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "head",
+      "params": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-5",
+          "variant": "max"
+        }
+      }
+    },
+    {
+      "provider": "aft",
+      "preset": "head",
+      "params": {}
+    },
+    {
+      "provider": "magic-context",
+      "preset": "head",
+      "params": {}
+    },
+    {
+      "provider": "notes-provider",
+      "preset": "head",
+      "params": {},
+      "optional": true
+    }
+  ],
+  "step_transform_items": [],
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "bash_status",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "magic-context",
+        "tools": [
+          {
+            "name": "ctx_memory",
+            "capabilities": [
+              "magic-context:memory.write/v1"
+            ]
+          },
+          {
+            "name": "ctx_note",
+            "capabilities": [
+              "magic-context:notes/v1"
+            ]
+          },
+          {
+            "name": "ctx_search",
+            "capabilities": [
+              "magic-context:archive.search/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "notes-provider",
+        "tools": []
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": [
+          {
+            "name": "browser_use",
+            "capabilities": [
+              "browser.use/v1",
+              "cerebellum:browser.use/v1"
+            ]
+          },
+          {
+            "name": "computer_use",
+            "capabilities": [
+              "cerebellum:computer.use/v1",
+              "computer.use/v1"
+            ]
+          }
+        ]
+      }
+    ],
+    "step_transform_items": []
+  },
+  "composition_digest": "c5128fb525aa4af8f05b3a7ee015b506e83ea26820aa04d3ab1ab2b437e56723"
+}

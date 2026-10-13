@@ -1,0 +1,50 @@
+[package]
+name = "broca-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca catalog: ingests a vendored models.dev snapshot + a hand-maintained overlay into the provider framework's ProviderSpec/ModelSpec. No network, no runtime IO — the snapshot is embedded and lazy-parsed."
+
+[features]
+# Embed the multi-MB vendored snapshot into the binary at compile time. On by
+# default for release binaries; tooling/tests that load a snapshot from a string or
+# disk can turn it off to avoid linking the JSON into every binary.
+default = ["bundled-catalog"]
+bundled-catalog = []
+# Pull in the provider's live transport so catalog-resolved configs can actually run
+# (the catalog→live resolver in `live.rs` + the end-to-end test). Also needs the core
+# `Provider` trait the resolver returns a boxed instance of. base64 decodes the ChatGPT
+# token's JWT payload to extract the codex account id (the live auth-resolution path only).
+live = ["broca-provider/live", "dep:broca-core", "dep:base64"]
+
+[dependencies]
+broca-owner-only.workspace = true
+# Sits ABOVE the provider framework: produces the specs the framework consumes.
+broca-provider = { path = "../broca-provider" }
+# Only the `live` resolver needs the core `Provider` trait (the resolver returns a
+# `Box<dyn Provider>`); optional so the default catalog build stays core-free.
+broca-core = { path = "../broca-core", optional = true }
+# Decodes the ChatGPT JWT payload for the codex account-id header (live path only).
+base64 = { version = "0.22", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+# build.rs validates the vendored snapshot parses at build time (fails the build,
+# not production, on a malformed snapshot).
+serde_json.workspace = true
+
+[dev-dependencies]
+broca-owner-only = { workspace = true, features = ["test-support"] }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+# The catalog→live end-to-end test drives a real provider through the loop's
+# Provider trait, so it needs the core trait, the protocol types, and a runtime.
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+tokio = { workspace = true, features = ["test-util"] }
+# The mixed-pipe warm proof negotiates the same Responses socket compression as production.
+tokio-tungstenite.workspace = true
+futures.workspace = true

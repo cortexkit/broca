@@ -1,0 +1,1 @@
+{"requires":["step-transforms/v1"],"record":{"type":"tool_no_dispatch","batch_id":"r-b1","tool_call_id":"t2","reason":{"kind":"validation_failed","detail":"bad input"},"hooks":{"original":{"f":"a"},"final":{"f":"b"},"ops":[{"module":"magic-context","hook":"pre_tool","phase":"mutate","op":"mutate","block":0,"note":"restrict input"}],"unavailable":["notes"]}}}

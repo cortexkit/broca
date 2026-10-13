@@ -1,0 +1,18 @@
+{
+  "family": "provider_switch",
+  "model": "gemini-2.5-flash",
+  "normalized_events": [
+    "Control(StreamStart { warnings: [] })",
+    "Control(StepStarted { step_id: StepId(1) })",
+    "Display(TextDelta { message_id: MessageId(\"\"), tool_call_id: None, delta: \"synthetic-001 \" })",
+    "Display(TextDelta { message_id: MessageId(\"\"), tool_call_id: None, delta: \"synthetic-002 \" })",
+    "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"\"), content: [Text { text: \"synthetic-001 synthetic-002 \" }] } })",
+    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(126), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(10), reasoning_tokens: None }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(Finished { usage: Usage { input_tokens: Some(126), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(10), reasoning_tokens: None }, finish_reason: Stop, retries_used: 0 })"
+  ],
+  "note": "Synthetic response bytes and normalized events; preserves the original event order, field structure, usage shapes and chunk boundaries. No request or credentials.",
+  "raw_response_base64": null,
+  "raw_response_is_utf8": true,
+  "raw_response_text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic-001 \"}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":126,\"candidatesTokenCount\":4,\"totalTokenCount\":130,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":126}],\"serviceTier\":\"standard\"},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"00000000-0000-4000-8000-000000000057\"}\n\r\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic-002 \"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":126,\"candidatesTokenCount\":10,\"totalTokenCount\":136,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":126}],\"serviceTier\":\"standard\"},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"00000000-0000-4000-8000-000000000057\"}\n\r\n",
+  "scenario": "gemini_leg_b"
+}

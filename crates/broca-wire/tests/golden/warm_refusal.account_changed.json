@@ -1,0 +1,1 @@
+{"code":"account_changed","message":"the credential now belongs to a different account than the one the session froze; nothing was sent","detail":{"kind":"account_changed","frozen_account":"acct-1","served_account":"acct-2"}}

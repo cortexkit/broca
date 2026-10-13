@@ -1,0 +1,14 @@
+{
+  "tag": "elicitation-records-v1",
+  "method": "elicitation.answers",
+  "request": {
+    "since": null
+  },
+  "reply": {
+    "records": [],
+    "cursor": {
+      "provider_incarnation": "core-incarnation-2",
+      "seq": 7
+    }
+  }
+}

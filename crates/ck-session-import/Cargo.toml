@@ -1,0 +1,20 @@
+[package]
+name = "ck-session-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Foreign harness session readers that convert transcripts to broca's canonical message schema."
+
+[dependencies]
+broca-protocol = { path = "../broca-protocol" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+broca-module-serve = { path = "../broca-module-serve" }
+broca-provider = { path = "../broca-provider" }

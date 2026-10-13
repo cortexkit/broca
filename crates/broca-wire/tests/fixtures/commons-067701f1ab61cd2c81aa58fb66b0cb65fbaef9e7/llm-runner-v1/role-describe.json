@@ -1,0 +1,551 @@
+{
+  "accepted": [
+    {
+      "name": "every group declared, session capabilities from admission",
+      "declares": [
+        "transcript_reads",
+        "run_ops",
+        "dispatch_attribution",
+        "streaming",
+        "model_view",
+        "steer",
+        "queue",
+        "ordered_hook_phases",
+        "interrupt",
+        "compaction",
+        "session_change",
+        "plans"
+      ],
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "compaction.ready",
+              "session.read",
+              "session.head",
+              "run.result",
+              "session.subscribe",
+              "session.send",
+              "session.refresh",
+              "session.refresh_policy",
+              "session.flush_prefix"
+            ]
+          }
+        ],
+        "implementation_version": "0.9.0",
+        "capabilities": [
+          "transcript_reads",
+          "run_ops",
+          "dispatch_attribution",
+          "streaming",
+          "model_view",
+          "steer",
+          "queue",
+          "ordered_hook_phases",
+          "interrupt",
+          "compaction",
+          "session_change",
+          "plans"
+        ],
+        "session_capabilities_from": "admission",
+        "max_bytes": {
+          "default": 4194304,
+          "maximum": 16777216
+        }
+      }
+    },
+    {
+      "name": "steer only, hosting no sessions: no compaction, session capabilities from the baseline",
+      "declares": [
+        "steer"
+      ],
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.send"
+            ]
+          }
+        ],
+        "implementation_version": "1.0.0",
+        "capabilities": [
+          "steer"
+        ],
+        "session_capabilities_from": "baseline"
+      }
+    },
+    {
+      "name": "no capabilities member, an extra op and an unknown capability",
+      "declares": [],
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "beta",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "compaction.ready",
+              "vendor.extra"
+            ]
+          }
+        ],
+        "implementation_version": "2.0.0",
+        "session_capabilities_from": "admission",
+        "extra_top_level": true
+      }
+    },
+    {
+      "name": "compaction declared with compaction.ready",
+      "declares": [
+        "compaction"
+      ],
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "compaction.ready"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "compaction"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "session_change declared with its three ops",
+      "declares": [
+        "session_change"
+      ],
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.refresh",
+              "session.refresh_policy",
+              "session.flush_prefix"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "session_change"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "plans declared without compaction or delivery groups",
+      "declares": [
+        "plans"
+      ],
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.send"
+            ]
+          }
+        ],
+        "implementation_version": "0.1.0",
+        "capabilities": [
+          "plans"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    }
+  ],
+  "canonical": [
+    {
+      "name": "minimal answer",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ],
+            "stability": "alpha"
+          }
+        ],
+        "implementation_version": "0.1.0",
+        "capabilities": [],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "transcript reads with the byte cap",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.read",
+              "session.head"
+            ],
+            "stability": "alpha"
+          }
+        ],
+        "implementation_version": "0.9.0",
+        "capabilities": [
+          "transcript_reads"
+        ],
+        "session_capabilities_from": "admission",
+        "max_bytes": {
+          "default": 4194304,
+          "maximum": 16777216
+        }
+      }
+    },
+    {
+      "name": "plans declaration round trips",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.send"
+            ]
+          }
+        ],
+        "implementation_version": "0.1.0",
+        "capabilities": [
+          "plans"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "steer receipt guaranteed",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.send"
+            ],
+            "stability": "alpha"
+          }
+        ],
+        "implementation_version": "0.1.0",
+        "capabilities": [
+          "steer"
+        ],
+        "session_capabilities_from": "admission",
+        "steer_receipt": "guaranteed"
+      }
+    },
+    {
+      "name": "steer receipt confirm",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.send"
+            ],
+            "stability": "alpha"
+          }
+        ],
+        "implementation_version": "0.1.0",
+        "capabilities": [
+          "steer"
+        ],
+        "session_capabilities_from": "admission",
+        "steer_receipt": "confirm"
+      }
+    }
+  ],
+  "stability_defaults": [
+    {
+      "name": "absent stability reads as alpha",
+      "stability": "alpha",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "stated stability is kept",
+      "stability": "stable",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "stable",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "session_capabilities_from": "admission"
+      }
+    }
+  ],
+  "refused": [
+    {
+      "name": "not an object",
+      "problem": "not_an_object",
+      "answer": [
+        "llm-runner/v1"
+      ]
+    },
+    {
+      "name": "majors missing",
+      "problem": "undecodable",
+      "answer": {
+        "implementation_version": "1",
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "only another role",
+      "problem": "missing_major",
+      "answer": {
+        "majors": [
+          {
+            "version": "tool-provider/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "tool.catalog"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "session.baseline missing",
+      "problem": "missing_op",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "compaction.ready"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "transcript_reads declared without session.head",
+      "problem": "group_incomplete",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.read"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "transcript_reads"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "steer declared without session.send",
+      "problem": "group_incomplete",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "steer"
+        ],
+        "session_capabilities_from": "baseline"
+      }
+    },
+    {
+      "name": "no session capability source",
+      "problem": "missing_session_capabilities_source",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "1"
+      }
+    },
+    {
+      "name": "transcript_reads declared without a byte cap",
+      "problem": "missing_max_bytes",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.read",
+              "session.head"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "transcript_reads"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "interrupt declared without session.send",
+      "problem": "group_incomplete",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "interrupt"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "compaction declared without compaction.ready",
+      "problem": "group_incomplete",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "compaction"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "session_change declared without session.flush_prefix",
+      "problem": "group_incomplete",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline",
+              "session.refresh",
+              "session.refresh_policy"
+            ]
+          }
+        ],
+        "implementation_version": "1",
+        "capabilities": [
+          "session_change"
+        ],
+        "session_capabilities_from": "admission"
+      }
+    },
+    {
+      "name": "plans without session.send",
+      "answer": {
+        "majors": [
+          {
+            "version": "llm-runner/v1",
+            "stability": "alpha",
+            "ops": [
+              "role.describe",
+              "session.baseline"
+            ]
+          }
+        ],
+        "implementation_version": "0.1.0",
+        "capabilities": [
+          "plans"
+        ],
+        "session_capabilities_from": "admission"
+      },
+      "problem": "group_incomplete"
+    }
+  ]
+}

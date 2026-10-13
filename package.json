@@ -1,0 +1,8 @@
+{
+  "name": "broca-test-harness",
+  "private": true,
+  "description": "Test-only Node dependencies for the broca provider/error e2e suite. The pinned aimock drives byte-level provider assertions, so it is version-locked (exact, no caret) — a floating version could change SSE framing and silently break the normalizer tests.",
+  "devDependencies": {
+    "@copilotkit/aimock": "1.32.0"
+  }
+}

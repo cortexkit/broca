@@ -1,0 +1,1 @@
+{"code":"plan_model_mismatch","message":"provider prefrontal-core has a plan model different from the send model","detail":{"plan_model":{"id":"other","provider":"fake"},"provider":"prefrontal-core","send_model":{"id":"fake","provider":"fake"}}}

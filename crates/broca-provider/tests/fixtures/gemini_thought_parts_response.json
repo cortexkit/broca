@@ -1,0 +1,46 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "thought": true,
+            "text": "**Analyzing the Problem**\n\nCheck the requested calculation."
+          },
+          {
+            "text": "Answer: 391.",
+            "thoughtSignature": "discarded-answer-signature"
+          },
+          {
+            "thought": true,
+            "text": "I should verify with tools.",
+            "thoughtSignature": "signed-reasoning"
+          },
+          {
+            "functionCall": {
+              "name": "lookup",
+              "args": { "value": 391 }
+            },
+            "thoughtSignature": "signed-first-call"
+          },
+          {
+            "functionCall": {
+              "name": "explain",
+              "args": { "value": 391 }
+            }
+          },
+          {
+            "text": " Done."
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 12,
+    "candidatesTokenCount": 18
+  }
+}

@@ -1,0 +1,1 @@
+{"code":"retained_session_too_large","message":"retained session log cannot exceed 4096 bytes","detail":{"class":"permanent","max_bytes":4096}}

@@ -1,0 +1,66 @@
+{
+  "providers": [
+    {
+      "provider": "aft",
+      "tools": [
+        {
+          "name": "bash",
+          "capabilities": [
+            "shell.exec/v1"
+          ]
+        },
+        {
+          "name": "edit",
+          "capabilities": [
+            "code.edit/v1"
+          ]
+        },
+        {
+          "name": "read",
+          "capabilities": [
+            "code.read/v1"
+          ]
+        }
+      ]
+    },
+    {
+      "provider": "magic-context",
+      "tools": []
+    },
+    {
+      "provider": "prefrontal-core",
+      "tools": []
+    }
+  ],
+  "compaction": {
+    "provider": "magic-context"
+  },
+  "step_transform_items": [
+    {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "subscriptions": [
+        {
+          "hook": "pre_user",
+          "ops": [
+            "append"
+          ],
+          "on_unavailable": "refuse",
+          "budget_ms": 1000
+        },
+        {
+          "hook": "post_tool",
+          "tools": [
+            "read"
+          ],
+          "ops": [
+            "append"
+          ],
+          "on_unavailable": "refuse",
+          "budget_ms": 1000
+        }
+      ]
+    }
+  ]
+}

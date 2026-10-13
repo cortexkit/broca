@@ -1,0 +1,8 @@
+{
+  "fetched_at": "2026-09-18T20:41:24Z",
+  "model_count": 7854,
+  "note": "Vendored models.dev catalog snapshot. Refresh via scripts/refresh-catalog.sh (explicit, human/CI-run) \u2014 never fetched at build or run time.",
+  "provider_count": 222,
+  "sha256": "2ed7b0a8fb9a4e7b11e36441a400698c1b46090b00c96aef6f90918da550ebf9",
+  "source_url": "https://models.dev/api.json"
+}

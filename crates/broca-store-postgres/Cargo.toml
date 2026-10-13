@@ -1,0 +1,26 @@
+[package]
+name = "broca-store-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca materialized store: PostgresStore backend implementing the stable SessionStore traits without leaking database types to the loop crate."
+
+[features]
+default = []
+live-postgres = []
+
+[dependencies]
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-wal = { path = "../broca-wal" }
+serde.workspace = true
+serde_json.workspace = true
+# The SessionStore traits are synchronous. The blocking postgres driver avoids an
+# async runtime bridge and keeps database-specific types confined to this crate.
+postgres = "0.19"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+broca-store = { path = "../broca-store", features = ["test-conformance"] }

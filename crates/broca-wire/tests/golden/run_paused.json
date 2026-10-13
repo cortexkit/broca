@@ -1,0 +1,1 @@
+{"code":"run_paused","message":"run '@RUN_ID@' is paused (auth_required), so this session takes no new message: resend that run's own send_id once the pause is resolved, cancel it, or send with delivery \"interrupt\" to end it and start this message","detail":{"kind":"run_paused","run_id":"@RUN_ID@","reason":"auth_required"}}

@@ -1,0 +1,16 @@
+{"timestamp":"2026-01-01T10:00:00Z","type":"session_meta","payload":{"id":"codex-tools","cwd":"/tmp/scrubbed-project","originator":"Codex CLI","cli_version":"1.0.0","model_provider":"openai","base_instructions":"SYSTEM-PROMPT-MUST-NOT-SURVIVE"}}
+{"timestamp":"2026-01-01T10:00:01Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"SYSTEM-PROMPT-MUST-NOT-SURVIVE"}]}}
+{"timestamp":"2026-01-01T10:00:02Z","type":"turn_context","payload":{"cwd":"/tmp/scrubbed-project","model":"gpt-scrubbed","approval_policy":"never","sandbox_policy":{"type":"read-only"}}}
+{"timestamp":"2026-01-01T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect the scrubbed file."}]}}
+{"timestamp":"2026-01-01T10:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"scrubbed-turn"}}
+{"timestamp":"2026-01-01T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the example."}]}}
+{"timestamp":"2026-01-01T10:00:06Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"SIGNED-REASONING-MUST-NOT-SURVIVE"}],"encrypted_content":"SIGNED-REASONING-MUST-NOT-SURVIVE"}}
+{"timestamp":"2026-01-01T10:00:07Z","type":"response_item","payload":{"type":"function_call","name":"read_scrubbed","arguments":"{\"path\":\"/tmp/example.txt\"}","call_id":"call-scrubbed","thought_signature":"SIGNED-CALL-MUST-NOT-SURVIVE"}}
+{"timestamp":"2026-01-01T10:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-scrubbed","output":"scrubbed output"}}
+{"timestamp":"2026-01-01T10:00:08.500Z","type":"turn_context","payload":{"cwd":"/tmp/scrubbed-project","model":"gpt-scrubbed-next","approval_policy":"never","sandbox_policy":{"type":"read-only"}}}
+{"timestamp":"2026-01-01T10:00:09Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The scrubbed file is ready."}]}}
+{"timestamp":"2026-01-01T10:00:10Z","type":"compacted","payload":{"message":"scrubbed compaction","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Older compacted history."}]},{"type":"compaction","encrypted_content":"opaque"}]}}
+{"timestamp":"2026-01-01T10:00:11Z","type":"world_state","payload":{"state":{},"full":true}}
+{"timestamp":"2026-01-01T10:00:12Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":"scrubbed-turn"}}
+{"timestamp":"2026-01-01T10:00:13Z","type":"response_item","payload":{"type":"custom_tool_call","name":"unsupported_custom","input":"scrubbed","call_id":"custom-call","status":"completed"}}
+{"timestamp":"2026-01-01T10:00:14Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-call","output":[{"type":"input_text","text":"unsupported output"}]}}

@@ -1,0 +1,1089 @@
+//! WAL-authoritative retention decisions and lease-scoped deletion.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use broca_core::{Clock, FileWalStore, LeaseHandle, LeaseStore, RunIndexRow, WalStore};
+use broca_protocol::BindIdentity;
+use broca_store::retention::{RetentionLineageRow, RetentionRunRow, RunRetention};
+use broca_store::SqliteStore;
+use broca_wal::{FramedRecord, WalRecord};
+use serde::{Deserialize, Serialize};
+
+pub const MAX_RETENTION_SECONDS: u64 = 2_592_000;
+pub const SWEEP_INTERVAL_MS: u64 = 300_000;
+
+/// Backends store expiry deadlines and run accounting without transcript content.
+pub trait RetentionIndex: Send + Sync {
+    fn runs(&self, _lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
+        Err("retention index cannot read run accounting".into())
+    }
+    fn live(&self, session: &BindIdentity) -> Result<Option<RetentionLineageRow>, String>;
+    fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String>;
+    fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String>;
+    fn run(&self, id: &str) -> Result<Option<RunRetention>, String>;
+    fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String>;
+    fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
+        Ok(Vec::new())
+    }
+    fn expire_with_withdrawals(
+        &self,
+        row: &RetentionLineageRow,
+        runs: &[RetentionRunRow],
+        questions: &[broca_store::retention_withdrawals::RetentionWithdrawal],
+    ) -> Result<(), String> {
+        if !questions.is_empty() {
+            return Err("retention index cannot persist content-free withdrawals".into());
+        }
+        self.upsert(row, runs)
+    }
+    fn pending_withdrawals(
+        &self,
+    ) -> Result<Vec<broca_store::retention_withdrawals::RetentionWithdrawal>, String> {
+        Err("retention index cannot read content-free withdrawals".into())
+    }
+    fn settle_withdrawal(&self, _lineage: &str, _key: &str) -> Result<bool, String> {
+        Err("retention index cannot settle content-free withdrawals".into())
+    }
+    fn discovery_lineages(&self) -> Result<Vec<BindIdentity>, String> {
+        Ok(Vec::new())
+    }
+}
+
+impl RetentionIndex for SqliteStore {
+    fn runs(&self, lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
+        self.retention_run_rows(lineage)
+    }
+    fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
+        SqliteStore::retained_sessions(self).map_err(|e| e.to_string())
+    }
+    fn expire_with_withdrawals(
+        &self,
+        row: &RetentionLineageRow,
+        runs: &[RetentionRunRow],
+        questions: &[broca_store::retention_withdrawals::RetentionWithdrawal],
+    ) -> Result<(), String> {
+        self.upsert_retention_lineage_with_withdrawals(row, runs, questions)
+            .map_err(|e| e.to_string())
+    }
+    fn pending_withdrawals(
+        &self,
+    ) -> Result<Vec<broca_store::retention_withdrawals::RetentionWithdrawal>, String> {
+        self.pending_retention_withdrawals()
+            .map_err(|e| e.to_string())
+    }
+    fn settle_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
+        self.settle_retention_withdrawal(lineage, key)
+            .map_err(|e| e.to_string())
+    }
+    fn discovery_lineages(&self) -> Result<Vec<BindIdentity>, String> {
+        self.retention_lineages_with_discovery()
+            .map_err(|e| e.to_string())
+    }
+    fn live(&self, session: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+        self.lookup_live_retention_lineage(session)
+            .map_err(|e| e.to_string())
+    }
+    fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+        self.lookup_retention_lineage(id).map_err(|e| e.to_string())
+    }
+    fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String> {
+        self.retention_candidates(now_ms).map_err(|e| e.to_string())
+    }
+    fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+        self.lookup_run_retention(id).map_err(|e| e.to_string())
+    }
+    fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String> {
+        self.upsert_retention_lineage(row, runs)
+            .map_err(|e| e.to_string())
+    }
+}
+
+pub use cortexkit_role_llm_runner::errors::RetentionInvalidDetail as InvalidRetention;
+pub use cortexkit_role_llm_runner::errors::{ExpiredDetail, EXPIRED};
+
+pub fn validate_retention(
+    requested: Option<u64>,
+    current: Option<u64>,
+    exists: bool,
+) -> Result<Option<u64>, InvalidRetention> {
+    let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
+    request.retention = requested;
+    let limits =
+        cortexkit_role_llm_runner::describe::Retention::new(MAX_RETENTION_SECONDS, 3_600_000);
+    request.check_retention(Some(&limits), exists.then_some(current))?;
+    Ok(requested.filter(|seconds| current != Some(*seconds)))
+}
+
+/// Only sends and lifecycle records advance the retention clock. Holding a pending queue,
+/// subscription or warm open cannot prevent expiry; paused and active episodes have no deadline.
+pub fn policy(records: &[FramedRecord]) -> Option<(u64, u64, Option<u64>)> {
+    if !broca_core::is_retention_lineage(records) {
+        return None;
+    }
+    let mut seconds = 0;
+    let mut activity = 0;
+    let mut nonterminal = false;
+    for frame in records {
+        match &frame.record {
+            WalRecord::RunStarted {
+                retention, ts_ms, ..
+            } => {
+                if let Some(value) = retention {
+                    seconds = *value;
+                }
+                activity = ts_ms.unwrap_or(activity);
+                nonterminal = true;
+            }
+            WalRecord::Queued {
+                retention, ts_ms, ..
+            }
+            | WalRecord::Steered {
+                retention, ts_ms, ..
+            } => {
+                if let Some(value) = retention {
+                    seconds = *value;
+                }
+                if let Some(time) = ts_ms {
+                    activity = *time;
+                }
+            }
+            WalRecord::RunFinished { ts_ms, .. } => {
+                activity = ts_ms.unwrap_or(activity);
+                nonterminal = false;
+            }
+            WalRecord::RunPaused { ts_ms, .. } => {
+                activity = ts_ms.unwrap_or(activity);
+                nonterminal = true;
+            }
+            _ => {}
+        }
+    }
+    let deadline = (!nonterminal).then_some(activity.saturating_add(seconds.saturating_mul(1000)));
+    Some((seconds, activity, deadline))
+}
+
+fn derive(
+    session: &BindIdentity,
+    lineage: String,
+    records: &[FramedRecord],
+    wal_bytes: u64,
+    expired_at_ms: Option<u64>,
+) -> Option<(RetentionLineageRow, Vec<RetentionRunRow>)> {
+    let (retention_s, last_activity_ms, expires_at_ms) = policy(records)?;
+    let withdrawals = broca_core::projection_plan::retained_withdrawal_projection(
+        None,
+        records,
+        Some(&lineage),
+        None,
+    )
+    .ok()?;
+    let raw: Vec<_> = records.iter().map(|frame| frame.record.clone()).collect();
+    let mut runs = BTreeMap::new();
+    for frame in records {
+        if let WalRecord::Retracted {
+            submission_id,
+            failure: Some(failure),
+        } = &frame.record
+        {
+            let digest = records.iter().find_map(|frame| match &frame.record {
+                WalRecord::Queued {
+                    submission_id: id,
+                    request_identity_digest,
+                    ..
+                } if id == submission_id => request_identity_digest.clone(),
+                _ => None,
+            });
+            runs.insert(
+                failure.run_id.0.clone(),
+                RetentionRunRow {
+                    run: RunIndexRow {
+                        run_id: failure.run_id.0.clone(),
+                        session: session.clone(),
+                        submission_id: Some(submission_id.0.clone()),
+                        request_identity_digest: digest,
+                        state: broca_core::RunIndexState::Error,
+                        usage: None,
+                        final_step_finish_reason: None,
+                        retries_used: 0,
+                        title: None,
+                        withdrawals_owed: false,
+                    },
+                    state_changed_ms: None,
+                },
+            );
+        }
+        if let WalRecord::RunStarted {
+            run_id,
+            submission_id,
+            request_identity_digest,
+            ..
+        } = &frame.record
+        {
+            let state = broca_core::reconcile_run_state(&raw, &run_id.0)?;
+            let episode = records
+                .iter()
+                .skip_while(|f| f.seq < frame.seq)
+                .skip(1)
+                .take_while(|f| !matches!(f.record, WalRecord::RunStarted { .. }));
+            let state_changed_ms = episode
+                .filter_map(|f| match &f.record {
+                    WalRecord::RunFinished { ts_ms, .. } | WalRecord::RunPaused { ts_ms, .. } => {
+                        *ts_ms
+                    }
+                    _ => None,
+                })
+                .last()
+                .or(match &frame.record {
+                    WalRecord::RunStarted { ts_ms, .. } => *ts_ms,
+                    _ => None,
+                });
+            runs.insert(
+                run_id.0.clone(),
+                RetentionRunRow {
+                    run: RunIndexRow {
+                        run_id: run_id.0.clone(),
+                        session: session.clone(),
+                        submission_id: submission_id.as_ref().map(|id| id.0.clone()),
+                        request_identity_digest: request_identity_digest.clone(),
+                        state: state.state,
+                        usage: state.usage,
+                        final_step_finish_reason: state.final_step_finish_reason,
+                        retries_used: state.retries_used,
+                        title: None,
+                        withdrawals_owed: expired_at_ms.is_none()
+                            && withdrawals.as_ref().is_some_and(|metadata| {
+                                metadata.withdrawals_owed_runs.contains(&run_id.0)
+                            }),
+                    },
+                    state_changed_ms,
+                },
+            );
+        }
+    }
+    Some((
+        RetentionLineageRow {
+            lineage_id: lineage,
+            session: session.clone(),
+            retention_s,
+            last_activity_ms,
+            expires_at_ms: if expired_at_ms.is_some() {
+                None
+            } else {
+                expires_at_ms
+            },
+            wal_bytes,
+            expired_at_ms,
+        },
+        runs.into_values().collect(),
+    ))
+}
+
+/// Content-free durable deletion progress. The parent directory identifies the address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub lineage_id: String,
+    pub expired_at_ms: u64,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+/// Each failed write increments the address's repair generation so an older repair cannot
+/// remove a newer failure, even when the address was already awaiting repair.
+#[derive(Default)]
+pub(crate) struct Repairs(Mutex<HashMap<BindIdentity, u64>>);
+impl Repairs {
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+    pub(crate) fn insert(&self, key: &BindIdentity) {
+        let mut entries = self.0.lock().unwrap();
+        let gen = entries.entry(key.clone()).or_default();
+        *gen = gen.checked_add(1).expect("repair generation exhausted");
+    }
+    pub(crate) fn snapshot(&self) -> Vec<(BindIdentity, u64)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+    pub(crate) fn remove_if_unchanged(&self, key: &BindIdentity, generation: u64) {
+        let mut entries = self.0.lock().unwrap();
+        if entries.get(key) == Some(&generation) {
+            entries.remove(key);
+        }
+    }
+}
+
+type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;
+
+type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String> + Send + Sync;
+
+/// Shared by actors and the registry. All mutating methods require the caller's session lease.
+pub struct RetentionService {
+    pub(crate) withdrawal_adapter:
+        std::sync::OnceLock<Arc<dyn crate::retention_withdrawals::RetentionWithdrawalAdapter>>,
+    pub(crate) withdrawal_wake: tokio::sync::Notify,
+    unreadable: Mutex<std::collections::HashSet<String>>,
+    pub wal: Arc<FileWalStore>,
+    pub index: Arc<dyn RetentionIndex>,
+    pub clock: Clock,
+    evict: std::sync::OnceLock<Arc<EvictCaches>>,
+    acquire: Arc<AcquireLease>,
+    export: Arc<dyn broca_core::ExportIndex>,
+    resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
+}
+
+impl RetentionService {
+    pub fn new<L: LeaseStore + 'static>(
+        wal: Arc<FileWalStore>,
+        index: Arc<dyn RetentionIndex>,
+        leases: Arc<L>,
+        export: Arc<dyn broca_core::ExportIndex>,
+        resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
+    ) -> io::Result<Self> {
+        let clock = Clock::for_state_root(wal.ephemeral_root().parent().unwrap_or(Path::new("")))?;
+        Ok(Self {
+            withdrawal_adapter: std::sync::OnceLock::new(),
+            withdrawal_wake: tokio::sync::Notify::new(),
+            evict: std::sync::OnceLock::new(),
+            unreadable: Mutex::new(std::collections::HashSet::new()),
+            wal,
+            index,
+            clock,
+            export,
+            resolver,
+            acquire: Arc::new(move |session| {
+                leases
+                    .acquire(&broca_core::lease_key_for(session))
+                    .map_err(|e| e.to_string())
+            }),
+        })
+    }
+
+    pub(crate) fn set_evictor(&self, evict: Arc<EvictCaches>) {
+        let _ = self.evict.set(evict);
+    }
+
+    pub(crate) fn lease(&self, key: &BindIdentity) -> Result<Box<dyn LeaseHandle>, String> {
+        (self.acquire)(key)
+    }
+
+    fn tombstones(&self, key: &BindIdentity) -> Result<Vec<Tombstone>, String> {
+        let dir = self.wal.tombstone_path(key, "");
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut stones = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.is_file() && path.extension().is_none() {
+                let stone: Tombstone =
+                    serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                if path.file_name().and_then(|s| s.to_str()) != Some(&stone.lineage_id) {
+                    return Err("tombstone identity mismatch".into());
+                }
+                stones.push(stone);
+            }
+        }
+        Ok(stones)
+    }
+
+    fn write_tombstone(&self, key: &BindIdentity, stone: &Tombstone) -> Result<(), String> {
+        let path = self.wal.tombstone_path(key, &stone.lineage_id);
+        let parent = path.parent().expect("tombstone parent");
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let temp = path.with_extension("tmp");
+        let mut file = File::create(&temp).map_err(|e| e.to_string())?;
+        file.write_all(&serde_json::to_vec(stone).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(temp, &path).map_err(|e| e.to_string())?;
+        sync_dir(parent)?;
+        sync_dir(parent.parent().expect("ephemeral root"))
+    }
+
+    fn read_path(&self, path: &Path) -> Result<broca_wal::WalRangeRead, String> {
+        broca_wal::read_records_range(path, self.wal.max_read_bytes(), 0, None, None)
+            .map_err(|e| e.to_string())
+    }
+
+    fn initial_lineage(&self, path: &Path) -> Result<String, String> {
+        let mut bytes = [0; broca_wal::framing::LINEAGE_FRAME_LEN];
+        File::open(path)
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(|e| e.to_string())?;
+        match broca_wal::framing::decode_next(&bytes) {
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => {
+                Ok(lineage_id.to_string())
+            }
+            _ => Err("retention WAL has no verified initial identity".into()),
+        }
+    }
+
+    pub fn unreadable_sessions(&self) -> usize {
+        self.unreadable.lock().unwrap().len()
+    }
+
+    fn current_indexed(
+        &self,
+        key: &BindIdentity,
+        path: &Path,
+        id: Option<&str>,
+    ) -> Result<RetentionLineageRow, String> {
+        let row = match id {
+            Some(id) => self.index.lineage(id)?,
+            None => self.index.live(key)?,
+        }
+        .ok_or("unreadable WAL has no retention row")?;
+        // Corruption after records that the index has not yet copied can prevent deletion
+        // within one hour after the session expires. An indexed deadline from before a new
+        // active run would delete it too early, so unreadable logs require matching length and identity.
+        if row.session != *key
+            || row.wal_bytes != fs::metadata(path).map_err(|e| e.to_string())?.len()
+            || row.lineage_id != self.initial_lineage(path)?
+        {
+            return Err("unreadable WAL has no current retention projection".into());
+        }
+        Ok(row)
+    }
+
+    fn mark_unreadable(&self, key: &BindIdentity) {
+        self.mark_unreadable_address(broca_core::session_addr(key));
+    }
+
+    fn mark_unreadable_address(&self, address: String) {
+        if self.unreadable.lock().unwrap().insert(address.clone()) {
+            tracing::error!(target: "retention", session = %address,
+                "retention deletion blocked by unreadable WAL with no current projection");
+        }
+    }
+
+    fn withdrawal_export(
+        &self,
+        key: &BindIdentity,
+        read: &broca_wal::WalRangeRead,
+    ) -> Result<Vec<broca_store::retention_withdrawals::RetentionWithdrawal>, String> {
+        use broca_store::retention_withdrawals::{
+            RetentionQuestionId, RetentionScopeIdentity, RetentionWithdrawal,
+        };
+        let broca_wal::WalRangeRecords::Complete(records) = read.records() else {
+            return Err("retention export requires complete durable records".into());
+        };
+        let projection = crate::approval::projection_from_frames(read.lineage_id, records)?;
+        let mut rows = Vec::new();
+        for owed in projection.obligations().withdrawals {
+            let WalRecord::ToolCallDeferred { scope, ask, .. } = &owed.prepared.record else {
+                continue;
+            };
+            rows.push(RetentionWithdrawal {
+                lineage_id: projection.lineage_id.clone(),
+                session: key.clone(),
+                call_key: owed.withdrawal.call_key,
+                scope: RetentionScopeIdentity::from_scope(scope),
+                question: owed
+                    .withdrawal
+                    .elicitation_id
+                    .map_or(RetentionQuestionId::Unknown, RetentionQuestionId::Known),
+                provider_id: "prefrontal-core".into(),
+                provider_incarnation: None,
+                expires_at_ms: ask.expires_at_ms,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn deleting(&self, key: &BindIdentity, id: &str) -> PathBuf {
+        self.wal
+            .ephemeral_root()
+            .join(format!("{}.{id}.deleting", broca_core::session_addr(key)))
+    }
+
+    /// The row is a candidate hint only. Every read checks the actual WAL and the tombstone for that WAL's lineage.
+    pub fn expired(&self, key: &BindIdentity, run: Option<&str>) -> Result<Option<u64>, String> {
+        self.expired_head(key, run, None)
+    }
+
+    pub(crate) fn expired_head(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+        head: Option<u64>,
+    ) -> Result<Option<u64>, String> {
+        if let Some(run) = run {
+            if let Some(meta) = self.index.run(run)? {
+                if meta.expired_at_ms.is_some() {
+                    return Ok(meta.expired_at_ms);
+                }
+                if let Some(id) = meta.lineage_id {
+                    if let Some(stone) = self
+                        .tombstones(key)?
+                        .into_iter()
+                        .find(|s| s.lineage_id == id)
+                    {
+                        return Ok(Some(stone.expired_at_ms));
+                    }
+                }
+            }
+        }
+        if head.is_none() {
+            self.wal.flush_for_read(key).map_err(|e| e.to_string())?;
+        }
+        let read = self
+            .wal
+            .read_records_range(key, 0, head, None)
+            .map_err(|e| e.to_string())?;
+        let stones = self.tombstones(key)?;
+        if matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)) {
+            if let Some(stone) = stones.iter().find(|s| {
+                Some(s.lineage_id.as_str())
+                    == read.lineage_id.as_ref().map(|id| id.to_string()).as_deref()
+            }) {
+                return Ok(Some(stone.expired_at_ms));
+            }
+            if run.is_some_and(|id| {
+                !frames(&read).iter().any(
+                    |f| matches!(&f.record, WalRecord::RunStarted { run_id, .. } if run_id.0 == id),
+                )
+            }) {
+                return Ok(None);
+            }
+            return Ok(policy(frames(&read))
+                .and_then(|(_, _, deadline)| deadline)
+                .filter(|deadline| *deadline <= self.clock.now_ms()));
+        }
+        if run.is_some() {
+            return Ok(None);
+        }
+        if self
+            .wal
+            .lineage_exists(key, None)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(None);
+        }
+        Ok(stones
+            .into_iter()
+            .max_by_key(|stone| stone.seq)
+            .map(|stone| stone.expired_at_ms))
+    }
+
+    pub(crate) fn rederive(&self, key: &BindIdentity) -> Result<(), String> {
+        self.rederive_head(key, None)
+    }
+
+    /// Discovery can be stale even when the WAL byte length did not change. Re-read its
+    /// durable facts periodically, under the lease, instead of waiting for new traffic.
+    pub(crate) fn repair_discovery_flags(&self) -> Result<(), String> {
+        for key in self.index.discovery_lineages()? {
+            let Ok(_lease) = self.lease(&key) else {
+                continue;
+            };
+            if let Err(error) = self.rederive(&key) {
+                let path = self
+                    .wal
+                    .resolve_live_path(&key)
+                    .map_err(|e| e.to_string())?;
+                if let Some(path) = path.filter(|path| self.read_path(path).is_err()) {
+                    if self.current_indexed(&key, &path, None).is_err() {
+                        self.mark_unreadable(&key);
+                    }
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rederive_head(
+        &self,
+        key: &BindIdentity,
+        head: Option<u64>,
+    ) -> Result<(), String> {
+        let path = self.wal.resolve_live_path(key).map_err(|e| e.to_string())?;
+        let Some(path) = path else { return Ok(()) };
+        let read =
+            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, head, None)
+                .map_err(|e| e.to_string())?;
+        let Some(id) = read.lineage_id else {
+            return Err("retention WAL has no identity".into());
+        };
+        let bytes = match head {
+            Some(seq) => durable_prefix_bytes(&path, seq)?,
+            None => fs::metadata(&path).map_err(|e| e.to_string())?.len(),
+        };
+        if let Some((row, runs)) = derive(key, id.to_string(), frames(&read), bytes, None) {
+            self.remember_session(key)?;
+            self.index.upsert(&row, &runs)?;
+        }
+        Ok(())
+    }
+}
+
+fn sync_dir(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        // Portable directory handles are unavailable on Windows. Match the file WAL's
+        // best-effort directory flush; tombstone file contents are always synced first.
+        if let Ok(file) = File::open(path) {
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl RetentionService {
+    /// At boot and on each sweep, replay a WAL only when its live retention row is missing
+    /// or records a different byte length from the file on disk.
+    pub fn enroll(&self) -> Result<usize, String> {
+        let mut replayed = 0;
+        for path in self.ephemeral_files("wal")? {
+            let portable = self
+                .wal
+                .root()
+                .join(path.file_name().ok_or("retention WAL filename")?);
+            if portable
+                .with_extension("moving")
+                .try_exists()
+                .map_err(|e| e.to_string())?
+                || portable
+                    .with_extension("moved")
+                    .try_exists()
+                    .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
+            // The hashed address is not reversible. New writers leave a content-free identity
+            // sidecar; older WALs without one need replay to discover their session.
+            let (first, discovered) = match self.read_first_session(&path) {
+                Ok(found) => found,
+                Err(_) => {
+                    self.mark_unreadable_address(
+                        path.file_stem()
+                            .ok_or("retention address missing")?
+                            .to_string_lossy()
+                            .into(),
+                    );
+                    continue;
+                }
+            };
+            let Some(key) = first else { continue };
+            if self.wal.check_move(&key, true).is_err() {
+                continue;
+            }
+            let bytes = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+            let matching = self
+                .index
+                .live(&key)?
+                .is_some_and(|row| row.wal_bytes == bytes);
+            if matching && !discovered {
+                continue;
+            }
+            let _lease = match self.lease(&key) {
+                Ok(lease) => lease,
+                Err(_) => {
+                    tracing::warn!(target: "retention", "enrollment lease held; retry on sweep");
+                    continue;
+                }
+            };
+            if discovered {
+                self.remember_session(&key)?;
+            }
+            if !matching {
+                if let Err(error) = self.rederive(&key) {
+                    if self.read_path(&path).is_err() {
+                        self.mark_unreadable(&key);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+            replayed += 1;
+        }
+        Ok(replayed)
+    }
+
+    fn ephemeral_files(&self, extension: &str) -> Result<Vec<PathBuf>, String> {
+        let entries = match fs::read_dir(self.wal.ephemeral_root()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        };
+        entries
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.path().extension().is_some_and(|ext| ext == extension) => {
+                    Some(Ok(entry.path()))
+                }
+                Ok(_) => None,
+                Err(e) => Some(Err(e.to_string())),
+            })
+            .collect()
+    }
+
+    fn read_first_session(&self, path: &Path) -> Result<(Option<BindIdentity>, bool), String> {
+        // A bounded range still validates the log, so discovery is cached in a content-free
+        // sidecar. Once written, boot enrollment needs only a stat and indexed row lookup.
+        let sidecar = path.with_extension("session");
+        if let Ok(bytes) = fs::read(&sidecar) {
+            if let Ok(session) = serde_json::from_slice::<BindIdentity>(&bytes) {
+                if path.file_stem().and_then(|stem| stem.to_str())
+                    == Some(broca_core::session_addr(&session).as_str())
+                {
+                    return Ok((Some(session), false));
+                }
+            }
+        }
+        let read = self.read_path(path)?;
+        Ok((
+            frames(&read).iter().find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { session, .. } => Some(session.clone()),
+                _ => None,
+            }),
+            true,
+        ))
+    }
+
+    pub(crate) fn remember_session(&self, key: &BindIdentity) -> Result<(), String> {
+        let path = self.wal.ephemeral_wal_path(key).with_extension("session");
+        let temp = path.with_extension("session.tmp");
+        let mut file = File::create(&temp).map_err(|e| e.to_string())?;
+        file.write_all(&serde_json::to_vec(key).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(temp, &path).map_err(|e| e.to_string())?;
+        sync_dir(path.parent().expect("ephemeral root"))
+    }
+
+    /// Confirm expiry from the WAL and export terminal runs before writing the tombstone.
+    /// The caller holds the session lease throughout.
+    pub(crate) fn delete_expired(
+        &self,
+        key: &BindIdentity,
+        now_ms: u64,
+    ) -> Result<Option<String>, String> {
+        self.wal.check_move(key, true).map_err(|e| e.to_string())?;
+        for stone in self
+            .tombstones(key)?
+            .into_iter()
+            .filter(|s| s.completed_at_ms.is_none())
+        {
+            self.complete(key, stone, now_ms)?;
+        }
+        let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let read = self.read_path(&path);
+        let (id, deadline) = match &read {
+            Ok(read) => {
+                let Some((_, _, Some(deadline))) = policy(frames(read)) else {
+                    self.rederive(key)?;
+                    return Ok(None);
+                };
+                if deadline > now_ms {
+                    self.rederive(key)?;
+                    tracing::info!(target: "retention", "WAL confirmation skipped unexpired candidate");
+                    return Ok(None);
+                }
+                (
+                    read.lineage_id
+                        .ok_or("retention WAL has no identity")?
+                        .to_string(),
+                    deadline,
+                )
+            }
+            Err(_) => {
+                let row = match self.current_indexed(key, &path, None) {
+                    Ok(row) => row,
+                    Err(_) => {
+                        self.mark_unreadable(key);
+                        return Ok(None);
+                    }
+                };
+                let Some(deadline) = row.expires_at_ms.filter(|deadline| *deadline <= now_ms)
+                else {
+                    return Ok(None);
+                };
+                (row.lineage_id, deadline)
+            }
+        };
+        self.unreadable
+            .lock()
+            .unwrap()
+            .remove(&broca_core::session_addr(key));
+        let mut failed_exports = Vec::new();
+        if let Ok(read) = &read {
+            let raw: Vec<_> = frames(read).iter().map(|f| f.record.clone()).collect();
+            for frame in frames(read) {
+                if let WalRecord::RunStarted { run_id, .. } = &frame.record {
+                    if broca_core::reconcile_run_state(&raw, &run_id.0)
+                        .is_some_and(|state| state.state.is_terminal())
+                        && self
+                            .export
+                            .emit_run(frames(read), run_id, self.resolver.as_ref())
+                            .is_err()
+                    {
+                        failed_exports.push(run_id.0.clone());
+                    }
+                }
+            }
+        } else {
+            failed_exports = self
+                .export
+                .missing_terminal_runs()
+                .map(|runs| {
+                    runs.into_iter()
+                        .filter(|run| run.session == *key)
+                        .map(|run| run.run_id.0)
+                        .collect()
+                })
+                .unwrap_or(
+                    self.index
+                        .runs(&id)?
+                        .into_iter()
+                        .map(|run| run.run.run_id)
+                        .collect(),
+                );
+        }
+        if !failed_exports.is_empty() {
+            // Retry billing facts normally emitted at run completion, but delete expired
+            // conversation content even if that retry fails. Do not log content-bearing causes.
+            tracing::warn!(target: "retention", session = %broca_core::session_addr(key), runs = ?failed_exports,
+                "retention billing catch-up failed; deleting content anyway");
+        }
+        let seq = self
+            .tombstones(key)?
+            .into_iter()
+            .map(|s| s.seq)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("tombstone sequence exhausted")?;
+        let stone = Tombstone {
+            lineage_id: id.clone(),
+            expired_at_ms: deadline,
+            seq,
+            completed_at_ms: None,
+        };
+        self.remember_session(key)?;
+        self.write_tombstone(key, &stone)?;
+        self.complete(key, stone, now_ms)?;
+        Ok(Some(id))
+    }
+
+    /// Recovery infers progress from disk and never moves a different lineage's live WAL.
+    fn complete(
+        &self,
+        key: &BindIdentity,
+        mut stone: Tombstone,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.wal.check_move(key, true).map_err(|e| e.to_string())?;
+        let moved = self.deleting(key, &stone.lineage_id);
+        if let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? {
+            let identity = match self.read_path(&path) {
+                Ok(read) => read.lineage_id.map(|id| id.to_string()),
+                Err(_) => Some(self.initial_lineage(&path)?),
+            };
+            if identity.as_deref() == Some(stone.lineage_id.as_str()) {
+                fs::rename(path, &moved).map_err(|e| e.to_string())?;
+                sync_dir(&self.wal.ephemeral_root())?;
+            }
+        }
+        if moved.exists() {
+            let read = self.read_path(&moved);
+            let identity = match &read {
+                Ok(read) => read.lineage_id.map(|id| id.to_string()),
+                Err(_) => Some(self.initial_lineage(&moved)?),
+            };
+            if identity.as_deref() != Some(stone.lineage_id.as_str()) {
+                return Err("deleting WAL identity mismatch".into());
+            }
+            let bytes = fs::metadata(&moved).map_err(|e| e.to_string())?.len();
+            let (row, runs) = match &read {
+                Ok(read) => derive(
+                    key,
+                    stone.lineage_id.clone(),
+                    frames(read),
+                    bytes,
+                    Some(stone.expired_at_ms),
+                )
+                .ok_or("deleting WAL has no retention")?,
+                Err(_) => {
+                    let mut row = self.current_indexed(key, &moved, Some(&stone.lineage_id))?;
+                    row.expired_at_ms = Some(stone.expired_at_ms);
+                    row.expires_at_ms = None;
+                    let mut runs = self.index.runs(&stone.lineage_id)?;
+                    if runs.iter().any(|run| !run.run.state.is_terminal()) {
+                        return Err("current retention projection is not terminal".into());
+                    }
+                    for run in &mut runs {
+                        run.run.withdrawals_owed = false;
+                        run.run.title = None;
+                    }
+                    (row, runs)
+                }
+            };
+            // The approval index only records which lineage and runs may owe withdrawals;
+            // it stores no scope or question identities before expiry. Recover those identities
+            // from the WAL when possible. If corruption prevents recovery, drop the withdrawal
+            // obligations: prefrontal-core expires the questions on their own deadlines.
+            let questions = match read
+                .as_ref()
+                .map_err(|_| ())
+                .and_then(|read| self.withdrawal_export(key, read).map_err(|_| ()))
+            {
+                Ok(questions) => questions,
+                Err(()) => {
+                    tracing::warn!(target: "retention", session = %broca_core::session_addr(key),
+                        "retention withdrawal identities unavailable; dropping obligations");
+                    Vec::new()
+                }
+            };
+            self.index
+                .expire_with_withdrawals(&row, &runs, &questions)?;
+            self.withdrawal_wake.notify_one();
+            fs::remove_file(&moved).map_err(|e| e.to_string())?;
+            sync_dir(&self.wal.ephemeral_root())?;
+        } else {
+            // Once the WAL is deleted, the transaction committed before deletion is the
+            // remaining proof of the lineage's expiry and each run's terminal state.
+            let row = self
+                .index
+                .lineage(&stone.lineage_id)?
+                .ok_or("deleted WAL has no committed retention row")?;
+            if row.expired_at_ms != Some(stone.expired_at_ms) {
+                return Err("deleted WAL has no committed expiry".into());
+            }
+            self.index.upsert(&row, &[])?;
+        }
+        if let Some(evict) = self.evict.get() {
+            evict(key);
+        }
+        if self
+            .wal
+            .resolve_live_path(key)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            let session = self.wal.ephemeral_wal_path(key).with_extension("session");
+            for side in [session.clone(), session.with_extension("session.tmp")] {
+                match fs::remove_file(side) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            sync_dir(&self.wal.ephemeral_root())?;
+        }
+        // Completion is durable only after identity sidecars are removed and the directory is synced.
+        // A crash or removal failure before this point leaves an incomplete tombstone to retry.
+        stone.completed_at_ms = Some(now_ms);
+        self.write_tombstone(key, &stone)?;
+        Ok(())
+    }
+
+    /// Finish incomplete tombstones before accepting requests. Addresses whose leases
+    /// another process holds are retried by the sweep.
+    pub fn resume_deletions(&self, now_ms: u64) -> Result<Vec<BindIdentity>, String> {
+        let mut completed = Vec::new();
+        for key in self.known_sessions()? {
+            let stones = self.tombstones(&key)?;
+            if stones.iter().all(|s| s.completed_at_ms.is_some()) {
+                continue;
+            }
+            let _lease = match self.lease(&key) {
+                Ok(lease) => lease,
+                Err(_) => {
+                    tracing::warn!(target: "retention", "deletion recovery lease held");
+                    continue;
+                }
+            };
+            for stone in stones.into_iter().filter(|s| s.completed_at_ms.is_none()) {
+                self.complete(&key, stone, now_ms)?;
+            }
+            completed.push(key);
+        }
+        Ok(completed)
+    }
+
+    fn known_sessions(&self) -> Result<Vec<BindIdentity>, String> {
+        let mut sessions = self
+            .ephemeral_files("session")?
+            .into_iter()
+            .map(|path| {
+                serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<std::collections::HashSet<BindIdentity>, String>>()?;
+        // After deletion there is no session sidecar. Durable identity-only rows still
+        // discover an interrupted tombstone completion without needing any transcript.
+        sessions.extend(self.index.retained_sessions()?);
+        Ok(sessions.into_iter().collect())
+    }
+}
+
+fn frames(read: &broca_wal::WalRangeRead) -> &[FramedRecord] {
+    match read.records() {
+        broca_wal::WalRangeRecords::Complete(records)
+        | broca_wal::WalRangeRecords::Partial(records)
+        | broca_wal::WalRangeRecords::Unknown(records) => records,
+        broca_wal::WalRangeRecords::Absent => &[],
+    }
+}
+
+#[cfg(test)]
+#[path = "retention_tests.rs"]
+mod tests;
+
+/// Count file bytes through the actor's highest fsynced sequence, including the lineage-ID
+/// metadata between records but excluding later records appended by a concurrent run.
+/// Replay offsets locate record starts, not the full durable prefix, so they cannot prove
+/// which file length the retention row describes.
+fn durable_prefix_bytes(path: &Path, head: u64) -> Result<u64, String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(broca_wal::DEFAULT_MAX_READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > broca_wal::DEFAULT_MAX_READ_BYTES {
+        return Err("retention WAL exceeds read limit".into());
+    }
+    let mut offset = 0;
+    let mut found = head == 0;
+    while offset < bytes.len() {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                if framed.seq > head {
+                    return Ok(offset as u64);
+                }
+                offset += consumed;
+                found |= framed.seq == head;
+            }
+            _ if found => return Ok(offset as u64),
+            _ => return Err("retention durable prefix cannot be decoded".into()),
+        }
+    }
+    if found {
+        Ok(offset as u64)
+    } else {
+        Err("retention durable head is absent".into())
+    }
+}

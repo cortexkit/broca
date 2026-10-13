@@ -1,0 +1,1 @@
+{"code":"warm_unsupported","message":"this session cannot be warmed: bedrock converse has no documented zero-output request","detail":{"kind":"warm_unsupported","reason":"bedrock converse has no documented zero-output request"}}

@@ -1,0 +1,1 @@
+{"code":"scope_freeze_busy","message":"this send would freeze its scope on the session, but run 'run-sid-abc' is active; retry when the session is idle","detail":{"kind":"run_active","run_id":"run-sid-abc"}}

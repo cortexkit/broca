@@ -1,0 +1,25 @@
+{
+  "plan": "plans/broca-head.json",
+  "composition": "compositions/broca-head.json",
+  "fetches": [
+    {
+      "provider": "aft",
+      "reason": "timeout"
+    }
+  ],
+  "expected": {
+    "admitted": false,
+    "code": "fetch_unavailable",
+    "detail": {
+      "provider": "aft",
+      "reason": "timeout"
+    },
+    "writes": "nothing",
+    "class": "transient"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "first_send": "sends/broca-head-first-send.json",
+  "later_plan": "plans/broca-head.json",
+  "expected": {
+    "admitted": true,
+    "no_op": true
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false
+  }
+}

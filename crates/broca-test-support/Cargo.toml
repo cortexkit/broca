@@ -1,0 +1,21 @@
+[package]
+name = "broca-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Test-only helpers for the broca workspace: one owned, self-reclaiming scratch root for test temp paths. A dev-dependency only; never a runtime dependency of a shipped binary."
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+broca-owner-only.workspace = true
+
+[dependencies]
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

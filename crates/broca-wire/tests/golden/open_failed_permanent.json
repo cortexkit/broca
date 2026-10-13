@@ -1,0 +1,1 @@
+{"code":"open_failed","message":"open failed: run resolution failed: provider 'ollama-cloud' with wire family OpenAiChat does not support broca cache preferences","detail":{"class":"permanent"}}

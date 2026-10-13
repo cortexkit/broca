@@ -1,0 +1,155 @@
+{
+  "plan_inline": {
+    "tool_items": [
+      {
+        "provider": "aft",
+        "preset": "head",
+        "params": {
+          "behavior": "interactive",
+          "scope": "all",
+          "tool_descs": "full",
+          "host": "broca"
+        }
+      },
+      {
+        "provider": "magic-context",
+        "preset": "head",
+        "params": {}
+      },
+      {
+        "provider": "prefrontal-core",
+        "preset": "head",
+        "params": {
+          "exclude": [
+            "web_search"
+          ]
+        }
+      },
+      {
+        "provider": "aft",
+        "preset": "head",
+        "params": {
+          "behavior": "interactive",
+          "scope": "all",
+          "tool_descs": "full",
+          "host": "broca"
+        }
+      }
+    ],
+    "system_text_items": [
+      {
+        "provider": "prefrontal-core",
+        "preset": "head",
+        "params": {
+          "model": {
+            "provider": "anthropic",
+            "id": "claude-opus-5",
+            "variant": "max"
+          }
+        }
+      },
+      {
+        "provider": "aft",
+        "preset": "head",
+        "params": {}
+      },
+      {
+        "provider": "magic-context",
+        "preset": "head",
+        "params": {}
+      }
+    ],
+    "step_transform_items": [],
+    "composition": {
+      "providers": [
+        {
+          "provider": "aft",
+          "tools": [
+            {
+              "name": "bash",
+              "capabilities": [
+                "shell.exec/v1"
+              ]
+            },
+            {
+              "name": "bash_status",
+              "capabilities": [
+                "shell.exec/v1"
+              ]
+            },
+            {
+              "name": "edit",
+              "capabilities": [
+                "code.edit/v1"
+              ]
+            },
+            {
+              "name": "read",
+              "capabilities": [
+                "code.read/v1"
+              ]
+            }
+          ]
+        },
+        {
+          "provider": "magic-context",
+          "tools": [
+            {
+              "name": "ctx_memory",
+              "capabilities": [
+                "magic-context:memory.write/v1"
+              ]
+            },
+            {
+              "name": "ctx_note",
+              "capabilities": [
+                "magic-context:notes/v1"
+              ]
+            },
+            {
+              "name": "ctx_search",
+              "capabilities": [
+                "magic-context:archive.search/v1"
+              ]
+            }
+          ]
+        },
+        {
+          "provider": "prefrontal-core",
+          "tools": [
+            {
+              "name": "browser_use",
+              "capabilities": [
+                "browser.use/v1",
+                "cerebellum:browser.use/v1"
+              ]
+            },
+            {
+              "name": "computer_use",
+              "capabilities": [
+                "cerebellum:computer.use/v1",
+                "computer.use/v1"
+              ]
+            }
+          ]
+        }
+      ],
+      "step_transform_items": []
+    },
+    "composition_digest": "e5d6c646c78f48fe16b1e3f3d1ee8a656f7bbd5447ba6b8b02a4837d44c4d3a7"
+  },
+  "composition": "compositions/broca-head.json",
+  "expected": {
+    "admitted": false,
+    "code": "invalid_params",
+    "detail": {
+      "field": "plan.tool_items"
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false
+  }
+}

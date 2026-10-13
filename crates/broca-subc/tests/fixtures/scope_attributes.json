@@ -1,0 +1,6 @@
+{
+  "none": {},
+  "agent-a-delegating": { "agent_id": "agent-a", "delegates": true },
+  "agent-a": { "agent_id": "agent-a" },
+  "agent-b": { "agent_id": "agent-b" }
+}

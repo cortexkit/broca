@@ -1,0 +1,24 @@
+{
+  "family": "gemini",
+  "model": "gemini-2.5-flash",
+  "normalized_events": [
+    "Control(StreamStart { warnings: [] })",
+    "Control(StepStarted { step_id: StepId(1) })",
+    "Display(ToolInputDelta { tool_call_id: ToolCallId(\"call_0\"), delta: \"{\\\"path\\\":\\\"build-status.txt\\\"}\" })",
+    "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"\"), content: [ToolCall(ToolCall { tool_call_id: ToolCallId(\"call_0\"), tool_name: \"read_file\", input: Object {\"path\": String(\"build-status.txt\")}, thought_signature: Some(\"synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-\") })] } })",
+    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(69), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(66), reasoning_tokens: Some(47) }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(Finished { usage: Usage { input_tokens: Some(69), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(66), reasoning_tokens: Some(47) }, finish_reason: Stop, retries_used: 0 })",
+    "Control(StreamStart { warnings: [] })",
+    "Control(StepStarted { step_id: StepId(2) })",
+    "Display(TextDelta { message_id: MessageId(\"\"), tool_call_id: None, delta: \"synthetic-001 \" })",
+    "Display(TextDelta { message_id: MessageId(\"\"), tool_call_id: None, delta: \"synthetic-002 \" })",
+    "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"\"), content: [Text { text: \"synthetic-001 synthetic-002 \" }] } })",
+    "Control(StepFinished { step_id: StepId(2), usage: Usage { input_tokens: Some(156), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(7), reasoning_tokens: None }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(Finished { usage: Usage { input_tokens: Some(156), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(7), reasoning_tokens: None }, finish_reason: Stop, retries_used: 0 })"
+  ],
+  "note": "Synthetic response bytes and normalized events; preserves the original event order, field structure, usage shapes and chunk boundaries. No request or credentials.",
+  "raw_response_base64": null,
+  "raw_response_is_utf8": true,
+  "raw_response_text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"build-status.txt\"}},\"thoughtSignature\":\"synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-synthetic-opaque-0084-\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0,\"finishMessage\":\"Model generated function call(s).\"}],\"usageMetadata\":{\"promptTokenCount\":69,\"candidatesTokenCount\":19,\"totalTokenCount\":135,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":69}],\"thoughtsTokenCount\":47,\"serviceTier\":\"standard\"},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"00000000-0000-4000-8000-000000000032\"}\n\r\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic-001 \"}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":156,\"candidatesTokenCount\":4,\"totalTokenCount\":160,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":156}],\"serviceTier\":\"standard\"},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"00000000-0000-4000-8000-000000000033\"}\n\r\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic-002 \"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":156,\"candidatesTokenCount\":7,\"totalTokenCount\":163,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":156}],\"serviceTier\":\"standard\"},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"00000000-0000-4000-8000-000000000033\"}\n\r\n",
+  "scenario": "tool_call"
+}

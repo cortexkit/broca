@@ -1,0 +1,1 @@
+{"contents":[{"parts":[{"text":"What is 17 × 23?"}],"role":"user"},{"parts":[{"text":"**Analyzing the Problem**\n\nWe need answer the multiplication question directly.\n\n17 × 23 = **391**."}],"role":"model"},{"parts":[{"text":"Now add 9."}],"role":"user"}],"generationConfig":{"maxOutputTokens":2048}}

@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-split","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"chatcmpl-split","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_function_split","type":"function","function":{"name":"search_token","arguments":"{\"query\":\"token "}}]}}]}
+
+data: {"id":"chatcmpl-split","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"refresh\"}"}}]}}]}
+
+data: {"id":"chatcmpl-split","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]

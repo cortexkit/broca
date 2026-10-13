@@ -1,0 +1,1 @@
+{"code":"invalid_params","message":"invalid plan or send: {\"field\":\"plan.step_transform_items\",\"item\":1,\"problem\":\"approve_on_unavailable_pass\",\"subscription\":1}","detail":{"field":"plan.step_transform_items","item":1,"problem":"approve_on_unavailable_pass","subscription":1}}

@@ -1,0 +1,24 @@
+{
+  "request": {
+    "method": "route.account_status",
+    "params": {
+      "provider": "anthropic",
+      "account_id": "00000000-0000-4000-8000-00000000000a"
+    }
+  },
+  "reply": {
+    "result": {
+      "provider": "anthropic",
+      "account_id": "00000000-0000-4000-8000-00000000000a",
+      "observed_at": "2026-09-29T11:59:00Z",
+      "age_band": "full",
+      "windows": [
+        { "kind": "five_hour", "used_percent": 99.5, "resets_at": "2026-09-29T14:00:00Z", "window_minutes": 300 },
+        { "kind": "weekly", "used_percent": 40.0, "resets_at": null, "window_minutes": 10080 },
+        { "kind": "Fable", "used_percent": 5.0, "resets_at": null, "window_minutes": 10080 }
+      ],
+      "warm_ok": false,
+      "reason": { "code": "within_reserve", "window": "five_hour" }
+    }
+  }
+}

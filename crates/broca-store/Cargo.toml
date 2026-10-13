@@ -1,0 +1,34 @@
+[package]
+name = "broca-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca materialized store: SqliteStore (the MaterializedStore impl) + the persister that projects committed WAL turns into SQLite (one txn per range, resume from last seq). Keeps the SQLite native dep out of the pure loop crate."
+
+[features]
+default = []
+test-conformance = []
+
+[dependencies]
+broca-owner-only.workspace = true
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-wal = { path = "../broca-wal" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# Bundled SQLite — no system dependency; the persister is sync (runs off the hot
+# path), matching rusqlite's blocking API.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+broca-owner-only = { workspace = true, features = ["test-support"] }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+# Tests of the paths that copy WAL bytes need a gated frame this build can read; see
+# `broca_wal::framing::TEST_KNOWN_FEATURE`.
+broca-wal = { path = "../broca-wal", features = ["test-known-feature"] }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,17 @@
+{
+  "plan": "plans/pre-tool-declared.json",
+  "composition": "compositions/pre-tool-declared.json",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": true
+  },
+  "expected": {
+    "admitted": false,
+    "code": "invalid_params",
+    "detail": {
+      "field": "plan.step_transform_items"
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, fleet #1684–#1685"
+}

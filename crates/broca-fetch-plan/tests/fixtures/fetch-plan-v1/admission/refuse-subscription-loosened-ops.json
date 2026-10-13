@@ -1,0 +1,55 @@
+{
+  "plan": "plans/text-only-and-hook-only.json",
+  "composition": "compositions/text-only-and-hook-only.json",
+  "declarations": [
+    {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "answer": {
+        "subscriptions": [
+          {
+            "hook": "pre_user",
+            "ops": [
+              "append"
+            ],
+            "on_unavailable": "refuse",
+            "budget_ms": 1000
+          },
+          {
+            "hook": "post_tool",
+            "tools": [
+              "read"
+            ],
+            "ops": [
+              "prepend"
+            ],
+            "on_unavailable": "refuse",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "admitted": false,
+    "code": "plan_stale",
+    "detail": {
+      "differences": [
+        {
+          "kind": "subscription_loosened",
+          "provider": "magic-context",
+          "hook": "post_tool",
+          "phase": null,
+          "field": "ops"
+        }
+      ]
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": true,
+    "compaction": true
+  }
+}

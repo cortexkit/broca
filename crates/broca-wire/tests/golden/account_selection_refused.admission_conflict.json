@@ -1,0 +1,1 @@
+{"code":"account_selection_refused","message":"the routing module refused to choose a provider account for this send (admission_conflict)","detail":{"routing_code":"admission_conflict","class":"permanent","decision_id":"acd-0456"}}

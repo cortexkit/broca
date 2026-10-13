@@ -1,0 +1,808 @@
+//! The wire-family contract — the BEHAVIOR half of the provider framework.
+//!
+//! A `WireFamily` owns one API grammar: it renders a canonical request to the
+//! exact wire BYTES that grammar sends, and normalizes that grammar's response
+//! stream back to canonical events. There are only ~5 of these (most providers are
+//! pure config over one of them).
+//!
+//! The load-bearing rule is the `render` TYPE BOUNDARY: `render` is handed ONLY a
+//! `&FrozenRenderConfig` (a bounded, typed, frozen-at-run-start bundle) and the
+//! `&CallOptions` for this step. It cannot see the `ProviderSpec`/`ModelSpec`/`raw`
+//! catalog data, nor auth, nor any ambient state (clock/env/RNG) — so the rendered
+//! bytes are a PURE function of those two inputs. That's what makes the bytes
+//! reproducible on resume: freeze the `FrozenRenderConfig` once, and every later
+//! re-render of the same step produces identical bytes.
+//!
+//! This module is the PURE contract — traits + the frozen-config type — with no
+//! transport. The adapter that implements the loop's `Provider` trait by driving a
+//! `WireFamily` over real HTTP/SSE lives in the transport driver (the `live`
+//! feature), since `Provider::step` needs a network leg this pure layer doesn't
+//! carry.
+
+use broca_protocol::{CallOptions, NormalizedEvent, StepId};
+
+/// Re-exported so the frozen cache policy and its caller-declared tail can be named from one
+/// module, the way `CacheTtl` and `MarkerSyntax` already are.
+pub use broca_protocol::request::CacheTail;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::policy::{
+    ReasoningPolicy, SystemPromptPolicy, TokenLimitField, ToolIdPolicy, UsagePolicy,
+};
+use crate::spec::WireFamilyId;
+
+/// Prompt-cache policy resolved before freeze and carried inside the render config.
+/// Renderers read only this frozen value, so resume replays place the same provider
+/// cache hints and breakpoints byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachePolicy {
+    pub version: u32,
+    #[serde(flatten)]
+    pub class: CacheClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+pub enum CacheClass {
+    Markers {
+        syntax: MarkerSyntax,
+        ttl: CacheTtl,
+        max_breakpoints: u32,
+        lookback_blocks: u32,
+        /// The caller's frozen declaration about its final message. Resolved at admission
+        /// like `ttl`, so a resume replays the same placement instead of re-deciding it.
+        /// Absent is the pre-field shape and plans markers exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail: Option<CacheTail>,
+        /// Render each marker without a `ttl` field, which leaves its lifetime to the
+        /// provider's own default (Anthropic's is 5m, the value `ttl` then records for
+        /// scheduling). Only broca's no-request default sets this; a caller's explicit request
+        /// keeps `ttl` on the wire, so its bytes are the same as before the default existed.
+        /// Absent is the pre-field shape and means `false`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        omit_ttl: bool,
+    },
+    Hints {
+        cache_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention: Option<String>,
+    },
+    None,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerSyntax {
+    AnthropicCacheControl,
+    BedrockCachePoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl CacheTtl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+}
+
+/// The bounded, typed render inputs frozen at run start — the SOLE input to
+/// `render`/`normalizer` besides `CallOptions`. Everything here is resolved from a
+/// `ProviderSpec`/`ModelSpec` once (so the catalog can update freely without
+/// changing an in-flight run's rendered bytes), and nothing unbounded (like the
+/// catalog `raw` passthrough) is included — keeping the frozen bundle both bounded
+/// and complete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrozenRenderConfig {
+    pub family_id: WireFamilyId,
+    /// The family render ABI version. A change means a resume can't reproduce the
+    /// original bytes, so resume must stop for review rather than re-render.
+    pub renderer_version: u32,
+    /// The wire model id (request `model` field, or endpoint path for path-labeled APIs).
+    pub wire_model_id: String,
+    /// The API base URL, when the provider isn't at the family's default host. This
+    /// is what makes the OpenAI-compatible long tail config-only: every
+    /// OpenAI-compatible provider is the OpenAI-Chat family pointed at a different
+    /// `base_url` (e.g. `https://api.deepseek.com/v1`). `None` = the family default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Max output tokens to request.
+    pub max_output_tokens: u32,
+    /// The caller's explicit output-token cap before provider defaults are applied. `None`
+    /// means the caller omitted the field, allowing a family-specific default. Keeping this
+    /// distinction in the frozen bundle lets resumed renders make the same default-vs-clamp
+    /// decision without guessing from a concrete fallback value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_max_output_tokens: Option<u32>,
+    /// The resolved reasoning policy (how thinking is requested + echoed).
+    pub reasoning: ReasoningPolicy,
+    /// How tool-call ids round-trip.
+    pub tool_id: ToolIdPolicy,
+    /// Where the system prompt goes (+ any required identity lead).
+    pub system_prompt: SystemPromptPolicy,
+    /// How usage is read off the response (used by the normalizer).
+    pub usage: UsagePolicy,
+    /// Resolved prompt-cache behavior. `None` is omitted from frozen blobs so runs
+    /// without cache policy keep the exact pre-cache serialized config shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CachePolicy>,
+    /// Which request field carries the output-token limit.
+    #[serde(default)]
+    pub token_limit_field: TokenLimitField,
+    /// Body options merged into every request (e.g. provider-required flags).
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub static_options: Value,
+    /// AWS region for SigV4/region-scoped endpoints (e.g. Bedrock Runtime).
+    /// This is auth KIND metadata only: never credentials, timestamps, or signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
+    /// The cloud project the request is bound to — a BODY-VISIBLE render input for the
+    /// Google Antigravity / Code-Assist family (the envelope's `project` field). Frozen at
+    /// run start (resolved from the vault alongside the token) so a resume renders the same
+    /// project. `None` for every other family. Unlike the token (off-hash, attached at the
+    /// endpoint), this IS in the rendered bytes, so it must be frozen, not re-resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// A caller-selected prompt-cache scope, emitted by OpenAI renderers. ChatGPT codex uses
+    /// the run session id only when this caller scope is absent. A per-run constant, it is frozen
+    /// here (reproduced from the blob on resume) rather than carried per-step like `step_context`.
+    /// Other families retain it without emitting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// A reasoning effort for the ChatGPT codex backend. The caller-facing `-pro` suffix
+    /// resolves to the base wire model plus `effort="max"` (the native codex CLI's pro
+    /// setting, wire-captured), so it must be frozen for byte-identical resume. `None`
+    /// keeps every non-pro render unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// The body `service_tier` value, sent by the OpenAI Responses, ChatGPT codex, OpenAI Chat
+    /// and Gemini renderers when set. A caller's `service_tier` sets it where its provider family
+    /// maps the tier to this field (see `crate::service_tier`). Freezing it keeps resumed request
+    /// bytes identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Anthropic's body `speed` value (`"fast"` for fast mode, which is how a caller's
+    /// `priority` tier renders there); when set, the fast-mode beta header is sent too. `None`
+    /// is omitted, keeping every other render byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    /// The caller's service tier and the provider it was admitted against. Never rendered: the
+    /// bytes are in `service_tier` / `speed`. Kept so a provider's refusal can be recognised
+    /// and reported as a refusal of this tier. `None` (no tier requested) is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_request: Option<crate::service_tier::ServiceTierRequest>,
+    /// Whether the provider requires a non-empty `reasoning_content` on a tool-call
+    /// assistant message (the OpenAI-compatible DeepSeek-reasoner/Kimi/Moonshot subset).
+    /// When set, the OpenAI-Chat render supplies `""` where it is missing. Frozen from the
+    /// provider's quirks at run start. DEFAULT FALSE — no provider is opted in, so this
+    /// changes no current render.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_content_required: bool,
+    /// Whether the provider requires a string `content` (not JSON null) on tool-call-only
+    /// assistant turns. When set, OpenAI-Chat render uses `""` instead of `null`. Frozen
+    /// from the provider's quirks at run start. DEFAULT FALSE — no provider is opted in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_call_content_empty_string: bool,
+    /// The caller's reasoning variant, resolved at admission from the model's catalog reasoning
+    /// options into the wire parameters its family sends (see `crate::variant`). Frozen so a
+    /// resume renders the same parameters even if the catalog has changed since. `None` (no
+    /// variant) is omitted, keeping every run without one byte-identical to before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<crate::variant::FrozenVariant>,
+    /// Set this flag to render Responses function tools with `strict: false`, keeping optional
+    /// parameters optional. The value is frozen at admission; older blobs lack the field, so
+    /// resumed runs omit `strict` to reproduce their original bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub responses_tools_non_strict: bool,
+    /// Whether Codex may use input configuration updates for effort changes, recorded when
+    /// the episode starts. Old frozen blobs lack this field and keep request-level effort.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chatgpt_effort_updates: bool,
+}
+
+/// One HTTP request the family wants sent: method, full URL, headers, body bytes.
+/// Auth is attached when this is built (in `endpoint`), AFTER the body is
+/// rendered, so it never enters the rendered/hashed bytes.
+///
+/// Header values and body bytes can contain credentials or prompts, so `Debug` is implemented
+/// manually to redact them. Do not derive `Debug` for this type.
+#[derive(Clone)]
+pub struct HttpRequest {
+    pub method: HttpMethod,
+    pub url: String,
+    /// Header name/value pairs in a fixed order.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "<redacted>"))
+            .collect();
+        let body = format!("<{} bytes>", self.body.len());
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .field("body", &body)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Post,
+}
+
+/// What a runtime auth credential supplies. Held by the adapter, attached in
+/// `endpoint` — never seen by `render`.
+///
+/// Every credential-bearing value is redacted by the manual `Debug` implementation. Do not
+/// derive `Debug` for this type. Equality compares the secrets too; use it only as a boolean
+/// ("is this the token that was just rejected?"), never to print either side.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AuthHandle {
+    /// `Authorization: Bearer <token>`.
+    Bearer(String),
+    /// A named API-key header.
+    ApiKeyHeader { header: String, value: String },
+    /// AWS SigV4 request signing. The transport/auth layer computes these signed
+    /// headers after render from the method, URL, headers, and body.
+    SigV4 {
+        region: String,
+        service: String,
+        signed_headers: Vec<(String, String)>,
+    },
+    /// A complete, pre-computed header set to attach verbatim (name/value pairs in
+    /// order), including the `Authorization` header. The auth-resolution layer builds
+    /// this when a credential needs more than one header derived from runtime context —
+    /// e.g. the ChatGPT codex backend wants `Authorization` plus a `ChatGPT-Account-Id`
+    /// decoded from the token's JWT and a per-session `session-id`. Like `SigV4`'s
+    /// `signed_headers`, the derivation happens in the auth layer (off the rendered/hashed
+    /// bytes); `endpoint` just attaches what it's given.
+    Headers(Vec<(String, String)>),
+    /// No credential.
+    None,
+}
+
+impl std::fmt::Debug for AuthHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthHandle::Bearer(_) => f.debug_tuple("Bearer").field(&"<redacted>").finish(),
+            AuthHandle::ApiKeyHeader { header, .. } => f
+                .debug_struct("ApiKeyHeader")
+                .field("header", header)
+                .field("value", &"<redacted>")
+                .finish(),
+            AuthHandle::SigV4 {
+                region, service, ..
+            } => f
+                .debug_struct("SigV4")
+                .field("region", region)
+                .field("service", service)
+                .finish(),
+            AuthHandle::Headers(headers) => {
+                let headers: Vec<(&str, &str)> = headers
+                    .iter()
+                    .map(|(name, _)| (name.as_str(), "<redacted>"))
+                    .collect();
+                f.debug_tuple("Headers").field(&headers).finish()
+            }
+            AuthHandle::None => f.write_str("None"),
+        }
+    }
+}
+
+/// A wire grammar: canonical → bytes (render) and bytes → canonical (normalize).
+pub trait WireFamily: Send + Sync {
+    /// The provider-shaped request as a structured value, BEFORE byte emission — the
+    /// pure policy-decision + assembly stage. A PURE function of `(frozen, opts)`
+    /// (see the module docs for why that purity is load-bearing). `render` is defined
+    /// as `canonical_json_bytes(shape(...))`, so this is where every family's request
+    /// shaping lives; exposing it (rather than only the emitted bytes) lets the
+    /// decode/MITM side and conformance tests reuse the shaped value without
+    /// re-emitting bytes.
+    fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value;
+
+    /// Render `opts` to the EXACT, DETERMINISTIC request body bytes this grammar
+    /// sends. Defined as `emit∘shape` — `canonical_json_bytes(self.shape(frozen,
+    /// opts))` (sorted keys, the deterministic JSON the cache/resume hash is taken
+    /// over). A family whose wire is not canonical JSON over its shaped value MAY
+    /// override this, but every current family uses the default.
+    fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
+        broca_protocol::canonical_json_bytes(&self.shape(frozen, opts))
+    }
+
+    /// The HTTP shape (method, URL, headers) for `body`. Auth attaches HERE, after
+    /// render — never on the rendered/hashed bytes.
+    fn endpoint(
+        &self,
+        frozen: &FrozenRenderConfig,
+        auth: &AuthHandle,
+        body: Vec<u8>,
+    ) -> HttpRequest;
+
+    /// A fresh per-stream incremental normalizer (response bytes → canonical
+    /// events). The wire framing (text/SSE vs binary event-stream) is the
+    /// normalizer's internal concern.
+    fn normalizer(&self, frozen: &FrozenRenderConfig, step_id: StepId)
+        -> Box<dyn StreamNormalizer>;
+
+    /// The body of a cache warm for `base`, a request body this family rendered and already
+    /// sent: `base` changed only so the provider generates nothing, which keeps the prompt
+    /// prefix `base` cached. `Err` says why this family, or `base`'s shape, cannot be warmed;
+    /// nothing is then sent. The default cannot warm.
+    fn warm_body(&self, _frozen: &FrozenRenderConfig, _base: &[u8]) -> Result<Vec<u8>, String> {
+        Err("this wire family has no zero-output request to warm a cache with".into())
+    }
+}
+
+/// Stateful response-bytes → canonical normalization. `push` is fed raw chunks and
+/// returns any newly-complete events; the wire framing is the implementor's
+/// concern, so this stays grammar-generic.
+pub trait StreamNormalizer: Send {
+    /// Omit untrusted backend error text from diagnostics when the transport requires privacy.
+    /// Wrappers forward this; it never changes model-output normalization or request bytes.
+    fn private_error_diagnostics(&mut self) {}
+
+    /// Append raw response bytes; return any newly-complete events.
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError>;
+
+    /// Monotonic count of complete data-bearing wire records decoded so far. For SSE,
+    /// comment-only, blank, and empty-data records are not progress. The transport uses
+    /// changes in this marker to reset its idle deadline; raw HTTP chunks alone are not
+    /// progress because a peer may drip an incomplete record.
+    fn progress_marker(&self) -> u64 {
+        0
+    }
+
+    /// Monotonic count of complete wire records that prove the peer is ALIVE, including
+    /// records that carry no content, such as SSE `: keepalive` comments. `None` (the
+    /// default) means the grammar has no such records.
+    ///
+    /// When this returns `Some`, the transport runs two deadlines: a short liveness
+    /// deadline reset by this marker (a dead or dripping connection trips it), and a long
+    /// content deadline reset only by [`Self::progress_marker`] (a peer that sends
+    /// keepalives forever and never any content trips it). When it returns `None`, the
+    /// transport keeps its single idle deadline reset by `progress_marker`, exactly as
+    /// before liveness existed. It must count complete records only, never raw bytes, for
+    /// the same reason `progress_marker` does.
+    fn liveness_marker(&self) -> Option<u64> {
+        None
+    }
+
+    /// Last complete SSE event's name or JSON `type`, without response content.
+    /// Wrappers must forward this so transport failures retain the wire discriminator.
+    fn last_event_type(&self) -> Option<&str> {
+        None
+    }
+
+    /// Number of SSE keepalive comments since the most recent content record.
+    fn keepalives_after_content(&self) -> Option<u64> {
+        None
+    }
+
+    /// Bounded per-type counts of decoded content events, without their payloads.
+    fn event_type_counts(&self) -> Option<&[(String, u64)]> {
+        None
+    }
+
+    /// The response stream has ENDED (the transport saw EOF). Return any final
+    /// events the grammar emits only at the end. This exists because some grammars
+    /// have no in-band terminal event — e.g. OpenAI's stream just stops after a
+    /// `[DONE]` sentinel, and the usage chunk arrives after the finish reason — so
+    /// the assembled message is emitted here. Grammars with an explicit terminal
+    /// event (e.g. Anthropic's `message_stop`) emit there; an SSE grammar still uses
+    /// this to flush its decoder, because a final record ending in a bare CR is only
+    /// complete once the stream has ended.
+    fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
+        Ok(Vec::new())
+    }
+
+    /// The successful response's HTTP headers, handed over once per attempt before the first
+    /// body chunk. Most grammars report everything in the body and ignore this; Gemini is the
+    /// exception, reporting the service tier it served in the `x-gemini-service-tier` header.
+    /// A wrapping normalizer must forward this to the one it wraps.
+    fn observe_response_headers(&mut self, _headers: &ResponseHeaders) {}
+
+    /// The response's own report of how the provider altered the request, once decoded
+    /// (Anthropic's `input_transformations` on `message_start`). `None` until the stream has
+    /// carried it, and always `None` for grammars without one. A wrapping normalizer must
+    /// forward this to the one it wraps.
+    fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
+        None
+    }
+}
+
+/// Response headers as the transport received them, reduced to what a normalizer can read:
+/// lowercase names and the values that are valid UTF-8. Kept free of the HTTP client's types
+/// so the pure normalize layer stays transport-free.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseHeaders(Vec<(String, String)>);
+
+impl ResponseHeaders {
+    /// Build from `(name, value)` pairs; names are lowercased so lookups are case-insensitive,
+    /// as HTTP header names are.
+    pub fn new<N: Into<String>, V: Into<String>>(pairs: impl IntoIterator<Item = (N, V)>) -> Self {
+        Self(
+            pairs
+                .into_iter()
+                .map(|(name, value)| (name.into().to_ascii_lowercase(), value.into()))
+                .collect(),
+        )
+    }
+
+    /// The first value of the header `name` (any case), if the response carried it.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A response normalization failure.
+#[derive(Debug, Clone)]
+pub enum NormalizeError {
+    /// The provider response was malformed or violated its wire protocol.
+    Invalid(String),
+    /// A response framing buffer exceeded a defensive memory limit.
+    StreamLimit(String),
+    /// A tool call's arguments were left incomplete because the output-token ceiling was
+    /// reached, as the provider's own stop reason says. The response is well formed; the
+    /// request asked for more output than its cap allows, so resending it is cut the same way.
+    OutputCeiling(OutputCeilingCut),
+}
+
+/// What the provider reported about an output ceiling that cut a tool call mid-arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputCeilingCut {
+    /// The provider's stop reason, verbatim (`max_tokens`, `length`, `MAX_TOKENS`, ...).
+    pub provider_stop_reason: String,
+    /// The output-token cap the request was rendered with, when the normalizer knows it.
+    pub max_output_tokens: Option<u32>,
+    /// The output-token count the provider reported for the response, when it did.
+    pub output_tokens: Option<u64>,
+    /// The tool whose arguments were cut.
+    pub tool_name: String,
+    /// How many argument bytes arrived before the cut.
+    pub argument_bytes: usize,
+}
+
+/// The provider's statement that output stopped at the output-token ceiling. A normalizer
+/// builds one only from a stop reason that names the ceiling; anything else keeps the
+/// ordinary argument-parse failure.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CeilingStop<'a> {
+    pub provider_stop_reason: &'a str,
+    pub max_output_tokens: Option<u32>,
+    pub output_tokens: Option<u64>,
+}
+
+impl NormalizeError {
+    pub(crate) fn stream_limit(message: impl Into<String>) -> Self {
+        Self::StreamLimit(message.into())
+    }
+
+    /// The wire error class this failure carries.
+    ///
+    /// An unparseable or over-limit stream is transient: the next attempt gets a fresh stream,
+    /// and nothing durable recorded a partial step. An output-ceiling cut is permanent: the
+    /// retry sends the same bytes with the same cap, and the provider stops it at the same
+    /// place, so every further attempt is spend with no chance of success.
+    pub fn class(&self) -> broca_protocol::error::ErrorClass {
+        match self {
+            Self::Invalid(_) | Self::StreamLimit(_) => broca_protocol::error::ErrorClass::Transient,
+            Self::OutputCeiling(_) => broca_protocol::error::ErrorClass::Permanent,
+        }
+    }
+
+    /// Test-only discriminator. `StreamLimit` and `Invalid` share the transient class, so
+    /// only tests need to tell the limit arm apart from a malformed stream.
+    #[cfg(test)]
+    pub(crate) fn is_stream_limit(&self) -> bool {
+        matches!(self, Self::StreamLimit(_))
+    }
+}
+
+/// Decode a provider's terminal tool-argument buffer. An exactly empty buffer is the
+/// wire representation used by zero-argument calls; every non-empty buffer must be JSON.
+///
+/// `ceiling` is the provider's statement, when it made one, that output stopped at the
+/// output-token ceiling. When the arguments do not parse AND that statement is present, the
+/// failure is named as the ceiling cut rather than as a malformed stream. Without it the
+/// ordinary parse failure stands, so an unexplained bad buffer is never promoted to a
+/// permanent error.
+pub(crate) fn decode_terminal_tool_arguments(
+    arguments: &str,
+    tool_name: &str,
+    ceiling: Option<CeilingStop<'_>>,
+) -> Result<Value, NormalizeError> {
+    if arguments.is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    serde_json::from_str(arguments).map_err(|error| match ceiling {
+        Some(stop) => NormalizeError::OutputCeiling(stop.cut(tool_name, arguments)),
+        None => NormalizeError::Invalid(format!("invalid terminal tool arguments: {error}")),
+    })
+}
+
+const TOOL_ARGS_WHITESPACE_LIMIT: usize = 4096;
+
+/// Counts only the new delta's JSON whitespace suffix, never rescanning the accumulated
+/// buffer. A run is parsed once, when it first exceeds 4096 bytes. Whitespace inside an
+/// unterminated string cannot fire: the prefix before that run is not a complete JSON value.
+#[derive(Default)]
+pub(crate) struct TrailingWhitespaceDetector {
+    trailing: usize,
+}
+
+impl TrailingWhitespaceDetector {
+    fn observe(&mut self, arguments: &str, delta: &str) -> Option<(usize, usize)> {
+        let suffix = json_whitespace_suffix(delta);
+        let previous = self.trailing;
+        self.trailing = if suffix == delta.len() {
+            previous.saturating_add(suffix)
+        } else {
+            suffix
+        };
+        if self.trailing > TOOL_ARGS_WHITESPACE_LIMIT
+            && (previous <= TOOL_ARGS_WHITESPACE_LIMIT || suffix != delta.len())
+        {
+            return complete_prefix(arguments, self.trailing);
+        }
+        None
+    }
+}
+
+fn json_whitespace_suffix(arguments: &str) -> usize {
+    arguments
+        .bytes()
+        .rev()
+        .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .count()
+}
+
+fn complete_prefix(arguments: &str, whitespace: usize) -> Option<(usize, usize)> {
+    let json_bytes = arguments.len().checked_sub(whitespace)?;
+    serde_json::from_str::<Value>(&arguments[..json_bytes]).ok()?;
+    Some((json_bytes, whitespace))
+}
+
+/// Shared streaming detector and terminal backstop. The cut is a completed step with a
+/// rejected call, not a provider failure; only byte counts, never arguments, leave this guard.
+#[derive(Default)]
+pub(crate) struct ToolArgsGuard {
+    detectors: std::collections::HashMap<u64, TrailingWhitespaceDetector>,
+    cut: Option<broca_protocol::provider::ToolArgsTrailingGarbage>,
+}
+
+impl ToolArgsGuard {
+    pub(crate) fn stream(&mut self, key: u64, id: &str, name: &str, arguments: &str, delta: &str) {
+        if self.cut.is_none() {
+            let counts = self
+                .detectors
+                .entry(key)
+                .or_default()
+                .observe(arguments, delta);
+            self.mark(id, name, counts);
+        }
+    }
+
+    pub(crate) fn terminal(&mut self, id: &str, name: &str, arguments: &str) {
+        let whitespace = json_whitespace_suffix(arguments);
+        if self.cut.is_none() && whitespace > TOOL_ARGS_WHITESPACE_LIMIT {
+            self.mark(id, name, complete_prefix(arguments, whitespace));
+        }
+    }
+
+    pub(crate) fn replace(&mut self, key: u64, id: &str, name: &str, arguments: &str) {
+        self.detectors.entry(key).or_default().trailing = json_whitespace_suffix(arguments);
+        self.terminal(id, name, arguments);
+    }
+
+    fn mark(&mut self, id: &str, name: &str, counts: Option<(usize, usize)>) {
+        if let Some((json_bytes, whitespace_bytes)) = counts {
+            self.cut = Some(broca_protocol::provider::ToolArgsTrailingGarbage {
+                tool_call_id: broca_protocol::ToolCallId(id.to_owned()),
+                tool_name: name.to_owned(),
+                json_bytes,
+                whitespace_bytes,
+                omitted_tool_calls: 0,
+            });
+        }
+    }
+
+    pub(crate) fn fired(&self) -> bool {
+        self.cut.is_some()
+    }
+
+    pub(crate) fn omit_tool(&mut self) {
+        if let Some(cut) = &mut self.cut {
+            cut.omitted_tool_calls += 1;
+        }
+    }
+
+    pub(crate) fn decode(
+        &mut self,
+        arguments: &str,
+        name: &str,
+        ceiling: Option<CeilingStop<'_>>,
+        completed: bool,
+    ) -> Result<Option<Value>, NormalizeError> {
+        if self.fired() {
+            // Empty buffers on a cut are still in progress, not zero-argument calls.
+            if arguments.is_empty() && completed {
+                return Ok(Some(Value::Object(Default::default())));
+            }
+            if let Ok(input) = serde_json::from_str(arguments) {
+                return Ok(Some(input));
+            }
+            self.omit_tool();
+            return Ok(None);
+        }
+        decode_terminal_tool_arguments(arguments, name, ceiling).map(Some)
+    }
+
+    pub(crate) fn event(&self) -> Option<NormalizedEvent> {
+        self.cut.clone().map(|cut| {
+            NormalizedEvent::Control(broca_protocol::ProviderControl::ToolArgsTrailingGarbage {
+                cut,
+            })
+        })
+    }
+}
+
+impl CeilingStop<'_> {
+    /// The cut this stop reason explains, for one tool call's argument buffer.
+    pub(crate) fn cut(&self, tool_name: &str, arguments: &str) -> OutputCeilingCut {
+        OutputCeilingCut {
+            provider_stop_reason: self.provider_stop_reason.to_owned(),
+            max_output_tokens: self.max_output_tokens,
+            output_tokens: self.output_tokens,
+            tool_name: tool_name.to_owned(),
+            argument_bytes: arguments.len(),
+        }
+    }
+}
+
+impl std::fmt::Display for OutputCeilingCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "output ceiling reached mid tool call: finish=length, max_output_tokens="
+        )?;
+        match self.max_output_tokens {
+            Some(cap) => write!(f, "{cap}")?,
+            None => f.write_str("unknown")?,
+        }
+        write!(
+            f,
+            " (tool {}, {} argument bytes received; provider stop reason {}",
+            self.tool_name, self.argument_bytes, self.provider_stop_reason
+        )?;
+        if let Some(output_tokens) = self.output_tokens {
+            write!(f, ", output_tokens={output_tokens}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl std::fmt::Display for NormalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "normalize: {message}"),
+            Self::StreamLimit(message) => write!(f, "stream limit: {message}"),
+            Self::OutputCeiling(cut) => write!(f, "{cut}"),
+        }
+    }
+}
+
+impl std::error::Error for NormalizeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_handle_debug_redacts_every_credential_value() {
+        let secret = "auth-secret-literal";
+        let handles = [
+            AuthHandle::Bearer(secret.to_string()),
+            AuthHandle::ApiKeyHeader {
+                header: "x-api-key".to_string(),
+                value: secret.to_string(),
+            },
+            AuthHandle::SigV4 {
+                region: "us-east-1".to_string(),
+                service: "bedrock".to_string(),
+                signed_headers: vec![("authorization".to_string(), secret.to_string())],
+            },
+            AuthHandle::Headers(vec![("authorization".to_string(), secret.to_string())]),
+            AuthHandle::None,
+        ];
+
+        for handle in handles {
+            let debug = format!("{handle:?}");
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn http_request_debug_redacts_headers_and_body() {
+        let secret = "request-secret-literal";
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            url: "https://provider.example/v1/messages".to_string(),
+            headers: vec![("authorization".to_string(), secret.to_string())],
+            body: secret.as_bytes().to_vec(),
+        };
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("<22 bytes>"));
+    }
+
+    #[test]
+    fn cache_policy_wire_shape_uses_top_level_class_tag() {
+        let policy = CachePolicy {
+            version: 1,
+            class: CacheClass::Markers {
+                syntax: MarkerSyntax::AnthropicCacheControl,
+                ttl: CacheTtl::OneHour,
+                max_breakpoints: 4,
+                lookback_blocks: 20,
+                tail: None,
+                omit_ttl: false,
+            },
+        };
+        let value = serde_json::to_value(&policy).expect("serialize policy");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "version": 1,
+                "class": "markers",
+                "syntax": "anthropic_cache_control",
+                "ttl": "1h",
+                "max_breakpoints": 4,
+                "lookback_blocks": 20,
+            })
+        );
+        let restored: CachePolicy = serde_json::from_value(value).expect("deserialize policy");
+        assert_eq!(restored, policy);
+    }
+
+    #[test]
+    fn cache_policy_is_serde_additive() {
+        let frozen = crate::families::anthropic_frozen_config("claude-opus-4-8");
+        assert_eq!(frozen.cache, None);
+
+        let serialized = serde_json::to_string(&frozen).expect("serialize frozen config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json value");
+        assert!(
+            value.get("cache").is_none(),
+            "cache=None must serialize to the old frozen-config shape"
+        );
+
+        let restored: FrozenRenderConfig =
+            serde_json::from_str(&serialized).expect("old-shaped frozen config deserializes");
+        assert_eq!(restored.cache, None);
+    }
+}

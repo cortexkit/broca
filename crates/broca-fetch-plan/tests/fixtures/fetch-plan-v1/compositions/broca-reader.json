@@ -1,0 +1,20 @@
+{
+  "providers": [
+    {
+      "provider": "aft",
+      "tools": [
+        {
+          "name": "read",
+          "capabilities": [
+            "code.read/v1"
+          ]
+        }
+      ]
+    },
+    {
+      "provider": "prefrontal-core",
+      "tools": []
+    }
+  ],
+  "step_transform_items": []
+}

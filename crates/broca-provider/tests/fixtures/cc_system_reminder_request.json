@@ -1,0 +1,161 @@
+{
+  "model": "claude-sonnet-5",
+  "system": [
+    {
+      "type": "text",
+      "text": "An invented blue-tile sample."
+    },
+    {
+      "type": "text",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      },
+      "text": "An invented blue-tile sample."
+    },
+    {
+      "type": "text",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      },
+      "text": "An invented blue-tile sample."
+    }
+  ],
+  "tools": [
+    {
+      "name": "tool_0",
+      "input_schema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "tool_1",
+      "input_schema": {
+        "type": "object"
+      }
+    }
+  ],
+  "metadata": {
+    "user_id": "00000000-0000-4000-8000-000000000025"
+  },
+  "max_tokens": 64000,
+  "thinking": {
+    "type": "adaptive"
+  },
+  "context_management": {
+    "edits": [
+      {
+        "type": "clear_thinking_20251015",
+        "keep": "all"
+      }
+    ]
+  },
+  "output_config": {
+    "effort": "xhigh"
+  },
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    },
+    {
+      "role": "system",
+      "content": "An invented blue-tile sample."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "An invented blue-tile sample.",
+          "signature": "synthetic-opaque-0081-sy"
+        },
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "An invented blue-tile sample."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "An invented blue-tile sample.",
+          "signature": "synthetic-opaque-0081-sy"
+        },
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "tool_use",
+          "id": "00000000-0000-4000-8000-000000000026",
+          "name": "scrubbed_tool",
+          "input": {
+            "scrubbed": true
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "00000000-0000-4000-8000-000000000026",
+          "content": "An invented blue-tile sample."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          },
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"code":"scope_sender_mismatch","message":"this send differs from the session's frozen sender","detail":{"field":"sender"}}

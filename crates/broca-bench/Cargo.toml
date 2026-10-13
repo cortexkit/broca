@@ -1,0 +1,31 @@
+[package]
+name = "broca-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The (A) latency/jitter test bench: in-process vs process-separated, deterministic replay, CLOCK_MONOTONIC one-way timing, raw + realistic-JSON bodies."
+
+[dependencies]
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-replay = { path = "../broca-replay" }
+broca-store = { path = "../broca-store" }
+broca-wal = { path = "../broca-wal" }
+subc-protocol.workspace = true
+subc-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "broca-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "wave2-perf"
+path = "src/bin/wave2_perf.rs"

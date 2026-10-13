@@ -1,0 +1,113 @@
+{
+  "model": "gpt-5.5",
+  "instructions": "Arrange the imaginary blue tiles. Use the sample tools when needed.",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "input_text",
+          "text": "An invented blue-tile sample."
+        },
+        {
+          "type": "input_text",
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Think step by step and reason carefully: what is 17 * 23, and why is that a semiprime? Show your reasoning, then give the answer as REASON=<n>."
+        }
+      ]
+    },
+    {
+      "type": "reasoning",
+      "summary": [],
+      "content": null,
+      "encrypted_content": "synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaque-0001-synthetic-opaq"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic answer REASON=391."
+        }
+      ],
+      "phase": "final_answer"
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "An invented blue-tile sample."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "sample_probe",
+      "description": "Inspect an invented sample.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "additionalProperties": false
+      },
+      "strict": true
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "xhigh"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000005",
+  "text": {
+    "verbosity": "low"
+  },
+  "client_metadata": {
+    "x-codex-window-id": "00000000-0000-4000-8000-000000000005:0",
+    "thread_id": "00000000-0000-4000-8000-000000000005",
+    "x-codex-installation-id": "00000000-0000-4000-8000-000000000004",
+    "session_id": "00000000-0000-4000-8000-000000000005",
+    "turn_id": "00000000-0000-4000-8000-000000000006",
+    "x-codex-turn-metadata": "{\"installation_id\":\"00000000-0000-4000-8000-000000000004\",\"session_id\":\"00000000-0000-4000-8000-000000000005\",\"thread_id\":\"00000000-0000-4000-8000-000000000005\",\"turn_id\":\"00000000-0000-4000-8000-000000000006\",\"window_id\":\"00000000-0000-4000-8000-000000000005:0\",\"request_kind\":\"turn\",\"thread_source\":\"user\",\"sandbox\":\"seatbelt\",\"turn_started_at_unix_ms\":1700000000000}"
+  }
+}

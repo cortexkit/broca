@@ -1,0 +1,1 @@
+{"code":"scope_adoption_refused","message":"a session recorded without a scope cannot adopt a flow scope; start a new session under the flow scope","detail":{"kind":"flow_scope"}}

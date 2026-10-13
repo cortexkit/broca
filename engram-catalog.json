@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "module_id": "broca",
+  "entries": [
+    {
+      "entry_id": "broca/session-wals",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "wal",
+      "cursor_authority": "seq"
+    },
+    {
+      "entry_id": "broca/session-archive",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "wal-archive"
+    },
+    {
+      "entry_id": "broca/ephemeral-wals",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "wal-ephemeral",
+      "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
+    },
+    {
+      "entry_id": "broca/run-index",
+      "class": "rebuild",
+      "mechanism": "whole-db",
+      "path": "run-index.db"
+    },
+    {
+      "entry_id": "broca/caps",
+      "class": "rebuild",
+      "mechanism": "whole-db",
+      "path": "caps.db"
+    },
+    {
+      "entry_id": "broca/leases",
+      "class": "device-local",
+      "mechanism": "filetree",
+      "path": "leases"
+    },
+    {
+      "entry_id": "broca/request-dumps",
+      "class": "device-local",
+      "mechanism": "filetree",
+      "path": "request-dumps"
+    }
+  ]
+}

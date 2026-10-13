@@ -1,0 +1,1 @@
+{"contents":[{"parts":[{"functionCall":{"args":{"path":"a"},"name":"read"}}],"role":"model"}],"generationConfig":{"maxOutputTokens":2048}}

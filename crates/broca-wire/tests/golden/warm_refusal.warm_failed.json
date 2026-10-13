@@ -1,0 +1,1 @@
+{"code":"warm_failed","message":"the warm was sent and the provider refused it","detail":{"kind":"warm_failed","error":{"class":"transient","message":"529: overloaded","status":529,"provider_code":"overloaded_error"}}}

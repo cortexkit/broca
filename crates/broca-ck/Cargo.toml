@@ -1,0 +1,22 @@
+[package]
+name = "broca-ck"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The CK-Message canonical type (Ck#1) + the lift/project between it and the owned
+# broca canonical message. Shared across the codec (this workspace) and, later, the
+# MITM module (a separate Rust consumer). Kept in its own crate so a shared contract type
+# is not buried inside one consumer.
+
+[dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+broca-protocol = { path = "../broca-protocol" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# The wire-golden sha pin (tests/it/ck_wire_golden.rs) hashes the fixture bytes.
+sha2.workspace = true

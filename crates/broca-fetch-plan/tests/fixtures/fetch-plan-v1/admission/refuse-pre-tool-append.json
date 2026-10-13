@@ -1,0 +1,86 @@
+{
+  "plan_inline": {
+    "tool_items": [],
+    "system_text_items": [
+      {
+        "provider": "prefrontal-core",
+        "preset": "worker",
+        "params": {
+          "role": "mason"
+        }
+      }
+    ],
+    "compaction_item": {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {}
+    },
+    "step_transform_items": [
+      {
+        "provider": "magic-context",
+        "preset": "worker",
+        "params": {},
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [
+              "append"
+            ],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    ],
+    "composition": {
+      "providers": [
+        {
+          "provider": "magic-context",
+          "tools": []
+        },
+        {
+          "provider": "prefrontal-core",
+          "tools": []
+        }
+      ],
+      "compaction": {
+        "provider": "magic-context"
+      },
+      "step_transform_items": [
+        {
+          "provider": "magic-context",
+          "preset": "worker",
+          "params": {},
+          "subscriptions": [
+            {
+              "hook": "pre_tool",
+              "phase": "validate",
+              "ops": [],
+              "on_unavailable": "pass",
+              "budget_ms": 1000
+            }
+          ]
+        }
+      ]
+    },
+    "composition_digest": "0482cc96fe3b2a69a8a81a10d43a23a18151ed81450d39c3d3d24fa82cb2189c"
+  },
+  "composition": "compositions/pre-tool-declared.json",
+  "expected": {
+    "admitted": false,
+    "code": "invalid_params",
+    "detail": {
+      "field": "plan.step_transform_items",
+      "item": 0,
+      "subscription": 0,
+      "problem": "ops_on_pre_tool"
+    },
+    "writes": "nothing"
+  },
+  "settled": "Extensibility room, 2026-10-01 #912–#916; MC Q5/Q11",
+  "runner_declaration": {
+    "hooks": true,
+    "compaction": true
+  }
+}

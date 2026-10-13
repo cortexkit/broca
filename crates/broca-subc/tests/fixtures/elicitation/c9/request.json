@@ -1,0 +1,43 @@
+{
+  "tag": "elicitation-records-v1",
+  "method": "elicitation.request",
+  "request": {
+    "kind": "consent",
+    "title": "Run bash",
+    "prompt": "Allow this command?",
+    "options": [
+      {
+        "id": "approve",
+        "label": "Approve",
+        "effect": "grant"
+      },
+      {
+        "id": "deny",
+        "label": "Deny",
+        "effect": "decline"
+      }
+    ],
+    "default": "deny",
+    "urgency": "normal",
+    "on_expiry": "deny",
+    "material_damage": true,
+    "late_execution": "execute",
+    "target": {
+      "kind": "module",
+      "label": "aft"
+    },
+    "expires_in_ms": 60000,
+    "call_key": "br:episode:17",
+    "module": "aft",
+    "tool": "bash",
+    "schema_pin": "tp1:bash:example-schema:1",
+    "executor": "runner",
+    "args_jcs": "{\"command\":\"printf ok\",\"cwd\":\"/project\"}",
+    "args_hash": "0c9151b4c4a4d6f6b89255252e997813ea683956186a42e294f3f8a22ae002f3"
+  },
+  "reply": {
+    "elicitation_id": "el_call",
+    "args_hash": "0c9151b4c4a4d6f6b89255252e997813ea683956186a42e294f3f8a22ae002f3",
+    "approval_digest": "56bab7087909a6d064453af22409a7bc3d2266299893f31c9e504344a703f1d7"
+  }
+}

@@ -1,0 +1,254 @@
+{
+  "tool-and-text": {
+    "provider": "aft",
+    "request": {
+      "preset": "head",
+      "params": {
+        "behavior": "interactive",
+        "scope": "all",
+        "tool_descs": "full",
+        "host": "broca"
+      },
+      "system_text": {
+        "preset": "head",
+        "params": {}
+      },
+      "composition": {
+        "providers": [
+          {
+            "provider": "aft",
+            "tools": [
+              {
+                "name": "bash",
+                "capabilities": [
+                  "shell.exec/v1"
+                ]
+              },
+              {
+                "name": "bash_status",
+                "capabilities": [
+                  "shell.exec/v1"
+                ]
+              },
+              {
+                "name": "edit",
+                "capabilities": [
+                  "code.edit/v1"
+                ]
+              },
+              {
+                "name": "read",
+                "capabilities": [
+                  "code.read/v1"
+                ]
+              }
+            ]
+          },
+          {
+            "provider": "magic-context",
+            "tools": [
+              {
+                "name": "ctx_memory",
+                "capabilities": [
+                  "magic-context:memory.write/v1"
+                ]
+              },
+              {
+                "name": "ctx_note",
+                "capabilities": [
+                  "magic-context:notes/v1"
+                ]
+              },
+              {
+                "name": "ctx_search",
+                "capabilities": [
+                  "magic-context:archive.search/v1"
+                ]
+              }
+            ]
+          },
+          {
+            "provider": "prefrontal-core",
+            "tools": [
+              {
+                "name": "browser_use",
+                "capabilities": [
+                  "browser.use/v1",
+                  "cerebellum:browser.use/v1"
+                ]
+              },
+              {
+                "name": "computer_use",
+                "capabilities": [
+                  "cerebellum:computer.use/v1",
+                  "computer.use/v1"
+                ]
+              }
+            ]
+          }
+        ],
+        "step_transform_items": []
+      }
+    }
+  },
+  "text-only": {
+    "provider": "prefrontal-core",
+    "request": {
+      "params": {},
+      "system_text": {
+        "preset": "worker",
+        "params": {
+          "role": "mason"
+        }
+      },
+      "composition": {
+        "providers": [
+          {
+            "provider": "aft",
+            "tools": [
+              {
+                "name": "bash",
+                "capabilities": [
+                  "shell.exec/v1"
+                ]
+              },
+              {
+                "name": "edit",
+                "capabilities": [
+                  "code.edit/v1"
+                ]
+              },
+              {
+                "name": "read",
+                "capabilities": [
+                  "code.read/v1"
+                ]
+              }
+            ]
+          },
+          {
+            "provider": "magic-context",
+            "tools": []
+          },
+          {
+            "provider": "prefrontal-core",
+            "tools": []
+          }
+        ],
+        "compaction": {
+          "provider": "magic-context"
+        },
+        "step_transform_items": [
+          {
+            "provider": "magic-context",
+            "preset": "worker",
+            "params": {},
+            "subscriptions": [
+              {
+                "hook": "pre_user",
+                "ops": [
+                  "append"
+                ],
+                "on_unavailable": "refuse",
+                "budget_ms": 1000
+              },
+              {
+                "hook": "post_tool",
+                "tools": [
+                  "read"
+                ],
+                "ops": [
+                  "append"
+                ],
+                "on_unavailable": "refuse",
+                "budget_ms": 1000
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "worker-tool-and-text": {
+    "provider": "prefrontal-core",
+    "request": {
+      "preset": "worker",
+      "params": {
+        "exclude": [
+          "web_search"
+        ]
+      },
+      "system_text": {
+        "preset": "worker",
+        "params": {
+          "role": "mason"
+        }
+      },
+      "composition": {
+        "providers": [
+          {
+            "provider": "aft",
+            "tools": [
+              {
+                "name": "bash",
+                "capabilities": [
+                  "shell.exec/v1"
+                ]
+              },
+              {
+                "name": "edit",
+                "capabilities": [
+                  "code.edit/v1"
+                ]
+              },
+              {
+                "name": "read",
+                "capabilities": [
+                  "code.read/v1"
+                ]
+              }
+            ]
+          },
+          {
+            "provider": "prefrontal-core",
+            "tools": [
+              {
+                "name": "ask",
+                "capabilities": [
+                  "prefrontal-core:parent.ask/v1"
+                ]
+              },
+              {
+                "name": "browser_use",
+                "capabilities": [
+                  "browser.use/v1",
+                  "cerebellum:browser.use/v1"
+                ]
+              },
+              {
+                "name": "computer_use",
+                "capabilities": [
+                  "cerebellum:computer.use/v1",
+                  "computer.use/v1"
+                ]
+              },
+              {
+                "name": "knowhow",
+                "capabilities": [
+                  "prefrontal-core:knowhow.read/v1"
+                ]
+              },
+              {
+                "name": "sidekick",
+                "capabilities": [
+                  "prefrontal-core:sidekick.research/v1"
+                ]
+              }
+            ]
+          }
+        ],
+        "step_transform_items": []
+      }
+    }
+  }
+}

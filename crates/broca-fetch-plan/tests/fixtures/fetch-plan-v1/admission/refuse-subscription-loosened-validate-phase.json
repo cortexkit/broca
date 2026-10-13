@@ -1,0 +1,50 @@
+{
+  "plan": "plans/pre-tool-two-phase.json",
+  "composition": "compositions/pre-tool-two-phase.json",
+  "declarations": [
+    {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "answer": {
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "mutate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          },
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 500
+          }
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "admitted": false,
+    "code": "plan_stale",
+    "detail": {
+      "differences": [
+        {
+          "kind": "subscription_loosened",
+          "provider": "magic-context",
+          "hook": "pre_tool",
+          "phase": "validate",
+          "field": "budget_ms"
+        }
+      ]
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": true,
+    "compaction": true
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "first_send_inline": {
+    "prompt": "A planless first episode",
+    "send_id": "first"
+  },
+  "later_plan": "plans/broca-head.json",
+  "expected": {
+    "admitted": false,
+    "code": "plan_drift",
+    "detail": {
+      "sent": "8f3ac238ef62c3ea5018135445beb0db6b568cdeba8674a2edadb5de03490022"
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false
+  }
+}

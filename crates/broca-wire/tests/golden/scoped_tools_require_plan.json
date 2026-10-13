@@ -1,0 +1,1 @@
+{"code":"scoped_tools_require_plan","message":"tools on a scoped session must come from a fetch plan, because tool providers require a per-call preset on scoped routes","detail":{"class":"permanent"}}

@@ -1,0 +1,17 @@
+[package]
+name = "broca-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca canonical types: provider<->runner stream-parts, runner<->caller control-units, error taxonomy, usage, cache-tier markers, and std-only single-write diagnostics. No transport dependency."
+
+[dependencies]
+cortexkit-anthropic-policy = { path = "../cortexkit-anthropic-policy" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+

@@ -1,0 +1,131 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {
+        "behavior": "autonomous",
+        "scope": "readwrite",
+        "tool_descs": "concise",
+        "host": "broca",
+        "remote_exec": {
+          "enabled": true,
+          "default_demand": "linux"
+        },
+        "siblings": [
+          "/Users/worker/projects/commons",
+          "/Users/worker/projects/claustrum"
+        ]
+      }
+    }
+  ],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "worker",
+      "params": {
+        "role": "mason"
+      }
+    }
+  ],
+  "compaction_item": {
+    "provider": "magic-context",
+    "preset": "worker",
+    "params": {}
+  },
+  "step_transform_items": [
+    {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "subscriptions": [
+        {
+          "hook": "pre_user",
+          "ops": [
+            "append"
+          ],
+          "on_unavailable": "refuse",
+          "budget_ms": 1000
+        },
+        {
+          "hook": "post_tool",
+          "tools": [
+            "read"
+          ],
+          "ops": [
+            "append"
+          ],
+          "on_unavailable": "refuse",
+          "budget_ms": 1000
+        }
+      ]
+    }
+  ],
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "magic-context",
+        "tools": []
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": []
+      }
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    },
+    "step_transform_items": [
+      {
+        "provider": "magic-context",
+        "preset": "worker",
+        "params": {},
+        "subscriptions": [
+          {
+            "hook": "pre_user",
+            "ops": [
+              "append"
+            ],
+            "on_unavailable": "refuse",
+            "budget_ms": 1000
+          },
+          {
+            "hook": "post_tool",
+            "tools": [
+              "read"
+            ],
+            "ops": [
+              "append"
+            ],
+            "on_unavailable": "refuse",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    ]
+  },
+  "composition_digest": "4fbb7040e057600736798e3def78aa85af81305cb1b1d217638f7bad8457b623"
+}

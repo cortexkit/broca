@@ -1,0 +1,33 @@
+[package]
+name = "broca-fetch-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fetch-plan admission: checks a session's first-send plan, fetches every provider's catalog and system text once under one deadline, and builds the frozen manifest its RunStarted records."
+
+[dependencies]
+broca-protocol = { path = "../broca-protocol" }
+broca-wal = { path = "../broca-wal" }
+# The tool-provider and step-transform-provider role crates own the catalog and declaration
+# wire types and the subscription admission rules; broca uses them rather than copies. Path deps
+# for the same reason as every other commons crate here (see broca-module-serve's manifest).
+cortexkit-role-tool-provider = { workspace = true }
+cortexkit-role-step-transform-provider = { workspace = true }
+cortexkit-role-compaction-provider = { workspace = true }
+# The runner role's refusal codes and details, and the baseline's item types.
+cortexkit-role-llm-runner = { workspace = true }
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# RFC 8785 (JCS) canonical JSON: a plan's identity is the SHA-256 of its canonical bytes.
+serde_jcs = { workspace = true }
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+broca-test-support = { path = "../broca-test-support" }
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,1 @@
+{"code":"account_selection_refused","message":"the routing module refused to choose a provider account for this send (account_pool_exhausted); retry after 1260 s","detail":{"routing_code":"account_pool_exhausted","class":"transient","retry_after_s":1260,"retry_after_secs":1260.0,"decision_id":"acd-0123"}}

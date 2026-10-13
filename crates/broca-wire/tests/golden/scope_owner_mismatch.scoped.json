@@ -1,0 +1,1 @@
+{"code":"scope_owner_mismatch","message":"this session is scoped to 'reserved:prefrontal-core' (ref 'head-1') and accepts sends only from that owner over a route stamped with the same scope","detail":{"kind":"scoped","owner":"reserved:prefrontal-core","ref":"head-1","scope_epoch":3,"presented_principal":"reserved:magic-context"}}

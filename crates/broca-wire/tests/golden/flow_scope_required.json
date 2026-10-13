@@ -1,0 +1,1 @@
+{"code":"flow_scope_required","message":"this principal may send only under a flow scope","class":"permanent","detail":{"kind":"flow_scope_required","principal":"reserved:basal"}}

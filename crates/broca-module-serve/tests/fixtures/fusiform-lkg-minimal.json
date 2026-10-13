@@ -1,0 +1,14 @@
+{
+  "catalog_version": 1786625485104,
+  "models": {
+    "openai/gpt-4o-mini": {
+      "capability.attachment": true,
+      "capability.reasoning": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 128000
+    }
+  },
+  "resolved_at_ms": 1786627685419,
+  "source": "models.dev"
+}

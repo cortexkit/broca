@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"00000000-0000-4000-8000-000000000002","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/text-project"}
+{"type":"model_change","id":"text-model","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","provider":"google","modelId":"gemini-scrubbed"}
+{"type":"message","id":"text-user","parentId":"text-model","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"Synthetic text-only request."}],"timestamp":1767225602000}}
+{"type":"message","id":"text-assistant","parentId":"text-user","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Synthetic text-only response."}],"api":"google-generative-ai","provider":"google","model":"gemini-scrubbed","timestamp":1767225603000}}

@@ -1,0 +1,1 @@
+{"state":"interrupted","error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"final_step_finish_reason":"tool_calls","undelivered_steers":[],"indeterminate_tool_calls":["call_slow"],"usage":{},"retries_used":0}

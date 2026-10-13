@@ -1,0 +1,48 @@
+{
+  "method": "elicitation.withdraw",
+  "reply": {
+    "answered_at_ms": "@ANSWERED_AT_MS@",
+    "created_at_ms": "@NOW_MS@",
+    "default": "deny",
+    "duration": "this call",
+    "elicitation_id": "@ELICITATION_ID@",
+    "expires_at_ms": "@EXPIRES_AT_MS@",
+    "expires_in_ms": 60000,
+    "facts": [],
+    "kind": "consent",
+    "late_execution": "execute",
+    "material_damage": true,
+    "on_expiry": "deny",
+    "options": [
+      {
+        "effect": "grant",
+        "id": "transfer:chrome",
+        "label": "Copy from Chrome"
+      },
+      {
+        "effect": "decline",
+        "id": "deny",
+        "label": "Not now"
+      }
+    ],
+    "prompt": "May I copy your login?",
+    "scope": "github.com",
+    "session_ref": "ses_head",
+    "state": "withdrawn",
+    "subject": {
+      "agent_id": "@HEAD_AGENT_ID@",
+      "head_agent_id": "@HEAD_AGENT_ID@",
+      "label": "ALF"
+    },
+    "target": {
+      "kind": "site",
+      "label": "github.com"
+    },
+    "title": "Copy login",
+    "urgency": "normal"
+  },
+  "request": {
+    "elicitation_id": "@ELICITATION_ID@"
+  },
+  "tag": "elicitation-requester-v1"
+}

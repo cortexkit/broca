@@ -1,0 +1,357 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    # `train/**` is a PRECONDITION for CI-gated trains, not a convenience. Under required
+    # status checks a push to master is refused unless its sha already carries a green check,
+    # and a check only exists if a workflow ran on the branch that produced the sha. Enabling
+    # protection while this trigger is master-only makes master unpushable with no check ever
+    # arriving -- the fleet-wide shape QTA found, since nearly every seat triggers on its
+    # default branch alone. Widen the trigger BEFORE turning protection on.
+    branches: [master, 'train/**']
+  pull_request:
+  workflow_call:
+  # Exercise the floating daemon/vault test rigs daily; linked crates are pinned.
+  schedule:
+    - cron: "0 6 * * *"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Workflow-wide, not per step: any step that runs a script importing a shared module under
+  # scripts/lib/ leaves a __pycache__ there, and the clean-worktree check at the end rightly
+  # refuses it. Set once here, so a new python step cannot forget it; a per-step setting
+  # is how the deploy-gate self-test slipped when scripts/lib/wal_gate.py arrived.
+  PYTHONDONTWRITEBYTECODE: "1"
+  # Line tables keep panics and backtraces readable while cutting the debug target to a
+  # fraction of its size. Full debuginfo filled a GitHub-hosted Linux runner's disk and the
+  # linker died mid-build.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  # Linux + Windows matrix. Windows is the load-bearing leg: the cfg(windows) paths
+  # (e.g. the lease's ERROR_LOCK_VIOLATION contention check, the subc-binary .exe
+  # suffix) cannot be exercised by local macOS/Linux development. macOS is intentionally
+  # NOT in CI: it is the development platform (continuously exercised by local cargo test
+  # + clippy) and macOS-vs-Linux divergence risk is low (both POSIX).
+  #
+  # Linux jobs run on Latchkey's managed Ubuntu runners; Latchkey has no Windows runners,
+  # so the Windows leg stays on GitHub-hosted runners.
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            # 4 vCPU, 16 GB, 100 GB disk. The leg also builds the subconscious and claustrum
+            # fixtures, which made the 2 vCPU size the slowest job in the run.
+            runner: latchkey-medium
+          - os: windows
+            runner: windows-latest
+    defaults:
+      run:
+        working-directory: broca
+    steps:
+      # A GitHub-hosted Linux runner starts with roughly 14 GB free; the workspace's test
+      # build plus the daemon and vault fixtures need more. These preinstalled SDKs are unused.
+      # Latchkey runners have 100 GB and no such SDKs, so the step runs only on GitHub's.
+      - name: Free runner disk
+        if: matrix.os == 'ubuntu' && runner.environment == 'github-hosted'
+        working-directory: /
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+
+      - name: Checkout broca
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+
+      # FIRST after checkout, and BEFORE the sibling checkouts, so trigger drift fails in
+      # seconds rather than after a full matrix build (ENGRAM's placement).
+      #
+      # ONE LEG ONLY, and that is not an optimisation. This asserts facts about a FILE, so its
+      # answer cannot differ by platform -- and on a Windows leg `pwsh` SOURCES a script rather
+      # than executing it and exits 0, so the step reports success having run nothing. That is
+      # the worse half of the trap: CKTUI hit the loud version (a red leg gets investigated)
+      # and QTA hit the green one, on the very check the fleet added to stop preconditions
+      # rotting unnoticed. `matrix.os` is a platform guard, not the path-dependent condition
+      # the checker itself forbids -- it is identical however the push arrived.
+      #
+      # The checker prints what it EXAMINED (branches, jobs, conditions) rather than a verdict,
+      # so a run that parsed nothing cannot print the same reassuring line as a healthy one.
+      # That denominator is what made the silent-pass visible: one summary line for two legs.
+      - name: Train preconditions
+        if: matrix.os == 'ubuntu'
+        run: python3 scripts/check-train-preconditions.py
+
+      # Sibling checkouts supply test rig binaries only. Linked fleet crates are
+      # resolved from exact registry releases or pinned git revisions.
+      - name: Checkout subconscious
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: cortexkit/subconscious
+          path: subconscious
+
+      # The credential arms boot a real claustrum beside broca. Without this checkout they
+      # skip -- and a skipped test here reports PASS, so CI showed green on them at 0.007s,
+      # which is not enough time to spawn a daemon let alone a vault. They were dark for two
+      # days behind that PASS while a catalog change stopped them reaching credentials at all.
+      - name: Checkout claustrum
+        if: matrix.os == 'ubuntu'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: cortexkit/claustrum
+          path: claustrum
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          components: clippy, rustfmt
+
+      - uses: taiki-e/install-action@2eb6de229bc778f7df20e106e4b34e9a364c73e6 # nextest tag
+
+      # The provider-family e2e tests boot the pinned @copilotkit/aimock devDep (a
+      # Node mock LLM server) from node_modules, which is gitignored. Without it the
+      # tests can't boot aimock: most skip, but stream_errors_e2e requires it and
+      # fails — so the whole mock matrix only runs for real once `npm ci` installs it.
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - name: Install aimock (npm ci)
+        run: npm ci
+
+      # The real-subc spine tests (dogfood, resume_spine, tool_fault_spine) spawn the
+      # subc-core daemon + fake-aft-stub as subprocesses. Both are bins in the sibling
+      # subc-core crate, so one build produces them; the rig probes
+      # ../../../subconscious/target/debug, which matches this checkout layout. Without
+      # this step the tests skip — and BROCA_REQUIRE_SUBC (set on the Rust gate step)
+      # turns that skip into a loud failure, so a future drop of this step can't silently
+      # zero the spine coverage while showing green.
+      - name: Build subc binaries (real-subc spine tests)
+        working-directory: subconscious
+        run: cargo build -p subc-core --bins
+
+      # Debug, not release: the rig's default path is release only because that is what a
+      # workstation has lying around, and CK_CLAUSTRUM_BIN/CK_AUTH_BIN below point at debug
+      # so CI pays a debug build instead of an optimised one it gains nothing from.
+      #
+      # Linux only, matching the deploy-gate self-test. The credential arms exercise the vault
+      # pause/resume path, which is not platform-specific, so one leg proves it -- and pinning
+      # a binary path per platform to gain nothing would just add a way for Windows to fail.
+      - name: Build claustrum binaries (credential e2e arms)
+        if: matrix.os == 'ubuntu'
+        working-directory: claustrum
+        run: cargo build -p credentials-module --bins
+
+      - name: Check linked dependency sources
+        run: python3 scripts/check-path-deps.py && python3 scripts/test-check-path-deps.py
+        shell: bash
+
+      - name: Real Linux ELF deployment under subc
+        if: matrix.os == 'ubuntu'
+        timeout-minutes: 15
+        env:
+          SUBC_CORE_BIN: ${{ github.workspace }}/subconscious/target/debug/ck-subc
+          BROCA_DEPLOY_TEST_BIN: ${{ github.workspace }}/broca/target/release/ck-broca
+          BROCA_REQUIRE_LINUX_DEPLOY: "1"
+        run: |
+          cargo build --release --locked -p broca-module-serve
+          python3 -B scripts/test-place-release-gate.py LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v
+        shell: bash
+
+      - name: Check shared Anthropic policy dependencies
+        if: matrix.os == 'ubuntu'
+        run: python3 scripts/test-anthropic-policy-deps.py
+
+      - name: Rust test gate (live and test-clock, fmt, clippy, units, integrations, doctests)
+        # On GitHub's hosted Windows runner this step takes 24-29 minutes (build plus about
+        # 1,300 tests, measured over six green runs on 2026-10-10). The bound exists to stop a
+        # leaked child holding the output pipe open after the tests finish; a single stuck test
+        # is already terminated after five minutes by the nextest profile.
+        timeout-minutes: 45
+        # The checked-in default nextest profile reserves two cores for local workstation
+        # headroom. CI runners are otherwise idle, so use every core here.
+        env:
+          # Anti-masking guard: missing subc binaries MUST fail in CI rather than silently
+          # skipping the real-daemon spine suite.
+          BROCA_REQUIRE_SUBC: "1"
+          # Anti-masking guard: missing aimock/node_modules MUST fail in CI rather than
+          # silently skipping the provider-family mock matrix.
+          BROCA_REQUIRE_AIMOCK: "1"
+          # Anti-masking guard, and the reason the checkout above is worth its build time: a
+          # missing vault MUST fail here rather than skipping. Without this the credential
+          # arms report PASS in single-digit milliseconds, which is indistinguishable from
+          # having run -- the exact shape that hid them for two days.
+          BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
+          CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/claustrum/target/debug/ck-claustrum', github.workspace) || '' }}
+          CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/claustrum/target/debug/ck-auth', github.workspace) || '' }}
+          NEXTEST_PROFILE: ci
+          NEXTEST_TEST_THREADS: num-cpus
+        run: ./scripts/rust-test-gate.sh
+        shell: bash
+
+      # The deploy gate decides whether restarting broca would cut a live run. Its one failure
+      # mode is approving a restart that does, and the r104 fix -- refusing on an unreadable WAL
+      # rather than reading it as sealed -- is the guard against reaching that by a permission
+      # change or transient IO error.
+      #
+      # It carries a self-test and nothing ran it. A script exercised only by hand is checked
+      # exactly when someone remembers, which is not a schedule. Verified to DISCRIMINATE before
+      # being wired here: planting the r104 fail-open (return False for an unreadable WAL) turns
+      # `self-test passed` into `self-test FAILED ... must raise, not report a state`, exit 1.
+      #
+      # Linux only. The gate reads a POSIX state root and CI has no WAL tree; the self-test
+      # builds its own scratch files, so one platform proves the logic.
+      - name: Deploy-gate self-test
+        if: runner.os == 'Linux'
+        run: python3 scripts/live-runs.py --self-test
+        shell: bash
+
+      # audit-export-lane.py compares its terminal-state allowlist with broca-core in
+      # both directions. An omitted state could disable the audit for a whole database.
+      # The self-test reads source and an in-memory database, so one platform suffices.
+      - name: Export-lane enumeration self-test
+        if: runner.os == 'Linux'
+        run: python3 scripts/audit-export-lane.py --self-test
+        shell: bash
+
+      # SIX EXECUTABLE SCRIPT SUITES EXISTED AND NOTHING RAN ANY OF THEM. Found while fixing
+      # issue #20: they are run when someone remembers, which is the property their own
+      # docstrings argue against -- test-train-push.py exists precisely because the previous
+      # arms "proved the change once and could never prove it again", and an unrun suite has
+      # the same defect one level up.
+      #
+      # These guard operator tooling that touches SHARED STATE: the release seam another seat
+      # places from, the train lock, the WAL archive readers, a destructive re-key. A
+      # regression there is found by an operator mid-operation, which is the worst place.
+      #
+      # Linux only, and DELIBERATELY so for one of them: test-stage-release.py stubs `uname`
+      # rather than reading the host's, so it reproduces the macOS-only defect ON LINUX. A
+      # platform-specific bug whose arm only runs on that platform is an arm that cannot fail
+      # in CI; stubbing is what lets one runner prove both.
+      #
+      # test-watch-ci.py is NOT here on purpose: it needs network and an authenticated gh, and
+      # refuses loudly when unarmed rather than skipping. Wiring it would turn a correct
+      # refusal into a red build. Its hermetic sibling test-watch-ci-resolve.py IS here: it
+      # serves the run list from a fake gh and applies the script's own --jq with real jq.
+      - name: Operator script suites
+        if: runner.os == 'Linux'
+        shell: bash
+        # Python bytecode written by these suites would show up as untracked files and fail the
+        # clean-worktree check below. PYTHONDONTWRITEBYTECODE, unlike `python3 -B`, reaches
+        # suites that start Python themselves. It is not ignored in .gitignore, so that check
+        # still sees any other file a suite leaves.
+        #
+        # The list lives in scripts/script-suites.sh, which the local gate also runs, so a
+        # suite cannot pass locally and fail only here.
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: scripts/script-suites.sh
+
+      # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
+      # every run since the repo existed and nothing showed it COULD go red:
+      #   clean tree                     -> passes
+      #   modified tracked file          -> fails, naming it
+      #   untracked file left behind     -> fails, naming it
+      # The third case is the one worth protecting and it rests on a default: porcelain
+      # reports untracked files, so a build that emits a generated source nobody added trips
+      # this. Adding --untracked-files=no while tidying would silently remove exactly that
+      # case, and the remaining two would keep passing.
+      # The diff is EMPTY for an untracked file, so it is printed conditionally: an
+      # unconditional `git diff` under a porcelain listing makes the listing look redundant,
+      # and the listing is the only output naming the file.
+      - name: Verify clean worktree
+        shell: bash
+        run: |
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "::error::Working tree changed during CI (modified tracked files, or new files a build left behind)"
+            printf '%s\n' "$dirty"
+            diff_out="$(git diff -- . | head -c 20000)"
+            if [ -n "$diff_out" ]; then
+              echo "git diff (first 20000 bytes):"
+              printf '%s\n' "$diff_out"
+            else
+              echo "(no diff: the change is untracked files the build left behind -- see the list above)"
+            fi
+            exit 1
+          fi
+
+  postgres-conformance:
+    name: Postgres Store Conformance
+    # The postgres `services:` container needs a Linux runner with Docker.
+    runs-on: latchkey-small
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: broca
+    steps:
+      - name: Checkout broca
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          components: clippy, rustfmt
+
+      - name: Run live-postgres conformance tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+        # Preserve the same resolved registry/git dependency set as the local gate.
+        run: cargo test --locked -p broca-store-postgres -p broca-store --features broca-store-postgres/live-postgres -- --test-threads=1
+
+      # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
+      # every run since the repo existed and nothing showed it COULD go red:
+      #   clean tree                     -> passes
+      #   modified tracked file          -> fails, naming it
+      #   untracked file left behind     -> fails, naming it
+      # The third case is the one worth protecting and it rests on a default: porcelain
+      # reports untracked files, so a build that emits a generated source nobody added trips
+      # this. Adding --untracked-files=no while tidying would silently remove exactly that
+      # case, and the remaining two would keep passing.
+      # The diff is EMPTY for an untracked file, so it is printed conditionally: an
+      # unconditional `git diff` under a porcelain listing makes the listing look redundant,
+      # and the listing is the only output naming the file.
+      - name: Verify clean worktree
+        shell: bash
+        run: |
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "::error::Working tree changed during CI (modified tracked files, or new files a build left behind)"
+            printf '%s\n' "$dirty"
+            diff_out="$(git diff -- . | head -c 20000)"
+            if [ -n "$diff_out" ]; then
+              echo "git diff (first 20000 bytes):"
+              printf '%s\n' "$diff_out"
+            else
+              echo "(no diff: the change is untracked files the build left behind -- see the list above)"
+            fi
+            exit 1
+          fi

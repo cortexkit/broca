@@ -1,0 +1,1 @@
+{"compaction":{"provider":"magic-context"},"providers":[{"provider":"magic-context","tools":[]},{"provider":"prefrontal-core","tools":[]}],"step_transform_items":[{"params":{},"preset":"worker","provider":"magic-context","subscriptions":[{"budget_ms":1000,"hook":"pre_tool","on_unavailable":"pass","ops":[],"phase":"validate"}]}]}

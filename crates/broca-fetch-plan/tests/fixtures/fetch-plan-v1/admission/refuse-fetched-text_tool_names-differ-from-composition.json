@@ -1,0 +1,48 @@
+{
+  "plan": "plans/broca-head.json",
+  "composition": "compositions/broca-head.json",
+  "fetches": [
+    {
+      "provider": "aft",
+      "answer": {
+        "composition_digest": "e5d6c646c78f48fe16b1e3f3d1ee8a656f7bbd5447ba6b8b02a4837d44c4d3a7",
+        "tool_names": [
+          "bash",
+          "bash_status",
+          "edit",
+          "read"
+        ],
+        "system_text": {
+          "composition_digest": "e5d6c646c78f48fe16b1e3f3d1ee8a656f7bbd5447ba6b8b02a4837d44c4d3a7",
+          "tool_names": [
+            "bash",
+            "edit",
+            "read"
+          ]
+        }
+      }
+    }
+  ],
+  "expected": {
+    "admitted": false,
+    "code": "plan_stale",
+    "detail": {
+      "differences": [
+        {
+          "kind": "text_tool_names",
+          "provider": "aft",
+          "missing": [
+            "bash_status"
+          ],
+          "unexpected": []
+        }
+      ]
+    },
+    "writes": "nothing"
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false
+  }
+}

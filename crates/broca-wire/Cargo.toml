@@ -1,0 +1,25 @@
+[package]
+name = "broca-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client-facing wire contracts for the broca session management surface."
+
+[dependencies]
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+# The `llm-runner/v1` role's own types for the members whose meaning the role defines: the
+# `role.describe` answer and the steer delivery receipt on a `session.send` reply. Pure serde.
+# The workspace git pin keeps these types identical to the conformance suite's.
+cortexkit-role-llm-runner = { workspace = true }
+cortexkit-role-agent-data.workspace = true
+
+[dev-dependencies]
+cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
+tokio = { workspace = true, features = ["test-util"] }
+# Only the golden-bytes tests use it, to print and pin each golden file's digest.
+sha2.workspace = true

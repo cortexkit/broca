@@ -1,0 +1,215 @@
+# Error Class Contract (v1)
+
+This document defines the normative error-class contract. The vault and
+magic-context mirror it by reference; subconscious preserves it on results.
+
+## Principle
+
+**Classification is PRODUCED by the error source, never INFERRED by the consumer.**
+A consumer branches on the produced class tag and structured sibling fields only —
+never on status codes, message substrings, or producer-detail codes.
+
+Classification is emitted as a structured field, preserved across every layer
+boundary, and consumed by branching on the class tag. Message text and status
+codes are not substitutes for a producer's classification.
+
+## The closed class set
+
+Wire strings, snake_case, pinned by a conformance test in every producer:
+
+| Wire string | Consumer decision |
+|---|---|
+| `transient` | Retry may succeed. With `retry_after_secs` present: respect it as a backoff floor (a longer producer value wins; a shorter one may clamp down). Without: consumer's own schedule/routing. |
+| `permanent` | Retrying THIS target with THIS input is futile until out-of-band action. Advance to an alternative immediately; if all alternatives are permanent-dead, abandon and surface — never backoff-retry. |
+| `auth_required` | A credential/authorization must be re-established by a human or admin. Pause and surface an actionable auth prompt. Provider-scoped: the consumer marks same-provider alternatives dead from its own routing knowledge. |
+| `context_overflow` | Input exceeds THIS producer+model's bound; retrying the same input against the SAME model is futile. Whether a larger-bound alternative helps is the CONSUMER's decision (windows are heterogeneous — a 128k overflow may be precisely fixable by a 1M fallback). Producer-neutral: model context windows, bounded batch reads, any bounded-input producer. |
+
+The canonical copy-pastable set every producer constant and golden test asserts
+against:
+
+```
+ERROR_CLASS_WIRE_SET = ["transient", "permanent", "auth_required", "context_overflow"]
+(+ optional sibling retry_after_secs, seconds)
+```
+
+## Quota-429 mapping rule
+
+Not all quota errors are the same class, and they all arrive as HTTP 429:
+
+- **Billing/credits exhaustion** (e.g. OpenAI `insufficient_quota`): `permanent` —
+  a human must pay; no amount of waiting fixes it.
+- **Window quotas** (e.g. Claude 5-hour windows, daily caps): `transient` +
+  `retry_after_secs` when the provider supplies it — they self-recover in
+  minutes-to-hours.
+- **Safe default**: when the producer cannot distinguish which kind a quota-429
+  is, map it to `transient`. The costs are asymmetric: mis-classifying as
+  transient burns a few retries; mis-classifying as permanent silently kills a
+  healthy model and fires a false chain-dead alarm in the consumer's health
+  channel.
+
+The `permanent` arm's definition pins as "cannot recover without human or config
+action", which makes the quota split derivable per provider code.
+
+**Ordering rule:** code/body discrimination runs before generic status defaults.
+A quota-429 is indistinguishable only after provider-code discrimination.
+
+
+### Producer-side status/code refinements
+
+These mappings refine the producer's classification only; they do not add wire vocabulary or
+change the consumer contract:
+
+| Provider response | Class |
+|---|---|
+| HTTP 401 | `auth_required` |
+| HTTP 403 (authenticated but forbidden) | `permanent` |
+| Anthropic `authentication_error` | `auth_required` |
+| Anthropic `permission_error` | `permanent` |
+
+A producer may use a more specific structured provider code before applying a generic status
+default. In particular, a credential-authentication code remains `auth_required`, while an
+authorization/entitlement denial remains `permanent`. Only the former reaches vault auth-failure
+reporting; a 403 must not invalidate a valid credential.
+
+## Sibling fields and the detail channel
+
+- `retry_after_secs` (seconds — the only unit) is an optional structured sibling,
+  not arm data. Rate-limitedness is a transport phenomenon, not a consumer
+  decision: a 429 with `Retry-After` is `transient` + the field; a 429
+  `insufficient_quota` (billing exhaustion) is `permanent`.
+- Normalization is the PRODUCER's job: whatever shape the provider sends
+  (`Retry-After` seconds or HTTP-date, `retry-after-ms`, rate-limit-reset headers,
+  reset hints in body text), the producer folds it into `retry_after_secs` so no
+  consumer ever parses headers or text. Consumers treat the value as a backoff
+  floor and may cap it — capping policy stays consumer-local.
+- Producer detail (broca `provider_code`/`status`, vault `ReadError` name)
+  travels alongside for diagnostics, logging, and corroboration ONLY. A consumer
+  branching generically on detail is the bug this contract kills.
+
+## Guard: arm-admission test
+
+*"Does a consumer branch on it GENERICALLY?"*
+
+- `ProviderUnavailable` (broca): NO — its generic decision is `transient`'s;
+  the runner's respawn-and-reissue mechanics are producer business. It maps to
+  `transient` at shared boundaries (`ErrorClass::shared_class`) and survives in
+  detail.
+- `ContextOverflow`: YES — the compaction/reduce trigger is a generic consumer
+  decision distinct from both `permanent` and `transient`. A consumer whose
+  inputs are budget-sized below every target's bound may treat an overflow as its
+  own estimator bug and short-circuit — that mapping is consumer-specific, not
+  contract semantics.
+
+## Consumer decoding: OPEN on read, PINNED on write
+
+The set is pinned for PRODUCERS. Consumers should decode `class` as an OPEN string
+rather than a closed enum, so an unrecognised value becomes a PASSTHROUGH rather
+than a decode failure.
+
+This is not a softening of the contract, and it costs nothing while the set holds.
+It decides what happens on the day it does not: with a closed enum, adding a fifth
+class turns every existing consumer's decode into an error on a field they were
+reading fine — the producer ships a strictly more precise error and the consumer
+reports a parse failure, which is the least useful outcome available. With an open
+string, an unknown class arrives intact and can be logged, surfaced, or defaulted
+by the consumer's own policy.
+
+A consumer that pins the enum makes vocabulary extension a BREAKING change for
+everyone at once, which in practice means it never happens and producers smuggle
+new meanings into `message` text instead. That is the failure this rule exists to
+prevent.
+
+Producers assert the closed set. Widening is a contract amendment; open consumer
+reads protect against vocabulary changes without licensing arbitrary new classes.
+
+## Placement and migration
+
+The contract is the WIRE STRING SET, not a Rust type. Each producer keeps its own
+enum; a pinned string-set serde test per producer asserts conformance. Each producer mirrors this wire contract independently.
+
+broca specifics:
+
+- The canonical enum is `ErrorClass` in `crates/broca-protocol/src/error.rs`.
+- The `Auth` arm's wire spelling is `auth_required`, with `auth` accepted on read
+  indefinitely (serde alias) so WAL records written before the rename replay clean.
+- `ErrorClass::shared_class()` is the boundary mapping for cross-producer
+  consumers.
+- Served management refusals carry their class in their error code, never in the
+  message. The codes whose class is fixed:
+
+  | Code | Class | Detail |
+  |---|---|---|
+  | `variant_unsupported` | `permanent` | `{model, variant, defined}` |
+  | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
+
+  One served admission refusal carries its class in its detail, because its class depends on
+  which refusal routing sent:
+
+  | Code | Class | Detail |
+  |---|---|---|
+  | `account_selection_refused` | `detail.class`: `transient` or `permanent` | `{routing_code, class, retry_after_s?, retry_after_secs?, decision_id?}` |
+
+  The fetch-plan admission refusal `scoped_tools_require_plan` is permanent and carries
+  `detail: {class: "permanent"}`. A new send declaring non-empty legacy `tools` on a stamped
+  route or an already-scoped session needs a fetch plan (carried by the send or already frozen
+  in the session's manifest): scoped tool providers require a per-call preset, which only the
+  manifest supplies. Nothing is fetched or written for this refusal. Existing scope and plan
+  refusals retain precedence, and an already-admitted keyed resend keeps its existing answer.
+  The served bytes are pinned by
+  `crates/broca-wire/tests/golden/scoped_tools_require_plan.json`.
+
+  `account_selection_refused` means the routing module would not choose a provider account
+  for the send; nothing was written. `routing_code` is routing's own refusal code, copied
+  verbatim with its `retry_after_s` and `decision_id`. It is `transient` for
+  `account_hold`, `account_pool_exhausted`, `account_pool_reserve_limited`,
+  `account_quota_unknown` and `account_selection_unavailable`, with `retry_after_secs` set
+  from routing's wait when it gave one; `permanent` for `account_not_authorized`,
+  `admission_conflict` and `invalid_request`. Callers branch on `routing_code` and `class`,
+  never on the message. The bodies are pinned by
+  `crates/broca-wire/tests/golden/account_selection_refused.*.json`.
+
+  `wal_newer_writer` means the session's WAL holds a complete frame that requires WAL
+  features this build does not know: a newer broca wrote it. The bytes are intact and
+  nothing was written, so retrying cannot help; the remedy is to place a build that
+  knows every name in `missing`. It is not in any retryable set. Every other failure
+  to open a session's WAL, corruption included, stays `open_failed`. The `wal_newer_writer` body is
+  pinned by `crates/broca-wire/tests/golden/wal_newer_writer.json`.
+
+  `open_failed` carries optional `detail.class` in the four-class shared vocabulary.
+  Admission and run-resolution causes use `RunError::admission_error_class`, never message
+  matching. Typed temporary WAL I/O (`Interrupted`, `WouldBlock`, `TimedOut`) is transient:
+  the same read can succeed on retry. Unsupported handler operations are permanent.
+  Opaque storage/write/replay/lifecycle errors remain unclassified, including corruption;
+  neither a generic WAL error nor replay failure establishes retryability. A newer writer
+  retains its dedicated code and unchanged body. When class is absent, no detail is added
+  and legacy bytes are unchanged. Consumers must not invent a default class; they may keep
+  their legacy fallback for unclassified errors. All other error bodies are unchanged.
+
+### `open_failed` construction inventory
+
+`broca-module::ServeError::Open` has 14 production construction sites in
+`crates/broca-module/src/serve.rs`, pinned by
+`open_failed_classes::every_open_failed_site_chooses_a_class`:
+
+| Site | Class | Reason |
+| --- | --- | --- |
+| `final_message_of`, missing RunStarted | absent | Missing history supplies no retryable I/O cause. |
+| `final_message_of`, replay failure | absent | Replay errors are not evidence that retry can succeed. |
+| `final_message_of`, missing assistant | absent | Transcript shape alone does not establish a remedy. |
+| `From<OpenError>`, `Open` | absent | Lease, write, replay and lifecycle causes were erased. |
+| `From<OpenError>`, `Classified` | carried | Typed temporary WAL read I/O can succeed on retry. |
+| default `head` | permanent | The handler does not implement the operation. |
+| default `warm` | permanent | The handler does not implement the operation. |
+| default `run_result` | permanent | The handler does not implement the operation. |
+| default `baseline` | permanent | The handler does not implement the operation. |
+| `send`, `Error` | absent | Actor storage, replay and lifecycle failures are opaque strings. |
+| `send`, `ClassifiedError` | `admission_error_class()` | The original admission/run-resolution `RunError` knows the remedy. |
+| `retract`, `Error` | absent | Combined WAL read/write errors have erased causes. |
+| `subscribe`, `Error` | absent | Attachment errors combine replay and channel failures. |
+| `warm`, `Error` | absent | Combined replay, storage and actor failures have erased causes. |
+
+The read classifier only marks `Interrupted`, `WouldBlock` and `TimedOut` transient;
+permission errors and other I/O remain unknown. Corrupt WAL bodies remain byte-identical.
+`WalOpenError::Failed` erases its cause in `WalWriteError`, so writes and recovery/proof
+failures stay unknown rather than guessing from their message. `NewerWriter` is handled
+separately before either conversion and never gains `detail.class` here.

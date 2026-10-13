@@ -1,0 +1,99 @@
+{
+  "providers": [
+    {
+      "provider": "aft",
+      "tools": [
+        {
+          "name": "bash",
+          "capabilities": [
+            "shell.exec/v1"
+          ]
+        },
+        {
+          "name": "bash_status",
+          "capabilities": [
+            "shell.exec/v1"
+          ]
+        },
+        {
+          "name": "edit",
+          "capabilities": [
+            "code.edit/v1"
+          ]
+        },
+        {
+          "name": "read",
+          "capabilities": [
+            "code.read/v1"
+          ]
+        }
+      ]
+    },
+    {
+      "provider": "magic-context",
+      "tools": [
+        {
+          "name": "ctx_memory",
+          "capabilities": [
+            "magic-context:memory.write/v1"
+          ]
+        },
+        {
+          "name": "ctx_note",
+          "capabilities": [
+            "magic-context:notes/v1"
+          ]
+        },
+        {
+          "name": "ctx_search",
+          "capabilities": [
+            "magic-context:archive.search/v1"
+          ]
+        }
+      ]
+    },
+    {
+      "provider": "plexus",
+      "tools": [
+        {
+          "name": "github",
+          "capabilities": [
+            "plexus:github.facade/v1"
+          ]
+        },
+        {
+          "name": "web_search",
+          "capabilities": [
+            "plexus:web.search/v1"
+          ]
+        }
+      ]
+    },
+    {
+      "provider": "prefrontal-core",
+      "tools": [
+        {
+          "name": "browser_use",
+          "capabilities": [
+            "browser.use/v1",
+            "cerebellum:browser.use/v1"
+          ]
+        },
+        {
+          "name": "computer_use",
+          "capabilities": [
+            "cerebellum:computer.use/v1",
+            "computer.use/v1"
+          ]
+        },
+        {
+          "name": "web_search",
+          "capabilities": [
+            "plexus:web.search/v1"
+          ]
+        }
+      ]
+    }
+  ],
+  "step_transform_items": []
+}

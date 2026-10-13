@@ -1,0 +1,4 @@
+{"timestamp":"2026-01-02T10:00:00Z","type":"session_meta","payload":{"id":"codex-text","cwd":"/tmp/text-project","originator":"Codex CLI","cli_version":"1.0.0","model_provider":"openai","base_instructions":"Scrubbed system prompt"}}
+{"timestamp":"2026-01-02T10:00:01Z","type":"turn_context","payload":{"cwd":"/tmp/text-project","model":"gpt-text-scrubbed","approval_policy":"never","sandbox_policy":{"type":"read-only"}}}
+{"timestamp":"2026-01-02T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Give a scrubbed greeting."}]}}
+{"timestamp":"2026-01-02T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Hello from the scrubbed fixture."}]}}

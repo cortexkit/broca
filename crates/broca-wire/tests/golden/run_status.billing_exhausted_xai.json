@@ -1,0 +1,1 @@
+{"state":"error","undelivered_steers":[],"retries_used":0,"error":{"class":"permanent","message":"403: {\"code\":\"personal-team-blocked:spending-limit\",\"error\":\"You have run out of credits or need a Grok subscription...\"}","status":403,"provider_code":"billing_exhausted","account_ref":"acct-x","credential_id":"apikey:xai"}}

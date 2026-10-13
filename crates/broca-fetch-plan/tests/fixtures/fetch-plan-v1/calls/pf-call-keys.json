@@ -1,0 +1,42 @@
+{
+  "valid": [
+    {
+      "name": "ulid record id",
+      "call_key": "pf:01JB3Y5Q8N6V2D4K7M9P0R1S2T"
+    },
+    {
+      "name": "one-byte record id",
+      "call_key": "pf:1"
+    },
+    {
+      "name": "253-byte record id, the longest allowed (256-byte key)",
+      "call_key": "pf:rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    },
+    {
+      "name": "every printable punctuation class is allowed",
+      "call_key": "pf:rec-1_2.3~4:5/6"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "254-byte record id makes a 257-byte key",
+      "call_key": "pf:rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "refused_by": "validate_call_key"
+    },
+    {
+      "name": "space inside the record id",
+      "call_key": "pf:rec 1",
+      "refused_by": "validate_call_key"
+    },
+    {
+      "name": "tab inside the record id",
+      "call_key": "pf:rec\t1",
+      "refused_by": "validate_call_key"
+    },
+    {
+      "name": "empty record id",
+      "call_key": "pf:",
+      "refused_by": "record_id_rule"
+    }
+  ]
+}

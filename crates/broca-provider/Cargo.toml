@@ -1,0 +1,67 @@
+[package]
+name = "broca-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca provider module: owns one provider's SSE transport + auth, normalizes wire->canonical stream-parts, emits the two lanes over the direct runner<->provider socket."
+
+[features]
+# The (A) cross-process bench fixture (arm3 producer). OFF by default so the
+# production provider binary carries neither the bench code nor broca-replay.
+bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
+# The live Anthropic provider (LiveAnthropicProvider): a real HTTP/SSE front for
+# Provider::step. OFF by default so the pure normalize path stays reqwest-free.
+live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:sha2", "dep:tokio-tungstenite", "dep:tungstenite", "tokio/rt"]
+
+[dependencies]
+broca-owner-only.workspace = true
+cortexkit-anthropic-policy = { path = "../cortexkit-anthropic-policy" }
+broca-diagnostics = { path = "../broca-diagnostics" }
+# SIMD terminator search for the SSE field split, which runs once per record on the
+# token-streaming hot path. Already in the tree as a runtime transitive dep of
+# serde_json, so this declares what is compiled rather than adding a crate.
+memchr = "2"
+broca-protocol = { path = "../broca-protocol" }
+# Shared CK request decode types; feature-free and no transport dependencies.
+broca-ck = { path = "../broca-ck" }
+broca-replay = { path = "../broca-replay", optional = true }
+# broca-core for the Provider trait the live provider implements (feature `live`).
+broca-core = { path = "../broca-core", optional = true }
+# Only the bench-replay producer speaks the subc wire; the library codec paths are
+# transport-free so MITM consumers can depend on this crate with zero subc stacks.
+subc-protocol = { workspace = true, optional = true }
+subc-transport = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"], optional = true }
+futures = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bytes = "1"
+httpdate = { version = "1", optional = true }
+# RFC 3339 parsing for the reset timestamp in Google's quota-exhausted 429 body. Already in
+# the lockfile (broca-module-serve), with the same minimal feature set.
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+rand = { version = "0.9", optional = true }
+tokio-util = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+# Codex's Responses socket client, including its permessage-deflate support; rustls only.
+tungstenite = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+
+[dev-dependencies]
+broca-owner-only = { workspace = true, features = ["test-support"] }
+# Test scratch paths live under one owned, self-reclaiming root; see that crate.
+broca-test-support = { path = "../broca-test-support" }
+# The #1b frozen-config-resume gate drives the real loop + truncates the WAL.
+broca-wal = { path = "../broca-wal" }
+# The family e2e harness drives the real run_loop (broca-core) against a mock LLM
+# server (aimock) over the live transport, with a deterministic StubToolPlane. The transport reset
+# test freezes the clock to prove relative resets use the injected value.
+broca-core = { path = "../broca-core", features = ["test-clock"] }
+# Test providers implement broca-core's async `Provider` trait without the `live` feature.
+async-trait.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

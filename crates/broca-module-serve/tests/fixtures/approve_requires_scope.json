@@ -1,0 +1,1 @@
+{"code":"approve_requires_scope","message":"an approve subscription requires a daemon-attested session scope","detail":{"field":"plan.step_transform_items","phase":"approve"}}

@@ -1,0 +1,7 @@
+{"type":"compaction_request","provider":"magic-context","request_id":"cr-42"}
+{"type":"compaction_message","provider":"magic-context","kind":"setup","compaction_id":"head-1","version":1,"range":{"from":0,"to":0},"replacement":[{"role":"user","content":[{"type":"text","text":"head"}]}],"sha256":"4634db2ae6e63e3c2d86e1e2c9a36927ae491351398e7bcb82de0ae8ff955928","call_when":"{\"default\":0.80,\"every_n_steps\":1e1}","stability":[{"index":0,"rank":2}]}
+{"type":"compaction_message","provider":"magic-context","kind":"step","compaction_id":"summary-2","version":2,"range":{"from":0,"to":12},"replacement":[{"role":"user","content":[{"type":"text","text":"summary"}]}],"sha256":"967b0d430ab56fcd0d623d110e93f5b02499076c9b7e21ed96723fe62e29adcf","request_id":"cr-42","cursor":{"lineage_id":"lin-7","after_ordinal":11}}
+{"type":"compaction_answer","provider":"magic-context","request_id":"cr-43","cursor":{"lineage_id":"lin-7","after_ordinal":12},"disposition":"wait","wait":{"reason":"historian is compressing","bound_ms":30000}}
+{"type":"compaction_answer","provider":"magic-context","request_id":"cr-44","cursor":{"lineage_id":"lin-7","after_ordinal":12},"disposition":"structural","rejected":{"compaction_id":"bad-3","version":3,"range":{"from":0,"to":12}}}
+{"type":"compaction_answer","provider":"magic-context","request_id":"cr-45","cursor":{"lineage_id":"lin-7"},"disposition":"timeout"}
+{"type":"compaction_wait","exited":"interrupted","reason":"restart during compaction wait"}

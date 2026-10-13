@@ -1,0 +1,75 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# ENGINE RUNTIME STATE. `broca-run` writes its WAL and single-writer leases under
+# `<project-root>/.broca/`, and --project-root defaults to the CWD -- so running the CLI
+# from a checkout puts session state inside the repo. That is correct behaviour for a
+# harness whose durable log belongs beside the project it drives; what was wrong was
+# tracking the result.
+#
+# A WAL is a TRANSCRIPT: prompts, tool arguments and tool results, verbatim. The two files
+# this rule retired held only a `say pong` acceptance probe, but the same command run
+# against real work would commit that work's contents to a public repository. Nothing about
+# the file makes that visible in a diff -- it is opaque framed bytes -- so the review that
+# would catch it does not exist.
+/.broca/
+**/.broca/
+
+# Node deps for the e2e test harness (aimock) — reinstall with `npm ci` from the
+# committed package.json + package-lock.json. The installed tree is not a deliverable.
+/node_modules
+
+# Commit Cargo.lock (this workspace builds binaries).
+
+.DS_Store
+
+# Agent runtime + local tooling installs (reinstallable, not project deliverables)
+/.alfonso
+/.opencode
+/.agents
+# CortexKit layout: internal docs, scripts and tool state stay out of git.
+!/.cortexkit/
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
+
+# Auto-generated docs from overnight tooling (not hand-maintained deliverables;
+# regenerated, and were repeatedly swept into commits by `git add -A`). Left on disk
+# for reference, kept out of the repo.
+/ARCHITECTURE.md
+/STRUCTURE.md
+
+# Bench capture artifacts (large, regenerable)
+/crates/broca-bench/captures/*.sse
+
+# (A rule for /crates/broca-provider/tests/live/captures/ was removed here. Those 22 files
+# are tracked, nothing on disk reads them, and the rule's only effect was to hide a NEW
+# family's capture from `git status`. The reasoning lives beside the writer, in
+# crates/broca-provider/tests/live_common/mod.rs, which is where someone deciding whether
+# to commit a capture is actually looking.)
+
+# STAGED LOOP CORPUS -- NEVER COMMITTABLE.
+#
+# Rounds of THE LOOP stage a read-only extract here for a worker that cannot reach the live
+# daemon: an export/run-index slice and a sample of REAL PRODUCTION WALs. Those WALs carry
+# full transcripts -- user prompts, tool arguments, tool results -- and this repository has
+# outside contributors.
+#
+# Without this rule the corpus sits untracked in a worktree, one `git add -A` away from
+# being published. The rule is the guard; a convention to be careful is not.
+#
+# Consequence, and it is intended: the corpus is STAGED PER ROUND, never carried in the
+# tree. A prompt that needs a reading gets one staged beside it.
+.loop-corpus/
+
+# Test-runner output. Three nextest logs were committed in a3dbb8c4 (2026-07-10) and
+# tracked until a fleet gitignore census found them: 133 KB of PASS lines and cargo
+# compile paths, benign, but a run's output is evidence of one run on one machine and
+# not a fact about the tree. No .log file has ever been legitimately tracked here.
+*.log
+
+# Test-rig binaries staged into worker worktrees by the head (see .cortexkit/alfonso/scripts).
+/.test-rigs/

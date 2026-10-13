@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-interleaved","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"chatcmpl-interleaved","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"first_call","arguments":"{\"x\":"}}]}}]}
+
+data: {"id":"chatcmpl-interleaved","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"second_call","arguments":"{}"}}]}}]}
+
+data: {"id":"chatcmpl-interleaved","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"arguments":"1}"}}]}}]}
+
+data: {"id":"chatcmpl-interleaved","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]

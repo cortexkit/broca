@@ -1,0 +1,256 @@
+//! The model-step seam. The loop runs each step through this trait, so the
+//! deterministic stub (offline loop proof) and the real direct-socket provider
+//! client are two impls of one contract.
+//!
+//! A step yields a STREAM of normalized events: display deltas (forwarded to the
+//! caller untouched) interleaved with the provider-ASSEMBLED control units (the
+//! only thing the loop consumes). The stream ends after `Finished` or `Error`.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use broca_protocol::{CallOptions, GenerationConfig, NormalizedEvent, StepId, ToolChoice};
+use tokio::{sync::mpsc, time::Instant};
+use tokio_util::sync::CancellationToken;
+
+#[async_trait]
+pub trait Provider: Send + Sync {
+    /// Release run-local network state on completion, cancellation, graceful stop or task abort.
+    /// The loop calls this even if a caller retains the provider for a later run.
+    fn close_run_transport(&self) {}
+
+    /// Runtime break-glass policy for the ChatGPT socket. Evaluated per attempt, off the
+    /// rendering/cache domain; providers for other families ignore it.
+    fn set_chatgpt_https_policy(&self, _policy: Arc<dyn Fn() -> bool + Send + Sync>) {}
+
+    /// Run ONE model step for `opts`. The returned receiver streams normalized
+    /// events until the provider's terminal `Finished`/`Error`.
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent>;
+
+    /// Run one model step with caller-owned cancellation and an optional absolute watchdog
+    /// deadline. Transport-backed providers use the deadline to avoid parking a rate-limit retry
+    /// past the point where the caller will cancel it. The default preserves compatibility for
+    /// providers that complete synchronously or only stream in-process events.
+    async fn step_with_cancel(
+        &self,
+        step_id: StepId,
+        opts: &CallOptions,
+        _cancel: CancellationToken,
+        _deadline: Option<Instant>,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.step(step_id, opts).await
+    }
+
+    /// Run one step from an immutable request snapshot. The default preserves the
+    /// borrowed API for in-process providers; transport providers can retain the
+    /// shared snapshot until blocking request rendering finishes.
+    async fn step_with_shared_cancel(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        cancel: CancellationToken,
+        deadline: Option<Instant>,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.step_with_cancel(step_id, &opts, cancel, deadline)
+            .await
+    }
+
+    /// Run one step that the module's shutdown seal can stop through `seal`, a signal that is
+    /// NOT the caller's cancel. A provider that honors it registers each HTTP attempt with the
+    /// seal, and when the seal trips mid-attempt it hands that attempt's record to the seal
+    /// instead of sending it on the stream, then keeps its stream open and silent until the run
+    /// task is dropped. The default ignores the seal, which leaves the seal nothing to record.
+    async fn step_with_shutdown_seal(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        cancel: CancellationToken,
+        deadline: Option<Instant>,
+        _seal: crate::ShutdownSeal,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.step_with_shared_cancel(step_id, opts, cancel, deadline)
+            .await
+    }
+
+    /// Render `opts` to the EXACT, DETERMINISTIC request bytes this provider would
+    /// send. This is the cache/resume hash domain — the loop hashes THESE bytes,
+    /// and a real provider MUST use the same function to build its live request, so
+    /// the hash can never drift from what's actually sent. The default is the
+    /// shared canonical renderer; a provider with a bespoke wire shape overrides it
+    /// (and MUST stay deterministic + bump its renderer version on any change).
+    fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
+        crate::render::canonical_request_bytes(opts)
+    }
+
+    /// This provider's renderer version (recorded in `run_config`; a change busts
+    /// resume). Defaults to the shared canonical renderer's version.
+    fn renderer_version(&self) -> u32 {
+        crate::render::CANONICAL_RENDERER_VERSION
+    }
+
+    /// This provider's frozen render config, serialized to an OPAQUE blob for the
+    /// WAL. The loop stores it verbatim and never interprets it; on resume the
+    /// provider is reconstructed FROM this blob so it renders byte-identical bytes.
+    /// Providers with no configurable render state use a non-null stateless marker.
+    /// The blob only needs to round-trip losslessly; it is NOT the cache-hash domain
+    /// (that is the rendered request bytes).
+    fn render_config_blob(&self) -> serde_json::Value {
+        serde_json::json!({ "render_config": "stateless" })
+    }
+
+    /// Return a permanent configuration error when a fresh episode cannot be rendered with the
+    /// provider state selected during resolution. The run loop calls this only before writing a
+    /// new `RunStarted`; resumes keep using their previously admitted frozen configuration.
+    fn fresh_admission_config_error(
+        &self,
+        _generation: &GenerationConfig,
+        _tool_choice: &ToolChoice,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Whether this provider sends a `ProviderControl::AttemptFinished` for every attempt,
+    /// INCLUDING the in-flight one when its step is cancelled, and then closes its stream
+    /// promptly. When true, the loop keeps reading a cancelled step's stream for a short grace
+    /// period so that last attempt record reaches the WAL before the run's terminal. When
+    /// false (the default, for in-process providers that may hold their stream open after a
+    /// cancel), the loop stops reading at once, exactly as before attempt records existed.
+    fn reports_attempt_evidence(&self) -> bool {
+        false
+    }
+
+    /// Re-send `base`, an exact request body this provider rendered earlier, shaped so the
+    /// provider generates nothing and only reads (and so keeps) the cached prefix. One attempt,
+    /// never retried. The default cannot warm and sends nothing.
+    async fn warm(&self, _base: &[u8]) -> Result<crate::WarmSent, crate::WarmFailure> {
+        Err(crate::WarmFailure::Unsupported(
+            "this provider cannot warm a prompt cache".into(),
+        ))
+    }
+}
+
+/// A boxed provider is itself a provider — it forwards every method to the inner
+/// value. This lets a caller that chooses a provider at runtime (e.g. a factory that
+/// returns `Box<dyn Provider>` for a catalog-resolved wire family) drive the generic
+/// `run_loop` directly, without the loop needing to know the concrete type.
+#[async_trait]
+impl Provider for Box<dyn Provider> {
+    fn close_run_transport(&self) {
+        (**self).close_run_transport();
+    }
+
+    fn set_chatgpt_https_policy(&self, policy: Arc<dyn Fn() -> bool + Send + Sync>) {
+        (**self).set_chatgpt_https_policy(policy);
+    }
+
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        (**self).step(step_id, opts).await
+    }
+
+    async fn step_with_cancel(
+        &self,
+        step_id: StepId,
+        opts: &CallOptions,
+        cancel: CancellationToken,
+        deadline: Option<Instant>,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        (**self)
+            .step_with_cancel(step_id, opts, cancel, deadline)
+            .await
+    }
+
+    async fn step_with_shared_cancel(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        cancel: CancellationToken,
+        deadline: Option<Instant>,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        (**self)
+            .step_with_shared_cancel(step_id, opts, cancel, deadline)
+            .await
+    }
+
+    async fn step_with_shutdown_seal(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        cancel: CancellationToken,
+        deadline: Option<Instant>,
+        seal: crate::ShutdownSeal,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        (**self)
+            .step_with_shutdown_seal(step_id, opts, cancel, deadline, seal)
+            .await
+    }
+
+    fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
+        (**self).render_request(opts)
+    }
+
+    fn renderer_version(&self) -> u32 {
+        (**self).renderer_version()
+    }
+
+    fn render_config_blob(&self) -> serde_json::Value {
+        (**self).render_config_blob()
+    }
+
+    fn fresh_admission_config_error(
+        &self,
+        generation: &GenerationConfig,
+        tool_choice: &ToolChoice,
+    ) -> Option<String> {
+        (**self).fresh_admission_config_error(generation, tool_choice)
+    }
+
+    fn reports_attempt_evidence(&self) -> bool {
+        (**self).reports_attempt_evidence()
+    }
+
+    async fn warm(&self, base: &[u8]) -> Result<crate::WarmSent, crate::WarmFailure> {
+        (**self).warm(base).await
+    }
+}
+
+/// A deterministic provider that replays a scripted event sequence per step
+/// (offline loop proof). Scripts are consumed in order; a step past the last
+/// script yields an empty stream (a protocol violation the loop surfaces).
+#[derive(Clone)]
+pub struct StubProvider {
+    scripts: Arc<Mutex<VecDeque<Vec<NormalizedEvent>>>>,
+    calls: Arc<Mutex<Vec<CallOptions>>>,
+}
+
+impl StubProvider {
+    /// `scripts[i]` is the event sequence the provider streams for step i.
+    pub fn new(scripts: Vec<Vec<NormalizedEvent>>) -> Self {
+        Self {
+            scripts: Arc::new(Mutex::new(scripts.into())),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Provider call options in invocation order.
+    pub fn calls(&self) -> Vec<CallOptions> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Provider for StubProvider {
+    async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        self.calls.lock().unwrap().push(opts.clone());
+        let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            for ev in script {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+}

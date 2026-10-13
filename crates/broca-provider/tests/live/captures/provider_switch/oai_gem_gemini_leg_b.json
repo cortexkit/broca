@@ -1,0 +1,17 @@
+{
+  "family": "provider_switch",
+  "model": "gemini-2.5-flash",
+  "normalized_events": [
+    "Control(StreamStart { warnings: [] })",
+    "Control(StepStarted { step_id: StepId(1) })",
+    "Display(TextDelta { message_id: MessageId(\"\"), tool_call_id: None, delta: \"synthetic-001 \" })",
+    "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"\"), content: [Text { text: \"synthetic-001 \" }] } })",
+    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(118), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(58), reasoning_tokens: Some(47) }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(Finished { usage: Usage { input_tokens: Some(118), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(58), reasoning_tokens: Some(47) }, finish_reason: Stop, retries_used: 0 })"
+  ],
+  "note": "Synthetic response bytes and normalized events; preserves the original event order, field structure, usage shapes and chunk boundaries. No request or credentials.",
+  "raw_response_base64": null,
+  "raw_response_is_utf8": true,
+  "raw_response_text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic-001 \"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":118,\"candidatesTokenCount\":11,\"totalTokenCount\":176,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":118}],\"thoughtsTokenCount\":47,\"serviceTier\":\"standard\"},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"00000000-0000-4000-8000-000000000062\"}\n\r\n",
+  "scenario": "oai_gem_gemini_leg_b"
+}
