@@ -1646,6 +1646,64 @@ mod tests {
         }
     }
 
+    fn intact_rejected_frames() -> Vec<Vec<u8>> {
+        [
+            "010000000102000000000000000100000000000000e36c2cb768b1bc82603d9f2b9b5887e8e6ef59c06a9cff1568337df0a85031f87b",
+            "000000000200000000000000000000000000000000401da6ea6a614dd6d773b1ba84c91ee6d981827bd0bdc5188aa2e5dbffba558c",
+            "020000000402000000000000000100000000000000bc8904cedfcc5d62bdcada4163a0277512d243828920eb0a756692a79632c3167b7d",
+        ].iter().map(|hex| hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()).collect()
+    }
+
+    #[test]
+    fn intact_rejected_tail_bytes_are_pinned() {
+        use sha2::{Digest, Sha256};
+        let frames = intact_rejected_frames();
+        for (frame, digest) in frames.iter().zip([
+            "fc173954f8d37c3ab05dca617977688791396ed3ce890761a8ec309fa4a61003",
+            "aadca446961718a022df99918817d44dc7b82e1d6a17bcda15982600f8ffd3a0",
+            "e798c4b8bf64d274cb865b2c095edfce1509ee08a10e1c645e04037b90565fb4",
+        ]) {
+            assert_eq!(format!("{:x}", Sha256::digest(frame)), digest);
+        }
+        assert!(matches!(
+            crate::framing::decode_next(&frames[0]),
+            DecodeStep::Corrupt(FrameError::Deserialize(_))
+        ));
+        assert!(matches!(
+            crate::framing::decode_next(&frames[1]),
+            DecodeStep::Corrupt(FrameError::InvalidLineageFrame { .. })
+        ));
+        assert!(matches!(
+            crate::framing::decode_next(&frames[2]),
+            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 4 })
+        ));
+    }
+
+    #[test]
+    fn full_length_corrupt_tail_bytes_pin_decoder_classification() {
+        // Pin zero-filled headers, a damaged digest and an incomplete declared
+        // payload independently of replay's decision to discard only a final tail.
+        let mut bad_length = [0u8; crate::framing::HEADER_LEN];
+        bad_length[..4].copy_from_slice(&[0, 16, 0, 0]);
+        bad_length[4] = 1;
+        assert!(matches!(
+            crate::framing::decode_next(&bad_length),
+            DecodeStep::TornTail
+        ));
+        let mut bad_digest = [0u8; crate::framing::HEADER_LEN];
+        bad_digest[4] = 1;
+        bad_digest[5] = 2;
+        bad_digest[13] = 1;
+        assert!(matches!(
+            crate::framing::decode_next(&bad_digest),
+            DecodeStep::Corrupt(FrameError::DigestMismatch { seq: 2 })
+        ));
+        assert!(matches!(
+            crate::framing::decode_next(&[0u8; crate::framing::HEADER_LEN]),
+            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 0 })
+        ));
+    }
+
     fn expect_sequence_gap<T>(result: Result<T, WalError>, expected_seq: u64, seq: u64) {
         match result {
             Err(WalError::SequenceGap {
