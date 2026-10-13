@@ -41,8 +41,7 @@ jobs:
   # NOT in CI: it is the development platform (continuously exercised by local cargo test
   # + clippy) and macOS-vs-Linux divergence risk is low (both POSIX).
   #
-  # Linux jobs run on Latchkey's managed Ubuntu runners; Latchkey has no Windows runners,
-  # so the Windows leg stays on GitHub-hosted runners.
+  # Every job runs on GitHub-hosted runners.
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -52,9 +51,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu
-            # 4 vCPU, 16 GB, 100 GB disk. The leg also builds the subconscious and claustrum
-            # fixtures, which made the 2 vCPU size the slowest job in the run.
-            runner: latchkey-medium
+            runner: ubuntu-latest
           - os: windows
             runner: windows-latest
     defaults:
@@ -63,9 +60,8 @@ jobs:
     steps:
       # A GitHub-hosted Linux runner starts with roughly 14 GB free; the workspace's test
       # build plus the daemon and vault fixtures need more. These preinstalled SDKs are unused.
-      # Latchkey runners have 100 GB and no such SDKs, so the step runs only on GitHub's.
       - name: Free runner disk
-        if: matrix.os == 'ubuntu' && runner.environment == 'github-hosted'
+        if: matrix.os == 'ubuntu'
         working-directory: /
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
 
@@ -292,7 +288,7 @@ jobs:
   postgres-conformance:
     name: Postgres Store Conformance
     # The postgres `services:` container needs a Linux runner with Docker.
-    runs-on: latchkey-small
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
       postgres:

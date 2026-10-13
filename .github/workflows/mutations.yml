@@ -26,7 +26,7 @@ env:
 jobs:
   mutations:
     name: Mutation catalogue (shard ${{ matrix.shard }}/4)
-    runs-on: latchkey-small
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -49,10 +49,8 @@ jobs:
       run:
         working-directory: broca
     steps:
-      # Same as ci.yml: the build and fixtures need more than a GitHub-hosted runner's
-      # default free space. Latchkey runners have 100 GB, so the step is skipped there.
+      # Same as ci.yml: the build and fixtures need more than the runner's default free space.
       - name: Free runner disk
-        if: runner.environment == 'github-hosted'
         working-directory: /
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
