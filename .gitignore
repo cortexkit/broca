@@ -29,7 +29,6 @@
 /.opencode
 /.agents
 # CortexKit layout: internal docs, scripts and tool state stay out of git.
-!/.cortexkit/
 /.cortexkit/*
 !/.cortexkit/release-notes/
 !/.cortexkit/skills/
