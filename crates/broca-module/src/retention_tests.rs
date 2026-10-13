@@ -2060,12 +2060,14 @@ async fn actor_expiry_hands_owed_withdrawals_to_content_free_worker_before_relea
     // notification instead of guessing how long the actor's teardown will take.
     registry.wait_for_slot_closed(&rig.key).await;
     assert_eq!(registry.slot_state(&rig.key), None);
-    assert!(rig
-        .service
-        .wal
-        .resolve_live_path(&rig.key)
-        .unwrap()
-        .is_none());
+    // The actor logs only that deletion was deferred, so when the WAL survives, ask the
+    // service directly and put its error in the failure: that names which step refused.
+    if let Some(path) = rig.service.wal.resolve_live_path(&rig.key).unwrap() {
+        let retried = rig
+            .service
+            .delete_expired(&rig.key, rig.service.clock.now_ms());
+        panic!("expired WAL still present at {path:?} after the actor closed; a direct delete_expired now returns {retried:?}");
+    }
     assert_eq!(rig.store.pending_retention_withdrawals().unwrap().len(), 1);
     let questions = Arc::new(RetainedQuestions::default());
     rig.service.set_withdrawal_adapter(Arc::new(

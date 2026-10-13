@@ -9699,9 +9699,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let key = self.key.clone();
             let deleted =
                 tokio::task::spawn_blocking(move || service.delete_expired(&key, now_ms)).await;
-            if !matches!(deleted, Ok(Ok(_))) {
+            let failure = match deleted {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(join) => Some(format!("deletion task failed: {join}")),
+            };
+            if let Some(error) = failure {
                 self.registry.repair_retention(&self.key);
-                tracing::warn!(target: "retention", "expired content deletion deferred to sweep");
+                tracing::warn!(target: "retention", %error, "expired content deletion deferred to sweep");
             }
         }
         while let Ok(cmd) = self.rx.try_recv() {
