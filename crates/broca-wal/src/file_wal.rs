@@ -1238,7 +1238,9 @@ fn decode_anchored_suffix(
                     Err(error) => Err(error),
                 };
             }
-            DecodeStep::TornTail if offset > 0 => {
+            DecodeStep::TornTail
+                if offset > 0 && !has_intact_data_after(&bytes[offset..], lineage_id) =>
+            {
                 return Ok(Some(DecodedBytes {
                     records: Vec::new(),
                     valid_end: absolute_start + offset as u64,
@@ -1304,6 +1306,30 @@ fn validate_contiguous_sequence(
     Ok(())
 }
 
+// A damaged length cannot identify the next boundary. Search for intact frames
+// instead; matching lineage-only metadata after a damaged last record is part
+// of its uncommitted tail. Unreadable frames and conflicting identities are not.
+fn has_intact_data_after(bytes: &[u8], mut expected_lineage: Option<WalLineageId>) -> bool {
+    (1..bytes.len().saturating_sub(crate::framing::HEADER_LEN - 1)).any(|offset| {
+        let suffix = &bytes[offset..];
+        match crate::framing::decode_next(suffix) {
+            DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,
+            DecodeStep::Corrupt(_) => crate::framing::digest_verifies(suffix),
+            DecodeStep::Lineage {
+                lineage_id: found, ..
+            } => {
+                if expected_lineage.is_some_and(|first| first != found) {
+                    true
+                } else {
+                    expected_lineage = Some(found);
+                    false
+                }
+            }
+            DecodeStep::TornTail => false,
+        }
+    })
+}
+
 fn decode_bytes_seeded(
     bytes: &[u8],
     absolute_start: u64,
@@ -1329,8 +1355,19 @@ fn decode_bytes_seeded(
                 fold_lineage_id(&mut lineage_id, found)?;
                 offset += consumed;
             }
+            DecodeStep::TornTail if has_intact_data_after(&bytes[offset..], lineage_id) => {
+                return Err(WalError::Corrupt {
+                    offset: (absolute_start + offset as u64) as usize,
+                    source: FrameError::NonTailIncompleteFrame,
+                });
+            }
             DecodeStep::TornTail => break,
             DecodeStep::Corrupt(source) => {
+                if !crate::framing::digest_verifies(&bytes[offset..])
+                    && !has_intact_data_after(&bytes[offset..], lineage_id)
+                {
+                    break;
+                }
                 return Err(WalError::Corrupt {
                     offset: (absolute_start + offset as u64) as usize,
                     source,
@@ -1646,12 +1683,168 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_length_unsynced_tail_recovers_verified_prefix() {
+        for (tag, zero, lineage) in [
+            ("digest-tail", false, false),
+            ("zero-tail", true, false),
+            ("lineage-tail", false, true),
+        ] {
+            let path = tmp(tag);
+            let _ = std::fs::remove_file(&path);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(1, &run_started(1), true).unwrap();
+            let prefix = std::fs::read(&path).unwrap();
+            let id = wal.lineage_id.unwrap();
+            wal.append(1, &run_started(2), false).unwrap();
+            drop(wal);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let record_end = bytes.len() - crate::framing::LINEAGE_FRAME_LEN;
+            if zero {
+                bytes[prefix.len()..record_end].fill(0);
+            } else {
+                bytes[record_end - 1] ^= 0xff;
+            }
+            if !lineage {
+                bytes.truncate(record_end);
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap().len(), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "read never repairs");
+            let mut reopened = FileWal::open(&path).unwrap();
+            assert_eq!(reopened.lineage_id, Some(id));
+            assert_eq!(std::fs::read(&path).unwrap(), prefix);
+            reopened.append(1, &run_started(2), true).unwrap();
+            assert_eq!(reopened.replay().unwrap().len(), 2);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn damaged_length_before_valid_record_is_not_a_torn_tail() {
+        let path = tmp("bad-length-before-record");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        for seq in 1..=3 {
+            wal.append(1, &run_started(seq), true).unwrap();
+        }
+        drop(wal);
+        let anchor = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)
+            .unwrap()
+            .next_anchor
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let second = anchor.byte_end as usize + crate::framing::LINEAGE_FRAME_LEN;
+        bytes[second..second + 4].copy_from_slice(&4096u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            replay_file(&path, DEFAULT_MAX_READ_BYTES),
+            Err(WalError::Corrupt {
+                source: FrameError::NonTailIncompleteFrame,
+                ..
+            })
+        ));
+        assert!(read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, Some(&anchor)).is_err());
+        assert!(FileWal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_record_before_newer_writer_is_not_discarded() {
+        let path = tmp("bad-before-newer");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        drop(wal);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0; crate::framing::HEADER_LEN]).unwrap();
+        drop(file);
+        append_newer_writer_frame(&path, 2);
+        assert!(matches!(
+            FileWal::open(&path),
+            Err(WalError::Corrupt { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
     fn intact_rejected_frames() -> Vec<Vec<u8>> {
         [
             "010000000102000000000000000100000000000000e36c2cb768b1bc82603d9f2b9b5887e8e6ef59c06a9cff1568337df0a85031f87b",
             "000000000200000000000000000000000000000000401da6ea6a614dd6d773b1ba84c91ee6d981827bd0bdc5188aa2e5dbffba558c",
             "020000000402000000000000000100000000000000bc8904cedfcc5d62bdcada4163a0277512d243828920eb0a756692a79632c3167b7d",
         ].iter().map(|hex| hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()).collect()
+    }
+
+    #[test]
+    fn intact_rejected_tail_is_never_repaired() {
+        for (index, frame) in intact_rejected_frames().into_iter().enumerate() {
+            assert!(crate::framing::digest_verifies(&frame));
+            let path = tmp(&format!("intact-rejected-tail-{index}"));
+            let _ = std::fs::remove_file(&path);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(1, &run_started(1), true).unwrap();
+            drop(wal);
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&frame)
+                .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(replay_file(&path, DEFAULT_MAX_READ_BYTES).is_err());
+            assert!(FileWal::open(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn corruption_before_intact_rejected_frame_is_fatal() {
+        let path = tmp("corrupt-before-intact-rejected");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        drop(wal);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0; crate::framing::HEADER_LEN]).unwrap();
+        file.write_all(&intact_rejected_frames()[2]).unwrap();
+        drop(file);
+        let before = std::fs::read(&path).unwrap();
+        assert!(FileWal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conflicting_lineage_after_damage_is_never_repaired() {
+        for legacy in [false, true] {
+            let path = tmp(&format!("foreign-lineage-after-damage-{legacy}"));
+            let _ = std::fs::remove_file(&path);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(1, &run_started(1), true).unwrap();
+            let prefix_id = wal.lineage_id.unwrap();
+            drop(wal);
+            if legacy {
+                std::fs::write(&path, encode(1, 1, &run_started(1)).unwrap()).unwrap();
+            }
+            let first = WalLineageId::from_bytes([0x5a; 16]);
+            let second = WalLineageId::from_bytes([0x5b; 16]);
+            let foreign = if prefix_id == first { second } else { first };
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&[0; crate::framing::HEADER_LEN]).unwrap();
+            file.write_all(&encode_lineage(if legacy { first } else { foreign }))
+                .unwrap();
+            if legacy {
+                file.write_all(&encode_lineage(second)).unwrap();
+            }
+            drop(file);
+            let before = std::fs::read(&path).unwrap();
+            assert!(replay_file(&path, DEFAULT_MAX_READ_BYTES).is_err());
+            assert!(FileWal::open(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -2630,7 +2823,7 @@ mod tests {
         let path = tmp("range-anchor-corrupt");
         let _ = std::fs::remove_file(&path);
         let mut wal = FileWal::open(&path).unwrap();
-        for i in 0..3 {
+        for i in 0..4 {
             wal.append(1, &run_started(i), false).unwrap();
         }
         let first = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)

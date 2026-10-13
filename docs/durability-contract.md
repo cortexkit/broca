@@ -121,7 +121,12 @@ PROVIDER-INVALID (Anthropic rejects it).
 1. **Acquire the lease** (new lease-tenure stamp — §5). Open the WAL; validate each
    record's digest + monotonic `seq` (the `fence` is retained as forensic metadata, not a
    replay gate). Discard a torn/corrupt TRAILING record (never committed); **FAIL LOUD on
-   non-tail corruption**.
+    non-tail corruption**. A digest-verified frame that this reader cannot interpret
+    is intact authority data, not evidence of crash damage: it refuses replay/open,
+    even at EOF, and is never repaired or truncated. Trailing lineage metadata
+    (reserved frames carrying the WAL's durable 128-bit identity, rather than run
+    records) may accompany a discarded damaged record only if claimed identities
+    are consistent with any identity proven in the prefix and with one another.
 2. **`run_config` is authoritative** — rebuild the request config from it; reject
    if caller-supplied config conflicts.
 3. **Fold by TURN:**

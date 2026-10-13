@@ -7492,8 +7492,10 @@ test_file = "crates/broca-wal/src/floor.rs"
 expect_red = ["floor::windows_acl_tests::windows_floor_temporary_and_replacement_are_private"]
 platforms = ["windows"]
 file = "crates/broca-wal/src/floor.rs"
-old = "let mut options = broca_owner_only::OpenOptions::new();"
-new = "let mut options = std::fs::OpenOptions::new(); // NON-VACUITY BREAK"
+old = '''let mut options = broca_owner_only::OpenOptions::new();
+        options.write(true).create_new(true);'''
+new = '''let mut options = std::fs::OpenOptions::new(); // NON-VACUITY BREAK
+        options.write(true).create_new(true);'''
 
 [[control]]
 id = "windows-floor-directory-owner-only"
@@ -9151,3 +9153,289 @@ old = '''.sealed_digest
                     .as_deref()'''
 new = '''.sealed_digest
                     .as_deref().or(Some(plan.digest.as_str())) /* NON-VACUITY BREAK */'''
+
+[[control]]
+id = "wal-full-length-corrupt-tail"
+guards = "Recovery discards damaged final logical records, including trailing lineage metadata"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::full_length_unsynced_tail_recovers_verified_prefix"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'if !crate::framing::digest_verifies(&bytes[offset..])'
+new = 'if false && !crate::framing::digest_verifies(&bytes[offset..]) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "wal-corruption-before-newer-writer"
+guards = "A verified newer-writer record following corruption prevents tail repair"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::corrupt_record_before_newer_writer_is_not_discarded"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,'
+new = '''DecodeStep::Record { .. } => true,
+            DecodeStep::NewerWriter { .. } => false, // NON-VACUITY BREAK: ignore newer records'''
+
+[[control]]
+id = "wal-ordinary-file-byte-ceiling"
+guards = "Raw and preencoded ordinary appends reserve metadata and terminal space below the recovery ceiling"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::unretained_append_never_crosses_recovery_cap"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'if required > self.append_budget {'
+new = 'if false && required > self.append_budget { // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-ordinary-enqueue-byte-ceiling"
+guards = "An ordinary session refuses before enqueue, preserves sequence and writer health, and commits its reserved terminal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
+expect_red = ["wal_writer::retention_tests::unretained_append_never_crosses_recovery_cap"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'if end.saturating_add(reserve) > budget.max_bytes {'
+new = 'if false && end.saturating_add(reserve) > budget.max_bytes { // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-ordinary-size-refusal-code"
+guards = "Ordinary size-refusal terminals use session_too_large without changing retained diagnostics"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
+expect_red = ["wal_writer::retention_tests::unretained_append_never_crosses_recovery_cap"]
+file = "crates/broca-wal/src/size_limit.rs"
+old = 'SizeScope::Session => ("session", "session_too_large"),'
+new = 'SizeScope::Session => ("session", "retained_session_too_large"), // NON-VACUITY BREAK'
+
+[[control]]
+id = "archive-scan-bad-magic-is-not-index"
+guards = "Missing or invalid indexes never turn damaged newer member magic into cached absence"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/archive/tests.rs"
+expect_red = ["archive::tests::newer_bad_magic_with_missing_index_never_returns_older_transcript"]
+file = "crates/broca-wal/src/archive.rs"
+old = 'let info = parse_header(&bytes, offset, members_end)?;'
+new = '''if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != MAGIC_MEMBER { return Ok(entries); } // NON-VACUITY BREAK
+            let info = parse_header(&bytes, offset, members_end)?;'''
+
+[[control]]
+id = "archive-scan-proves-member-boundary"
+guards = "A header cache cannot publish a partial set when the trailer length swallows a member"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/archive/tests.rs"
+expect_red = ["archive::tests::archive_scan_refuses_uncertain_member_boundary"]
+file = "crates/broca-wal/src/archive.rs"
+old = 'if index_len != 0 {'
+new = 'if false && index_len != 0 { // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-directory-barrier-error"
+guards = "A Unix directory sync error refuses creation acknowledgement"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::unix_directory_sync_failure_never_acknowledges_creation"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'crate::directory_sync::sync_dir(&dir_path).map_err(WalError::Io)?;'
+new = 'let _ = crate::directory_sync::sync_dir(&dir_path); // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-reopen-proves-directory"
+guards = "Recovery proves an existing WAL name before publishing durable head"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::reopened_unsynced_creation_syncs_parent_before_recovery_ack"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'dir_needs_sync: Cell::new(true),'
+new = 'dir_needs_sync: Cell::new(created), // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-directory-retry-preserves-chain"
+guards = "A failed directory barrier retains all newly-created parents for retry"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::unix_directory_sync_failure_never_acknowledges_creation"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'self.newly_created_dirs.borrow().iter()'
+new = 'self.newly_created_dirs.borrow_mut().drain(..) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "floor-directory-error-refuses-frame"
+guards = "The feature-floor rename must pass a Unix directory barrier before a gated append"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::floor_directory_eio_refuses_gated_append"]
+file = "crates/broca-wal/src/floor.rs"
+old = '''    crate::directory_sync::sync_dir(dir)
+}'''
+new = '''    let _ = crate::directory_sync::sync_dir(dir); // NON-VACUITY BREAK
+    Ok(())
+}'''
+
+[[control]]
+id = "floor-readable-is-not-durable"
+guards = "A covered floor still proves the prior rename instead of acknowledging a failed directory sync"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::floor_directory_eio_refuses_gated_append"]
+file = "crates/broca-wal/src/floor.rs"
+old = 'return crate::directory_sync::sync_dir(dir);'
+new = 'return Ok(()); // NON-VACUITY BREAK'
+
+[[control]]
+id = "floor-relative-directory-barrier"
+guards = "An empty relative parent syncs the current directory on Unix"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/floor.rs"
+expect_red = ["floor::tests::relative_floor_syncs_current_directory"]
+file = "crates/broca-wal/src/directory_sync.rs"
+old = 'Path::new(".")'
+new = 'path /* NON-VACUITY BREAK: leave an empty relative parent */'
+
+[[control]]
+id = "floor-cross-process-union"
+guards = "Writers with different session leases cannot lose feature-floor union updates across processes"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/floor/process_tests.rs"
+expect_red = ["floor::process_tests::concurrent_process_floor_raises_preserve_union"]
+file = "crates/broca-wal/src/floor.rs"
+old = 'lock.lock()?;'
+new = 'let _ = &lock; // NON-VACUITY BREAK: rely only on the process-local mutex'
+
+[[control]]
+id = "wal-damaged-length-before-record"
+guards = "A damaged payload length cannot hide later verified records as a torn tail"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::damaged_length_before_valid_record_is_not_a_torn_tail"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'DecodeStep::TornTail if has_intact_data_after(&bytes[offset..], lineage_id) => {'
+new = 'DecodeStep::TornTail if false && has_intact_data_after(&bytes[offset..], lineage_id) => { // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-anchored-damaged-length-before-record"
+guards = "An anchored suffix retries full replay rather than silently discarding later verified records"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::damaged_length_before_valid_record_is_not_a_torn_tail"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'offset > 0 && !has_intact_data_after(&bytes[offset..], lineage_id)'
+new = 'offset > 0 /* NON-VACUITY BREAK: discard a damaged anchored suffix */'
+
+[[control]]
+id = "wal-corruption-before-verified-record"
+guards = "Digest damage before a later verified logical record remains fatal in anchored replay"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::anchored_range_still_fails_loud_on_later_corruption"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,'
+new = '''DecodeStep::NewerWriter { .. } => true,
+            DecodeStep::Record { .. } => false, // NON-VACUITY BREAK: ignore known records'''
+
+[[control]]
+id = "wal-intact-rejected-tail-is-not-repaired"
+guards = "Digest-verified unreadable versions and payloads refuse open without truncating authority bytes"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::intact_rejected_tail_is_never_repaired"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = '!crate::framing::digest_verifies(&bytes[offset..])'
+new = 'true /* NON-VACUITY BREAK: treat intact rejected data as crash damage */'
+
+[[control]]
+id = "wal-corruption-before-intact-rejected-frame"
+guards = "Corruption cannot hide a later intact frame just because its version or payload is unreadable"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::corruption_before_intact_rejected_frame_is_fatal"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'DecodeStep::Corrupt(_) => crate::framing::digest_verifies(suffix),'
+new = 'DecodeStep::Corrupt(_) => false, // NON-VACUITY BREAK'
+
+[[control]]
+id = "wal-trailing-lineage-conflict-is-fatal"
+guards = "Tail repair cannot erase a digest-verified lineage identity conflicting with the verified prefix"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::conflicting_lineage_after_damage_is_never_repaired"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'expected_lineage.is_some_and(|first| first != found)'
+new = 'false /* NON-VACUITY BREAK: ignore conflicting verified identities */'
+
+[[control]]
+id = "wal-trailing-lineage-legacy-conflict"
+guards = "A legacy prefix without an identity still refuses two conflicting intact identities after damage"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::conflicting_lineage_after_damage_is_never_repaired"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = 'expected_lineage = Some(found);'
+new = 'let _ = found; // NON-VACUITY BREAK: forget the first verified identity'
