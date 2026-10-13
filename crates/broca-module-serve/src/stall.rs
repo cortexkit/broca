@@ -402,8 +402,9 @@ mod windows_acl_tests {
     use broca_owner_only::test_support::{
         assert_protected_private as assert_private, observe, BroadParent,
     };
-    #[test]
-    fn windows_stall_log_and_directory_are_private() {
+    // `start` reads the current Tokio runtime's metrics, so it needs a runtime, as in production.
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_stall_log_and_directory_are_private() {
         let fixture = BroadParent::new("stall");
         let seen = std::rc::Rc::new(std::cell::Cell::new(0));
         let output = seen.clone();
