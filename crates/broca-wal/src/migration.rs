@@ -60,8 +60,19 @@ pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::Wa
         .map_err(Into::into)
 }
 
+/// Makes a rename, create or unlink inside `path` durable. On unix that takes an fsync of the
+/// directory itself, and a failure must propagate.
+#[cfg(unix)]
 pub fn sync_dir(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
+}
+
+/// NTFS needs no directory handle to make a rename or unlink durable, and `File::open` cannot
+/// open a directory there (it fails with "Access is denied"), so there is nothing to do. This is
+/// the same rule as the WAL fold's directory sync.
+#[cfg(not(unix))]
+pub fn sync_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Every newly created parent is synced too: a synced file in an uncommitted
