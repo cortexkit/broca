@@ -168,7 +168,9 @@ class WorkflowGraph(unittest.TestCase):
         mutations = self.workflow('mutations.yml')['jobs']
         for name in ('mutations', 'mutations-windows'):
             job = mutations[name]
-            self.assertEqual(job['needs'], 'fixtures')
+            # Shards wait for the shared fixtures and for the static platform check, so an
+            # invalid platform claim never starts a native shard.
+            self.assertEqual(job['needs'], ['fixtures', 'mutation-platforms'])
             self.assertEqual(job['strategy']['matrix']['shard'], ['1', '2', '3', '4'])
             script = '\n'.join(s.get('run', '') for s in job['steps'])
             self.assertIn('ckdev-mutate check', script)
