@@ -264,7 +264,8 @@ async fn unretained_append_never_crosses_recovery_cap() {
         .record_size_refusal_terminal(cap, Some(1), Default::default(), 0)
         .unwrap();
     writer.sync().await.unwrap();
-    writer.shutdown().await;
+    // The ceiling refusal must leave a writer that still shuts down cleanly.
+    writer.shutdown().await.unwrap();
     let frames = f.store.read_records(&f.session).unwrap();
     assert!(
         matches!(&frames.last().unwrap().record, WalRecord::RunFinished { reason: broca_protocol::RunFinishReason::Error, error: Some(error), .. } if error.provider_code.as_deref() == Some("session_too_large") && error.class == broca_protocol::ErrorClass::Permanent)
