@@ -699,14 +699,16 @@ impl SubcConnection {
     )> {
         let state = self.shared.current.lock().unwrap();
         let runtime = Arc::clone(&state.runtime);
+        let routes = runtime.route_epochs.lock().unwrap();
         if !state.active
             || handle.conn != runtime.conn
-            || runtime.route_epochs.lock().unwrap().get(&handle.channel) != Some(&handle.epoch)
+            || routes.get(&handle.channel) != Some(&handle.epoch)
         {
             return Err(ConnError::StaleRouteHandle(*handle));
         }
         let (registration, rx) =
             PendingRegistration::new(Arc::clone(&runtime.pending), key, false, None)?;
+        drop(routes);
         Ok((runtime, registration, rx))
     }
 
@@ -1209,9 +1211,10 @@ impl SubcConnection {
         let (runtime, registration, rx, lagged) = {
             let state = self.shared.current.lock().unwrap();
             let runtime = Arc::clone(&state.runtime);
+            let routes = runtime.route_epochs.lock().unwrap();
             if !state.active
                 || route.conn != runtime.conn
-                || runtime.route_epochs.lock().unwrap().get(&route.channel) != Some(&route.epoch)
+                || routes.get(&route.channel) != Some(&route.epoch)
             {
                 return Err(ConnError::StaleRouteHandle(*route));
             }
@@ -1219,6 +1222,7 @@ impl SubcConnection {
                 Arc::clone(&runtime.pending),
                 (route.channel, route.epoch, corr),
             )?;
+            drop(routes);
             (runtime, registration, rx, lagged)
         };
         let frame = Frame::build(
@@ -1260,12 +1264,9 @@ impl SubcConnection {
             Vec::new(),
         )
         .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send(&runtime, frame).await?;
-        let mut routes = runtime.route_epochs.lock().unwrap();
-        if routes.get(&route.channel) == Some(&route.epoch) {
-            routes.remove(&route.channel);
-        }
-        Ok(())
+        // Local invalidation must wake callers even when egress cannot accept the GOODBYE.
+        finish_route(&runtime.pending, &runtime.route_epochs, &frame);
+        self.send(&runtime, frame).await
     }
 
     /// Send ONE unary request on `route_channel` with caller-encoded JSON bytes and await the
@@ -2354,34 +2355,7 @@ async fn reader_task<R>(
         }
 
         if frame.header.ty == FrameType::Goodbye && channel != 0 {
-            let mut routes = route_epochs.lock().unwrap();
-            if routes.get(&channel) == Some(&epoch) {
-                routes.remove(&channel);
-            }
-            drop(routes);
-            let senders: Vec<_> = pending
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(&waiter_key, entry)| {
-                    if waiter_key.0 == channel && waiter_key.1 == epoch {
-                        match entry {
-                            PendingEntry::Live { sender, .. } => Some((waiter_key, sender.clone())),
-                            PendingEntry::LateRouteOpen { .. } => None,
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for (waiter_key, sender) in senders {
-                if matches!(
-                    sender.send(frame.clone()),
-                    Err(PendingSendError::StreamFull)
-                ) {
-                    pending.lock().unwrap().remove(&waiter_key);
-                }
-            }
+            finish_route(&pending, &route_epochs, &frame);
             continue;
         }
 
@@ -2434,6 +2408,26 @@ async fn reader_task<R>(
         route_epochs.lock().unwrap().clear();
         pending.lock().unwrap().clear();
     }
+}
+
+/// Hold the epoch lock through fanout so registration cannot slip between validation and close.
+fn finish_route(pending: &PendingMap, route_epochs: &RouteEpochs, goodbye: &Frame) {
+    let channel = goodbye.header.channel;
+    let epoch = goodbye.header.epoch;
+    let mut routes = route_epochs.lock().unwrap();
+    if routes.get(&channel) != Some(&epoch) {
+        return;
+    }
+    routes.remove(&channel);
+    pending.lock().unwrap().retain(|&(ch, ep, _), entry| {
+        if ch != channel || ep != epoch {
+            return true;
+        }
+        if let PendingEntry::Live { sender, .. } = entry {
+            let _ = sender.send(goodbye.clone());
+        }
+        false
+    });
 }
 
 fn detach_lagged_stream(
@@ -4180,6 +4174,48 @@ mod tests {
         );
         drop(client);
         reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_route_close_wakes_sibling_calls_only_in_its_epoch() {
+        use futures::FutureExt;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2), (8, 3)])));
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        write_tx.try_send(frame(FrameType::Push, 0, 0, 0)).unwrap();
+        let conn = test_connection(write_tx, Arc::clone(&pending), routes, ConnToken(1), 1);
+        let route = RouteHandle::new(7, 2, ConnToken(1));
+        let (_, _first, mut first_rx) = conn.register_route(&route, (7, 2, 5)).unwrap();
+        let (_, _sibling, mut sibling_rx) = conn.register_route(&route, (7, 2, 6)).unwrap();
+        let (_old, mut old_rx) =
+            PendingRegistration::new(Arc::clone(&pending), (7, 1, 5), false, None).unwrap();
+        let (_, _other, mut other_rx) = conn
+            .register_route(&RouteHandle::new(8, 3, ConnToken(1)), (8, 3, 5))
+            .unwrap();
+
+        let close = conn.route_close(&route);
+        tokio::pin!(close);
+        assert!(close.as_mut().now_or_never().is_none(), "egress is full");
+        for rx in [&mut first_rx, &mut sibling_rx] {
+            let terminal = rx
+                .try_recv()
+                .expect("local close must fan out before enqueue");
+            assert_eq!(terminal.header.ty, FrameType::Goodbye);
+            assert_eq!((terminal.header.channel, terminal.header.epoch), (7, 2));
+        }
+        assert!(matches!(
+            old_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!conn.route_is_open(&route));
+        assert!(conn.register_route(&route, (7, 2, 7)).is_err());
+        write_rx.recv().await.unwrap();
+        close.await.unwrap();
+        assert_eq!(write_rx.recv().await.unwrap().header.ty, FrameType::Goodbye);
     }
 
     #[tokio::test]

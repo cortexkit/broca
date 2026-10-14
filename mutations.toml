@@ -9653,3 +9653,15 @@ expect_red = ["actor::writer_shutdown_tests::actor_reports_final_writer_shutdown
 file = "crates/broca-module/src/actor.rs"
 old = "if let Err(error) = result {\n            self.registry.report_seal_failure();"
 new = "if let Err(error) = result {\n            // NON-VACUITY BREAK: report a successful registry shutdown."
+
+[[control]]
+id = "subc-local-close-fanout"
+guards = "Local route close wakes sibling calls before enqueue without touching other routes or epochs"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::local_route_close_wakes_sibling_calls_only_in_its_epoch"]
+file = "crates/broca-subc/src/connection.rs"
+old = '        finish_route(&runtime.pending, &runtime.route_epochs, &frame);'
+new = '        /* NON-VACUITY BREAK: leave local waiters stranded */'
