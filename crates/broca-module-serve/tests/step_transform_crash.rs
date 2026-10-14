@@ -267,7 +267,7 @@ async fn drive(
         &tx,
     )
     .await;
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     drop(tx);
     collector.await.unwrap();
     (summary, model, tools)
@@ -697,7 +697,7 @@ async fn pre_user_answer_lost_before_send_record_retries_once() {
         .await;
     assert_eq!(answered.subject.blocks().unwrap(), ["user-hooked"]);
     assert_eq!(state.hooks().len(), 1);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     assert!(
         log(&cut).1.is_empty(),
         "an answered but unacknowledged send has no durable record"
@@ -785,7 +785,7 @@ async fn sequential_batch_finishes_post_tool_before_next_dispatch() {
     )
     .await
     .unwrap();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     drop(tx);
     collector.await.unwrap();
     assert_eq!(state.hooks().len(), 2);

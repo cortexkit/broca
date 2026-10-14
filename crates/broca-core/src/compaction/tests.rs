@@ -536,7 +536,7 @@ async fn claude_code_answer_fields_decode_but_do_not_change_broca_apply_or_wal()
             runtime::StepResult::Continue
         ));
         let records = shared.records.lock().unwrap().clone();
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         records
     }
 
@@ -641,7 +641,7 @@ async fn setup_failures_timeout_refuse_and_oversize_write_no_setup() {
             code.and(provider_code)
         );
         assert!(shared.frames().is_empty());
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 #[tokio::test]
@@ -695,7 +695,7 @@ async fn every_step_outcome_records_atomic_cursor_and_rejection() {
     assert_eq!(next.last_not_applied.unwrap().reason, "structural");
     assert_eq!(next.after_ordinal, Some(3));
     assert!(next.messages.is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 #[test]
 fn checkpoint_has_three_states_and_absent_never_folds_from_tail() {
@@ -825,7 +825,7 @@ async fn wait_bound_and_ready_recall_with_fresh_status_and_close_wait() {
         };
         assert!(shared.frames().iter().any(|frame| matches!(frame.record, WalRecord::CompactionWait { exited, .. } if exited == exit)));
         assert!(state.open_wait.is_none());
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 #[tokio::test]
@@ -887,7 +887,7 @@ async fn wait_cap_sends_only_below_margin_and_fails_closed_otherwise() {
         assert!(
             matches!(shared.records.lock().unwrap().last(), Some(WalRecord::CompactionWait { exited, .. }) if *exited == expected)
         );
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 #[test]
@@ -973,7 +973,7 @@ async fn terminal_wait_intents_recover_without_provider_call_and_survive_second_
             retries_used: 0,
         });
         assert!(state.open_wait.is_none());
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 #[test]
@@ -1129,7 +1129,7 @@ async fn engine_setup_once_and_durable_apply_cut_resume_make_no_compaction_calls
         }]
     );
     let records = shared.records.lock().unwrap().clone();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let cut = records
         .iter()
         .position(|record| {
@@ -1181,7 +1181,7 @@ async fn engine_setup_once_and_durable_apply_cut_resume_make_no_compaction_calls
         crate::canonical_request_bytes(&model.calls()[0]),
         crate::canonical_request_bytes(&model2.calls()[0])
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1230,7 +1230,7 @@ async fn engine_missing_lineage_refuses_before_compaction_or_model_calls() {
                 | WalRecord::CompactionAnswer { .. }
         ))
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1264,7 +1264,7 @@ async fn engine_legacy_auth_resume_mints_lineage_before_setup_and_step() {
         Some(broca_protocol::PauseReason::AuthRequired)
     );
     assert!(model.calls().is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 
     // A legacy file retains the paused records but has no lineage header. Resolving auth
     // without refreezing config writes no resume record, so StepStarted must mint the id.
@@ -1304,7 +1304,7 @@ async fn engine_legacy_auth_resume_mints_lineage_before_setup_and_step() {
         .starts_with(&format!("{lineage_id}:setup:")));
     assert_eq!(scripted.statuses.lock().unwrap()[0].lineage_id, lineage_id);
     assert_eq!(model.calls().len(), 1);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[test]
@@ -1454,7 +1454,7 @@ async fn engine_setup_refusals_make_no_model_call_and_preserve_role_code() {
             );
         }
         drop(records);
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 #[tokio::test]
@@ -1559,7 +1559,7 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
         .unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert_eq!(page.compaction_id.as_deref(), Some("c"));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[test]
@@ -1707,7 +1707,7 @@ async fn q28_cached_fill_is_inside_margin_and_unreported_input_fails_closed() {
                 runtime::StepResult::Terminal(RunFinishReason::Error, _)
             ) != (usage == codex)
         );
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
     assert_eq!(
         request_estimate(101, &CompactionHistory::default()),
@@ -1758,7 +1758,7 @@ async fn issued_request_cut_is_filed_without_advancing_cursor_and_forces_fresh_c
         matches!(&records[2], WalRecord::CompactionAnswer { request_id, cursor, disposition: CompactionDisposition::FailedCall, .. } if request_id == "lost" && cursor.after_ordinal.is_none())
     );
     assert!(!state.pending_request);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[cfg(feature = "test-clock")]
@@ -1836,7 +1836,7 @@ async fn frozen_clock_drives_configured_compaction_timeout_without_wall_time() {
             ..
         })
     ));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -2005,7 +2005,7 @@ async fn concurrent_clock_refresh_cannot_move_wait_cap_into_real_time() {
     std::fs::write(&path, r#"{"now_ms":100}"#).unwrap();
     clock.refresh().unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), step).await;
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let result = result
         .expect("fixed-clock compaction cap did not fire at 100 ms after the held refresh")
         .unwrap();
@@ -2105,7 +2105,7 @@ async fn clock_reaching_the_cap_mid_poll_takes_the_cap_exit_not_the_bound() {
     std::fs::write(&path, r#"{"now_ms":100,"offset_ms":1}"#).unwrap();
     clock.refresh_on_read_after(99);
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), step).await;
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let result = result
         .expect("fixed-clock compaction cap did not fire at 100 ms")
         .unwrap();
@@ -2290,7 +2290,7 @@ async fn late_receipt_during_model_wait_is_durable_without_resending_and_crash_r
     .await
     .expect("late receipt must be filed while the model is held");
     assert_eq!(summary.unwrap().reason, RunFinishReason::Completed);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     // The persisted prefix used for resume ends after the timeout and discarded receipt;
     // it contains neither a model answer nor a run terminal.
     let resumed = Shared {
@@ -2323,5 +2323,5 @@ async fn late_receipt_during_model_wait_is_durable_without_resending_and_crash_r
         crate::canonical_request_bytes(&model.calls.lock().unwrap()[0]),
         crate::canonical_request_bytes(&model2.calls()[0])
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }

@@ -1087,7 +1087,7 @@ mod durability_tests {
             .await
             .expect_err("a matching complete tail must not receive already_imported after poison");
         assert!(matches!(retry, ImportError::Wal(_)));
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
 
         // The Active-path preflight receives a distinct writer while the complete matching frames
         // are readable from a store. Its durable head is zero, so it must refuse the shortcut.
@@ -1119,6 +1119,6 @@ mod durability_tests {
             &fresh_writer,
         );
         assert!(matches!(preflight, Err(ImportError::Wal(_))));
-        fresh_writer.shutdown().await;
+        let _ = fresh_writer.shutdown().await;
     }
 }

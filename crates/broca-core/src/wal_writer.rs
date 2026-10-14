@@ -1207,7 +1207,7 @@ enum WalCommand {
     /// fsync everything pending + ack with the last FSYNCED seq (a barrier point).
     Sync(oneshot::Sender<Result<u64, WalWriteError>>),
     /// Final fsync if anything is still dirty, then stop the writer.
-    Shutdown,
+    Shutdown(std_mpsc::Sender<Result<(), WalWriteError>>),
 }
 
 /// Publishes every record after the writer's fsync makes it durable, in FIFO order.
@@ -1370,7 +1370,17 @@ impl WalHandle {
         observer: Option<RecordObserver>,
     ) -> Result<WalHandle, WalWriteError> {
         let (wal, last_seq) = Self::prove_recovery(wal)?;
-        Self::spawn_proven_observed(wal, last_seq, fence, observer)
+        Self::spawn_proven_observed(wal, last_seq, fence, observer, None)
+    }
+
+    /// Keep the per-run lease on the writer thread, including if its owner is cancelled.
+    pub(crate) fn spawn_with_lease(
+        wal: Box<dyn Wal + Send>,
+        lease: Box<dyn LeaseHandle>,
+    ) -> Result<WalHandle, WalWriteError> {
+        let fence = lease.epoch();
+        let (wal, last_seq) = Self::prove_recovery(wal)?;
+        Self::spawn_proven_observed(wal, last_seq, fence, None, Some(lease))
     }
 
     /// Open and prove a session WAL away from the async runtime, then start its writer thread.
@@ -1420,7 +1430,7 @@ impl WalHandle {
             )))
         })??;
         let (wal, last_seq, fence, lease) = opened;
-        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer)
+        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, None)
             .map_err(WalOpenError::Failed)?;
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -1445,6 +1455,7 @@ impl WalHandle {
         last_seq: u64,
         fence: u64,
         observer: Option<RecordObserver>,
+        lease: Option<Box<dyn LeaseHandle>>,
     ) -> Result<WalHandle, WalWriteError> {
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
@@ -1473,6 +1484,8 @@ impl WalHandle {
         let join = std::thread::Builder::new()
             .name("broca-wal-writer".into())
             .spawn(move || {
+                // writer_loop drops its WAL before the lease is released, even on unwind.
+                let _lease = lease;
                 writer_loop(
                     wal,
                     fence,
@@ -1762,15 +1775,40 @@ impl WalHandle {
 
     /// Drain + final fsync IF DIRTY + join the writer BEFORE the lease releases (so a
     /// superseded writer can never append after a new run acquires the session).
-    pub async fn shutdown(mut self) {
-        let _ = self.tx.send(WalCommand::Shutdown);
-        if let Some(join) = self.join.take() {
-            // Only the finite shutdown join uses the pool; never block an async
-            // worker or detach in-flight WAL IO before the caller releases its lease.
-            // Panics still run the panic hook and fail pending acknowledgements;
-            // as before, shutdown waits for completion but ignores the join error.
-            let _ = tokio::task::spawn_blocking(move || join.join()).await;
+    pub async fn shutdown(mut self) -> Result<(), WalWriteError> {
+        // The blocking job owns the whole handle, so cancelling this await cannot detach
+        // a join from the writer's lifetime. Drop also joins if this future is never polled.
+        tokio::task::spawn_blocking(move || self.shutdown_blocking())
+            .await
+            .map_err(|error| WalWriteError::Failed(format!("WAL shutdown task failed: {error}")))?
+    }
+
+    fn shutdown_blocking(&mut self) -> Result<(), WalWriteError> {
+        let Some(join) = self.join.take() else {
+            return current_poison(&self.poisoned)
+                .map_or(Ok(()), |error| Err(WalWriteError::Failed(error)));
+        };
+        let (ack, result) = std_mpsc::channel();
+        let sent = self.tx.send(WalCommand::Shutdown(ack));
+        // Always join, even when the channel or final sync failed. No writer may
+        // survive its owning handle and continue appending under a released lease.
+        if join.join().is_err() {
+            set_poison(
+                &self.poisoned,
+                "WAL writer thread panicked during shutdown".into(),
+            );
         }
+        if sent.is_err() {
+            set_poison(&self.poisoned, "WAL writer closed before shutdown".into());
+        }
+        if let Some(error) = current_poison(&self.poisoned) {
+            return Err(WalWriteError::Failed(error));
+        }
+        result.recv().unwrap_or_else(|_| {
+            let error = "WAL writer dropped the shutdown acknowledgement".to_string();
+            set_poison(&self.poisoned, error.clone());
+            Err(WalWriteError::Failed(error))
+        })
     }
 
     /// Serializes sequence reservation with the enqueue that follows it, so two appenders
@@ -1820,14 +1858,25 @@ impl WalHandle {
 
     #[cfg(test)]
     async fn stop_writer_for_test(&mut self) {
+        let (ack, _result) = std_mpsc::channel();
         self.tx
-            .send(WalCommand::Shutdown)
+            .send(WalCommand::Shutdown(ack))
             .expect("test writer is running");
         if let Some(join) = self.join.take() {
             tokio::task::spawn_blocking(move || join.join())
                 .await
                 .expect("test join task completes")
                 .expect("test writer joins");
+        }
+    }
+}
+
+impl Drop for WalHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            if let Err(error) = self.shutdown_blocking() {
+                tracing::error!("WAL writer shutdown failed during drop: {error}");
+            }
         }
     }
 }
@@ -1935,8 +1984,15 @@ fn writer_loop(
                     }
                 }
             }
-            WalCommand::Shutdown => {
-                if current_poison(&poisoned).is_none() && dirty && wal.sync().is_ok() {
+            WalCommand::Shutdown(ack) => {
+                let poison = current_poison(&poisoned);
+                let result = if dirty {
+                    sync_result(&*wal, &poison)
+                } else {
+                    poison.map_or(Ok(()), Err)
+                };
+                if result.is_ok() && dirty {
+                    durable_head.store(last_appended_seq, Ordering::Release);
                     if let Some(obs) = &observer {
                         for (seq, record) in pending_observed.drain(..) {
                             obs.observe(seq, fence, &record);
@@ -1946,6 +2002,11 @@ fn writer_loop(
                         }
                     }
                 }
+                let result = result.map_err(|error| {
+                    set_poison(&poisoned, error.clone());
+                    WalWriteError::Failed(error)
+                });
+                let _ = ack.send(result);
                 break;
             }
         }
@@ -2081,10 +2142,11 @@ mod tests {
             // Unpark every writer before asserting, including writers queued behind a
             // saturated pool in the regression. Runtime drop must not hang on a failed test.
             for handle in &handles {
-                let _ = handle.tx.send(WalCommand::Shutdown);
+                let (ack, _result) = std_mpsc::channel();
+                let _ = handle.tx.send(WalCommand::Shutdown(ack));
             }
             for handle in handles {
-                handle.shutdown().await;
+                let _ = handle.shutdown().await;
             }
 
             assert_eq!(
@@ -2302,7 +2364,7 @@ mod tests {
         );
         assert_eq!(head, second_seq);
 
-        Arc::try_unwrap(handle)
+        let _ = Arc::try_unwrap(handle)
             .ok()
             .expect("record threads released their handles")
             .shutdown()
@@ -2393,7 +2455,7 @@ mod tests {
             "the durable head must include every sequence reserved before sync"
         );
 
-        Arc::try_unwrap(handle)
+        let _ = Arc::try_unwrap(handle)
             .ok()
             .expect("test threads released their handles")
             .shutdown()
@@ -2446,7 +2508,7 @@ mod tests {
         );
         handle.sync().await.unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_millis(200), inbox.recv()).await;
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         assert_eq!(event.unwrap(), Some(1));
         assert!(
             inbox.try_recv().is_err(),
@@ -2476,7 +2538,7 @@ mod tests {
         handle.sync().await.unwrap();
         handle.record(WalRecord::StepStarted { step_id: StepId(2) });
         assert_eq!(handle.sync().await.unwrap(), 2);
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         assert!(
             !healthy.load(Ordering::Acquire),
             "a panicking tap still claims known state"
@@ -2519,7 +2581,7 @@ mod tests {
             matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
             "the next appended record also waits for the shutdown sync"
         );
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         assert_eq!(
             rx.recv()
                 .await
@@ -2569,7 +2631,7 @@ mod tests {
             1,
             "the durable head stays put without new appends"
         );
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         assert_eq!(
             sync_calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -2614,7 +2676,7 @@ mod tests {
             1,
             "the clean barrier reuses the established recovery proof"
         );
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
     }
 
     #[tokio::test]
@@ -2658,7 +2720,7 @@ mod tests {
         .expect("spawn writer");
 
         handle.record(WalRecord::TurnFinished { step_id: StepId(1) });
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         assert_eq!(
             sync_calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -2682,7 +2744,7 @@ mod tests {
             head, 2,
             "sync returns the last fsynced seq (2 records, 1-based)"
         );
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
 
         // Reopen and confirm both records are durable.
         let wal2 = store.open(&session).unwrap();
@@ -2720,7 +2782,7 @@ mod tests {
             "record() returns 1-based monotonic seqs"
         );
         handle.sync().await.expect("sync ok");
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
 
         // The durable records carry EXACTLY the seqs record() returned — no drift, so a
         // ring cursor tagged at publish equals the projection's cursor.
@@ -2781,7 +2843,7 @@ mod tests {
             on_disk,
             "after a barrier the handle reports the identity the append minted"
         );
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2803,7 +2865,7 @@ mod tests {
                 1
             );
             h.sync().await.unwrap();
-            h.shutdown().await;
+            let _ = h.shutdown().await;
         }
         // Reopen: one record (seq 1) durable → the next record() returns 2.
         let h = WalHandle::spawn(store.open(&session).unwrap(), 2).expect("spawn writer");
@@ -2815,7 +2877,7 @@ mod tests {
             "record() continues from the durable prefix, not from 1"
         );
         h.sync().await.unwrap();
-        h.shutdown().await;
+        let _ = h.shutdown().await;
     }
 
     #[tokio::test]
@@ -2830,7 +2892,7 @@ mod tests {
             let handle = WalHandle::spawn(store.open(&session).unwrap(), 1).expect("spawn writer");
             handle.record(WalRecord::TurnFinished { step_id: StepId(1) });
             handle.sync().await.unwrap();
-            handle.shutdown().await;
+            let _ = handle.shutdown().await;
         }
         // Reopen: one record (seq 1) is already durable.
         let handle = WalHandle::spawn(store.open(&session).unwrap(), 2).expect("spawn writer");
@@ -2842,7 +2904,7 @@ mod tests {
         handle.record(WalRecord::TurnFinished { step_id: StepId(2) });
         let head2 = handle.sync().await.expect("sync ok");
         assert_eq!(head2, 2, "a new append advances the head past the prefix");
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2901,6 +2963,9 @@ mod tests {
 
 #[cfg(test)]
 mod archive_tests;
+
+#[cfg(test)]
+mod shutdown_tests;
 
 #[cfg(test)]
 pub(crate) mod retention_tests;

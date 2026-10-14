@@ -1441,7 +1441,7 @@ mod tests {
         ));
 
         fanout.teardown().await;
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1531,7 +1531,7 @@ mod tests {
             })
         );
 
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1642,7 +1642,7 @@ mod tests {
             "an ambiguous retraction seed must use full replay"
         );
 
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1697,7 +1697,7 @@ mod tests {
         ));
 
         fanout.teardown().await;
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1796,7 +1796,7 @@ mod tests {
             "BudgetFired in a materialized suffix must select the full replay safety path"
         );
 
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1890,7 +1890,7 @@ mod tests {
         }
 
         fanout.teardown().await;
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2014,7 +2014,7 @@ mod tests {
         );
 
         fanout.teardown().await;
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 

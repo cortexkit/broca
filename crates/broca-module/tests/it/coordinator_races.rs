@@ -3418,7 +3418,7 @@ async fn stale_active_reconciles_to_terminal_from_wal() {
             retries_used: 0,
         });
         writer.sync().await.unwrap();
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         drop(lease); // release so the actor the lookup opens can acquire it
     }
 
@@ -3554,7 +3554,7 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
         retries_used: 0,
     });
     writer.sync().await.expect("fsync the core-sealed terminal");
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     drop(lease);
 
     assert_eq!(

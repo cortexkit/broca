@@ -445,7 +445,7 @@ async fn held_run(declared: bool, resume: bool) {
         // Land the queued append and join the writer before releasing the lease, as the actor
         // does at close. Only then may another writer open this WAL.
         hold.release();
-        seed_writer.shutdown().await;
+        let _ = seed_writer.shutdown().await;
         drop(seed_lease);
         assert!(wal
             .read_records(&session)

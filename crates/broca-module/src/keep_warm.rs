@@ -377,7 +377,7 @@ mod retention_tests {
         assert_eq!(reason, "session_moved");
         assert_eq!(std::fs::read(path).unwrap(), before);
         drop(warmer);
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     }
 
     #[tokio::test]
@@ -439,7 +439,7 @@ mod retention_tests {
                 );
             }
         }
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 }

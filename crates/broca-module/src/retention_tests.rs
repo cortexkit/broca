@@ -1101,7 +1101,7 @@ async fn resumed_episode_keeps_the_first_run_retention_and_provider_privacy_flag
         .read_admission_snapshot(&rig.key)
         .unwrap()
         .is_none());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     drop(lease);
 }
 

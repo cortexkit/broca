@@ -1283,9 +1283,20 @@ pub fn resume_state_from_store(
             usage,
             prefix.retries_used.saturating_add(tail_retries),
             tail_state.last_step_usage.or(prefix.last_step_usage),
-            tail_state
-                .last_step_finish_reason
-                .or(prefix.last_step_finish_reason),
+            if tail.iter().any(|record| {
+                matches!(
+                    record,
+                    WalRecord::ModelStepFinished { .. }
+                        | WalRecord::Retracted {
+                            failure: Some(_),
+                            ..
+                        }
+                )
+            }) {
+                tail_state.last_step_finish_reason
+            } else {
+                prefix.last_step_finish_reason
+            },
             prefix.completed_steps > 0 || tail_state.provider_call_started,
         )
     };
@@ -1938,6 +1949,96 @@ mod tests {
                 "merge at watermark {wm} must equal full replay"
             );
         }
+    }
+
+    fn assert_resume_clears_finish_reason(tail: Vec<WalRecord>) {
+        use broca_protocol::FinishReason;
+
+        let mut records = sample_wal()[..7].to_vec();
+        if let WalRecord::ModelStepFinished { finish_reason, .. } = &mut records[1] {
+            *finish_reason = Some(FinishReason::ToolCalls);
+        }
+        let prior = replay(&records).expect("prefix replay");
+        assert_eq!(prior.last_step_finish_reason, Some(FinishReason::ToolCalls));
+        let prefix = StorePrefix {
+            prefix: prior.prompt.clone(),
+            watermark_seq: records.len() as u64,
+            completed_steps: prior.completed_steps,
+            usage: prior.usage,
+            retries_used: prior.retries_used,
+            last_step_usage: prior.last_step_usage,
+            last_step_finish_reason: prior.last_step_finish_reason,
+            ..StorePrefix::empty()
+        };
+        let mut seed = crate::ProjectionSeed::empty();
+        seed.prefix_len = prefix.prefix.len() as u64;
+        seed.completed_steps = prefix.completed_steps;
+        seed.usage = prefix.usage;
+        seed.retries_used = prefix.retries_used;
+        seed.last_step_usage = prefix.last_step_usage;
+        seed.last_step_finish_reason = prefix.last_step_finish_reason;
+        seed.last_run_id = prior.run_id.clone();
+        seed.admission_checkpoint
+            .fold_frames(&framed(&records))
+            .expect("checkpoint prefix");
+
+        let unchanged = resume_state_from_store(
+            &prefix,
+            &[WalRecord::Unknown],
+            prior.run_config.clone(),
+            prior.run_id.clone(),
+            None,
+        )
+        .expect("untouched tail");
+        assert_eq!(
+            unchanged.last_step_finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+
+        let merged = resume_state_from_store(&prefix, &tail, prior.run_config, prior.run_id, None)
+            .expect("resume merge");
+        let mut tail_frames = framed(&tail);
+        for frame in &mut tail_frames {
+            frame.seq += prefix.watermark_seq;
+        }
+        let projected =
+            crate::replay_projection_tail(&seed, &tail_frames).expect("projection replay");
+        records.extend(tail);
+        let full = replay(&records).expect("full replay");
+        assert_eq!(full.last_step_finish_reason, None, "full replay must clear");
+        assert_eq!(
+            projected.last_step_finish_reason, None,
+            "projection must clear"
+        );
+        assert_eq!(merged.last_step_finish_reason, None, "resume must clear");
+    }
+
+    #[test]
+    fn resume_merge_clears_omitted_step_finish_reason() {
+        assert_resume_clears_finish_reason(vec![sample_wal()[7].clone()]);
+    }
+
+    #[test]
+    fn resume_merge_failed_retraction_clears_prefix_finish_reason() {
+        assert_resume_clears_finish_reason(vec![WalRecord::Retracted {
+            submission_id: broca_protocol::SubmissionId("next-submission".into()),
+            failure: Some(broca_wal::QueuedAdmissionFailure {
+                run_id: RunId("next-run".into()),
+                error: broca_protocol::error::ProviderError {
+                    class: ErrorClass::Permanent,
+                    message: "unknown model".into(),
+                    refusal: None,
+                    status: None,
+                    retry_after_secs: None,
+                    provider_code: Some("queued_admission_failed".into()),
+                    resets_at_ms: None,
+                    resets_at_source: None,
+                    limit_window: None,
+                    account_ref: None,
+                    credential_id: None,
+                },
+            }),
+        }]);
     }
 
     #[test]

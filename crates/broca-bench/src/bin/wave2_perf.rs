@@ -160,7 +160,8 @@ impl Fixture {
             .take()
             .expect("writer is present")
             .shutdown()
-            .await;
+            .await
+            .expect("benchmark writer shutdown must succeed");
     }
 }
 

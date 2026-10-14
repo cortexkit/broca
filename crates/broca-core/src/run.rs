@@ -1099,11 +1099,12 @@ where
             other => RunError::Lease(other.to_string()),
         })?;
 
-    // Run the body under the lease we just acquired; its epoch is stamped on WAL records for
-    // forensic tenure correlation. The lease drops on return.
-    let result = run_under_lease(
+    // Move the lease to the writer thread so dropping this future cannot release it
+    // while queued WAL appends or the final sync are still running.
+    run_under_lease(
         req,
         lease.epoch(),
+        Some(lease),
         provider,
         tool_plane,
         approval,
@@ -1114,9 +1115,7 @@ where
         control,
         out,
     )
-    .await;
-    drop(lease);
-    result
+    .await
 }
 
 /// Run the loop body under an ALREADY-HELD lease, identified by its `lease_epoch` (the
@@ -1151,6 +1150,7 @@ where
     run_under_lease(
         req,
         lease_epoch,
+        None,
         provider,
         tool_plane,
         approval,
@@ -1188,6 +1188,7 @@ where
     run_under_lease(
         req,
         lease_epoch,
+        None,
         provider,
         tool_plane,
         approval,
@@ -1748,6 +1749,7 @@ async fn project_store_blocking(
 async fn run_under_lease<P, T, A, W>(
     mut req: RunRequest,
     lease_epoch: u64,
+    owned_lease: Option<Box<dyn crate::LeaseHandle>>,
     provider: &P,
     tool_plane: &T,
     approval: &A,
@@ -1769,8 +1771,11 @@ where
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
     // session-scoped writer it shuts down once at session close.
     let wal = wal_store.open(&req.session).map_err(RunError::from)?;
-    let writer =
-        WalHandle::spawn(wal, lease_epoch).map_err(|error| RunError::Wal(error.to_string()))?;
+    let writer = match owned_lease {
+        Some(lease) => WalHandle::spawn_with_lease(wal, lease),
+        None => WalHandle::spawn(wal, lease_epoch),
+    }
+    .map_err(|error| RunError::Wal(error.to_string()))?;
 
     let mode = if append_episode {
         StartMode::AppendEpisode
@@ -1779,7 +1784,9 @@ where
     } else {
         StartMode::FreshOrResume
     };
-    let result = run_on_writer(
+    // Heap-own the run body so lease ownership and shutdown bookkeeping do not
+    // enlarge the public per-run future's inline frame.
+    let result = Box::pin(run_on_writer(
         &mut req,
         &writer,
         mode == StartMode::AppendEpisode,
@@ -1793,9 +1800,9 @@ where
         out,
         None, // the per-run wrapper has no coordinator awaiting admission
         None,
-    )
+    ))
     .await;
-    writer.shutdown().await; // drain + final fsync + join, before the caller drops the lease
+    writer.shutdown().await.map_err(RunError::from)?;
     result
 }
 
@@ -2421,6 +2428,7 @@ async fn seal_size_refusal<W: WalStore>(
     // before the Error terminal below, startup commits an Interrupted orphan terminal.
     let owned = owns_prior_episode || prior.run_id.as_ref() == Some(&req.run_id);
     if owned && prior.run_finished_durable {
+        control.close_steers();
         writer.clear_size_refusal();
         if let Some((reason, usage, retries_used)) =
             records.iter().rev().find_map(|record| match record {
@@ -2444,6 +2452,7 @@ async fn seal_size_refusal<W: WalStore>(
         }
     }
     if !prior.run_finished_durable && owned {
+        control.close_steers();
         let run_id = prior
             .run_id
             .as_ref()
@@ -3366,7 +3375,7 @@ where
                         config.frozen_render_config = provider.render_config_blob();
                     }
                     writer.record(WalRecord::RunConfigRefrozen {
-                        ts_ms: epoch_millis(),
+                        ts_ms: control.now_ms(),
                         renderer_version: provider.renderer_version(),
                         frozen_render_config: provider.render_config_blob(),
                     });
@@ -3385,7 +3394,7 @@ where
                         config.auth_selection = Some(auth_selection.clone());
                     }
                     writer.record(WalRecord::RunAuthRefrozen {
-                        ts_ms: epoch_millis(),
+                        ts_ms: control.now_ms(),
                         auth_selection: auth_selection.clone(),
                     });
                     refreeze_recorded = true;
@@ -6991,6 +7000,7 @@ async fn finalize_hard_stop(
     writer.record(WalRecord::TurnFinished { step_id });
     record_budget_firings(writer, resolved_run_id, budget_firings);
     // The terminal goes in the SAME barrier as the repair batch (no intermediate sync).
+    control.close_steers();
     writer.record(WalRecord::RunFinished {
         ts_ms: control.now_ms(),
         reason,
@@ -7118,6 +7128,94 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[tokio::test]
+    async fn run_future_frame_sizes() {
+        let session = BindIdentity::new("/future-size", "test", "sizes");
+        let mut req = RunRequest::from_submission(
+            serde_json::from_value(serde_json::json!({
+                "model": {"provider_module_id": "stub", "model_id": "m"},
+                "input": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+            }))
+            .unwrap(),
+            RunId("r".into()),
+            session,
+            broca_protocol::SubmissionId("s".into()),
+        );
+        let provider = crate::StubProvider::new(vec![]);
+        let plane = crate::StubToolPlane::new();
+        let control = RunControl::default();
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: Arc::new(std::sync::Mutex::new(vec![])),
+            }),
+            1,
+        )
+        .unwrap();
+        let wal_store = ReadableWalStore;
+        let lease_store = crate::FileLeaseStore::new("/future-size/leases");
+        let (out, _events) = mpsc::channel(1);
+        let body = run_body_with_approval_history(
+            &mut req,
+            crate::replay(&[]).unwrap(),
+            None,
+            false,
+            false,
+            false,
+            &control,
+            &provider,
+            &plane,
+            &crate::AllowAll,
+            &writer,
+            || Ok(false),
+            None,
+            &out,
+            None,
+            None,
+            None,
+        );
+        println!(
+            "run_body_with_approval_history={} bytes",
+            std::mem::size_of_val(&body)
+        );
+        drop(body);
+        let leased = run_under_lease(
+            req.clone(),
+            1,
+            None,
+            &provider,
+            &plane,
+            &crate::AllowAll,
+            &wal_store,
+            None,
+            false,
+            false,
+            RunControl::default(),
+            &out,
+        );
+        println!("run_under_lease={} bytes", std::mem::size_of_val(&leased));
+        let public = run_loop_with_control(
+            req,
+            &provider,
+            &plane,
+            &lease_store,
+            &crate::AllowAll,
+            &wal_store,
+            None,
+            RunControl::default(),
+            &out,
+        );
+        println!(
+            "run_loop_with_control={} bytes",
+            std::mem::size_of_val(&public)
+        );
+        drop(public);
+        drop(leased);
+        writer
+            .shutdown()
+            .await
+            .expect("measurement writer shutdown");
+    }
 
     /// `stamp_credential` sets `credential_id` only on credential-scoped terminals (a billing
     /// refusal, an exhausted account window, a rate limit) and on no other error. It rewrites
@@ -7764,7 +7862,7 @@ mod tests {
         assert!(records.lock().unwrap().iter().any(|record| matches!(
             record, WalRecord::RunStarted { scope: Some(frozen), .. } if frozen == &scope
         )));
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 
     impl broca_wal::Wal for RecordingWal {
@@ -8176,7 +8274,7 @@ mod tests {
                 "the durable terminal record remains byte-identical"
             );
         }
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 
     #[tokio::test]
@@ -8224,7 +8322,7 @@ mod tests {
                 ..
             }]
         ));
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8300,7 +8398,7 @@ mod tests {
         projector.close();
         drop(projector);
         drop(pending);
-        Arc::try_unwrap(writer)
+        let _ = Arc::try_unwrap(writer)
             .ok()
             .expect("finish task released writer")
             .shutdown()
@@ -8890,6 +8988,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run/terminal_regression_tests.rs"]
+mod terminal_regression_tests;
 
 #[cfg(test)]
 #[path = "run/hook_tests.rs"]

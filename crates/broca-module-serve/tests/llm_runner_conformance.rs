@@ -1509,7 +1509,7 @@ impl LlmRunnerSubject for BrocaSubject {
         )
         .await
         .map_err(|e| HarnessError::new(e.to_string()))?;
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let import = seed_store
             .read_records(&identity)
             .map_err(|e| HarnessError::new(e.to_string()))?;

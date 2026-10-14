@@ -779,7 +779,7 @@ async fn retry_keeps_discovery_flag_until_full_wal_debt_is_empty() {
     assert!(!rig.row().withdrawals_owed);
     assert!(pass().await.unwrap());
     assert_eq!(questions.withdrawals.lock().unwrap().len(), 2);
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
 }
 
 struct UnknownRead {
@@ -856,7 +856,7 @@ async fn an_unknown_full_wal_read_never_clears_the_discovery_flag() {
         assert!(pass().await.unwrap());
         assert!(!rig.row().withdrawals_owed);
         assert_eq!(questions.withdrawals.lock().unwrap().len(), 1);
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     }
 }
 
@@ -946,7 +946,7 @@ async fn dispatched_refused_declined_and_approved_closed_calls_send_no_withdrawa
         assert!(!rig.row().withdrawals_owed, "{kind}");
         assert!(questions.withdrawals.lock().unwrap().is_empty(), "{kind}");
         assert!(questions.requests.lock().unwrap().is_empty(), "{kind}");
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     }
 }
 
@@ -1008,7 +1008,7 @@ async fn idle_writes_skip_withdrawal_reads_but_new_debt_wakes_the_task() {
     })
     .await;
     task.stop().await;
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     assert!(
         sent.is_ok(),
         "new owed debt was not serviced within the first backoff bound"
@@ -1133,7 +1133,7 @@ async fn withdrawal_stop_joins_read_and_flag_jobs_before_writer_shutdown() {
             rig.row().withdrawals_owed,
             "a cancelled flag job must not clear discovery after stop"
         );
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     }
 }
 
@@ -1194,7 +1194,7 @@ async fn invalid_request_and_requester_refusal_retain_question_debt() {
         )
         .await
         .unwrap();
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
         assert!(!empty, "{reason} is not a withdrawal stop class");
         assert!(!rig.frames().iter().any(|frame| matches!(
             frame.record,
@@ -1439,7 +1439,7 @@ async fn missing_origin_is_expired_without_blocking_other_owed_calls() {
         &broca_core::Clock::default(),
     )
     .await;
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     assert!(result.unwrap());
     assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::QuestionWithdrawalAcknowledged { call_key, reason: Some(reason), .. } if call_key == &bad_key && reason == "expired")));
     assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::QuestionWithdrawalAcknowledged { call_key, answer: broca_wal::WithdrawalAnswer::Acknowledged, .. } if call_key == &good_key)));
@@ -1483,7 +1483,7 @@ async fn expired_question_acknowledgement_does_not_settle_failed_index_cleanup()
         &broca_core::Clock::default(),
     )
     .await;
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
     assert!(
         !result.unwrap(),
         "acknowledged questions still require retrying failed discovery cleanup"
@@ -1895,7 +1895,7 @@ async fn actor_job_drain_releases_writer_before_reporting_completion() {
     draining.await;
     assert_eq!(Arc::strong_count(&writer), 1);
     blocking.await.unwrap();
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
 }
 
 #[tokio::test]
@@ -1919,7 +1919,7 @@ async fn dropping_withdrawal_task_cancels_its_idle_worker() {
         "implicit drop left the worker running"
     );
     rig.eventually(|| Arc::strong_count(&writer) == 1).await;
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
 }
 
 struct RecoveringCleanupIndex {
@@ -1998,7 +1998,7 @@ async fn cleanup_failure_retries_without_traffic_after_question_acknowledgement(
         })
         .await;
         task.stop().await;
-        Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
         assert!(
             repaired.is_ok(),
             "cleanup failure parked its stale flag instead of retrying"

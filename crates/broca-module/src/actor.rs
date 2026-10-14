@@ -5703,7 +5703,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let Some(arc) = self.writer.take() else {
             return;
         };
-        match Arc::try_unwrap(arc) {
+        let result = match Arc::try_unwrap(arc) {
             Ok(handle) => handle.shutdown().await, // drain + final fsync + join
             Err(arc) => {
                 // SOLE-OWNER INVARIANT VIOLATED: a clone of the session writer outlived the
@@ -5731,8 +5731,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                      violated (a subscriber/task is holding the writer Arc); the writer task \
                      won't be joined before the lease drops"
                 );
-                let _ = arc.sync().await;
+                arc.sync().await.map(|_| ())
             }
+        };
+        if let Err(error) = result {
+            self.registry.report_seal_failure();
+            #[cfg(test)]
+            self.registry
+                .report_seal_error(&self.key, format!("writer shutdown failed: {error}"));
+            tracing::error!(target: "lifecycle", session = %self.key.session, "writer shutdown failed; WAL requires recovery: {error}");
         }
     }
 
@@ -9222,7 +9229,7 @@ mod import_idempotency_tests {
             retries_used: 0,
         });
         writer.sync().await.expect("sync interrupted lineage");
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
 
         let store =
             Arc::new(broca_store::SqliteStore::open_in_memory().expect("open materialized store"));
@@ -9350,7 +9357,7 @@ mod import_idempotency_tests {
         broca_core::run_import(request.clone(), &writer, wal_store.as_ref())
             .await
             .expect("complete import without projection");
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
 
         let store =
             Arc::new(broca_store::SqliteStore::open_in_memory().expect("open materialized store"));
@@ -9412,7 +9419,7 @@ mod import_idempotency_tests {
         broca_core::run_import(import_request.clone(), &writer, wal_store.as_ref())
             .await
             .expect("complete import");
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
 
         let registry = LineageRegistry::new(Arc::new(SeamOpener {
             lease_store,
@@ -9600,6 +9607,14 @@ mod steer_auth_conflict_tests {
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "steer_terminal_tests.rs"]
+mod steer_terminal_tests;
+
+#[cfg(test)]
+#[path = "writer_shutdown_tests.rs"]
+mod writer_shutdown_tests;
 
 #[path = "pre_user.rs"]
 mod pre_user;
