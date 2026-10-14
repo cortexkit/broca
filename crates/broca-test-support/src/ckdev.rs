@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_recovers_when_pruned_during_copy() {
+    fn publication_survives_pruning_during_copy() {
         let scratch = fixture("prune-copy-race");
         let built = source(&scratch, "target/debug/ck-probe", b"complete executable");
         let pruned = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -742,7 +742,13 @@ mod tests {
                                     Path::new(""),
                                     SystemTime::now(),
                                 );
-                                assert!(!directory.exists());
+                                // Windows retains the directory while the temporary copy is open;
+                                // pruning must not interrupt publication even when removal fails.
+                                if cfg!(windows) {
+                                    assert!(directory.is_dir());
+                                } else {
+                                    assert!(!directory.exists());
+                                }
                             })
                             .join()
                             .unwrap();
