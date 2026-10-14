@@ -77,17 +77,23 @@ pub fn set_owner_to_administrators(path: &Path) {
     powershell(path, "$acl=Get-Acl -LiteralPath $p; $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))); Set-Acl -LiteralPath $p -AclObject $acl");
 }
 
-/// Makes the file's ACL unreadable to its owner. Windows grants an owner READ_CONTROL
-/// implicitly, whatever the DACL says, unless an OWNER RIGHTS (S-1-3-4) entry is present; a
-/// deny entry on the owner's own SID alone therefore changes nothing for the owner.
+/// Makes the file's ACL unreadable without removing existing WRITE_DAC grants used for cleanup.
+/// Set the owner to the token user so OWNER RIGHTS applies even when the token's default owner
+/// is Administrators. OWNER RIGHTS suppresses implicit owner READ_CONTROL and WRITE_DAC; the
+/// current-user deny also blocks READ_CONTROL from explicit or inherited account/group grants.
 pub fn deny_acl_read(path: &Path) {
     powershell(
         path,
         r#"
         $acl=Get-Acl -LiteralPath $p;
+        $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;
+        $acl.SetOwner($user);
         $ownerRights=New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4');
-        $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($ownerRights,'ReadPermissions','Deny');
-        $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl;
+        foreach ($sid in @($user,$ownerRights)) {
+            $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'ReadPermissions','Deny');
+            $acl.AddAccessRule($rule);
+        }
+        Set-Acl -LiteralPath $p -AclObject $acl;
     "#,
     );
 }

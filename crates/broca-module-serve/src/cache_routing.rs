@@ -1,7 +1,7 @@
 //! Prompt-cache policy routing: resolve caller cache preferences into the frozen provider
 //! render config used by the live executor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use broca_catalog::live::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, WireFamilyId};
@@ -20,6 +20,11 @@ const LOOKBACK_BLOCKS: u32 = 20;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheTtlTable {
     rows: HashMap<String, ProviderCacheRow>,
+    /// Providers whose prompt cache engages only when the request names a cache scope, so a
+    /// send that names none is given its session as the scope (see
+    /// [`resolve_prompt_cache_key`]). Separate from `rows`: this is not a cache policy, adds no
+    /// retention and admits no `role` or `ttl` preference.
+    session_key_providers: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +67,7 @@ impl CacheTtlTable {
     pub fn empty() -> Self {
         Self {
             rows: HashMap::new(),
+            session_key_providers: BTreeSet::new(),
         }
     }
 
@@ -110,7 +116,15 @@ impl CacheTtlTable {
             "fireworks-ai".to_string(),
             ProviderCacheRow::Hints { retention: None },
         );
-        Self { rows }
+        // Meta's Responses API (api.meta.ai/v1) reuses a cached prefix only for requests that
+        // carry `prompt_cache_key`. Measured on muse-spark-1.3 with one fixed 8,426-token input:
+        // two sends without a key both reported `cached_tokens: 0`; with a key, the second send
+        // reported 8,419 cached tokens.
+        let session_key_providers = BTreeSet::from(["meta".to_string()]);
+        Self {
+            rows,
+            session_key_providers,
+        }
     }
 
     /// The resolved config path: `$BROCA_CONFIG_PATH` if set, else `broca.jsonc` under the
@@ -159,6 +173,10 @@ impl CacheTtlTable {
             table.rows.insert(provider, row);
         }
         Ok(table)
+    }
+
+    fn defaults_to_session_key(&self, provider: &str) -> bool {
+        self.session_key_providers.contains(provider)
     }
 
     fn row(&self, provider: &str) -> Option<&ProviderCacheRow> {
@@ -435,6 +453,27 @@ pub fn resolve_caller_cache_key(request: Option<&CacheRequest>) -> Option<String
     request
         .and_then(|request| request.key.as_deref())
         .map(broca_provider::hash::clamp_prompt_cache_key)
+}
+
+/// The prompt-cache scope a fresh episode freezes into its render config.
+///
+/// A caller's own `cache.key` always wins. Without one, a provider the table lists in
+/// `session_key_providers` gets the session id, clamped by the same rule the ChatGPT backend's
+/// session-derived key uses, so every step, retry and warm of the session names one scope. A
+/// resume does not call this: it re-reads the key frozen in the episode's render config.
+/// `cache.mode: "none"` suppresses the session default, as it suppresses every other default
+/// cache hint; it does not drop a key the caller named explicitly.
+pub fn resolve_prompt_cache_key(
+    provider_id: &str,
+    request: Option<&CacheRequest>,
+    table: &CacheTtlTable,
+    bind: &BindIdentity,
+) -> Option<String> {
+    resolve_caller_cache_key(request).or_else(|| {
+        let caching_off = request.is_some_and(|request| request.mode == Some(CacheMode::None));
+        (!caching_off && table.defaults_to_session_key(provider_id))
+            .then(|| broca_provider::hash::clamp_prompt_cache_key(&bind.session))
+    })
 }
 
 fn resolve_marker_policy(
@@ -913,6 +952,7 @@ mod tests {
                 "openai".to_string(),
                 ProviderCacheRow::Hints { retention: None },
             )]),
+            session_key_providers: BTreeSet::new(),
         };
         for table in [CacheTtlTable::shipped_defaults(), configured] {
             for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
@@ -992,10 +1032,83 @@ mod tests {
             .filter_map(|row| row.get("provider_id").and_then(serde_json::Value::as_str))
             .collect::<std::collections::HashSet<_>>();
 
-        for provider_id in CacheTtlTable::shipped_defaults().rows.keys() {
+        let shipped = CacheTtlTable::shipped_defaults();
+        for provider_id in shipped.rows.keys().chain(&shipped.session_key_providers) {
             assert!(
                 provider_ids.contains(provider_id.as_str()),
                 "shipped cache row '{provider_id}' is not a canonical catalog provider id"
+            );
+        }
+    }
+
+    /// Meta caches a prefix only when the request names a scope, so a Meta send without a
+    /// caller key freezes its session id as the key. This default comes from the shipped table:
+    /// an empty table supplies no default for Meta, the shipped table lists only Meta, and every
+    /// other provider still freezes only the key its caller named.
+    #[test]
+    fn shipped_table_gives_meta_alone_a_session_prompt_cache_key() {
+        let shipped = CacheTtlTable::shipped_defaults();
+        assert_eq!(
+            shipped.session_key_providers,
+            BTreeSet::from(["meta".to_string()]),
+            "the shipped session-key providers"
+        );
+        assert_eq!(
+            resolve_prompt_cache_key("meta", None, &shipped, &bind("muse-session")).as_deref(),
+            Some("muse-session")
+        );
+        assert_eq!(
+            resolve_prompt_cache_key("meta", Some(&req(None, None)), &shipped, &bind("s1"))
+                .as_deref(),
+            Some("s1"),
+            "a cache request without a key still gets the session default"
+        );
+        let long_session = "meta-session-".repeat(8);
+        assert_eq!(
+            resolve_prompt_cache_key("meta", None, &shipped, &bind(&long_session)),
+            Some(broca_provider::hash::clamp_prompt_cache_key(&long_session)),
+            "a long session id is clamped by the same rule as a caller key"
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(
+                "meta",
+                Some(&req_with_key("caller-scope")),
+                &shipped,
+                &bind("s1")
+            )
+            .as_deref(),
+            Some("caller-scope"),
+            "a caller-supplied scope wins over the session default"
+        );
+        let off = CacheRequest {
+            mode: Some(CacheMode::None),
+            ..req(None, None)
+        };
+        assert_eq!(
+            resolve_prompt_cache_key("meta", Some(&off), &shipped, &bind("s1")),
+            None,
+            "cache.mode none sends no default cache hint"
+        );
+        assert_eq!(
+            resolve_prompt_cache_key("meta", None, &CacheTtlTable::empty(), &bind("s1")),
+            None,
+            "the default comes from the table, not from the provider name"
+        );
+        for provider in ["openai", "xai", "fireworks-ai", "anthropic", "google"] {
+            assert_eq!(
+                resolve_prompt_cache_key(provider, None, &shipped, &bind("s1")),
+                None,
+                "{provider} keeps sending no key without a caller scope"
+            );
+            assert_eq!(
+                resolve_prompt_cache_key(
+                    provider,
+                    Some(&req_with_key("caller-scope")),
+                    &shipped,
+                    &bind("s1")
+                ),
+                resolve_caller_cache_key(Some(&req_with_key("caller-scope"))),
+                "{provider} freezes exactly the caller key it froze before"
             );
         }
     }
