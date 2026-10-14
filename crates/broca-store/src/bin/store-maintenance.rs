@@ -825,7 +825,7 @@ mod tests {
         let root = temp_root("unreadable-acl");
         std::fs::create_dir_all(root.join("wal")).unwrap();
         let db = root.join("run-index.db");
-        let file = root.join("wal/session.wal");
+        let file = root.join("wal").join("session.wal");
         std::fs::write(&db, b"database marker").unwrap();
         std::fs::write(&file, b"WAL marker").unwrap();
         for dry_run in [true, false] {
