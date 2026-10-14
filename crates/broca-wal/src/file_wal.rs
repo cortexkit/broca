@@ -290,7 +290,7 @@ impl std::fmt::Display for WalError {
                 file_size,
             } => write!(
                 f,
-                "wal read refused: file size {file_size} exceeds the {max_bytes}-byte safety cap"
+                "wal size refused: file size {file_size} exceeds the {max_bytes}-byte safety cap"
             ),
             WalError::NonMonotonic { prev_seq, seq } => {
                 write!(f, "wal seq regressed: {seq} after {prev_seq}")
@@ -361,10 +361,19 @@ pub trait Wal {
         self.append(fence, record, sync)
     }
 
-    /// Optional byte cap, current file bytes and per-append metadata bytes. File stores
-    /// select this for expiring sessions so their logs stay readable for content deletion.
+    /// Optional (total-byte ceiling, current file size, metadata bytes added per record).
+    /// Enqueue checks charge the encoded frame plus lineage metadata against this ceiling,
+    /// reserving terminal space so refusing a record never makes the log unreadable.
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         None
+    }
+
+    fn recovery_byte_cap(&self) -> Option<u64> {
+        None
+    }
+
+    fn append_budget_scope(&self) -> crate::size_limit::SizeScope {
+        crate::size_limit::SizeScope::Session
     }
 
     /// fsync queued writes without adding a record, including those previously
@@ -417,9 +426,8 @@ pub struct FileWal {
     /// compare it with an authority and does not use it to reject an append. The belt catches
     /// the residual case: a draining old writer appending AFTER a new writer already wrote.
     last_write_end: u64,
-    /// A newly-created WAL file needs ONE directory-sync pass so its name and every parent
-    /// directory created while opening it are crash-durable. Once the first file barrier has
-    /// paid that cost, later barriers only need to sync the file itself.
+    /// The first barrier after each open syncs the WAL's parent directory so the
+    /// file's name is durable, including when an earlier process did not sync it.
     dir_needs_sync: Cell<bool>,
     /// Directories that were absent before `create_dir_all`, ordered from the WAL's parent
     /// upward. The first directory-sync pass drains this list after syncing every directory
@@ -429,7 +437,9 @@ pub struct FileWal {
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
     /// record is refused, because nothing would tell placement that the machine now holds it.
-    append_budget: Option<u64>,
+    recovery_cap: u64,
+    append_budget: u64,
+    budget_scope: crate::size_limit::SizeScope,
     feature_floor: Option<PathBuf>,
     session_ref: String,
     #[cfg(test)]
@@ -607,15 +617,14 @@ impl FileWal {
         }
         let mut create_opts = OpenOptions::new();
         create_opts.read(true).append(true).create_new(true);
-        let (mut file, dir_needs_sync, created) = match create_opts.open(&path) {
-            Ok(file) => (file, true, true),
+        let (mut file, created) = match create_opts.open(&path) {
+            Ok(file) => (file, true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
                 OpenOptions::new()
                     .read(true)
                     .append(true)
                     .open(&path)
                     .map_err(WalError::Io)?,
-                false,
                 false,
             ),
             Err(e) => return Err(WalError::Io(e)),
@@ -649,10 +658,12 @@ impl FileWal {
             file,
             next_seq,
             last_write_end,
-            dir_needs_sync: Cell::new(dir_needs_sync),
+            dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
             lineage_id,
-            append_budget: None,
+            recovery_cap: DEFAULT_MAX_READ_BYTES,
+            append_budget: DEFAULT_MAX_READ_BYTES,
+            budget_scope: crate::size_limit::SizeScope::Session,
             feature_floor: None,
             session_ref: String::new(),
             #[cfg(test)]
@@ -667,9 +678,9 @@ impl FileWal {
         self
     }
 
-    /// fsync the file's data + metadata. A newly-created WAL file also pays ONE
-    /// best-effort directory-sync pass so the file name and any parent directories created by
-    /// `open` become durable too; after that, later barriers only need to sync the file itself.
+    /// The first barrier syncs the file, its parent, and parents of directories
+    /// created by this open. Unix errors fail the barrier and keep every directory
+    /// in that bottom-up list queued for the next attempt.
     fn fsync(&self) -> Result<(), WalError> {
         self.file.sync_all().map_err(WalError::Io)?;
         #[cfg(test)]
@@ -691,7 +702,7 @@ impl FileWal {
                 // The WAL file's name lives in its immediate parent.
                 sync_dirs.push(sync_path(parent));
             }
-            for created in self.newly_created_dirs.borrow_mut().drain(..) {
+            for created in self.newly_created_dirs.borrow().iter() {
                 // A newly-created directory's name lives in its own parent. The created list is
                 // bottom-up, so these parents preserve the required durability order.
                 if let Some(parent) = created.parent() {
@@ -704,19 +715,15 @@ impl FileWal {
             for dir_path in sync_dirs {
                 #[cfg(test)]
                 if let Some(probe) = &self.sync_probe {
-                    // The probe counts ATTEMPTS, not successful directory syncs: Windows cannot
-                    // open a directory via File::open, so the best-effort operation below is an
-                    // expected no-op there. The once-only attempt is the portable invariant.
+                    // Count directory-barrier attempts, including the explicit non-Unix no-op.
                     probe
                         .dir_syncs
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     probe.dir_sync_paths.lock().unwrap().push(dir_path.clone());
                 }
-                // Best-effort directory fsync (not all platforms require or permit it).
-                if let Ok(dir) = File::open(dir_path) {
-                    let _ = dir.sync_all();
-                }
+                crate::directory_sync::sync_dir(&dir_path).map_err(WalError::Io)?;
             }
+            self.newly_created_dirs.borrow_mut().clear();
             self.dir_needs_sync.set(false);
         }
         Ok(())
@@ -728,10 +735,18 @@ impl FileWal {
         self.session_ref = session_ref;
         self
     }
-    /// Expose a byte cap and file sizes to WalHandle's enqueue checks. FileWal does not
-    /// decide which sessions expire; the FileWalStore that opened the file selects the cap.
+    /// Restrict the total byte ceiling without allowing it to exceed recovery's cap.
+    pub fn with_recovery_cap(mut self, max_bytes: u64) -> Self {
+        self.recovery_cap = max_bytes.min(DEFAULT_MAX_READ_BYTES);
+        self.append_budget = self.recovery_cap;
+        self
+    }
+
+    /// Apply a total-byte ceiling and choose `retained_session_too_large` rather
+    /// than `session_too_large` for the writer's typed refusal terminal.
     pub fn with_append_budget(mut self, max_bytes: u64) -> Self {
-        self.append_budget = Some(max_bytes);
+        self.append_budget = max_bytes.min(self.recovery_cap);
+        self.budget_scope = crate::size_limit::SizeScope::RetainedSession;
         self
     }
 
@@ -757,6 +772,45 @@ impl FileWal {
                 found: current,
             });
         }
+        if self.next_seq == 1
+            && self.budget_scope == crate::size_limit::SizeScope::RetainedSession
+            && matches!(
+                record,
+                WalRecord::RunStarted {
+                    retention: None,
+                    ..
+                }
+            )
+        {
+            self.budget_scope = crate::size_limit::SizeScope::Session;
+            self.append_budget = self.recovery_cap;
+        }
+        let seq = self.next_seq;
+        let record_bytes = match frame {
+            Some(frame) => frame,
+            None => encode(seq, fence, record).map_err(WalError::Frame)?,
+        };
+        let overhead = crate::framing::LINEAGE_FRAME_LEN as u64
+            * if self.lineage_id.is_none() && current > 0 {
+                2
+            } else {
+                1
+            };
+        let reserve = if matches!(record, WalRecord::RunFinished { .. }) {
+            0
+        } else {
+            crate::size_limit::reserve_bytes(overhead)
+        };
+        let required = current
+            .saturating_add(record_bytes.len() as u64)
+            .saturating_add(overhead)
+            .saturating_add(reserve);
+        if required > self.append_budget {
+            return Err(WalError::TooLarge {
+                max_bytes: self.append_budget,
+                file_size: required,
+            });
+        }
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
         // a gated frame written first would be data it does not know about if the process
@@ -774,11 +828,6 @@ impl FileWal {
             crate::floor::raise_floor(&floor, requires)
                 .map_err(|error| refuse(Some(floor), error.to_string()))?;
         }
-        let seq = self.next_seq;
-        let record_bytes = match frame {
-            Some(frame) => frame,
-            None => encode(seq, fence, record).map_err(WalError::Frame)?,
-        };
         let (lineage_id, minted_for_legacy) = match self.lineage_id {
             Some(lineage_id) => (lineage_id, false),
             None => {
@@ -832,18 +881,24 @@ impl Wal for FileWal {
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
-        self.append_budget.map(|cap| {
-            (
-                cap,
-                self.last_write_end,
-                crate::framing::LINEAGE_FRAME_LEN as u64
-                    * if self.lineage_id.is_none() && self.last_write_end > 0 {
-                        2
-                    } else {
-                        1
-                    },
-            )
-        })
+        Some((
+            self.append_budget,
+            self.last_write_end,
+            crate::framing::LINEAGE_FRAME_LEN as u64
+                * if self.lineage_id.is_none() && self.last_write_end > 0 {
+                    2
+                } else {
+                    1
+                },
+        ))
+    }
+
+    fn recovery_byte_cap(&self) -> Option<u64> {
+        Some(self.recovery_cap)
+    }
+
+    fn append_budget_scope(&self) -> crate::size_limit::SizeScope {
+        self.budget_scope
     }
 
     fn sync(&self) -> Result<(), WalError> {
@@ -1238,7 +1293,9 @@ fn decode_anchored_suffix(
                     Err(error) => Err(error),
                 };
             }
-            DecodeStep::TornTail if offset > 0 => {
+            DecodeStep::TornTail
+                if offset > 0 && !has_intact_data_after(&bytes[offset..], lineage_id) =>
+            {
                 return Ok(Some(DecodedBytes {
                     records: Vec::new(),
                     valid_end: absolute_start + offset as u64,
@@ -1304,6 +1361,30 @@ fn validate_contiguous_sequence(
     Ok(())
 }
 
+// A damaged length cannot identify the next boundary. Search for intact frames
+// instead; matching lineage-only metadata after a damaged last record is part
+// of its uncommitted tail. Unreadable frames and conflicting identities are not.
+fn has_intact_data_after(bytes: &[u8], mut expected_lineage: Option<WalLineageId>) -> bool {
+    (1..bytes.len().saturating_sub(crate::framing::HEADER_LEN - 1)).any(|offset| {
+        let suffix = &bytes[offset..];
+        match crate::framing::decode_next(suffix) {
+            DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,
+            DecodeStep::Corrupt(_) => crate::framing::digest_verifies(suffix),
+            DecodeStep::Lineage {
+                lineage_id: found, ..
+            } => {
+                if expected_lineage.is_some_and(|first| first != found) {
+                    true
+                } else {
+                    expected_lineage = Some(found);
+                    false
+                }
+            }
+            DecodeStep::TornTail => false,
+        }
+    })
+}
+
 fn decode_bytes_seeded(
     bytes: &[u8],
     absolute_start: u64,
@@ -1329,8 +1410,19 @@ fn decode_bytes_seeded(
                 fold_lineage_id(&mut lineage_id, found)?;
                 offset += consumed;
             }
+            DecodeStep::TornTail if has_intact_data_after(&bytes[offset..], lineage_id) => {
+                return Err(WalError::Corrupt {
+                    offset: (absolute_start + offset as u64) as usize,
+                    source: FrameError::NonTailIncompleteFrame,
+                });
+            }
             DecodeStep::TornTail => break,
             DecodeStep::Corrupt(source) => {
+                if !crate::framing::digest_verifies(&bytes[offset..])
+                    && !has_intact_data_after(&bytes[offset..], lineage_id)
+                {
+                    break;
+                }
                 return Err(WalError::Corrupt {
                     offset: (absolute_start + offset as u64) as usize,
                     source,
@@ -1646,6 +1738,253 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unretained_append_never_crosses_recovery_cap() {
+        assert_eq!(DEFAULT_MAX_READ_BYTES, 1_073_741_824);
+        let path = tmp("ordinary-byte-cap");
+        let _ = std::fs::remove_file(&path);
+        let cap = 2048;
+        let mut wal = FileWal::open(&path).unwrap().with_recovery_cap(cap);
+        let first = WalRecord::StepStarted { step_id: StepId(1) };
+        wal.append(1, &first, true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let oversized = run_started(2);
+        let mut huge = encode(2, 1, &oversized).unwrap();
+        huge.resize(cap as usize + 1, 0);
+        assert!(matches!(
+            wal.append_preencoded(1, &oversized, false, huge),
+            Err(WalError::TooLarge { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(wal.last_seq(), 1);
+        let terminal = crate::size_limit::scoped_terminal(
+            cap,
+            crate::size_limit::SizeScope::Session,
+            Some(1),
+            Default::default(),
+            0,
+        );
+        wal.append(1, &terminal, true).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= cap);
+        drop(wal);
+        assert_eq!(FileWal::open(&path).unwrap().replay().unwrap().len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_length_unsynced_tail_recovers_verified_prefix() {
+        for (tag, zero, lineage) in [
+            ("digest-tail", false, false),
+            ("zero-tail", true, false),
+            ("lineage-tail", false, true),
+        ] {
+            let path = tmp(tag);
+            let _ = std::fs::remove_file(&path);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(1, &run_started(1), true).unwrap();
+            let prefix = std::fs::read(&path).unwrap();
+            let id = wal.lineage_id.unwrap();
+            wal.append(1, &run_started(2), false).unwrap();
+            drop(wal);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let record_end = bytes.len() - crate::framing::LINEAGE_FRAME_LEN;
+            if zero {
+                bytes[prefix.len()..record_end].fill(0);
+            } else {
+                bytes[record_end - 1] ^= 0xff;
+            }
+            if !lineage {
+                bytes.truncate(record_end);
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap().len(), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "read never repairs");
+            let mut reopened = FileWal::open(&path).unwrap();
+            assert_eq!(reopened.lineage_id, Some(id));
+            assert_eq!(std::fs::read(&path).unwrap(), prefix);
+            reopened.append(1, &run_started(2), true).unwrap();
+            assert_eq!(reopened.replay().unwrap().len(), 2);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn damaged_length_before_valid_record_is_not_a_torn_tail() {
+        let path = tmp("bad-length-before-record");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        for seq in 1..=3 {
+            wal.append(1, &run_started(seq), true).unwrap();
+        }
+        drop(wal);
+        let anchor = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)
+            .unwrap()
+            .next_anchor
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let second = anchor.byte_end as usize + crate::framing::LINEAGE_FRAME_LEN;
+        bytes[second..second + 4].copy_from_slice(&4096u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            replay_file(&path, DEFAULT_MAX_READ_BYTES),
+            Err(WalError::Corrupt {
+                source: FrameError::NonTailIncompleteFrame,
+                ..
+            })
+        ));
+        assert!(read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, Some(&anchor)).is_err());
+        assert!(FileWal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_record_before_newer_writer_is_not_discarded() {
+        let path = tmp("bad-before-newer");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        drop(wal);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0; crate::framing::HEADER_LEN]).unwrap();
+        drop(file);
+        append_newer_writer_frame(&path, 2);
+        assert!(matches!(
+            FileWal::open(&path),
+            Err(WalError::Corrupt { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn intact_rejected_frames() -> Vec<Vec<u8>> {
+        [
+            "010000000102000000000000000100000000000000e36c2cb768b1bc82603d9f2b9b5887e8e6ef59c06a9cff1568337df0a85031f87b",
+            "000000000200000000000000000000000000000000401da6ea6a614dd6d773b1ba84c91ee6d981827bd0bdc5188aa2e5dbffba558c",
+            "020000000402000000000000000100000000000000bc8904cedfcc5d62bdcada4163a0277512d243828920eb0a756692a79632c3167b7d",
+        ].iter().map(|hex| hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()).collect()
+    }
+
+    #[test]
+    fn intact_rejected_tail_is_never_repaired() {
+        for (index, frame) in intact_rejected_frames().into_iter().enumerate() {
+            assert!(crate::framing::digest_verifies(&frame));
+            let path = tmp(&format!("intact-rejected-tail-{index}"));
+            let _ = std::fs::remove_file(&path);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(1, &run_started(1), true).unwrap();
+            drop(wal);
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&frame)
+                .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(replay_file(&path, DEFAULT_MAX_READ_BYTES).is_err());
+            assert!(FileWal::open(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn corruption_before_intact_rejected_frame_is_fatal() {
+        let path = tmp("corrupt-before-intact-rejected");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        drop(wal);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0; crate::framing::HEADER_LEN]).unwrap();
+        file.write_all(&intact_rejected_frames()[2]).unwrap();
+        drop(file);
+        let before = std::fs::read(&path).unwrap();
+        assert!(FileWal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conflicting_lineage_after_damage_is_never_repaired() {
+        for legacy in [false, true] {
+            let path = tmp(&format!("foreign-lineage-after-damage-{legacy}"));
+            let _ = std::fs::remove_file(&path);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(1, &run_started(1), true).unwrap();
+            let prefix_id = wal.lineage_id.unwrap();
+            drop(wal);
+            if legacy {
+                std::fs::write(&path, encode(1, 1, &run_started(1)).unwrap()).unwrap();
+            }
+            let first = WalLineageId::from_bytes([0x5a; 16]);
+            let second = WalLineageId::from_bytes([0x5b; 16]);
+            let foreign = if prefix_id == first { second } else { first };
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&[0; crate::framing::HEADER_LEN]).unwrap();
+            file.write_all(&encode_lineage(if legacy { first } else { foreign }))
+                .unwrap();
+            if legacy {
+                file.write_all(&encode_lineage(second)).unwrap();
+            }
+            drop(file);
+            let before = std::fs::read(&path).unwrap();
+            assert!(replay_file(&path, DEFAULT_MAX_READ_BYTES).is_err());
+            assert!(FileWal::open(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn intact_rejected_tail_bytes_are_pinned() {
+        use sha2::{Digest, Sha256};
+        let frames = intact_rejected_frames();
+        for (frame, digest) in frames.iter().zip([
+            "fc173954f8d37c3ab05dca617977688791396ed3ce890761a8ec309fa4a61003",
+            "aadca446961718a022df99918817d44dc7b82e1d6a17bcda15982600f8ffd3a0",
+            "e798c4b8bf64d274cb865b2c095edfce1509ee08a10e1c645e04037b90565fb4",
+        ]) {
+            assert_eq!(format!("{:x}", Sha256::digest(frame)), digest);
+        }
+        assert!(matches!(
+            crate::framing::decode_next(&frames[0]),
+            DecodeStep::Corrupt(FrameError::Deserialize(_))
+        ));
+        assert!(matches!(
+            crate::framing::decode_next(&frames[1]),
+            DecodeStep::Corrupt(FrameError::InvalidLineageFrame { .. })
+        ));
+        assert!(matches!(
+            crate::framing::decode_next(&frames[2]),
+            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 4 })
+        ));
+    }
+
+    #[test]
+    fn full_length_corrupt_tail_bytes_pin_decoder_classification() {
+        // Pin zero-filled headers, a damaged digest and an incomplete declared
+        // payload independently of replay's decision to discard only a final tail.
+        let mut bad_length = [0u8; crate::framing::HEADER_LEN];
+        bad_length[..4].copy_from_slice(&[0, 16, 0, 0]);
+        bad_length[4] = 1;
+        assert!(matches!(
+            crate::framing::decode_next(&bad_length),
+            DecodeStep::TornTail
+        ));
+        let mut bad_digest = [0u8; crate::framing::HEADER_LEN];
+        bad_digest[4] = 1;
+        bad_digest[5] = 2;
+        bad_digest[13] = 1;
+        assert!(matches!(
+            crate::framing::decode_next(&bad_digest),
+            DecodeStep::Corrupt(FrameError::DigestMismatch { seq: 2 })
+        ));
+        assert!(matches!(
+            crate::framing::decode_next(&[0u8; crate::framing::HEADER_LEN]),
+            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 0 })
+        ));
+    }
+
     fn expect_sequence_gap<T>(result: Result<T, WalError>, expected_seq: u64, seq: u64) {
         match result {
             Err(WalError::SequenceGap {
@@ -1942,6 +2281,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_directory_sync_failure_never_acknowledges_creation() {
+        let root = dir_sync_root("creation-eio");
+        let path = root.join("nested/wal/writer.log");
+        let probe = SyncProbe::default();
+        let mut wal = FileWal::open_with_probe(&path, probe.clone()).unwrap();
+        wal.append(1, &run_started(1), false).unwrap();
+        let pending = wal.newly_created_dirs.borrow().clone();
+        crate::directory_sync::with_failure(&root, || {
+            assert!(
+                matches!(wal.sync(), Err(WalError::Io(error)) if error.raw_os_error() == Some(5))
+            );
+            assert!(wal.dir_needs_sync.get());
+            assert_eq!(*wal.newly_created_dirs.borrow(), pending);
+        });
+        wal.sync().unwrap();
+        assert!(!wal.dir_needs_sync.get());
+        assert!(wal.newly_created_dirs.borrow().is_empty());
+        let attempts = probe.dir_syncs.load(std::sync::atomic::Ordering::SeqCst);
+        wal.sync().unwrap();
+        assert_eq!(
+            probe.dir_syncs.load(std::sync::atomic::Ordering::SeqCst),
+            attempts
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopened_unsynced_creation_syncs_parent_before_recovery_ack() {
+        let root = dir_sync_root("reopen-eio");
+        let path = root.join("writer.log");
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), false).unwrap();
+        drop(wal);
+        let recovered = FileWal::open_with_probe(&path, SyncProbe::default()).unwrap();
+        crate::directory_sync::with_failure(&root, || {
+            assert!(
+                recovered.sync().is_err(),
+                "a readable prefix does not prove its name durable"
+            );
+        });
+        assert!(recovered.dir_needs_sync.get());
+        recovered.sync().unwrap();
+        assert!(!recovered.dir_needs_sync.get());
+        assert_eq!(recovered.last_seq(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn floor_directory_eio_refuses_gated_append() {
+        let root = dir_sync_root("floor-eio");
+        let path = root.join("writer.log");
+        let floor = root.join(crate::floor::FEATURE_FLOOR_FILENAME);
+        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
+        let before = std::fs::read(&path).unwrap();
+        crate::directory_sync::with_failure(&root, || {
+            for _ in 0..2 {
+                assert!(matches!(
+                    wal.append(1, &scoped_run_started("eio"), false),
+                    Err(WalError::FeatureFloor { .. })
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(wal.last_seq(), 0);
+            }
+        });
+        assert_eq!(wal.append(1, &scoped_run_started("eio"), true).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2572,7 +2983,7 @@ mod tests {
         let path = tmp("range-anchor-corrupt");
         let _ = std::fs::remove_file(&path);
         let mut wal = FileWal::open(&path).unwrap();
-        for i in 0..3 {
+        for i in 0..4 {
             wal.append(1, &run_started(i), false).unwrap();
         }
         let first = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)

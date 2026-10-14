@@ -470,6 +470,7 @@ struct Upstream {
     hold: std::sync::atomic::AtomicBool,
     held: std::sync::atomic::AtomicUsize,
     reject_auth: std::sync::atomic::AtomicBool,
+    large_reply: std::sync::atomic::AtomicBool,
     output_ceiling: std::sync::atomic::AtomicBool,
     context_overflow: std::sync::atomic::AtomicBool,
     billing_exhausted_xai: std::sync::atomic::AtomicBool,
@@ -633,6 +634,11 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     output_ceiling_sse()
+                } else if upstream
+                    .large_reply
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    anthropic_sse(&"x".repeat(65536))
                 } else {
                     anthropic_sse("hello")
                 };
@@ -2036,6 +2042,57 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
     assert_eq!(value["auth"]["credential_id"], "oauth:anthropic:acct-b");
     assert_eq!(value["auth"]["account_ref"], "acct-b");
     assert_eq!(value["auth"]["path"], "routed");
+}
+
+// Regenerate only from the daemon's real run.status reply with BROCA_UPDATE_GOLDEN=1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_too_large_status_matches_golden_through_real_serve() {
+    let rig = Rig::start()
+        .await
+        .expect("the size-limit golden requires the real daemon");
+    std::fs::write(rig.state_root.join("test-session-wal-cap"), "16384").unwrap();
+    rig.upstream
+        .large_reply
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = rig.client("session-too-large").await;
+    let run_id = send(&client, "send-session-too-large", None).await;
+    let frames = rig.finished("session-too-large").await;
+    assert!(
+        matches!(&frames.last().unwrap().record, WalRecord::RunFinished { error: Some(error), .. } if error.provider_code.as_deref() == Some("session_too_large"))
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = client.run_status(&run_id).await.unwrap();
+        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run.status never reached the size-limit error"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["error"]["provider_code"], "session_too_large");
+    assert_eq!(value["error"]["class"], "permanent");
+    assert_eq!(
+        value["error"]["message"],
+        "session log cannot exceed 16384 bytes"
+    );
+    let bytes = serde_json::to_vec(&status).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/run_status.session_too_large.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    let golden =
+        std::fs::read(&path).expect("generate the size-limit golden through the real serve path");
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&golden)),
+        "3bcd6d3df82bcf4f59695db4386d8a628a8cfbca321c63ec7da02000a83d9b37"
+    );
+    assert_eq!(bytes, golden);
 }
 
 /// Regenerate the fixture only from the daemon's real run.status reply:

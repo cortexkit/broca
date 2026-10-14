@@ -230,24 +230,52 @@ fn retained_terminal_reserve_covers_maximal_error_detail_and_accounting() {
 
 #[cfg(feature = "test-clock")]
 #[tokio::test]
-async fn unretained_append_keeps_the_legacy_uncapped_path() {
+async fn unretained_append_never_crosses_recovery_cap() {
+    assert_eq!(broca_wal::DEFAULT_MAX_READ_BYTES, 1_073_741_824);
     let mut f = Fixture::new("forever-cap");
-    f.store = FileWalStore::new(f.root.join("wal")).with_read_cap_for_test(4096);
+    let cap = 8192;
+    f.store = FileWalStore::new(f.root.join("wal")).with_read_cap_for_test(cap);
     let wal = f.store.open(&f.session).unwrap();
-    assert!(wal.append_budget().is_none());
+    assert_eq!(wal.append_budget().unwrap().0, cap);
     let writer = WalHandle::spawn(wal, 1).unwrap();
+    assert!(matches!(
+        writer.record(started("forever", None)),
+        RecordOutcome::Accepted(1)
+    ));
+    writer.sync().await.unwrap();
+    let before = std::fs::read(f.store.wal_path(&f.session)).unwrap();
+    let seq = writer.next_record_seq();
     let mut record = started("forever", None);
     if let WalRecord::RunStarted { title, .. } = &mut record {
         *title = Some("z".repeat(8192));
     }
-    writer.record(record);
+    assert!(matches!(
+        writer.record(record),
+        RecordOutcome::Refused(WalWriteError::SessionTooLarge { max_bytes: 8192 })
+    ));
+    assert!(matches!(
+        writer.sync().await,
+        Err(WalWriteError::SessionTooLarge { .. })
+    ));
+    assert_eq!(writer.next_record_seq(), seq);
+    assert_eq!(std::fs::read(f.store.wal_path(&f.session)).unwrap(), before);
+    assert!(!writer.is_poisoned());
+    writer
+        .record_size_refusal_terminal(cap, Some(1), Default::default(), 0)
+        .unwrap();
     writer.sync().await.unwrap();
+    writer.shutdown().await;
+    let frames = f.store.read_records(&f.session).unwrap();
+    assert!(
+        matches!(&frames.last().unwrap().record, WalRecord::RunFinished { reason: broca_protocol::RunFinishReason::Error, error: Some(error), .. } if error.provider_code.as_deref() == Some("session_too_large") && error.class == broca_protocol::ErrorClass::Permanent)
+    );
     assert!(
         std::fs::metadata(f.store.wal_path(&f.session))
             .unwrap()
             .len()
-            > 4096
+            <= cap
     );
+    assert_eq!(f.store.open(&f.session).unwrap().last_seq(), 2);
 }
 
 #[cfg(feature = "test-clock")]

@@ -39,7 +39,6 @@ fn fixture(path: &Path, members: &[(String, Vec<u8>)]) {
     writer.seal().unwrap();
 }
 /// A v1 container, as sealed before index format v2, for tests of the unverified route.
-#[cfg(unix)]
 fn fixture_v1(path: &Path, members: &[(String, Vec<u8>)]) {
     std::fs::write(path, super::v2_tests::v1_container(members)).unwrap();
 }
@@ -200,9 +199,8 @@ fn rescan_reads_each_member_header_once() {
         index: None,
     };
     assert_eq!(reader.rescan().unwrap().len(), 50);
-    // The 8-byte trailer, one header per member, then one 64-byte read at the start of
-    // the index that finds no member magic there.
-    assert_eq!(read.get(), 8 + 50 * 64 + 64);
+    // The seal supplies the index boundary, so the walk reads only member headers.
+    assert_eq!(read.get(), 8 + 50 * 64);
 }
 
 #[test]
@@ -246,7 +244,7 @@ fn corrupt_index_fields_recover_without_hiding_members() {
     );
     let bytes = std::fs::read(path).unwrap();
     let index = 134;
-    for position in [index, index + 4, index + 20, index + 28, bytes.len() - 8] {
+    for position in [index, index + 4, index + 20, index + 28] {
         let mut corrupt = bytes.clone();
         corrupt[position] ^= 0xff;
         let mut reader = ArchiveReader::new(Cursor::new(corrupt), 100);
@@ -259,6 +257,12 @@ fn corrupt_index_fields_recover_without_hiding_members() {
             b"two"
         );
     }
+    let mut bad_boundary = bytes.clone();
+    let trailer = bad_boundary.len() - 8;
+    bad_boundary[trailer] ^= 0xff;
+    assert!(ArchiveReader::new(Cursor::new(bad_boundary), 100)
+        .read_member(&addr(1))
+        .is_err());
     // A syntactically valid but wrong address must not turn a cache miss into absence.
     let mut corrupt = bytes;
     corrupt[index + 4..index + 20].copy_from_slice(addr(3).as_bytes());
@@ -675,8 +679,9 @@ fn index_driven_cache_never_serves_an_older_transcript_past_damaged_newer_magic(
     assert_eq!(&bytes[header + 8..header + 24], addr(1).as_bytes());
     bytes[header] ^= 1;
     std::fs::write(&new, bytes).unwrap();
+    assert!(prewarm(std::slice::from_ref(&old)).unwrap().is_none());
     let paths = [old.clone(), new.clone()];
-    assert!(prewarm(&paths).unwrap().is_none());
+    assert!(prewarm(&paths).is_err());
     assert_eq!(cached_membership(&old), Some(CachedMembership::FromIndex));
     for _ in 0..2 {
         let result = read_newest_member(&paths, &addr(1), 100);
@@ -836,4 +841,81 @@ fn real_container_absent_lookup_probe() {
     }
     samples.sort_by(f64::total_cmp);
     eprintln!("warm median: {:.6} ms", (samples[4] + samples[5]) / 2.0);
+}
+
+#[test]
+fn missing_index_legacy_container_bytes_are_pinned() {
+    let bytes = without_index(include_bytes!(
+        "../../tests/fixtures/archive/v1/fold-1001.ark"
+    ));
+    assert_eq!(bytes.len(), 827);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        "8f1c97ed5a9bc50773da34470ab138cadbe9afd5f5d09e5ce29937182bc6d118"
+    );
+    assert_eq!(&bytes[bytes.len() - 8..], b"\0\0\0\0WALK");
+    assert!(!ArchiveReader::new(Cursor::new(bytes), 4096)
+        .rescan()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn newer_bad_magic_with_missing_index_never_returns_older_transcript() {
+    let dir = TempDir::new();
+    for missing in [true, false] {
+        let old = dir.path(if missing { 11 } else { 21 });
+        let new = dir.path(if missing { 12 } else { 22 });
+        fixture_v1(&old, &[(addr(1), b"older transcript".to_vec())]);
+        fixture_v1(
+            &new,
+            &[
+                (addr(5), b"five".to_vec()),
+                (addr(1), b"newer transcript".to_vec()),
+                (addr(7), b"seven".to_vec()),
+            ],
+        );
+        let mut bytes = std::fs::read(&new).unwrap();
+        if missing {
+            bytes = without_index(&bytes);
+        } else {
+            let index_len =
+                u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                    as usize;
+            let start = bytes.len() - 8 - index_len;
+            bytes[start] ^= 0xff;
+        }
+        bytes[64 + 4] ^= 1;
+        std::fs::write(&new, bytes).unwrap();
+        let mut direct = ArchiveReader::open(&new, 100).unwrap();
+        assert!(direct.rescan().is_err());
+        assert!(direct.read_member(&addr(1)).is_err());
+        let paths = [old, new.clone()];
+        for _ in 0..2 {
+            assert!(
+                read_newest_member(&paths, &addr(1), 100).is_err(),
+                "uncertain newer coverage must not return older bytes"
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(cached_membership(&new), Some(CachedMembership::Disabled));
+    }
+}
+
+#[test]
+fn archive_scan_refuses_uncertain_member_boundary() {
+    let dir = TempDir::new();
+    let path = dir.path(30);
+    fixture_v1(
+        &path,
+        &[(addr(1), b"one".to_vec()), (addr(2), b"two".to_vec())],
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let trailer = bytes.len() - 8;
+    bytes[trailer..trailer + 4].copy_from_slice(&135u32.to_le_bytes());
+    let mut reader = ArchiveReader::new(Cursor::new(bytes), 100);
+    assert!(
+        reader.rescan().is_err(),
+        "a trailer length swallowing a member is not coverage proof"
+    );
 }

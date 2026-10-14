@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+mod directory_sync;
 pub mod file_wal;
 pub mod floor;
 pub mod framing;
@@ -47,3 +48,5 @@ pub use record::{
 // keep resolving.
 pub use broca_protocol::PauseReason;
 pub mod migration;
+
+pub mod size_limit;

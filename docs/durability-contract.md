@@ -38,6 +38,12 @@ payload. Replay validates monotonic `seq` and the digest; `fence` is retained as
 forensic lease-tenure stamp and is not a replay gate.
 Fence/dedup keys are **COMPOUND**: `session/run/batch/tool_call_id`, never
 bare `tool_call_id`. Encoding + size caps: `docs/wal-and-resume-design.md` §1.
+Every session WAL has a total-byte ceiling of **1 GiB (1,073,741,824 bytes)**,
+shared by append and recovery. Admission reserves lineage metadata and a bounded
+terminal before accepting ordinary records. A byte-budget refusal writes nothing,
+does not poison the writer, and leaves room for a permanent `run_finished{reason:
+error}` terminal: `session_too_large` for ordinary sessions, or the unchanged
+`retained_session_too_large` for retained sessions.
 
 | Record | fsync point | Purpose |
 |---|---|---|
@@ -68,6 +74,18 @@ queued before it.
 record.
 
 ## 3. The barrier (per turn's tool batch)
+
+On Unix, the first WAL barrier after **every open**, including recovery of an
+existing file, also syncs its parent directory and the parents of directories
+created by that open. A directory-open or directory-sync error refuses the barrier;
+the pending pass is cleared only after success. Feature-floor publication likewise
+syncs the renamed floor's parent (including `.` for a bare relative path), and a
+readable floor still needs that proof before a gated append. Non-Unix directory
+sync is an explicit no-op, not a best-effort attempt to open a directory as a file.
+Feature-floor raises hold both an in-process mutex and a cross-process advisory
+lock on a stable sibling `wal-feature-floor.lock` throughout read, union, write,
+rename and directory sync. The lock file is never renamed or removed by writers;
+session-specific leases alone do not serialize that machine-wide union.
 
 1. **Resolve a per-call PLAN first** (capability validate + approval): each call is
    either *dispatchable* or *no_dispatch{reason}* (denied / schema-invalid /
@@ -121,7 +139,15 @@ PROVIDER-INVALID (Anthropic rejects it).
 1. **Acquire the lease** (new lease-tenure stamp — §5). Open the WAL; validate each
    record's digest + monotonic `seq` (the `fence` is retained as forensic metadata, not a
    replay gate). Discard a torn/corrupt TRAILING record (never committed); **FAIL LOUD on
-   non-tail corruption**.
+    non-tail corruption**. A digest-verified frame that this reader cannot interpret
+    is intact authority data, not evidence of crash damage: it refuses replay/open,
+    even at EOF, and is never repaired or truncated. Trailing lineage metadata
+    (reserved frames carrying the WAL's durable 128-bit identity, rather than run
+    records) may accompany a discarded damaged record only if claimed identities
+    are consistent with any identity proven in the prefix and with one another.
+    Archive lookups with a missing or invalid index must
+    prove coverage of the entire sealed member region before reporting absence or
+    caching membership; damaged member headers never justify serving older history.
 2. **`run_config` is authoritative** — rebuild the request config from it; reject
    if caller-supplied config conflicts.
 3. **Fold by TURN:**

@@ -667,6 +667,9 @@ pub enum RunError {
     RetainedSessionTooLarge {
         max_bytes: u64,
     },
+    SessionTooLarge {
+        max_bytes: u64,
+    },
     /// The session's WAL holds a frame that requires WAL features this build does not know
     /// (`missing`): a newer broca build wrote this session. The bytes are intact, so this is
     /// not corruption, and nothing about the session changes between retries. Only placing a
@@ -754,6 +757,7 @@ impl RunError {
             | Self::ContextManagementChanged { .. }
             | Self::ContextManagementUnavailable { .. }
             | Self::RetainedSessionTooLarge { .. }
+            | Self::SessionTooLarge { .. }
             | Self::NewerWriter { .. } => ErrorClass::Permanent,
             Self::LeaseHeld(_)
             | Self::Lease(_)
@@ -771,6 +775,7 @@ impl std::fmt::Display for RunError {
             RunError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
             RunError::Lease(s) => write!(f, "lease error: {s}"),
             RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::error(*max_bytes).message),
+            RunError::SessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),
             RunError::Wal(s) => write!(f, "wal failure: {s}"),
             RunError::NewerWriter { missing } => write!(
                 f,
@@ -816,6 +821,7 @@ impl From<WalWriteError> for RunError {
     fn from(e: WalWriteError) -> Self {
         match e {
             WalWriteError::Failed(detail) => RunError::Wal(detail),
+            WalWriteError::SessionTooLarge { max_bytes } => RunError::SessionTooLarge { max_bytes },
             WalWriteError::RetainedSessionTooLarge { max_bytes } => {
                 RunError::RetainedSessionTooLarge { max_bytes }
             }
@@ -2416,8 +2422,15 @@ async fn seal_size_refusal<W: WalStore>(
     out: &mpsc::Sender<OutputEvent>,
     owns_prior_episode: bool,
 ) -> Result<RunSummary, RunError> {
-    let Err(RunError::RetainedSessionTooLarge { max_bytes }) = &result else {
-        return result;
+    let (max_bytes, scope) = match &result {
+        Err(RunError::RetainedSessionTooLarge { max_bytes }) => (
+            *max_bytes,
+            broca_wal::size_limit::SizeScope::RetainedSession,
+        ),
+        Err(RunError::SessionTooLarge { max_bytes }) => {
+            (*max_bytes, broca_wal::size_limit::SizeScope::Session)
+        }
+        _ => return result,
     };
     let _ = writer.sync_for_seal().await?;
     let frames = wal_store.read_records(&req.session)?;
@@ -2458,13 +2471,13 @@ async fn seal_size_refusal<W: WalStore>(
             .as_ref()
             .ok_or_else(|| RunError::Wal("unfinished resume has no run id".into()))?;
         writer.record_size_refusal_terminal(
-            *max_bytes,
+            max_bytes,
             control.now_ms(),
             prior.usage,
             prior.retries_used,
         )?;
         writer.sync().await?;
-        let error = crate::wal_writer::retained_size::error(*max_bytes);
+        let error = crate::wal_writer::retained_size::scoped_error(max_bytes, scope);
         let _ = send(
             out,
             OutputEvent::Control(ControlUnit::Error {

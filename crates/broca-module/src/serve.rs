@@ -599,6 +599,9 @@ pub enum ServeError {
     RetainedSessionTooLarge {
         max_bytes: u64,
     },
+    SessionTooLarge {
+        max_bytes: u64,
+    },
     WalNewerWriter {
         missing: Vec<String>,
         reason: String,
@@ -695,6 +698,7 @@ impl std::fmt::Display for ServeError {
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
+            ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
             ServeError::Open(s, _) | ServeError::WalNewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
@@ -1291,6 +1295,9 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
             SendOutcome::ClassifiedError { reason, class } => {
                 Err(ServeError::Open(reason, Some(class)))
+            }
+            SendOutcome::SessionTooLarge { max_bytes } => {
+                Err(ServeError::SessionTooLarge { max_bytes })
             }
             SendOutcome::RetainedSessionTooLarge { max_bytes } => {
                 Err(ServeError::RetainedSessionTooLarge { max_bytes })

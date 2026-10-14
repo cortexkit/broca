@@ -85,6 +85,9 @@ pub enum FrameError {
     DigestMismatch {
         seq: u64,
     },
+    /// An incomplete frame has later intact data, so its damage is not confined
+    /// to a discardable final append.
+    NonTailIncompleteFrame,
     /// Unsupported framing version byte.
     UnsupportedVersion {
         ver: u8,
@@ -116,6 +119,9 @@ impl std::fmt::Display for FrameError {
             }
             FrameError::DigestMismatch { seq } => {
                 write!(f, "record seq={seq} failed its digest — WAL corruption")
+            }
+            FrameError::NonTailIncompleteFrame => {
+                write!(f, "incomplete frame before intact data")
             }
             FrameError::UnsupportedVersion { ver } => {
                 write!(f, "unsupported WAL framing version {ver}")
@@ -362,6 +368,24 @@ fn compute_digest(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> [u8; DIGEST_
     h.update(fence.to_le_bytes());
     h.update(payload);
     h.finalize().into()
+}
+
+/// Verify the fixed frame envelope without interpreting its version or payload.
+/// Intact bytes that this reader rejects may belong to a newer writer, not a crash.
+pub(crate) fn digest_verifies(buf: &[u8]) -> bool {
+    if buf.len() < HEADER_LEN {
+        return false;
+    }
+    let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+    let Some(total) = HEADER_LEN.checked_add(len) else {
+        return false;
+    };
+    if buf.len() < total {
+        return false;
+    }
+    let seq = u64::from_le_bytes(buf[5..13].try_into().unwrap());
+    let fence = u64::from_le_bytes(buf[13..21].try_into().unwrap());
+    compute_digest(buf[4], seq, fence, &buf[HEADER_LEN..total]).as_slice() == &buf[21..53]
 }
 
 /// Encode a record into its complete framed bytes.

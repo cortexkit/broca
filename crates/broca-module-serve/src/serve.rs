@@ -2697,6 +2697,11 @@ async fn send_serve_error(
                 .with_detail(serde_json::json!({"holder":holder}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
+        ServeError::SessionTooLarge { max_bytes } => {
+            let body = ErrorBody::new("session_too_large", err.to_string())
+                .with_detail(serde_json::json!({"class": "permanent", "max_bytes": max_bytes}));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::RetainedSessionTooLarge { max_bytes } => {
             let body = ErrorBody::new("retained_session_too_large", err.to_string())
                 .with_detail(serde_json::json!({"class": "permanent", "max_bytes": max_bytes}));
