@@ -414,8 +414,10 @@ if [[ "$prewarm" -eq 1 ]]; then
     bash "$repo_root/scripts/rust-test-prewarm.sh" "${cargo_feature_args[@]}"
 fi
 
+# --no-fail-fast: one failing crate must not hide the rest. A CI run that stops at the
+# first failing crate turns N independent failures into N full CI round trips.
 run_phase "cargo test --workspace --lib --bins (live and test-clock features) --quiet" \
-  cargo test --workspace --lib --bins "${cargo_feature_args[@]}" --quiet
+  cargo test --workspace --lib --bins --no-fail-fast "${cargo_feature_args[@]}" --quiet
 
 run_phase "cargo nextest run --workspace -E kind(test) (live binaries excluded)" \
   run_integration_phase
