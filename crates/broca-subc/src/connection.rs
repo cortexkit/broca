@@ -26,11 +26,8 @@ use subc_protocol::{
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{
-    io::AsyncRead,
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
+    io::{AsyncRead, AsyncWrite},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::{mpsc, oneshot},
     time,
 };
@@ -46,6 +43,7 @@ pub const REVERSE_REQUEST_UNHANDLED: &str = "reverse_request_unhandled";
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_EGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// A route bind may keep the daemon's connection loop busy for roughly twelve seconds from
 /// registration. A retained route.open tombstone keeps that original bind window visible to probe
 /// scheduling, then stops blocking without giving cleanup state an unbounded lifetime as traffic.
@@ -647,7 +645,12 @@ impl SubcConnection {
             write_half,
             write_rx,
         );
-        tokio::spawn(reconnect_supervisor(Arc::downgrade(&shared), reconnect_rx));
+        let supervisor = tokio::spawn(reconnect_supervisor(Arc::downgrade(&shared), reconnect_rx));
+        tokio::spawn(async move {
+            if let Err(error) = supervisor.await {
+                tracing::error!(target: "transport", %error, "subc reconnect supervisor terminated");
+            }
+        });
         Ok(Self { shared })
     }
 
@@ -699,14 +702,16 @@ impl SubcConnection {
     )> {
         let state = self.shared.current.lock().unwrap();
         let runtime = Arc::clone(&state.runtime);
+        let routes = runtime.route_epochs.lock().unwrap();
         if !state.active
             || handle.conn != runtime.conn
-            || runtime.route_epochs.lock().unwrap().get(&handle.channel) != Some(&handle.epoch)
+            || routes.get(&handle.channel) != Some(&handle.epoch)
         {
             return Err(ConnError::StaleRouteHandle(*handle));
         }
         let (registration, rx) =
             PendingRegistration::new(Arc::clone(&runtime.pending), key, false, None)?;
+        drop(routes);
         Ok((runtime, registration, rx))
     }
 
@@ -1209,9 +1214,10 @@ impl SubcConnection {
         let (runtime, registration, rx, lagged) = {
             let state = self.shared.current.lock().unwrap();
             let runtime = Arc::clone(&state.runtime);
+            let routes = runtime.route_epochs.lock().unwrap();
             if !state.active
                 || route.conn != runtime.conn
-                || runtime.route_epochs.lock().unwrap().get(&route.channel) != Some(&route.epoch)
+                || routes.get(&route.channel) != Some(&route.epoch)
             {
                 return Err(ConnError::StaleRouteHandle(*route));
             }
@@ -1219,6 +1225,7 @@ impl SubcConnection {
                 Arc::clone(&runtime.pending),
                 (route.channel, route.epoch, corr),
             )?;
+            drop(routes);
             (runtime, registration, rx, lagged)
         };
         let frame = Frame::build(
@@ -1260,12 +1267,9 @@ impl SubcConnection {
             Vec::new(),
         )
         .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send(&runtime, frame).await?;
-        let mut routes = runtime.route_epochs.lock().unwrap();
-        if routes.get(&route.channel) == Some(&route.epoch) {
-            routes.remove(&route.channel);
-        }
-        Ok(())
+        // Local invalidation must wake callers even when egress cannot accept the GOODBYE.
+        finish_route(&runtime.pending, &runtime.route_epochs, &frame);
+        self.send(&runtime, frame).await
     }
 
     /// Send ONE unary request on `route_channel` with caller-encoded JSON bytes and await the
@@ -1765,14 +1769,13 @@ async fn open_authenticated_socket(
 ) -> ConnResult<(OwnedReadHalf, OwnedWriteHalf)> {
     let conn = connection_file::read(connection_file_path)
         .map_err(|e| ConnError::Transport(format!("read connection file: {e}")))?;
-    let endpoint = conn
-        .endpoints
-        .first()
-        .ok_or_else(|| ConnError::Transport("connection file has no endpoints".into()))?;
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| ConnError::Transport(format!("connect {addr}: {e}")))?;
+    let mut stream = crate::tcp_connect::connect_endpoints(
+        conn.endpoints
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),
+    )
+    .await
+    .map_err(|e| ConnError::Transport(format!("connect: {e}")))?;
     stream
         .set_nodelay(true)
         .map_err(|e| ConnError::Transport(e.to_string()))?;
@@ -2112,14 +2115,17 @@ async fn run_liveness_probe(
         .lock()
         .unwrap()
         .insert(corr, confirmation_tx);
-    if runtime.write_tx.send(ping).await.is_err() {
-        runtime.write_confirmations.lock().unwrap().remove(&corr);
-        generation_failed(&shared, runtime.conn);
-        return;
-    }
-    let probe_start = match confirmation_rx.await {
+    // Egress has its own budget: a blocked writer cannot defer conviction indefinitely.
+    // The silence window below still begins only after the writer confirms the Ping.
+    let egress = time::timeout(PROBE_EGRESS_TIMEOUT, async {
+        runtime.write_tx.send(ping).await.map_err(|_| ())?;
+        confirmation_rx.await.map_err(|_| ())?.map_err(|_| ())
+    })
+    .await;
+    let probe_start = match egress {
         Ok(Ok(sent_at)) => sent_at,
-        Ok(Err(_)) | Err(_) => {
+        _ => {
+            runtime.write_confirmations.lock().unwrap().remove(&corr);
             generation_failed(&shared, runtime.conn);
             return;
         }
@@ -2271,7 +2277,9 @@ async fn reader_task<R>(
             let Ok(reply) = reverse_request_refusal(&frame) else {
                 continue;
             };
-            if write_tx.send(reply).await.is_err() {
+            // Control replies are best-effort; a full egress queue must not stop ingress.
+            let refusal = write_tx.try_send(reply);
+            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {
                 break;
             }
             continue;
@@ -2332,7 +2340,8 @@ async fn reader_task<R>(
                         let Ok(goodbye) = goodbye else {
                             break;
                         };
-                        if write_tx.send(goodbye).await.is_err() {
+                        let late_cleanup = write_tx.try_send(goodbye);
+                        if matches!(late_cleanup, Err(mpsc::error::TrySendError::Closed(_))) {
                             break;
                         }
                         let mut routes = route_epochs.lock().unwrap();
@@ -2354,34 +2363,7 @@ async fn reader_task<R>(
         }
 
         if frame.header.ty == FrameType::Goodbye && channel != 0 {
-            let mut routes = route_epochs.lock().unwrap();
-            if routes.get(&channel) == Some(&epoch) {
-                routes.remove(&channel);
-            }
-            drop(routes);
-            let senders: Vec<_> = pending
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(&waiter_key, entry)| {
-                    if waiter_key.0 == channel && waiter_key.1 == epoch {
-                        match entry {
-                            PendingEntry::Live { sender, .. } => Some((waiter_key, sender.clone())),
-                            PendingEntry::LateRouteOpen { .. } => None,
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for (waiter_key, sender) in senders {
-                if matches!(
-                    sender.send(frame.clone()),
-                    Err(PendingSendError::StreamFull)
-                ) {
-                    pending.lock().unwrap().remove(&waiter_key);
-                }
-            }
+            finish_route(&pending, &route_epochs, &frame);
             continue;
         }
 
@@ -2405,7 +2387,8 @@ async fn reader_task<R>(
                         let Ok(goodbye) = goodbye else {
                             break;
                         };
-                        if write_tx.send(goodbye).await.is_err() {
+                        let abandoned_cleanup = write_tx.try_send(goodbye);
+                        if matches!(abandoned_cleanup, Err(mpsc::error::TrySendError::Closed(_))) {
                             break;
                         }
                         let mut routes = route_epochs.lock().unwrap();
@@ -2436,6 +2419,26 @@ async fn reader_task<R>(
     }
 }
 
+/// Hold the epoch lock through fanout so registration cannot slip between validation and close.
+fn finish_route(pending: &PendingMap, route_epochs: &RouteEpochs, goodbye: &Frame) {
+    let channel = goodbye.header.channel;
+    let epoch = goodbye.header.epoch;
+    let mut routes = route_epochs.lock().unwrap();
+    if routes.get(&channel) != Some(&epoch) {
+        return;
+    }
+    routes.remove(&channel);
+    pending.lock().unwrap().retain(|&(ch, ep, _), entry| {
+        if ch != channel || ep != epoch {
+            return true;
+        }
+        if let PendingEntry::Live { sender, .. } = entry {
+            let _ = sender.send(goodbye.clone());
+        }
+        false
+    });
+}
+
 fn detach_lagged_stream(
     pending: &PendingMap,
     route_epochs: &RouteEpochs,
@@ -2464,8 +2467,8 @@ fn detach_lagged_stream(
     }
 }
 
-async fn writer_task(
-    mut write_half: OwnedWriteHalf,
+async fn writer_task<W: AsyncWrite + Unpin>(
+    mut write_half: W,
     mut rx: mpsc::Receiver<Frame>,
     shared: Weak<ConnectionShared>,
     conn: ConnToken,
@@ -2489,7 +2492,12 @@ async fn writer_task(
             corr = frame.header.corr, ty = ?frame.header.ty,
             "consumer egress progress"
         );
-        let result = write_frame(&mut write_half, &frame).await;
+        // A partial frame may be discarded only when this socket generation is retiring.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            result = write_frame(&mut write_half, &frame) => result,
+        };
         tracing::debug!(
             target: "subc.wire",
             stage = "write_finished",
@@ -3031,6 +3039,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use tokio::net::TcpStream;
 
     /// The behavioural grace tests inject their own window to compress timeouts, so they prove
     /// the MECHANISM and are blind to the shipped VALUE. Found by mutation: setting the constant
@@ -3620,6 +3629,27 @@ mod tests {
         .expect("connect to control TCP stub")
     }
 
+    #[tokio::test]
+    async fn consumer_connect_tries_second_endpoint() {
+        let stub = ControlTcpStub::start(ControlStubReply::Blackhole).await;
+        let first = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut info = connection_file::read(&stub.connection_file).unwrap();
+        info.endpoints.insert(
+            0,
+            Endpoint {
+                host: "127.0.0.1".into(),
+                port: first.local_addr().unwrap().port(),
+            },
+        );
+        drop(first);
+        connection_file::write_atomic(&stub.connection_file, &info).unwrap();
+        let conn = SubcConnection::connect(&stub.connection_file)
+            .await
+            .unwrap();
+        assert!(conn.shared.current.lock().unwrap().active);
+        assert_eq!(stub.accept_count(), 1);
+    }
+
     async fn wait_for_accept_count(stub: &ControlTcpStub, expected: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while stub.accept_count() < expected {
@@ -4183,6 +4213,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_route_close_wakes_sibling_calls_only_in_its_epoch() {
+        use futures::FutureExt;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2), (8, 3)])));
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        write_tx.try_send(frame(FrameType::Push, 0, 0, 0)).unwrap();
+        let conn = test_connection(write_tx, Arc::clone(&pending), routes, ConnToken(1), 1);
+        let route = RouteHandle::new(7, 2, ConnToken(1));
+        let (_, _first, mut first_rx) = conn.register_route(&route, (7, 2, 5)).unwrap();
+        let (_, _sibling, mut sibling_rx) = conn.register_route(&route, (7, 2, 6)).unwrap();
+        let (_old, mut old_rx) =
+            PendingRegistration::new(Arc::clone(&pending), (7, 1, 5), false, None).unwrap();
+        let (_, _other, mut other_rx) = conn
+            .register_route(&RouteHandle::new(8, 3, ConnToken(1)), (8, 3, 5))
+            .unwrap();
+
+        let close = conn.route_close(&route);
+        tokio::pin!(close);
+        assert!(close.as_mut().now_or_never().is_none(), "egress is full");
+        for rx in [&mut first_rx, &mut sibling_rx] {
+            let terminal = rx
+                .try_recv()
+                .expect("local close must fan out before enqueue");
+            assert_eq!(terminal.header.ty, FrameType::Goodbye);
+            assert_eq!((terminal.header.channel, terminal.header.epoch), (7, 2));
+        }
+        assert!(matches!(
+            old_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!conn.route_is_open(&route));
+        assert!(conn.register_route(&route, (7, 2, 7)).is_err());
+        write_rx.recv().await.unwrap();
+        close.await.unwrap();
+        assert_eq!(write_rx.recv().await.unwrap().header.ty, FrameType::Goodbye);
+    }
+
+    #[tokio::test]
     async fn route_gone_goodbye_fans_out_only_within_its_epoch() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
@@ -4511,6 +4583,82 @@ mod tests {
         reader.await.unwrap();
     }
 
+    async fn congested_egress_does_not_stop_ingress(cleanup: u8) {
+        let pending: PendingMap = Arc::default();
+        let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
+        let (_live, mut reply_rx) =
+            PendingRegistration::new(Arc::clone(&pending), (0, 0, 2), false, None).unwrap();
+        let (mut abandoned, open_rx) =
+            PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, None).unwrap();
+        drop(open_rx);
+        if cleanup == 1 {
+            abandoned.arm_late_route_open_cleanup();
+            drop(abandoned);
+        }
+        let trigger = if cleanup == 0 {
+            reverse_request(7, 2, 1, "unhandled")
+        } else {
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    route_channel: 9,
+                    route_epoch: 4,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        write_tx.try_send(frame(FrameType::Ping, 0, 0, 99)).unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let reader = tokio::spawn(reader_task(
+            server,
+            Arc::clone(&pending),
+            Arc::clone(&routes),
+            write_tx,
+            None,
+        ));
+        write_frame(&mut client, &trigger).await.unwrap();
+        write_frame(&mut client, &frame(FrameType::Response, 0, 0, 2))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(1), reply_rx.recv())
+            .await
+            .expect("ingress must process a reply while egress remains full")
+            .unwrap();
+        assert_eq!(reply.header.corr, 2);
+        assert_eq!(
+            write_rx.try_recv().unwrap().header.corr,
+            99,
+            "the full queue was not drained to permit ingress"
+        );
+        assert!(
+            !routes.lock().unwrap().contains_key(&9),
+            "abandoned opens must still be invalidated when cleanup cannot enqueue"
+        );
+        drop(client);
+        reader.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_egress_reverse_refusal_does_not_block_replies() {
+        congested_egress_does_not_stop_ingress(0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_egress_late_open_cleanup_does_not_block_replies() {
+        congested_egress_does_not_stop_ingress(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_egress_abandoned_open_cleanup_does_not_block_replies() {
+        congested_egress_does_not_stop_ingress(2).await;
+    }
+
     #[tokio::test]
     async fn foreign_connection_handle_fails_without_emitting_a_frame() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -4748,7 +4896,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn probe_timeout_starts_only_after_confirmed_write() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::new()));
@@ -4759,10 +4907,15 @@ mod tests {
             Arc::clone(&state.runtime)
         };
 
-        conn.spawn_liveness_probe(&runtime);
+        conn.shared.current.lock().unwrap().probe_in_flight = true;
+        let probe = tokio::spawn(run_liveness_probe(
+            Arc::downgrade(&conn.shared),
+            Arc::clone(&runtime),
+            1,
+        ));
         let ping = write_rx.recv().await.expect("probe must queue its Ping");
         assert_eq!(ping.header.ty, FrameType::Ping);
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::advance(Duration::from_millis(60)).await;
         assert!(
             conn.shared.current.lock().unwrap().active,
             "queue insertion alone must not start conviction"
@@ -4776,11 +4929,98 @@ mod tests {
             .expect("the Ping must await a writer receipt")
             .send(Ok(Instant::now()))
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        wait_for_probe_window(&conn).await;
+        tokio::time::advance(conn.shared.probe_timeout).await;
+        probe.await.unwrap();
         assert!(
             !conn.shared.current.lock().unwrap().active,
             "silence after a confirmed Ping write must convict the generation"
         );
+    }
+
+    struct BlockedWriter(Arc<tokio::sync::Notify>);
+
+    impl AsyncWrite for BlockedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.notify_one();
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_ping_write_expires_and_reconnects() {
+        let (write_tx, write_rx) = mpsc::channel(1);
+        let mut conn = test_connection(write_tx, Arc::default(), Arc::default(), ConnToken(1), 1);
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        Arc::get_mut(&mut conn.shared).unwrap().reconnect_tx = reconnect_tx;
+        let runtime = Arc::clone(&conn.shared.current.lock().unwrap().runtime);
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let writer = tokio::spawn(writer_task(
+            BlockedWriter(Arc::clone(&blocked)),
+            write_rx,
+            Arc::downgrade(&conn.shared),
+            runtime.conn,
+            runtime.shutdown.clone(),
+            Arc::clone(&runtime.write_confirmations),
+        ));
+        let probe = tokio::spawn(run_liveness_probe(
+            Arc::downgrade(&conn.shared),
+            Arc::clone(&runtime),
+            1,
+        ));
+        blocked.notified().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .expect("egress deadline must finish the probe")
+            .unwrap();
+        assert!(!conn.shared.current.lock().unwrap().active);
+        assert_eq!(
+            reconnect_rx
+                .try_recv()
+                .expect("conviction must request reconnect"),
+            runtime.conn
+        );
+        assert!(runtime.shutdown.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("generation shutdown must interrupt the blocked write")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_ping_enqueue_expires() {
+        use futures::FutureExt;
+        let (write_tx, _write_rx) = mpsc::channel(1);
+        write_tx.try_send(frame(FrameType::Push, 0, 0, 0)).unwrap();
+        let conn = test_connection(write_tx, Arc::default(), Arc::default(), ConnToken(1), 1);
+        let runtime = Arc::clone(&conn.shared.current.lock().unwrap().runtime);
+        let probe = run_liveness_probe(Arc::downgrade(&conn.shared), Arc::clone(&runtime), 1);
+        tokio::pin!(probe);
+        assert!(probe.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            probe.now_or_never().is_some(),
+            "queue send must share the egress budget"
+        );
+        assert!(!conn.shared.current.lock().unwrap().active);
+        assert!(runtime.write_confirmations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

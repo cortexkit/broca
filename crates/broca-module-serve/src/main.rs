@@ -878,18 +878,76 @@ where
 
 async fn connect(conn_path: &PathBuf) -> Result<TcpStream, ServeIoError> {
     let conn = connection_file::read(conn_path).map_err(|e| ServeIoError(e.to_string()))?;
-    let endpoint = conn
-        .endpoints
-        .first()
-        .ok_or_else(|| ServeIoError("connection file has no endpoints".into()))?;
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| ServeIoError(format!("connect {addr}: {e}")))?;
+    let mut stream = broca_subc::tcp_connect::connect_endpoints(
+        conn.endpoints
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),
+    )
+    .await
+    .map_err(|e| ServeIoError(format!("connect: {e}")))?;
     authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
         .await
         .map_err(|e| ServeIoError(format!("authenticate: {e}")))?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod endpoint_connect_tests {
+    use super::*;
+    use subc_transport::connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+    #[tokio::test]
+    async fn ipv6_endpoint_connects_after_failed_first() {
+        let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("::1", 0)).await.unwrap();
+        let key = vec![0x5c; 32];
+        let path = broca_test_support::scratch_root()
+            .join(format!("module-connect-{}.json", std::process::id()));
+        connection_file::write_atomic(
+            &path,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: None,
+                endpoints: vec![
+                    Endpoint {
+                        host: "127.0.0.1".into(),
+                        port: first.local_addr().unwrap().port(),
+                    },
+                    Endpoint {
+                        host: "::1".into(),
+                        port: listener.local_addr().unwrap().port(),
+                    },
+                ],
+                key: key.clone(),
+                daemon_id: [0xc5; 16],
+                pid: std::process::id(),
+                daemon_ver: "test".into(),
+            },
+        )
+        .unwrap();
+        drop(first);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            subc_transport::authenticate_server(
+                &mut stream,
+                &key,
+                &[0xc5; 16],
+                "test",
+                broca_test_support::STAND_IN_AUTH_DEADLINE,
+            )
+            .await
+            .unwrap();
+            stream
+        });
+        let stream = connect(&path)
+            .await
+            .expect("module socket must fall back to raw IPv6");
+        assert!(stream.peer_addr().unwrap().is_ipv6());
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 enum LaunchArgs {

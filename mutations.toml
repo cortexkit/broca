@@ -1391,8 +1391,8 @@ target = "--lib"
 test_file = "crates/broca-subc/src/connection.rs"
 expect_red = ["connection::tests::a_reverse_request_sharing_a_pending_calls_corr_does_not_complete_that_call"]
 file = "crates/broca-subc/src/connection.rs"
-old = "            if write_tx.send(reply).await.is_err() {\n                break;\n            }\n            continue;\n        }\n        let key = (channel, epoch, frame.header.corr);"
-new = "            if write_tx.send(reply).await.is_err() {\n                break;\n            }\n            // NON-VACUITY BREAK: also route the request to the forward waiters\n        }\n        let key = (channel, epoch, frame.header.corr);"
+old = "            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {\n                break;\n            }\n            continue;\n        }\n        let key = (channel, epoch, frame.header.corr);"
+new = "            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {\n                break;\n            }\n            // NON-VACUITY BREAK: also route the request to the forward waiters\n        }\n        let key = (channel, epoch, frame.header.corr);"
 
 [[control]]
 id = "bash-watch-deadline-grace"
@@ -9653,3 +9653,183 @@ expect_red = ["actor::writer_shutdown_tests::actor_reports_final_writer_shutdown
 file = "crates/broca-module/src/actor.rs"
 old = "if let Err(error) = result {\n            self.registry.report_seal_failure();"
 new = "if let Err(error) = result {\n            // NON-VACUITY BREAK: report a successful registry shutdown."
+
+[[control]]
+id = "subc-local-close-fanout"
+guards = "Local route close wakes sibling calls before enqueue without touching other routes or epochs"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::local_route_close_wakes_sibling_calls_only_in_its_epoch"]
+file = "crates/broca-subc/src/connection.rs"
+old = '        finish_route(&runtime.pending, &runtime.route_epochs, &frame);'
+new = '        /* NON-VACUITY BREAK: leave local waiters stranded */'
+
+[[control]]
+id = "subc-probe-egress-budget"
+guards = "Probe enqueue and write confirmation have a deadline independent of post-write silence"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::blocked_ping_write_expires_and_reconnects", "connection::tests::blocked_ping_enqueue_expires"]
+file = "crates/broca-subc/src/connection.rs"
+old = 'const PROBE_EGRESS_TIMEOUT: Duration = Duration::from_secs(2);'
+new = 'const PROBE_EGRESS_TIMEOUT: Duration = Duration::from_secs(3600); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-writer-shutdown-cancellation"
+guards = "Generation shutdown interrupts a blocked frame write"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::blocked_ping_write_expires_and_reconnects"]
+file = "crates/broca-subc/src/connection.rs"
+old = '            _ = shutdown.cancelled() => break,'
+new = '            _ = std::future::pending::<()>() => break, // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-budget"
+guards = "A blackholed TCP connection finishes within the application budget"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::blackholed_endpoint_is_bounded_by_budget"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = 'const CONNECT_BUDGET: Duration = Duration::from_secs(2);'
+new = 'const CONNECT_BUDGET: Duration = Duration::from_secs(3600); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-ipv6"
+guards = "Raw IPv6 endpoint hosts use tuple resolution"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::ipv6_endpoint_connects"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = '    connect_with(&endpoints, TcpStream::connect).await'
+new = '    connect_with(&endpoints, |(host, port)| TcpStream::connect((host.replace(":", ""), port))).await // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-fallback"
+guards = "A failed first TCP endpoint does not suppress later endpoints"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::failed_first_endpoint_tries_second"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = '    for (index, endpoint) in endpoints.iter().enumerate() {'
+new = '    for (index, endpoint) in endpoints.iter().enumerate().take(1) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-blackhole-fallback"
+guards = "A blackholed first TCP endpoint reserves time for fallback"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::blackholed_first_endpoint_leaves_budget_for_second"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = '        let share = remaining / (endpoints.len() - index) as u32;'
+new = '        let share = remaining; let _ = index; // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-consumer-connect-endpoints"
+guards = "The consumer socket passes all endpoints to bounded selection"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::consumer_connect_tries_second_endpoint"]
+file = "crates/broca-subc/src/connection.rs"
+old = '            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),'
+new = '            .take(1).map(|endpoint| (endpoint.host.as_str(), endpoint.port)), // NON-VACUITY BREAK'
+
+[[control]]
+id = "module-connect-endpoints"
+guards = "The module socket passes all endpoints to bounded IPv6 selection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["endpoint_connect_tests::ipv6_endpoint_connects_after_failed_first"]
+file = "crates/broca-module-serve/src/main.rs"
+old = '            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),'
+new = '            .take(1).map(|endpoint| (endpoint.host.as_str(), endpoint.port)), // NON-VACUITY BREAK'
+
+[[control]]
+id = "websocket-idle-keepalives"
+guards = "257 acknowledged idle Pings cannot block the next response.create on a retained socket"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::pump_tests::idle_ping_gap_does_not_block_next_response_create"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '                    if !*activity.borrow_and_update() { continue; }'
+new = '                    if false { continue; } // NON-VACUITY BREAK'
+
+[[control]]
+id = "websocket-completed-keepalive-unblocks"
+guards = "Completion interrupts a keepalive send blocked on the receive queue"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::pump_tests::completed_attempt_interrupts_congested_keepalive_delivery"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '                        _ = activity.changed() => continue,'
+new = '                        _ = std::future::pending::<()>() => continue, // NON-VACUITY BREAK'
+
+[[control]]
+id = "websocket-attempt-activity-retires"
+guards = "The production attempt driver retires keepalive consumption after response.completed"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::pump_tests::idle_ping_gap_does_not_block_next_response_create"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '        self.0.send_replace(false);'
+new = '        self.0.send_replace(true); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-ingress-full-egress-reverse"
+guards = "Ingress continues processing replies with egress full during a reverse refusal"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::full_egress_reverse_refusal_does_not_block_replies"]
+file = "crates/broca-subc/src/connection.rs"
+old = '            let refusal = write_tx.try_send(reply);'
+new = '            let refusal = write_tx.send(reply).await.map_err(|error| mpsc::error::TrySendError::Closed(error.0)); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-ingress-full-egress-late-open"
+guards = "Ingress continues processing replies with egress full during late-open cleanup"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::full_egress_late_open_cleanup_does_not_block_replies"]
+file = "crates/broca-subc/src/connection.rs"
+old = '                        let late_cleanup = write_tx.try_send(goodbye);'
+new = '                        let late_cleanup = write_tx.send(goodbye).await.map_err(|error| mpsc::error::TrySendError::Closed(error.0)); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-ingress-full-egress-abandoned-open"
+guards = "Ingress continues processing replies with egress full during abandoned-open cleanup"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::full_egress_abandoned_open_cleanup_does_not_block_replies"]
+file = "crates/broca-subc/src/connection.rs"
+old = '                        let abandoned_cleanup = write_tx.try_send(goodbye);'
+new = '                        let abandoned_cleanup = write_tx.send(goodbye).await.map_err(|error| mpsc::error::TrySendError::Closed(error.0)); // NON-VACUITY BREAK'
