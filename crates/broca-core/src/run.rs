@@ -448,10 +448,18 @@ pub struct RunSummary {
     pub final_step_finish_reason: Option<FinishReason>,
 }
 
+#[cfg(all(test, feature = "test-clock"))]
+pub(crate) struct ApprovalWaitProbe {
+    entered: mpsc::UnboundedSender<(bool, bool)>,
+    release: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+}
+
 /// Cooperative run controls. Optional controls default to "off"; ordinary control-payload
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    #[cfg(all(test, feature = "test-clock"))]
+    pub(crate) approval_wait_probe: Option<Arc<ApprovalWaitProbe>>,
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
@@ -608,6 +616,8 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            #[cfg(all(test, feature = "test-clock"))]
+            approval_wait_probe: None,
             clock: None,
             cancel: None,
             compaction_plane: None,
@@ -9904,7 +9914,9 @@ mod approval_gate {
         let mut dispatched = HashSet::new();
         let mut cursor = None;
         let mut polling: Option<AnswerRead<'_>> = None;
-        let mut next_poll = 0;
+        let mut answer_poll = AnswerPollSchedule::default();
+        let clock = control.clock.clone().unwrap_or_default();
+        let mut clock_changes = clock.subscribe();
         let mut interruption = None;
         if slots.iter().any(|slot| matches!(slot, Slot::Held(_))) {
             marker(slots, ctx, writer, history).await?;
@@ -10062,12 +10074,49 @@ mod approval_gate {
                 marker(slots, ctx, writer, history).await?;
                 continue;
             }
-            if !stopping && polling.is_none() && now(control) >= next_poll && (slots.iter().any(|slot| matches!(slot, Slot::Held(call) if call.digest.is_none() && call.id.is_some())) || !history.projection.obligations().expired_without_late_record.is_empty()) {
+            let needs_answers = slots.iter().any(|slot| matches!(slot, Slot::Held(call) if call.digest.is_none() && call.id.is_some())) || !history.projection.obligations().expired_without_late_record.is_empty();
+            if !stopping && polling.is_none() && answer_poll.ready(now(control)) && needs_answers {
                 if let Some(elicitation) = control.elicitation_plane.as_ref() {
                     let since = cursor.clone();
-                    polling = Some(Box::pin(async move { tokio::time::timeout(Duration::from_millis(1000), elicitation.answers(ctx, since.as_ref())).await
-                        .unwrap_or_else(|_| Err(ApprovalRouteError { code: "timeout".into(), retryable: true })) }));
+                    polling = Some(Box::pin(async move {
+                        tokio::time::timeout(
+                            Duration::from_millis(1000),
+                            elicitation.answers(ctx, since.as_ref()),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(ApprovalRouteError {
+                                code: "timeout".into(),
+                                retryable: true,
+                            })
+                        })
+                    }));
                 }
+            }
+            let timestamp = now(control);
+            let mut wake_at = if needs_answers && polling.is_none() {
+                answer_poll.next
+            } else {
+                u64::MAX
+            };
+            for (index, slot) in slots.iter().enumerate() {
+                if let Slot::Held(call) = slot {
+                    if stopping {
+                        continue;
+                    }
+                    if call.digest.is_none() {
+                        wake_at = wake_at.min(call.expires());
+                    }
+                    if !call.filed && !active.contains(&index) {
+                        wake_at = wake_at.min(call.retry_at);
+                    }
+                }
+            }
+            #[cfg(all(test, feature = "test-clock"))]
+            if let Some(probe) = &control.approval_wait_probe {
+                // Acknowledge the durable transition before tests advance the shared clock.
+                let _ = probe.entered.send((polling.is_some(), !jobs.is_empty()));
+                let _ = probe.release.lock().await.recv().await;
             }
             tokio::select! {
                 biased;
@@ -10124,11 +10173,13 @@ mod approval_gate {
                     }
                 }
                 page = async { match polling.as_mut() { Some(poll) => poll.await, None => std::future::pending().await } } => {
-                    polling = None; next_poll = now(control).saturating_add(50);
+                    polling = None;
+                    answer_poll.completed(now(control));
                     match page {
-                        Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }
+                        Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }
                         Err(_) => {}
                         Ok(page) => {
+                            if !page.records.is_empty() { answer_poll.reset_backoff(); }
                             let Ok(answers)=read_answers(&page.records) else {continue};
                             for (key,id,approved,digest) in answers {
                                 if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && call.digest.is_none())) {
@@ -10153,9 +10204,82 @@ mod approval_gate {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                _ = cancelled_token(control.cancel.as_ref()), if !stopping => {}
+                _ = cancelled_token(control.stop_requested.as_ref()), if !stopping => {}
+                _ = clock_changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_millis(wake_at.saturating_sub(timestamp))), if wake_at != u64::MAX => {}
             }
         }
+    }
+    #[derive(Default)]
+    struct AnswerPollSchedule {
+        next: u64,
+        delay: u64,
+    }
+
+    impl AnswerPollSchedule {
+        fn ready(&self, now: u64) -> bool {
+            now >= self.next
+        }
+
+        fn completed(&mut self, now: u64) {
+            // The pinned requester vectors expose a cursor read, not a settlement notification.
+            // Empty/error reads back off from 50 ms to 1 s, adding at most 1 s of pickup
+            // delay (plus the answer RPC). Cancellation and clock changes wake independently.
+            let delay = self.delay.max(50);
+            self.next = now.saturating_add(delay);
+            self.delay = (delay * 2).min(1000);
+        }
+
+        fn reset_backoff(&mut self) {
+            self.delay = 50;
+        }
+    }
+
+    #[tokio::test]
+    async fn held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap() {
+        let (ticks, mut clock) = tokio::sync::mpsc::channel(1);
+        let (observed, mut observations) = tokio::sync::mpsc::channel(1);
+        let (answer, mut answer_gate) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let mut schedule = AnswerPollSchedule::default();
+            let mut polls = 0;
+            let mut pickup = None;
+            while let Some(now) = clock.recv().await {
+                if schedule.ready(now) {
+                    polls += 1;
+                    if answer_gate.try_recv().is_ok() {
+                        pickup = Some(now);
+                    }
+                    schedule.completed(now);
+                }
+                observed.send((polls, pickup)).await.unwrap();
+            }
+        });
+        // Each clock advance is acknowledged before the next one; no scheduler or wall-time
+        // assumption decides how many reads a held approval performs.
+        for now in 0..=5_000 {
+            ticks.send(now).await.unwrap();
+            observations.recv().await.unwrap();
+        }
+        answer.send(()).unwrap();
+        let mut last = (0, None);
+        for now in 5_001..=10_000 {
+            ticks.send(now).await.unwrap();
+            last = observations.recv().await.unwrap();
+        }
+        drop(ticks);
+        waiter.await.unwrap();
+        let (polls, pickup) = last;
+        assert!(
+            polls <= 15,
+            "held approval performed {polls} reads in 10 seconds"
+        );
+        let pickup = pickup.expect("answer gate was never read");
+        assert!(
+            (5_001..=6_001).contains(&pickup),
+            "answer missed the 1 s pickup cap: {pickup}"
+        );
     }
     async fn cancelled_token(token: Option<&CancellationToken>) {
         cancelled(token).await

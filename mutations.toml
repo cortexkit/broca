@@ -4881,8 +4881,8 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::old_incarnation_is_re_read_and_sibling_keys_are_distinct"]
 file = "crates/broca-core/src/run.rs"
-old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }'''
-new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK */ next_poll = 0; }'''
+old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }'''
+new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK */ answer_poll = AnswerPollSchedule::default(); }'''
 
 [[control]]
 id = "core-approval-classify-late-before-dedup"
@@ -10315,3 +10315,57 @@ select = "expected"
 file = "crates/broca-provider/src/transport_websocket.rs"
 old = "        let configured_https = policy();\n        let state = self.state.lock().unwrap();"
 new = "        let state = self.state.lock().unwrap();\n        let configured_https = policy(); // NON-VACUITY BREAK: read config under session mutex"
+
+[[control]]
+id = "approval-held-answer-backoff-bounded"
+guards = "held approvals back off answer reads while retaining a one-second pickup cap"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::approval_gate::held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = 50; // NON-VACUITY BREAK: poll every 50 ms forever"
+
+[[control]]
+id = "approval-answer-pickup-cap"
+guards = "an answer arriving during a held approval backoff is read within one second"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::approval_gate::held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = (delay * 2).min(10000); // NON-VACUITY BREAK: allow ten-second pickup delay"
+
+[[control]]
+id = "approval-wait-real-rpc-rate"
+guards = "the actual held approval wait uses backoff rather than repeatedly resetting to 50 ms"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "                    answer_poll.completed(now(control));"
+new = "                    answer_poll.completed(now(control)); answer_poll.delay = 50; // NON-VACUITY BREAK: force rapid reads in the real waiter"
+
+[[control]]
+id = "approval-wait-real-answer-pickup"
+guards = "the actual held approval wait picks up an answer within one second of its arrival mid-backoff"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "                    answer_poll.completed(now(control));"
+new = "                    answer_poll.completed(now(control)); answer_poll.next = now(control).saturating_add(10000); // NON-VACUITY BREAK: oversleep answer arrival in the real waiter"
