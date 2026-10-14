@@ -14,7 +14,3 @@ crates/broca-provider/tests/fixtures/cc_system_reminder_request.json -text
 crates/broca-provider/tests/fixtures/codex_spark_toolcall_done_only.sse -text
 # Sealed WAL archive containers are binary fixtures pinned by digest.
 *.ark binary
-# Rows are append-only, so parallel branches that each add rows merge without conflict.
-# A union merge would duplicate lines if two branches edited the same existing row;
-# that yields a duplicate TOML key, which ckdev-mutate check and the parser refuse.
-mutations.toml merge=union
