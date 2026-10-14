@@ -2377,20 +2377,10 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
         .unwrap();
         lineage = wal.lineage_id().unwrap().to_string();
     }
-    // There is no retention_lineage row or session-identity sidecar. Without boot
-    // enrollment, the sweep's indexed deadline query cannot discover this expired WAL.
+    // No retention deadline row or identity sidecar is seeded. Require completed deletion
+    // before any session request, not only a read-time expiry refusal.
+    assert!(!live_path.with_extension("session").exists());
     let live = subject.start(&root).await.unwrap();
-    let route = subject
-        .session_route(&live, "rolled-back-retention", &subject.owner_stamp())
-        .await
-        .unwrap();
-    match route.request("session.read", json!({})).await.unwrap() {
-        Reply::Error(body) => {
-            assert_eq!(body.code, "expired");
-            assert_eq!(body.detail.unwrap()["expired_at_ms"], 1200);
-        }
-        other => panic!("expired content was served: {other:?}"),
-    }
     let stone = wal_store.tombstone_path(&key, &lineage);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2405,7 +2395,18 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
         }
     })
     .await
-    .expect("boot enrolled the WAL and the first sweep completed deletion");
+    .expect("startup enrollment and the first sweep must delete the WAL without a session read");
+    let route = subject
+        .session_route(&live, "rolled-back-retention", &subject.owner_stamp())
+        .await
+        .unwrap();
+    match route.request("session.read", json!({})).await.unwrap() {
+        Reply::Error(body) => {
+            assert_eq!(body.code, "expired");
+            assert_eq!(body.detail.unwrap()["expired_at_ms"], 1200);
+        }
+        other => panic!("expired content was served: {other:?}"),
+    }
     drop(route);
     drop(live);
     let _ = std::fs::remove_dir_all(scratch);
