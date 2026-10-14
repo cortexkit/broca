@@ -422,7 +422,9 @@ struct Routes {
     // inside it: BindIdentity also keys the actor registry, so folding them in would give one
     // session WAL a separate actor per distinct observation, all writing the same file.
     by_channel: std::collections::HashMap<u16, (u32, BrocaBindIdentity, BindObservation)>,
-    subscribe_cancel: std::collections::HashMap<u16, CancellationToken>,
+    pending_binds: std::collections::HashMap<u16, (u32, CancellationToken)>,
+    bind_tasks: JoinSet<BindCompletion>,
+    subscribe_cancel: std::collections::HashMap<u16, Arc<SubscriptionSlot>>,
     dispatch_lanes: std::collections::HashMap<BrocaBindIdentity, Arc<DispatchLane>>,
     next_dispatch_lane_sweep: usize,
     /// Whether the daemon advertises `scopes/v1` (from `server.describe`, or from this
@@ -435,6 +437,8 @@ impl Routes {
     fn new(daemon_scopes: bool) -> Self {
         Self {
             by_channel: std::collections::HashMap::new(),
+            pending_binds: std::collections::HashMap::new(),
+            bind_tasks: JoinSet::new(),
             subscribe_cancel: std::collections::HashMap::new(),
             dispatch_lanes: std::collections::HashMap::new(),
             next_dispatch_lane_sweep: DISPATCH_LANE_SWEEP_MIN,
@@ -450,13 +454,31 @@ impl Routes {
             .reserve()
     }
 
-    fn route_closed(&mut self, channel: u16) {
+    fn route_closed(&mut self, channel: u16, epoch: u32) {
+        if self
+            .pending_binds
+            .get(&channel)
+            .is_some_and(|(pending_epoch, _)| *pending_epoch == epoch)
+        {
+            if let Some((_, cancel)) = self.pending_binds.remove(&channel) {
+                cancel.cancel();
+            }
+        }
+        // A pending replacement and the published route can share a channel, but a GOODBYE
+        // names only one generation. Closing either must leave the other generation intact.
+        if !self
+            .by_channel
+            .get(&channel)
+            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)
+        {
+            return;
+        }
         let departed_session = self
             .by_channel
             .remove(&channel)
             .map(|(_, session, _)| session);
         if let Some(cancel) = self.subscribe_cancel.remove(&channel) {
-            cancel.cancel();
+            cancel.route.cancel();
         }
         if let Some(session) = departed_session {
             self.evict_dispatch_lane_if_idle(&session);
@@ -557,9 +579,34 @@ impl Drop for DispatchTurn {
 enum PreparedRouteRequest {
     Request(RouteRequest),
     Subscribe {
-        from: SubscribeFrom,
-        cancel: CancellationToken,
+        params: serde_json::Value,
+        slot: Arc<SubscriptionSlot>,
     },
+}
+
+struct SubscriptionSlot {
+    route: CancellationToken,
+    current: std::sync::Mutex<Option<CancellationToken>>,
+}
+
+struct BindCompletion {
+    header: subc_protocol::EnvelopeHeader,
+    channel: u16,
+    epoch: u32,
+    identity: BrocaBindIdentity,
+    bind: BindObservation,
+    cancel: CancellationToken,
+    refusal: Option<broca_core::AdoptionRefusal>,
+}
+
+impl SubscriptionSlot {
+    fn replace(&self) -> CancellationToken {
+        let cancel = self.route.child_token();
+        if let Some(previous) = self.current.lock().unwrap().replace(cancel.clone()) {
+            previous.cancel();
+        }
+        cancel
+    }
 }
 
 /// Why a served connection stopped without an error. main.rs appends it to the shutdown seal
@@ -686,7 +733,7 @@ where
 {
     let stall_state = stall::connection_state();
     let (tx, rx) = broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, stall_state.egress.clone());
-    let writer = tokio::spawn(drain_writer(write_half, rx));
+    let mut writer = tokio::spawn(drain_writer(write_half, rx));
     let reader_lifetime = stall::reader_lifetime(stall_state.clone());
 
     // A connection-level cancel: when the frame loop ends (EOF / GOODBYE / error), this
@@ -695,26 +742,39 @@ where
     // lineage-scoped subscription's parked forward task would keep the egress open forever
     // and hang the connection on teardown.
     let conn_cancel = CancellationToken::new();
-    let loop_result = stall::READER
-        .scope(
-            stall_state,
-            run_frame_loop(
-                &mut read_half,
-                tx.clone(),
-                module_id,
-                handler,
-                health_registry.as_ref(),
-                vault_gauge.as_ref(),
-                catalog_cache.as_deref(),
-                conn_cancel.clone(),
-                archive,
-                &consumer_routes,
-                vault_auditor,
-                daemon_capabilities,
-                scope_describer.as_deref(),
-            ),
-        )
-        .await;
+    let frame_loop = stall::READER.scope(
+        stall_state,
+        run_frame_loop(
+            &mut read_half,
+            tx.clone(),
+            module_id,
+            handler,
+            health_registry.as_ref(),
+            vault_gauge.as_ref(),
+            catalog_cache.as_deref(),
+            conn_cancel.clone(),
+            archive,
+            &consumer_routes,
+            vault_auditor,
+            daemon_capabilities,
+            scope_describer.as_deref(),
+        ),
+    );
+    let mut writer_finished = false;
+    let loop_result = tokio::select! {
+        biased;
+        // A reset reported by the write half closes the TCP connection, not one route
+        // (RFC 9293 §3.10.7.4). Observe it before a request sees the closed egress queue.
+        result = &mut writer => {
+            writer_finished = true;
+            match result {
+                Ok(Ok(())) => Ok(ServeEnd::PeerReset),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(ServeIoError(error.to_string())),
+            }
+        }
+        result = frame_loop => result,
+    };
     drop(reader_lifetime);
     // Before the egress queue can close: the describer holds a sender on it.
     if let Some(describer) = &scope_describer {
@@ -722,7 +782,11 @@ where
     }
     conn_cancel.cancel();
     drop(tx);
-    let writer_result = writer.await;
+    let writer_result = if writer_finished {
+        Ok(Ok(()))
+    } else {
+        writer.await
+    };
 
     match (loop_result, writer_result) {
         (Err(e), _) => Err(e),
@@ -784,6 +848,12 @@ where
 
     let loop_result = loop {
         tokio::select! {
+            joined = routes.bind_tasks.join_next(), if !routes.bind_tasks.is_empty() => {
+                match joined.expect("guarded by !routes.bind_tasks.is_empty()") {
+                    Ok(completed) => finish_bind(completed, &writer, &mut routes).await?,
+                    Err(error) => break Err(ServeIoError(format!("bind authorization task failed: {error}"))),
+                }
+            }
             joined = request_tasks.join_next(), if !request_tasks.is_empty() => {
                 match joined.expect("guarded by !request_tasks.is_empty()") {
                     Ok(Ok(())) => {}
@@ -886,6 +956,15 @@ where
     } else {
         None
     };
+    if frame.header.ty == FrameType::Goodbye
+        && routes
+            .pending_binds
+            .get(&frame.header.channel)
+            .is_some_and(|(epoch, _)| *epoch == frame.header.epoch)
+    {
+        routes.route_closed(frame.header.channel, frame.header.epoch);
+        return Ok(true);
+    }
     let bound_epoch = routes
         .by_channel
         .get(&frame.header.channel)
@@ -953,7 +1032,7 @@ where
         FrameType::Goodbye => {
             // A route GOODBYE: drop the channel binding and cancel any live subscribe
             // forward task on it (explicit unsubscribe → prompt teardown).
-            routes.route_closed(frame.header.channel);
+            routes.route_closed(frame.header.channel, frame.header.epoch);
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
@@ -1025,28 +1104,6 @@ where
                     return Ok(true);
                 }
             }
-            let authorization = {
-                let write = matches!(
-                    req.method.as_str(),
-                    OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT
-                );
-                let session_read = matches!(
-                    req.method.as_str(),
-                    OP_READ | OP_HEAD | OP_RUN_RESULT | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE
-                );
-                if write || session_read {
-                    if let Err(error) = handler.check_migration(&session, write).await {
-                        send_serve_error(writer, ver, channel, epoch, corr, &error).await?;
-                        return Ok(true);
-                    }
-                }
-                let _phase = stall::enter(Phase::FlowAuthorization).await;
-                authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await
-            };
-            if let Err(error) = authorization {
-                send_serve_error(writer, ver, channel, epoch, corr, &error).await?;
-                return Ok(true);
-            }
             if req.method == OP_ROLE_DESCRIBE {
                 trace_describe("admitted", channel, epoch, corr);
             }
@@ -1062,23 +1119,13 @@ where
                     epoch,
                     corr,
                     vault_auditor,
+                    handler.clone(),
+                    session,
+                    bind,
                 )
                 .await?;
             } else {
-                let Some(prepared) = prepare_route_request(
-                    req,
-                    writer,
-                    routes,
-                    channel,
-                    epoch,
-                    corr,
-                    ver,
-                    conn_cancel,
-                )
-                .await?
-                else {
-                    return Ok(true);
-                };
+                let prepared = prepare_route_request(req, routes, channel, conn_cancel);
                 let dispatch_ticket = routes.reserve_dispatch(&session);
                 if matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE)
                 {
@@ -1175,53 +1222,32 @@ async fn handle_control_request(
                 )
                 .await;
             }
-            // A stamped bind to a session recorded without a scope whose history refuses the
-            // stamp is refused here too, with the same typed body the send would get, so the
-            // opener learns it at route open rather than on its first send.
-            if let broca_protocol::SendScope::Stamped(stamp) = &bind.scope {
-                let refusal = {
-                    let _phase = stall::enter(Phase::BindOwnership).await;
-                    health_registry
-                        .bind_adoption_refusal(&identity, bind.principal.as_ref(), stamp)
-                        .await
-                };
-                if let Some(refusal) = refusal {
-                    let body = serde_json::to_vec(&adoption_refused(&refusal))
-                        .map_err(|e| ServeIoError(e.to_string()))?;
-                    return send_error_bytes(
-                        writer,
-                        frame.header.ver,
-                        0,
-                        0,
-                        frame.header.corr,
-                        body,
-                    )
-                    .await;
-                }
+            let cancel = CancellationToken::new();
+            if let Some((_, previous)) = routes
+                .pending_binds
+                .insert(route_channel, (epoch, cancel.clone()))
+            {
+                previous.cancel();
             }
-            tracing::debug!(
-                target: "wire.ingress",
-                stage = "bound",
-                channel = route_channel, epoch,
-                session = %identity.session,
-                "module route bound"
-            );
-            routes
-                .by_channel
-                .insert(route_channel, (epoch, identity, bind));
-            let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
-                .map_err(|e| ServeIoError(e.to_string()))?;
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                control_flags(),
-                0,
-                0,
-                frame.header.corr,
-                body,
-            )
-            .map_err(|e| ServeIoError(e.to_string()))?;
-            send(writer, response).await
+            let completed = BindCompletion {
+                header: frame.header,
+                channel: route_channel,
+                epoch,
+                identity,
+                bind,
+                cancel,
+                refusal: None,
+            };
+            // Keep the bind unacknowledged until its history authorizes the stamp. The read
+            // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
+            if matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_)) {
+                let registry = health_registry.clone();
+                routes
+                    .bind_tasks
+                    .spawn(async move { authorize_bind(completed, registry).await });
+                return Ok(());
+            }
+            finish_bind(completed, writer, routes).await
         }
         // Health probes read only in-memory gauges stamped by normal dependency calls. A probe
         // must never add catalog, vault, WAL, lease, or store IO to an already degraded daemon.
@@ -1489,56 +1515,101 @@ async fn handle_control_request(
     }
 }
 
-/// Before spawning a route request, verify the state needed to manage that route. For
-/// `subscribe`, only a valid request should be allowed to replace the active stream on this
-/// channel, so a malformed retry cannot accidentally cancel the stream that is already
-/// running.
-#[allow(clippy::too_many_arguments)]
-async fn prepare_route_request(
-    req: RouteRequest,
+async fn authorize_bind(
+    mut completed: BindCompletion,
+    registry: LineageRegistry,
+) -> BindCompletion {
+    if let broca_protocol::SendScope::Stamped(stamp) = &completed.bind.scope {
+        completed.refusal = registry
+            .bind_adoption_refusal(
+                &completed.identity,
+                completed.bind.principal.as_ref(),
+                stamp,
+            )
+            .await;
+    }
+    completed
+}
+
+async fn finish_bind(
+    completed: BindCompletion,
     writer: &EgressSender<Frame>,
     routes: &mut Routes,
+) -> Result<(), ServeIoError> {
+    if completed.cancel.is_cancelled() {
+        return Ok(());
+    }
+    routes.pending_binds.remove(&completed.channel);
+    if let Some(refusal) = completed.refusal {
+        let body = serde_json::to_vec(&adoption_refused(&refusal))
+            .map_err(|e| ServeIoError(e.to_string()))?;
+        return send_error_bytes(
+            writer,
+            completed.header.ver,
+            0,
+            0,
+            completed.header.corr,
+            body,
+        )
+        .await;
+    }
+    tracing::debug!(target: "wire.ingress", stage = "bound", channel = completed.channel,
+        epoch = completed.epoch, session = %completed.identity.session, "module route bound");
+    routes.by_channel.insert(
+        completed.channel,
+        (completed.epoch, completed.identity, completed.bind),
+    );
+    let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
+        .map_err(|e| ServeIoError(e.to_string()))?;
+    let response = Frame::build_with_version(
+        completed.header.ver,
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        completed.header.corr,
+        body,
+    )
+    .map_err(|e| ServeIoError(e.to_string()))?;
+    send(writer, response).await
+}
+
+/// Reserve subscription teardown state on ingress so GOODBYE can cancel a queued request.
+/// Leave parameters opaque until task-side authorization; reserving a slot does not replace
+/// its active stream or reveal validation errors to an unauthorized caller.
+fn prepare_route_request(
+    req: RouteRequest,
+    routes: &mut Routes,
     channel: u16,
-    epoch: u32,
-    corr: u64,
-    ver: u8,
     conn_cancel: &CancellationToken,
-) -> Result<Option<PreparedRouteRequest>, ServeIoError> {
+) -> PreparedRouteRequest {
     if req.method != OP_SUBSCRIBE {
-        return Ok(Some(PreparedRouteRequest::Request(req)));
+        return PreparedRouteRequest::Request(req);
     }
-
-    let params: SubscribeParams = match decode_params(&req.params) {
-        Ok(p) => p,
-        Err((field, message)) => {
-            send_invalid_params(writer, ver, channel, epoch, corr, field, &message).await?;
-            return Ok(None);
-        }
-    };
-    let from = match params.from {
-        None => SubscribeFrom::Live,
-        Some(w) => match w.to_subscribe_from() {
-            Ok(f) => f,
-            Err(e) => {
-                send_invalid_params(writer, ver, channel, epoch, corr, Some("from".into()), &e)
-                    .await?;
-                return Ok(None);
-            }
-        },
-    };
-
-    if let Some(prev) = routes.subscribe_cancel.remove(&channel) {
-        prev.cancel();
+    let slot = routes.subscribe_cancel.entry(channel).or_insert_with(|| {
+        Arc::new(SubscriptionSlot {
+            route: conn_cancel.child_token(),
+            current: std::sync::Mutex::new(None),
+        })
+    });
+    PreparedRouteRequest::Subscribe {
+        params: req.params,
+        slot: slot.clone(),
     }
-    let cancel = conn_cancel.child_token();
-    routes.subscribe_cancel.insert(channel, cancel.clone());
-    Ok(Some(PreparedRouteRequest::Subscribe { from, cancel }))
+}
+
+fn subscribe_from(params: &serde_json::Value) -> Result<SubscribeFrom, (Option<String>, String)> {
+    let params: SubscribeParams = decode_params(params)?;
+    match params.from {
+        None => Ok(SubscribeFrom::Live),
+        Some(w) => w.to_subscribe_from().map_err(|e| (Some("from".into()), e)),
+    }
 }
 
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
 /// The configured `VaultAuditor` performs the vault call; this decodes params and writes the answer.
 #[allow(clippy::too_many_arguments)]
-async fn spawn_vault_audit_request(
+async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
     req: RouteRequest,
     writer: &EgressSender<Frame>,
     conn_cancel: &CancellationToken,
@@ -1549,20 +1620,24 @@ async fn spawn_vault_audit_request(
     epoch: u32,
     corr: u64,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
+    handler: Arc<H>,
+    session: BrocaBindIdentity,
+    bind: BindObservation,
 ) -> Result<(), ServeIoError> {
-    let permit = {
-        let _phase = stall::enter(Phase::RequestPermit).await;
-        request_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?
-    };
+    let request_slots = request_slots.clone();
     let writer = writer.clone();
     let conn_cancel = conn_cancel.clone();
     request_tasks.spawn(async move {
-        let _permit = permit;
+        let _permit = request_slots
+            .acquire_owned()
+            .await
+            .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
         let work = async move {
+            if let Err(error) =
+                authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await
+            {
+                return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+            }
             if !req.params.is_null() {
                 if let Err(error) =
                     serde_json::from_value::<crate::wire::VaultAuditParams>(req.params)
@@ -1616,25 +1691,36 @@ async fn spawn_route_request<H>(
 where
     H: ServeHandler + 'static,
 {
-    let permit = {
-        let _phase = stall::enter(Phase::RequestPermit).await;
-        request_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?
-    };
+    let request_slots = request_slots.clone();
     let writer = writer.clone();
     let handler = handler.clone();
     let conn_cancel = conn_cancel.clone();
     let describe =
         matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE);
-    if describe {
-        trace_describe("permit_acquired", channel, epoch, corr);
-    }
 
     request_tasks.spawn(async move {
-        let _permit = permit;
+        // Authorization can read durable history, and permits can be held by slow calls.
+        // Neither wait belongs on the frame reader: it must still answer PING and GOODBYE.
+        let _turn = dispatch_ticket.wait().await;
+        let _permit = request_slots.acquire_owned().await
+            .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
+        if describe {
+            trace_describe("permit_acquired", channel, epoch, corr);
+        }
+        let method = match &prepared {
+            PreparedRouteRequest::Request(req) => req.method.as_str(),
+            PreparedRouteRequest::Subscribe { .. } => OP_SUBSCRIBE,
+        };
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
+        if write || session_read {
+            if let Err(error) = handler.check_migration(&session, write).await {
+                return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+            }
+        }
         if describe {
             trace_describe("task_started", channel, epoch, corr);
         }
@@ -1643,7 +1729,6 @@ where
         // concurrent; replies may still arrive out of order because correlation ids disambiguate them.
         match prepared {
             PreparedRouteRequest::Request(req) => {
-                let _turn = dispatch_ticket.wait().await;
                 if describe {
                     trace_describe("turn_acquired", channel, epoch, corr);
                 }
@@ -1652,11 +1737,15 @@ where
                     result = execute_route_request(req, &writer, ver, channel, epoch, corr, session, bind, &handler) => result,
                 }
             }
-            PreparedRouteRequest::Subscribe { from, cancel } => {
-                let _turn = dispatch_ticket.wait().await;
-                if let Err(error) = handler.authorize_session(&session, bind.principal.as_ref()).await {
-                    return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
-                }
+            PreparedRouteRequest::Subscribe { params, slot } => {
+                let from = match subscribe_from(&params) {
+                    Ok(from) => from,
+                    Err((field, message)) => {
+                        return send_invalid_params(&writer, ver, channel, epoch, corr, field, &message).await;
+                    }
+                };
+                // Only an authorized, well-formed replacement may stop the previous stream.
+                let cancel = slot.replace();
                 tokio::select! {
                     _ = conn_cancel.cancelled() => Ok(()),
                     _ = cancel.cancelled() => Ok(()),
@@ -1695,7 +1784,7 @@ async fn authorize_route_request<H: ServeHandler>(
     }
 }
 
-/// Handle a request on an already bound route channel by checking the request method and
+/// Handle an authorized request on an already bound route channel by checking the request method and
 /// calling the matching handler for that method.
 #[allow(clippy::too_many_arguments)]
 async fn execute_route_request<H>(
@@ -1726,11 +1815,6 @@ where
             )
             .await;
         }
-    }
-    if let Err(error) =
-        authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await
-    {
-        return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
     }
     match req.method.as_str() {
         "compaction.ready" => {
@@ -2648,6 +2732,20 @@ async fn send_json_response<T: serde::Serialize>(
 ) -> Result<(), ServeIoError> {
     let envelope = ResultEnvelope { result };
     let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;
+    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {
+        // No bytes from this reply have reached the wire, so a small correlated Error
+        // can fail this call without invalidating any sibling request on the connection.
+        return send_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "response_too_large",
+            "response exceeds the protocol frame body limit",
+        )
+        .await;
+    }
     let frame = Frame::build_with_version(
         ver,
         FrameType::Response,
@@ -3162,8 +3260,15 @@ async fn send_error_bytes(
     channel: u16,
     epoch: u32,
     corr: u64,
-    body: Vec<u8>,
+    mut body: Vec<u8>,
 ) -> Result<(), ServeIoError> {
+    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {
+        body = serde_json::to_vec(&ErrorBody::new(
+            "response_too_large",
+            "error response exceeds the protocol frame body limit",
+        ))
+        .map_err(|error| ServeIoError(error.to_string()))?;
+    }
     let frame = Frame::build_with_version(
         ver,
         FrameType::Error,
@@ -3343,10 +3448,8 @@ mod tests {
     async fn watchdog_reader_phase_gates_name_stalls() {
         use crate::stall::{tests::Witness, Gate, State};
         use std::time::Duration;
+        // Authorization and permit waits run in request tasks, not reader phases.
         for (phase, expected_name) in [
-            (Phase::FlowAuthorization, "flow_authorization"),
-            (Phase::BindOwnership, "bind_ownership"),
-            (Phase::RequestPermit, "request_permit"),
             (Phase::EgressSend, "egress_send"),
             (Phase::Control, "channel_0_control"),
         ] {
@@ -3358,67 +3461,9 @@ mod tests {
             });
             let witness = Witness::new(state);
             let (writer, _rx) = broca_diagnostics::channel(1, witness.state.egress.clone());
-            let session = BrocaBindIdentity::new(
-                std::path::PathBuf::from("/tmp/stall-project"),
-                "runner",
-                "stall-session",
-            );
             let mut routes = Routes::new(true);
-            routes.by_channel.insert(
-                7,
-                (
-                    1,
-                    session.clone(),
-                    BindObservation {
-                        project_id: None,
-                        principal: None,
-                        scope: broca_protocol::SendScope::Unstamped,
-                    },
-                ),
-            );
-            let (channel, body) = if phase == Phase::BindOwnership {
-                let owner = subc_protocol::Principal::Reserved {
-                    module_id: "prefrontal".into(),
-                };
-                let bind = ModuleControlRequest::RouteBind {
-                    route_channel: 7,
-                    epoch: 1,
-                    target: subc_protocol::RouteTarget::ManagementSurface {
-                        module_id: "broca".into(),
-                    },
-                    identity: SubcBindIdentity::new(
-                        std::path::PathBuf::from("/tmp/stall-project"),
-                        "runner",
-                        "stall-session",
-                    ),
-                    principal: Some(owner.clone()),
-                    consumer_capabilities: None,
-                    admission_facts: None,
-                    role_versions: None,
-                    call_mode: None,
-                    scope: Some(
-                        subc_protocol::scope::ScopeStamp::new(
-                            owner,
-                            "head",
-                            1,
-                            subc_protocol::scope::ScopeKind::Head,
-                        )
-                        .with_owner_authorized(true),
-                    ),
-                };
-                (0, serde_json::to_vec(&bind).unwrap())
-            } else if matches!(phase, Phase::Control | Phase::EgressSend) {
-                (
-                    0,
-                    serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
-                )
-            } else {
-                (
-                    7,
-                    serde_json::to_vec(&serde_json::json!({"method": OP_STATUS, "params": {}}))
-                        .unwrap(),
-                )
-            };
+            let channel = 0;
+            let body = serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap();
             let frame = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -3432,6 +3477,7 @@ mod tests {
             let task = tokio::spawn(stall::READER.scope(state, async move {
                 stall::frame_context(0, channel);
                 let handler = Arc::new(GatedStatusHandler {
+                    gate_auth: false,
                     entered: tokio::sync::Notify::new(),
                     release: tokio::sync::Notify::new(),
                 });
@@ -3710,7 +3756,7 @@ mod tests {
         assert!(routes.dispatch_lanes.contains_key(&session));
         drop(ticket);
 
-        routes.route_closed(7);
+        routes.route_closed(7, 1);
         assert!(!routes.dispatch_lanes.contains_key(&session));
         assert!(routes.dispatch_lanes.is_empty());
     }
@@ -3724,7 +3770,7 @@ mod tests {
             .insert(7, (1, departed.clone(), BindObservation::default()));
         let ticket = routes.reserve_dispatch(&departed);
 
-        routes.route_closed(7);
+        routes.route_closed(7, 1);
         assert!(routes.dispatch_lanes.contains_key(&departed));
         drop(ticket);
 
@@ -3747,7 +3793,7 @@ mod tests {
             .insert(7, (1, session.clone(), BindObservation::default()));
         let first_turn = routes.reserve_dispatch(&session).wait().await;
 
-        routes.route_closed(7);
+        routes.route_closed(7, 1);
         assert!(routes.dispatch_lanes.contains_key(&session));
         routes
             .by_channel
@@ -4015,10 +4061,25 @@ mod tests {
 
     struct MockSubscribeHandler {
         sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
+        refuse_session: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl ServeHandler for MockSubscribeHandler {
+        async fn authorize_session(
+            &self,
+            _session: &BrocaBindIdentity,
+            _principal: Option<&broca_protocol::BindPrincipal>,
+        ) -> Result<(), ServeError> {
+            if self.refuse_session.load(Ordering::Relaxed) {
+                Err(ServeError::ScopeRefused(
+                    broca_core::ScopeRefusal::SenderNotOwner,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
         async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
             unimplemented!()
         }
@@ -4066,7 +4127,10 @@ mod tests {
         use std::time::Duration;
 
         let (sink_tx, mut sink_rx) = mpsc::channel(1);
-        let handler = Arc::new(MockSubscribeHandler { sink_tx });
+        let handler = Arc::new(MockSubscribeHandler {
+            sink_tx,
+            refuse_session: std::sync::atomic::AtomicBool::new(false),
+        });
 
         // Bounded channel of size 1 for the writer.
         let (writer_tx, _writer_rx) = broca_diagnostics::channel::<Frame>(1, Arc::default());
@@ -4125,12 +4189,25 @@ mod tests {
     /// A handler whose session status parks until the test releases it, so the test decides
     /// exactly when a route request task finishes.
     struct GatedStatusHandler {
+        gate_auth: bool,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
     impl ServeHandler for GatedStatusHandler {
+        async fn authorize_session(
+            &self,
+            _session: &BrocaBindIdentity,
+            _principal: Option<&broca_protocol::BindPrincipal>,
+        ) -> Result<(), ServeError> {
+            if self.gate_auth {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+
         async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
             unimplemented!()
         }
@@ -4159,7 +4236,18 @@ mod tests {
         ) -> Result<CancelResponse, ServeError> {
             unimplemented!()
         }
-        async fn status(&self, _session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+        async fn status(&self, session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            if session.session == "oversized-error-response" {
+                return Err(ServeError::Transient(
+                    "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize),
+                ));
+            }
+            if session.session == "oversized-response" {
+                return Ok(StatusResponse::Active {
+                    run_id: "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize),
+                    step: 1,
+                });
+            }
             self.entered.notify_one();
             self.release.notified().await;
             Err(ServeError::Transient("released by the test".into()))
@@ -4197,6 +4285,1020 @@ mod tests {
             .expect("the serve loop's writer channel closed")
     }
 
+    struct HeldBindRead {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: tokio::sync::Notify,
+        records: Vec<broca_wal::FramedRecord>,
+    }
+
+    impl broca_core::WalStore for HeldBindRead {
+        fn open(
+            &self,
+            _: &BrocaBindIdentity,
+        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+            panic!("bind ownership must not open an actor")
+        }
+        fn read_records(
+            &self,
+            _: &BrocaBindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.entered.notify_one();
+            self.release.lock().unwrap().recv().unwrap();
+            self.finished.notify_one();
+            Ok(self.records.clone())
+        }
+    }
+
+    struct ReleaseBindRead(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseBindRead {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    struct BindIngress {
+        routes: Routes,
+        registry: Arc<LineageRegistry>,
+        handler: Arc<MockSubscribeHandler>,
+        writer: EgressSender<Frame>,
+        written: EgressReceiver<Frame>,
+        sinks: mpsc::Receiver<mpsc::Sender<Delivery>>,
+        requests: JoinSet<Result<(), ServeIoError>>,
+        cancel: CancellationToken,
+    }
+
+    impl BindIngress {
+        fn new(registry: Arc<LineageRegistry>) -> Self {
+            let (writer, written) = broca_diagnostics::channel(16, Arc::default());
+            let (sink_tx, sinks) = mpsc::channel(4);
+            Self {
+                routes: Routes::new(true),
+                registry,
+                handler: Arc::new(MockSubscribeHandler {
+                    sink_tx,
+                    refuse_session: std::sync::atomic::AtomicBool::new(false),
+                }),
+                writer,
+                written,
+                sinks,
+                requests: JoinSet::new(),
+                cancel: CancellationToken::new(),
+            }
+        }
+
+        async fn frame(&mut self, frame: Frame) {
+            handle_frame(
+                frame,
+                &self.writer,
+                &mut self.routes,
+                &self.handler,
+                &self.registry,
+                &VaultGauge::not_in_use(),
+                None,
+                &self.cancel,
+                &Arc::new(Semaphore::new(4)),
+                &mut self.requests,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn bind(&mut self, epoch: u32, session: &str, stamped: bool) {
+            let owner = subc_protocol::Principal::Reserved {
+                module_id: "agent".into(),
+            };
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: 7,
+                epoch,
+                target: subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "broca".into(),
+                },
+                identity: SubcBindIdentity::new("/tmp/project-a", "runner", session),
+                principal: Some(owner.clone()),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: stamped.then(|| {
+                    subc_protocol::scope::ScopeStamp::new(
+                        owner,
+                        "head",
+                        1,
+                        subc_protocol::scope::ScopeKind::Head,
+                    )
+                    .with_owner_authorized(true)
+                }),
+                role_versions: None,
+                call_mode: None,
+            };
+            self.frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    u64::from(epoch),
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        }
+
+        async fn complete_bind(&mut self) {
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.routes.bind_tasks.join_next(),
+            )
+            .await
+            .expect("bind authorization did not finish")
+            .unwrap()
+            .unwrap();
+            finish_bind(completed, &self.writer, &mut self.routes)
+                .await
+                .unwrap();
+        }
+
+        async fn goodbye(&mut self, epoch: u32) {
+            self.frame(
+                Frame::build(FrameType::Goodbye, control_flags(), 7, epoch, 0, vec![]).unwrap(),
+            )
+            .await;
+        }
+
+        async fn subscribe(&mut self, epoch: u32, corr: u64) -> mpsc::Sender<Delivery> {
+            self.frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    epoch,
+                    corr,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let sink = tokio::time::timeout(std::time::Duration::from_secs(5), self.sinks.recv())
+                .await
+                .expect("subscription did not reach the handler")
+                .unwrap();
+            self.assert_delivery(&sink, epoch, corr).await;
+            sink
+        }
+
+        async fn assert_delivery(&mut self, sink: &mpsc::Sender<Delivery>, epoch: u32, corr: u64) {
+            sink.send(Delivery::Display(Arc::new(
+                broca_protocol::display::DisplayEvent::DisplayReset,
+            )))
+            .await
+            .expect("the original subscription was canceled");
+            let delivered = next_written(&mut self.written).await;
+            assert_eq!(
+                (
+                    delivered.header.ty,
+                    delivered.header.epoch,
+                    delivered.header.corr
+                ),
+                (FrameType::StreamData, epoch, corr)
+            );
+        }
+    }
+
+    impl Drop for BindIngress {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    fn held_bind_registry() -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
+        held_bind_registry_with_records(vec![])
+    }
+
+    fn held_bind_registry_with_records(
+        records: Vec<broca_wal::FramedRecord>,
+    ) -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
+        let (release, read_gate) = std::sync::mpsc::channel();
+        let store = Arc::new(HeldBindRead {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(read_gate),
+            finished: tokio::sync::Notify::new(),
+            records,
+        });
+        let registry = Arc::new(LineageRegistry::new_with_reader(
+            Arc::new(RefusingOpener),
+            store.clone(),
+            None,
+        ));
+        (
+            BindIngress::new(registry),
+            store,
+            ReleaseBindRead(Some(release)),
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_generation_goodbye_preserves_published_route_and_stream() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 1);
+        let sink = ingress.subscribe(1, 10).await;
+        ingress.bind(2, "pending", true).await;
+        store.entered.notified().await;
+        ingress.goodbye(2).await;
+        assert!(!ingress.routes.pending_binds.contains_key(&7));
+        assert_eq!(ingress.routes.by_channel[&7].0, 1);
+        ingress.assert_delivery(&sink, 1, 10).await;
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 1);
+        assert!(
+            ingress.written.try_recv().is_err(),
+            "canceled bind acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_generation_goodbye_preserves_pending_bind() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let _sink = ingress.subscribe(1, 10).await;
+        let slot = ingress.routes.subscribe_cancel[&7].clone();
+        ingress.bind(2, "pending", true).await;
+        store.entered.notified().await;
+        let pending = ingress.routes.pending_binds[&7].1.clone();
+        ingress.goodbye(1).await;
+        assert!(slot.route.is_cancelled());
+        assert!(!ingress.routes.by_channel.contains_key(&7));
+        assert_eq!(ingress.routes.pending_binds[&7].0, 2);
+        assert!(!pending.is_cancelled());
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        let mut ack = next_written(&mut ingress.written).await;
+        if ack.header.corr == 10 {
+            assert_eq!((ack.header.ty, ack.header.epoch), (FrameType::StreamEnd, 1));
+            ack = next_written(&mut ingress.written).await;
+        }
+        assert_eq!((ack.header.ty, ack.header.corr), (FrameType::Response, 2));
+    }
+
+    #[tokio::test]
+    async fn accepted_replacement_makes_old_generation_goodbye_stale() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        ingress.bind(2, "replacement", true).await;
+        store.entered.notified().await;
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        let sink = ingress.subscribe(2, 20).await;
+        ingress.goodbye(1).await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
+    #[tokio::test]
+    async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
+        let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
+        let record = broca_wal::WalRecord::RunStarted {
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: broca_protocol::RunId("legacy".into()),
+            session,
+            config: Box::new(broca_wal::RunConfig {
+                model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::json!({"test": true}),
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: vec![],
+                context_management: None,
+            }),
+            input: vec![].into(),
+            origin: broca_wal::RunOrigin::Fresh,
+            submission_id: None,
+        };
+        let (mut ingress, store, release) =
+            held_bind_registry_with_records(vec![broca_wal::FramedRecord {
+                seq: 1,
+                fence: 1,
+                record,
+            }]);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        ingress.bind(2, "published", true).await;
+        store.entered.notified().await;
+        drop(release);
+        ingress.complete_bind().await;
+        let refused = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (refused.header.ty, refused.header.corr),
+            (FrameType::Error, 2)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+            "scope_adoption_refused"
+        );
+        ingress.goodbye(2).await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 1);
+        ingress.assert_delivery(&sink, 1, 10).await;
+    }
+
+    #[tokio::test]
+    async fn request_during_stamped_bind_authorization_is_unbound() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(2, "pending", true).await;
+        store.entered.notified().await;
+        ingress
+            .frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    2,
+                    20,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(ingress.routes.by_channel.is_empty());
+        assert_eq!(ingress.routes.pending_binds[&7].0, 2);
+        assert!(ingress.routes.subscribe_cancel.is_empty());
+        assert!(
+            ingress.requests.is_empty(),
+            "unbound request dispatched to a handler task"
+        );
+        assert!(ingress.sinks.try_recv().is_err());
+        assert!(ingress.written.try_recv().is_err());
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        assert!(
+            ingress.requests.is_empty(),
+            "unbound request was deferred until ack"
+        );
+        assert!(ingress.sinks.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn superseded_bind_late_authorization_preserves_replacement() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "superseded", true).await;
+        store.entered.notified().await;
+        ingress.bind(2, "replacement", false).await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        let sink = ingress.subscribe(2, 20).await;
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        assert_eq!(ingress.routes.by_channel[&7].1.session, "replacement");
+        assert!(
+            ingress.written.try_recv().is_err(),
+            "superseded bind acknowledged"
+        );
+        ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
+    #[tokio::test]
+    async fn unauthorized_subscribe_reports_authorization_before_invalid_params() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        ingress
+            .handler
+            .refuse_session
+            .store(true, Ordering::Relaxed);
+        for (corr, params) in [
+            (20, serde_json::json!({"unknown": true})),
+            (21, serde_json::json!({"from": "not-an-attach-point"})),
+        ] {
+            ingress
+                .frame(
+                    Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        7,
+                        1,
+                        corr,
+                        serde_json::to_vec(&RouteRequest {
+                            method: OP_SUBSCRIBE.into(),
+                            params,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await;
+            let refused = next_written(&mut ingress.written).await;
+            assert_eq!(
+                (refused.header.ty, refused.header.corr),
+                (FrameType::Error, corr)
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+                "sender_not_owner"
+            );
+        }
+        assert!(ingress.sinks.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_replacement_subscribe_preserves_original_stream_correlation() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        let original = ingress.routes.subscribe_cancel[&7]
+            .current
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        ingress
+            .handler
+            .refuse_session
+            .store(true, Ordering::Relaxed);
+        ingress
+            .frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    1,
+                    20,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        let refused = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (refused.header.ty, refused.header.corr),
+            (FrameType::Error, 20)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+            "sender_not_owner"
+        );
+        assert!(!original.is_cancelled());
+        assert!(
+            ingress.sinks.try_recv().is_err(),
+            "unauthorized replacement reached subscribe"
+        );
+        ingress.assert_delivery(&sink, 1, 10).await;
+    }
+
+    #[tokio::test]
+    async fn authorized_invalid_subscribe_preserves_original_stream_correlation() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        ingress
+            .frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    1,
+                    20,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({"unknown": true}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        let invalid = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (invalid.header.ty, invalid.header.corr),
+            (FrameType::Error, 20)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&invalid.body).unwrap()["code"],
+            "invalid_params"
+        );
+        assert!(ingress.sinks.try_recv().is_err());
+        ingress.assert_delivery(&sink, 1, 10).await;
+    }
+
+    #[tokio::test]
+    async fn reader_answers_ping_and_goodbye_while_bind_ownership_read_is_held() {
+        let (release, read_gate) = std::sync::mpsc::channel();
+        let release = ReleaseBindRead(Some(release));
+        let store = Arc::new(HeldBindRead {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(read_gate),
+            finished: tokio::sync::Notify::new(),
+            records: vec![],
+        });
+        let registry = Arc::new(LineageRegistry::new_with_reader(
+            Arc::new(RefusingOpener),
+            store.clone(),
+            None,
+        ));
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(module);
+        let serve = tokio::spawn(serve_connection(
+            reader,
+            writer,
+            "broca",
+            registry.clone(),
+            registry,
+            VaultGauge::not_in_use(),
+        ));
+        bind_test_route(&mut daemon, "slow-bind").await;
+        let owner = subc_protocol::Principal::Reserved {
+            module_id: "agent".into(),
+        };
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 2,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("/tmp/project-a", "runner", "slow-bind"),
+            principal: Some(owner.clone()),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(
+                subc_protocol::scope::ScopeStamp::new(
+                    owner,
+                    "head",
+                    1,
+                    subc_protocol::scope::ScopeKind::Head,
+                )
+                .with_owner_authorized(true),
+            ),
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                3,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        store.entered.notified().await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut daemon))
+            .await
+            .expect("held bind read blocked health ingress")
+            .unwrap()
+            .unwrap();
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 4));
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 5, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+        drop(release);
+        store.finished.notified().await;
+    }
+
+    #[tokio::test]
+    async fn pending_bind_goodbye_cannot_publish_a_late_ack() {
+        let mut routes = Routes::new(true);
+        let cancel = CancellationToken::new();
+        routes.pending_binds.insert(7, (1, cancel.clone()));
+        let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 7, 1, 0, vec![]).unwrap();
+        let (writer, mut written) = broca_diagnostics::channel::<Frame>(4, Arc::default());
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        handle_frame(
+            goodbye,
+            &writer,
+            &mut routes,
+            &registry,
+            &registry,
+            &VaultGauge::not_in_use(),
+            None,
+            &CancellationToken::new(),
+            &Arc::new(Semaphore::new(1)),
+            &mut JoinSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let header = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, vec![])
+            .unwrap()
+            .header;
+        finish_bind(
+            BindCompletion {
+                header,
+                channel: 7,
+                epoch: 1,
+                identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
+                bind: BindObservation {
+                    project_id: None,
+                    principal: None,
+                    scope: broca_protocol::SendScope::Unstamped,
+                },
+                cancel,
+                refusal: None,
+            },
+            &writer,
+            &mut routes,
+        )
+        .await
+        .unwrap();
+        assert!(routes.by_channel.is_empty());
+        assert!(
+            written.try_recv().is_err(),
+            "a canceled bind must not publish an ack"
+        );
+    }
+
+    struct ResetWrite<W> {
+        inner: W,
+        reset: Arc<std::sync::atomic::AtomicBool>,
+        observed: Arc<tokio::sync::Notify>,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for ResetWrite<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.reset.load(Ordering::SeqCst) {
+                self.observed.notify_one();
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn bind_test_route(daemon: &mut tokio::io::DuplexStream, session: &str) {
+        let hello = read_frame(daemon).await.unwrap().unwrap();
+        write_frame(
+            daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&ModuleHelloAckBody {
+                    negotiated_ver: PROTOCOL_VERSION,
+                    subc_ops: vec![],
+                    subc_capabilities: vec![],
+                    storage: None,
+                    machine_id: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("/tmp/project-a", "runner", session),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                2,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame(daemon).await.unwrap().unwrap().header.ty,
+            FrameType::Response
+        );
+    }
+
+    async fn test_request(daemon: &mut tokio::io::DuplexStream, method: &str, corr: u64) {
+        write_frame(
+            daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                7,
+                1,
+                corr,
+                serde_json::to_vec(&RouteRequest {
+                    method: method.into(),
+                    params: serde_json::Value::Null,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_fails_only_its_call_and_sibling_completes() {
+        for session in ["oversized-response", "oversized-error-response"] {
+            let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(module);
+            let handler = Arc::new(GatedStatusHandler {
+                gate_auth: false,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let serve = tokio::spawn(serve_connection(
+                reader,
+                writer,
+                "broca",
+                handler,
+                Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+                VaultGauge::not_in_use(),
+            ));
+            bind_test_route(&mut daemon, session).await;
+            test_request(&mut daemon, OP_STATUS, 3).await;
+            test_request(&mut daemon, OP_ROLE_DESCRIBE, 4).await;
+            let error = read_frame(&mut daemon)
+                .await
+                .unwrap()
+                .expect("oversized call lost the connection");
+            assert_eq!((error.header.ty, error.header.corr), (FrameType::Error, 3));
+            assert_eq!(
+                serde_json::from_slice::<ErrorBody>(&error.body)
+                    .unwrap()
+                    .code,
+                "response_too_large"
+            );
+            let sibling = read_frame(&mut daemon)
+                .await
+                .unwrap()
+                .expect("sibling lost the connection");
+            assert_eq!(
+                (sibling.header.ty, sibling.header.corr),
+                (FrameType::Response, 4)
+            );
+            write_frame(
+                &mut daemon,
+                &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 5, vec![]).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_half_reset_is_classified_even_with_a_request_in_flight() {
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(module);
+        let reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let serve = tokio::spawn(serve_connection(
+            reader,
+            ResetWrite {
+                inner: writer,
+                reset: reset.clone(),
+                observed: observed.clone(),
+            },
+            "broca",
+            handler.clone(),
+            Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+            VaultGauge::not_in_use(),
+        ));
+        bind_test_route(&mut daemon, "reset-response").await;
+        test_request(&mut daemon, OP_STATUS, 3).await;
+        handler.entered.notified().await;
+        reset.store(true, Ordering::SeqCst);
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        observed.notified().await;
+        handler.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), serve)
+            .await
+            .expect("write reset left the reader waiting on an unusable connection")
+            .unwrap();
+        assert_eq!(result.unwrap(), ServeEnd::PeerReset);
+    }
+
+    #[tokio::test]
+    async fn reader_answers_health_ping_during_authorization_and_permit_waits() {
+        let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let handler = Arc::new(GatedStatusHandler {
+            gate_auth: true,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let loop_handler = handler.clone();
+        let serve = tokio::spawn(async move {
+            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            run_frame_loop(
+                &mut module_read,
+                writer,
+                "broca",
+                loop_handler,
+                &registry,
+                &VaultGauge::not_in_use(),
+                None,
+                CancellationToken::new(),
+                crate::wal_archive::WalArchiveConfig::default(),
+                &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let hello = next_written(&mut written).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&ModuleHelloAckBody {
+                    negotiated_ver: PROTOCOL_VERSION,
+                    subc_ops: vec![],
+                    subc_capabilities: vec![],
+                    storage: None,
+                    machine_id: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        // Separate sessions occupy all permits without depending on task scheduling order.
+        for index in 0..=MAX_INFLIGHT_ROUTE_REQUESTS {
+            let channel = index as u16 + 1;
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "broca".into(),
+                },
+                identity: SubcBindIdentity::new("/tmp/project-a", "runner", format!("s{index}")),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            };
+            write_frame(
+                &mut daemon,
+                &Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    2,
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                next_written(&mut written).await.header.ty,
+                FrameType::Response
+            );
+            write_frame(
+                &mut daemon,
+                &Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    channel,
+                    1,
+                    3,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_STATUS.into(),
+                        params: serde_json::Value::Null,
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            if index < MAX_INFLIGHT_ROUTE_REQUESTS {
+                handler.entered.notified().await;
+            }
+            // The last request has no permit; earlier requests are inside authorization.
+            write_frame(
+                &mut daemon,
+                &Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, vec![]).unwrap(),
+            )
+            .await
+            .unwrap();
+            let pong = next_written(&mut written).await;
+            assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 4));
+        }
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 5, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+    }
+
     /// The tool plane's `scope.describe` goes out on this registered module connection, only
     /// once it has registered, and the daemon's reply is routed back to the describer instead
     /// of the ordinary frame handling. Before registration the describer answers "can't tell".
@@ -4217,6 +5319,7 @@ mod tests {
         );
         let loop_describer = Arc::clone(&describer);
         let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -4320,6 +5423,7 @@ mod tests {
         let (writer_tx, mut written) =
             broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
         let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -4466,6 +5570,7 @@ mod tests {
         let (writer_tx, mut written) =
             broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
         let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });

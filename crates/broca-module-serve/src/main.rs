@@ -38,8 +38,23 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 /// cached, so the caller's next attempt finds it ready rather than binding again.
 const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run_runtime(serve_main())?
+}
+
+fn run_runtime<F: std::future::Future>(work: F) -> std::io::Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(work);
+    // The main future explicitly joins durability work before returning. Startup export
+    // catch-up is replayable from the durable outbox, and archive prewarm is only a cache;
+    // neither may prolong process exit through Tokio's implicit blocking-pool join.
+    runtime.shutdown_background();
+    Ok(result)
+}
+
+async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // READ THE LAUNCH NONCE BEFORE ANYTHING ELSE. The daemon hands it over as an inherited pipe
     // (named by SUBC_LAUNCH_NONCE_FD), and that descriptor stays inheritable until it is read:
     // a process spawned before this line would inherit the pipe and could read broca's secret.
@@ -684,6 +699,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::pin!(stopping);
             // Keep the wire loop live for health probes and typed admission refusals while
             // actors drain. Losing the connection must not abandon the durable session jobs.
+            // Actor sealing owns final WAL syncs and lease release; transport loss cannot
+            // abandon those durability jobs before the bounded seal attempt completes.
             let sealed = tokio::select! {
                 biased;
                 sealed = &mut stopping => sealed,
@@ -709,6 +726,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "shutdown incomplete; unsealed WALs require replay"
                 );
             }
+            // Stop the sweep supervisor so it cannot start another deletion. Interrupted
+            // blocking deletions are recoverable from their durable tombstones on next boot;
+            // joining this supervisor is not a blocking-pool drain.
             let _ = retention_sweep.await;
             // Tokio runtime destruction waits for blocking filesystem tasks. A stuck fsync must
             // not turn the bounded seal attempt into an unbounded shutdown -- so the process ends
@@ -726,7 +746,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 0, `eof` and `reset` are the connection ending without one, `error` is a fault.
             let cause = ServeEnd::cause_of(&result);
             let in_flight_at_goodbye = registry.slot_counts().runs_in_flight;
+            // Wait for final actor WAL syncs and lease release before dropping the runtime.
             let sealed = registry.stop_and_seal().await;
+            // Stop the sweep supervisor; incomplete deletions recover from durable tombstones.
             let _ = retention_sweep.await;
             if sealed {
                 // STAYS AT WARN, and it looks exactly like the boot statements demoted to info
@@ -754,6 +776,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_shutdown_tests {
+    use super::run_runtime;
+
+    #[test]
+    fn runtime_exit_joins_durability_but_not_unrelated_blocking_jobs() {
+        let (durability_started, durability_entered) = std::sync::mpsc::channel();
+        let (release_durability, durability_gate) = std::sync::mpsc::channel();
+        let (unrelated_started, unrelated_entered) = std::sync::mpsc::channel();
+        let (release_unrelated, unrelated_gate) = std::sync::mpsc::channel();
+        let (finished, exit) = std::sync::mpsc::channel();
+        let process = std::thread::spawn(move || {
+            run_runtime(async move {
+                tokio::task::spawn_blocking(move || {
+                    unrelated_started.send(()).unwrap();
+                    unrelated_gate.recv().unwrap();
+                });
+                let durability = tokio::task::spawn_blocking(move || {
+                    durability_started.send(()).unwrap();
+                    durability_gate.recv().unwrap();
+                });
+                durability.await.unwrap();
+            })
+            .unwrap();
+            finished.send(()).unwrap();
+        });
+        durability_entered.recv().unwrap();
+        unrelated_entered.recv().unwrap();
+        assert!(
+            matches!(exit.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "exit must wait for the durability join"
+        );
+        release_durability.send(()).unwrap();
+        // The timeout is a deadlock watchdog, not the ordering assertion: the unrelated
+        // job remains behind its gate until after exit has been observed.
+        let result = exit.recv_timeout(std::time::Duration::from_secs(5));
+        release_unrelated.send(()).unwrap();
+        process.join().unwrap();
+        result.expect("an unrelated blocking job delayed runtime exit");
+    }
 }
 
 /// First half of the startup crash-orphan pass, run BEFORE serving begins.

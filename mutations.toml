@@ -4885,8 +4885,8 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::old_incarnation_is_re_read_and_sibling_keys_are_distinct"]
 file = "crates/broca-core/src/run.rs"
-old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }'''
-new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK */ next_poll = 0; }'''
+old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }'''
+new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK */ answer_poll = AnswerPollSchedule::default(); }'''
 
 [[control]]
 id = "core-approval-classify-late-before-dedup"
@@ -10402,3 +10402,266 @@ expect_red = ["serve::read_page_tests::reply_body_cap_includes_envelope_for_tail
 file = "crates/broca-protocol/src/lib.rs"
 old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
 new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"
+
+[[control]]
+id = "serve-reader-authorization-off-ingress"
+guards = "health pings and GOODBYE are read while authorization waits"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_health_ping_during_authorization_and_permit_waits"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if req.method == OP_VAULT_AUDIT {"
+new = "            authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await.unwrap(); // NON-VACUITY BREAK: block ingress on authorization\n            if req.method == OP_VAULT_AUDIT {"
+
+[[control]]
+id = "serve-reader-permit-off-ingress"
+guards = "health pings and GOODBYE are read when route permits are exhausted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_health_ping_during_authorization_and_permit_waits"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if req.method == OP_VAULT_AUDIT {"
+new = "            drop(request_slots.clone().acquire_owned().await.unwrap()); // NON-VACUITY BREAK: wait for a permit on ingress\n            if req.method == OP_VAULT_AUDIT {"
+
+[[control]]
+id = "serve-bind-authorization-off-ingress"
+guards = "health pings and GOODBYE stay readable while stamped-bind ownership reads are held"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_ping_and_goodbye_while_bind_ownership_read_is_held"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                routes\n                    .bind_tasks\n                    .spawn(async move { authorize_bind(completed, registry).await });"
+new = "                let completed = authorize_bind(completed, registry).await; // NON-VACUITY BREAK: bind read blocks ingress\n                finish_bind(completed, writer, routes).await?;"
+
+[[control]]
+id = "serve-canceled-bind-cannot-publish"
+guards = "a route GOODBYE fences a late bind read from installing a binding or acknowledging it"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::pending_bind_goodbye_cannot_publish_a_late_ack"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if completed.cancel.is_cancelled() {"
+new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish stale bind completion"
+
+[[control]]
+id = "websocket-policy-read-outside-session-lock"
+guards = "per-attempt transport policy refresh does not hold the session mutex"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::policy_read_does_not_hold_session_lock"]
+select = "expected"
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = "        let configured_https = policy();\n        let state = self.state.lock().unwrap();"
+new = "        let state = self.state.lock().unwrap();\n        let configured_https = policy(); // NON-VACUITY BREAK: read config under session mutex"
+
+[[control]]
+id = "approval-held-answer-backoff-bounded"
+guards = "held approvals back off answer reads while retaining a one-second pickup cap"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::approval_gate::held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = 50; // NON-VACUITY BREAK: poll every 50 ms forever"
+
+[[control]]
+id = "approval-answer-pickup-cap"
+guards = "an answer arriving during a held approval backoff is read within one second"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::approval_gate::held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = (delay * 2).min(10000); // NON-VACUITY BREAK: allow ten-second pickup delay"
+
+[[control]]
+id = "approval-wait-real-rpc-rate"
+guards = "the actual held approval wait uses backoff rather than repeatedly resetting to 50 ms"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "                    answer_poll.completed(now(control));"
+new = "                    answer_poll.completed(now(control)); answer_poll.delay = 50; // NON-VACUITY BREAK: force rapid reads in the real waiter"
+
+[[control]]
+id = "approval-wait-real-answer-pickup"
+guards = "the actual held approval wait picks up an answer within one second of its arrival mid-backoff"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "                    answer_poll.completed(now(control));"
+new = "                    answer_poll.completed(now(control)); answer_poll.next = now(control).saturating_add(10000); // NON-VACUITY BREAK: oversleep answer arrival in the real waiter"
+
+[[control]]
+id = "serve-exit-does-not-join-unrelated-blocking-jobs"
+guards = "process exit explicitly joins durability but does not wait for unrelated blocking tasks"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["runtime_shutdown_tests::runtime_exit_joins_durability_but_not_unrelated_blocking_jobs"]
+select = "expected"
+file = "crates/broca-module-serve/src/main.rs"
+old = "    runtime.shutdown_background();"
+new = "    drop(runtime); // NON-VACUITY BREAK: implicitly join every blocking task"
+
+[[control]]
+id = "serve-oversized-response-is-call-local"
+guards = "an oversized success response fails its call while a sibling completes on the same connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {"
+new = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversize tears down connection"
+
+[[control]]
+id = "serve-oversized-error-is-call-local"
+guards = "an oversized error response fails its call while a sibling completes on the same connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {\n        body = serde_json::to_vec(&ErrorBody::new("
+new = "    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversized error tears down connection\n        body = serde_json::to_vec(&ErrorBody::new("
+
+[[control]]
+id = "serve-write-reset-is-classified-close"
+guards = "a write-half reset ends the connection as reset rather than a generic egress failure"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::write_half_reset_is_classified_even_with_a_request_in_flight"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        result = &mut writer => {"
+new = "        result = &mut writer, if false => { // NON-VACUITY BREAK: wait for the reader to notice closed egress"
+
+[[control]]
+id = "serve-goodbye-preserves-other-pending-generation"
+guards = "closing a published route does not cancel authorization of its pending replacement epoch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::published_generation_goodbye_preserves_pending_bind"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            .is_some_and(|(pending_epoch, _)| *pending_epoch == epoch)"
+new = "            .is_some_and(|(_, _)| true) // NON-VACUITY BREAK: cancel every pending epoch"
+
+[[control]]
+id = "serve-goodbye-preserves-other-published-generation"
+guards = "closing a pending or stale generation leaves the published route and original stream correlation intact"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::pending_generation_goodbye_preserves_published_route_and_stream"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if !self\n            .by_channel\n            .get(&channel)\n            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)"
+new = "        if false && !self // NON-VACUITY BREAK: close the published route for every epoch\n            .by_channel\n            .get(&channel)\n            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)"
+
+[[control]]
+id = "serve-pending-bind-requests-stay-unbound"
+guards = "a request while stamped-bind authorization is held cannot register a subscription or reach a handler"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::request_during_stamped_bind_authorization_is_unbound"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if frame.header.channel != 0 && bound_epoch != Some(frame.header.epoch) {"
+new = "    if false && frame.header.channel != 0 && bound_epoch != Some(frame.header.epoch) { // NON-VACUITY BREAK: dispatch before bind publication"
+
+[[control]]
+id = "serve-superseded-bind-late-authorization-is-fenced"
+guards = "a superseded bind finishing a real delayed history read cannot overwrite or acknowledge over its replacement"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::superseded_bind_late_authorization_preserves_replacement"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if completed.cancel.is_cancelled() {"
+new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish a superseded completion"
+
+[[control]]
+id = "serve-subscribe-authorization-precedes-validation"
+guards = "an unauthorized subscriber receives sender_not_owner before schema or attach-point validation can disclose errors"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::unauthorized_subscribe_reports_authorization_before_invalid_params"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+new = "        if let PreparedRouteRequest::Subscribe { params, .. } = &prepared { // NON-VACUITY BREAK: disclose validation before authorization\n            if let Err((field, message)) = subscribe_from(params) {\n                return send_invalid_params(&writer, ver, channel, epoch, corr, field, &message).await;\n            }\n        }\n        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+
+[[control]]
+id = "serve-unauthorized-subscribe-preserves-active-stream"
+guards = "a well-formed unauthorized replacement leaves the active stream delivering on its original correlation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::unauthorized_replacement_subscribe_preserves_original_stream_correlation"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+new = "        if let PreparedRouteRequest::Subscribe { slot, .. } = &prepared { slot.replace(); } // NON-VACUITY BREAK: replace before authorization\n        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+
+[[control]]
+id = "serve-invalid-subscribe-preserves-active-stream"
+guards = "an authorized malformed subscription cannot replace the active stream before validation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::authorized_invalid_subscribe_preserves_original_stream_correlation"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                let from = match subscribe_from(&params) {"
+new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"

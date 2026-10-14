@@ -350,6 +350,77 @@ struct Rig {
     control: RunControl,
     questions: Arc<Questions>,
 }
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer() {
+    let mut rig = Rig::new("pass", "none", false, false);
+    let origin = epoch_millis().unwrap();
+    std::fs::write(
+        rig.root.join("test-clock"),
+        json!({"now_ms":origin}).to_string(),
+    )
+    .unwrap();
+    let clock = crate::Clock::for_state_root(&rig.root).unwrap();
+    rig.control.clock = Some(clock.clone());
+    let (entered, mut waiting) = mpsc::unbounded_channel();
+    let (release, resume) = mpsc::unbounded_channel();
+    rig.control.approval_wait_probe = Some(Arc::new(ApprovalWaitProbe {
+        entered,
+        release: tokio::sync::Mutex::new(resume),
+    }));
+    let polls_at_answer = std::cell::Cell::new(None);
+    let driver = async {
+        let mut elapsed = 0;
+        loop {
+            let (answer_read_in_flight, work_in_flight) = waiting.recv().await.unwrap();
+            if !answer_read_in_flight
+                && !work_in_flight
+                && rig.questions.polls.load(Ordering::SeqCst) > 0
+            {
+                if elapsed == 10_000 {
+                    let polls = rig.questions.polls.load(Ordering::SeqCst);
+                    assert!(
+                        polls <= 15,
+                        "held wait made {polls} actual answer RPCs in 10 seconds"
+                    );
+                    polls_at_answer.set(Some(polls));
+                    *rig.questions.answer.lock().unwrap() = "decline";
+                    elapsed += 1;
+                } else {
+                    elapsed += 50;
+                }
+                assert!(
+                    elapsed <= 11_001,
+                    "answer was not picked up within the one-second backoff cap"
+                );
+                std::fs::write(
+                    rig.root.join("test-clock"),
+                    json!({"now_ms":origin+elapsed}).to_string(),
+                )
+                .unwrap();
+                clock.refresh().unwrap();
+            }
+            release.send(()).unwrap();
+        }
+    };
+    let result = tokio::select! {
+        result = rig.batch(&crate::AllowAll, vec![call("held")], None, false) => result,
+        () = driver => unreachable!(),
+    };
+    assert_eq!(result.results.len(), 1);
+    assert!(
+        polls_at_answer.get().is_some(),
+        "wait completed before the answer gate opened"
+    );
+    assert!(rig.questions.polls.load(Ordering::SeqCst) > polls_at_answer.get().unwrap());
+    assert!(clock.now_ms() <= origin + 11_001);
+    assert!(
+        rig.tools.sent.lock().unwrap().is_empty(),
+        "declined call was dispatched"
+    );
+    rig.finish().await;
+}
 impl Rig {
     fn new(second: &'static str, answer: &'static str, transient: bool, stop: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
