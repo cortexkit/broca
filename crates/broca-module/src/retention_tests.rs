@@ -1928,6 +1928,7 @@ fn interrupted_retention_deletion_exports_owed_identity_without_restoring_wal() 
     assert_eq!(rig.store.pending_retention_withdrawals().unwrap().len(), 1);
 }
 
+#[cfg(feature = "test-clock")]
 fn assert_no_marker(path: &Path) {
     if path.is_dir() {
         for entry in fs::read_dir(path).unwrap() {

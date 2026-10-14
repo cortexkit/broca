@@ -2835,7 +2835,8 @@ impl LineageRegistry {
         })
     }
 
-    #[cfg(test)]
+    // Only the test-clock expiry tests close a slot by advancing time.
+    #[cfg(all(test, feature = "test-clock"))]
     pub(crate) async fn wait_for_slot_closed(&self, key: &LineageKey) {
         let mut close_started = self.inner.close_started.subscribe();
         loop {
@@ -4506,7 +4507,7 @@ impl LineageRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-clock"))]
     pub(crate) fn expiry_probe_for_test(&self, probe: Arc<dyn Fn() + Send + Sync>) {
         *self.inner.expiry_read_probe.lock().unwrap() = Some(probe);
     }
