@@ -10249,3 +10249,123 @@ expect_red = ["single_turn_module_e2e::meta_muse_oauth_uses_responses_bearer_and
 file = "crates/broca-module-serve/src/cache_routing.rs"
 old = 'let session_key_providers = BTreeSet::from(["meta".to_string()]);'
 new = 'let session_key_providers = BTreeSet::new(); // NON-VACUITY BREAK: drop the Meta session key'
+
+[[control]]
+id = "consent-fixtures-mapping-exactly-once"
+guards = "vendored README maps each of the eighteen HeldCallRequest fields exactly once"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_mapping_exactly_once"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = '| `executor` | dropped |'
+new = '| `tool` | dropped <!-- NON-VACUITY BREAK: duplicate a mapping field --> |'
+
+[[control]]
+id = "consent-fixtures-independent-upstream-pin"
+guards = "upstream manifest pins in README match the independent pins in the verifier"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_upstream_pins"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = 'd276eaed5330b95923166d006b2f1b5d83a9a95e050cfe99446d685b22c2e568'
+new = '0000000000000000000000000000000000000000000000000000000000000000 <!-- NON-VACUITY BREAK: alter the source pin -->'
+
+[[control]]
+id = "consent-fixtures-raw-upstream-bytes"
+guards = "vendored requester readbacks retain exact upstream bytes under their pinned manifest"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_upstream_coverage_and_bytes"]
+file = "crates/broca-subc/tests/fixtures/consent/upstream/consent-requester-v2/cerebellum-ref-get-reply.json"
+old = '"elicitation_id":"el_1"'
+new = '"elicitation_id":"NON-VACUITY BREAK"'
+
+[[control]]
+id = "consent-fixtures-complete-local-coverage"
+guards = "root checksum coverage includes README and the verifier as well as all fixture payloads"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_local_coverage_and_bytes"]
+file = "crates/broca-subc/tests/fixtures/consent/SHA256SUMS"
+old = '  verify.py'
+new = '  NON-VACUITY BREAK verify.py'
+
+[[control]]
+id = "consent-fixtures-ledger-blocks-escalation"
+guards = "an unsettled contract ledger entry prevents downstream readiness"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_ledger_settled"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = '| L6 | Settled |'
+new = '| L6 | Escalated <!-- NON-VACUITY BREAK --> |'
+
+[[control]]
+id = "consent-fixtures-no-identity-in-body"
+guards = "broca-authored generic request contains no requester or subject identity fields"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_no_identity_in_body"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
+old = '"params":{"args_digest":'
+new = '"params":{"owner":"NON-VACUITY BREAK","args_digest":'
+
+[[control]]
+id = "consent-fixtures-args-byte-binding"
+guards = "broca binding uses the exact frozen argument bytes rather than parsed and reserialized JSON"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_binding_exact_argument_bytes"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
+old = '"binding":{"args_hash":"68cb3925e8c7384994607e6d1ee1fad72b4c9af5b0354ea9fca91900b9ee7413"'
+new = '"binding":{"args_hash":"NON-VACUITY BREAK"'
+
+[[control]]
+id = "consent-fixtures-expired-metadata-never-approval"
+guards = "the declared broca rendering of legacy expired-choice metadata never authorizes dispatch"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_deny_on_expiry"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/expired-rendering.json"
+old = '"late_decision":"none"'
+new = '"late_decision":"approved NON-VACUITY BREAK"'
+
+[[control]]
+id = "consent-fixtures-selected-ack-branch"
+guards = "vendored consent contract selects the owner-feed no-ack branch and names its provider"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_ack_branch_and_provider"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = 'Selected ack branch: **C**.'
+new = 'Selected ack branch: **A**. <!-- NON-VACUITY BREAK -->'
+
+[[control]]
+id = "consent-fixtures-held-call-golden-mapping"
+guards = "the broca-authored golden retains the mapped held-call request envelope and bounded correlation key"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_held_call_request_mapping"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
+old = '"method":"consent.request"'
+new = '"method":"consent.request NON-VACUITY BREAK"'
