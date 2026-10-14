@@ -80,21 +80,30 @@ fn windows_private_mode_dry_run_and_idempotent_repair() {
     );
 }
 #[test]
-fn windows_private_mode_refuses_unreadable_acl() {
+fn windows_private_mode_observes_unreadable_acl() {
     let fixture = BroadParent::new("repair-unreadable");
     let (root, _) = tree(&fixture.path);
     let file = root.join("wal/session.wal");
     deny_acl_read(&file);
-    // The refusal below is only evidence if the ACL really is unreadable to this process;
-    // check that with the same call the tool makes, so a deny that did not take effect fails
-    // here by name instead of as "the tool succeeded".
-    let inspection = broca_owner_only::is_private(&file)
-        .expect_err("precondition: deny_acl_read left the ACL readable to this process");
-    assert_eq!(
-        inspection.kind(),
-        std::io::ErrorKind::PermissionDenied,
-        "precondition: ACL inspection failed for a reason other than access denial: {inspection}"
-    );
+    // A privileged token can read the ACL despite the deny. This test records whether
+    // ACL inspection actually returns PermissionDenied on Windows; the portable
+    // injected test verifies that private-mode refuses when inspection is denied.
+    match broca_owner_only::is_private(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            observation(format_args!(
+                "observation: ACL inspection really returned PermissionDenied"
+            ));
+        }
+        inspection => {
+            observation(format_args!(
+                "observation: cannot construct an unreadable ACL: {inspection:?}"
+            ));
+            observe_acl_environment(&file);
+            reset_acl(&file);
+            assert_eq!(std::fs::read(&file).unwrap(), b"WAL marker");
+            return;
+        }
+    }
     for dry_run in [true, false] {
         let result = run(&root, dry_run);
         assert!(!result.status.success());
@@ -102,6 +111,89 @@ fn windows_private_mode_refuses_unreadable_acl() {
     }
     reset_acl(&file);
     assert_eq!(std::fs::read(&file).unwrap(), b"WAL marker");
+}
+
+fn observation(message: std::fmt::Arguments<'_>) {
+    // Write directly so a passing observation remains visible under libtest capture.
+    use std::io::Write;
+    writeln!(std::io::stderr().lock(), "{message}").unwrap();
+}
+
+fn observe_acl_environment(file: &Path) {
+    let privileges = Command::new("whoami.exe").arg("/priv").output().unwrap();
+    observation(format_args!(
+        "whoami /priv ({}):\n{}{}",
+        privileges.status,
+        String::from_utf8_lossy(&privileges.stdout),
+        String::from_utf8_lossy(&privileges.stderr)
+    ));
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class AclTokenObservation {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Luid { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PrivilegeSet {
+        public uint Count, Control;
+        public Luid Luid;
+        public uint Attributes;
+    }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetTokenInformation(IntPtr token, int kind, out int value, int size, out int returned);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool LookupPrivilegeValue(string system, string name, out Luid luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool PrivilegeCheck(IntPtr token, ref PrivilegeSet required, out bool enabled);
+    public static int Elevation(IntPtr token) {
+        int value, returned;
+        if (!GetTokenInformation(token, 20, out value, sizeof(int), out returned))
+            throw new Win32Exception();
+        return value;
+    }
+    public static bool BackupEnabled(IntPtr token) {
+        var required = new PrivilegeSet { Count = 1, Control = 1, Attributes = 2 };
+        if (!LookupPrivilegeValue(null, "SeBackupPrivilege", out required.Luid))
+            throw new Win32Exception();
+        bool enabled;
+        if (!PrivilegeCheck(token, ref required, out enabled))
+            throw new Win32Exception();
+        return enabled;
+    }
+}
+'@
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+Write-Output ('TokenIsElevated={0}' -f [AclTokenObservation]::Elevation($identity.Token))
+Write-Output ('SeBackupPrivilegeEnabled={0}' -f [AclTokenObservation]::BackupEnabled($identity.Token))
+Write-Output 'File SDDL:'
+try { Get-Acl -LiteralPath $env:BROCA_ACL_OBSERVATION_PATH | % Sddl }
+catch { Write-Output ('Get-Acl failed: {0}' -f $_) }
+"#;
+    let diagnostics = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("BROCA_ACL_OBSERVATION_PATH", file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&diagnostics.stdout);
+    observation(format_args!(
+        "token and ACL observation ({}):\n{stdout}{}",
+        diagnostics.status,
+        String::from_utf8_lossy(&diagnostics.stderr)
+    ));
+    if stdout.contains("SeBackupPrivilegeEnabled=True") {
+        observation(format_args!(
+            "observation: enabled SeBackupPrivilege means this environment cannot construct \
+             the unreadable-ACL state with a DACL deny"
+        ));
+    } else {
+        observation(format_args!(
+            "observation: the unreadable-ACL state was not reached; \
+             SeBackupPrivilege was not observed enabled (see diagnostics above)"
+        ));
+    }
 }
 #[test]
 fn windows_private_mode_never_follows_junctions() {

@@ -7563,15 +7563,31 @@ id = "windows-private-mode-incomplete-is-error"
 guards = "an unreadable or unrepaired Windows object makes private-mode exit nonzero"
 runner = "cargo"
 package = "broca-store"
-target = "--test windows_private_mode"
-test_file = "crates/broca-store/tests/windows_private_mode.rs"
-expect_red = ["windows_private_mode_refuses_unreadable_acl"]
-platforms = ["windows"]
+target = "--bin store-maintenance"
+test_file = "crates/broca-store/src/bin/store-maintenance.rs"
+expect_red = ["tests::private_mode_refuses_injected_unreadable_acl"]
 file = "crates/broca-store/src/bin/store-maintenance.rs"
 old = '''    println!("scanned dirs {scanned_dirs}\nscanned files {scanned_files}\ntightened {tightened}\nfailed {failed}");
     if failed > 0 {'''
 new = '''    println!("scanned dirs {scanned_dirs}\nscanned files {scanned_files}\ntightened {tightened}\nfailed {failed}");
     if false && failed > 0 { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "private-mode-acl-inspection-refusal"
+guards = "private-mode refuses an ACL inspection denial without attempting repair in dry-run or repair mode"
+runner = "cargo"
+package = "broca-store"
+target = "--bin store-maintenance"
+test_file = "crates/broca-store/src/bin/store-maintenance.rs"
+expect_red = ["tests::private_mode_refuses_injected_unreadable_acl"]
+file = "crates/broca-store/src/bin/store-maintenance.rs"
+old = '''        let private = match inspection {
+            Ok(private) => private,
+            Err(error) => {'''
+new = '''        let private = match inspection {
+            Ok(private) => private,
+            Err(_) if true => false, // NON-VACUITY BREAK: treat unreadable ACLs as repairable
+            Err(error) => {'''
 
 [[control]]
 id = "windows-private-mode-dry-run-does-not-repair"
