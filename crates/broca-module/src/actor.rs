@@ -5821,16 +5821,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 // The snapshot's complete-WAL fallback insists the file ends exactly at the
                 // durable head, which an active run appending past it breaks. The owner check
                 // only needs the history through that head, so fold exactly that prefix.
-                Err(_) => {
-                    let records = wal_store
-                        .read_records(&key)
-                        .map_err(|error| error.to_string())?;
-                    let durable: Vec<_> = records
-                        .into_iter()
-                        .take_while(|record| record.seq <= safe_head)
-                        .collect();
-                    broca_core::AdmissionCheckpointV1::from_frames(&durable)
-                        .map_err(|error| error.to_string())
+                Err(cause) => {
+                    let range = wal_store
+                        .read_records_range(&key, 0, Some(safe_head), None)
+                        .map_err(|error| {
+                            format!("{cause}; ownership prefix read failed: {error}")
+                        })?;
+                    let durable =
+                        crate::durable_read::DurableRead::classify(&range, 0, Some(safe_head))
+                            .records()
+                            .map_err(|error| format!("{cause}; ownership prefix: {error}"))?;
+                    broca_core::AdmissionCheckpointV1::from_frames(durable)
+                        .map_err(|error| format!("{cause}; ownership prefix fold failed: {error}"))
                 }
             }
         })
@@ -6091,18 +6093,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let wal_store = self.wal_store.clone();
         let key = self.key.clone();
         spawn_blocking(JobKind::WalRead, move || {
-            wal_store
+            let range = wal_store
                 .read_records_range(&key, 0, Some(safe_head), None)
-                .map(|range| match range.into_records() {
-                    broca_wal::WalRangeRecords::Complete(records)
-                    | broca_wal::WalRangeRecords::Partial(records)
-                    | broca_wal::WalRangeRecords::Unknown(records) => records,
-                    broca_wal::WalRangeRecords::Absent => Vec::new(),
-                })
+                .map_err(|error| format!("wal read failed: {error}"))?;
+            crate::durable_read::DurableRead::classify(&range, 0, Some(safe_head))
+                .records()
+                .map(<[_]>::to_vec)
         })
         .await
-        .map_err(|e| format!("wal read task failed: {e}"))
-        .and_then(|records| records.map_err(|e| format!("wal read failed: {e}")))
+        .map_err(|e| format!("wal read task failed: {e}"))?
     }
 
     fn replace_wal_scan_sets(&mut self, records: &[WalRecord]) {
@@ -7252,29 +7251,9 @@ mod tests {
             }
         }
 
-        fn durable_records(&self, session: &BindIdentity) -> Vec<broca_wal::FramedRecord> {
-            self.inner
-                .read_records(session)
-                .expect("read durable WAL through non-failing inner store")
-        }
-    }
-
-    impl WalStore for FlakyReadWalStore {
-        fn open(
-            &self,
-            session: &BindIdentity,
-        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-            self.inner.open(session)
-        }
-
-        fn read_records(
-            &self,
-            session: &BindIdentity,
-        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        fn before_read(&self) -> Result<(), broca_wal::WalError> {
             self.read_attempts.fetch_add(1, Ordering::SeqCst);
             self.read_attempt_signal.add_permits(1);
-            // Take one injected failure if any remain. A compare-exchange loop rather than
-            // `fetch_update`, which Rust 1.99 deprecates for a method older toolchains lack.
             let mut remaining = self.fail_next_reads.load(Ordering::SeqCst);
             let fail_once = loop {
                 let Some(next) = remaining.checked_sub(1) else {
@@ -7295,7 +7274,42 @@ mod tests {
                     "injected WAL read failure",
                 )));
             }
+            Ok(())
+        }
+
+        fn durable_records(&self, session: &BindIdentity) -> Vec<broca_wal::FramedRecord> {
+            self.inner
+                .read_records(session)
+                .expect("read durable WAL through non-failing inner store")
+        }
+    }
+
+    impl WalStore for FlakyReadWalStore {
+        fn open(
+            &self,
+            session: &BindIdentity,
+        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+            self.inner.open(session)
+        }
+
+        fn read_records(
+            &self,
+            session: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.before_read()?;
             self.inner.read_records(session)
+        }
+
+        fn read_records_range(
+            &self,
+            session: &BindIdentity,
+            after: u64,
+            through: Option<u64>,
+            anchor: Option<&broca_wal::WalByteAnchor>,
+        ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+            self.before_read()?;
+            self.inner
+                .read_records_range(session, after, through, anchor)
         }
     }
 
@@ -9726,3 +9740,7 @@ mod approval_tests;
 #[cfg(feature = "test-clock")]
 #[path = "actor_agent_run_scope_tests.rs"]
 mod agent_run_scope_tests;
+
+#[cfg(test)]
+#[path = "wal_proof_tests.rs"]
+mod wal_proof_tests;

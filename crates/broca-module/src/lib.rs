@@ -32,6 +32,7 @@ pub use serve::{
 mod approval;
 mod approval_state;
 pub mod cut_state;
+mod durable_read;
 mod keep_warm;
 pub mod move_files;
 pub mod move_install;

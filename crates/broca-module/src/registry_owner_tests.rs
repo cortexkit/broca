@@ -184,6 +184,7 @@ async fn owner_authorization_on_15mb_wal() {
 struct CountingWal {
     inner: Arc<FileWalStore>,
     reads: Mutex<Vec<u64>>,
+    fault: AtomicU64,
 }
 
 impl WalStore for CountingWal {
@@ -204,11 +205,29 @@ impl WalStore for CountingWal {
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
         self.reads.lock().unwrap().push(after);
+        if self.fault.load(Ordering::Relaxed) == 2 {
+            return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
+        }
+        if self.fault.load(Ordering::Relaxed) == 5 && through.is_some() {
+            return self
+                .inner
+                .read_records_range(session, after, Some(after), anchor);
+        }
         self.inner
             .read_records_range(session, after, through, anchor)
     }
 
     fn flush_for_read(&self, session: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
+        match self.fault.load(Ordering::Relaxed) {
+            1 => {
+                return Err(broca_wal::WalError::Io(std::io::Error::other(
+                    "injected authorization barrier failure",
+                )))
+            }
+            3 => panic!("injected authorization barrier task failure"),
+            4 => return Ok(Some(u64::MAX)),
+            _ => {}
+        }
         self.inner.flush_for_read(session)
     }
 
@@ -263,6 +282,7 @@ fn registry(
     let wal = Arc::new(CountingWal {
         inner: fixture.wal.clone(),
         reads: Mutex::new(Vec::new()),
+        fault: AtomicU64::new(0),
     });
     let store = Arc::new(SnapshotStore {
         snapshot: Mutex::new(snapshot),
@@ -464,6 +484,7 @@ async fn ownership_tail_freezes_scope_after_the_store_watermark() {
     let wal = Arc::new(CountingWal {
         inner: fixture.wal.clone(),
         reads: Mutex::new(Vec::new()),
+        fault: AtomicU64::new(0),
     });
     let registry =
         LineageRegistry::new_with_reader(Arc::new(NeverOpener), wal.clone(), Some(store));
@@ -997,4 +1018,169 @@ async fn live_ownership_is_removed_on_close_and_late_publication_is_ignored() {
             "read-only recovery must not resurrect an actor"
         );
     }
+}
+
+fn assert_transient(result: Result<(), crate::serve::ServeError>) {
+    assert!(
+        matches!(
+            result,
+            Err(crate::serve::ServeError::Open(
+                _,
+                Some(broca_protocol::ErrorClass::Transient)
+            ))
+        ),
+        "expected transient storage refusal, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn owner_barrier_failure_refuses_cancel_and_retract_without_writes() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(
+            &fixture.session,
+            Some(reserved("basal")),
+            Some(scope("core")),
+        ),
+        finished(),
+    ]);
+    let path = fixture.wal.wal_path(&fixture.session);
+    let before = std::fs::read(&path).unwrap();
+    for operation in ["cancel", "retract"] {
+        for fault in [1, 3, 4, 5] {
+            let (registry, wal, _) = registry(&fixture, Ok(None));
+            wal.fault.store(fault, Ordering::Relaxed);
+            assert_transient(
+                registry
+                    .authorize_session_owner(
+                        &fixture.session,
+                        Some(&reserved("stranger")),
+                        &SendScope::Unstamped,
+                    )
+                    .await,
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{operation}: no writes on refusal"
+            );
+            wal.fault.store(0, Ordering::Relaxed);
+            assert!(matches!(
+                registry
+                    .authorize_session_owner(
+                        &fixture.session,
+                        Some(&reserved("stranger")),
+                        &SendScope::Unstamped
+                    )
+                    .await,
+                Err(crate::serve::ServeError::ScopeRefused(_))
+            ));
+            registry
+                .authorize_session_owner(
+                    &fixture.session,
+                    Some(&reserved("core")),
+                    &SendScope::Unstamped,
+                )
+                .await
+                .unwrap();
+            let fresh = BindIdentity::new(fixture.root.join("project"), "runner", "absent");
+            registry
+                .authorize_session_owner(&fresh, Some(&reserved("stranger")), &SendScope::Unstamped)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn advanced_owner_head_refuses_failed_suffix_and_full_revalidation() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(
+            &fixture.session,
+            Some(reserved("basal")),
+            Some(scope("core")),
+        ),
+        finished(),
+    ]);
+    let (registry, wal, _) = registry(&fixture, Ok(None));
+    let checkpoint = snapshot(&fixture).checkpoint.unwrap();
+    registry.owner_ownership(&fixture.session).await.unwrap();
+    let head = install_live(&registry, &fixture.session, &checkpoint);
+    assert!(matches!(
+        registry
+            .authorize_session_owner(
+                &fixture.session,
+                Some(&reserved("stranger")),
+                &SendScope::Unstamped
+            )
+            .await,
+        Err(crate::serve::ServeError::ScopeRefused(_))
+    ));
+    registry.owner_ownership(&fixture.session).await.unwrap();
+    fixture.append(&[super::tests::assistant_record()]);
+    head.fetch_add(1, Ordering::Release);
+    wal.fault.store(2, Ordering::Relaxed);
+    let before = std::fs::read(fixture.wal.wal_path(&fixture.session)).unwrap();
+    assert_transient(
+        registry
+            .authorize_session_owner(
+                &fixture.session,
+                Some(&reserved("stranger")),
+                &SendScope::Unstamped,
+            )
+            .await,
+    );
+    assert!(
+        wal.reads.lock().unwrap().contains(&0),
+        "full revalidation attempted"
+    );
+    assert_eq!(
+        std::fs::read(fixture.wal.wal_path(&fixture.session)).unwrap(),
+        before
+    );
+    wal.fault.store(0, Ordering::Relaxed);
+    registry
+        .authorize_session_owner(
+            &fixture.session,
+            Some(&reserved("core")),
+            &SendScope::Unstamped,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cold_flow_sender_refuses_degraded_read_but_warm_sender_remains_authoritative() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(&fixture.session, Some(reserved("core")), None),
+        finished(),
+    ]);
+    let (registry, wal, _) = registry(&fixture, Ok(None));
+    wal.fault.store(1, Ordering::Relaxed);
+    assert_transient(
+        registry
+            .authorize_session(&fixture.session, Some(&reserved("basal")))
+            .await,
+    );
+    wal.fault.store(0, Ordering::Relaxed);
+    assert!(matches!(
+        registry
+            .authorize_session(&fixture.session, Some(&reserved("basal")))
+            .await,
+        Err(crate::serve::ServeError::ScopeRefused(_))
+    ));
+    wal.fault.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        registry
+            .authorize_session(&fixture.session, Some(&reserved("basal")))
+            .await,
+        Err(crate::serve::ServeError::ScopeRefused(_))
+    ));
+    let fresh = BindIdentity::new(fixture.root.join("project"), "runner", "absent");
+    registry
+        .authorize_session(&fresh, Some(&reserved("basal")))
+        .await
+        .unwrap();
 }
