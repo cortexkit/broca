@@ -1745,6 +1745,13 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
         request_body.get("reasoning").is_none(),
         "a Muse model without a variant does not add reasoning settings: {request_body}"
     );
+    // Meta reuses a cached prefix only for a request that names a cache scope. A send without a
+    // cache key gets its session id as the scope, frozen at admission.
+    assert_eq!(
+        request_body.get("prompt_cache_key"),
+        Some(&serde_json::json!(session)),
+        "the Meta request names the session as its prompt cache scope: {request_body}"
+    );
 
     let mut records = std::fs::read_dir(daemon.module_wal_dir())
         .expect("module WAL directory exists")
@@ -1765,7 +1772,7 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
                 .then_some(frames)
         })
         .expect("the completed Meta run has a readable WAL");
-    let (run_id, credential_id) = records
+    let (run_id, credential_id, frozen_cache_key) = records
         .iter()
         .find_map(|frame| match &frame.record {
             broca_wal::WalRecord::RunStarted {
@@ -1779,11 +1786,17 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
                     .auth_selection
                     .as_ref()
                     .map(|selection| selection.credential_id.clone()),
+                config.frozen_render_config.get("prompt_cache_key").cloned(),
             )),
             _ => None,
         })
         .expect("RunStarted records the Meta credential selection");
     assert_eq!(credential_id.as_deref(), Some("oauth:meta:test"));
+    assert_eq!(
+        frozen_cache_key,
+        Some(serde_json::json!(session)),
+        "RunStarted freezes the key, so a resume renders the same scope"
+    );
 
     let facts = broca_core::compute_segments_for_run(
         &records,

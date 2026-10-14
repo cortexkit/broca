@@ -1946,7 +1946,7 @@ mod executor {
         frozen_render_config(config).and_then(|frozen| frozen.cache)
     }
 
-    fn frozen_caller_cache_key(config: &broca_wal::RunConfig) -> Option<String> {
+    fn frozen_prompt_cache_key(config: &broca_wal::RunConfig) -> Option<String> {
         frozen_render_config(config).and_then(|frozen| frozen.prompt_cache_key)
     }
 
@@ -1964,7 +1964,7 @@ mod executor {
             return None;
         }
         let config = last?;
-        Some((frozen_cache_policy(config), frozen_caller_cache_key(config)))
+        Some((frozen_cache_policy(config), frozen_prompt_cache_key(config)))
     }
 
     /// The output cap the episode froze at start. Read straight off the blob, like the recorded
@@ -2538,6 +2538,26 @@ mod executor {
             } else {
                 prior_run.and_then(|prior| frozen_cache_policy(&prior.config))
             })
+        }
+
+        /// The prompt-cache key a fresh episode freezes: the caller's `cache.key`, else the
+        /// session-derived default for a provider the cache table lists. A resume never calls
+        /// this; it re-applies the key frozen in the episode's render config. The
+        /// `BROCA_PROVIDER_BASE_URL` mock endpoint is opaque, so like the cache policy it gets
+        /// no provider default, only a key the caller named.
+        fn prompt_cache_key_for_fresh_episode(
+            &self,
+            req: &broca_core::RunRequest,
+        ) -> Option<String> {
+            if self.provider_base_url.is_some() {
+                return broca_module_serve::resolve_caller_cache_key(req.cache.as_ref());
+            }
+            broca_module_serve::resolve_prompt_cache_key(
+                req.model.provider_module_id.as_str(),
+                req.cache.as_ref(),
+                &self.cache_table,
+                &req.session,
+            )
         }
 
         /// Decide this run's auth: the mock path needs none; the vault path resolves the
@@ -3148,14 +3168,14 @@ mod executor {
                     return Err(RunError::Config(error));
                 }
             };
-            let caller_cache_key = if let Some((_, key)) = inherited {
+            let prompt_cache_key = if let Some((_, key)) = inherited {
                 key
             } else if fresh_episode {
-                broca_module_serve::resolve_caller_cache_key(job.req.cache.as_ref())
+                self.prompt_cache_key_for_fresh_episode(&job.req)
             } else {
                 prior_run
                     .as_ref()
-                    .and_then(|prior| frozen_caller_cache_key(&prior.config))
+                    .and_then(|prior| frozen_prompt_cache_key(&prior.config))
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
                 auth_method: resolution.method,
@@ -3165,7 +3185,7 @@ mod executor {
                 session_id: Some(job.req.session.session.as_str()),
                 account_id: resolution.account_id.as_deref(),
                 cache_policy: cache_policy.clone(),
-                prompt_cache_key: caller_cache_key.as_deref(),
+                prompt_cache_key: prompt_cache_key.as_deref(),
                 // Only a fresh episode resolves the caller's requested variant. A resume ignores
                 // the resuming send's variant and re-applies the one frozen in the episode's
                 // render config (`restored_variant` below), matching core, which keeps the
