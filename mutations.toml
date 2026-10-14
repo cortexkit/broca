@@ -9189,3 +9189,127 @@ expect_message = "the refused account must not enter the shared fallback cache"
 file = "crates/broca-module-serve/src/main.rs"
 old = "                    vault.gauge.stamp_ok();\n                    validate_routed_account(token, routed_vault_id, routed_account)?;"
 new = "                    vault.gauge.stamp_ok();\n                    let _ = (token, routed_vault_id, routed_account); // NON-VACUITY BREAK: cache before validation"
+id = "owner-authorization-requires-proven-wal"
+guards = "cancel and retract never infer no owner from a degraded full read"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::owner_barrier_failure_refuses_cancel_and_retract_without_writes", "registry::owner_tests::advanced_owner_head_refuses_failed_suffix_and_full_revalidation"]
+file = "crates/broca-module/src/registry.rs"
+old = '''        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
+            .records()
+            .map_err(|reason| OpenError::Classified {
+                reason: format!("owner authorization: {reason}"),
+                class: broca_protocol::ErrorClass::Transient,
+            })?;'''
+new = '''        // NON-VACUITY BREAK: treat unproven owner history as authoritative.
+        let records = match range.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records,
+            broca_wal::WalRangeRecords::Absent => &[],
+        };'''
+
+[[control]]
+id = "sender-authorization-requires-proven-wal"
+guards = "flow-only sender admission refuses a cold unproven history"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::cold_flow_sender_refuses_degraded_read_but_warm_sender_remains_authoritative"]
+file = "crates/broca-module/src/registry.rs"
+old = '''        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
+            .records()
+            .map_err(|reason| OpenError::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            })?
+            .to_vec();'''
+new = '''        // NON-VACUITY BREAK: erase the full-read source proof.
+        let records = match range.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records.to_vec(),
+            broca_wal::WalRangeRecords::Absent => Vec::new(),
+        };'''
+
+[[control]]
+id = "registry-barrier-reread-reaches-observed-head"
+guards = "a successful flush cannot turn a short bounded reread into proof of no owner"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::owner_barrier_failure_refuses_cancel_and_retract_without_writes"]
+file = "crates/broca-module/src/registry.rs"
+old = '        if matches!(proven.records(), broca_wal::WalRangeRecords::Complete(_))'
+new = '        if false /* NON-VACUITY BREAK: discard the observed-head coverage check */'
+
+[[control]]
+id = "actor-key-fence-requires-proven-wal"
+guards = "full actor scans cannot replace key or tombstone sets with an unproven read"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::old_keyed_send_requires_proven_full_scan_without_run_index", "actor::wal_proof_tests::degraded_retract_preserves_good_scan_sets_and_refuses_negative_answers"]
+file = "crates/broca-module/src/actor.rs"
+old = '''            crate::durable_read::DurableRead::classify(&range, 0, Some(safe_head))
+                .records()
+                .map(<[_]>::to_vec)'''
+new = '''            // NON-VACUITY BREAK: accept an unproven full scan.
+            Ok(match range.into_records() {
+                broca_wal::WalRangeRecords::Complete(records)
+                | broca_wal::WalRangeRecords::Partial(records)
+                | broca_wal::WalRangeRecords::Unknown(records) => records,
+                broca_wal::WalRangeRecords::Absent => Vec::new(),
+            })'''
+
+[[control]]
+id = "actor-checkpoint-fallback-requires-proven-prefix"
+guards = "checkpoint fallback proves the entire durable prefix and keeps its primary failure"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::checkpoint_fallback_requires_coverage_and_keeps_primary_cause"]
+file = "crates/broca-module/src/actor.rs"
+old = '''                    let durable =
+                        crate::durable_read::DurableRead::classify(&range, 0, Some(safe_head))
+                            .records()
+                            .map_err(|error| format!("{cause}; ownership prefix: {error}"))?;'''
+new = '''                    // NON-VACUITY BREAK: fold a short fallback as a complete checkpoint.
+                    let durable = match range.records() {
+                        broca_wal::WalRangeRecords::Complete(records)
+                        | broca_wal::WalRangeRecords::Partial(records)
+                        | broca_wal::WalRangeRecords::Unknown(records) => records,
+                        broca_wal::WalRangeRecords::Absent => &[],
+                    };'''
+
+[[control]]
+id = "durable-read-requires-contiguous-head-coverage"
+only = false
+guards = "complete-source labels cannot stand in for contiguous coverage through the durable head"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::old_keyed_send_requires_proven_full_scan_without_run_index"]
+file = "crates/broca-module/src/durable_read.rs"
+old = '        if contiguous {'
+new = '        if contiguous || true /* NON-VACUITY BREAK: trust short and gapped ranges */ {'
+
+[[control]]
+id = "durable-read-unknown-source-is-unproven"
+only = false
+guards = "generic WalStore Unknown reads remain unproven even when all sequence numbers are present"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::old_keyed_send_requires_proven_full_scan_without_run_index"]
+file = "crates/broca-module/src/durable_read.rs"
+old = '            WalRangeRecords::Complete(records) => records,'
+new = '            WalRangeRecords::Complete(records) | WalRangeRecords::Unknown(records) => records, // NON-VACUITY BREAK'

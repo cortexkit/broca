@@ -1051,12 +1051,12 @@ impl LineageRegistry {
         let range = self
             .read_durable_range(reader, key, 0, None, live_head)
             .await?;
-        let records = match range.records() {
-            broca_wal::WalRangeRecords::Complete(records)
-            | broca_wal::WalRangeRecords::Partial(records)
-            | broca_wal::WalRangeRecords::Unknown(records) => records,
-            broca_wal::WalRangeRecords::Absent => &[],
-        };
+        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
+            .records()
+            .map_err(|reason| OpenError::Classified {
+                reason: format!("owner authorization: {reason}"),
+                class: broca_protocol::ErrorClass::Transient,
+            })?;
         let mut ownership = broca_core::SessionOwnershipV1::default();
         ownership.fold_owner_records(records);
         let head = records.last().map_or(0, |record| record.seq);
@@ -1104,9 +1104,11 @@ impl LineageRegistry {
         {
             return Ok(None);
         }
-        let records = match range.records() {
-            broca_wal::WalRangeRecords::Complete(records) => records,
-            _ => return Ok(None),
+        let Ok(records) =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
+                .records()
+        else {
+            return Ok(None);
         };
         let head = records
             .last()
@@ -1905,6 +1907,15 @@ impl LineageRegistry {
             .map_err(|error| {
                 OpenError::from_wal_read(format!("wal range-read failed: {error}"), &error)
             })?;
+        // A bounded reread can lose frames even after a successful barrier. Preserve that
+        // uncertainty instead of letting full-history consumers infer absence from a short read.
+        if matches!(proven.records(), broca_wal::WalRangeRecords::Complete(_))
+            && crate::durable_read::DurableRead::classify(&proven, after_seq, Some(candidate_head))
+                .records()
+                .is_err()
+        {
+            return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
+        }
         let identity_after = spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
@@ -2112,12 +2123,13 @@ impl LineageRegistry {
         let range = self
             .read_durable_range(reader, key, 0, None, live_head)
             .await?;
-        let records = match range.records() {
-            broca_wal::WalRangeRecords::Complete(records)
-            | broca_wal::WalRangeRecords::Partial(records)
-            | broca_wal::WalRangeRecords::Unknown(records) => records.to_vec(),
-            broca_wal::WalRangeRecords::Absent => Vec::new(),
-        };
+        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
+            .records()
+            .map_err(|reason| OpenError::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            })?
+            .to_vec();
         Ok((records, range.lineage_id))
     }
 
