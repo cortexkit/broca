@@ -137,6 +137,19 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eligible_windows([{"id": "invalid", "platforms": []}])
 
+    def test_unix_approval_gate_controls_are_not_claimed_on_windows(self):
+        root = Path(__file__).resolve().parents[1]
+        catalog = tomllib.loads((root / "mutations.toml").read_text())
+        controls = [row for row in catalog["control"]
+                    if row.get("test_file") == "crates/broca-module-serve/tests/it/approval_gate.rs"]
+        self.assertEqual({row["id"] for row in controls},
+                         {"serve-boot-terminal-withdrawal-debt", "serve-installs-elicitation-plane"})
+        for row in controls:
+            with self.subTest(control=row["id"]):
+                self.assertEqual(row.get("platforms"), ["macos", "linux"])
+                self.assertTrue(all(name.startswith("approval_gate::") for name in row["expect_red"]))
+        self.assertEqual(eligible_windows(controls), {})
+
     def test_pinned_shards_sort_before_platform_filtering(self):
         controls = [
             {"id": "d"}, {"id": "c"}, {"id": "b"},

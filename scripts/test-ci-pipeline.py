@@ -2,6 +2,7 @@
 """Exercise archive/shard guards and the workflow dependency graph without compiling."""
 import json
 import io
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import tarfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -104,6 +106,15 @@ class ArchiveShards(unittest.TestCase):
         result = self.run_mode('run', str(self.archive), '1/4', RUN_EXIT='19')
         self.assertEqual(result.returncode, 19)
 
+    def test_shard_reports_failure_output_immediately_without_stopping_other_tests(self):
+        result = self.run_mode('run', str(self.archive), '1/4')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        shard = self.commands()[1]
+        self.assertEqual(shard[shard.index('--failure-output') + 1], 'immediate-final')
+        config = (ROOT / '.config/nextest.toml').read_text()
+        import tomllib
+        self.assertFalse(tomllib.loads(config)['profile']['ci']['fail-fast'])
+
 
 class WorkflowGraph(unittest.TestCase):
     @staticmethod
@@ -116,6 +127,21 @@ class WorkflowGraph(unittest.TestCase):
             self.assertNotIn('needs', jobs[name], name)
         self.assertEqual(jobs['integration']['strategy']['matrix']['shard'], ['1', '2', '3', '4'])
         self.assertEqual(jobs['integration']['strategy']['matrix']['os'], ['ubuntu', 'windows'])
+
+    def test_shards_prepare_immediately_and_wait_only_for_platform_artifacts(self):
+        jobs = self.workflow('ci.yml')['jobs']
+        self.assertNotIn('needs', jobs['integration'])
+        steps = jobs['integration']['steps']
+        wait = next(i for i, step in enumerate(steps) if 'wait-ci-artifacts.py' in step.get('run', ''))
+        self.assertTrue(any(step.get('run') == 'npm ci' for step in steps[:wait]))
+        self.assertIn('"fixtures-${{ runner.os }}" "integration-${{ matrix.os }}"', steps[wait]['run'])
+        self.assertEqual(steps[wait]['env']['GH_TOKEN'], '${{ github.token }}')
+        downloads = [i for i, step in enumerate(steps) if step.get('uses', '').startswith('actions/download-artifact@')]
+        self.assertTrue(downloads)
+        self.assertTrue(all(i > wait for i in downloads))
+        self.assertEqual(self.workflow('ci.yml')['permissions']['actions'], 'read')
+        self.assertEqual(set(jobs['test']['needs']),
+                         {'lint', 'scripts', 'unit', 'integration-build', 'fixtures', 'integration', 'linux-deploy'})
 
     def test_scripts_prefetch_locked_dependencies_before_offline_suites(self):
         steps = self.workflow('ci.yml')['jobs']['scripts']['steps']
@@ -158,6 +184,72 @@ class WorkflowGraph(unittest.TestCase):
             run = subprocess.run(['bash', '-c', script], env={**os.environ, 'NEEDS_JSON': json.dumps(lanes)},
                                  text=True, capture_output=True, timeout=5)
             self.assertEqual(run.returncode == 0, result == 'success', run.stdout + run.stderr)
+
+
+class ArtifactWait(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('wait_ci_artifacts', ROOT / 'scripts/wait-ci-artifacts.py')
+        assert spec is not None and spec.loader is not None
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    @staticmethod
+    def artifacts(*names):
+        return {'artifacts': [{'name': name, 'expired': False} for name in names]}
+
+    @staticmethod
+    def job(name, status='in_progress', conclusion=None):
+        return {'name': name, 'status': status, 'conclusion': conclusion}
+
+    def run_wait(self, replies, timeout=10.0):
+        with patch.object(self.module, 'api', side_effect=replies) as api, \
+             patch.object(self.module.time, 'sleep'), \
+             patch('sys.argv', ['wait-ci-artifacts.py', 'fixtures-Windows', 'integration-windows',
+                                '--timeout', str(timeout), '--poll-seconds', '0']), \
+             patch.dict(os.environ, GITHUB_REPOSITORY='cortexkit/broca', GITHUB_RUN_ID='42'):
+            self.module.main()
+            return api
+
+    def test_windows_ready_does_not_wait_for_linux_or_producer_post_steps(self):
+        api = self.run_wait([self.artifacts('fixtures-Windows', 'integration-windows')])
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual(api.call_args.args[0], 'repos/cortexkit/broca/actions/runs/42/artifacts?per_page=100&page=1')
+
+    def test_waits_for_windows_archive_but_ignores_failed_linux_producer(self):
+        api = self.run_wait([self.artifacts('fixtures-Windows'),
+                             {'jobs': [self.job('Archive (windows)'), self.job('Archive (ubuntu)', 'completed', 'failure')]},
+                             self.artifacts('fixtures-Windows', 'integration-windows')])
+        self.assertEqual(api.call_count, 3)
+
+    def test_failed_required_producer_is_reported_by_name(self):
+        with self.assertRaisesRegex(RuntimeError, r'Producer failed: fixtures / Fixtures \(Windows\) \(failure\)'):
+            self.run_wait([self.artifacts('integration-windows'),
+                           {'jobs': [self.job('fixtures / Fixtures (Windows)', 'completed', 'failure')]}])
+
+    def test_completed_producers_without_artifacts_refuse(self):
+        with self.assertRaisesRegex(RuntimeError, 'Producers finished without artifacts: integration-windows'):
+            self.run_wait([self.artifacts('fixtures-Windows'),
+                           {'jobs': [self.job('Archive (windows)', 'completed', 'success')]}])
+
+    def test_expired_archive_is_not_replayed(self):
+        response = self.artifacts('fixtures-Windows', 'integration-windows')
+        response['artifacts'][1]['expired'] = True
+        with self.assertRaisesRegex(RuntimeError, 'without artifacts: integration-windows'):
+            self.run_wait([response, {'jobs': [self.job('Archive (windows)', 'completed', 'success')]}])
+
+    def test_queued_producer_has_bounded_wait(self):
+        with self.assertRaisesRegex(RuntimeError, 'Timed out waiting for artifacts: integration-windows'):
+            self.run_wait([self.artifacts('fixtures-Windows'), {'jobs': []}], timeout=0.000001)
+
+    def test_query_failure_refuses_instead_of_replaying(self):
+        with patch.object(self.module.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'forbidden')):
+            with self.assertRaisesRegex(RuntimeError, 'GitHub artifact query failed: forbidden'):
+                self.module.api('repos/cortexkit/broca/actions/runs/42/artifacts')
+
+    def test_paginates_artifacts_before_deciding_windows_is_missing(self):
+        response = self.artifacts(*['other-' + str(i) for i in range(100)])
+        api = self.run_wait([response, self.artifacts('fixtures-Windows', 'integration-windows')])
+        self.assertTrue(api.call_args.args[0].endswith('page=2'))
 
 
 class FixtureUnpack(unittest.TestCase):

@@ -42,7 +42,7 @@ if re.search(pattern, text, re.MULTILINE) is None:
     sys.exit("CI shard: test-clock sentinel did not execute successfully")
 print("CI shard: executed test-clock sentinel")
 PY
-    "${base[@]}" -E "$nextest_filter" --partition "hash:$partition" --success-output final
+    "${base[@]}" -E "$nextest_filter" --partition "hash:$partition" --success-output final --failure-output immediate-final
     ;;
   *) echo "unknown mode: $mode" >&2; exit 2 ;;
 esac
