@@ -73,8 +73,13 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     if floor.len() == before {
         // A prior process may have renamed this readable floor without syncing
         // its parent directory. Visibility now does not prove the rename durable.
+        // Sync through a writable handle: Windows `FlushFileBuffers` refuses a read-only one
+        // with "Access is denied", while unix accepts either.
         if path.try_exists()? {
-            std::fs::File::open(path)?.sync_all()?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .sync_all()?;
         }
         return crate::directory_sync::sync_dir(dir);
     }
