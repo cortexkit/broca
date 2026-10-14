@@ -290,7 +290,7 @@ impl std::fmt::Display for WalError {
                 file_size,
             } => write!(
                 f,
-                "wal read refused: file size {file_size} exceeds the {max_bytes}-byte safety cap"
+                "wal size refused: file size {file_size} exceeds the {max_bytes}-byte safety cap"
             ),
             WalError::NonMonotonic { prev_seq, seq } => {
                 write!(f, "wal seq regressed: {seq} after {prev_seq}")
@@ -361,10 +361,19 @@ pub trait Wal {
         self.append(fence, record, sync)
     }
 
-    /// Optional byte cap, current file bytes and per-append metadata bytes. File stores
-    /// select this for expiring sessions so their logs stay readable for content deletion.
+    /// Optional (total-byte ceiling, current file size, metadata bytes added per record).
+    /// Enqueue checks charge the encoded frame plus lineage metadata against this ceiling,
+    /// reserving terminal space so refusing a record never makes the log unreadable.
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         None
+    }
+
+    fn recovery_byte_cap(&self) -> Option<u64> {
+        None
+    }
+
+    fn append_budget_scope(&self) -> crate::size_limit::SizeScope {
+        crate::size_limit::SizeScope::Session
     }
 
     /// fsync queued writes without adding a record, including those previously
@@ -429,7 +438,9 @@ pub struct FileWal {
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
     /// record is refused, because nothing would tell placement that the machine now holds it.
-    append_budget: Option<u64>,
+    recovery_cap: u64,
+    append_budget: u64,
+    budget_scope: crate::size_limit::SizeScope,
     feature_floor: Option<PathBuf>,
     session_ref: String,
     #[cfg(test)]
@@ -652,7 +663,9 @@ impl FileWal {
             dir_needs_sync: Cell::new(dir_needs_sync),
             newly_created_dirs: RefCell::new(newly_created_dirs),
             lineage_id,
-            append_budget: None,
+            recovery_cap: DEFAULT_MAX_READ_BYTES,
+            append_budget: DEFAULT_MAX_READ_BYTES,
+            budget_scope: crate::size_limit::SizeScope::Session,
             feature_floor: None,
             session_ref: String::new(),
             #[cfg(test)]
@@ -728,10 +741,18 @@ impl FileWal {
         self.session_ref = session_ref;
         self
     }
-    /// Expose a byte cap and file sizes to WalHandle's enqueue checks. FileWal does not
-    /// decide which sessions expire; the FileWalStore that opened the file selects the cap.
+    /// Restrict the total byte ceiling without allowing it to exceed recovery's cap.
+    pub fn with_recovery_cap(mut self, max_bytes: u64) -> Self {
+        self.recovery_cap = max_bytes.min(DEFAULT_MAX_READ_BYTES);
+        self.append_budget = self.recovery_cap;
+        self
+    }
+
+    /// Apply a total-byte ceiling and choose `retained_session_too_large` rather
+    /// than `session_too_large` for the writer's typed refusal terminal.
     pub fn with_append_budget(mut self, max_bytes: u64) -> Self {
-        self.append_budget = Some(max_bytes);
+        self.append_budget = max_bytes.min(self.recovery_cap);
+        self.budget_scope = crate::size_limit::SizeScope::RetainedSession;
         self
     }
 
@@ -757,6 +778,45 @@ impl FileWal {
                 found: current,
             });
         }
+        if self.next_seq == 1
+            && self.budget_scope == crate::size_limit::SizeScope::RetainedSession
+            && matches!(
+                record,
+                WalRecord::RunStarted {
+                    retention: None,
+                    ..
+                }
+            )
+        {
+            self.budget_scope = crate::size_limit::SizeScope::Session;
+            self.append_budget = self.recovery_cap;
+        }
+        let seq = self.next_seq;
+        let record_bytes = match frame {
+            Some(frame) => frame,
+            None => encode(seq, fence, record).map_err(WalError::Frame)?,
+        };
+        let overhead = crate::framing::LINEAGE_FRAME_LEN as u64
+            * if self.lineage_id.is_none() && current > 0 {
+                2
+            } else {
+                1
+            };
+        let reserve = if matches!(record, WalRecord::RunFinished { .. }) {
+            0
+        } else {
+            crate::size_limit::reserve_bytes(overhead)
+        };
+        let required = current
+            .saturating_add(record_bytes.len() as u64)
+            .saturating_add(overhead)
+            .saturating_add(reserve);
+        if required > self.append_budget {
+            return Err(WalError::TooLarge {
+                max_bytes: self.append_budget,
+                file_size: required,
+            });
+        }
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
         // a gated frame written first would be data it does not know about if the process
@@ -774,11 +834,6 @@ impl FileWal {
             crate::floor::raise_floor(&floor, requires)
                 .map_err(|error| refuse(Some(floor), error.to_string()))?;
         }
-        let seq = self.next_seq;
-        let record_bytes = match frame {
-            Some(frame) => frame,
-            None => encode(seq, fence, record).map_err(WalError::Frame)?,
-        };
         let (lineage_id, minted_for_legacy) = match self.lineage_id {
             Some(lineage_id) => (lineage_id, false),
             None => {
@@ -832,18 +887,24 @@ impl Wal for FileWal {
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
-        self.append_budget.map(|cap| {
-            (
-                cap,
-                self.last_write_end,
-                crate::framing::LINEAGE_FRAME_LEN as u64
-                    * if self.lineage_id.is_none() && self.last_write_end > 0 {
-                        2
-                    } else {
-                        1
-                    },
-            )
-        })
+        Some((
+            self.append_budget,
+            self.last_write_end,
+            crate::framing::LINEAGE_FRAME_LEN as u64
+                * if self.lineage_id.is_none() && self.last_write_end > 0 {
+                    2
+                } else {
+                    1
+                },
+        ))
+    }
+
+    fn recovery_byte_cap(&self) -> Option<u64> {
+        Some(self.recovery_cap)
+    }
+
+    fn append_budget_scope(&self) -> crate::size_limit::SizeScope {
+        self.budget_scope
     }
 
     fn sync(&self) -> Result<(), WalError> {
@@ -1681,6 +1742,39 @@ mod tests {
             service_tier_used: None,
             speed_used: None,
         }
+    }
+
+    #[test]
+    fn unretained_append_never_crosses_recovery_cap() {
+        assert_eq!(DEFAULT_MAX_READ_BYTES, 1_073_741_824);
+        let path = tmp("ordinary-byte-cap");
+        let _ = std::fs::remove_file(&path);
+        let cap = 2048;
+        let mut wal = FileWal::open(&path).unwrap().with_recovery_cap(cap);
+        let first = WalRecord::StepStarted { step_id: StepId(1) };
+        wal.append(1, &first, true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let oversized = run_started(2);
+        let mut huge = encode(2, 1, &oversized).unwrap();
+        huge.resize(cap as usize + 1, 0);
+        assert!(matches!(
+            wal.append_preencoded(1, &oversized, false, huge),
+            Err(WalError::TooLarge { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(wal.last_seq(), 1);
+        let terminal = crate::size_limit::scoped_terminal(
+            cap,
+            crate::size_limit::SizeScope::Session,
+            Some(1),
+            Default::default(),
+            0,
+        );
+        wal.append(1, &terminal, true).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= cap);
+        drop(wal);
+        assert_eq!(FileWal::open(&path).unwrap().replay().unwrap().len(), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

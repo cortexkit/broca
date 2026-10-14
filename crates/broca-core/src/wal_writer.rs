@@ -441,14 +441,19 @@ impl FileWalStore {
         self
     }
 
-    fn retained_append_cap(&self) -> Result<u64, WalError> {
+    fn append_cap(&self, scope: retained_size::SizeScope) -> Result<u64, WalError> {
+        #[cfg(not(feature = "test-clock"))]
+        let _ = scope;
         #[cfg(feature = "test-clock")]
         {
             let path = self
                 .root
                 .parent()
                 .unwrap_or(Path::new(""))
-                .join("test-retained-wal-cap");
+                .join(match scope {
+                    retained_size::SizeScope::Session => "test-session-wal-cap",
+                    retained_size::SizeScope::RetainedSession => "test-retained-wal-cap",
+                });
             match std::fs::read_to_string(path) {
                 Ok(value) => {
                     return value.trim().parse().map_err(|_| {
@@ -499,6 +504,7 @@ impl FileWalStore {
             session_addr(session),
             identity,
         )?
+        .with_recovery_cap(self.max_read_bytes)
         .with_feature_floor(self.feature_floor_path())
         .with_session_ref(cortexkit_role_llm_runner::session_ref(
             &session.harness,
@@ -518,9 +524,9 @@ impl FileWalStore {
             false
         };
         Ok(Box::new(if retained_policy {
-            wal.with_append_budget(self.retained_append_cap()?)
+            wal.with_append_budget(self.append_cap(retained_size::SizeScope::RetainedSession)?)
         } else {
-            wal
+            wal.with_recovery_cap(self.append_cap(retained_size::SizeScope::Session)?)
         }))
     }
 
@@ -1087,7 +1093,7 @@ fn member_range(
     )
 }
 
-pub(crate) mod retained_size;
+pub(crate) use broca_wal::size_limit as retained_size;
 
 /// Only accepted enqueue operations have a sequence. A refused append must not be
 /// published as an attempt, call key, projection cursor or any other WAL reference.
@@ -1107,7 +1113,8 @@ impl RecordOutcome {
 }
 
 struct AppendBudget {
-    enforced: bool,
+    retained: bool,
+    session_max_bytes: u64,
     max_bytes: u64,
     used_bytes: u64,
     overhead: u64,
@@ -1115,19 +1122,49 @@ struct AppendBudget {
     refused: bool,
 }
 
+impl AppendBudget {
+    fn scope(&self) -> retained_size::SizeScope {
+        if self.retained {
+            retained_size::SizeScope::RetainedSession
+        } else {
+            retained_size::SizeScope::Session
+        }
+    }
+
+    fn refusal(&self) -> WalWriteError {
+        match self.scope() {
+            retained_size::SizeScope::Session => WalWriteError::SessionTooLarge {
+                max_bytes: self.max_bytes,
+            },
+            retained_size::SizeScope::RetainedSession => WalWriteError::RetainedSessionTooLarge {
+                max_bytes: self.max_bytes,
+            },
+        }
+    }
+}
+
 /// A failure reported by WalHandle::sync while committing queued records to disk.
-/// I/O failures are fatal. A byte-budget refusal for an expiring session leaves accepted
+/// I/O failures are fatal. A byte-budget refusal leaves accepted
 /// records writable so the run boundary can append and commit an Error terminal.
 #[derive(Debug, Clone)]
 pub enum WalWriteError {
     Failed(String),
     RetainedSessionTooLarge { max_bytes: u64 },
+    SessionTooLarge { max_bytes: u64 },
 }
 
 impl std::fmt::Display for WalWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Failed(detail) => write!(f, "wal write failure: {detail}"),
+            Self::SessionTooLarge { max_bytes } => {
+                write!(
+                    f,
+                    "{}",
+                    retained_size::scoped_error(*max_bytes, retained_size::SizeScope::Session)
+                        .message
+                )
+            }
             Self::RetainedSessionTooLarge { max_bytes } => {
                 write!(f, "{}", retained_size::error(*max_bytes).message)
             }
@@ -1459,7 +1496,9 @@ impl WalHandle {
             .append_budget()
             .map(|(max_bytes, used_bytes, overhead)| {
                 Mutex::new(AppendBudget {
-                    enforced: true,
+                    retained: wal.append_budget_scope()
+                        == retained_size::SizeScope::RetainedSession,
+                    session_max_bytes: wal.recovery_byte_cap().unwrap_or(max_bytes),
                     max_bytes,
                     used_bytes,
                     overhead,
@@ -1574,16 +1613,15 @@ impl WalHandle {
             ) && *self.lineage_retention.lock().unwrap()
                 == Some(crate::LineageRetention::Unstarted)
             {
-                budget.enforced = false;
+                if budget.retained {
+                    budget.max_bytes = budget.session_max_bytes;
+                }
+                budget.retained = false;
                 budget.refused = false;
             }
-            if !budget.enforced {
-                (self.next_seq.fetch_add(1, Ordering::SeqCst), None)
-            } else {
+            {
                 if budget.refused && !reserved_terminal {
-                    return RecordOutcome::Refused(WalWriteError::RetainedSessionTooLarge {
-                        max_bytes: budget.max_bytes,
-                    });
+                    return RecordOutcome::Refused(budget.refusal());
                 }
                 let frame = match broca_wal::framing::encode(seq, self.fence, &record) {
                     Ok(frame) => frame,
@@ -1604,9 +1642,7 @@ impl WalHandle {
                     };
                 if end.saturating_add(reserve) > budget.max_bytes {
                     budget.refused = true;
-                    return RecordOutcome::Refused(WalWriteError::RetainedSessionTooLarge {
-                        max_bytes: budget.max_bytes,
-                    });
+                    return RecordOutcome::Refused(budget.refusal());
                 }
                 budget.used_bytes = end;
                 if reserved_terminal {
@@ -1645,6 +1681,14 @@ impl WalHandle {
         RecordOutcome::Accepted(seq)
     }
 
+    fn size_scope(&self) -> retained_size::SizeScope {
+        self.append_budget
+            .as_ref()
+            .map_or(retained_size::SizeScope::Session, |budget| {
+                budget.lock().unwrap().scope()
+            })
+    }
+
     pub(crate) fn clear_size_refusal(&self) {
         let _guard = self.lock_enqueue();
         if let Some(budget) = &self.append_budget {
@@ -1659,8 +1703,9 @@ impl WalHandle {
         usage: broca_protocol::Usage,
         retries_used: u32,
     ) -> Result<u64, WalWriteError> {
-        self.record_terminal(retained_size::terminal(
+        self.record_terminal(retained_size::scoped_terminal(
             max_bytes,
+            self.size_scope(),
             ts_ms,
             usage,
             retries_used,
@@ -1678,7 +1723,11 @@ impl WalHandle {
             ));
         }
         let first = self.enqueue_record(record.clone(), true).into_result();
-        if matches!(first, Err(WalWriteError::RetainedSessionTooLarge { .. })) {
+        if matches!(
+            first,
+            Err(WalWriteError::RetainedSessionTooLarge { .. }
+                | WalWriteError::SessionTooLarge { .. })
+        ) {
             if let WalRecord::RunFinished { error, .. } = &mut record {
                 let max = self
                     .append_budget
@@ -1687,7 +1736,7 @@ impl WalHandle {
                     .lock()
                     .unwrap()
                     .max_bytes;
-                *error = Some(retained_size::error(max));
+                *error = Some(retained_size::scoped_error(max, self.size_scope()));
             }
             return self.enqueue_record(record, true).into_result();
         }
@@ -1698,9 +1747,10 @@ impl WalHandle {
     /// failures still abort sealing; only a byte-budget refusal can use the reserved terminal.
     pub async fn sync_for_seal(&self) -> Result<u64, WalWriteError> {
         match self.sync().await {
-            Err(WalWriteError::RetainedSessionTooLarge { .. }) => {
-                Ok(self.durable_head.load(Ordering::Acquire))
-            }
+            Err(
+                WalWriteError::RetainedSessionTooLarge { .. }
+                | WalWriteError::SessionTooLarge { .. },
+            ) => Ok(self.durable_head.load(Ordering::Acquire)),
             result => result,
         }
     }
@@ -1744,9 +1794,7 @@ impl WalHandle {
                 if let Some(budget) = &self.append_budget {
                     let budget = budget.lock().unwrap();
                     if budget.refused {
-                        return Err(WalWriteError::RetainedSessionTooLarge {
-                            max_bytes: budget.max_bytes,
-                        });
+                        return Err(budget.refusal());
                     }
                 }
                 Ok(head)

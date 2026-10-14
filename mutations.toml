@@ -6157,7 +6157,7 @@ test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::retained_size_refusal_seals_error_and_expires_within_deletion_bound"]
 file = "crates/broca-core/src/run.rs"
 old = '''        writer.record_size_refusal_terminal(
-            *max_bytes,
+            max_bytes,
             control.now_ms(),
             prior.usage,
             prior.retries_used,
@@ -6187,7 +6187,7 @@ target = "--lib"
 select = "expected"
 test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
 expect_red = ["wal_writer::retention_tests::retained_terminal_reserve_covers_maximal_error_detail_and_accounting"]
-file = "crates/broca-core/src/wal_writer/retained_size.rs"
+file = "crates/broca-wal/src/size_limit.rs"
 old = '''    .len() as u64
         + overhead'''
 new = '''    .len() as u64 * 0 + overhead // NON-VACUITY BREAK: omit terminal frame reserve'''
@@ -6204,20 +6204,6 @@ expect_red = ["file_wal::tests::preencoded_append_reuses_the_measured_frame_byte
 file = "crates/broca-wal/src/file_wal.rs"
 old = "self.append_frame(fence, record, sync, Some(frame))"
 new = "let _ = frame; self.append_frame(fence, record, sync, None) // NON-VACUITY BREAK"
-
-[[control]]
-id = "retention-budget-does-not-cap-forever"
-guards = "unretained logs retain the existing append path even when their replay would exceed the cap"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-features = ["test-clock"]
-select = "expected"
-test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
-expect_red = ["wal_writer::retention_tests::unretained_append_keeps_the_legacy_uncapped_path"]
-file = "crates/broca-core/src/wal_writer.rs"
-old = "let retained = path == self.ephemeral_wal_path(session);"
-new = "let retained = true; // NON-VACUITY BREAK: cap forever logs too"
 
 [[control]]
 id = "retention-size-refusal-wire-golden"
@@ -6364,8 +6350,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::refused_retained_first_admission_does_not_cap_a_later_forever_send"]
 file = "crates/broca-core/src/wal_writer.rs"
-old = "budget.enforced = false;"
-new = "budget.enforced = true; // NON-VACUITY BREAK: inherit a directory's provisional cap"
+old = "budget.max_bytes = budget.session_max_bytes;"
+new = "budget.max_bytes = budget.max_bytes; // NON-VACUITY BREAK: inherit a directory's provisional cap"
 
 [[control]]
 id = "retention-audit-legacy-live-identity"

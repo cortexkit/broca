@@ -317,6 +317,9 @@ pub enum SendOutcome {
     RetainedSessionTooLarge {
         max_bytes: u64,
     },
+    SessionTooLarge {
+        max_bytes: u64,
+    },
     NewerWriter {
         missing: Vec<String>,
         reason: String,
@@ -2816,6 +2819,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
                     SendOutcome::AccountSelectionRefused(refusal)
+                }
+                Err(StartRunFailure::Admission(RunError::SessionTooLarge { max_bytes })) => {
+                    SendOutcome::SessionTooLarge { max_bytes }
                 }
                 Err(StartRunFailure::Admission(RunError::RetainedSessionTooLarge {
                     max_bytes,

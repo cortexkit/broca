@@ -38,6 +38,12 @@ payload. Replay validates monotonic `seq` and the digest; `fence` is retained as
 forensic lease-tenure stamp and is not a replay gate.
 Fence/dedup keys are **COMPOUND**: `session/run/batch/tool_call_id`, never
 bare `tool_call_id`. Encoding + size caps: `docs/wal-and-resume-design.md` §1.
+Every session WAL has a total-byte ceiling of **1 GiB (1,073,741,824 bytes)**,
+shared by append and recovery. Admission reserves lineage metadata and a bounded
+terminal before accepting ordinary records. A byte-budget refusal writes nothing,
+does not poison the writer, and leaves room for a permanent `run_finished{reason:
+error}` terminal: `session_too_large` for ordinary sessions, or the unchanged
+`retained_session_too_large` for retained sessions.
 
 | Record | fsync point | Purpose |
 |---|---|---|
