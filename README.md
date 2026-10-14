@@ -19,7 +19,7 @@ effect.
 | `broca-provider` | Provider wire families, rendering, normalization and transport. |
 | `broca-catalog`, `broca-fetch-plan` | Catalog resolution/cache and first-send fetch-plan admission. |
 | `broca-ck` | Message codec for prompt-reduction transforms. |
-| `broca-store`, `broca-store-postgres` | Materialized session stores and export index. |
+| `broca-store` | Materialized session store and export index. |
 | `broca-owner-only` | Private-state file permissions and validation. |
 | `broca-diagnostics` | Blocking-job and egress instrumentation. |
 | `cortexkit-anthropic-policy` | Shared Anthropic auth, header and quota policy. |
