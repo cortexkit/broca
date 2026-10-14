@@ -9189,6 +9189,8 @@ expect_message = "the refused account must not enter the shared fallback cache"
 file = "crates/broca-module-serve/src/main.rs"
 old = "                    vault.gauge.stamp_ok();\n                    validate_routed_account(token, routed_vault_id, routed_account)?;"
 new = "                    vault.gauge.stamp_ok();\n                    let _ = (token, routed_vault_id, routed_account); // NON-VACUITY BREAK: cache before validation"
+
+[[control]]
 id = "owner-authorization-requires-proven-wal"
 guards = "cancel and retract never infer no owner from a degraded full read"
 runner = "cargo"
