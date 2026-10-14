@@ -1391,8 +1391,8 @@ target = "--lib"
 test_file = "crates/broca-subc/src/connection.rs"
 expect_red = ["connection::tests::a_reverse_request_sharing_a_pending_calls_corr_does_not_complete_that_call"]
 file = "crates/broca-subc/src/connection.rs"
-old = "            if write_tx.send(reply).await.is_err() {\n                break;\n            }\n            continue;\n        }\n        let key = (channel, epoch, frame.header.corr);"
-new = "            if write_tx.send(reply).await.is_err() {\n                break;\n            }\n            // NON-VACUITY BREAK: also route the request to the forward waiters\n        }\n        let key = (channel, epoch, frame.header.corr);"
+old = "            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {\n                break;\n            }\n            continue;\n        }\n        let key = (channel, epoch, frame.header.corr);"
+new = "            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {\n                break;\n            }\n            // NON-VACUITY BREAK: also route the request to the forward waiters\n        }\n        let key = (channel, epoch, frame.header.corr);"
 
 [[control]]
 id = "bash-watch-deadline-grace"
@@ -9797,3 +9797,39 @@ expect_red = ["transport::responses_websocket::pump_tests::idle_ping_gap_does_no
 file = "crates/broca-provider/src/transport_websocket.rs"
 old = '        self.0.send_replace(false);'
 new = '        self.0.send_replace(true); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-ingress-full-egress-reverse"
+guards = "Ingress continues processing replies with egress full during a reverse refusal"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::full_egress_reverse_refusal_does_not_block_replies"]
+file = "crates/broca-subc/src/connection.rs"
+old = '            let refusal = write_tx.try_send(reply);'
+new = '            let refusal = write_tx.send(reply).await.map_err(|error| mpsc::error::TrySendError::Closed(error.0)); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-ingress-full-egress-late-open"
+guards = "Ingress continues processing replies with egress full during late-open cleanup"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::full_egress_late_open_cleanup_does_not_block_replies"]
+file = "crates/broca-subc/src/connection.rs"
+old = '                        let late_cleanup = write_tx.try_send(goodbye);'
+new = '                        let late_cleanup = write_tx.send(goodbye).await.map_err(|error| mpsc::error::TrySendError::Closed(error.0)); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-ingress-full-egress-abandoned-open"
+guards = "Ingress continues processing replies with egress full during abandoned-open cleanup"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::full_egress_abandoned_open_cleanup_does_not_block_replies"]
+file = "crates/broca-subc/src/connection.rs"
+old = '                        let abandoned_cleanup = write_tx.try_send(goodbye);'
+new = '                        let abandoned_cleanup = write_tx.send(goodbye).await.map_err(|error| mpsc::error::TrySendError::Closed(error.0)); // NON-VACUITY BREAK'

@@ -2277,7 +2277,9 @@ async fn reader_task<R>(
             let Ok(reply) = reverse_request_refusal(&frame) else {
                 continue;
             };
-            if write_tx.send(reply).await.is_err() {
+            // Control replies are best-effort; a full egress queue must not stop ingress.
+            let refusal = write_tx.try_send(reply);
+            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {
                 break;
             }
             continue;
@@ -2338,7 +2340,8 @@ async fn reader_task<R>(
                         let Ok(goodbye) = goodbye else {
                             break;
                         };
-                        if write_tx.send(goodbye).await.is_err() {
+                        let late_cleanup = write_tx.try_send(goodbye);
+                        if matches!(late_cleanup, Err(mpsc::error::TrySendError::Closed(_))) {
                             break;
                         }
                         let mut routes = route_epochs.lock().unwrap();
@@ -2384,7 +2387,8 @@ async fn reader_task<R>(
                         let Ok(goodbye) = goodbye else {
                             break;
                         };
-                        if write_tx.send(goodbye).await.is_err() {
+                        let abandoned_cleanup = write_tx.try_send(goodbye);
+                        if matches!(abandoned_cleanup, Err(mpsc::error::TrySendError::Closed(_))) {
                             break;
                         }
                         let mut routes = route_epochs.lock().unwrap();
@@ -4577,6 +4581,82 @@ mod tests {
         assert!(routes.lock().unwrap().is_empty());
         drop(client);
         reader.await.unwrap();
+    }
+
+    async fn congested_egress_does_not_stop_ingress(cleanup: u8) {
+        let pending: PendingMap = Arc::default();
+        let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
+        let (_live, mut reply_rx) =
+            PendingRegistration::new(Arc::clone(&pending), (0, 0, 2), false, None).unwrap();
+        let (mut abandoned, open_rx) =
+            PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, None).unwrap();
+        drop(open_rx);
+        if cleanup == 1 {
+            abandoned.arm_late_route_open_cleanup();
+            drop(abandoned);
+        }
+        let trigger = if cleanup == 0 {
+            reverse_request(7, 2, 1, "unhandled")
+        } else {
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    route_channel: 9,
+                    route_epoch: 4,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        write_tx.try_send(frame(FrameType::Ping, 0, 0, 99)).unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let reader = tokio::spawn(reader_task(
+            server,
+            Arc::clone(&pending),
+            Arc::clone(&routes),
+            write_tx,
+            None,
+        ));
+        write_frame(&mut client, &trigger).await.unwrap();
+        write_frame(&mut client, &frame(FrameType::Response, 0, 0, 2))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(1), reply_rx.recv())
+            .await
+            .expect("ingress must process a reply while egress remains full")
+            .unwrap();
+        assert_eq!(reply.header.corr, 2);
+        assert_eq!(
+            write_rx.try_recv().unwrap().header.corr,
+            99,
+            "the full queue was not drained to permit ingress"
+        );
+        assert!(
+            !routes.lock().unwrap().contains_key(&9),
+            "abandoned opens must still be invalidated when cleanup cannot enqueue"
+        );
+        drop(client);
+        reader.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_egress_reverse_refusal_does_not_block_replies() {
+        congested_egress_does_not_stop_ingress(0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_egress_late_open_cleanup_does_not_block_replies() {
+        congested_egress_does_not_stop_ingress(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_egress_abandoned_open_cleanup_does_not_block_replies() {
+        congested_egress_does_not_stop_ingress(2).await;
     }
 
     #[tokio::test]
