@@ -17,13 +17,31 @@ def inside(path, root):
         return False
 
 
+# cargo holds the machine-wide package-cache lock while it resolves, so a stalled
+# fetch blocks every other cargo command on the host. Bound each attempt.
+METADATA_TIMEOUT_SECS = 300
+
+
+def run_metadata(manifest, offline):
+    command = ["cargo", "metadata", "--locked", "--all-features", "--format-version", "1",
+               "--manifest-path", str(manifest)]
+    if offline:
+        command.insert(2, "--offline")
+    return subprocess.run(command, capture_output=True, text=True, timeout=METADATA_TIMEOUT_SECS)
+
+
 def check(manifest, root):
     root = root.resolve()
-    result = subprocess.run(
-        ["cargo", "metadata", "--locked", "--all-features", "--format-version", "1",
-         "--manifest-path", str(manifest)],
-        capture_output=True, text=True,
-    )
+    # Offline first: a warm cache answers without touching the network or holding the
+    # cache lock while waiting on it. A fresh machine (CI) falls back to fetching.
+    try:
+        result = run_metadata(manifest, offline=True)
+        if result.returncode:
+            result = run_metadata(manifest, offline=False)
+    except subprocess.TimeoutExpired:
+        print(f"path dependency check itself failed: cargo metadata did not finish within "
+              f"{METADATA_TIMEOUT_SECS}s", file=sys.stderr)
+        return 2
     if result.returncode:
         sys.stderr.write(result.stderr)
         print("path dependency check itself failed: cargo metadata failed", file=sys.stderr)
