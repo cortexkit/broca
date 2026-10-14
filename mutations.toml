@@ -2562,18 +2562,6 @@ old = "call.withdrawal_acknowledged = true;"
 new = "call.withdrawal_acknowledged = false; // NON-VACUITY BREAK"
 
 [[control]]
-id = "postgres-projection-sets-withdrawal-flag"
-guards = "Postgres projection commits implement the same withdrawal discovery invariant"
-runner = "command"
-command = ["cargo", "test", "--locked", "-p", "broca-store-postgres", "--features", "live-postgres", "--lib", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-store-postgres/src/lib.rs"
-expect_red = ["tests::postgres_store_conformance"]
-file = "crates/broca-store-postgres/src/lib.rs"
-old = "for run_id in prepared.withdrawals_owed_runs {"
-new = "for run_id in prepared.withdrawals_owed_runs.into_iter().take(0) { // NON-VACUITY BREAK"
-
-[[control]]
 id = "deferred-reader-never-writes-gated-records"
 guards = "only the core run loop constructs gated approval records; no other production file can"
 runner = "cargo"
@@ -2893,26 +2881,6 @@ file = "crates/broca-store/src/lib.rs"
 old = '                "UPDATE run_index SET withdrawals_owed=1 WHERE run_id=?1 AND session=?2'
 new = '''                // NON-VACUITY BREAK: plant retained text in a real SQLite WAL page.
                 "UPDATE run_index SET withdrawals_owed=1, title='retained-deferred-text-should-stay-in-wal-873bc1' WHERE run_id=?1 AND session=?2'''
-
-# Replay prerequisite: a real disposable Postgres service and DATABASE_URL pointing
-# to a fresh conformance schema, with serial test execution. The catalogue has no
-# declarative service-provisioning field; live-postgres alone does not provide a DB.
-# postgres_store_conformance otherwise prints SKIP and returns successfully, so a
-# replay without that service is not evidence that this control reached its guard.
-[[control]]
-id = "retention-approval-postgres-withdrawal-flag"
-guards = "real Postgres metadata-only commits preserve withdrawal discovery for retained runs without projecting their content"
-runner = "cargo"
-package = "broca-store-postgres"
-target = "--lib"
-features = ["live-postgres"]
-test_file = "crates/broca-store-postgres/src/lib.rs"
-expect_red = ["tests::postgres_store_conformance"]
-expect_message = "withdrawals_owed"
-file = "crates/broca-store-postgres/src/lib.rs"
-old = '                "UPDATE run_index SET withdrawals_owed=TRUE WHERE run_id=$1 AND session=$2'
-new = '''                // NON-VACUITY BREAK: lose retained withdrawal discovery in Postgres.
-                "UPDATE run_index SET withdrawals_owed=FALSE WHERE run_id=$1 AND session=$2'''
 
 [[control]]
 id = "test-rig-ckdev-atomic-publication"
@@ -8436,50 +8404,6 @@ file = "crates/broca-store/src/export_index.rs"
 old = '"INSERT OR IGNORE INTO export_imported_runs (session, run_id, cut_id)'
 new = '''// NON-VACUITY BREAK: reject a repeated floor write.
                 "INSERT INTO export_imported_runs (session, run_id, cut_id)'''
-
-# These replays need a disposable Postgres service and DATABASE_URL. The feature-only
-# tests require the URL instead of treating a missing service as a passing skip.
-[[control]]
-id = "billing-floor-postgres-emission"
-guards = "Postgres direct and retention emission cannot mint facts for imported runs after projection reset and reopen"
-runner = "cargo"
-package = "broca-store-postgres"
-target = "--lib"
-features = ["live-postgres"]
-test_file = "crates/broca-store-postgres/src/lib.rs"
-expect_red = ["tests::billing_floor_blocks_imported_emission_after_reopen_and_projection_drop"]
-expect_message = "imported runs minted facts"
-file = "crates/broca-store-postgres/src/export_index.rs"
-old = '            if imported {'
-new = '            if imported && false { // NON-VACUITY BREAK: ignore imported billing floor'
-
-[[control]]
-id = "billing-floor-postgres-outbox"
-guards = "Postgres backfill outbox excludes imported terminal runs even though they have no local facts"
-runner = "cargo"
-package = "broca-store-postgres"
-target = "--lib"
-features = ["live-postgres"]
-test_file = "crates/broca-store-postgres/src/lib.rs"
-expect_red = ["tests::billing_floor_excludes_imported_runs_from_backfill_and_retention"]
-expect_message = "imported run remained in backfill outbox"
-file = "crates/broca-store-postgres/src/export_index.rs"
-old = 'WHERE imported.session = runs.session AND imported.run_id = runs.run_id'
-new = 'WHERE imported.session = runs.session AND imported.run_id = runs.run_id AND FALSE -- NON-VACUITY BREAK'
-
-[[control]]
-id = "billing-floor-postgres-idempotent"
-guards = "Postgres billing-floor repeats succeed without replacing or removing existing imported ids"
-runner = "cargo"
-package = "broca-store-postgres"
-target = "--lib"
-features = ["live-postgres"]
-test_file = "crates/broca-store-postgres/src/lib.rs"
-expect_red = ["tests::billing_floor_blocks_imported_emission_after_reopen_and_projection_drop"]
-expect_message = "duplicate key value violates unique constraint"
-file = "crates/broca-store-postgres/src/export_index.rs"
-old = 'VALUES ($1, $2, $3) ON CONFLICT DO NOTHING'
-new = 'VALUES ($1, $2, $3) /* NON-VACUITY BREAK: reject a repeated floor write */'
 
 [[control]]
 id = "subc-door-chunk-cap"

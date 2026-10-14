@@ -285,43 +285,6 @@ jobs:
             exit 1
           fi
 
-  postgres-conformance:
-    name: Postgres Store Conformance
-    # The postgres `services:` container needs a Linux runner with Docker.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    defaults:
-      run:
-        working-directory: broca
-    steps:
-      - name: Checkout broca
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          path: broca
-
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
-        with:
-          components: clippy, rustfmt
-
-      - name: Run live-postgres conformance tests
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-        # Preserve the same resolved registry/git dependency set as the local gate.
-        run: cargo test --locked -p broca-store-postgres -p broca-store --features broca-store-postgres/live-postgres -- --test-threads=1
 
       # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
       # every run since the repo existed and nothing showed it COULD go red:

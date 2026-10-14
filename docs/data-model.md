@@ -529,8 +529,6 @@ when the daemon opens it: `CREATE TABLE IF NOT EXISTS`, then `ALTER TABLE ADD CO
 any column an older file lacks. So on a long-lived file, columns appear in the order they
 were added, not in the order below.
 
-A second backend (`broca-store-postgres`) exists with the same logical tables. The
-daemon does not use it.
 
 ### 4.1 `run_index`
 

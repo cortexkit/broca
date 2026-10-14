@@ -40,7 +40,7 @@ indeterminate: the resumed run stops as `Interrupted`, names the calls in
 `indeterminate_tool_calls` and never dispatches them again. See the
 [durability contract](durability-contract.md).
 
-**Store** (`broca-store`, `broca-store-postgres`). The run index, materialized
+**Store** (`broca-store`). The run index, materialized
 transcript prefix, admission checkpoints and usage-export facts are projections
 of the WAL, updated asynchronously and bound to its `lineage_id`. The WAL wins when
 the store disagrees, and the projection is rebuilt.
@@ -103,7 +103,7 @@ supervisor can respawn it.
 | `broca-owner-only` | Owner-only private-state creation and validation. |
 | `broca-diagnostics` | Blocking-job and egress instrumentation. |
 | `cortexkit-anthropic-policy` | Shared Anthropic auth, header and quota policy. |
-| `broca-store`, `broca-store-postgres` | Materialized stores, export index and store maintenance. |
+| `broca-store` | Materialized store, export index and store maintenance. |
 | `ck-session-import`, `ck-import` | Readers for other harnesses' logs and the import CLI. |
 | `broca-run`, `broca-bench`, `broca-replay`, `broca-test-support` | Standalone runner, benchmarks, replay fixtures and test support. |
 | `broca-crash-harness` | Crash-cut testing and recovery invariant checks. |
