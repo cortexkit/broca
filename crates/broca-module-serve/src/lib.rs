@@ -41,7 +41,9 @@ pub mod wire;
 
 pub use auth_routing::{family_for_method, AuthMethod, CredentialId, MethodConfig};
 pub use billing_routing::{ChargeBasisTable, CHARGE_BASIS_MAPPING_VERSION};
-pub use cache_routing::{resolve_cache_policy, resolve_caller_cache_key, CacheTtlTable};
+pub use cache_routing::{
+    resolve_cache_policy, resolve_caller_cache_key, resolve_prompt_cache_key, CacheTtlTable,
+};
 pub use catalog_refresh::{spawn_catalog_poll, CatalogPoller, CATALOG_POLL_INTERVAL};
 pub use client::SessionClient;
 pub use consumer_routes::ConsumerRoutes;

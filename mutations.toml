@@ -10204,3 +10204,16 @@ new = """
             );
         }
 """
+
+[[control]]
+id = "meta-session-prompt-cache-key"
+guards = "a Meta send without a caller cache key freezes its session id as prompt_cache_key, so the request reaching Meta's Responses API names a cache scope and resumes render it unchanged"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/single_turn_module_e2e.rs"
+select = "expected"
+expect_red = ["single_turn_module_e2e::meta_muse_oauth_uses_responses_bearer_and_subscription_billing", "meta_prompt_cache_key_render::a_meta_episode_sends_one_session_prompt_cache_key_on_every_step_and_its_resume"]
+file = "crates/broca-module-serve/src/cache_routing.rs"
+old = 'let session_key_providers = BTreeSet::from(["meta".to_string()]);'
+new = 'let session_key_providers = BTreeSet::new(); // NON-VACUITY BREAK: drop the Meta session key'
