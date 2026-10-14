@@ -1338,6 +1338,13 @@ fn collect_dump_files(dir: &Path) -> std::io::Result<Vec<DumpFileMeta>> {
             }
         };
         let path = entry.path();
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_request_dump_filename)
+        {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) => {
@@ -1412,6 +1419,7 @@ fn dump_files_to_delete(
     deletions
 }
 
+use crate::request_dump::is_request_dump_filename;
 pub use crate::request_dump::request_dump_filename;
 
 fn now_millis() -> u64 {
@@ -7686,6 +7694,59 @@ mod tests {
     fn request_dump_filename_falls_back_and_sanitizes() {
         let filename = request_dump_filename(None, "run/with spaces", 3);
         assert_eq!(filename, "run_with_spaces-s3.json");
+    }
+
+    #[test]
+    fn dump_sweep_preserves_foreign_files_under_age_and_size_pressure() {
+        use super::{create_dump_dir, sweep_dump_dir};
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-provider-mixed-dumps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dump_dir(&dir).unwrap();
+        let foreign = [
+            "notes.txt",
+            "other.json",
+            "run-s01.json",
+            "run-s+1.json",
+            "run-s18446744073709551616.json",
+        ];
+        for caps in [
+            DumpRetentionCaps {
+                max_bytes: u64::MAX,
+                max_age_days: 0,
+            },
+            DumpRetentionCaps {
+                max_bytes: 0,
+                max_age_days: u64::MAX,
+            },
+        ] {
+            for name in foreign.into_iter().chain(["run-abc-s7.json"]) {
+                let path = dir.join(name);
+                write_dump_file(&path, b"keep these exact bytes").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+                    )
+                    .unwrap();
+            }
+            sweep_dump_dir(&dir, caps).unwrap();
+            assert!(
+                !dir.join("run-abc-s7.json").exists(),
+                "valid dump must be pruned"
+            );
+            for name in foreign {
+                assert_eq!(
+                    std::fs::read(dir.join(name)).unwrap(),
+                    b"keep these exact bytes",
+                    "{name}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

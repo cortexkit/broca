@@ -9177,3 +9177,16 @@ expect_red = ["transport::tests::chatgpt_upstream_key_diagnostic_does_not_copy_b
 file = "crates/broca-provider/src/transport.rs"
 old = "the account's OAuth token, not a key); not a credential failure.\""
 new = "the account's OAuth token, not a key); not a credential failure. body: {body}\" /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "dump-retention-only-owned-filenames"
+guards = "Dump age and size retention never prune unrelated files sharing BROCA_DUMP_REQUEST_DIR"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::dump_sweep_preserves_foreign_files_under_age_and_size_pressure"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''            .is_some_and(is_request_dump_filename)'''
+new = '''            .is_some_and(|name| is_request_dump_filename(name) || !name.is_empty() /* NON-VACUITY BREAK */)'''
