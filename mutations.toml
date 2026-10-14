@@ -7101,6 +7101,19 @@ old = '        macos_exec_root(std::env::var_os("TMPDIR"))'
 new = '        profile_directory(_binary) // NON-VACUITY BREAK: publish under the build folder'
 
 [[control]]
+id = "ckdev-exec-skips-var-folders"
+platforms = ["macos"]
+guards = "on macOS, a TMPDIR under /var/folders is never used for published executables (codesign can hang there); /tmp is used instead"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+test_file = "crates/broca-test-support/src/ckdev.rs"
+expect_red = ["ckdev::tests::macos_publishes_outside_the_build_on_the_internal_disk"]
+file = "crates/broca-test-support/src/ckdev.rs"
+old = '            !path.starts_with("/var/folders") && !path.starts_with("/private/var/folders")'
+new = '            true // NON-VACUITY BREAK: accept a /var/folders TMPDIR'
+
+[[control]]
 id = "ckdev-exec-target-directory"
 platforms = ["macos"]
 guards = "on macOS, reject executable roots that resolve inside Cargo's target directory, including paths reached through symlinks"

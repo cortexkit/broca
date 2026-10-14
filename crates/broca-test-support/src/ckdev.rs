@@ -135,8 +135,10 @@ impl Source {
 
 /// Where published copies live.
 ///
-/// On macOS copies go under the per-task temporary directory when `TMPDIR` is set, or under
-/// `/tmp` when it is not. Both locations are on the internal disk, unlike build folders that may
+/// On macOS copies go under the per-task temporary directory when `TMPDIR` is set and is not
+/// the system's per-user `/var/folders` directory, or under `/tmp` otherwise. `codesign` can
+/// hang in `/var/folders`, and macOS may hold a fresh executable there for 30 s or more, so an
+/// ordinary shell's TMPDIR is not used. Both locations are on the internal disk, unlike build folders that may
 /// live on removable volumes. A rig launches these copies as their own responsible process (the
 /// daemon spawns the module), so a copy executed from a removable volume asks the user for access
 /// once per build, and while that prompt is open every process's listing of the volume hangs.
@@ -161,6 +163,9 @@ fn macos_exec_root(tmpdir: Option<OsString>) -> PathBuf {
     tmpdir
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+        .filter(|path| {
+            !path.starts_with("/var/folders") && !path.starts_with("/private/var/folders")
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("broca-exec")
 }
@@ -892,7 +897,10 @@ mod tests {
         let scratch = fixture("internal");
         TEST_EXEC_ROOT.with(|slot| *slot.borrow_mut() = None);
         let built = source(&scratch, "target/debug/ck-probe", b"internal disk");
-        let worker_tmpdir = scratch.join("worker temp").into_os_string();
+        // A worker's per-task TMPDIR; the path is only compared, never created. It must not sit
+        // under /var/folders, which `scratch_root()` does in an ordinary shell.
+        let worker_tmpdir =
+            OsString::from("/Users/agent/.local/share/cortexkit/runner/bash-tasks/t 1/tmp");
         assert_eq!(
             macos_exec_root(Some(worker_tmpdir.clone())),
             PathBuf::from(&worker_tmpdir).join("broca-exec")
@@ -902,6 +910,13 @@ mod tests {
             macos_exec_root(Some(OsString::new())),
             PathBuf::from("/tmp/broca-exec")
         );
+        for system_tmp in ["/var/folders/18/abc/T/", "/private/var/folders/18/abc/T/"] {
+            assert_eq!(
+                macos_exec_root(Some(system_tmp.into())),
+                PathBuf::from("/tmp/broca-exec"),
+                "{system_tmp} must not hold published executables"
+            );
+        }
 
         let expected_root = macos_exec_root(std::env::var_os("TMPDIR"));
         let selected_root = exec_root(&built);
