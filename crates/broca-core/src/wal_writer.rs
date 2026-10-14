@@ -711,6 +711,42 @@ impl FileWalStore {
         self.retry_live_identity(session)
     }
 
+    fn flush_for_read_with_identity(
+        &self,
+        session: &BindIdentity,
+        read_identity: impl FnOnce(&Path) -> Result<Option<u64>, WalError>,
+    ) -> Result<Option<u64>, WalError> {
+        self.check_move(session, false)?;
+        if let Some(member) = self.archived_member(session)?.member {
+            // A sealed archive was fsynced before publication and its digest just verified.
+            // Reads need no write handle or extraction to prove these immutable bytes.
+            return Ok(Some(member_identity(&member)));
+        }
+        // This is deliberately not FileWal::open: recovery-open may truncate a torn tail, while
+        // a read-side proof is allowed to fsync only. Write access is required by Windows
+        // FlushFileBuffers, and Rust's shared open mode permits this alongside the append writer.
+        let path = self.read_path(session)?;
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return self.retry_archived_member(
+                    session,
+                    |_consulted| None,
+                    |member| Ok(Some(member_identity(member))),
+                    || self.retry_live_flush(session),
+                );
+            }
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        file.sync_all().map_err(WalError::Io)?;
+        let identity = read_identity(&path)?;
+        // The open handle has already proved durability. A missing identity means the proof
+        // cannot be cached (always the case off Unix), not that another flush is needed.
+        // Reopening by pathname could race retention deletion and flush a different lineage
+        // or fail after the original WAL has moved to its deleting path.
+        Ok(identity)
+    }
+
     fn retry_live_identity(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
         // Unlike the public identity helper, a retry must not turn NotFound into None.
         // Platforms without file identities still return None for an existing file.
@@ -1014,39 +1050,7 @@ impl WalStore for FileWalStore {
     }
 
     fn flush_for_read(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        self.check_move(session, false)?;
-        if let Some(member) = self.archived_member(session)?.member {
-            // A sealed archive was fsynced before publication and its digest just verified.
-            // Reads need no write handle or extraction to prove these immutable bytes.
-            return Ok(Some(member_identity(&member)));
-        }
-        // This is deliberately not FileWal::open: recovery-open may truncate a torn tail, while
-        // a read-side proof is allowed to fsync only. Write access is required by Windows
-        // FlushFileBuffers, and Rust's shared open mode permits this alongside the append writer.
-        let path = self.read_path(session)?;
-        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return self.retry_archived_member(
-                    session,
-                    |_consulted| None,
-                    |member| Ok(Some(member_identity(member))),
-                    || self.retry_live_flush(session),
-                );
-            }
-            Err(error) => return Err(WalError::Io(error)),
-        };
-        file.sync_all().map_err(WalError::Io)?;
-        let identity = broca_wal::file_identity(&path)?;
-        if identity.is_none() {
-            return self.retry_archived_member(
-                session,
-                |_consulted| None,
-                |member| Ok(Some(member_identity(member))),
-                || self.retry_live_flush(session),
-            );
-        }
-        Ok(identity)
+        self.flush_for_read_with_identity(session, |path| broca_wal::file_identity(path))
     }
 
     fn file_identity(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {

@@ -122,6 +122,46 @@ fn ephemeral_wal_resolves_through_every_store_reader() {
 }
 
 #[test]
+fn absent_file_identity_flush_does_not_reopen_a_deleting_wal() {
+    let f = Fixture::new("identityless-flush");
+    let path = f.store.ephemeral_wal_path(&f.session);
+    drop(f.store.open_with_retention(&f.session, Some(3600)).unwrap());
+    std::fs::remove_dir(f.store.root()).unwrap();
+    let lineage = f
+        .store
+        .read_records_range(&f.session, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap();
+    let moved = f.store.deleting_path(&f.session, lineage);
+    let deletion = moved.clone();
+    let flushed = f
+        .store
+        .flush_for_read_with_identity(&f.session, |observed| {
+            assert_eq!(observed, path);
+            // Force the no-identity result used off Unix after the real handle has been synced.
+            // A redundant live lookup lets deletion move the WAL between its stat and reopen.
+            AFTER_LIVE_STAT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::rename(path, deletion).unwrap();
+                }));
+            });
+            Ok(None)
+        });
+    // When no redundant lookup occurs, finish the scheduled deletion after the flush returns.
+    // Either ordering must preserve the successful barrier on the original open handle.
+    AFTER_LIVE_STAT.with(|hook| {
+        if let Some(delete) = hook.borrow_mut().take() {
+            delete();
+        }
+    });
+    assert!(moved.exists());
+    assert_eq!(f.store.resolve_live_path(&f.session).unwrap(), None);
+    assert!(!f.store.wal_path(&f.session).exists());
+    assert_eq!(flushed.unwrap(), None);
+}
+
+#[test]
 fn dual_live_wals_are_an_error_naming_both_paths() {
     let f = Fixture::new("conflict");
     let portable = f.store.wal_path(&f.session);
