@@ -1,14 +1,11 @@
 use broca_ck::{
-    lift, CkMessage, ContentBlock as CkContentBlock, ContentKind, OpaqueArcKind, OpaqueArcRole,
+    CkMessage, ContentBlock as CkContentBlock, ContentKind, OpaqueArcKind, OpaqueArcRole,
     OpaqueBlock, ResultBlock, ResultBlockKind, Role, ToolResultOutputKind,
 };
 use broca_protocol::{
-    content::{
-        ContentBlock, EncryptedReasoningFormat, FinishReason, Message, ToolCall, ToolOutput,
-        ToolResult,
-    },
-    request::{CallOptions, ModelHandle, ToolChoice},
-    NormalizedEvent, ProviderControl, ToolCallId,
+    content::{ContentBlock, EncryptedReasoningFormat, FinishReason, Message},
+    request::{CallOptions, ModelHandle},
+    NormalizedEvent, ProviderControl,
 };
 use broca_provider::{
     conformance::check_render_determinism,
@@ -652,54 +649,6 @@ fn decode_error_is_reserved_for_structural_garbage() {
         responses_decode::decode(br#"{"input":[{"role":"user"}]}"#),
         Err(responses_decode::DecodeError::ItemWithoutType { index: 0 })
     ));
-}
-
-#[test]
-fn render_then_decode_matches_lifted_prompt() {
-    let prompt = vec![
-        Message::new(
-            Role::System,
-            vec![ContentBlock::Text {
-                text: "Be concise.".into(),
-            }],
-        ),
-        Message::new(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: "What time is it in Madrid?".into(),
-            }],
-        ),
-        Message::assistant_from(
-            vec![ContentBlock::ToolCall(ToolCall {
-                thought_signature: None,
-                tool_call_id: ToolCallId("call_01".into()),
-                tool_name: "get_time".into(),
-                input: json!({"timezone": "Europe/Madrid"}),
-            })],
-            broca_protocol::request::ModelHandle::new("openai", "gpt-5-codex"),
-        ),
-        Message::new(
-            Role::Tool,
-            vec![ContentBlock::ToolResult(ToolResult {
-                tool_call_id: ToolCallId("call_01".into()),
-                output: ToolOutput::Text {
-                    text: "14:32".into(),
-                },
-                is_error: false,
-            })],
-        ),
-    ];
-    let mut opts = CallOptions::new(prompt.clone());
-    opts.tool_choice = ToolChoice::Auto.into();
-
-    let frozen = openai_responses_chatgpt_frozen_config("gpt-5-codex");
-    let rendered = OpenAiResponsesChatgpt.render(&frozen, &opts);
-    let decoded = responses_decode::decode(&rendered).unwrap();
-
-    assert_eq!(
-        decoded.messages,
-        lift(&prompt, &|_| "openai_responses".into())
-    );
 }
 
 #[test]

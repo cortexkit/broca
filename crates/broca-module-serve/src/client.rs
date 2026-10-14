@@ -30,9 +30,6 @@ use crate::wire::{
 
 pub use broca_wire::{decode_subscribe_event, SubscribeEvent};
 
-/// The module id of the broca management surface (what a client route.opens).
-pub const LLM_RUNNER_MODULE: &str = "broca";
-
 /// A client for one session on a module. Short requests like send/status/cancel/retract use
 /// the shared command channel because they complete quickly, and replies are matched by
 /// channel plus correlation id. `subscribe` gets its own channel because it stays open for
@@ -183,11 +180,6 @@ impl SessionClient {
             module_id: module_id.to_string(),
             session,
         })
-    }
-
-    /// The session this client is bound to.
-    pub fn session(&self) -> &BindIdentity {
-        &self.session
     }
 
     /// `session.send`: start a run (idle lineage) or durably queue it (active). Arguments

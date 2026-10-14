@@ -97,89 +97,6 @@ impl CatalogRoute for SubcConnection {
     }
 }
 
-/// Render the diverging override lines carried by a response.
-///
-/// An override is silent in the dangerous direction: the served value is the one that looks
-/// right, so a wrong override under-uses a model's window forever and nothing ever fails. These
-/// lines are the only place that divergence becomes visible on this side.
-///
-/// Both values are printed, never just the served one. "limit.context 200000" is exactly what an
-/// operator expects to see, so showing it alone communicates that nothing happened.
-///
-/// The authority is quoted in full on its own line because it is long, and because a claim a
-/// reader cannot re-check is one they learn to skip.
-///
-/// FILTERS BY `diverges()` ITSELF, and must keep doing so. The cache filters caught-up cells at
-/// install, but this runs on the RAW response before `cache.refresh`, so it inherits nothing from
-/// that. I claimed otherwise when adding the cache-side filter -- that the poll log would agree
-/// "without each remembering the check" -- and it was false for exactly this reader.
-///
-/// Unfiltered, a cell whose upstream has adopted the corrected value prints "upstream X, serving
-/// X": a line asserting a divergence while showing none, on the instrument whose only job is
-/// making real divergences visible. It also contradicts `catalog_overrides`, which counts the
-/// filtered set, so the log and the health surface would disagree about the same poll.
-fn override_lines(response: &FusiformCatalogResponse) -> Vec<String> {
-    response
-        .overridden
-        .iter()
-        .filter(|entry| entry.diverges())
-        .map(|entry| {
-            // ONE RECORD, ONE LINE. This wrapped the authority onto a continuation line, and a
-            // continuation carries no timestamp, level or module id -- so in the shared daemon
-            // log it is indistinguishable from another producer's line, which is the exact
-            // misattribution the per-record attribution exists to prevent. It was not
-            // hypothetical: subc's fleet log census `tail -1`'d this file, sampled the
-            // continuation, and recorded broca as a producer emitting no id at all.
-            //
-            // Attribution is satisfied per-RECORD and the log is read per-LINE.
-            format!(
-                "catalog override {}/{} {} — upstream {}, serving {} authority={}",
-                entry.provider_id,
-                entry.model_id,
-                entry.fact_key,
-                entry.upstream_value,
-                entry.served_value,
-                entry.authority
-            )
-        })
-        .collect()
-}
-
-/// Compare an accepted override set with the last emitted set and commit the new dedupe state.
-/// The caller invokes this only after the catalog refresh succeeds, so `last` never claims a
-/// rejected response was reported.
-fn report_overrides(lines: Vec<String>, last: &Mutex<Option<Vec<String>>>) -> Option<Vec<String>> {
-    let mut guard = last.lock().unwrap();
-    if guard.as_ref() == Some(&lines) {
-        return None;
-    }
-    // An override DISAPPEARING is as much a change as one arriving: it means a value this daemon
-    // was serving corrected has reverted to the upstream's. Report the transition rather than
-    // going silently quiet, which would be indistinguishable from the override still holding.
-    let report = if lines.is_empty() {
-        match guard.as_ref() {
-            Some(previous) if !previous.is_empty() => {
-                vec![format!(
-                    "catalog overrides cleared ({} previously in effect); \
-                     serving upstream values",
-                    previous.len()
-                )]
-            }
-            // First poll with nothing overridden: the ordinary case, and saying so once at
-            // startup is worth more than silence, because it distinguishes "no overrides" from
-            // "this daemon does not report overrides".
-            None => vec!["catalog has no overrides; serving upstream values".to_string()],
-            Some(_) => return None,
-        }
-    } else {
-        lines.clone()
-    };
-    *guard = Some(lines);
-    Some(report)
-}
-
-type CatalogReportSink = dyn Fn(&str) + Send + Sync;
-
 /// Lazily opens and reuses the fusiform route. Construction and boot do not contact fusiform; the
 /// first invocation of [`Self::poll`] is the first place route opening can occur.
 pub struct CatalogPoller {
@@ -187,14 +104,6 @@ pub struct CatalogPoller {
     identity: BindIdentity,
     cache: Arc<CatalogCache>,
     handle: Mutex<Option<PollRouteHandle>>,
-    report_sink: Arc<CatalogReportSink>,
-    /// The override set reported at the last poll, so an unchanged set stays quiet.
-    ///
-    /// Overrides change on the order of twice a week and the poll runs every 30 minutes, so
-    /// reprinting unconditionally would emit the same block ~48 times a day and train an
-    /// operator to skip it. A line nobody reads is the same as no line, which is the failure
-    /// this whole path exists to prevent.
-    last_reported_overrides: Mutex<Option<Vec<String>>>,
 }
 
 impl CatalogPoller {
@@ -211,33 +120,11 @@ impl CatalogPoller {
         identity: BindIdentity,
         cache: Arc<CatalogCache>,
     ) -> Self {
-        Self::with_route_and_reporter(
-            route,
-            identity,
-            cache,
-            // INFO, and it carries BOTH shapes: an override in effect and the "no overrides"
-            // line are equally true on a healthy boot. An override is a deliberate divergence
-            // from upstream, not a fault -- the fault arm is the refresh failure below, which
-            // stays at warn. A fleet log census once sampled the continuation line of this
-            // record and recorded broca as a producer emitting no module id; that is why the
-            // record is one line, and it is orthogonal to its level.
-            Arc::new(|line| tracing::info!(target: "catalog", "{line}")),
-        )
-    }
-
-    fn with_route_and_reporter(
-        route: Arc<dyn CatalogRoute>,
-        identity: BindIdentity,
-        cache: Arc<CatalogCache>,
-        report_sink: Arc<CatalogReportSink>,
-    ) -> Self {
         Self {
             route,
             identity,
             cache,
             handle: Mutex::new(None),
-            report_sink,
-            last_reported_overrides: Mutex::new(None),
         }
     }
 
@@ -312,15 +199,9 @@ impl CatalogPoller {
         // cache validation fails. Retain it so one bad document cannot leak a route every poll.
         *self.handle.lock().unwrap() = Some(handle.clone());
         let response = decode_tool_response(response)?;
-        let override_lines = override_lines(&response);
         self.cache
             .refresh(response)
             .map_err(|error| PollError::Cache(error.to_string()))?;
-        if let Some(report) = report_overrides(override_lines, &self.last_reported_overrides) {
-            for line in report {
-                (self.report_sink)(&line);
-            }
-        }
         Ok(())
     }
 }
@@ -487,173 +368,7 @@ mod tests {
             ]),
             withheld: Vec::new(),
             uncertain: Vec::new(),
-            overridden: Vec::new(),
         }
-    }
-
-    fn override_entry(model: &str, upstream: &str, served: &str) -> broca_catalog::CatalogOverride {
-        broca_catalog::CatalogOverride {
-            provider_id: "anthropic".into(),
-            model_id: model.into(),
-            fact_key: "limit.context".into(),
-            upstream_value: upstream.into(),
-            served_value: served.into(),
-            authority: "https://docs.example/ctx (read 2026-08-13) \u{2014} 'has a 200k-token context window'".into(),
-        }
-    }
-
-    /// The report must carry BOTH values and the authority, and must not repeat itself.
-    ///
-    /// Both values because the served one alone is exactly what an operator expects to see, so it
-    /// reads as "nothing happened". Not repeating because the poll runs every 30 minutes against a
-    /// set that changes about twice a week, and a block reprinted 48 times a day is one an operator
-    /// learns to skip \u{2014} which is the same as not printing it.
-    #[test]
-    fn the_override_report_carries_both_values_and_stays_quiet_when_unchanged() {
-        let last = Mutex::new(None);
-        let mut response = response(1);
-        response.overridden = vec![override_entry("claude-sonnet-4-5", "1000000", "200000")];
-
-        let first = report_overrides(override_lines(&response), &last)
-            .expect("a new override must be reported");
-        let text = first.join("\n");
-        assert!(
-            text.contains("1000000") && text.contains("200000"),
-            "the report must show upstream AND served, got: {text}"
-        );
-        assert!(
-            text.contains("200k-token context window"),
-            "the authority must be quoted so a reader can re-check it, got: {text}"
-        );
-
-        assert!(
-            report_overrides(override_lines(&response), &last).is_none(),
-            "an unchanged override set must not reprint"
-        );
-
-        // A second override appearing is a change and must surface.
-        response
-            .overridden
-            .push(override_entry("claude-opus-5", "1000000", "500000"));
-        let grown = report_overrides(override_lines(&response), &last)
-            .expect("a new entry must be reported");
-        assert_eq!(grown.len(), 2, "both overrides belong in the report");
-
-        // And an override DISAPPEARING must surface too: going quiet would be indistinguishable
-        // from it still holding, while the daemon has silently reverted to the upstream value.
-        response.overridden.clear();
-        let cleared = report_overrides(override_lines(&response), &last)
-            .expect("a cleared set must be reported");
-        assert!(
-            cleared.join("\n").contains("cleared"),
-            "a withdrawal must say so, got: {cleared:?}"
-        );
-        assert!(
-            report_overrides(override_lines(&response), &last).is_none(),
-            "staying cleared is not a new event"
-        );
-    }
-
-    /// A caught-up override cell is not reported, and clearing the last real one still is.
-    ///
-    /// The cache filters these at install; this reader runs on the raw response BEFORE the
-    /// install, so it has to filter too. I claimed the opposite in the commit that added the
-    /// cache-side filter, which is why this needs a test rather than a comment.
-    ///
-    /// The second half is the part a naive filter gets wrong: when the only genuine divergence
-    /// becomes a no-op, the reporter must emit the CLEARED transition. Filtering to an empty list
-    /// and returning early would go silently quiet, which is indistinguishable from the override
-    /// still holding.
-    #[test]
-    fn a_caught_up_override_is_not_reported_and_clearing_the_last_one_is() {
-        let last = Mutex::new(None);
-        let mut response = response(1);
-        response.overridden = vec![
-            override_entry("claude-sonnet-4-5", "1000000", "200000"),
-            // Upstream has adopted the corrected value: same cell, no longer a divergence.
-            override_entry("claude-caught-up", "200000", "200000"),
-        ];
-
-        let first = report_overrides(override_lines(&response), &last)
-            .expect("the genuine divergence is reported");
-        assert_eq!(
-            first.len(),
-            1,
-            "only the real divergence belongs in the log, got: {first:?}"
-        );
-        assert!(
-            first[0].contains("claude-sonnet-4-5"),
-            "the reported line must be the diverging one, got: {first:?}"
-        );
-
-        // The remaining divergence catches up too. The set is now empty of real divergences, so
-        // this is the cleared transition rather than silence.
-        response.overridden = vec![
-            override_entry("claude-sonnet-4-5", "200000", "200000"),
-            override_entry("claude-caught-up", "200000", "200000"),
-        ];
-        let cleared = report_overrides(override_lines(&response), &last)
-            .expect("the transition must be reported");
-        assert!(
-            cleared.join("\n").contains("cleared"),
-            "losing the last real divergence must say so, got: {cleared:?}"
-        );
-        assert!(
-            report_overrides(override_lines(&response), &last).is_none(),
-            "staying cleared is not a new event"
-        );
-    }
-
-    /// A rejected response must not consume the log transition for a later accepted response.
-    ///
-    /// Override reporting is deduplicated across polls. Advancing that state before refresh means
-    /// the failed poll emits nothing, then the successful retry carrying the same set is mistaken
-    /// for an already-reported response and also emits nothing.
-    #[tokio::test]
-    async fn a_rejected_override_set_is_reported_when_the_retry_succeeds() {
-        let route = Arc::new(FakeRoute::default());
-        let mut rejected = response(1);
-        rejected.overridden = vec![override_entry("claude-sonnet-4-5", "1000000", "200000")];
-        rejected
-            .withheld
-            .push(serde_json::json!({"model": "anthropic/claude-sonnet-4-5"}));
-        let mut accepted = rejected.clone();
-        accepted.resolved_at_ms = 2;
-        accepted.withheld.clear();
-        route.responses.lock().unwrap().extend([
-            Ok(serde_json::to_value(rejected).unwrap()),
-            Ok(serde_json::to_value(accepted).unwrap()),
-        ]);
-
-        let cache = Arc::new(CatalogCache::empty());
-        let emitted = Arc::new(Mutex::new(Vec::<String>::new()));
-        let report_sink: Arc<CatalogReportSink> = {
-            let emitted = Arc::clone(&emitted);
-            Arc::new(move |line| emitted.lock().unwrap().push(line.to_string()))
-        };
-        let poller = CatalogPoller::with_route_and_reporter(route, identity(), cache, report_sink);
-
-        let error = poller
-            .poll()
-            .await
-            .expect_err("qualified catalog response must be rejected");
-        assert!(matches!(error, PollError::Cache(_)), "{error}");
-        assert!(
-            emitted.lock().unwrap().is_empty(),
-            "a rejected response must not be reported"
-        );
-
-        poller.poll().await.expect("clean retry must install");
-        assert_eq!(
-            *emitted.lock().unwrap(),
-            vec![
-                "catalog override anthropic/claude-sonnet-4-5 limit.context — upstream \
-                 1000000, serving 200000 authority=https://docs.example/ctx (read 2026-08-13) \
-                 — 'has a 200k-token context window'"
-                    .to_string()
-            ],
-            "the accepted retry must emit the complete override report exactly once"
-        );
     }
 
     /// The refresh request must ask for the producer's CURRENT view.

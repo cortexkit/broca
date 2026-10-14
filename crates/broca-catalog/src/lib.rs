@@ -29,7 +29,7 @@ pub mod runtime;
 
 pub use runtime::{
     catalog, global_catalog_cache, install_global_catalog_cache, CatalogCache, CatalogHealth,
-    CatalogOverride, CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogUnavailable,
+    CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogUnavailable,
     FusiformCatalogResponse, FUSIFORM_FACT_PREFIXES,
 };
 

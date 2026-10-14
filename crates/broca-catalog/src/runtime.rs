@@ -66,49 +66,6 @@ pub struct FusiformCatalogResponse {
     pub withheld: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncertain: Vec<Value>,
-    /// Facts where fusiform serves a different value than the upstream published.
-    ///
-    /// Retained and surfaced rather than ignored, because an override is SILENT IN THE
-    /// DANGEROUS DIRECTION: the served value is the one that looks right, so a wrong override
-    /// under-uses a model's window forever and nothing ever fails. There is no error to notice.
-    /// This array is the only place the divergence exists on our side.
-    ///
-    /// `default` is load-bearing, not decoration: the producer skips the key entirely when no
-    /// override applies, which is almost every response.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub overridden: Vec<CatalogOverride>,
-}
-
-/// One upstream-versus-served divergence, as reported by fusiform.
-///
-/// Both values are strings carrying the JSON text verbatim, so a numeric limit arrives as
-/// "1000000" and a capability as "true". That is the producer's choice and the right one: the
-/// same field must carry every fact type without the wire type changing per row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogOverride {
-    // Fields below; see `diverges` for why an entry can be present without being a divergence.
-    pub provider_id: String,
-    pub model_id: String,
-    pub fact_key: String,
-    pub upstream_value: String,
-    pub served_value: String,
-    /// The source that justifies the override, quoted. Carried so a reader can re-check the
-    /// claim rather than take it on trust -- a line that cannot be re-checked is one a reader
-    /// learns to skip, and a skipped line is the same as no line.
-    pub authority: String,
-}
-
-impl CatalogOverride {
-    /// Whether this entry actually serves a different value than the upstream published.
-    ///
-    /// An override cell can stop diverging without being withdrawn: if the upstream adopts the
-    /// corrected value, the cell keeps applying and becomes a no-op. Reporting one would print
-    /// "upstream 200000, serving 200000" -- a line asserting a divergence while showing none, on
-    /// the one instrument whose whole job is making real divergences visible. It would also
-    /// inflate the health count, so the pointer would disagree with the detail it points at.
-    pub fn diverges(&self) -> bool {
-        self.upstream_value != self.served_value
-    }
 }
 
 /// Where the currently served in-memory document was obtained.
@@ -135,10 +92,6 @@ struct LoadedCatalog {
     resolved_at_ms: i64,
     catalog_version: i64,
     source: CatalogSource,
-    /// Carried from the response so the divergence stays answerable between polls. Arc-wrapped
-    /// with the index above, for the same reason: an equal-version refresh republishes it
-    /// rather than rebuilding it.
-    overridden: Arc<Vec<CatalogOverride>>,
     /// Whether any row of the source document carried `limit.output`. The equal-version fast
     /// path reuses this index on the premise that equal versions mean equal facts, which stops
     /// holding when broca starts requesting a fact it did not request before: an LKG written
@@ -310,14 +263,6 @@ impl CatalogSnapshot {
 
     pub fn source(&self) -> CatalogSource {
         self.0.source
-    }
-
-    /// Facts fusiform serves at a different value than the upstream published.
-    ///
-    /// Held on the snapshot rather than logged once at parse time so an operator can ask what is
-    /// currently overridden without waiting for the next poll to print it.
-    pub fn overrides(&self) -> &[CatalogOverride] {
-        &self.0.overridden
     }
 
     /// Whether two snapshots share one serving index rather than holding equal copies.
@@ -1398,38 +1343,11 @@ impl CatalogCache {
                         resolved_at_ms: response.resolved_at_ms,
                     });
                 }
-                // Taken from the RESPONSE, not carried over from the installed document, and
-                // filtered like the full path: an entry whose upstream has caught up is not a
-                // divergence, so this path must not admit one the rebuild would reject.
-                let overridden: Vec<CatalogOverride> = response
-                    .overridden
-                    .iter()
-                    .filter(|entry| entry.diverges())
-                    .cloned()
-                    .collect();
-
-                // REUSE ONLY IF THE OVERRIDE SET ALSO MATCHES, not on version equality alone.
-                //
-                // The reuse rests on "equal version means equal facts". An override CHANGES a
-                // served fact -- claude-sonnet-4-5's context limit is 200000 rather than the
-                // published 1000000 because of one -- and I wrote in this very branch that
-                // fusiform can withdraw an override without minting a version. Both cannot be
-                // true: if a withdrawal needs no new version, then at equal version the served
-                // facts CAN differ, and reusing the index serves the pre-withdrawal limit while
-                // the health surface reports the override gone. Disk and memory disagree until
-                // a restart.
-                //
-                // Rebuilding on an override delta is correct under either reading. If the
-                // premise holds, this is the case that needed rebuilding; if it does not, the
-                // sets never differ and the branch never fires, so r115's 2.96ms/1.38 MB saving
-                // on genuinely unchanged polls is untouched.
-                //
-                // Qualification is refused before any version fast path. No branch may persist a
-                // document that `open` would reject through `loaded`; otherwise a degraded poll
-                // keeps serving from memory but leaves a rejected LKG, and the next restart starts
-                // with an empty catalog.
-                if overridden.as_slice() != current.overridden.as_slice()
-                    || response_carries_output_limits(&response) != current.carries_output_limits
+                // `loaded` rejects responses with withheld or uncertain facts. Keep that check
+                // ahead of the version fast path: persisting a rejected response would leave an
+                // LKG that `open` refuses after restart, even while the in-memory catalog keeps
+                // serving its last accepted snapshot.
+                if response_carries_output_limits(&response) != current.carries_output_limits
                     || response_carries_mode_rates(&response) != current.carries_mode_rates
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
                 {
@@ -1452,7 +1370,6 @@ impl CatalogCache {
                     resolved_at_ms: response.resolved_at_ms,
                     catalog_version: current.catalog_version,
                     source: CatalogSource::Fusiform,
-                    overridden: Arc::new(overridden),
                     carries_output_limits: current.carries_output_limits,
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
@@ -1525,7 +1442,6 @@ impl CatalogCache {
             resolved_at_ms,
             catalog_version: 0,
             source,
-            overridden: Arc::new(Vec::new()),
             carries_output_limits: true,
             carries_mode_rates: false,
             carries_warm_rates: true,
@@ -1539,7 +1455,6 @@ impl CatalogCache {
         Ok(CatalogHealth {
             age_ms: now_ms.saturating_sub(snapshot.resolved_at_ms()).max(0),
             source: snapshot.source(),
-            overrides: snapshot.overrides().len(),
             consecutive_refusals: refusals,
             refusal_reason: reason,
             total_refusals: self.total_refusals(),
@@ -1561,12 +1476,6 @@ pub struct CatalogHealth {
     /// Refusals since process start, including cleared ones. Zero streak with a non-zero total
     /// is "this occurred and recovered" -- a different fact from "this has never occurred".
     pub total_refusals: u64,
-    /// How many facts are served at a value the upstream did not publish.
-    ///
-    /// A count rather than the entries: an override is silent in the dangerous direction, so
-    /// what a health reader needs is to know the divergence EXISTS. The identities, both values
-    /// and the quoted authority live in the poll log, which is where a reader goes next.
-    pub overrides: usize,
 }
 
 fn loaded(
@@ -1589,17 +1498,6 @@ fn loaded(
         carries_output_limits: response_carries_output_limits(response),
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
-        // Retain only entries that actually diverge, so "an override is a divergence" holds by
-        // construction and every consumer -- the poll log, the health count, any later reader --
-        // agrees without each having to remember the check.
-        overridden: Arc::new(
-            response
-                .overridden
-                .iter()
-                .filter(|entry| entry.diverges())
-                .cloned()
-                .collect(),
-        ),
     })
 }
 
@@ -1955,8 +1853,28 @@ mod tests {
             ]),
             withheld: Vec::new(),
             uncertain: Vec::new(),
-            overridden: Vec::new(),
         }
+    }
+
+    #[test]
+    fn legacy_overridden_member_is_ignored() {
+        let mut legacy = serde_json::to_value(response(100)).expect("serialize response");
+        legacy.as_object_mut().expect("response object").insert(
+            "overridden".into(),
+            serde_json::json!([{
+                "provider_id": "anthropic",
+                "model_id": "claude-sonnet-4-5",
+                "fact_key": "limit.context",
+                "upstream_value": "1000000",
+                "served_value": "200000",
+                "authority": "https://example.invalid"
+            }]),
+        );
+
+        let decoded: FusiformCatalogResponse =
+            serde_json::from_value(legacy).expect("legacy catalog fields are ignored");
+        assert_eq!(decoded.catalog_version, 9);
+        assert_eq!(decoded.models.len(), 2);
     }
 
     #[test]
@@ -2159,71 +2077,10 @@ mod tests {
         );
     }
 
-    /// The health surface's override count reports the real number, not a constant.
-    ///
-    /// `catalog_overrides` is asserted at ZERO in the wire test, and SUBC's rule is that a gauge
-    /// asserted only at zero proves nothing -- a field hardcoded to 0 satisfies it. The other
-    /// five gauges on that surface are each driven non-zero somewhere; this one was not, so a
-    /// count wired to a literal would have passed everything.
-    ///
-    /// It matters for this field specifically because an override is silent in the dangerous
-    /// direction: the served value is the one that looks right, so a stuck-at-zero count would
-    /// report "fusiform is changing nothing" while it corrected a model's context window under
-    /// us, and no other reading would contradict it.
-    #[test]
-    fn the_health_override_count_reflects_the_served_set() {
-        let cache = CatalogCache::empty();
-        let mut first = response(100);
-        first.overridden = vec![
-            CatalogOverride {
-                provider_id: "anthropic".into(),
-                model_id: "claude-sonnet-4-5".into(),
-                fact_key: "limit.context".into(),
-                upstream_value: "1000000".into(),
-                served_value: "200000".into(),
-                authority: "https://docs.example/ctx".into(),
-            },
-            CatalogOverride {
-                provider_id: "anthropic".into(),
-                model_id: "claude-retired".into(),
-                fact_key: "limit.context".into(),
-                upstream_value: "500000".into(),
-                served_value: "200000".into(),
-                authority: "https://docs.example/ctx".into(),
-            },
-        ];
-        cache.refresh(first).expect("install");
-
-        let health = cache.health(200).expect("health");
-        assert_eq!(
-            health.overrides, 2,
-            "the health count must be the size of the served override set"
-        );
-
-        // And it must MOVE with the set rather than being written once: a count that latched at
-        // its first value would satisfy the assertion above forever.
-        let mut fewer = response(300);
-        fewer.overridden = vec![CatalogOverride {
-            provider_id: "anthropic".into(),
-            model_id: "claude-sonnet-4-5".into(),
-            fact_key: "limit.context".into(),
-            upstream_value: "1000000".into(),
-            served_value: "200000".into(),
-            authority: "https://docs.example/ctx".into(),
-        }];
-        cache.refresh(fewer).expect("install");
-        assert_eq!(
-            cache.health(400).expect("health").overrides,
-            1,
-            "the count must follow the set down as well as up"
-        );
-    }
-
     /// An unchanged equal-version poll still reuses the index, so r115's saving is intact.
     ///
-    /// The override-delta check above must not become "rebuild on every equal-version poll".
-    /// That would silently undo the measured 2.96ms / 1.38 MB saved per unchanged poll -- and a
-    /// performance regression of that shape has no failing test anywhere, so it needs one here.
+    /// The equal-version fast path must keep reusing the index on unchanged polls. Rebuilding it
+    /// every 30 minutes would undo the measured 2.96ms / 1.38 MB saving, so this test pins reuse.
     #[test]
     fn an_unchanged_equal_version_poll_reuses_the_existing_index() {
         let cache = CatalogCache::empty();
@@ -2744,69 +2601,6 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// An override withdrawn at the same version rebuilds the served facts, not just the report.
-    ///
-    /// r117-bug. The equal-version fast path reuses the index on "equal version means equal
-    /// facts" -- but an override CHANGES a served fact, and this branch's own comment says
-    /// fusiform can withdraw one without minting a version. Both cannot hold. Under the comment,
-    /// reuse serves the pre-withdrawal value while health reports the override gone, and disk
-    /// and memory disagree until a restart.
-    ///
-    /// The assertion is on the SERVED FACT rather than the override list, because the list being
-    /// right while the index is stale is exactly the bug.
-    #[test]
-    fn an_override_withdrawn_at_the_same_version_updates_the_served_fact() {
-        let cache = CatalogCache::empty();
-
-        let mut with_override = response(100);
-        with_override
-            .models
-            .get_mut("anthropic/claude-sonnet-4-5")
-            .expect("fixture model")
-            .insert("limit.context".into(), serde_json::json!(200_000));
-        with_override.overridden = vec![CatalogOverride {
-            provider_id: "anthropic".into(),
-            model_id: "claude-sonnet-4-5".into(),
-            fact_key: "limit.context".into(),
-            upstream_value: "1000000".into(),
-            served_value: "200000".into(),
-            authority: "https://docs.example/ctx".into(),
-        }];
-        let version = with_override.catalog_version;
-        cache.refresh(with_override).expect("install");
-        assert_eq!(
-            cache
-                .snapshot()
-                .expect("installed")
-                .context_limit("anthropic", "claude-sonnet-4-5"),
-            Some(200_000),
-            "the corrected limit is served while the override holds"
-        );
-
-        // Same version, override withdrawn, upstream value now effective.
-        let mut withdrawn = response(200);
-        withdrawn.catalog_version = version;
-        withdrawn
-            .models
-            .get_mut("anthropic/claude-sonnet-4-5")
-            .expect("fixture model")
-            .insert("limit.context".into(), serde_json::json!(1_000_000));
-        withdrawn.overridden = Vec::new();
-        cache.refresh(withdrawn).expect("same-version refresh");
-
-        let snapshot = cache.snapshot().expect("installed");
-        assert!(
-            snapshot.overrides().is_empty(),
-            "the override list must reflect the withdrawal"
-        );
-        assert_eq!(
-            snapshot.context_limit("anthropic", "claude-sonnet-4-5"),
-            Some(1_000_000),
-            "the SERVED fact must follow the withdrawal too -- a stale index here serves the \
-             corrected limit while health reports the override gone"
-        );
-    }
-
     /// A cleared refusal stays visible in the total, because the streak forgets it.
     ///
     /// FUSI's point that this gauge is the only instrument either of us has pointed at a real
@@ -3008,57 +2802,6 @@ mod tests {
             snapshot.resolved_at_ms(),
             100,
             "a refused refresh must not advance freshness either"
-        );
-    }
-
-    /// An override cell whose upstream has caught up is not a divergence and must not be served
-    /// as one.
-    ///
-    /// The cell keeps applying when models.dev adopts the corrected value, so it arrives on the
-    /// wire looking exactly like a live override. Reporting it would print "upstream 200000,
-    /// serving 200000" -- a line asserting a divergence while showing none -- and would inflate
-    /// the health count so the pointer disagreed with the detail it points at.
-    ///
-    /// This case had no coverage until FUSI found the equivalent surviving mutant on their side:
-    /// every fixture either of us had disagreed with its correction, so the AGREEING case was
-    /// untested on both sides of the same wire.
-    #[test]
-    fn an_override_whose_upstream_caught_up_is_not_reported_as_a_divergence() {
-        let mut response = response(1);
-        response.overridden = vec![
-            CatalogOverride {
-                provider_id: "anthropic".into(),
-                model_id: "claude-sonnet-4-5".into(),
-                fact_key: "limit.context".into(),
-                upstream_value: "1000000".into(),
-                served_value: "200000".into(),
-                authority: "https://docs.example/ctx — 'has a 200k-token context window'".into(),
-            },
-            CatalogOverride {
-                provider_id: "anthropic".into(),
-                model_id: "claude-retired".into(),
-                fact_key: "limit.context".into(),
-                // The upstream adopted the corrected value: same cell, no longer a divergence.
-                upstream_value: "200000".into(),
-                served_value: "200000".into(),
-                authority: "https://docs.example/ctx — 'has a 200k-token context window'".into(),
-            },
-        ];
-
-        let cache = CatalogCache::empty();
-        cache.refresh(response).expect("install");
-        let snapshot = cache.snapshot().expect("installed");
-
-        let overrides = snapshot.overrides();
-        assert_eq!(
-            overrides.len(),
-            1,
-            "only the genuine divergence belongs in the served set, got: {overrides:?}"
-        );
-        assert_eq!(overrides[0].model_id, "claude-sonnet-4-5");
-        assert!(
-            overrides.iter().all(|entry| entry.diverges()),
-            "a retained override must actually diverge"
         );
     }
 
@@ -3359,7 +3102,6 @@ mod windows_acl_tests {
             models: BTreeMap::new(),
             withheld: vec![],
             uncertain: vec![],
-            overridden: vec![],
         };
         let seen = std::rc::Rc::new(std::cell::Cell::new(0));
         let output = seen.clone();

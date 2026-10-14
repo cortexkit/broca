@@ -134,11 +134,6 @@ impl ToolManifest {
         self.provider_replies.get(provider)?.get(tool)
     }
 
-    pub fn with_max_input_bytes(mut self, max: usize) -> Self {
-        self.max_input_bytes = max;
-        self
-    }
-
     /// Return one declaration per name in the name-index HashMap's iteration order.
     pub fn tools(&self) -> Vec<Tool> {
         self.name_to_index

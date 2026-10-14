@@ -6,10 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# The CK-Message canonical type (Ck#1) + the lift/project between it and the owned
-# broca canonical message. Shared across the codec (this workspace) and, later, the
-# MITM module (a separate Rust consumer). Kept in its own crate so a shared contract type
-# is not buried inside one consumer.
+# CK-Message is the shared JSON representation for prompt-reduction transforms. It is independent
+# of any one consumer's internal message types, so both sides can depend on the same wire contract.
 
 [dependencies]
 serde = { workspace = true }

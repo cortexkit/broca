@@ -929,22 +929,6 @@ impl SubcConnection {
         .await
     }
 
-    /// Open the module-level, unscoped step-transform role. The shared tool-module bind
-    /// translation supplies `runner`; hook requests separately carry the caller's harness.
-    /// The caller must bound the whole future, since the retry deadline alone does not
-    /// interrupt a route-open attempt already in flight.
-    pub async fn route_open_step_transform_within(
-        &self,
-        module_id: &str,
-        identity: &BindIdentity,
-        retry: RouteOpenRetry,
-    ) -> ConnResult<RouteHandle> {
-        use cortexkit_role_step_transform_provider::{ROLE, VERSION};
-
-        self.route_open_role_within(module_id, identity, ROLE, VERSION, retry)
-            .await
-    }
-
     /// Open an unscoped module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(
