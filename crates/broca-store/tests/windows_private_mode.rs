@@ -85,6 +85,13 @@ fn windows_private_mode_refuses_unreadable_acl() {
     let (root, _) = tree(&fixture.path);
     let file = root.join("wal/session.wal");
     deny_acl_read(&file);
+    // The refusal below is only evidence if the ACL really is unreadable to this process;
+    // check that with the same call the tool makes, so a deny that did not take effect fails
+    // here by name instead of as "the tool succeeded".
+    assert!(
+        broca_owner_only::is_private(&file).is_err(),
+        "precondition: deny_acl_read left the ACL readable to this process"
+    );
     for dry_run in [true, false] {
         let result = run(&root, dry_run);
         assert!(!result.status.success());

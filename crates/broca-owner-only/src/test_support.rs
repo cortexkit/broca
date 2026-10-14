@@ -77,13 +77,16 @@ pub fn set_owner_to_administrators(path: &Path) {
     powershell(path, "$acl=Get-Acl -LiteralPath $p; $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))); Set-Acl -LiteralPath $p -AclObject $acl");
 }
 
+/// Makes the file's ACL unreadable to its owner. Windows grants an owner READ_CONTROL
+/// implicitly, whatever the DACL says, unless an OWNER RIGHTS (S-1-3-4) entry is present; a
+/// deny entry on the owner's own SID alone therefore changes nothing for the owner.
 pub fn deny_acl_read(path: &Path) {
     powershell(
         path,
         r#"
         $acl=Get-Acl -LiteralPath $p;
-        $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]);
-        $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($owner,'ReadPermissions','Deny');
+        $ownerRights=New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4');
+        $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($ownerRights,'ReadPermissions','Deny');
         $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl;
     "#,
     );
