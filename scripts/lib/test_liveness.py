@@ -67,9 +67,14 @@ class MaintenanceTests(unittest.TestCase):
         (self.root / "wal-manifest").write_bytes(b"original mapping\n")
 
     def snapshot(self):
+        # The native Windows probe runs powershell.exe, which inherits this test's USERPROFILE
+        # and creates its own profile caches under it. Those are PowerShell's writes, not the
+        # tool's, so only the native test skips that one subtree.
+        skipped = self.home / "AppData" if getattr(self, "native_windows_probe", False) else None
         return {str(p.relative_to(self.base)): p.read_bytes() if p.is_file() else None
                 for directory in (self.root, self.home)
-                for p in [directory, *directory.rglob("*")]}
+                for p in [directory, *directory.rglob("*")]
+                if skipped is None or not (p == skipped or skipped in p.parents)}
 
     def run_tool(self, tool, probe, *, apply=True):
         argv = ["maintenance", "--state-root", str(self.root)]
@@ -214,6 +219,7 @@ class MaintenanceTests(unittest.TestCase):
         if sys.platform.startswith("linux"):
             code = "import ctypes; ctypes.CDLL(None).prctl(15, b'ck-broca', 0, 0, 0); " + code
         elif sys.platform == "win32":
+            self.native_windows_probe = True
             executable = str(self.base / "ck-broca.exe")
             shutil.copy2(sys.executable, executable)
             env["PYTHONHOME"] = sys.prefix
