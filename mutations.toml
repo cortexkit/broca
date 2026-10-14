@@ -10249,3 +10249,15 @@ expect_red = ["single_turn_module_e2e::meta_muse_oauth_uses_responses_bearer_and
 file = "crates/broca-module-serve/src/cache_routing.rs"
 old = 'let session_key_providers = BTreeSet::from(["meta".to_string()]);'
 new = 'let session_key_providers = BTreeSet::new(); // NON-VACUITY BREAK: drop the Meta session key'
+
+[[control]]
+id = "session-read-reply-body-budget"
+guards = "tail and range transcript replies include their envelope within the 3 MiB budget"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/read_page_tests.rs"
+expect_red = ["serve::read_page_tests::reply_body_cap_includes_envelope_for_tail_and_range"]
+file = "crates/broca-protocol/src/lib.rs"
+old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
+new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"

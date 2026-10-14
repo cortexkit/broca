@@ -107,9 +107,13 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
 - `after_mid` reads strictly after the message `m<ordinal>` of the lineage `lineage_id` names;
   a read naming another lineage is refused `lineage_changed` whatever its mode, an unknown mid
   `unknown_mid`, and misuse `invalid_params` with `detail.field`. Every refusal writes nothing.
-- A page is also capped by bytes, measured over each message's serialized `message` (default
-  4 MiB, at most 16 MiB). A range page stops early with `next_from_ordinal`; a tail page keeps
-  its newest messages; a single message over the cap comes alone, whole.
+- A transcript page is also capped by bytes, measured over the complete serialized reply body
+  (default and maximum **3 MiB / 3,145,728 bytes**). Larger `max_bytes` requests are capped to
+  that maximum. Messages and late approvals share the budget, including tools, attribution,
+  head fields and continuation cursors. A range page stops early with `next_from_ordinal`;
+  a tail page keeps its newest messages. One message and one late entry, when present, are
+  always kept whole, never truncated. Oversized atomic items, their combined minimum, or
+  unpaged metadata can therefore exceed the budget; this is not a strict frame-size guarantee.
 - `tool_calls[].call_key` is `<lineage_id>:<wal_seq>` of the call's own `tool_dispatch_intent`,
   derived on read and never stored. `dispatched_to` is that intent's `module_id`, absent on an
   intent written before broca recorded it. Sending `call_key` to providers waits until each
@@ -119,6 +123,7 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   one pass over the whole WAL fills the first time a read needs them.
 - `run.result`'s `final_message.text` joins the final assistant message's text parts with
   nothing inserted, leaving reasoning out; a completed run with no text answers `""`.
+  It is unpaged and not bounded by `session.read.max_bytes`.
 - `session.baseline` and the admitting send's `baseline`: sessions are admitted without a fetch
   plan, so `items` is empty and `composition_digest` absent; `tool_names` are the first
   episode's tools; both generations are 0. The send reply carries it only when the session's

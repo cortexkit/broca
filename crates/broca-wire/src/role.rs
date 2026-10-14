@@ -22,10 +22,11 @@ pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
 pub const OP_SESSION_BASELINE: &str = "session.baseline";
 
+pub use broca_protocol::READ_REPLY_MAX_BYTES;
 /// The `session.read` byte cap a page stops at when the request names none.
-pub const READ_DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const READ_DEFAULT_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 /// The largest `session.read` byte cap broca honours; a larger request is capped to it.
-pub const READ_MAXIMUM_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const READ_MAXIMUM_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 
 /// A request member is malformed, unknown, or combined with one it excludes. `detail.field`
 /// names it.
@@ -665,7 +666,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "d36235def1de02ebfcec061a805b2073804debca82364dff40388d3229c7ef46",
+            "e6ca7fdbf53ad8417bcae2b392640640f3605dbd95a361a047259e81c1f7d60a",
         );
     }
 
@@ -822,7 +823,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "41c310f173de353a74bf6896fe98c5edc2d94832d6c7e9b59778d1a5bfa47b5a";
+        "e240b84adcb82e2326480b7cc9cc52e84f1933fd9f8cae58398b2a8ea750025c";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =
