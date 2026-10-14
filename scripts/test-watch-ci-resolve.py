@@ -216,5 +216,80 @@ class ResolveTests(unittest.TestCase):
         self.assertIn("epoch seconds", bad.stderr)
 
 
+class PollFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="watch-ci-poll-")
+        self.addCleanup(self.tmp.cleanup)
+        self.bins = Path(self.tmp.name)
+        gh = self.bins / "gh"
+        gh.write_text(r'''#!/usr/bin/env python3
+import os, pathlib, sys
+args = sys.argv[1:]
+field = args[args.index("--json") + 1] if "--json" in args else "logs"
+mode = os.environ.get("POLL_MODE", "success")
+if field == "url":
+    print("https://example.invalid/run")
+elif field == "status":
+    count = pathlib.Path(os.environ["POLL_COUNT"])
+    n = int(count.read_text()) + 1 if count.exists() else 1
+    count.write_text(str(n))
+    if mode == "status-errors" or (mode == "settle-errors" and n > 1) or (mode == "transient" and n in (1, 3)):
+        sys.exit(7)
+    print("in_progress" if mode.startswith("settle") or mode == "pending" else "completed")
+elif field == "jobs":
+    if mode == "jobs-errors": sys.exit(7)
+    if mode.startswith("settle"): print("fixture-job|17")
+elif field == "conclusion":
+    if mode == "conclusion-error": sys.exit(7)
+    print("failure" if mode == "red" else "success")
+''')
+        gh.chmod(0o755)
+        sleep = self.bins / "sleep"
+        sleep.write_text("#!/bin/sh\n/bin/sleep 0.2\n")
+        sleep.chmod(0o755)
+
+    def watch(self, mode, **env):
+        return subprocess.run(["bash", str(WATCH), "123"], cwd=ROOT,
+                              env={**os.environ, "PATH": f"{self.bins}:{os.environ['PATH']}",
+                                   "REPO": "fixture/repo", "OPERATOR_GH_FALLBACK_PATHS": "",
+                                   "POLL_MODE": mode, "POLL_COUNT": str(self.bins / "count"),
+                                   "WATCH_CI_MAX_POLL_ERRORS": "2", "WATCH_CI_DEADLINE_SECS": "10",
+                                   **env}, text=True, capture_output=True, timeout=4)
+
+    def test_persistent_poll_errors_are_bounded(self):
+        for mode in ("status-errors", "jobs-errors", "settle-errors"):
+            with self.subTest(mode=mode):
+                (self.bins / "count").unlink(missing_ok=True)
+                result = self.watch(mode, WATCH_CI_SETTLE="1")
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("consecutive poll errors", result.stderr)
+
+    def test_deadline_bounds_pending_and_settle_polling(self):
+        for mode in ("pending", "settle-pending"):
+            with self.subTest(mode=mode):
+                result = self.watch(mode, WATCH_CI_SETTLE="1", WATCH_CI_DEADLINE_SECS="1")
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertIn("overall deadline", result.stderr)
+
+    def test_conclusion_fetch_error_is_not_ci_red(self):
+        result = self.watch("conclusion-error")
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("could not read the conclusion", result.stderr)
+        self.assertNotIn("CI_DONE", result.stdout)
+
+    def test_success_and_genuine_red_keep_exit_codes(self):
+        self.assertEqual(self.watch("success").returncode, 0)
+        self.assertEqual(self.watch("red").returncode, 1)
+
+    def test_successful_poll_resets_error_streak(self):
+        # A successful in-progress poll separates two errors before the run completes.
+        gh = self.bins / "gh"
+        text = gh.read_text().replace('mode == "pending" else "completed"',
+                                     'mode == "pending" or (mode == "transient" and n < 4) else "completed"')
+        gh.write_text(text)
+        result = self.watch("transient")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,7 +16,55 @@
 #   scripts/watch-ci.sh <run-id>
 #   scripts/watch-ci.sh <sha>      # run for any branch head, e.g. a train branch
 #   WATCH_CI_SETTLE=1 scripts/watch-ci.sh <run-id>
+# Exit codes: 0 green, 1 CI red, 2 usage/run resolution, 3 overall polling
+# deadline, 4 consecutive poll errors, 5 unreadable run conclusion.
 set -uo pipefail
+
+DEADLINE_SECS="${WATCH_CI_DEADLINE_SECS:-7200}"
+MAX_POLL_ERRORS="${WATCH_CI_MAX_POLL_ERRORS:-5}"
+POLL_SLEEP="${WATCH_CI_POLL_SLEEP:-45}"
+for knob in DEADLINE_SECS MAX_POLL_ERRORS POLL_SLEEP; do
+  if ! [[ "${!knob}" =~ ^[0-9]+$ ]] || [ "${!knob}" -eq 0 ]; then
+    echo "watch-ci: $knob must be a positive integer" >&2
+    exit 2
+  fi
+done
+deadline=$((SECONDS + DEADLINE_SECS))
+poll_errors=0
+check_deadline() {
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "watch-ci: overall deadline of ${DEADLINE_SECS}s exceeded (run=${RID:-unresolved})" >&2
+    exit 3
+  fi
+}
+poll_failed() {
+  poll_errors=$((poll_errors + 1))
+  if [ "$poll_errors" -ge "$MAX_POLL_ERRORS" ]; then
+    echo "watch-ci: $poll_errors consecutive poll errors (run=${RID:-unresolved}); giving up" >&2
+    exit 4
+  fi
+}
+pause_poll() {
+  check_deadline
+  local delay="$1" remaining=$((deadline - SECONDS))
+  [ "$delay" -le "$remaining" ] || delay="$remaining"
+  sleep "$delay"
+}
+poll_run() {
+  check_deadline
+  if ! STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null); then
+    poll_failed
+    return 1
+  fi
+  if [ "${1:-}" = jobs ]; then
+    if ! FAILED_JOB=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
+      --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null); then
+      poll_failed
+      return 1
+    fi
+  fi
+  poll_errors=0
+}
 
 # The repository the runs live in: from the checkout's origin unless REPO is
 # given. A fixed default was the first thing a lift of this script kept by
@@ -127,11 +175,16 @@ if [ -z "$RID" ]; then
     select_expr="$select_expr | select((.createdAt | fromdateiso8601) >= $((NOT_BEFORE - NOT_BEFORE_SLACK)))"
   fi
   for _ in $(seq 1 "$RESOLVE_ATTEMPTS"); do
-    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
+    check_deadline
+    if RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
       --json databaseId,headSha,createdAt \
-      --jq ".[] | $select_expr | .databaseId" | head -1)
+      --jq ".[] | $select_expr | .databaseId" | head -1); then
+      poll_errors=0
+    else
+      poll_failed
+    fi
     [ -n "$RID" ] && break
-    sleep "$RESOLVE_SLEEP"
+    pause_poll "$RESOLVE_SLEEP"
   done
   if [ -z "$RID" ]; then
     if [ -n "$NOT_BEFORE" ]; then
@@ -158,14 +211,15 @@ if [ -n "$RUN_URL" ] && [ "$RUN_URL" != "null" ]; then
 fi
 
 while true; do
-  STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
+  if ! poll_run jobs; then
+    pause_poll "$POLL_SLEEP"
+    continue
+  fi
   # Advisory (continue-on-error) jobs read 'failure' at the job level but do
   # not gate the run: 'Bash permission e2e (Windows)' in PR mode
   # (_unit-suite.yml strict=false) and 'OpenCode 2 (Linux Docker)' until its
   # matrix is green and the check is required. Fail-fast must not fire on
   # them; the run-level conclusion check below remains authoritative.
-  FAILED_JOB=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
@@ -174,15 +228,19 @@ while true; do
       | grep -aE "FAIL \[|panicked at|error\[|bash startup failure" | head -8
     if [ "${WATCH_CI_SETTLE:-0}" = "1" ]; then
       echo "settling: waiting for run completion so a rerun is accepted"
-      while [ "$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)" != "completed" ]; do
-        sleep 45
+      while true; do
+        if poll_run && [ "$STATUS" = completed ]; then break; fi
+        pause_poll "$POLL_SLEEP"
       done
     fi
     exit 1
   fi
 
   if [ "$STATUS" = "completed" ]; then
-    CONC=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion')
+    if ! CONC=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion') || [ -z "$CONC" ] || [ "$CONC" = null ]; then
+      echo "watch-ci: could not read the conclusion for run $RID" >&2
+      exit 5
+    fi
     # A CANCELLED RUN MAY HAVE A LIVE TWIN. GitHub occasionally creates two push runs for one
     # push, in the same second, and the workflow's `concurrency: cancel-in-progress` group then
     # cancels one of them at once. The push-time bound above cannot tell them apart: both were
@@ -212,5 +270,5 @@ while true; do
     [ "$CONC" = "success" ] && exit 0 || exit 1
   fi
 
-  sleep 45
+   pause_poll "$POLL_SLEEP"
 done
