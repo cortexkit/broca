@@ -317,6 +317,12 @@ pub struct DeferredCallProjection {
     pub lineage_id: String,
     pub last_run_id: Option<RunId>,
     pub calls: BTreeMap<String, ProjectedDeferredCall>,
+    /// Runs cancelled or non-resumably interrupted while they still own open calls.
+    /// This cache is rebuilt from RunFinished records, not stored in the WAL itself.
+    /// Missing legacy data cannot authorize post-expiry tool execution; replay all
+    /// WAL records from the lineage's origin before deciding whether a run stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_runs: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -350,6 +356,7 @@ impl DeferredCallProjection {
             lineage_id: lineage_id.to_string(),
             last_run_id: None,
             calls: BTreeMap::new(),
+            stopped_runs: Some(std::collections::BTreeSet::new()),
         }
     }
 
@@ -359,6 +366,15 @@ impl DeferredCallProjection {
         for frame in records {
             match &frame.record {
                 WalRecord::RunStarted { run_id, .. } => self.last_run_id = Some(run_id.clone()),
+                WalRecord::RunFinished {
+                    reason: RunFinishReason::Cancelled | RunFinishReason::Interrupted,
+                    ..
+                } => {
+                    if let (Some(run), Some(stopped)) = (&self.last_run_id, &mut self.stopped_runs)
+                    {
+                        stopped.insert(run.0.clone());
+                    }
+                }
                 WalRecord::ToolCallDeferred { .. } => {
                     let key = format!("{}:{}", self.lineage_id, frame.seq);
                     self.calls
@@ -484,7 +500,42 @@ impl DeferredCallProjection {
                 }
                 _ => {}
             }
+            let open_runs: std::collections::BTreeSet<_> = self
+                .calls
+                .values()
+                .filter(|call| {
+                    matches!(
+                        call.state,
+                        OpenCallState::Deferred | OpenCallState::Approved
+                    ) || Self::late_open(call)
+                })
+                .filter_map(|call| call.run_id.as_ref().map(|run| run.0.clone()))
+                .collect();
+            if let Some(stopped) = &mut self.stopped_runs {
+                stopped.retain(|run| open_runs.contains(run));
+            }
         }
+    }
+
+    pub fn late_open(call: &ProjectedDeferredCall) -> bool {
+        call.decision == Some(DeferredDecision::Expired)
+            && call.late_result.is_none()
+            && matches!(
+                call.late_approval.as_deref(),
+                None | Some(WalRecord::LateApprovalRecorded {
+                    decision: LateDecision::Approved,
+                    late_execution: Some(LateExecution::Execute),
+                    ..
+                })
+            )
+    }
+
+    pub fn late_allowed(&self, call: &ProjectedDeferredCall) -> bool {
+        self.stopped_runs.as_ref().is_some_and(|stopped| {
+            call.run_id
+                .as_ref()
+                .is_some_and(|run| !stopped.contains(&run.0))
+        })
     }
 
     fn anchor(&self, batch: &BatchId, id: &ToolCallId) -> Option<String> {
@@ -516,7 +567,11 @@ impl DeferredCallProjection {
                     },
                 });
             }
-            if call.decision == Some(DeferredDecision::Expired) && call.late_approval.is_none() {
+            if self.late_allowed(call)
+                && call.decision == Some(DeferredDecision::Expired)
+                && call.late_approval.is_none()
+                && call.late_result.is_none()
+            {
                 obligations.expired_without_late_record.push(key.clone());
             }
             if matches!(
@@ -527,6 +582,7 @@ impl DeferredCallProjection {
                     ..
                 })
             ) && call.late_result.is_none()
+                && self.late_allowed(call)
             {
                 obligations.pending_late_execution.push(key.clone());
             }
@@ -594,10 +650,18 @@ pub fn project_deferred_calls(
                 Some(key.rsplit_once(':')?.0.to_owned())
             })
         })?;
-    let mut projection = seed
-        .filter(|seed| seed.lineage_id == lineage_id)
+    let origin = frames.first().is_some_and(|frame| frame.seq == 1)
+        && frames
+            .windows(2)
+            .all(|pair| pair[0].seq.checked_add(1) == Some(pair[1].seq));
+    let accepted_seed = seed
+        .filter(|seed| seed.lineage_id == lineage_id && (seed.stopped_runs.is_some() || !origin));
+    let mut projection = accepted_seed
         .cloned()
         .unwrap_or_else(|| DeferredCallProjection::new(&lineage_id));
+    if accepted_seed.is_none() && !origin && !(frames.is_empty() && last_run_id.is_none()) {
+        projection.stopped_runs = None;
+    }
     if projection.last_run_id.is_none() {
         projection.last_run_id = last_run_id.cloned();
     }

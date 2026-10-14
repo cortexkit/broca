@@ -369,3 +369,560 @@ async fn local_expiry_detaches_the_known_visible_card() {
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
     rig.finish().await;
 }
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn approving_detach_readback_stays_not_sent_across_later_admission() {
+    let rig = expired_run_with_detach("pass", "approve").await;
+    assert_eq!(
+        rig.questions
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| *v)
+            .collect::<Vec<_>>(),
+        [ApprovalExecution::ApprovedNotExecuted]
+    );
+    *rig.questions.answer.lock().unwrap() = "approve";
+    let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rig.tools.provider_requests.load(Ordering::SeqCst),
+        0,
+        "an approving detach readback must never become executable later"
+    );
+    assert_eq!(rig.questions.reports.lock().unwrap().len(), 1);
+    assert!(rig.frames().iter().any(|frame| matches!(
+        frame.record,
+        WalRecord::LateResult {
+            outcome: broca_wal::LateOutcome::NotSent,
+            ..
+        }
+    )));
+    assert!(!rig
+        .frames()
+        .iter()
+        .any(|frame| matches!(frame.record, WalRecord::LateDispatchIntent { .. })));
+    let bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
+    let mut cut = 0;
+    while cut < bytes.len() {
+        match broca_wal::framing::decode_next(&bytes[cut..]) {
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => cut += consumed,
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                cut += consumed;
+                if matches!(framed.record, WalRecord::LateResult { .. }) {
+                    break;
+                }
+            }
+            _ => panic!("complete release fixture"),
+        }
+    }
+    let cut_store = crate::FileWalStore::new(rig.root.join("release-result-cut"));
+    let path = cut_store.wal_path(&rig.bind);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &bytes[..cut]).unwrap();
+    let cut_writer = WalHandle::spawn(cut_store.open(&rig.bind).unwrap(), 1).unwrap();
+    let mut cut_history =
+        approval_gate::History::new(&cut_writer, cut_store.read_records(&rig.bind).unwrap())
+            .unwrap();
+    let reads = rig.questions.polls.load(Ordering::SeqCst);
+    approval_gate::admission(
+        &mut cut_history,
+        &cut_writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.questions.polls.load(Ordering::SeqCst),
+        reads,
+        "the terminal-before-approval cut is already closed"
+    );
+    cut_writer.shutdown().await.unwrap();
+    rig.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+async fn copied_pending_late_episode(stopped: bool) -> Rig {
+    let mut rig = expired_run("pass").await;
+    record_late_consent(&rig).await;
+    let bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
+    let broca_wal::framing::DecodeStep::Lineage { consumed, .. } =
+        broca_wal::framing::decode_next(&bytes)
+    else {
+        panic!("fixture has a lineage header")
+    };
+    let mut encoded = bytes[..consumed].to_vec();
+    for mut frame in rig.frames() {
+        if let WalRecord::RunFinished { reason, .. } = &mut frame.record {
+            if stopped {
+                *reason = RunFinishReason::Cancelled;
+            }
+        }
+        encoded.extend(broca_wal::framing::encode(frame.seq, frame.fence, &frame.record).unwrap());
+    }
+    let root = rig
+        .root
+        .join(if stopped { "stopped-seed" } else { "live-seed" });
+    let store = crate::FileWalStore::new(&root);
+    let path = store.wal_path(&rig.bind);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, encoded).unwrap();
+    let writer = WalHandle::spawn(store.open(&rig.bind).unwrap(), 1).unwrap();
+    assert_eq!(writer.lineage_id(), rig.writer.lineage_id());
+    let old = std::mem::replace(&mut rig.writer, writer);
+    old.shutdown().await.unwrap();
+    let keys = rig.questions.keys.lock().unwrap().clone();
+    rig.tools = tools_for_store(crate::FileWalStore::new(&root), rig.bind.clone());
+    rig.questions = Arc::new(Questions {
+        store: crate::FileWalStore::new(&root),
+        completed: rig.tools.completed.clone(),
+        lineage: rig.writer.lineage_id().unwrap(),
+        head: rig.writer.durable_head(),
+        keys: Mutex::new(keys),
+        attempts: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+        settlement_pages: AtomicUsize::new(0),
+        awaits: AtomicUsize::new(0),
+        gets: AtomicUsize::new(0),
+        outstanding: AtomicUsize::new(0),
+        ack_calls: AtomicUsize::new(0),
+        reports: Mutex::new(Vec::new()),
+        detaches: Mutex::new(Vec::new()),
+        detach_answer: Mutex::new("pending"),
+        transient: false,
+        cursors: Mutex::new(Vec::new()),
+        answer: Mutex::new("approve"),
+        stop: None,
+    });
+    rig.control.elicitation_plane = Some(rig.questions.clone());
+    rig
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn legacy_stop_facts_seed_requires_full_fold_before_late_dispatch() {
+    for stopped in [true, false] {
+        let rig = copied_pending_late_episode(stopped).await;
+        let full = rig.frames();
+        let mut history = approval_gate::History::new(&rig.writer, full.clone()).unwrap();
+        let mut legacy = serde_json::to_value(&history.projection).unwrap();
+        legacy.as_object_mut().unwrap().remove("stopped_runs");
+        history.projection = serde_json::from_value(legacy).unwrap();
+        history.frames.retain(|frame| {
+            matches!(
+                frame.record,
+                WalRecord::RunStarted { .. } | WalRecord::ToolBatchStarted { .. }
+            )
+        });
+        let incomplete = approval_gate::admission(
+            &mut history,
+            &rig.writer,
+            &rig.bind,
+            &rig.control,
+            &rig.tools,
+        )
+        .await;
+        assert!(
+            matches!(incomplete, Err(RunError::Wal(ref message)) if message.contains("consent_projection_incomplete")),
+            "unknown stop facts require a complete authoritative prefix, not an origin-only cache"
+        );
+        assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+        history.frames = full;
+        approval_gate::admission(
+            &mut history,
+            &rig.writer,
+            &rig.bind,
+            &rig.control,
+            &rig.tools,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rig.tools.provider_requests.load(Ordering::SeqCst),
+            usize::from(!stopped)
+        );
+        assert_eq!(
+            rig.questions.reports.lock().unwrap()[0].1,
+            if stopped {
+                ApprovalExecution::ApprovedNotExecuted
+            } else {
+                ApprovalExecution::Executed
+            }
+        );
+        assert_eq!(rig.questions.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.questions.awaits.load(Ordering::SeqCst), 0);
+        rig.finish().await;
+    }
+}
+
+#[cfg(feature = "test-clock")]
+async fn stopped_expired_sibling(cancel: bool) -> Rig {
+    struct LongerSibling(Arc<Hooks>);
+    #[async_trait::async_trait]
+    impl crate::HookPlane for LongerSibling {
+        async fn hook(
+            &self,
+            provider: &str,
+            bind: &BindIdentity,
+            hook: HookCall,
+        ) -> Result<HookAnswer, crate::HookUnavailable> {
+            if matches!(&hook.subject, Subject::PreTool { phase: Phase::Approve, tool_call_id, .. } if tool_call_id == "held")
+            {
+                return Ok(serde_json::from_value(json!({"answer":"ask","ask":{"prompt":"Allow held?","expires_at_ms":self.0.expires + 60_000,"on_expiry":"deny","material_damage":false,"late_execution":"execute"}})).unwrap());
+            }
+            crate::HookPlane::hook(self.0.as_ref(), provider, bind, hook).await
+        }
+    }
+    let mut rig = Rig::new("pass", "none", false, false);
+    let clock = crate::Clock::for_state_root(&rig.root).unwrap();
+    rig.control.clock = Some(clock.clone());
+    rig.control.hook_plane = Some(Arc::new(LongerSibling(rig.hooks.clone())));
+    rig.control.manifest = Some(Arc::new(frozen(
+        vec![vec![
+            sub("pre_tool", Some("approve"), "refuse"),
+            sub("pre_tool", Some("validate"), "pass"),
+        ]],
+        None,
+        false,
+    )));
+    let token = CancellationToken::new();
+    if cancel {
+        rig.control.cancel = Some(token.clone());
+    } else {
+        rig.control.stop_requested = Some(token.clone());
+    }
+    let mut req = hook_tests::request();
+    req.session = rig.bind.clone();
+    req.on_restart = None;
+    req.scope = Some(
+        serde_json::from_value(
+            json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"s","scope_epoch":1}),
+        )
+        .unwrap(),
+    );
+    let events = vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: broca_protocol::MessageId("siblings".into()),
+                content: vec![
+                    ContentBlock::ToolCall(call("c")),
+                    ContentBlock::ToolCall(call("held")),
+                ],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage::default(),
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ];
+    let provider = crate::StubProvider::new(vec![events]);
+    let (out, _rx) = mpsc::channel(1000);
+    let run = Box::pin(run_body_with_approval_history(
+        &mut req,
+        replay(&[]).unwrap(),
+        None,
+        false,
+        false,
+        false,
+        &rig.control,
+        &provider,
+        &rig.tools,
+        &crate::AllowAll,
+        &rig.writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+        Some(&rig.tools.store),
+        None,
+    ));
+    let interrupt = async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(2));
+        while rig.questions.outstanding.load(Ordering::SeqCst) < 2 {
+            tick.tick().await;
+        }
+        std::fs::write(
+            rig.root.join("test-clock"),
+            json!({"now_ms":rig.hooks.expires+1}).to_string(),
+        )
+        .unwrap();
+        clock.refresh().unwrap();
+        while !rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::ApprovalRecorded { call_id, decision: broca_wal::DeferredDecision::Expired, .. } if call_id.0 == "c")) { tick.tick().await; }
+        token.cancel();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(run, interrupt)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result.unwrap().reason,
+        if cancel {
+            RunFinishReason::Cancelled
+        } else {
+            RunFinishReason::Interrupted
+        }
+    );
+    rig.control.cancel = None;
+    rig.control.stop_requested = None;
+    *rig.questions.answer.lock().unwrap() = "approve";
+    let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rig.tools.provider_requests.load(Ordering::SeqCst),
+        0,
+        "a stopped episode's expired sibling cannot late-execute"
+    );
+    assert!(rig.frames().iter().any(|frame| matches!(
+        frame.record,
+        WalRecord::LateResult {
+            outcome: broca_wal::LateOutcome::NotSent,
+            ..
+        }
+    )));
+    rig
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn cancelled_episode_expired_sibling_never_late_executes() {
+    stopped_expired_sibling(true).await.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn nonresuming_stopped_episode_expired_sibling_never_late_executes() {
+    stopped_expired_sibling(false).await.finish().await;
+}
+
+#[test]
+fn stopped_run_projection_is_bounded_by_open_calls_and_prunes_terminals() {
+    use crate::replay::deferred_tests::{approval, batch, prepared};
+    let mut projection = crate::DeferredCallProjection::new("00000000-0000-0000-0000-000000000000");
+    let mut seq = 0;
+    for i in 0..128 {
+        let id = format!("c{i}");
+        let run = RunId(format!("r{i}"));
+        let mut records = batch(&[&id]);
+        let WalRecord::RunStarted { run_id, .. } = &mut records[0] else {
+            unreachable!()
+        };
+        *run_id = run.clone();
+        for record in records {
+            seq += 1;
+            projection.fold_frames(&[broca_wal::FramedRecord {
+                seq,
+                fence: 0,
+                record,
+            }]);
+        }
+        seq += 1;
+        let key = format!("{}:{seq}", projection.lineage_id);
+        projection.fold_frames(&[broca_wal::FramedRecord {
+            seq,
+            fence: 0,
+            record: prepared(&id, "b"),
+        }]);
+        seq += 1;
+        projection.fold_frames(&[broca_wal::FramedRecord {
+            seq,
+            fence: 0,
+            record: approval(&id, &key, broca_wal::DeferredDecision::Expired),
+        }]);
+        seq += 1;
+        projection.fold_frames(&[broca_wal::FramedRecord {
+            seq,
+            fence: 0,
+            record: WalRecord::RunFinished {
+                reason: RunFinishReason::Cancelled,
+                ts_ms: None,
+                usage: Usage::default(),
+                error: None,
+                retries_used: 0,
+            },
+        }]);
+        assert_eq!(
+            serde_json::to_value(&projection).unwrap()["stopped_runs"],
+            json!([run.0])
+        );
+        assert!(projection
+            .obligations()
+            .expired_without_late_record
+            .is_empty());
+        seq += 1;
+        projection.fold_frames(&[broca_wal::FramedRecord {
+            seq,
+            fence: 0,
+            record: WalRecord::LateResult {
+                call_key: key,
+                outcome: broca_wal::LateOutcome::NotSent,
+                result: Arc::new(crate::resume::not_dispatched_result(&ToolCallId(id))),
+            },
+        }]);
+        assert_eq!(
+            serde_json::to_value(&projection).unwrap()["stopped_runs"],
+            json!([]),
+            "finished runs cannot accumulate in the stop-facts seed"
+        );
+    }
+}
+
+#[test]
+fn released_0_3_199_projection_reader_accepts_stop_facts_cache_bytes() {
+    // The v0.3.199 Git tag at c39240ce has these three projection-reader fields.
+    // Decode the new cache bytes with that unchanged reader shape: default Serde
+    // behavior must ignore the additional stop-facts field, not reject the cache.
+    #[derive(serde::Deserialize)]
+    struct ReleasedProjection {
+        lineage_id: String,
+        last_run_id: Option<RunId>,
+        calls: std::collections::BTreeMap<String, crate::ProjectedDeferredCall>,
+    }
+    let mut projection = crate::DeferredCallProjection::new("00000000-0000-0000-0000-000000000000");
+    let records = crate::replay::deferred_tests::batch(&["c"]);
+    for (i, record) in records.into_iter().enumerate() {
+        projection.fold_frames(&[broca_wal::FramedRecord {
+            seq: i as u64 + 1,
+            fence: 0,
+            record,
+        }]);
+    }
+    projection.fold_frames(&[
+        broca_wal::FramedRecord {
+            seq: 4,
+            fence: 0,
+            record: crate::replay::deferred_tests::prepared("c", "b"),
+        },
+        broca_wal::FramedRecord {
+            seq: 5,
+            fence: 0,
+            record: crate::replay::deferred_tests::approval(
+                "c",
+                "00000000-0000-0000-0000-000000000000:4",
+                broca_wal::DeferredDecision::Expired,
+            ),
+        },
+        broca_wal::FramedRecord {
+            seq: 6,
+            fence: 0,
+            record: WalRecord::RunFinished {
+                reason: RunFinishReason::Cancelled,
+                ts_ms: None,
+                usage: Usage::default(),
+                error: None,
+                retries_used: 0,
+            },
+        },
+    ]);
+    let bytes = serde_json::to_vec(&projection).unwrap();
+    assert!(serde_json::from_slice::<Value>(&bytes)
+        .unwrap()
+        .get("stopped_runs")
+        .is_some());
+    let released: ReleasedProjection = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(released.lineage_id, projection.lineage_id);
+    assert_eq!(released.last_run_id, projection.last_run_id);
+    assert_eq!(released.calls, projection.calls);
+}
+
+#[test]
+fn legacy_projection_suffix_remains_unknown_until_complete_origin_fold() {
+    use crate::replay::deferred_tests::{approval, batch, prepared};
+    for stopped in [true, false] {
+        let lineage = "00000000-0000-0000-0000-000000000000";
+        let key = format!("{lineage}:4");
+        let mut records = batch(&["c"]);
+        records.push(prepared("c", "b"));
+        records.push(approval("c", &key, broca_wal::DeferredDecision::Expired));
+        records.push(WalRecord::RunFinished {
+            reason: if stopped {
+                RunFinishReason::Cancelled
+            } else {
+                RunFinishReason::Completed
+            },
+            ts_ms: None,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        });
+        records.push(WalRecord::LateApprovalRecorded {
+            call_key: key.clone(),
+            elicitation_id: "q".into(),
+            decision: broca_wal::LateDecision::Approved,
+            approval_digest: None,
+            late_execution: Some(broca_wal::LateExecution::Execute),
+        });
+        let frames: Vec<_> = records
+            .into_iter()
+            .enumerate()
+            .map(|(i, record)| broca_wal::FramedRecord {
+                seq: i as u64 + 1,
+                fence: 0,
+                record,
+            })
+            .collect();
+        let mut full = crate::DeferredCallProjection::new(lineage);
+        full.fold_frames(&frames);
+        let mut value = serde_json::to_value(&full).unwrap();
+        value.as_object_mut().unwrap().remove("stopped_runs");
+        let legacy: crate::DeferredCallProjection = serde_json::from_value(value).unwrap();
+        let suffix = crate::replay::project_deferred_calls(
+            Some(&legacy),
+            &[],
+            Some(lineage),
+            Some(&RunId("r".into())),
+        )
+        .unwrap();
+        assert!(
+            suffix.obligations().pending_late_execution.is_empty(),
+            "a legacy suffix cannot assume empty stop facts"
+        );
+        assert!(serde_json::to_value(&suffix)
+            .unwrap()
+            .get("stopped_runs")
+            .is_none());
+        let rebuilt =
+            crate::replay::project_deferred_calls(Some(&legacy), &frames, Some(lineage), None)
+                .unwrap();
+        assert_eq!(
+            rebuilt.obligations().pending_late_execution.len(),
+            usize::from(!stopped)
+        );
+        assert!(serde_json::to_value(&rebuilt)
+            .unwrap()
+            .get("stopped_runs")
+            .is_some());
+    }
+}

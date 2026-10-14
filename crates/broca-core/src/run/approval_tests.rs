@@ -237,15 +237,47 @@ impl ElicitationPlane for Questions {
         value: ApprovalExecution,
     ) -> Result<(), ApprovalRouteError> {
         let frames = self.store.read_records(&ctx.bind).unwrap();
+        let key = id
+            .strip_prefix("q:")
+            .map(str::to_owned)
+            .or_else(|| {
+                frames.iter().rev().find_map(|frame| match &frame.record {
+                    WalRecord::ApprovalRecorded {
+                        call_key,
+                        elicitation_id: Some(card),
+                        ..
+                    } if card == id => Some(call_key.clone()),
+                    WalRecord::LateApprovalRecorded {
+                        call_key,
+                        elicitation_id: card,
+                        ..
+                    } if card == id => Some(call_key.clone()),
+                    _ => None,
+                })
+            })
+            .expect("report names a durable card decision");
+        let prepared = frames
+            .iter()
+            .find(|frame| key.ends_with(&format!(":{}", frame.seq)))
+            .unwrap();
+        let WalRecord::ToolCallDeferred { call_id, .. } = &prepared.record else {
+            unreachable!()
+        };
         assert!(
             frames
                 .iter()
                 .any(|frame| self.head.load(Ordering::SeqCst) >= frame.seq
-                    && matches!(
-                        frame.record,
-                        WalRecord::ToolResult { .. } | WalRecord::LateResult { .. }
-                    )),
-            "result durable before report"
+                    && match &frame.record {
+                        WalRecord::ToolResult { result, .. } => result.tool_call_id == *call_id,
+                        WalRecord::LateResult { call_key, .. } => call_key == &key,
+                        WalRecord::ApprovalRecorded {
+                            call_key,
+                            closing_result: Some(_),
+                            ..
+                        } => call_key == &key,
+                        _ => false,
+                    }),
+            "the current call's terminal must be durable before report"
         );
         self.reports.lock().unwrap().push((id.into(), value));
         Ok(())
@@ -1120,7 +1152,13 @@ async fn restart_wait_spend_uses_batch_cache_warmed_usage_and_starts_no_extra_wa
 
 #[cfg(feature = "test-clock")]
 async fn expired_run(second: &'static str) -> Rig {
+    expired_run_with_detach(second, "pending").await
+}
+
+#[cfg(feature = "test-clock")]
+async fn expired_run_with_detach(second: &'static str, detach: &'static str) -> Rig {
     let mut rig = Rig::new(second, "none", false, false);
+    *rig.questions.detach_answer.lock().unwrap() = detach;
     let clock = crate::Clock::for_state_root(&rig.root).unwrap();
     rig.control.clock = Some(clock.clone());
     rig.control.manifest = Some(Arc::new(frozen(

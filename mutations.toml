@@ -1067,8 +1067,8 @@ target = "--lib"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_skips_expired_until_a_late_record"]
 file = "crates/broca-core/src/replay.rs"
-old = "if call.decision == Some(DeferredDecision::Expired) && call.late_approval.is_none() {"
-new = "if false && call.decision == Some(DeferredDecision::Expired) && call.late_approval.is_none() { // NON-VACUITY BREAK"
+old = "if self.late_allowed(call)"
+new = "if false && self.late_allowed(call) // NON-VACUITY BREAK"
 
 [[control]]
 id = "reader-fold-keeps-late-execution"
@@ -10696,5 +10696,81 @@ expect_red = ["run::approval_tests::consent_audit_tests::every_known_id_unavaila
 select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = '''// Invalid answered readbacks release the visible card just like transport refusals.
-                                        if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }'''
+                                        if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }'''
 new = '''// NON-VACUITY BREAK: discard the known card without detach'''
+
+[[control]]
+id = "core-consent-detach-terminal-before-approval"
+guards = "an approving detach readback durably fences non-execution before any late approval can be recorded"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::approving_detach_readback_stays_not_sent_across_later_admission"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''history.record(
+                    writer,
+                    WalRecord::LateResult {
+                        call_key: held.key.clone(),
+                        outcome: LateOutcome::NotSent,
+                        result: Arc::new(closed(&held.call(), "detached_not_executed")),
+                    },
+                );
+                writer.sync().await?;'''
+new = '''// NON-VACUITY BREAK: record the readback without its terminal fence'''
+
+[[control]]
+id = "core-consent-stopped-episode-blocks-late"
+guards = "durable cancellation and non-resuming stop invalidate late work from expired siblings"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::nonresuming_stopped_episode_expired_sibling_never_late_executes"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "reason: RunFinishReason::Cancelled | RunFinishReason::Interrupted,"
+new = "reason: RunFinishReason::Error, // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-legacy-stop-facts-refresh"
+guards = "unknown legacy stop facts refuse an incomplete prefix and refresh from complete WAL before late admission"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::legacy_stop_facts_seed_requires_full_fold_before_late_dispatch"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "if history.projection.stopped_runs.is_none() {"
+new = "if false && history.projection.stopped_runs.is_none() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-unknown-stop-facts-fail-closed"
+guards = "a legacy suffix without stop facts cannot advertise authorized late execution"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::legacy_projection_suffix_remains_unknown_until_complete_origin_fold"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "self.stopped_runs.as_ref().is_some_and(|stopped| {"
+new = "self.stopped_runs.as_ref().is_none_or(|stopped| { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-stop-facts-prune-closed-runs"
+guards = "stopped-run cache facts are bounded by open calls and disappear after their terminal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::stopped_run_projection_is_bounded_by_open_calls_and_prunes_terminals"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "stopped.retain(|run| open_runs.contains(run));"
+new = "stopped.retain(|run| true || open_runs.contains(run)); // NON-VACUITY BREAK"

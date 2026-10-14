@@ -184,6 +184,11 @@ pub fn plan_projection(
         .and_then(|range| range.lineage_id)
         .map(|lineage_id| lineage_id.to_string());
     let reset = !snapshot.attribution_complete
+        || snapshot
+            .seed
+            .as_ref()
+            .and_then(|seed| seed.deferred_calls.as_ref())
+            .is_some_and(|calls| calls.stopped_runs.is_none())
         || matches!(
             (expected_lineage_id.as_deref(), incoming_lineage_id.as_deref()),
             (Some(stored), Some(incoming)) if stored != incoming
