@@ -1,5 +1,15 @@
 # CI and release latency
 
+**Measured result:** the full portable CI workflow, including native Windows,
+completed green in **10:24 with no reruns**, versus the historical private green
+median **33:46**. CI on final candidate **4cce362**, containing the Unix
+retention metadata corrections, was **red in 12:45**, then remained
+red after a same-SHA failed-job retry (**21:56 total**). Its mutation workflow
+was **red in 32:02**, including **13:18 queued behind an obsolete run**.
+The build/sharding improvement is proven; the remaining rig and catalogue
+defects are not hidden by a green speed claim. Measurements, exact SHA/run IDs,
+release steps and fleet lessons follow.
+
 ## Baseline measured before changes (2026-10-14)
 
 Data: [ci-performance-baseline.json](ci-performance-baseline.json). GitHub run/job
@@ -15,7 +25,7 @@ gh run view <run-id> -R <repository> --log
 
 The same run-list, job-detail and log queries were made for `mutations.yml` and
 for both workflows on `cortexkit/broca-private`. Only **10 public runs
-per workflow exist**; all were retrieved, plus 20 private runs per workflow (60
+per workflow existed at baseline capture**; all were retrieved, plus 20 private runs per workflow (60
 runs total). There were 58 completed-run log requests; seven private logs were
 unavailable and three cancelled public mutation runs had empty logs. Two public
 runs were still active in the sample. A cancelled or failed run is not evidence
@@ -454,7 +464,206 @@ metadata and exposed another pre-existing absent-test declaration,
 `retention-shared-clock-advances-daemon`; it still cannot supply a green
 mutation-workflow after-measurement.
 
+### Green reconciled run
+
+[CI 38610426167](https://github.com/cortexkit/broca/actions/runs/38610426167)
+tested **18ef3838dc87b6e484562fee7fd442f0034329c1**, including approved master
+`000babd1`. Every lane passed, with **no reruns** and no Windows daemon-teardown
+leak failure. From creation at 17:52:59Z to the last job completion at 18:03:23Z,
+CI took **624 s (10:24)**. Compared with the measured private green median
+**2,026 s (33:46)**, that is **1,402 s (23:22) less wall time, 69.2% lower,
+or 3.25 times faster**. The repositories, source revisions and toolchains differ:
+this is an observed before/after comparison, not attribution of every second
+to one workflow edit.
+
+| Green-run lane | Start after creation | Duration | Passed tests |
+|---|---:|---:|---:|
+| Linux / Windows archive | 8 / 10 s | 224 / 441 s | Inventories 1,440 / 1,381; libtest = nextest |
+| Linux / Windows fixtures | 9 / 9 s | 24 / 43 s | Cached subc/vault binaries; neither daemon rebuilt |
+| Linux / Windows lint | 9 / 9 s | 108 / 124 s | Native platform lint |
+| Operator scripts | 8 s | 149 s | All operator suites |
+| Linux integration 1 / 2 / 3 / 4 | 8–10 s | 361 / 564 / 430 / 461 s | 351 / 377 / 372 / 336 |
+| Windows integration 1 / 2 / 3 / 4 | 8–9 s | 559 / 568 / 607 / 573 s | 343 / 356 / 359 / 320 |
+| Linux / Windows lib/bin/doc | 57 / 56 s | 184 / 481 s | 2,528 / 2,480 |
+| Real Linux deployment | 57 s | 152 s | Real ELF stage/place/restart proof |
+
+The independent inventories cover **1,436 Linux / 1,378 Windows** executed
+integrations, with the same **four / three ignored** tests, plus four dedicated
+clock proofs per platform. Approved upstream dead-code/API cleanup removed
+**11 integration tests per platform** and **four Linux / five Windows unit
+tests** relative to the early-start probe; those source changes were merged,
+not implemented as CI exclusions. No CI lane, feature or original selection
+filter was removed for speed.
+
+The new critical path was **Windows archive -> Windows integration shard 3 ->
+required statuses**. Shard 3 finished **616 s** after creation; aggregation
+finished **8 s** later. Linux shard 2 finished at **573 s**, and Windows
+lib/bin/doc at **537 s**. The old green critical path was the serial Linux /
+Windows Rust gate, about 34 minutes end-to-end.
+
+| Green critical lane, seconds | Checkout | Toolchain / Node | Cargo cache | Wait for same-OS archive / fixtures | Artifact restore / upload | Compile + discovery + archive | Test replay including extraction | Post |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Windows archive | 8 | 40 | 18 | — | 3 upload | 364 | — | 2 |
+| Windows integration shard 3 | 8 | 36 | — | 394 | 18 restore | — | 141 | 3 |
+| Linux archive | 2 | 3 | 7 | — | 11 upload | 195 | — | 0 |
+| Linux integration shard 2 | 1 | 6 | — | 215 | 14 restore | — | 323 | 0 |
+
+These are sums of actual step timestamps from one run, not median differences;
+small setup, npm, telemetry and between-step gaps account for the remainder.
+Windows shard 3's test execution itself was **126.456 s**; Linux shard 2's was
+**300.117 s**. Windows lib/bin's combined compile/execution step was **390 s**,
+with **247.22 s** summed serial harness execution. Archive compression,
+discovery and extraction are still real work even when dependency caches hit.
+
+Cache telemetry in this run: **2/2 fixture exact hits, 2/2 archive exact hits,
+2/2 unit exact hits**, and all four remaining Cargo cache actions (two lint,
+scripts, deployment) reported hits. This is one measured warm run, not a
+cross-fleet hit-rate guarantee. The earlier cold fixture probe had **0/2** hits.
+Slowest passed tests still include Linux LLM-runner conformance **152.146 s**
+and provider disconnect/truncation proofs **65–70 s**; none was removed.
+
+### Retention catalogue platform correction
+
+The next probe includes six further metadata corrections. The whole target is
+Unix-only at `crates/broca-module-serve/tests/llm_runner_conformance.rs:21`
+(`#![cfg(unix)]`), so its six retention controls now explicitly declare
+`platforms = ["macos", "linux"]`, including the four command rows invoking
+that Cargo target. Their mutation edits, expected failing tests and Unix
+coverage are unchanged. The regression test also rejects any of these rows
+being claimed as native Windows coverage.
+
+`retention-reader-boot-enrollment: SURVIVED` in **Linux mutation shard 2/4 of
+run 38604671455** remains a separate unresolved coverage/guard question. It was
+not skipped, removed, renamed or changed to make this performance work green.
+The release status policy still refuses a red mutation workflow. A passing
+later diff selection does not establish that this surviving control is fixed;
+full-catalogue replay is a distinct proof.
+
+### Final-tree first attempt and reliability findings
+
+[CI 38614765289, attempt 1](https://github.com/cortexkit/broca/actions/runs/38614765289/attempts/1)
+tested **4cce362bd13922724eab24279c1ec399d59f3564**, with the six Unix retention
+metadata corrections. The first attempt finished **red in 765 s (12:45)**.
+Its evidence is preserved by attempt number in the JSON rather than replaced
+with the latest rerun's job listing.
+
+| Failing Windows lane | Exact test | Measured failure / harness |
+|---|---|---|
+| Integration shard 1/4 | `broca-module::it coordinator_races::permanent_poison_head_is_consumed_before_younger_queue_work` | **34.544 s**; 343 run, 342 passed, one failed; shard execution **170.687 s** |
+| Integration shard 3/4 | `broca-module-serve::it account_selection_real_daemon::later_send_inherits_conversation_key_after_restart` | **34.569 s**; 359 run, 358 passed, one failed; shard execution **114.854 s** |
+| Lib/bin/doc | `broca-module::retention::tests::content_free_unknown_id_is_not_refiled_and_is_dropped_at_ask_expiry` | Failed harness: **319 passed, one failed, one ignored**, **274.81 s** |
+
+All three passed in the **18ef383 10:24 green run**. The test/daemon source and
+pinned fixtures did not change in `4cce362`; only catalogue metadata, its verifier
+regression test and report data changed. They are **flaky candidates, not cleared
+passes**. Even a successful rerun does not resolve whether their failure came
+from a race, an environmental assumption, or an unstable timeout. No test was
+rewritten, skipped, retried inside nextest, or granted a longer timeout.
+
+The integration failures were printed immediately at **18:33:05Z / 18:33:38Z**,
+before their final summaries at **18:34:34Z / 18:34:38Z**. The libtest failure
+marker appeared at **18:31:59Z**; its harness summary arrived at **18:34:09Z** and
+the no-fail-fast workspace command finished other targets at **18:36:11Z**.
+The operator requested **only failed-job reruns on the same SHA**, not another
+complete CI run. First-attempt wall time remains red regardless of that outcome.
+
+Attempt 2 completed **red in 519 s (8:39)** after its rerun start. Windows
+shard 3 passed **359 tests** in **93.751 s** execution / **167 s** job time;
+the Windows lib/bin/doc lane passed **2,480 tests** in **506 s**. Shard 1's
+original coordinator-race test passed, but a different test failed:
+`broca-subc::it tool_fault_spine::crash_after_send_interrupts_without_feeding_model`
+reported **LEAK-FAIL in 5.137 s**, with **343 run / 342 passed / one leak failure**
+in **109.154 s** execution / **209 s** job time. The original three failures
+remain flaky candidates, even though they all passed on this rerun.
+
+The output-handle leak is a **known defect in broca's daemon test launchers
+being fixed separately**. The identified likely cause is that daemons inherit
+the test's stdio and keep output handles open after the test returns. It is
+not attributed to SUBC. The strict leak check remains armed;
+no further job rerun was requested. This final-tree attempt is not CI-green.
+
+Including the **765 s** initial attempt, **32 s** before rerun launch, and
+**519 s** rerun, elapsed time from the original push to the last job completion
+was **1,316 s (21:56)**, still red. GitHub's attempt-2 metadata has a new
+`created_at`; the data retains attempt 1's original creation timestamp to avoid
+mistaking rerun duration for total train latency. Only the three failed lanes
+and their required-status aggregation were reexecuted; successful compilation,
+Linux tests, scripts, lint and deployment were reused.
+
+Final candidate `4cce362`'s mutation workflow was initially queued behind
+**38610426577**, which tested the superseded `18ef383` candidate.
+Its Windows validation had already refused the now-corrected Unix metadata while
+its Linux replays kept the branch's mutation concurrency slot occupied. The
+operator cancelled that obsolete run to unblock **38614765257**. Cancellation
+is not a successful full replay or evidence of a faster catalogue; its queue
+cost must not be folded into a supposed sub-15-minute green claim.
+
+### Final mutation outcome and remaining blockers
+
+[Mutation catalogue 38614765257](https://github.com/cortexkit/broca/actions/runs/38614765257)
+finished **red in 1,922 s (32:02)** on `4cce362`. The first fixture job started
+**798 s (13:18)** after creation: the obsolete run's concurrency slot caused
+that queue delay. From that first job start to the last completion was another
+**1,124 s (18:44)**. The cancelled predecessor, **38610426577**, lasted
+**2,631 s (43:51)** and is not counted as successful coverage.
+
+| Final mutation platform | Shards 1 / 2 / 3 / 4, job seconds | Outcome |
+|---|---:|---|
+| Linux | 675 / 607 / 588 / 585 | All selected diff proofs passed |
+| Windows | 840 / 990 / 1,068 / 931 | All four refused the same absent expected test during validation |
+
+The final mutation critical path was **queue -> fixture producer -> Windows
+shard 3 validation**. Its **1,068 s (17:48)** job alone exceeds 15 minutes.
+Thus the measured 10:24 CI improvement does **not** establish a sub-15-minute
+combined CI-plus-mutation release path, even after removing this queue delay.
+Full catalogue recompilation/validation and serialized broad selections remain
+expensive; a larger-runner speedup has not been measured.
+
+Three issues remain separate and prevent successful required checks and release:
+
+1. **Windows catalogue platform declarations:** all Windows shards of run
+   **38614765257** refused `agent-run-fresh-refusal-before-header` because
+   `real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_without_writes`
+   is absent. Its target has `#![cfg(unix)]` at
+   `crates/broca-module-serve/tests/scope_real_daemon_e2e.rs:17`, but the row lacks
+   platform tags. This belongs to the broader class of rows claiming Windows
+   tests that their `cfg` excludes. The eight corrected rows are not proof of
+   a complete catalogue platform audit; that audit is a separate follow-up.
+2. **Historical surviving Linux control:** `retention-reader-boot-enrollment`
+   reported **SURVIVED in run 38604671455, shard 2/4**. It remains unchanged and
+   under separate investigation. The final probe's narrower diff selection
+   passing on Linux does not resolve that survivor or prove the full catalogue.
+3. **Broca rig stdio leak:** the final CI retry refused
+   `tool_fault_spine::crash_after_send_interrupts_without_feeding_model` in
+   Windows shard 1/4. Inherited daemon stdio is a known rig defect being fixed,
+   not a reason to relax leak detection or attribute the defect to SUBC.
+
+The three first-attempt flaky candidates above also remain investigation items;
+their successful rerun is evidence of intermittency, not a reliability fix.
+No further source edits or probes were made to chase these remaining defects.
+No operator release tag, staged release build, installation into a running
+deployment or production restart was performed. CI's deployment proof uses
+an isolated test rig, not an operator deployment. The release
+helper must still refuse the final measured SHA while its workflows are red.
+
 ### Remaining limits
+
+For other CortexKit repositories, build integration tests once per platform,
+archive those binaries, and let independent consumers replay them without
+compiling again. Other changes worth copying are
+early preparation of artifact consumers, exact-revision sibling binary caches,
+independent lint/scripts/deployment lanes, a fixture-independent remote preflight
+with printed exclusions, and version-before-train/tag-the-tested-SHA releases.
+Keep producer jobs in the final required-status aggregate even when consumers
+start without job dependencies. Preserve native Windows tests, live/test-clock
+feature coverage and independent inventory counts when partitioning.
+
+Reliability matters as much as a short green run: a cheap same-SHA failed-job
+rerun preserves successful work, but does not turn an intermittent failure into
+a resolved test. Name initial failures, retain each attempt's evidence and count
+rerun/queue delays separately. A serialized obsolete mutation replay can hold
+up later probes even after it is already red; cancellation must be an explicit
+operator decision, not an automatic passing skip of required master coverage.
 
 Four hash shards preserve deterministic selection but do not balance duration:
 the second probe's Linux shard 2 took **299.351 s** of execution versus shard
