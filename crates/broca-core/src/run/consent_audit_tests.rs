@@ -169,3 +169,164 @@ async fn provisional_id_resume_reconciles_conflicting_settlements_before_get() {
     assert!(!cards.ops.lock().unwrap().contains(&"get"));
     rig.finish().await;
 }
+
+struct ConflictingFeed {
+    key: String,
+    prepared: WalRecord,
+    gets: AtomicUsize,
+    entered: std::sync::atomic::AtomicBool,
+    split: bool,
+}
+impl ConflictingFeed {
+    fn record(&self, id: &str, choice: &str) -> Value {
+        json!({"state":"answered","requester_ref":self.key,"elicitation_id":id,"answered_choice_id":choice,"binding":crate::consent::binding(&self.prepared)})
+    }
+}
+#[async_trait::async_trait]
+impl ElicitationPlane for ConflictingFeed {
+    async fn get(&self, _: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        Ok(ApprovalQuestion {
+            terminal: false,
+            record: json!({"state":"pending","requester_ref":self.key,"elicitation_id":id}),
+        })
+    }
+    async fn r#await(
+        &self,
+        _: &BatchCtx,
+        _: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.entered.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        cursor: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        if self.gets.load(Ordering::SeqCst) == 0 {
+            return Ok(ApprovalPage {
+                records: Vec::new(),
+                cursor: ApprovalCursor {
+                    provider_incarnation: "owner".into(),
+                    seq: 0,
+                },
+            });
+        }
+        while !self.entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let (records, seq) = match cursor.map(|c| c.seq) {
+            None if self.split => (vec![self.record("held", "approve")], 1),
+            None => (
+                vec![self.record("held", "approve"), self.record("other", "deny")],
+                1,
+            ),
+            Some(1) if self.split => (vec![self.record("other", "deny")], 2),
+            Some(seq) => (Vec::new(), seq),
+        };
+        Ok(ApprovalPage {
+            records,
+            cursor: ApprovalCursor {
+                provider_incarnation: "owner".into(),
+                seq,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "test-clock")]
+async fn conflict_wait(split: bool) -> Rig {
+    let mut rig = expired_run("pass").await;
+    let mut prepared = rig
+        .frames()
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::ToolCallDeferred { .. } => Some(frame.record.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let WalRecord::ToolCallDeferred { call_id, ask, .. } = &mut prepared else {
+        unreachable!()
+    };
+    *call_id = ToolCallId("held".into());
+    ask.expires_at_ms += 60_000;
+    let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
+    let key = crate::context::call_key(rig.writer.lineage_id().unwrap(), seq);
+    rig.writer.sync().await.unwrap();
+    let feed = Arc::new(ConflictingFeed {
+        key,
+        prepared: prepared.clone(),
+        gets: AtomicUsize::new(0),
+        entered: std::sync::atomic::AtomicBool::new(false),
+        split,
+    });
+    rig.control.elicitation_plane = Some(feed);
+    let resume = ResumeCtx {
+        batch_already_started: true,
+        existing: Default::default(),
+        prepared: vec![crate::replay::PreparedCall {
+            record_index: 0,
+            prepared: Arc::new(prepared),
+            approval: None,
+            elicitation_id: Some("held".into()),
+        }],
+    };
+    let result = rig
+        .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
+        .await;
+    assert!(
+        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")),
+        "all decisions for one key must be reduced before approval"
+    );
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    assert!(!rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::ApprovalRecorded { call_id, decision: broca_wal::DeferredDecision::Approved, .. } if call_id.0 == "held")));
+    rig
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn live_feed_conflicting_answers_refuse_before_any_dispatch() {
+    conflict_wait(false).await.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn live_feed_conflicting_continuations_refuse_before_any_dispatch() {
+    conflict_wait(true).await.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn late_feed_conflicting_answers_close_as_named_not_sent() {
+    let mut rig = expired_run("pass").await;
+    let prepared = rig
+        .frames()
+        .iter()
+        .find(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
+        .unwrap()
+        .clone();
+    let key = crate::context::call_key(rig.writer.lineage_id().unwrap(), prepared.seq);
+    let feed = Arc::new(ConflictingFeed {
+        key,
+        prepared: prepared.record,
+        gets: AtomicUsize::new(1),
+        entered: std::sync::atomic::AtomicBool::new(true),
+        split: true,
+    });
+    rig.control.elicitation_plane = Some(feed);
+    let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { outcome: broca_wal::LateOutcome::NotSent, result, .. } if matches!(&result.output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")))));
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}

@@ -9050,8 +9050,16 @@ mod approval_gate {
         ),
         Awaited(Result<crate::tool_plane::ApprovalQuestion, ApprovalRouteError>),
     }
+    struct PolledPage {
+        page: ApprovalPage,
+        complete: bool,
+    }
+    type FeedDecisions = Vec<(
+        String,
+        Result<crate::consent::ConsentAnswer, ApprovalRouteError>,
+    )>;
     type AnswerRead<'a> =
-        Pin<Box<dyn Future<Output = Result<ApprovalPage, ApprovalRouteError>> + Send + 'a>>;
+        Pin<Box<dyn Future<Output = Result<PolledPage, ApprovalRouteError>> + Send + 'a>>;
     type Job<'a> = Pin<Box<dyn Future<Output = (usize, Work)> + Send + 'a>>;
 
     pub(super) struct History {
@@ -10229,18 +10237,9 @@ mod approval_gate {
             {
                 if let Some(elicitation) = control.elicitation_plane.as_ref() {
                     let since = cursor.clone();
+                    let snapshot = history.projection.clone();
                     polling = Some(Box::pin(async move {
-                        tokio::time::timeout(
-                            Duration::from_millis(1000),
-                            elicitation.answers(ctx, since.as_ref()),
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(ApprovalRouteError {
-                                code: "timeout".into(),
-                                retryable: true,
-                            })
-                        })
+                        read_feed(elicitation.as_ref(), ctx, since, &snapshot).await
                     }));
                 }
             }
@@ -10328,9 +10327,24 @@ mod approval_gate {
                     match page {
                         Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }
                         Err(_) => {}
-                        Ok(page) => {
-                            let Ok(answers)=read_answers(&page.records, history) else {continue};
+                        Ok(polled) => {
+                            let page = polled.page;
+                            let Ok(answers)=read_answers(&page.records, &history.projection) else {continue};
+                            if !polled.complete { continue; }
                             for (key,answer) in answers {
+                                let answer = match answer {
+                                    Ok(answer) => answer,
+                                    Err(error) => {
+                                        if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && !call.approved)) {
+                                            if let Some(token) = waits.remove(&index) { token.cancel(); }
+                                            let Slot::Held(held) = &slots[index] else { unreachable!() }; let held = held.clone();
+                                            let result = refusal_decision(&held, &error, writer, history).await?;
+                                            slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                            if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }
+                                        } else { late_refusal(history, writer, &key, &error).await?; }
+                                        continue;
+                                    }
+                                };
                                 if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && call.filed && !call.approved)) {
                                     if let Some(token) = waits.remove(&index) { token.cancel(); }
                                     intake(slots, index, answer, ctx, writer, control, history).await?;
@@ -10505,6 +10519,44 @@ mod approval_gate {
         Ok(())
     }
 
+    async fn late_refusal(
+        history: &mut History,
+        writer: &WalHandle,
+        key: &str,
+        error: &ApprovalRouteError,
+    ) -> Result<(), RunError> {
+        let Some(call) = history.projection.calls.get(key).filter(|call| {
+            call.late_approval.is_none() && call.decision == Some(DeferredDecision::Expired)
+        }) else {
+            return Ok(());
+        };
+        let WalRecord::ToolCallDeferred { call_id, .. } = &*call.prepared else {
+            unreachable!()
+        };
+        let result = Arc::new(route_drained_result(call_id, &error.code));
+        let id = call.elicitation_id.clone().unwrap_or_default();
+        history.record(
+            writer,
+            WalRecord::LateApprovalRecorded {
+                call_key: key.into(),
+                elicitation_id: id,
+                decision: LateDecision::None,
+                approval_digest: None,
+                late_execution: None,
+            },
+        );
+        history.record(
+            writer,
+            WalRecord::LateResult {
+                call_key: key.into(),
+                outcome: LateOutcome::NotSent,
+                result,
+            },
+        );
+        writer.sync().await?;
+        Ok(())
+    }
+
     pub(super) async fn admission<T: ToolPlane>(
         history: &mut History,
         writer: &WalHandle,
@@ -10547,26 +10599,48 @@ mod approval_gate {
                 scope: None,
             };
             let ctx = held.ctx(&ctx);
-            let mut page = tokio::time::timeout(
-                Duration::from_millis(1000),
-                crate::consent::lookup(elicitation.as_ref(), &ctx, &key, &held.prepared),
-            )
-            .await;
+            let read = || async {
+                if let Some(id) = &held.id {
+                    crate::consent::reconcile(
+                        elicitation.as_ref(),
+                        &ctx,
+                        &key,
+                        &held.prepared,
+                        id,
+                        |record| async move {
+                            writer
+                                .record(record)
+                                .into_result()
+                                .map_err(|_| crate::consent::refusal("wal_write_failed", true))?;
+                            writer
+                                .sync()
+                                .await
+                                .map_err(|_| crate::consent::refusal("wal_sync_failed", true))?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .map(|card| card.answer)
+                } else {
+                    crate::consent::lookup(elicitation.as_ref(), &ctx, &key, &held.prepared).await
+                }
+            };
+            let mut page = tokio::time::timeout(Duration::from_millis(1000), read()).await;
             // A fresh cursor can also be refused during a provider restart. Never interpret
             // that refusal as a stream head; leave the call eligible for the next admission.
             if matches!(&page, Ok(Err(error)) if error.code == "cursor_incarnation_changed") {
-                page = tokio::time::timeout(
-                    Duration::from_millis(1000),
-                    crate::consent::lookup(elicitation.as_ref(), &ctx, &key, &held.prepared),
-                )
-                .await;
+                page = tokio::time::timeout(Duration::from_millis(1000), read()).await;
             }
-            if let Ok(Ok(answer)) = page {
-                if let Some(answer) = answer {
+            match page {
+                Ok(Ok(Some(answer))) => {
                     late_answer(history, writer, &key, answer).await?;
                 }
-            } else {
-                continue;
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) if error.code == "consent_conflicting_decisions" => {
+                    late_refusal(history, writer, &key, &error).await?;
+                    continue;
+                }
+                _ => continue,
             }
             if history.projection.calls[&key].late_approval.is_some() {
                 continue;
@@ -10820,9 +10894,12 @@ mod approval_gate {
     // record cannot advance the feed cursor past an answer that still needs recovery.
     fn read_answers(
         records: &[serde_json::Value],
-        history: &History,
-    ) -> Result<Vec<(String, crate::consent::ConsentAnswer)>, ()> {
-        let mut answers = Vec::new();
+        projection: &crate::replay::DeferredCallProjection,
+    ) -> Result<FeedDecisions, ()> {
+        let mut answers: std::collections::BTreeMap<
+            String,
+            Result<crate::consent::ConsentAnswer, ApprovalRouteError>,
+        > = std::collections::BTreeMap::new();
         for record in records {
             let Some(key) = record
                 .get("requester_ref")
@@ -10830,7 +10907,7 @@ mod approval_gate {
             else {
                 continue;
             };
-            let Some(call) = history.projection.calls.get(key) else {
+            let Some(call) = projection.calls.get(key) else {
                 continue;
             };
             if call
@@ -10840,12 +10917,62 @@ mod approval_gate {
                 continue;
             }
             match crate::consent::answer(record, key, &call.prepared) {
-                Ok(Some(answer)) => answers.push((key.into(), answer)),
+                Ok(Some(answer)) => match answers.entry(key.into()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Ok(answer));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if entry
+                            .get()
+                            .as_ref()
+                            .is_ok_and(|old| old.decision != answer.decision)
+                        {
+                            let _ = entry.insert(Err(crate::consent::refusal(
+                                "consent_conflicting_decisions",
+                                false,
+                            )));
+                        }
+                    }
+                },
                 Ok(None) => {}
                 Err(_) => return Err(()),
             }
         }
-        Ok(answers)
+        Ok(answers.into_iter().collect())
+    }
+
+    // Do not authorize an answer from a prefix: a later continuation can contain
+    // a contradictory answer for the same key. The caller advances its cursor only
+    // after this complete, binding-checked snapshot has been durably reduced.
+    async fn read_feed(
+        plane: &dyn crate::tool_plane::ElicitationPlane,
+        ctx: &BatchCtx,
+        mut cursor: Option<crate::tool_plane::ApprovalCursor>,
+        projection: &crate::replay::DeferredCallProjection,
+    ) -> Result<PolledPage, ApprovalRouteError> {
+        let mut records = Vec::new();
+        loop {
+            let page =
+                tokio::time::timeout(Duration::from_secs(1), plane.answers(ctx, cursor.as_ref()))
+                    .await
+                    .map_err(|_| crate::consent::refusal("timeout", true))??;
+            let readable = read_answers(&page.records, projection).is_ok();
+            let head = page.records.is_empty();
+            records.extend(page.records);
+            if !readable || head {
+                return Ok(PolledPage {
+                    page: ApprovalPage {
+                        records,
+                        cursor: page.cursor,
+                    },
+                    complete: readable && head,
+                });
+            }
+            if cursor.as_ref() == Some(&page.cursor) {
+                return Err(crate::consent::refusal("consent_cursor_stalled", true));
+            }
+            cursor = Some(page.cursor);
+        }
     }
 }
 

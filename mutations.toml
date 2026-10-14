@@ -10614,3 +10614,72 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = '''let card = crate::consent::reconcile(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, durable).await?;'''
 new = '''let card = crate::consent::RecoveredCard { id: id.clone(), answer: None }; // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-answered-duplicate-conflict"
+guards = "a duplicate answered during withdrawal is read and opposing decisions refuse before adoption"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_answered_during_withdrawal_refuses_conflicting_decisions"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if duplicate.decision != ConsentDecision::None && duplicate.decision != older {"
+new = "if false && duplicate.decision != ConsentDecision::None && duplicate.decision != older { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-unproven-withdrawal-refuses"
+guards = "a non-terminal withdrawal refusal never proves a duplicate closed or allows adoption"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::unproven_duplicate_withdrawal_does_not_adopt_an_older_answer"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''.ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;'''
+new = '''.or_else(|| Some(ConsentAnswer { id: id.into(), decision: older })) // NON-VACUITY BREAK
+        .ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;'''
+
+[[control]]
+id = "core-consent-live-feed-conflicting-decisions"
+guards = "live feed intake reduces conflicting answers for one key before any dispatch authorization"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_feed_conflicting_answers_refuse_before_any_dispatch"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = ".is_ok_and(|old| old.decision != answer.decision)"
+new = ".is_ok_and(|old| false && old.decision != answer.decision) // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-complete-before-approval"
+guards = "a live feed prefix never authorizes before later continuation conflicts are checked"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_feed_conflicting_continuations_refuse_before_any_dispatch"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let head = page.records.is_empty();"
+new = "let head = true; // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-late-feed-conflict-refuses"
+guards = "late conflicting settlements close durably as a named not-sent refusal instead of remaining eligible"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_feed_conflicting_answers_close_as_named_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''Ok(Err(error)) if error.code == "consent_conflicting_decisions" => {'''
+new = '''Ok(Err(error)) if false && error.code == "consent_conflicting_decisions" => { // NON-VACUITY BREAK'''

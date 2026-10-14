@@ -202,10 +202,7 @@ where
 {
     if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
         if answer.id != id {
-            match plane.withdraw(ctx, id).await {
-                ApprovalWithdrawal::Acknowledged | ApprovalWithdrawal::NotSent { .. } => {}
-                ApprovalWithdrawal::Retry(error) => return Err(error),
-            }
+            withdraw_duplicate(plane, ctx, key, prepared, id, answer.decision).await?;
         }
         durable(id_record(ctx, key, prepared, &answer.id)).await?;
         return Ok(RecoveredCard {
@@ -217,6 +214,37 @@ where
         id: id.into(),
         answer: None,
     })
+}
+
+async fn withdraw_duplicate(
+    plane: &dyn ElicitationPlane,
+    ctx: &BatchCtx,
+    key: &str,
+    prepared: &WalRecord,
+    id: &str,
+    older: ConsentDecision,
+) -> Result<(), ApprovalRouteError> {
+    let reason = match plane.withdraw(ctx, id).await {
+        ApprovalWithdrawal::Acknowledged => return Ok(()),
+        ApprovalWithdrawal::NotSent { reason } => reason,
+        ApprovalWithdrawal::Retry(error) if !error.retryable && terminal_refusal(&error.code) => {
+            error.code
+        }
+        ApprovalWithdrawal::Retry(error) => return Err(error),
+    };
+    // A refused withdrawal is not proof that the duplicate stayed unanswered.
+    // Read its terminal record before adopting the older card's decision.
+    let question = plane.get(ctx, id).await?;
+    let duplicate = answer(&question.record, key, prepared)?
+        .filter(|answer| answer.id == id && question.terminal)
+        .ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;
+    if reason == "answered" && duplicate.decision == ConsentDecision::None {
+        return Err(refusal("consent_withdrawal_unproven", true));
+    }
+    if duplicate.decision != ConsentDecision::None && duplicate.decision != older {
+        return Err(refusal("consent_conflicting_decisions", false));
+    }
+    Ok(())
 }
 
 /// Reporting is best-effort in this process only. Every retry uses the identical value;

@@ -68,6 +68,8 @@ struct Fake {
     records: Mutex<Vec<WalRecord>>,
     failure: Mutex<Option<ApprovalRouteError>>,
     answered_withdrawal: bool,
+    withdrawal_reason: Option<&'static str>,
+    pending_readback: bool,
     reports: Mutex<Vec<ApprovalExecution>>,
     ack_calls: AtomicUsize,
 }
@@ -79,6 +81,8 @@ impl Fake {
             records: Mutex::new(Vec::new()),
             failure: Mutex::new(None),
             answered_withdrawal: false,
+            withdrawal_reason: None,
+            pending_readback: false,
             reports: Mutex::new(Vec::new()),
             ack_calls: AtomicUsize::new(0),
         }
@@ -147,6 +151,11 @@ impl ElicitationPlane for Fake {
             );
         }
         self.events.lock().unwrap().push(format!("withdraw:{id}"));
+        if let Some(reason) = self.withdrawal_reason {
+            return ApprovalWithdrawal::NotSent {
+                reason: reason.into(),
+            };
+        }
         if self.answered_withdrawal {
             ApprovalWithdrawal::NotSent {
                 reason: "answered".into(),
@@ -158,8 +167,12 @@ impl ElicitationPlane for Fake {
     async fn get(&self, _: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
         self.events.lock().unwrap().push("get".into());
         Ok(ApprovalQuestion {
-            terminal: true,
-            record: record(id, "approve"),
+            terminal: !self.pending_readback,
+            record: if self.pending_readback {
+                json!({"state":"pending","requester_ref":"key","elicitation_id":id})
+            } else {
+                record(id, "approve")
+            },
         })
     }
     async fn report_execution(
@@ -183,6 +196,35 @@ impl ElicitationPlane for Fake {
         self.ack_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn duplicate_answered_during_withdrawal_refuses_conflicting_decisions() {
+    for reason in [None, Some("route_busy")] {
+        let mut fake = Fake::new(vec![vec![], vec![record("old", "deny")], vec![]]);
+        fake.answered_withdrawal = true;
+        fake.withdrawal_reason = reason;
+        let error = recover(&fake, &ctx(), "key", &prepared(), 0, |r| fake.durable(r))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "consent_conflicting_decisions");
+        assert!(!error.retryable);
+        assert!(fake.events.lock().unwrap().contains(&"get".into()));
+        assert!(!fake.events.lock().unwrap().contains(&"sync:old".into()));
+    }
+}
+
+#[tokio::test]
+async fn unproven_duplicate_withdrawal_does_not_adopt_an_older_answer() {
+    let mut fake = Fake::new(vec![vec![], vec![record("old", "approve")], vec![]]);
+    fake.withdrawal_reason = Some("route_busy");
+    fake.pending_readback = true;
+    let error = recover(&fake, &ctx(), "key", &prepared(), 0, |r| fake.durable(r))
+        .await
+        .unwrap_err();
+    assert!(error.retryable);
+    assert_eq!(error.code, "consent_withdrawal_unproven");
+    assert!(!fake.events.lock().unwrap().contains(&"sync:old".into()));
 }
 
 #[tokio::test]

@@ -725,9 +725,9 @@ async fn one_held_and_one_expired_call_use_one_await_one_page_and_drop_settled_w
     };
     rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;
-    // A pending resume rechecks the empty settlement head before get; the live
-    // wait still consumes exactly one nonempty page for the held and expired calls.
-    assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 2);
+    // One empty reconciliation read precedes get. The live wait then reads one
+    // nonempty page plus its empty continuation head before accepting either answer.
+    assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 3);
     assert_eq!(
         rig.questions.settlement_pages.load(Ordering::SeqCst),
         pages + 1
