@@ -32,17 +32,6 @@ pub use compaction::{
     RejectedCompaction, MAX_REPLACEMENT_BYTES,
 };
 
-/// The current WAL record schema version.
-///
-/// v2: lineage/episode model — a session WAL is now a SEQUENCE of runs (episodes), each
-/// opened by a `RunStarted`. Adds `origin`+`submission_id` to `RunStarted`, the
-/// non-terminal `RunPaused` (auth-required), and replay-fidelity fields
-/// (`StepStarted`, `finish_reason`, `tool_name`, typed `RunFinished.error`); replaces
-/// the dead `SteerQueued`/`FollowUpQueued` with the identity-carrying
-/// `Queued`/`Retracted`. HARD CUT — no v1→v2 migration (no production WAL data exists;
-/// dev WALs are disposable).
-pub const RECORD_SCHEMA_VERSION: u32 = 2;
-
 fn is_false(value: &bool) -> bool {
     !*value
 }

@@ -7034,6 +7034,687 @@
           "runner_group_id": 0,
           "runner_group_name": "GitHub Actions"
         }
+      ],
+      "log_summary": {
+        "Lint (windows)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-lint-Windows_NT-x64-ccac81b5-7fc33b24"
+          ]
+        },
+        "Lint (ubuntu)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-lint-Linux-x64-5a0b5213-7fc33b24"
+          ]
+        },
+        "Archive (ubuntu)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-archive-Linux-x64-5a0b5213-7fc33b24"
+          ]
+        },
+        "Archive (windows)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-archive-Windows_NT-x64-ccac81b5-7fc33b24"
+          ]
+        },
+        "fixtures / Fixtures (Windows)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: fixtures-v2-Windows-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5",
+            "Cache restored from key: fixtures-v2-Windows-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5"
+          ]
+        },
+        "fixtures / Fixtures (Linux)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: fixtures-v2-Linux-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5",
+            "Cache restored from key: fixtures-v2-Linux-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5"
+          ]
+        },
+        "Lib/bin/doc (ubuntu)": {
+          "nextest": [],
+          "libtest_passed": 2531,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-units-Linux-x64-5a0b5213-7fc33b24"
+          ]
+        },
+        "Lib/bin/doc (windows)": {
+          "nextest": [],
+          "libtest_passed": 2484,
+          "failures": [],
+          "cache": []
+        },
+        "Real Linux ELF deployment": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-release-deploy-Linux-x64-5a0b5213-7fc33b24"
+          ]
+        },
+        "Integration (windows 2/4)": {
+          "nextest": [
+            {
+              "seconds": 0.013,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.013s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 64.764,
+              "run": 358,
+              "passed": 358,
+              "text": "Summary [  64.764s] 358 tests run: 358 passed, 1032 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        },
+        "Integration (windows 3/4)": {
+          "nextest": [
+            {
+              "seconds": 0.013,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.013s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 112.632,
+              "run": 359,
+              "passed": 359,
+              "text": "Summary [ 112.632s] 359 tests run: 359 passed (2 slow), 1031 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        },
+        "Integration (ubuntu 4/4)": {
+          "nextest": [
+            {
+              "seconds": 0.007,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.007s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 227.184,
+              "run": 340,
+              "passed": 340,
+              "text": "Summary [ 227.184s] 340 tests run: 340 passed, 1109 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        },
+        "Integration (windows 4/4)": {
+          "nextest": [
+            {
+              "seconds": 0.016,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.016s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 92.609,
+              "run": 324,
+              "passed": 323,
+              "text": "Summary [  92.609s] 324 tests run: 323 passed, 1 failed, 1066 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [
+            "FAIL [   4.375s] (273/324) broca-store::windows_private_mode windows_private_mode_refuses_unreadable_acl",
+            "test windows_private_mode_refuses_unreadable_acl ... FAILED"
+          ],
+          "cache": []
+        },
+        "Integration (ubuntu 3/4)": {
+          "nextest": [
+            {
+              "seconds": 0.006,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.006s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 122.146,
+              "run": 372,
+              "passed": 372,
+              "text": "Summary [ 122.146s] 372 tests run: 372 passed, 1077 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        },
+        "Integration (ubuntu 2/4)": {
+          "nextest": [
+            {
+              "seconds": 0.006,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.006s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 299.351,
+              "run": 379,
+              "passed": 379,
+              "text": "Summary [ 299.351s] 379 tests run: 379 passed (1 slow), 1070 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        },
+        "Integration (windows 1/4)": {
+          "nextest": [
+            {
+              "seconds": 0.016,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.016s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 88.827,
+              "run": 346,
+              "passed": 346,
+              "text": "Summary [  88.827s] 346 tests run: 346 passed (1 slow), 1044 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        },
+        "Integration (ubuntu 1/4)": {
+          "nextest": [
+            {
+              "seconds": 0.404,
+              "run": 1,
+              "passed": 1,
+              "text": "Summary [   0.404s] 1 test run: 1 passed, 123 skipped"
+            },
+            {
+              "seconds": 73.422,
+              "run": 354,
+              "passed": 354,
+              "text": "Summary [  73.422s] 354 tests run: 354 passed (1 slow), 1095 skipped"
+            }
+          ],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": []
+        }
+      },
+      "per_binary_pass_totals": {
+        "windows broca-module::it": {
+          "tests": 127,
+          "sum_seconds": 191.701
+        },
+        "windows broca-catalog::default_max_output": {
+          "tests": 10,
+          "sum_seconds": 0.21499999999999994
+        },
+        "windows broca-catalog::it": {
+          "tests": 27,
+          "sum_seconds": 21.394
+        },
+        "windows broca-catalog::reasoning_variants": {
+          "tests": 19,
+          "sum_seconds": 0.5200000000000001
+        },
+        "windows broca-catalog::service_tier": {
+          "tests": 10,
+          "sum_seconds": 0.249
+        },
+        "windows broca-core::it": {
+          "tests": 203,
+          "sum_seconds": 40.89499999999999
+        },
+        "windows broca-crash-harness::it": {
+          "tests": 9,
+          "sum_seconds": 39.177
+        },
+        "windows broca-fetch-plan::persona_role": {
+          "tests": 4,
+          "sum_seconds": 0.057
+        },
+        "windows broca-fetch-plan::preset_rules": {
+          "tests": 7,
+          "sum_seconds": 0.07899999999999999
+        },
+        "windows broca-fetch-plan::step_admission": {
+          "tests": 5,
+          "sum_seconds": 0.08499999999999999
+        },
+        "windows broca-fetch-plan::vectors": {
+          "tests": 16,
+          "sum_seconds": 0.32900000000000007
+        },
+        "windows broca-crash-harness::steer_interrupt": {
+          "tests": 10,
+          "sum_seconds": 13.027999999999999
+        },
+        "windows broca-crash-harness::approval_gate": {
+          "tests": 4,
+          "sum_seconds": 8.128
+        },
+        "windows broca-module-serve::admission_wal_read_budget": {
+          "tests": 1,
+          "sum_seconds": 0.01
+        },
+        "windows broca-module-serve::cache_dump": {
+          "tests": 26,
+          "sum_seconds": 9.311
+        },
+        "windows broca-provider::conformance": {
+          "tests": 105,
+          "sum_seconds": 1.0060000000000007
+        },
+        "windows broca-provider::it": {
+          "tests": 346,
+          "sum_seconds": 237.8989999999999
+        },
+        "windows broca-module-serve::cache_warm_admission": {
+          "tests": 9,
+          "sum_seconds": 12.568
+        },
+        "windows broca-store::it": {
+          "tests": 26,
+          "sum_seconds": 45.17400000000001
+        },
+        "windows broca-module-serve::in_use_models_still_serve": {
+          "tests": 1,
+          "sum_seconds": 0.848
+        },
+        "windows broca-store::offline_liveness": {
+          "tests": 2,
+          "sum_seconds": 12.123
+        },
+        "windows broca-subc::it": {
+          "tests": 62,
+          "sum_seconds": 61.88299999999999
+        },
+        "windows broca-module-serve::it": {
+          "tests": 274,
+          "sum_seconds": 459.94999999999993
+        },
+        "windows broca-wal::compaction_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.025
+        },
+        "windows broca-wal::it": {
+          "tests": 19,
+          "sum_seconds": 11.058
+        },
+        "windows broca-test-support::ckdev_guard": {
+          "tests": 1,
+          "sum_seconds": 0.685
+        },
+        "windows broca-wire::agent_data_contract": {
+          "tests": 8,
+          "sum_seconds": 0.08399999999999998
+        },
+        "windows ck-import::it": {
+          "tests": 12,
+          "sum_seconds": 8.995
+        },
+        "windows broca-module-serve::step_transform_crash": {
+          "tests": 5,
+          "sum_seconds": 4.272
+        },
+        "windows broca-catalog::code_assist_variant_resume": {
+          "tests": 1,
+          "sum_seconds": 0.032
+        },
+        "windows broca-ck::it": {
+          "tests": 6,
+          "sum_seconds": 0.086
+        },
+        "windows broca-core::input_allocation": {
+          "tests": 6,
+          "sum_seconds": 0.272
+        },
+        "windows broca-crash-harness::plan_manifest_resume": {
+          "tests": 3,
+          "sum_seconds": 9.649999999999999
+        },
+        "windows broca-crash-harness::resume_close_out": {
+          "tests": 5,
+          "sum_seconds": 2.94
+        },
+        "windows broca-crash-harness::ported_scenarios": {
+          "tests": 2,
+          "sum_seconds": 22.398
+        },
+        "windows broca-test-support::log_capture_interest": {
+          "tests": 1,
+          "sum_seconds": 0.011
+        },
+        "windows broca-test-support::sweep_reclaims_aged": {
+          "tests": 1,
+          "sum_seconds": 0.018
+        },
+        "ubuntu broca-module::it": {
+          "tests": 127,
+          "sum_seconds": 11.354999999999993
+        },
+        "ubuntu broca-catalog::default_max_output": {
+          "tests": 10,
+          "sum_seconds": 0.09
+        },
+        "ubuntu broca-catalog::reasoning_variants": {
+          "tests": 19,
+          "sum_seconds": 0.20500000000000004
+        },
+        "ubuntu broca-catalog::service_tier": {
+          "tests": 10,
+          "sum_seconds": 0.11999999999999998
+        },
+        "ubuntu broca-ck::it": {
+          "tests": 6,
+          "sum_seconds": 0.035
+        },
+        "ubuntu broca-core::input_allocation": {
+          "tests": 6,
+          "sum_seconds": 0.189
+        },
+        "ubuntu broca-catalog::it": {
+          "tests": 27,
+          "sum_seconds": 15.28
+        },
+        "ubuntu broca-core::it": {
+          "tests": 203,
+          "sum_seconds": 60.96900000000006
+        },
+        "ubuntu broca-crash-harness::approval_gate": {
+          "tests": 4,
+          "sum_seconds": 0.38700000000000007
+        },
+        "ubuntu broca-crash-harness::it": {
+          "tests": 9,
+          "sum_seconds": 2.188
+        },
+        "ubuntu broca-crash-harness::resume_close_out": {
+          "tests": 5,
+          "sum_seconds": 0.129
+        },
+        "ubuntu broca-crash-harness::steer_interrupt": {
+          "tests": 10,
+          "sum_seconds": 1.4269999999999998
+        },
+        "ubuntu broca-fetch-plan::preset_rules": {
+          "tests": 7,
+          "sum_seconds": 0.041999999999999996
+        },
+        "ubuntu broca-fetch-plan::step_admission": {
+          "tests": 5,
+          "sum_seconds": 0.048
+        },
+        "ubuntu broca-fetch-plan::vectors": {
+          "tests": 16,
+          "sum_seconds": 0.198
+        },
+        "ubuntu broca-module-serve::cache_dump": {
+          "tests": 27,
+          "sum_seconds": 0.5650000000000003
+        },
+        "ubuntu broca-module-serve::dispatch_module_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.054
+        },
+        "ubuntu broca-provider::conformance": {
+          "tests": 105,
+          "sum_seconds": 0.6680000000000005
+        },
+        "ubuntu broca-provider::it": {
+          "tests": 346,
+          "sum_seconds": 204.41200000000032
+        },
+        "ubuntu broca-store::it": {
+          "tests": 26,
+          "sum_seconds": 1.6869999999999998
+        },
+        "ubuntu broca-subc::it": {
+          "tests": 63,
+          "sum_seconds": 130.99000000000004
+        },
+        "ubuntu broca-module-serve::it": {
+          "tests": 294,
+          "sum_seconds": 874.1999999999997
+        },
+        "ubuntu broca-test-support::sweep_spares_recent": {
+          "tests": 1,
+          "sum_seconds": 0.008
+        },
+        "ubuntu broca-wal::it": {
+          "tests": 19,
+          "sum_seconds": 12.180000000000001
+        },
+        "ubuntu broca-wire::agent_data_contract": {
+          "tests": 8,
+          "sum_seconds": 0.081
+        },
+        "ubuntu ck-import::it": {
+          "tests": 12,
+          "sum_seconds": 38.71099999999999
+        },
+        "ubuntu broca-module-serve::launch_nonce": {
+          "tests": 6,
+          "sum_seconds": 7.263000000000001
+        },
+        "ubuntu broca-module-serve::llm_runner_conformance": {
+          "tests": 25,
+          "sum_seconds": 317.029
+        },
+        "ubuntu broca-module-serve::operation_counters": {
+          "tests": 1,
+          "sum_seconds": 0.01
+        },
+        "ubuntu broca-module-serve::scope_real_daemon_e2e": {
+          "tests": 10,
+          "sum_seconds": 137.339
+        },
+        "ubuntu broca-module-serve::step_transform_crash": {
+          "tests": 5,
+          "sum_seconds": 7.016
+        },
+        "windows broca-module-serve::dispatch_module_older_build": {
+          "tests": 1,
+          "sum_seconds": 1.364
+        },
+        "windows broca-store::windows_private_mode": {
+          "tests": 2,
+          "sum_seconds": 35.565
+        },
+        "windows broca-test-support::sweep_spares_recent": {
+          "tests": 1,
+          "sum_seconds": 0.017
+        },
+        "windows broca-module-serve::launch_nonce": {
+          "tests": 2,
+          "sum_seconds": 0.30600000000000005
+        },
+        "windows broca-module-serve::operation_counters": {
+          "tests": 1,
+          "sum_seconds": 0.025
+        },
+        "ubuntu broca-catalog::code_assist_variant_resume": {
+          "tests": 1,
+          "sum_seconds": 0.011
+        },
+        "ubuntu broca-crash-harness::plan_manifest_resume": {
+          "tests": 3,
+          "sum_seconds": 0.366
+        },
+        "ubuntu broca-crash-harness::ported_scenarios": {
+          "tests": 2,
+          "sum_seconds": 0.72
+        },
+        "ubuntu broca-module-serve::cache_warm_admission": {
+          "tests": 9,
+          "sum_seconds": 11.385000000000002
+        },
+        "ubuntu broca-store::offline_liveness": {
+          "tests": 2,
+          "sum_seconds": 0.623
+        },
+        "ubuntu broca-test-support::log_capture_interest": {
+          "tests": 1,
+          "sum_seconds": 0.008
+        },
+        "ubuntu broca-test-support::sweep_reclaims_aged": {
+          "tests": 1,
+          "sum_seconds": 0.005
+        },
+        "ubuntu broca-fetch-plan::persona_role": {
+          "tests": 4,
+          "sum_seconds": 0.023
+        },
+        "ubuntu broca-module-serve::admission_wal_read_budget": {
+          "tests": 1,
+          "sum_seconds": 0.006
+        },
+        "ubuntu broca-module-serve::in_use_models_still_serve": {
+          "tests": 1,
+          "sum_seconds": 0.783
+        },
+        "ubuntu broca-test-support::ckdev_guard": {
+          "tests": 1,
+          "sum_seconds": 1.51
+        },
+        "ubuntu broca-wal::compaction_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.025
+        },
+        "windows broca-module-serve::fleet_log_record_shape": {
+          "tests": 1,
+          "sum_seconds": 0.053
+        },
+        "windows broca-replay::bench_envelope_is_representative": {
+          "tests": 1,
+          "sum_seconds": 0.01
+        },
+        "windows broca-module-serve::path_ladders": {
+          "tests": 3,
+          "sum_seconds": 2.8059999999999996
+        },
+        "windows broca-test-support::subc_bin_guard": {
+          "tests": 1,
+          "sum_seconds": 0.502
+        },
+        "windows broca-module-serve::manifest_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.694
+        },
+        "windows broca-module-serve::steer_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.705
+        },
+        "ubuntu broca-module-serve::fleet_log_record_shape": {
+          "tests": 1,
+          "sum_seconds": 0.023
+        },
+        "ubuntu broca-replay::bench_envelope_is_representative": {
+          "tests": 1,
+          "sum_seconds": 0.008
+        },
+        "ubuntu broca-test-support::subc_bin_guard": {
+          "tests": 1,
+          "sum_seconds": 0.805
+        },
+        "ubuntu broca-module-serve::manifest_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.03
+        },
+        "ubuntu broca-module-serve::path_ladders": {
+          "tests": 3,
+          "sum_seconds": 0.11000000000000001
+        },
+        "ubuntu broca-module-serve::steer_older_build": {
+          "tests": 1,
+          "sum_seconds": 0.032
+        }
+      },
+      "slowest_passes": [
+        {
+          "job": "Integration (ubuntu 2/4)",
+          "binary": "broca-module-serve::llm_runner_conformance",
+          "test": "ck_broca_passes_the_llm_runner_conformance_suite",
+          "seconds": 152.019
+        },
+        {
+          "job": "Integration (windows 1/4)",
+          "binary": "broca-provider::it",
+          "test": "stream_errors_e2e::truncated_stream_mid_text_finalizes_on_eof",
+          "seconds": 66.502
+        },
+        {
+          "job": "Integration (windows 3/4)",
+          "binary": "broca-provider::it",
+          "test": "stream_errors_e2e::truncated_stream_mid_tool_call",
+          "seconds": 65.559
+        },
+        {
+          "job": "Integration (ubuntu 1/4)",
+          "binary": "broca-provider::it",
+          "test": "stream_errors_e2e::truncated_stream_mid_text_finalizes_on_eof",
+          "seconds": 62.697
+        },
+        {
+          "job": "Integration (windows 3/4)",
+          "binary": "broca-provider::it",
+          "test": "stream_errors_e2e::mid_stream_disconnect_is_error",
+          "seconds": 60.354
+        },
+        {
+          "job": "Integration (ubuntu 3/4)",
+          "binary": "broca-provider::it",
+          "test": "stream_errors_e2e::truncated_stream_mid_tool_call",
+          "seconds": 57.835
+        },
+        {
+          "job": "Integration (ubuntu 3/4)",
+          "binary": "broca-provider::it",
+          "test": "stream_errors_e2e::mid_stream_disconnect_is_error",
+          "seconds": 56.853
+        },
+        {
+          "job": "Integration (ubuntu 2/4)",
+          "binary": "broca-module-serve::it",
+          "test": "approval_gate::graceful_restart_keeps_question_open_and_resumes_same_wait",
+          "seconds": 48.79
+        },
+        {
+          "job": "Integration (windows 4/4)",
+          "binary": "broca-module::it",
+          "test": "coordinator_races::send_racing_idle_close_always_reopens_cleanly",
+          "seconds": 46.14
+        },
+        {
+          "job": "Integration (ubuntu 2/4)",
+          "binary": "broca-module-serve::it",
+          "test": "single_turn_module_e2e::a_provider_401_evicts_the_current_real_vault_credential_from_process_cache",
+          "seconds": 31.229
+        }
       ]
     },
     {
@@ -8971,7 +9652,113 @@
           "runner_group_id": 0,
           "runner_group_name": "GitHub Actions"
         }
-      ]
+      ],
+      "log_summary": {
+        "fixtures / Fixtures (Windows)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: fixtures-v2-Windows-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5",
+            "Cache restored from key: fixtures-v2-Windows-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5"
+          ]
+        },
+        "fixtures / Fixtures (Linux)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: fixtures-v2-Linux-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5",
+            "Cache restored from key: fixtures-v2-Linux-X64-rustc-1.99.0-(b940084d7-2026-09-28)-5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae-f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5"
+          ]
+        },
+        "Mutation catalogue (native Windows shard 4/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [
+            "ckdev-mutate: serve-boot-terminal-withdrawal-debt: expect_red name no longer exists: approval_gate::process_kill_seals_interrupted_and_boot_withdraws_terminal_debt"
+          ],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Windows_NT-x64-ccac81b5-7fc33b24",
+            "Cache not found for input keys: Windows-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (native Windows shard 2/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [
+            "ckdev-mutate: serve-boot-terminal-withdrawal-debt: expect_red name no longer exists: approval_gate::process_kill_seals_interrupted_and_boot_withdraws_terminal_debt"
+          ],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Windows_NT-x64-ccac81b5-7fc33b24",
+            "Cache not found for input keys: Windows-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (shard 4/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Linux-x64-5a0b5213-7fc33b24",
+            "Cache hit for: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e",
+            "Cache restored from key: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (shard 1/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Linux-x64-5a0b5213-7fc33b24",
+            "Cache hit for: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e",
+            "Cache restored from key: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (native Windows shard 1/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [
+            "ckdev-mutate: serve-boot-terminal-withdrawal-debt: expect_red name no longer exists: approval_gate::process_kill_seals_interrupted_and_boot_withdraws_terminal_debt"
+          ],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Windows_NT-x64-ccac81b5-7fc33b24",
+            "Cache not found for input keys: Windows-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (shard 3/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Linux-x64-5a0b5213-7fc33b24",
+            "Cache hit for: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e",
+            "Cache restored from key: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (shard 2/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Linux-x64-5a0b5213-7fc33b24",
+            "Cache hit for: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e",
+            "Cache restored from key: Linux-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        },
+        "Mutation catalogue (native Windows shard 3/4)": {
+          "nextest": [],
+          "libtest_passed": 0,
+          "failures": [
+            "ckdev-mutate: serve-boot-terminal-withdrawal-debt: expect_red name no longer exists: approval_gate::process_kill_seals_interrupted_and_boot_withdraws_terminal_debt"
+          ],
+          "cache": [
+            "Cache hit for: v0-rust-mutations-Windows_NT-x64-ccac81b5-7fc33b24",
+            "Cache not found for input keys: Windows-X64-ckdev-mutate-0c99c7e16d8ae22b6e114136b6b7b68be6f1394e"
+          ]
+        }
+      },
+      "per_binary_pass_totals": {},
+      "slowest_passes": []
     }
   ]
 }

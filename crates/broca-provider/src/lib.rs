@@ -42,10 +42,7 @@ pub use normalize::{AnthropicNormalizer, NormalizeError};
 pub use safe_provider_code::safe_provider_code;
 
 #[cfg(feature = "live")]
-pub use factory::{
-    live_provider, live_provider_with_client, live_provider_with_clock_and_refresher,
-    live_provider_with_refresher, UnsupportedFamily,
-};
+pub use factory::{live_provider, live_provider_with_clock_and_refresher, UnsupportedFamily};
 #[cfg(feature = "live")]
 pub use live::{LiveAnthropicProvider, LiveAuthError};
 #[cfg(feature = "live")]

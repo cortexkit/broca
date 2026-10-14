@@ -2915,6 +2915,9 @@ old = '''        let output = Command::new("/bin/cp")
             .stdin(std::process::Stdio::from(source.file.try_clone()?))
             .output()?;
         if !output.status.success() {
+            if !temporary.directory.is_dir() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
             return Err(io::Error::other(format!(
                 "copying test executable to {} failed ({}): {}",
                 temporary.path.display(),
@@ -2943,6 +2946,19 @@ platforms = ["linux"]
 file = "crates/broca-test-support/src/ckdev.rs"
 old = "const EXECUTABLE_FILE_BUSY_RETRIES: usize = 40;"
 new = "const EXECUTABLE_FILE_BUSY_RETRIES: usize = 0; // NON-VACUITY BREAK: disable executable-busy retries."
+
+[[control]]
+id = "test-rig-ckdev-disable-prune"
+guards = "publishing a test executable removes unused cache copies older than 24 hours"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+test_file = "crates/broca-test-support/src/ckdev.rs"
+expect_red = ["ckdev::tests::pruning_removes_old_unused_copies"]
+expect_message = "unused copy older than 24 hours survived"
+file = "crates/broca-test-support/src/ckdev.rs"
+old = "        prune_copies(&cache, &directory, SystemTime::now());"
+new = "        // NON-VACUITY BREAK: disable executable cache pruning."
 
 [[control]]
 id = "stall-heartbeat-staleness"
@@ -7565,15 +7581,31 @@ id = "windows-private-mode-incomplete-is-error"
 guards = "an unreadable or unrepaired Windows object makes private-mode exit nonzero"
 runner = "cargo"
 package = "broca-store"
-target = "--test windows_private_mode"
-test_file = "crates/broca-store/tests/windows_private_mode.rs"
-expect_red = ["windows_private_mode_refuses_unreadable_acl"]
-platforms = ["windows"]
+target = "--bin store-maintenance"
+test_file = "crates/broca-store/src/bin/store-maintenance.rs"
+expect_red = ["tests::private_mode_refuses_injected_unreadable_acl"]
 file = "crates/broca-store/src/bin/store-maintenance.rs"
 old = '''    println!("scanned dirs {scanned_dirs}\nscanned files {scanned_files}\ntightened {tightened}\nfailed {failed}");
     if failed > 0 {'''
 new = '''    println!("scanned dirs {scanned_dirs}\nscanned files {scanned_files}\ntightened {tightened}\nfailed {failed}");
     if false && failed > 0 { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "private-mode-acl-inspection-refusal"
+guards = "private-mode refuses an ACL inspection denial without attempting repair in dry-run or repair mode"
+runner = "cargo"
+package = "broca-store"
+target = "--bin store-maintenance"
+test_file = "crates/broca-store/src/bin/store-maintenance.rs"
+expect_red = ["tests::private_mode_refuses_injected_unreadable_acl"]
+file = "crates/broca-store/src/bin/store-maintenance.rs"
+old = '''        let private = match inspection {
+            Ok(private) => private,
+            Err(error) => {'''
+new = '''        let private = match inspection {
+            Ok(private) => private,
+            Err(_) if true => false, // NON-VACUITY BREAK: treat unreadable ACLs as repairable
+            Err(error) => {'''
 
 [[control]]
 id = "windows-private-mode-dry-run-does-not-repair"

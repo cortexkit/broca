@@ -95,7 +95,6 @@ mod gated {
                 ]),
                 withheld: Vec::new(),
                 uncertain: Vec::new(),
-                overridden: Vec::new(),
             };
             let cache = Arc::new(CatalogCache::empty());
             cache

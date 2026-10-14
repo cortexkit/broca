@@ -351,3 +351,82 @@ and both fixture lookups missed. The first critical path was the Windows
 archive (**6:48**) followed by Linux shard 2 (**5:50**, including **297.768 s** of
 test execution). A corrected train must finish successfully before its timings
 can be reported as a green CI speedup or its warm-cache hit rate measured.
+
+### Corrected extraction probe and earlier shard preparation
+
+The second probe, **700e118809b076d4556172ed3cc71d432ec574cb**, ran as
+[CI 38571258967](https://github.com/cortexkit/broca/actions/runs/38571258967)
+and [Mutation catalogue 38571259043](https://github.com/cortexkit/broca/actions/runs/38571259043),
+the separate workflow that validates and replays the catalogue's fault controls.
+Its job/step timestamps, execution summaries and failure names are retained in
+[ci-performance-probes.json](ci-performance-probes.json).
+
+| Second-probe lane | Runtime | Execution / outcome |
+|---|---:|---|
+| Linux / Windows archive | 209 / 419 s | Both independent inventories agree |
+| Linux / Windows fixtures | 20 / 47 s | Exact binary-cache hits |
+| Linux / Windows lint | 51 / 155 s | Passed |
+| Operator scripts | 172 s | Passed, including offline dependency checks |
+| Linux / Windows lib/bin/doc | 182 / 500 s | 2,531 / 2,484 passed |
+| Linux shard 1 / 2 / 3 / 4 | 253 / 485 / 221 / 279 s | 354 / 379 / 372 / 340 passed, plus four clock proofs |
+| Windows shard 1 / 2 / 3 / 4 | 161 / 139 / 198 / 172 s | 346 / 358 / 359 / 323 passed; the ACL test named below failed |
+| Real Linux deployment | 117 s | Passed |
+| Linux mutation shards | 549–605 s | All four passed |
+| Windows mutation shards | 797–1,000 s | All four refused invalid platform metadata |
+
+CI took **919 s (15:19), red**, from run creation to the last job completion.
+The critical path was the Windows archive, the cross-platform matrix barrier,
+then Linux shard 2: it spent **299.351 s** executing tests but **485 s** in the
+job, including setup/extraction. All **1,445 Linux / 1,387 Windows** integrations
+executed; Windows had **1,386 passed / one failed**, in addition to the clock
+proofs. `broca-store::windows_private_mode::windows_private_mode_refuses_unreadable_acl`
+was that failure. The merge through `c39240c` included an earlier fixture
+correction, but the same test failed again on the early-start probe. The final
+upstream fix arrived later: `c78a150e` replaced the unreliable ACL fixture with
+an injected-denial test, and `d9262b15` corrected its path comparison. The
+reconciled probe must include those changes. Neither failed probe is a green
+after-measurement.
+
+Before replay, catalogue validation checks that each mutation's expected failing
+test exists in the compiled inventory. It refused `serve-boot-terminal-withdrawal-debt` because its
+`approval_gate::process_kill_seals_interrupted_and_boot_withdraws_terminal_debt`
+test is absent on Windows. The entire `approval_gate` module is `cfg(unix)`, so both catalogue rows
+using that module now declare `platforms = ["macos", "linux"]`. Their Unix tests
+and mutation edits remain unchanged. This corrects nonexistent Windows coverage;
+it does not remove an executable Windows test. A catalogue regression test
+checks both rows and their exclusion from Windows eligibility.
+
+Probe **bafebee5f1698001742806fb3bc1fb3e8e3ec504** starts all eight integration
+consumer jobs immediately. Checkout, Rust/nextest setup and npm installation
+overlap archive/fixture production. Consumers then poll for **only their own
+platform's artifacts**, with a bounded wait and named producer-failure refusal,
+before using the unchanged download/unpack/replay steps. They no longer wait
+for other-platform matrix legs or producer post-cache saves. The required status
+explicitly still depends on archive and fixture producers, so consuming an
+uploaded artifact cannot hide a later producer failure. Nextest prints failure
+output immediately and at the end, while `fail-fast = false` still executes the
+remaining tests.
+
+### Remaining limits
+
+Four hash shards preserve deterministic selection but do not balance duration:
+the second probe's Linux shard 2 took **299.351 s** of execution versus shard
+1's **73.422 s**. Sharding reduced serial execution without removing intentional
+timeout tests, but the slowest shard, archive compilation/transport and libtest
+units still determine wall time. Full mutation catalogue replay is a separate
+workload from a push's diff selection; neither a green diff replay nor faster
+fixture setup establishes a sub-15-minute full catalogue replay.
+
+Starting consumers early uses more idle hosted runners rather than repeating
+compilation. Public runner minutes are free, and the measurements show queueing
+was not the baseline bottleneck. Cache misses and toolchain/revision churn still
+require cold sibling builds. Cache hit rates must name the lane, exact versus
+prefix restore, and measured run; a successful cache step is not a hit.
+
+The release helper removes operator-triggered duplicate gates/trains, not
+GitHub's existing automatic master-push observations. The current all-runs-for-
+SHA status policy still waits for those observations if they exist. Changing
+that policy would be a separate correctness decision, not an unmeasured speed
+claim. Mac-native signing, Gatekeeper and daemon/vault behavior remain the Mac
+pre-merge gate's responsibility. `place-release.sh` installs the staged binary
+and restarts the daemon, so it remains separate and requires operator approval.

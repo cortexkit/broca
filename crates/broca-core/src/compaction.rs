@@ -569,16 +569,6 @@ fn tool_ids(message: &Message) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Six broca rules: cache metadata; origin fidelity; signed reasoning fidelity; no system;
-/// conversation/tool integrity; closed native fields. Opaque tool JSON remains opaque.
-pub fn structural(
-    compaction: &CompactionMessage,
-    raw: &[Message],
-) -> Result<Vec<Message>, CompactionDisposition> {
-    let messages = native_replacement(compaction, raw)?;
-    structural_conversation(compaction, &messages, raw)?;
-    Ok(messages)
-}
 fn native_replacement(
     compaction: &CompactionMessage,
     raw: &[Message],

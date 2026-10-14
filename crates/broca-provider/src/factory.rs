@@ -59,49 +59,7 @@ pub fn live_provider(
     )
 }
 
-/// Build a live provider over a shared HTTP client.
-///
-/// Cloning `client` before calling this function is cheap and keeps every resulting provider on
-/// the same reqwest connection pool. Runtime auth remains provider-local and request headers are
-/// still attached only after rendering.
-pub fn live_provider_with_client(
-    client: ProviderHttpClient,
-    frozen: FrozenRenderConfig,
-    auth: AuthHandle,
-) -> Result<Box<dyn Provider>, UnsupportedFamily> {
-    live_provider_inner(
-        Some(client),
-        frozen,
-        auth,
-        None,
-        None,
-        None,
-        broca_core::clock::Clock::default(),
-    )
-}
-
-/// As [`live_provider_with_client`] (or [`live_provider`] without a client), with an optional
-/// in-step 401 recovery: see [`LiveProvider::with_credential_refresher`].
-pub fn live_provider_with_refresher(
-    client: Option<ProviderHttpClient>,
-    frozen: FrozenRenderConfig,
-    auth: AuthHandle,
-    refresher: Option<Arc<dyn CredentialRefresher>>,
-    frozen_account_ref: Option<String>,
-    served_account_ref: Option<String>,
-) -> Result<Box<dyn Provider>, UnsupportedFamily> {
-    live_provider_with_clock_and_refresher(
-        client,
-        frozen,
-        auth,
-        refresher,
-        frozen_account_ref,
-        served_account_ref,
-        broca_core::clock::Clock::default(),
-    )
-}
-
-/// As [`live_provider_with_refresher`], using the caller's shared module clock.
+/// Build a live provider with optional in-step credential refresh and the caller's shared clock.
 pub fn live_provider_with_clock_and_refresher(
     client: Option<ProviderHttpClient>,
     frozen: FrozenRenderConfig,

@@ -759,7 +759,7 @@ a defect on this side, not a consumer-side filter to work around.
 
 ## 18. WAL enrichment + fork origin (real, now)
 
-`RECORD_SCHEMA_VERSION` bumps. Record changes:
+Record changes:
 - `RunStarted` gains `origin: Fresh | SeededFrom{source_lineage, at_seq}` (default
   `Fresh`; `seed_from` reserved on the wire, v1 rejects non-Fresh — the fork seam is real,
   cross-lineage read is future) and `submission_id` (§11), and is run_id-authoritative.
@@ -808,7 +808,7 @@ start and names both paths.
 
 ## 21. Core, WAL, and store invariants
 
-Additive to a sound durability core; bump `RECORD_SCHEMA_VERSION`:
+Additive WAL changes must retain the existing compatibility rules:
 1. **Episode-aware replay state machine**: per-`RunStarted` episode reset; prior
    episodes → prefix; last-unfinished resumable; explicit append-new-episode path.
    **`recover_run_config` MUST return the LAST active/resumable episode's

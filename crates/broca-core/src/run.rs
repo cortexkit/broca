@@ -1170,44 +1170,6 @@ where
     .await
 }
 
-/// Append a new episode to an idle lineage, under an already-held lease (the
-/// coordinator's continuation entry — see [`run_loop_append_episode`] for the
-/// lease-acquiring variant).
-#[allow(clippy::too_many_arguments)]
-pub async fn run_loop_append_episode_under_lease<P, T, A, W>(
-    req: RunRequest,
-    lease_epoch: u64,
-    provider: &P,
-    tool_plane: &T,
-    approval: &A,
-    wal_store: &W,
-    store: Option<Arc<dyn SessionStore>>,
-    control: RunControl,
-    out: &mpsc::Sender<OutputEvent>,
-) -> Result<RunSummary, RunError>
-where
-    P: Provider,
-    T: ToolPlane,
-    A: ApprovalPolicy,
-    W: WalStore,
-{
-    run_under_lease(
-        req,
-        lease_epoch,
-        None,
-        provider,
-        tool_plane,
-        approval,
-        wal_store,
-        store,
-        true,
-        false,
-        control,
-        out,
-    )
-    .await
-}
-
 /// Which start mode a run uses. The lineage coordinator chooses; the loop obeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartMode {

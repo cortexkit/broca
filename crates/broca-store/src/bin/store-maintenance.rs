@@ -619,6 +619,22 @@ fn private_mode(state_root: &std::path::Path, dry_run: bool) -> ExitCode {
 
 #[cfg(windows)]
 fn private_mode(state_root: &std::path::Path, dry_run: bool) -> ExitCode {
+    private_mode_acl(
+        state_root,
+        dry_run,
+        &mut std::io::stderr(),
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(any(windows, test))]
+fn private_mode_acl(
+    state_root: &std::path::Path,
+    dry_run: bool,
+    errors: &mut impl std::io::Write,
+    #[cfg(test)] denied_acl: Option<&std::path::Path>,
+) -> ExitCode {
     let mut scanned_dirs = 0u64;
     let mut scanned_files = 0u64;
     let mut tightened = 0u64;
@@ -653,13 +669,37 @@ fn private_mode(state_root: &std::path::Path, dry_run: bool) -> ExitCode {
             failed += 1;
             continue;
         }
-        let private = match broca_owner_only::is_private(&path) {
+        // A privileged Windows token can read the ACL despite a deny ACE. The
+        // test-only path override makes access denial independent of token privileges.
+        #[cfg(test)]
+        let inspection = if denied_acl == Some(path.as_path()) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected ACL inspection denial",
+            ))
+        } else {
+            #[cfg(windows)]
+            {
+                broca_owner_only::is_private(&path)
+            }
+            // Non-Windows hosts exercise the Windows walk with readable ACLs for
+            // every path except the injected denial; they have no Windows ACL API.
+            #[cfg(not(windows))]
+            {
+                Ok(true)
+            }
+        };
+        #[cfg(not(test))]
+        let inspection = broca_owner_only::is_private(&path);
+        let private = match inspection {
             Ok(private) => private,
             Err(error) => {
-                eprintln!(
+                writeln!(
+                    errors,
                     "store-maintenance: cannot inspect ACL {}: {error}",
                     path.display()
-                );
+                )
+                .expect("write ACL inspection refusal");
                 failed += 1;
                 continue;
             }
@@ -667,14 +707,20 @@ fn private_mode(state_root: &std::path::Path, dry_run: bool) -> ExitCode {
         if !private {
             if dry_run {
                 println!("would tighten {}", path.display());
-            } else if let Err(error) = broca_owner_only::repair(&path) {
-                eprintln!(
-                    "store-maintenance: cannot tighten {}: {error}",
-                    path.display()
-                );
-                failed += 1;
             } else {
-                tightened += 1;
+                #[cfg(windows)]
+                let repaired = broca_owner_only::repair(&path);
+                #[cfg(all(test, not(windows)))]
+                let repaired: std::io::Result<()> = Ok(());
+                if let Err(error) = repaired {
+                    eprintln!(
+                        "store-maintenance: cannot tighten {}: {error}",
+                        path.display()
+                    );
+                    failed += 1;
+                } else {
+                    tightened += 1;
+                }
             }
         }
         if metadata.is_dir() {
@@ -772,6 +818,38 @@ mod tests {
     fn temp_root(tag: &str) -> PathBuf {
         broca_test_support::scratch_root()
             .join(format!("store-maintenance-{}-{tag}", std::process::id()))
+    }
+
+    #[test]
+    fn private_mode_refuses_injected_unreadable_acl() {
+        let root = temp_root("unreadable-acl");
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let db = root.join("run-index.db");
+        let file = root.join("wal").join("session.wal");
+        std::fs::write(&db, b"database marker").unwrap();
+        std::fs::write(&file, b"WAL marker").unwrap();
+        for dry_run in [true, false] {
+            let mut errors = Vec::new();
+            let result = super::private_mode_acl(&root, dry_run, &mut errors, Some(&file));
+            assert_eq!(result, ExitCode::from(1), "dry_run={dry_run}");
+            let errors = String::from_utf8(errors).unwrap();
+            assert_eq!(errors.lines().count(), 1, "dry_run={dry_run}");
+            assert!(errors.contains("cannot inspect ACL"));
+            assert!(errors.contains(&file.display().to_string()));
+            assert!(errors.contains("injected ACL inspection denial"));
+            assert_eq!(std::fs::read(&file).unwrap(), b"WAL marker");
+            assert_eq!(std::fs::read(&db).unwrap(), b"database marker");
+        }
+        for dry_run in [true, false] {
+            let mut errors = Vec::new();
+            assert_eq!(
+                super::private_mode_acl(&root, dry_run, &mut errors, None),
+                ExitCode::SUCCESS,
+                "a readable tree must still be accepted"
+            );
+            assert!(errors.is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The refusals must fire, and must not fire on a usable root.

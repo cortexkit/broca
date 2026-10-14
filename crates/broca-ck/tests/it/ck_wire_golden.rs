@@ -1,30 +1,15 @@
 //! The CK-Message wire golden — a canonical serialized `CkMessage` array fixture.
 //!
-//! This is the CROSS-LANGUAGE VECTOR for the transform wire: it pins the exact JSON shape
-//! `broca-ck` emits (internally-tagged `ContentKind`, the `ToolResultOutput` shape, `origin`,
-//! provider-extras) so a downstream parser — magic-context's ingress — can pin its own golden
-//! against THIS file. That kills a wire-shape mismatch before the socket round-trip instead
-//! of during it (the one genuine mismatch risk in the producer↔transform integration).
-//!
-//! The fixture is produced by `lift`ing a representative canonical prompt that exercises every
-//! content kind the OWNED producer leg emits: text, signed + redacted reasoning, a tool call,
-//! and a tool-result turn covering the text / json / denied / error outputs, plus an assistant
-//! `origin`. The fixture then appends one realistic `Opaque` reasoning-arc vector too, because
-//! the cross-language CK wire contract must pin the serialized `OpaqueArcKind` vocabulary even
-//! when the owned producer leg does not emit that block on its own.
+//! The downstream prompt-reduction consumer parses this JSON array, so the fixture pins the
+//! `ContentKind`, `ToolResultOutput`, `origin`, and provider-extras shapes it expects. A matching
+//! downstream fixture catches a wire mismatch before the modules exchange messages. This vector
+//! also covers opaque reasoning arcs, which the owned message type does not emit itself.
 //!
 //! Regenerate after an INTENTIONAL CK shape change: `BROCA_UPDATE_GOLDEN=1 cargo test -p
-//! broca-ck --test it ck_wire_golden::`. A change here is a wire-contract change — coordinate the
-//! matching update with magic-context's ingress golden.
+//! broca-ck --test it ck_wire_golden::`. The wire-type change and the matching downstream fixture
+//! must move together.
 
-use broca_ck::{
-    lift, CkMessage, ContentBlock as CkBlock, ContentKind, OpaqueArc, OpaqueArcKind, OpaqueArcRole,
-    OpaqueBlock, OpaqueSource, ResultBlock, ResultBlockKind, Role as CkRole, ToolResultOutput,
-    ToolResultOutputKind,
-};
-use broca_protocol::content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
-use broca_protocol::request::ModelHandle;
-use broca_protocol::ToolCallId;
+use broca_ck::CkMessage;
 
 fn fixture_path() -> &'static str {
     concat!(
@@ -37,168 +22,11 @@ fn fixture_text() -> String {
     std::fs::read_to_string(fixture_path()).expect("read CK wire golden fixture")
 }
 
-/// A representative prompt exercising every owned-producer content kind.
-fn corpus() -> Vec<Message> {
-    vec![
-        Message::new(
-            Role::System,
-            vec![ContentBlock::Text {
-                text: "You are a helpful assistant.".into(),
-            }],
-        ),
-        Message::new(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: "Do the thing.".into(),
-            }],
-        ),
-        Message::assistant_from(
-            vec![
-                ContentBlock::Reasoning {
-                    text: "let me think".into(),
-                    signature: Some("sig-abc".into()),
-                },
-                ContentBlock::RedactedReasoning {
-                    data: "encrypted-blob".into(),
-                    provider_format: None,
-                },
-                ContentBlock::Text {
-                    text: "calling tools".into(),
-                },
-                ContentBlock::ToolCall(ToolCall {
-                    thought_signature: None,
-                    tool_call_id: ToolCallId("call_text".into()),
-                    tool_name: "read".into(),
-                    input: serde_json::json!({"path": "a.txt"}),
-                }),
-                ContentBlock::ToolCall(ToolCall {
-                    thought_signature: None,
-                    tool_call_id: ToolCallId("call_json".into()),
-                    tool_name: "inspect".into(),
-                    input: serde_json::json!({"target": "b"}),
-                }),
-                ContentBlock::ToolCall(ToolCall {
-                    thought_signature: None,
-                    tool_call_id: ToolCallId("call_denied".into()),
-                    tool_name: "delete".into(),
-                    input: serde_json::json!({"path": "c"}),
-                }),
-                ContentBlock::ToolCall(ToolCall {
-                    thought_signature: None,
-                    tool_call_id: ToolCallId("call_err".into()),
-                    tool_name: "write".into(),
-                    input: serde_json::json!({"path": "d"}),
-                }),
-            ],
-            ModelHandle::new("anthropic", "claude-opus-4-8"),
-        ),
-        Message::new(
-            Role::Tool,
-            vec![
-                ContentBlock::ToolResult(ToolResult {
-                    tool_call_id: ToolCallId("call_text".into()),
-                    output: ToolOutput::Text {
-                        text: "file contents".into(),
-                    },
-                    is_error: false,
-                }),
-                ContentBlock::ToolResult(ToolResult {
-                    tool_call_id: ToolCallId("call_json".into()),
-                    output: ToolOutput::Json {
-                        value: serde_json::json!({"ok": true, "n": 42}),
-                    },
-                    is_error: false,
-                }),
-                ContentBlock::ToolResult(ToolResult {
-                    tool_call_id: ToolCallId("call_denied".into()),
-                    output: ToolOutput::Denied {
-                        reason: "policy forbids delete".into(),
-                    },
-                    is_error: true,
-                }),
-                ContentBlock::ToolResult(ToolResult {
-                    tool_call_id: ToolCallId("call_err".into()),
-                    output: ToolOutput::Error {
-                        message: "disk full".into(),
-                    },
-                    is_error: true,
-                }),
-            ],
-        ),
-    ]
-}
-
-fn reasoning_arc_vector() -> CkMessage {
-    CkMessage {
-        role: CkRole::Assistant,
-        content: vec![CkBlock::bare(ContentKind::Opaque(OpaqueBlock {
-            source: OpaqueSource::Wire {
-                wire: "openai_responses".into(),
-            },
-            kind: "reasoning".into(),
-            raw: br#"{"type":"reasoning","id":"rs_example","summary":[],"encrypted_content":"enc_example"}"#
-                .to_vec(),
-            arc: Some(OpaqueArc {
-                kind: OpaqueArcKind::Reasoning,
-                id: "rs_example".into(),
-                role: OpaqueArcRole::Request,
-            }),
-        }))],
-        origin: None,
-        provider_extras: Default::default(),
-        meta: Default::default(),
-    }
-}
-
-/// Array-valued error tool results have no owned form (`lift` never produces them), so the
-/// pair is hand-built the way the Anthropic decoder emits it on the MITM leg. The assistant
-/// partner keeps the arc paired: a projector that enforces call/result pairing must accept
-/// the corpus.
-fn error_content_call_vector() -> CkMessage {
-    CkMessage {
-        role: CkRole::Assistant,
-        content: vec![CkBlock::bare(ContentKind::ToolCall {
-            id: "toolu_err_content".into(),
-            name: "run_build".into(),
-            input: serde_json::json!({"target": "release"}),
-            thought_signature: None,
-            provider_executed: false,
-        })],
-        origin: None,
-        provider_extras: Default::default(),
-        meta: Default::default(),
-    }
-}
-
-fn error_content_vector() -> CkMessage {
-    CkMessage {
-        role: CkRole::Tool,
-        content: vec![CkBlock::bare(ContentKind::ToolResult {
-            id: "toolu_err_content".into(),
-            tool_name: "run_build".into(),
-            output: ToolResultOutput::bare(ToolResultOutputKind::ErrorContent {
-                blocks: vec![ResultBlock {
-                    kind: ResultBlockKind::Text {
-                        text: "build failed: exit 1".into(),
-                    },
-                    provider_extras: Default::default(),
-                }],
-            }),
-            provider_executed: false,
-        })],
-        origin: None,
-        provider_extras: Default::default(),
-        meta: Default::default(),
-    }
-}
-
 #[test]
 fn ck_wire_serialization_matches_golden() {
-    // A fixed api-family so the fixture is stable (render never reads `api`).
-    let mut ck = lift(&corpus(), &|_| "anthropic".into());
-    ck.push(reasoning_arc_vector());
-    ck.push(error_content_call_vector());
-    ck.push(error_content_vector());
+    // Deserializing and re-serializing the complete vector keeps the wire schema pinned even
+    // though prompt conversion is not part of this crate's public surface.
+    let ck: Vec<CkMessage> = serde_json::from_str(&fixture_text()).expect("parse CK array");
     let rendered = serde_json::to_string_pretty(&ck).expect("serialize CK array");
 
     if std::env::var("BROCA_UPDATE_GOLDEN").is_ok() {

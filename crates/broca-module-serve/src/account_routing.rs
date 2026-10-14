@@ -545,12 +545,6 @@ impl Candidates {
             .collect::<std::collections::BTreeSet<_>>()
             .len()
     }
-
-    pub fn lists_credential(&self, credential_id: &str) -> bool {
-        self.accounts
-            .iter()
-            .any(|candidate| candidate.credential_id == credential_id)
-    }
 }
 
 /// Whether credentials of `method` belong to provider subscription accounts (OAuth logins, as
