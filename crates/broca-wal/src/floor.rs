@@ -53,10 +53,23 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     let _guard = RAISE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if !dir.as_os_str().is_empty() {
+        broca_owner_only::create_dir_all(dir)?;
+    }
+    // Lock a stable sibling, never the floor inode that rename replaces. Different
+    // session leases do not serialize updates to this shared machine-wide file.
+    let mut options = broca_owner_only::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    let lock = options.open(lock_path(path))?;
+    #[cfg(test)]
+    process_tests::before_lock(&lock);
+    lock.lock()?;
     let mut floor = read_floor(path)?;
+    #[cfg(test)]
+    process_tests::after_read();
     let before = floor.len();
     floor.extend(names.iter().map(|name| (*name).to_owned()));
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if floor.len() == before {
         // A prior process may have renamed this readable floor without syncing
         // its parent directory. Visibility now does not prove the rename durable.
@@ -64,9 +77,6 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
             std::fs::File::open(path)?.sync_all()?;
         }
         return crate::directory_sync::sync_dir(dir);
-    }
-    if !dir.as_os_str().is_empty() {
-        broca_owner_only::create_dir_all(dir)?;
     }
     let temp = temp_path(path);
     let contents: String = floor.iter().map(|name| format!("{name}\n")).collect();
@@ -83,6 +93,15 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
         return Err(error);
     }
     crate::directory_sync::sync_dir(dir)
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(FEATURE_FLOOR_FILENAME))
+        .to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -126,7 +145,8 @@ mod tests {
             assert!(raise_floor(&path, &["scope/v1"]).is_err());
         });
         raise_floor(&path, &["scope/v1"]).unwrap();
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(lock_path(&path)).unwrap();
     }
 
     /// A missing floor is empty; a raise writes the sorted names in the format the placement
@@ -158,13 +178,17 @@ mod tests {
             std::fs::read_to_string(&floor).unwrap(),
             "plan-manifest/v1\nscope/v1\nzz-later/v2\n"
         );
-        let entries: Vec<_> = std::fs::read_dir(&dir)
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
+        entries.sort();
         assert_eq!(
             entries,
-            vec![std::ffi::OsString::from(FEATURE_FLOOR_FILENAME)]
+            vec![
+                std::ffi::OsString::from(FEATURE_FLOOR_FILENAME),
+                std::ffi::OsString::from(format!("{FEATURE_FLOOR_FILENAME}.lock"))
+            ]
         );
     }
 
@@ -217,11 +241,14 @@ mod windows_acl_tests {
         );
         assert_eq!(
             seen.get(),
-            2,
-            "both temporary publications must be inspected before rename"
+            4,
+            "stable lock and temporary publication opens must all be inspected"
         );
         assert_private(&path);
         assert_private(path.parent().unwrap());
         assert_private(&fixture.path.join("floor"));
     }
 }
+
+#[cfg(test)]
+mod process_tests;

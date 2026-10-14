@@ -82,6 +82,10 @@ the pending pass is cleared only after success. Feature-floor publication likewi
 syncs the renamed floor's parent (including `.` for a bare relative path), and a
 readable floor still needs that proof before a gated append. Non-Unix directory
 sync is an explicit no-op, not a best-effort attempt to open a directory as a file.
+Feature-floor raises hold both an in-process mutex and a cross-process advisory
+lock on a stable sibling `wal-feature-floor.lock` throughout read, union, write,
+rename and directory sync. The lock file is never renamed or removed by writers;
+session-specific leases alone do not serialize that machine-wide union.
 
 1. **Resolve a per-call PLAN first** (capability validate + approval): each call is
    either *dispatchable* or *no_dispatch{reason}* (denied / schema-invalid /

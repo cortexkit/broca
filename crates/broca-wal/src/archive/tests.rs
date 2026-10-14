@@ -39,7 +39,6 @@ fn fixture(path: &Path, members: &[(String, Vec<u8>)]) {
     writer.seal().unwrap();
 }
 /// A v1 container, as sealed before index format v2, for tests of the unverified route.
-#[cfg(unix)]
 fn fixture_v1(path: &Path, members: &[(String, Vec<u8>)]) {
     std::fs::write(path, super::v2_tests::v1_container(members)).unwrap();
 }
