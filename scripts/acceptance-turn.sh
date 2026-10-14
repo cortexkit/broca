@@ -48,6 +48,10 @@ done
 }
 
 EXPECT="${1:-}"
+command -v timeout >/dev/null 2>&1 || {
+  echo "acceptance-turn: timeout is required; install GNU coreutils and put timeout on PATH (macOS: brew install coreutils, then add its libexec/gnubin)" >&2
+  exit 2
+}
 BIN="./target/release/broca-session"
 CONN="$HOME/.local/share/cortexkit/run/subc-connection.json"
 
