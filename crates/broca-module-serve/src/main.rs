@@ -706,6 +706,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 sealed = &mut stopping => sealed,
                 _ = &mut serving => stopping.await,
             };
+            let report = registry.shutdown_report().expect("stop records its outcome");
             // LOG BOTH ARMS. Logging only the failure made SUCCESS AND NEVER-RAN IDENTICAL: a
             // quiet-window stop seals nothing, returns true, and said nothing -- exactly what a
             // handler that never fired would produce. Since every placement happens on a quiet
@@ -717,13 +718,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             if sealed {
                 tracing::warn!(
                     target: "lifecycle",
-                    "shutdown seal complete; {} session(s) were in flight",
-                    in_flight_at_signal
+                    "shutdown seal complete; {} session(s) were in flight; {}",
+                    in_flight_at_signal,
+                    report
                 );
             } else {
                 tracing::warn!(
                     target: "lifecycle",
-                    "shutdown incomplete; unsealed WALs require replay"
+                    "shutdown incomplete; unsealed WALs require replay; {}",
+                    report
                 );
             }
             // Stop the sweep supervisor so it cannot start another deletion. Interrupted
@@ -748,6 +751,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             let in_flight_at_goodbye = registry.slot_counts().runs_in_flight;
             // Wait for final actor WAL syncs and lease release before dropping the runtime.
             let sealed = registry.stop_and_seal().await;
+            let report = registry.shutdown_report().expect("stop records its outcome");
             // Stop the sweep supervisor; incomplete deletions recover from durable tombstones.
             let _ = retention_sweep.await;
             if sealed {
@@ -761,15 +765,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 // exists to remove. Do not demote it while that grep is part of the placement.
                 tracing::warn!(
                     target: "lifecycle",
-                    "shutdown seal complete on serve return (cause: {}); {} session(s) were in flight",
+                    "shutdown seal complete on serve return (cause: {}); {} session(s) were in flight; {}",
                     cause,
-                    in_flight_at_goodbye
+                    in_flight_at_goodbye,
+                    report
                 );
             } else {
                 tracing::warn!(
                     target: "lifecycle",
-                    "shutdown incomplete on serve return (cause: {}); unsealed WALs require replay",
-                    cause
+                    "shutdown incomplete on serve return (cause: {}); unsealed WALs require replay; {}",
+                    cause,
+                    report
                 );
             }
             result?;

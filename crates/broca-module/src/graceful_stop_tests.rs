@@ -287,7 +287,9 @@ impl Fixture {
 fn stop_failure_message(elapsed: Duration, registry: &LineageRegistry) -> String {
     format!(
         "the stop completes: elapsed={elapsed:?}; {}",
-        registry.stop_failure_diagnostics()
+        registry
+            .shutdown_report()
+            .expect("stop records its outcome")
     )
 }
 
@@ -308,10 +310,17 @@ async fn stop_deadline_diagnostics_name_the_remaining_session() {
         "{message}"
     );
     assert!(message.contains("elapsed="), "{message}");
-    assert!(message.contains("total=0ns"), "{message}");
-    assert!(message.contains(&format!("{:?}", f.key)), "{message}");
+    assert!(message.contains("budget=0ns"), "{message}");
+    assert!(
+        message.contains(&format!("{:?}", f.key.session)),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&f.root.to_string_lossy().to_string()),
+        "{message}"
+    );
     assert!(message.contains("\"open\""), "{message}");
-    assert!(message.contains("seal_errors=[]"), "{message}");
+    assert!(message.contains("current_failures=[]"), "{message}");
     assert!(f.registry.stop_and_seal().await);
     println!("{message}");
 }
@@ -339,14 +348,17 @@ async fn stop_seal_failure_diagnostics_include_the_session_and_error() {
     );
     let message = stop_failure_message(started.elapsed(), &f.registry);
     assert!(
-        message.contains("actor bounded shutdown seal failed"),
+        message.contains("fresh final-sync or writer shutdown failure"),
         "{message}"
     );
     assert!(message.contains("elapsed="), "{message}");
-    assert!(message.contains("total=20s"), "{message}");
+    assert!(message.contains("budget=20s"), "{message}");
     assert!(message.contains("bound=5s"), "{message}");
     assert!(message.contains("remaining_sessions=[]"), "{message}");
-    assert!(message.contains(&format!("{:?}", f.key)), "{message}");
+    assert!(
+        message.contains(&format!("{:?}", f.key.session)),
+        "{message}"
+    );
     assert!(message.contains("foreign writer"), "{message}");
     println!("{message}");
 }

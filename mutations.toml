@@ -9627,7 +9627,7 @@ new = "drop(lease); // NON-VACUITY BREAK: release lease before the writer exits"
 
 [[control]]
 id = "actor-writer-shutdown-error-propagation"
-guards = "an actor's final writer sync failure makes registry shutdown unsuccessful after joining"
+guards = "an idle actor's final writer sync failure is retained as history and unresolved recovery debt after joining"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
@@ -9636,8 +9636,90 @@ select = "expected"
 test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
 expect_red = ["actor::writer_shutdown_tests::actor_reports_final_writer_shutdown_failure"]
 file = "crates/broca-module/src/actor.rs"
-old = "if let Err(error) = result {\n            self.registry.report_seal_failure();"
-new = "if let Err(error) = result {\n            // NON-VACUITY BREAK: report a successful registry shutdown."
+old = '''            self.registry.report_seal_failure(
+                &self.key,
+                self.gen,
+                crate::registry::SealFailureStage::WriterShutdown,
+                format!("writer shutdown failed: {error}"),
+            );'''
+new = '            // NON-VACUITY BREAK: discard the writer shutdown failure and its recovery debt.'
+
+[[control]]
+id = "shutdown-outcome-not-lifetime-failures"
+guards = "a recovered idle writer failure does not taint the current stop, while its history remains visible"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::recovered_idle_writer_failure_does_not_taint_later_stop"]
+file = "crates/broca-module/src/registry.rs"
+old = 'let first_failure = self.inner.seal_state.lock().unwrap().failures.len();'
+new = 'let first_failure = 0; // NON-VACUITY BREAK: lifetime failures taint every subsequent stop.'
+
+[[control]]
+id = "shutdown-fresh-failure-incomplete"
+guards = "a final-sync failure during the current stop still makes that stop incomplete"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::writer_failure_during_stop_is_incomplete"]
+file = "crates/broca-module/src/registry.rs"
+old = '''        let complete =
+            !deadline_expired && remaining_sessions.is_empty() && current_failures.is_empty();'''
+new = '''        let complete = !deadline_expired && remaining_sessions.is_empty(); // NON-VACUITY BREAK: ignore fresh seal failures.'''
+
+[[control]]
+id = "shutdown-recovery-debt-is-session-scoped"
+guards = "successful recovery of one session does not discharge an orphaned session's recovery debt"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::recovery_clears_only_the_recovered_session_debt"]
+file = "crates/broca-module/src/registry.rs"
+old = '''        self.inner
+            .seal_state
+            .lock()
+            .unwrap()
+            .recovery_debt
+            .remove(key);'''
+new = '''        let _ = key;
+        self.inner.seal_state.lock().unwrap().recovery_debt.clear(); // NON-VACUITY BREAK: erase all sessions' debt.'''
+
+[[control]]
+id = "shutdown-recovered-debt-discharged"
+guards = "successful recovery and sync discharge the recovered session's debt but preserve its failure event"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::recovered_idle_writer_failure_does_not_taint_later_stop"]
+file = "crates/broca-module/src/actor.rs"
+old = '            self.registry.report_recovered(&self.key);'
+new = '            // NON-VACUITY BREAK: keep debt even after successful recovery and sync.'
+
+[[control]]
+id = "shutdown-includes-failing-closing-generation"
+guards = "a failed writer still holding its closing slot at stop is part of the current stop's outcome"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::failing_slot_still_closing_at_stop_is_incomplete"]
+file = "crates/broca-module/src/registry.rs"
+old = '''*index >= first_failure || stopping_generations.contains(&event.generation)'''
+new = '''*index >= first_failure || (false && stopping_generations.contains(&event.generation)) /* NON-VACUITY BREAK: discard a closing slot's already-reported failure. */'''
 
 [[control]]
 id = "subc-local-close-fanout"
