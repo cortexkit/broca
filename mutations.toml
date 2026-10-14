@@ -9665,3 +9665,27 @@ expect_red = ["connection::tests::local_route_close_wakes_sibling_calls_only_in_
 file = "crates/broca-subc/src/connection.rs"
 old = '        finish_route(&runtime.pending, &runtime.route_epochs, &frame);'
 new = '        /* NON-VACUITY BREAK: leave local waiters stranded */'
+
+[[control]]
+id = "subc-probe-egress-budget"
+guards = "Probe enqueue and write confirmation have a deadline independent of post-write silence"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::blocked_ping_write_expires_and_reconnects", "connection::tests::blocked_ping_enqueue_expires"]
+file = "crates/broca-subc/src/connection.rs"
+old = 'const PROBE_EGRESS_TIMEOUT: Duration = Duration::from_secs(2);'
+new = 'const PROBE_EGRESS_TIMEOUT: Duration = Duration::from_secs(3600); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-writer-shutdown-cancellation"
+guards = "Generation shutdown interrupts a blocked frame write"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::blocked_ping_write_expires_and_reconnects"]
+file = "crates/broca-subc/src/connection.rs"
+old = '            _ = shutdown.cancelled() => break,'
+new = '            _ = std::future::pending::<()>() => break, // NON-VACUITY BREAK'
