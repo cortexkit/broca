@@ -27,10 +27,7 @@ use subc_protocol::{
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::{mpsc, oneshot},
     time,
 };
@@ -1772,14 +1769,13 @@ async fn open_authenticated_socket(
 ) -> ConnResult<(OwnedReadHalf, OwnedWriteHalf)> {
     let conn = connection_file::read(connection_file_path)
         .map_err(|e| ConnError::Transport(format!("read connection file: {e}")))?;
-    let endpoint = conn
-        .endpoints
-        .first()
-        .ok_or_else(|| ConnError::Transport("connection file has no endpoints".into()))?;
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| ConnError::Transport(format!("connect {addr}: {e}")))?;
+    let mut stream = crate::tcp_connect::connect_endpoints(
+        conn.endpoints
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),
+    )
+    .await
+    .map_err(|e| ConnError::Transport(format!("connect: {e}")))?;
     stream
         .set_nodelay(true)
         .map_err(|e| ConnError::Transport(e.to_string()))?;
@@ -3039,6 +3035,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use tokio::net::TcpStream;
 
     /// The behavioural grace tests inject their own window to compress timeouts, so they prove
     /// the MECHANISM and are blind to the shipped VALUE. Found by mutation: setting the constant
@@ -3626,6 +3623,27 @@ mod tests {
         )
         .await
         .expect("connect to control TCP stub")
+    }
+
+    #[tokio::test]
+    async fn consumer_connect_tries_second_endpoint() {
+        let stub = ControlTcpStub::start(ControlStubReply::Blackhole).await;
+        let first = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut info = connection_file::read(&stub.connection_file).unwrap();
+        info.endpoints.insert(
+            0,
+            Endpoint {
+                host: "127.0.0.1".into(),
+                port: first.local_addr().unwrap().port(),
+            },
+        );
+        drop(first);
+        connection_file::write_atomic(&stub.connection_file, &info).unwrap();
+        let conn = SubcConnection::connect(&stub.connection_file)
+            .await
+            .unwrap();
+        assert!(conn.shared.current.lock().unwrap().active);
+        assert_eq!(stub.accept_count(), 1);
     }
 
     async fn wait_for_accept_count(stub: &ControlTcpStub, expected: usize) {

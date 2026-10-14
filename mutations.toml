@@ -9689,3 +9689,75 @@ expect_red = ["connection::tests::blocked_ping_write_expires_and_reconnects"]
 file = "crates/broca-subc/src/connection.rs"
 old = '            _ = shutdown.cancelled() => break,'
 new = '            _ = std::future::pending::<()>() => break, // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-budget"
+guards = "A blackholed TCP connection finishes within the application budget"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::blackholed_endpoint_is_bounded_by_budget"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = 'const CONNECT_BUDGET: Duration = Duration::from_secs(2);'
+new = 'const CONNECT_BUDGET: Duration = Duration::from_secs(3600); // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-ipv6"
+guards = "Raw IPv6 endpoint hosts use tuple resolution"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::ipv6_endpoint_connects"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = '    connect_with(&endpoints, TcpStream::connect).await'
+new = '    connect_with(&endpoints, |(host, port)| TcpStream::connect((host.replace(":", ""), port))).await // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-fallback"
+guards = "A failed first TCP endpoint does not suppress later endpoints"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::failed_first_endpoint_tries_second"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = '    for (index, endpoint) in endpoints.iter().enumerate() {'
+new = '    for (index, endpoint) in endpoints.iter().enumerate().take(1) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-tcp-connect-blackhole-fallback"
+guards = "A blackholed first TCP endpoint reserves time for fallback"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/tcp_connect.rs"
+expect_red = ["tcp_connect::tests::blackholed_first_endpoint_leaves_budget_for_second"]
+file = "crates/broca-subc/src/tcp_connect.rs"
+old = '        let share = remaining / (endpoints.len() - index) as u32;'
+new = '        let share = remaining; let _ = index; // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-consumer-connect-endpoints"
+guards = "The consumer socket passes all endpoints to bounded selection"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::consumer_connect_tries_second_endpoint"]
+file = "crates/broca-subc/src/connection.rs"
+old = '            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),'
+new = '            .take(1).map(|endpoint| (endpoint.host.as_str(), endpoint.port)), // NON-VACUITY BREAK'
+
+[[control]]
+id = "module-connect-endpoints"
+guards = "The module socket passes all endpoints to bounded IPv6 selection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["endpoint_connect_tests::ipv6_endpoint_connects_after_failed_first"]
+file = "crates/broca-module-serve/src/main.rs"
+old = '            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),'
+new = '            .take(1).map(|endpoint| (endpoint.host.as_str(), endpoint.port)), // NON-VACUITY BREAK'
