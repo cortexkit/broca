@@ -29,13 +29,11 @@ use std::collections::HashSet;
 
 use super::session_client::{self, ClientRun, CLIENT_DEADLINE};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -294,6 +292,7 @@ impl Drop for ResponsesCapture {
 impl Drop for AiMock {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "aimock");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -316,7 +315,8 @@ impl AiMock {
 
         let argv = aimock_argv();
         let (program, base_args) = setup("resolve aimock argv", argv.split_first())?;
-        let mut child = match Command::new(program)
+        let mut child = match broca_test_support::tokio_rig_command(program, &dir, "aimock")
+            .unwrap_or_else(|error| panic!("cannot configure aimock log files: {error}"))
             .args(base_args)
             .arg("--fixtures")
             .arg(&fixture_path)
@@ -324,8 +324,6 @@ impl AiMock {
             .arg(port.to_string())
             .arg("--host")
             .arg("127.0.0.1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
         {
@@ -345,20 +343,25 @@ impl AiMock {
                 return None;
             }
         };
-        let stdout = child.stdout.take()?;
-        let mut lines = BufReader::new(stdout).lines();
         let base_url = match timeout(Duration::from_secs(20), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(addr) = parse_listening_addr(&line) {
+            loop {
+                let logs =
+                    std::fs::read_to_string(dir.join("aimock.stdout.log")).unwrap_or_default();
+                if let Some(addr) = logs.lines().find_map(parse_listening_addr) {
                     return Some(addr);
                 }
+                if child.try_wait().ok().flatten().is_some() {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            None
         })
         .await
         {
             Ok(Some(addr)) => format!("http://{addr}"),
             _ => {
+                broca_test_support::kill_and_reap(&mut child);
+                eprintln!("{}", broca_test_support::rig_process_logs(&dir, "aimock"));
                 if aimock_required() {
                     let why = required_because().unwrap_or("unknown");
                     panic!(
@@ -499,7 +502,7 @@ struct VaultSeed {
 
 /// The real subc-core daemon supervising the broca module + the fake-aft tool provider.
 struct Daemon {
-    child: RefCell<tokio::process::Child>,
+    child: RefCell<broca_test_support::RigChild>,
     dir: PathBuf,
     connection_file: PathBuf,
 }
@@ -507,7 +510,9 @@ struct Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(self.child.get_mut());
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -1013,7 +1018,7 @@ impl Daemon {
 
         let connection_file = runtime_dir.join("subc-connection.json");
         let child = broca_test_support::retry_executable_file_busy(|| {
-            Command::new(&subc_core)
+            broca_test_support::tokio_rig_command(&subc_core, &dir, "daemon")?
                 // The daemon derives its per-module capture directory from the DATA home
                 // (`<data-home>/cortexkit/run/logs/<module_id>.stderr.log`), not from
                 // XDG_RUNTIME_DIR. A rig that leaves it unset appends its own "broca" module's
@@ -1030,6 +1035,7 @@ impl Daemon {
                 .spawn()
         })
         .expect("spawn subc-core");
+        let child = broca_test_support::RigChild::new(child, &dir, "daemon");
 
         // Wait until the connection file is published (subc is up). Once the binaries are
         // present (subc_required passed), the daemon FAILING to come up is a real failure, not
@@ -2781,7 +2787,7 @@ async fn the_readiness_diagnosis_separates_a_dead_supervisor_from_a_missing_modu
     let mut dead = exits_immediately().spawn().expect("spawn");
     dead.wait().await.expect("reap");
     let mut daemon = Daemon {
-        child: RefCell::new(dead),
+        child: RefCell::new(broca_test_support::RigChild::new(dead, &dir, "daemon")),
         dir: dir.clone(),
         connection_file: dir.join("subc-connection.json"),
     };
@@ -2794,7 +2800,7 @@ async fn the_readiness_diagnosis_separates_a_dead_supervisor_from_a_missing_modu
     // A process still running, standing in for a live supervisor whose module never appeared.
     let alive = stays_running().kill_on_drop(true).spawn().expect("spawn");
     let mut daemon = Daemon {
-        child: RefCell::new(alive),
+        child: RefCell::new(broca_test_support::RigChild::new(alive, &dir, "daemon")),
         dir,
         connection_file: std::path::PathBuf::from("/nonexistent"),
     };

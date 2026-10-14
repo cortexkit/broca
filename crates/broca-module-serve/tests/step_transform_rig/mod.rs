@@ -235,9 +235,15 @@ pub async fn register_as(
     })
 }
 pub struct Daemon {
-    pub child: tokio::process::Child,
+    pub child: broca_test_support::RigChild,
     pub connection_file: PathBuf,
     serving: tokio::task::JoinHandle<()>,
+}
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.serving.abort();
+        broca_test_support::kill_and_reap(&mut self.child);
+    }
 }
 impl Daemon {
     pub async fn start(dir: &Path, state: Arc<State>) -> Self {
@@ -249,9 +255,11 @@ impl Daemon {
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(config, r#"{"version":1,"modules":{}}"#).unwrap();
         let child = broca_test_support::retry_executable_file_busy(|| {
-            tokio::process::Command::new(
-                broca_test_support::ckdev_command(source.clone(), dir).get_program(),
-            )
+            broca_test_support::tokio_rig_command(
+                broca_test_support::ckdev_binary(source.clone(), dir),
+                dir,
+                "daemon",
+            )?
             .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_DATA_HOME", dir.join("data-home"))
@@ -263,6 +271,7 @@ impl Daemon {
             .spawn()
         })
         .unwrap();
+        let child = broca_test_support::RigChild::new(child, dir, "daemon");
         let connection_file = runtime.join("subc-connection.json");
         tokio::time::timeout(Duration::from_secs(20), async {
             while !connection_file.exists() {

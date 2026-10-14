@@ -197,6 +197,7 @@ struct Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(self.child.get_mut());
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -284,7 +285,7 @@ impl Daemon {
 
         let connection_file = runtime_dir.join("subc-connection.json");
         let child = broca_test_support::retry_executable_file_busy(|| {
-            Command::new(&subc_core)
+            broca_test_support::tokio_rig_command(&subc_core, &dir, "daemon")?
                 // The daemon derives its per-module capture directory from the DATA home
                 // (`<data-home>/cortexkit/run/logs/<module_id>.stderr.log`), not from
                 // XDG_RUNTIME_DIR. A rig that leaves it unset appends its own "broca" module's

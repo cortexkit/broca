@@ -31,6 +31,7 @@
 mod ckdev;
 mod process;
 mod rig_logs;
+mod rig_stdio;
 mod tracing_capture;
 pub use ckdev::{
     ckdev_binary, ckdev_binary_pair, ckdev_binary_with_companion, ckdev_command,
@@ -38,6 +39,9 @@ pub use ckdev::{
 };
 pub use process::kill_and_reap;
 pub use rig_logs::{append_file_tail, rig_log_diagnostics};
+pub use rig_stdio::{
+    dump_rig_process_logs_on_failure, rig_command, rig_process_logs, tokio_rig_command, RigChild,
+};
 pub use tracing_capture::{capture_logs, LogCapture, LogEvent};
 
 use std::path::{Path, PathBuf};

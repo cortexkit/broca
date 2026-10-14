@@ -72,6 +72,7 @@ impl Drop for Rig {
             }
         }
         broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -230,7 +231,7 @@ impl Rig {
         // replacement, so for a moment the pid's image is the daemon's, not broca's.
         let daemon_image = subc_os::file_identity(&subc_core);
         let child = broca_test_support::retry_executable_file_busy(|| {
-            Command::new(&subc_core)
+            broca_test_support::tokio_rig_command(&subc_core, &dir, "daemon")?
                 .env("HOME", &dir)
                 .env("XDG_CONFIG_HOME", &config_home)
                 .env("XDG_RUNTIME_DIR", &runtime_dir)

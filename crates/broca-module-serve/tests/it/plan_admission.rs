@@ -1658,8 +1658,8 @@ async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(&config, r#"{"version":1,"modules":{}}"#).unwrap();
     let daemon_bin = broca_test_support::ckdev_binary(source, &rig.dir);
-    let mut daemon = broca_test_support::retry_executable_file_busy(|| {
-        tokio::process::Command::new(&daemon_bin)
+    let daemon = broca_test_support::retry_executable_file_busy(|| {
+        broca_test_support::tokio_rig_command(&daemon_bin, &rig.dir, "daemon")?
             .env("XDG_CONFIG_HOME", rig.dir.join("config"))
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_DATA_HOME", rig.dir.join("data-home"))
@@ -1671,6 +1671,7 @@ async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration
             .spawn()
     })
     .unwrap();
+    let mut daemon = broca_test_support::RigChild::new(daemon, &rig.dir, "daemon");
     let connection_file = runtime.join("subc-connection.json");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     while !connection_file.exists() {
@@ -1946,7 +1947,7 @@ fn subc_core_bin() -> std::path::PathBuf {
 async fn compaction_daemon(
     dir: &std::path::Path,
     modules: Value,
-) -> (tokio::process::Child, std::path::PathBuf) {
+) -> (broca_test_support::RigChild, std::path::PathBuf) {
     let source = subc_core_bin();
     assert!(source.exists(), "real ck-subc required: {source:?}");
     let runtime = dir.join("compaction-runtime");
@@ -1960,7 +1961,7 @@ async fn compaction_daemon(
     .unwrap();
     let daemon_bin = broca_test_support::ckdev_binary(source, dir);
     let daemon = broca_test_support::retry_executable_file_busy(|| {
-        tokio::process::Command::new(&daemon_bin)
+        broca_test_support::tokio_rig_command(&daemon_bin, dir, "daemon")?
             .env("XDG_CONFIG_HOME", dir.join("compaction-config"))
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_DATA_HOME", dir.join("compaction-data"))
@@ -1973,6 +1974,7 @@ async fn compaction_daemon(
             .spawn()
     })
     .unwrap();
+    let daemon = broca_test_support::RigChild::new(daemon, dir, "daemon");
     let connection = runtime.join("subc-connection.json");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     while !connection.exists() {
@@ -2197,7 +2199,7 @@ impl subc_client_rs::ModuleHandler for AdmissionCompaction {
 /// build is missing and the run does not require it.
 struct RealCompactionAdmission {
     rig: Rig,
-    daemon: tokio::process::Child,
+    daemon: broca_test_support::RigChild,
     provider: tokio::task::JoinHandle<()>,
     requests: Arc<Mutex<Vec<Value>>>,
     binds: Arc<Mutex<Vec<Value>>>,
