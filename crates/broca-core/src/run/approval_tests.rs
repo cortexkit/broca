@@ -13,6 +13,9 @@ use std::sync::{
     Mutex,
 };
 
+#[path = "consent_runtime_tests.rs"]
+mod consent_runtime_tests;
+
 struct Hooks {
     validates: AtomicUsize,
     second: &'static str,
@@ -68,6 +71,11 @@ struct Questions {
     keys: Mutex<Vec<String>>,
     attempts: AtomicUsize,
     polls: AtomicUsize,
+    awaits: AtomicUsize,
+    gets: AtomicUsize,
+    outstanding: AtomicUsize,
+    ack_calls: AtomicUsize,
+    reports: Mutex<Vec<(String, ApprovalExecution)>>,
     transient: bool,
     cursors: Mutex<Vec<Option<ApprovalCursor>>>,
     answer: Mutex<&'static str>,
@@ -118,12 +126,90 @@ impl ElicitationPlane for Questions {
             args_hash: args_hash.clone(),
         })
     }
-    async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+    async fn get(&self, _: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         let terminal = *self.answer.lock().unwrap() == "terminal";
         Ok(ApprovalQuestion {
             terminal,
-            record: json!({"state":if terminal { "expired" } else { "pending" }}),
+            record: json!({"state":if terminal { "expired" } else { "pending" },"elicitation_id":id,"requester_ref":id.strip_prefix("q:").unwrap(),"answered_choice_id":"approve","answered_at_ms":1}),
         })
+    }
+    async fn r#await(
+        &self,
+        ctx: &BatchCtx,
+        id: &str,
+        wait_ms: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        struct Outstanding<'a>(&'a AtomicUsize);
+        impl Drop for Outstanding<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+        let _route = Outstanding(&self.outstanding);
+        assert!(wait_ms <= 120_000);
+        let n = self.awaits.fetch_add(1, Ordering::SeqCst);
+        let frames = self.store.read_records(&ctx.bind).unwrap();
+        assert!(frames.iter().any(|frame| self.head.load(Ordering::SeqCst) >= frame.seq && matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.as_deref() == Some(id)))), "card id durable before await");
+        let answer = *self.answer.lock().unwrap();
+        if matches!(answer, "none" | "feed_only") {
+            return std::future::pending().await;
+        }
+        if answer == "overdue" {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let key = id.strip_prefix("q:").unwrap();
+        let prepared = frames
+            .iter()
+            .find(|frame| key.ends_with(&format!(":{}", frame.seq)))
+            .unwrap();
+        let mut record = json!({"state":"answered","requester_ref":key,"elicitation_id":id,"answered_choice_id":if answer == "decline" { "deny" } else { "approve" },"binding":crate::consent::binding(&prepared.record)});
+        if answer.starts_with("unreadable_") && n == 0 {
+            match answer {
+                "unreadable_choice_missing" => {
+                    record.as_object_mut().unwrap().remove("answered_choice_id");
+                }
+                "unreadable_choice_type" => record["answered_choice_id"] = json!(7),
+                "unreadable_id_missing" => {
+                    record.as_object_mut().unwrap().remove("elicitation_id");
+                }
+                "unreadable_id_type" => record["elicitation_id"] = json!(7),
+                "unreadable_binding_missing" => {
+                    record.as_object_mut().unwrap().remove("binding");
+                }
+                "unreadable_binding_type" => record["binding"] = json!(7),
+                _ => unreachable!(),
+            }
+        }
+        Ok(ApprovalQuestion {
+            terminal: true,
+            record,
+        })
+    }
+    async fn ack(&self, _: &BatchCtx, _: &ApprovalCursor) -> Result<(), ApprovalRouteError> {
+        self.ack_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn report_execution(
+        &self,
+        ctx: &BatchCtx,
+        id: &str,
+        value: ApprovalExecution,
+    ) -> Result<(), ApprovalRouteError> {
+        let frames = self.store.read_records(&ctx.bind).unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| self.head.load(Ordering::SeqCst) >= frame.seq
+                    && matches!(
+                        frame.record,
+                        WalRecord::ToolResult { .. } | WalRecord::LateResult { .. }
+                    )),
+            "result durable before report"
+        );
+        self.reports.lock().unwrap().push((id.into(), value));
+        Ok(())
     }
     async fn answers(
         &self,
@@ -132,6 +218,11 @@ impl ElicitationPlane for Questions {
     ) -> Result<ApprovalPage, ApprovalRouteError> {
         self.cursors.lock().unwrap().push(cursor.cloned());
         let answer = *self.answer.lock().unwrap();
+        if answer == "feed_only" {
+            while self.outstanding.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
         if answer == "none" && self.completed.load(Ordering::SeqCst) {
             let frames = self.store.read_records(&ctx.bind).unwrap();
             let terminal=frames.iter().find(|frame| matches!(&frame.record,WalRecord::ToolResult{result,..} if result.tool_call_id.0=="sibling"));
@@ -144,8 +235,7 @@ impl ElicitationPlane for Questions {
         if answer == "overdue" {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        if answer == "reset" && n == 1 {
-            assert!(cursor.is_some());
+        if answer == "reset" && n == 0 {
             return Err(ApprovalRouteError {
                 code: "cursor_incarnation_changed".into(),
                 retryable: false,
@@ -155,20 +245,39 @@ impl ElicitationPlane for Questions {
             assert!(cursor.is_none(), "old incarnation must be re-read fresh");
         }
         let unreadable = answer.starts_with("unreadable_");
-        if unreadable && n > 0 {
+        if unreadable && n == 1 {
             assert!(
                 cursor.is_none(),
                 "unreadable answer must be read again from the same position"
             );
         }
-        let mut records = if matches!(answer, "none" | "terminal") || (answer == "reset" && n == 0)
+        let after_expiry = self
+            .store
+            .read_records(&ctx.bind)
+            .unwrap()
+            .iter()
+            .any(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::ApprovalRecorded {
+                        decision: broca_wal::DeferredDecision::Expired,
+                        ..
+                    }
+                )
+            });
+        let mut records = if cursor.is_some()
+            || (self.awaits.load(Ordering::SeqCst) == 0 && !after_expiry)
+            || matches!(answer, "none" | "terminal")
         {
             Vec::new()
         } else {
-            self.keys.lock().unwrap().iter().map(|key| json!({"state":"answered", "call_key":key, "elicitation_id":format!("q:{key}"),
-                "answered_choice_id": if answer == "decline" { "deny" } else { "approve" }, "approval_digest":"digest"})).collect()
+            let frames = self.store.read_records(&ctx.bind).unwrap();
+            self.keys.lock().unwrap().iter().map(|key| {
+                let prepared = frames.iter().find(|frame| key.ends_with(&format!(":{}",frame.seq))).unwrap();
+                json!({"state":"answered", "requester_ref":key, "elicitation_id":format!("q:{key}"),
+                "answered_choice_id": if answer == "decline" { "deny" } else { "approve" }, "binding":crate::consent::binding(&prepared.record)}) }).collect()
         };
-        if unreadable && n == 0 {
+        if unreadable && n == 0 && !records.is_empty() {
             match answer {
                 "unreadable_choice_missing" => {
                     records[0]
@@ -181,13 +290,10 @@ impl ElicitationPlane for Questions {
                     records[0].as_object_mut().unwrap().remove("elicitation_id");
                 }
                 "unreadable_id_type" => records[0]["elicitation_id"] = json!(7),
-                "unreadable_digest_missing" => {
-                    records[0]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("approval_digest");
+                "unreadable_binding_missing" => {
+                    records[0].as_object_mut().unwrap().remove("binding");
                 }
-                "unreadable_digest_type" => records[0]["approval_digest"] = json!(7),
+                "unreadable_binding_type" => records[0]["binding"] = json!(7),
                 _ => unreachable!(),
             }
         }
@@ -214,6 +320,7 @@ struct Tools {
     outcome: Mutex<&'static str>,
     refuse_scope: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<(String, String, BatchId)>>,
+    provider_requests: AtomicUsize,
     store: crate::FileWalStore,
     bind: BindIdentity,
 }
@@ -248,6 +355,7 @@ impl ToolPlane for Tools {
         Ok(())
     }
     async fn dispatch(&self, _: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        self.provider_requests.fetch_add(1, Ordering::SeqCst);
         self.started.store(true, Ordering::SeqCst);
         let hold = self.hold.lock().unwrap().clone();
         if let Some(hold) = hold {
@@ -259,7 +367,7 @@ impl ToolPlane for Tools {
             output: ToolOutput::Text {
                 text: "ordinary".into(),
             },
-            is_error: false,
+            is_error: *self.outcome.lock().unwrap() == "provider_error",
         })
     }
     async fn recheck_approval_scope(
@@ -377,6 +485,11 @@ impl Rig {
             keys: Mutex::new(Vec::new()),
             attempts: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
+            awaits: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
+            outstanding: AtomicUsize::new(0),
+            ack_calls: AtomicUsize::new(0),
+            reports: Mutex::new(Vec::new()),
             transient,
             cursors: Mutex::new(Vec::new()),
             answer: Mutex::new(answer),
@@ -415,6 +528,7 @@ impl Rig {
                 outcome: Mutex::new("completed"),
                 refuse_scope: std::sync::atomic::AtomicBool::new(false),
                 sent: Mutex::new(Vec::new()),
+                provider_requests: AtomicUsize::new(0),
                 store,
                 bind,
             },
@@ -553,6 +667,7 @@ async fn restart_pause_refiles_same_key_without_mutate_and_continues_approved_ca
         WalRecord::ToolBatchFinished { .. } | WalRecord::ToolResult { .. }
     )));
     let validates = rig.hooks.validates.load(Ordering::SeqCst);
+    let recorded_id = rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some())));
     let resume = ResumeCtx {
         batch_already_started: true,
         existing: Default::default(),
@@ -577,10 +692,18 @@ async fn restart_pause_refiles_same_key_without_mutate_and_continues_approved_ca
         validates + 1,
         "resume runs only second validation"
     );
-    assert_eq!(rig.questions.keys.lock().unwrap().len(), 2);
+    assert_eq!(
+        rig.questions.keys.lock().unwrap().len(),
+        if recorded_id || paused.open[0].id.is_some() {
+            1
+        } else {
+            2
+        },
+        "a recorded id is read, while a request-return/id-sync pause recovers by key"
+    );
     {
         let keys = rig.questions.keys.lock().unwrap().clone();
-        assert_eq!(keys[0], keys[1]);
+        assert!(keys.iter().all(|key| key == &keys[0]));
     }
     assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1152,6 +1275,7 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
         outcome: Mutex::new("completed"),
         refuse_scope: std::sync::atomic::AtomicBool::new(false),
         sent: Mutex::new(Vec::new()),
+        provider_requests: AtomicUsize::new(0),
         store: cut_store,
         bind: rig.bind.clone(),
     };
@@ -1362,7 +1486,7 @@ async fn approved_not_dispatched_restart_resumes_only_second_validation() {
     .await
     .unwrap();
     assert_eq!(paused.interruption, Some(BatchInterruption::RestartPause));
-    assert!(paused.open[0].digest.is_some());
+    assert!(paused.open[0].approved);
     let frames = rig.frames();
     let recorded = frames
         .iter()
@@ -1396,6 +1520,8 @@ async fn approved_not_dispatched_restart_resumes_only_second_validation() {
         seen: Mutex::new(Vec::new()),
     });
     rig.control.hook_plane = Some(rig.hooks.clone());
+    let gets = rig.questions.gets.load(Ordering::SeqCst);
+    let awaits = rig.questions.awaits.load(Ordering::SeqCst);
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), true)
         .await;
@@ -1407,6 +1533,9 @@ async fn approved_not_dispatched_restart_resumes_only_second_validation() {
         "only the validate hook is re-entered"
     );
     assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
+    assert_eq!(rig.questions.gets.load(Ordering::SeqCst), gets);
+    assert_eq!(rig.questions.awaits.load(Ordering::SeqCst), awaits);
+    assert_eq!(rig.questions.ack_calls.load(Ordering::SeqCst), 0);
     rig.finish().await;
 }
 
@@ -1470,7 +1599,7 @@ async fn answer_read_after_broca_expiry_is_classified_late_before_terminal_dedup
     let batch = rig.batch(&crate::AllowAll, vec![call("c"), sibling], None, false);
     let expire_and_drain = async {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
-        while rig.questions.polls.load(Ordering::SeqCst) == 0 {
+        while rig.questions.awaits.load(Ordering::SeqCst) == 0 {
             interval.tick().await;
         }
         std::fs::write(
@@ -1685,14 +1814,12 @@ async fn late_cancel_at_successful_scope_recheck_starts_no_dispatch() {
 }
 
 #[tokio::test]
-async fn unreadable_answer_does_not_advance_cursor() {
+async fn unreadable_await_retries_same_card_without_refile() {
     for answer in [
         "unreadable_choice_missing",
         "unreadable_choice_type",
         "unreadable_id_missing",
         "unreadable_id_type",
-        "unreadable_digest_missing",
-        "unreadable_digest_type",
     ] {
         let rig = Rig::new("pass", answer, false, false);
         let result = rig
@@ -1708,6 +1835,7 @@ async fn unreadable_answer_does_not_advance_cursor() {
             vec![None, None],
             "both reads start at the same cursor position"
         );
+        assert_eq!(rig.questions.awaits.load(Ordering::SeqCst), 2);
         let frames = rig.frames();
         assert_eq!(
             frames
@@ -1745,6 +1873,7 @@ fn tools_for_store(store: crate::FileWalStore, bind: BindIdentity) -> Tools {
         outcome: Mutex::new("completed"),
         refuse_scope: std::sync::atomic::AtomicBool::new(false),
         sent: Mutex::new(Vec::new()),
+        provider_requests: AtomicUsize::new(0),
         store,
         bind,
     }
@@ -2053,4 +2182,40 @@ async fn store_resume_open_batch_pause_preserves_next_request_bytes() {
         paused.finish().await;
         uninterrupted.finish().await;
     }).await.expect("bounded store-assisted restart regression");
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn unreadable_answer_does_not_advance_cursor() {
+    let rig = expired_run("pass").await;
+    *rig.questions.answer.lock().unwrap() = "unreadable_choice_missing";
+    rig.questions.polls.store(0, Ordering::SeqCst);
+    rig.questions.cursors.lock().unwrap().clear();
+    let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *rig.questions.cursors.lock().unwrap(),
+        [None],
+        "unreadable page must not advance to its continuation"
+    );
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 1);
+    rig.finish().await;
 }

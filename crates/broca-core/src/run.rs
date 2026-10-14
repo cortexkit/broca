@@ -3161,8 +3161,12 @@ where
                     .and_then(|config| render_config_error(provider, config))
                     .is_some())
         {
-            for record in close_out {
-                writer.record(record);
+            for record in &close_out {
+                writer.record(record.clone());
+            }
+            writer.sync().await?;
+            if let Some(history) = &approval_history {
+                approval_gate::report_close_out(history, &close_out, &req.session, control).await;
             }
             control.close_steers();
             let (summary, seq) = finish_run(
@@ -3405,10 +3409,14 @@ where
                         _ => None,
                     })
                     .collect();
-                for record in close_out {
-                    writer.record(record);
+                for record in &close_out {
+                    writer.record(record.clone());
                 }
                 writer.sync().await?;
+                if let Some(history) = &approval_history {
+                    approval_gate::report_close_out(history, &close_out, &req.session, control)
+                        .await;
+                }
                 // Emitted after the barrier, like every live tool result, so a caller never
                 // sees a result a later resume would report as lost.
                 if control.emit_control_payloads {
@@ -5093,6 +5101,7 @@ async fn pause_run_impl(
     if is_cancelled(control) {
         if let Some((calls, ctx)) = open {
             approval_gate::close_open(calls, ctx, writer).await?;
+            approval_gate::report_open(calls, ctx, control).await;
         }
         return finish_run(
             writer,
@@ -8987,7 +8996,7 @@ mod approval_gate {
         pub key: String,
         pub prepared: Arc<WalRecord>,
         pub id: Option<String>,
-        pub digest: Option<String>,
+        pub approved: bool,
         filed: bool,
         retry_at: u64,
         backoff: u64,
@@ -9035,7 +9044,11 @@ mod approval_gate {
     enum Work {
         Dispatched(CallResolution),
         Validated(Option<CallResolution>),
-        Filed(Result<crate::tool_plane::ApprovalFiling, ApprovalRouteError>),
+        Filed(
+            Result<crate::consent::RecoveredCard, ApprovalRouteError>,
+            Option<String>,
+        ),
+        Awaited(Result<crate::tool_plane::ApprovalQuestion, ApprovalRouteError>),
     }
     type AnswerRead<'a> =
         Pin<Box<dyn Future<Output = Result<ApprovalPage, ApprovalRouteError>> + Send + 'a>>;
@@ -9114,19 +9127,19 @@ mod approval_gate {
                 .iter()
                 .find(|(_, value)| value.prepared == call.prepared)
                 .ok_or_else(|| RunError::Wal("Prepared anchor missing from full WAL".into()))?;
-            let digest = call
-                .approval
-                .as_deref()
-                .and_then(|approval| match approval {
+            let approved = call.approval.as_deref().is_some_and(|approval| {
+                matches!(
+                    approval,
                     WalRecord::ApprovalRecorded {
                         decision: DeferredDecision::Approved,
-                        approval_digest,
                         ..
-                    } => approval_digest.clone(),
-                    _ => None,
-                });
-            if call.approval.is_some() && digest.is_none() {
-                return Err(RunError::Wal("approved call lacks approval_digest".into()));
+                    }
+                )
+            });
+            if call.approval.is_some() && !approved {
+                return Err(RunError::Wal(
+                    "resumed call lacks an approved decision".into(),
+                ));
             }
             if let WalRecord::ToolCallDeferred {
                 args_jcs, executor, ..
@@ -9145,7 +9158,7 @@ mod approval_gate {
                 id: call
                     .elicitation_id
                     .or_else(|| projected.elicitation_id.clone()),
-                digest,
+                approved,
                 filed: false,
                 retry_at: 0,
                 backoff: 50,
@@ -9184,14 +9197,12 @@ mod approval_gate {
         let pending = slots
             .iter()
             .filter_map(|slot| match slot {
-                Slot::Held(call) if call.digest.is_none() => {
-                    Some(broca_wal::AwaitingApprovalEntry {
-                        call_key: call.key.clone(),
-                        call_id: call.call().tool_call_id,
-                        elicitation_id: call.id.clone(),
-                        expires_at_ms: call.expires(),
-                    })
-                }
+                Slot::Held(call) if !call.approved => Some(broca_wal::AwaitingApprovalEntry {
+                    call_key: call.key.clone(),
+                    call_id: call.call().tool_call_id,
+                    elicitation_id: call.id.clone(),
+                    expires_at_ms: call.expires(),
+                }),
                 _ => None,
             })
             .collect();
@@ -9248,16 +9259,84 @@ mod approval_gate {
                 reason: None,
                 hooks: None,
                 provider_held: None,
-                withdraw_elicitation: call.digest.is_none().then(|| {
-                    broca_wal::WithdrawElicitation {
-                        call_key: call.key.clone(),
-                        elicitation_id: call.id.clone(),
-                    }
+                withdraw_elicitation: (!call.approved).then(|| broca_wal::WithdrawElicitation {
+                    call_key: call.key.clone(),
+                    elicitation_id: call.id.clone(),
                 }),
             });
         }
         writer.sync().await?;
         Ok(())
+    }
+    pub(super) async fn report_close_out(
+        history: &History,
+        records: &[WalRecord],
+        bind: &BindIdentity,
+        control: &RunControl,
+    ) {
+        let Some(plane) = &control.elicitation_plane else {
+            return;
+        };
+        for record in records {
+            let WalRecord::ToolResult {
+                batch_id,
+                result,
+                outcome,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            for call in history
+                .projection
+                .calls
+                .values()
+                .filter(|call| call.decision == Some(DeferredDecision::Approved))
+            {
+                let WalRecord::ToolCallDeferred {
+                    batch_id: origin,
+                    call_id,
+                    scope,
+                    ..
+                } = &*call.prepared
+                else {
+                    continue;
+                };
+                if origin != batch_id || call_id != &result.tool_call_id {
+                    continue;
+                }
+                if let (Some(id), Some(run_id)) = (&call.elicitation_id, &call.run_id) {
+                    let ctx = BatchCtx {
+                        batch_id: batch_id.clone(),
+                        bind: bind.clone(),
+                        run_id: run_id.clone(),
+                        scope: Some(scope.clone()),
+                    };
+                    let value = if *outcome == DispatchOutcome::Unknown {
+                        crate::tool_plane::ApprovalExecution::OutcomeUnknown
+                    } else {
+                        crate::tool_plane::ApprovalExecution::ApprovedNotExecuted
+                    };
+                    crate::consent::report(plane.as_ref(), &ctx, id, value, None).await;
+                }
+            }
+        }
+    }
+    pub(super) async fn report_open(open: &[Held], ctx: &BatchCtx, control: &RunControl) {
+        if let Some(plane) = &control.elicitation_plane {
+            for call in open.iter().filter(|call| call.approved) {
+                if let Some(id) = &call.id {
+                    crate::consent::report(
+                        plane.as_ref(),
+                        &call.ctx(ctx),
+                        id,
+                        crate::tool_plane::ApprovalExecution::ApprovedNotExecuted,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
     }
     async fn sync_result(
         resolution: &mut CallResolution,
@@ -9544,7 +9623,7 @@ mod approval_gate {
             key,
             prepared: Arc::new(prepared),
             id: None,
-            digest: None,
+            approved: false,
             filed: false,
             retry_at: 0,
             backoff: 50,
@@ -9868,6 +9947,11 @@ mod approval_gate {
         let mut polling: Option<AnswerRead<'_>> = None;
         let mut next_poll = 0;
         let mut interruption = None;
+        let mut waits = HashMap::<usize, CancellationToken>::new();
+        let mut card_ids = HashMap::<usize, Arc<std::sync::Mutex<Option<String>>>>::new();
+        let mut approved_calls = HashMap::<usize, Held>::new();
+        let mut feedback: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + '_>>> =
+            FuturesUnordered::new();
         if slots.iter().any(|slot| matches!(slot, Slot::Held(_))) {
             marker(slots, ctx, writer, history).await?;
         }
@@ -9890,14 +9974,30 @@ mod approval_gate {
             let stopping = interruption.is_some();
             if stopping {
                 polling = None;
+                for token in waits.values() {
+                    token.cancel();
+                }
             }
             let eligible = slots
                 .iter()
                 .position(|slot| !matches!(slot, Slot::Done(_)))
                 .unwrap_or(slots.len());
             for index in 0..slots.len() {
+                // consent.request can return a card id before the AwaitingApproval
+                // WAL sync completes. Expiry or cancellation must not lose that id:
+                // syncing the closing record also commits the earlier id marker,
+                // so later detach or withdrawal can address the existing card.
+                if let (Slot::Held(call), Some(saved)) = (&mut slots[index], card_ids.get(&index)) {
+                    if let Some(id) = saved.lock().expect("recovery id lock").clone() {
+                        call.id = Some(id);
+                    }
+                }
                 if let Slot::Held(call) = &slots[index] {
-                    if !stopping && call.digest.is_none() && now(control) >= call.expires() {
+                    if !stopping && !call.approved && now(control) >= call.expires() {
+                        if let Some(token) = waits.remove(&index) {
+                            token.cancel();
+                        }
+                        let held = call.clone();
                         let kind = if call.id.is_some() {
                             DeferredDecision::Expired
                         } else {
@@ -9908,6 +10008,13 @@ mod approval_gate {
                             .expect("closing decision");
                         slots[index] = Slot::Done(result);
                         marker(slots, ctx, writer, history).await?;
+                        if let (Some(elicitation), Some(id)) =
+                            (control.elicitation_plane.as_ref(), held.id.clone())
+                        {
+                            feedback.push(Box::pin(async move {
+                                release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await;
+                            }));
+                        }
                         continue;
                     }
                 }
@@ -9953,11 +10060,12 @@ mod approval_gate {
                 if stopping {
                     continue;
                 }
-                if call.digest.is_some() {
+                if call.approved {
                     if sequential && index != eligible {
                         continue;
                     }
                     let held = call.clone();
+                    approved_calls.insert(index, held.clone());
                     active.insert(index);
                     jobs.push(Box::pin(async move {
                         let result = tokio::select! {
@@ -9981,20 +10089,67 @@ mod approval_gate {
                     let held = call.clone();
                     let timestamp = now(control);
                     active.insert(index);
+                    let wait_cancel = CancellationToken::new();
+                    waits.insert(index, wait_cancel.clone());
+                    let saved_id = Arc::new(std::sync::Mutex::new(held.id.clone()));
+                    card_ids.insert(index, saved_id.clone());
                     jobs.push(Box::pin(async move {
                         let filing_ctx = held.ctx(ctx);
+                        let saved = saved_id.clone();
                         let result = tokio::select! {
                             biased;
+                            _ = wait_cancel.cancelled() => Err(ApprovalRouteError { code: "stopped".into(), retryable: true }),
                             _ = cancelled_token(control.cancel.as_ref()) => Err(ApprovalRouteError { code: "cancelled".into(), retryable: true }),
                             _ = cancelled_token(control.stop_requested.as_ref()) => Err(ApprovalRouteError { code: "stopped".into(), retryable: true }),
-                            result = tokio::time::timeout(Duration::from_millis(held.expires().saturating_sub(timestamp).min(10_000)),
-                                elicitation.request(&filing_ctx, &held.key, &held.prepared, timestamp)) => result.unwrap_or_else(|_| Err(ApprovalRouteError { code: "timeout".into(), retryable: true })),
+                            result = tokio::time::timeout(Duration::from_millis(held.expires().saturating_sub(timestamp).min(10_000)), async {
+                                if let Some(id) = &held.id {
+                                    let question = elicitation.get(&filing_ctx, id).await?;
+                                    let answer = crate::consent::answer(&question.record, &held.key, &held.prepared)?;
+                                    if answer.as_ref().is_some_and(|answer| &answer.id != id) { return Err(crate::consent::refusal("consent_card_mismatch", false)); }
+                                    Ok(crate::consent::RecoveredCard { id: id.clone(), answer })
+                                } else {
+                                    crate::consent::recover(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, timestamp, |record| {
+                                        let saved = saved.clone();
+                                        async move {
+                                            let id = match &record { WalRecord::AwaitingApproval { pending, .. } => pending[0].elicitation_id.clone(), _ => None };
+                                            writer.record(record).into_result().map_err(|_| crate::consent::refusal("wal_write_failed", true))?;
+                                            *saved.lock().expect("recovery id lock") = id;
+                                            writer.sync().await.map_err(|_| crate::consent::refusal("wal_sync_failed", true))?;
+                                            Ok(())
+                                        }
+                                    }).await
+                                }
+                            }) => result.unwrap_or_else(|_| Err(ApprovalRouteError { code: "timeout".into(), retryable: true })),
                         };
-                        (index, Work::Filed(result))
+                        let id = saved_id.lock().expect("recovery id lock").clone();
+                        (index, Work::Filed(result, id))
+                    }));
+                } else if call.filed && now(control) >= call.retry_at {
+                    let Some(elicitation) = control.elicitation_plane.as_ref() else {
+                        continue;
+                    };
+                    let held = call.clone();
+                    let wait_cancel = CancellationToken::new();
+                    waits.insert(index, wait_cancel.clone());
+                    active.insert(index);
+                    jobs.push(Box::pin(async move {
+                        let wait_ms = held.expires().saturating_sub(now(control)).min(120_000);
+                        let await_ctx = held.ctx(ctx);
+                        let result = tokio::select! {
+                            biased;
+                            _ = wait_cancel.cancelled() => Err(crate::consent::refusal("stopped", true)),
+                            _ = cancelled_token(control.cancel.as_ref()) => Err(crate::consent::refusal("cancelled", true)),
+                            _ = cancelled_token(control.stop_requested.as_ref()) => Err(crate::consent::refusal("stopped", true)),
+                            result = tokio::time::timeout(Duration::from_millis(wait_ms), elicitation.r#await(&await_ctx, held.id.as_deref().expect("durable card id"), wait_ms)) => result.unwrap_or_else(|_| Err(crate::consent::refusal("timeout", true))),
+                        };
+                        (index, Work::Awaited(result))
                     }));
                 }
             }
             if slots.iter().all(|slot| matches!(slot, Slot::Done(_))) {
+                jobs.clear();
+                drop(polling.take());
+                while feedback.next().await.is_some() {}
                 return Ok(interruption);
             }
             if stopping && dispatched.is_empty() && active.is_empty() {
@@ -10003,6 +10158,7 @@ mod approval_gate {
                     && restart
                     && interruption == Some(BatchInterruption::StopRequested)
                 {
+                    marker(slots, ctx, writer, history).await?;
                     return Ok(Some(BatchInterruption::RestartPause));
                 }
                 let open: Vec<_> = slots
@@ -10013,6 +10169,7 @@ mod approval_gate {
                     })
                     .collect();
                 close_open(&open, ctx, writer).await?;
+                report_open(&open, ctx, control).await;
                 for slot in slots.iter_mut() {
                     if let Slot::Held(call) = slot {
                         *slot = Slot::Done(CallResolution::plain(
@@ -10024,38 +10181,80 @@ mod approval_gate {
                 marker(slots, ctx, writer, history).await?;
                 continue;
             }
-            if !stopping && polling.is_none() && now(control) >= next_poll && (slots.iter().any(|slot| matches!(slot, Slot::Held(call) if call.digest.is_none() && call.id.is_some())) || !history.projection.obligations().expired_without_late_record.is_empty()) {
+            if !stopping
+                && polling.is_none()
+                && now(control) >= next_poll
+                && !history
+                    .projection
+                    .obligations()
+                    .expired_without_late_record
+                    .is_empty()
+            {
                 if let Some(elicitation) = control.elicitation_plane.as_ref() {
                     let since = cursor.clone();
-                    polling = Some(Box::pin(async move { tokio::time::timeout(Duration::from_millis(1000), elicitation.answers(ctx, since.as_ref())).await
-                        .unwrap_or_else(|_| Err(ApprovalRouteError { code: "timeout".into(), retryable: true })) }));
+                    polling = Some(Box::pin(async move {
+                        tokio::time::timeout(
+                            Duration::from_millis(1000),
+                            elicitation.answers(ctx, since.as_ref()),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(ApprovalRouteError {
+                                code: "timeout".into(),
+                                retryable: true,
+                            })
+                        })
+                    }));
                 }
             }
             tokio::select! {
                 biased;
                 Some((index, work)) = jobs.next() => {
                     active.remove(&index);
+                    waits.remove(&index);
                     match work {
                         Work::Dispatched(mut result) => {
                             dispatched.remove(&index);
                             if result.ambiguous { interruption = Some(BatchInterruption::Ambiguous); }
                             if result.stopped && interruption.is_none() { interruption = Some(BatchInterruption::StopRequested); }
+                            let value = execution(&result);
                             sync_result(&mut result, ctx, writer, hooks).await?;
+                            if let (Some(held), Some(elicitation)) = (approved_calls.remove(&index), control.elicitation_plane.as_ref()) {
+                                feedback.push(Box::pin(async move { if let Some(id) = &held.id { crate::consent::report(elicitation.as_ref(), &held.ctx(ctx), id, value, None).await; } }));
+                            }
                             slots[index] = Slot::Done(result);
                         }
-                        Work::Filed(result) => {
+                        Work::Filed(result, saved_id) => {
+                            if let Slot::Held(call) = &mut slots[index] { if saved_id.is_some() { call.id = saved_id; } }
                             if is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) { continue }
                             let Slot::Held(call) = &mut slots[index] else { continue };
                             match result {
                                 Ok(reply) => {
-                                    let WalRecord::ToolCallDeferred { args_hash, .. } = &*call.prepared else { unreachable!() };
-                                    call.id = Some(reply.elicitation_id);
-                                    if reply.args_hash == *args_hash { call.filed = true; }
-                                    else { let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("bad filing closes"); slots[index] = Slot::Done(result); }
+                                    call.id = Some(reply.id); call.filed = true;
                                     marker(slots, ctx, writer, history).await?;
+                                    if let Some(answer) = reply.answer { intake(slots, index, answer, ctx, writer, control, history).await?; }
                                 }
                                 Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(call.backoff); call.backoff = (call.backoff * 2).min(1000); }
-                                Err(_) => { let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("refusal closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?; }
+                                Err(_) => { let held = call.clone(); let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("refusal closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                    if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }
+                                }
+                            }
+                        }
+                        Work::Awaited(result) => {
+                            if stopping || is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) { continue; }
+                            let Slot::Held(call) = &mut slots[index] else { continue };
+                            if call.approved { continue; }
+                            match result {
+                                Ok(question) => match crate::consent::answer(&question.record, &call.key, &call.prepared) {
+                                    Ok(Some(answer)) if call.id.as_deref() == Some(answer.id.as_str()) => { intake(slots, index, answer, ctx, writer, control, history).await?; }
+                                    Ok(None) => { call.retry_at = now(control).saturating_add(50); }
+                                    Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
+                                    _ => { let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("invalid answer closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?; }
+                                },
+                                Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
+                                Err(_) => { let held = call.clone(); let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("await refusal closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                    if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }
+                                }
                             }
                         }
                         Work::Validated(result) => {
@@ -10063,20 +10262,22 @@ mod approval_gate {
                             // dispatch and can be dropped without stranding an in-flight tool.
                             if is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) { continue }
                             if let Some(mut result) = result {
-                                sync_result(&mut result, ctx, writer, hooks).await?; slots[index] = Slot::Done(result);
+                                sync_result(&mut result, ctx, writer, hooks).await?;
+                                if let (Some(held), Some(elicitation)) = (approved_calls.remove(&index), control.elicitation_plane.as_ref()) { feedback.push(Box::pin(async move { if let Some(id) = &held.id { crate::consent::report(elicitation.as_ref(), &held.ctx(ctx), id, crate::tool_plane::ApprovalExecution::ApprovedNotExecuted, None).await; } })); }
+                                slots[index] = Slot::Done(result);
                             } else {
                                 let Slot::Held(held) = &slots[index] else { unreachable!() };
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
                                 history.record(writer, WalRecord::ToolDispatchIntent { batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
                                     args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
-                                    approval_digest: held.digest.clone(), call_key: Some(held.key.clone()) });
+                                    approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;
                                 let bytes = args_jcs.clone();
                                 slots[index] = Slot::Running; active.insert(index); dispatched.insert(index);
                                 let mut dispatch = PlannedDispatch::from(call);
                                 dispatch.call_key = Some(held.key.clone());
-                                dispatch.approved = Some((bytes, held.digest.clone().expect("synced approved answer")));
+                                dispatch.approved = Some((bytes, String::new()));
                                 jobs.push(Box::pin(async move {
                                     let resolution = resolve_hooked(CallPlan::Dispatch(dispatch), index, step, &held.ctx(ctx), plane, control.stop_requested.as_ref(), hooks).await;
                                     (index, Work::Dispatched(resolution))
@@ -10091,23 +10292,12 @@ mod approval_gate {
                         Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }
                         Err(_) => {}
                         Ok(page) => {
-                            let Ok(answers)=read_answers(&page.records) else {continue};
-                            for (key,id,approved,digest) in answers {
-                                if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && call.digest.is_none())) {
-                                    let Slot::Held(call) = &mut slots[index] else { unreachable!() };
-                                    call.id = Some(id.clone());
-                                    // Broca's clock wins even if the provider accepted the answer earlier.
-                                    if now(control) >= call.expires() {
-                                        let result = decision(call, DeferredDecision::Expired, None, writer, history).await?.expect("expiry closes"); slots[index] = Slot::Done(result);
-                                        late_answer(history, writer, &key, &id, approved, digest).await?;
-                                    } else {
-                                        let kind = if approved { DeferredDecision::Approved } else { DeferredDecision::Declined };
-                                        let result = decision(call, kind, digest.clone(), writer, history).await?;
-                                        if let Some(result) = result { slots[index] = Slot::Done(result); }
-                                        else { call.digest = digest; }
-                                    }
-                                    marker(slots, ctx, writer, history).await?;
-                                } else { late_answer(history, writer, &key, &id, approved, digest).await?; }
+                            let Ok(answers)=read_answers(&page.records, history) else {continue};
+                            for (key,answer) in answers {
+                                if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && !call.approved)) {
+                                    if let Some(token) = waits.remove(&index) { token.cancel(); }
+                                    intake(slots, index, answer, ctx, writer, control, history).await?;
+                                } else { late_answer(history, writer, &key, answer).await?; }
                             }
                             // Intake, including the marker updates, is durable before advancing.
                             writer.sync().await?;
@@ -10115,12 +10305,96 @@ mod approval_gate {
                         }
                     }
                 }
+                Some(()) = feedback.next() => {}
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
         }
     }
     async fn cancelled_token(token: Option<&CancellationToken>) {
         cancelled(token).await
+    }
+    fn execution(result: &CallResolution) -> crate::tool_plane::ApprovalExecution {
+        use crate::tool_plane::ApprovalExecution;
+        match result.outcome {
+            Some(DispatchOutcome::Unknown) => ApprovalExecution::OutcomeUnknown,
+            Some(DispatchOutcome::Completed) if result.plane_subject => ApprovalExecution::Executed,
+            _ => ApprovalExecution::ApprovedNotExecuted,
+        }
+    }
+    async fn release(
+        plane: &dyn crate::tool_plane::ElicitationPlane,
+        ctx: &BatchCtx,
+        held: &Held,
+        id: &str,
+    ) {
+        if let Ok(Ok(question)) =
+            tokio::time::timeout(Duration::from_secs(1), plane.detach(ctx, id)).await
+        {
+            if let Ok(Some(answer)) =
+                crate::consent::answer(&question.record, &held.key, &held.prepared)
+            {
+                if answer.decision == crate::consent::ConsentDecision::Approved {
+                    crate::consent::report(
+                        plane,
+                        ctx,
+                        id,
+                        crate::tool_plane::ApprovalExecution::ApprovedNotExecuted,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    async fn report_late(control: &RunControl, ctx: &BatchCtx, call: &Held, outcome: LateOutcome) {
+        if let (Some(plane), Some(id)) = (control.elicitation_plane.as_ref(), &call.id) {
+            let value = match outcome {
+                LateOutcome::Completed => crate::tool_plane::ApprovalExecution::Executed,
+                LateOutcome::NotSent => crate::tool_plane::ApprovalExecution::ApprovedNotExecuted,
+                LateOutcome::Unknown => crate::tool_plane::ApprovalExecution::OutcomeUnknown,
+            };
+            crate::consent::report(plane.as_ref(), ctx, id, value, None).await;
+        }
+    }
+    async fn intake(
+        slots: &mut [Slot],
+        index: usize,
+        answer: crate::consent::ConsentAnswer,
+        ctx: &BatchCtx,
+        writer: &WalHandle,
+        control: &RunControl,
+        history: &mut History,
+    ) -> Result<(), RunError> {
+        let Slot::Held(call) = &mut slots[index] else {
+            return Ok(());
+        };
+        if call.approved {
+            return Ok(());
+        }
+        call.id = Some(answer.id.clone());
+        if now(control) >= call.expires()
+            || answer.decision == crate::consent::ConsentDecision::None
+        {
+            let key = call.key.clone();
+            let result = decision(call, DeferredDecision::Expired, None, writer, history)
+                .await?
+                .expect("expiry closes");
+            slots[index] = Slot::Done(result);
+            late_answer(history, writer, &key, answer).await?;
+        } else {
+            let approved = answer.decision == crate::consent::ConsentDecision::Approved;
+            let kind = if approved {
+                DeferredDecision::Approved
+            } else {
+                DeferredDecision::Declined
+            };
+            if let Some(result) = decision(call, kind, None, writer, history).await? {
+                slots[index] = Slot::Done(result);
+            } else {
+                call.approved = true;
+            }
+        }
+        marker(slots, ctx, writer, history).await
     }
     fn dispatch_resolution(id: &ToolCallId, result: DispatchResult) -> CallResolution {
         match result {
@@ -10163,9 +10437,7 @@ mod approval_gate {
         history: &mut History,
         writer: &WalHandle,
         key: &str,
-        id: &str,
-        approved: bool,
-        digest: Option<String>,
+        answer: crate::consent::ConsentAnswer,
     ) -> Result<(), RunError> {
         // Classify before deduplicating: expiry is an ordinary terminal but can still
         // acquire its one late record. All other terminals discard answers.
@@ -10182,13 +10454,13 @@ mod approval_gate {
             writer,
             WalRecord::LateApprovalRecorded {
                 call_key: key.into(),
-                elicitation_id: id.into(),
-                decision: if approved {
-                    LateDecision::Approved
-                } else {
-                    LateDecision::Declined
+                elicitation_id: answer.id,
+                decision: match answer.decision {
+                    crate::consent::ConsentDecision::Approved => LateDecision::Approved,
+                    crate::consent::ConsentDecision::Declined => LateDecision::Declined,
+                    crate::consent::ConsentDecision::None => LateDecision::None,
                 },
-                approval_digest: if approved { digest } else { None },
+                approval_digest: None,
                 late_execution: Some(late_execution),
             },
         );
@@ -10223,7 +10495,7 @@ mod approval_gate {
                 key: key.clone(),
                 prepared: projected.prepared.clone(),
                 id: projected.elicitation_id.clone(),
-                digest: None,
+                approved: false,
                 filed: false,
                 retry_at: 0,
                 backoff: 50,
@@ -10238,24 +10510,23 @@ mod approval_gate {
                 scope: None,
             };
             let ctx = held.ctx(&ctx);
-            let mut page =
-                tokio::time::timeout(Duration::from_millis(1000), elicitation.answers(&ctx, None))
-                    .await;
+            let mut page = tokio::time::timeout(
+                Duration::from_millis(1000),
+                crate::consent::lookup(elicitation.as_ref(), &ctx, &key, &held.prepared),
+            )
+            .await;
             // A fresh cursor can also be refused during a provider restart. Never interpret
             // that refusal as a stream head; leave the call eligible for the next admission.
             if matches!(&page, Ok(Err(error)) if error.code == "cursor_incarnation_changed") {
                 page = tokio::time::timeout(
                     Duration::from_millis(1000),
-                    elicitation.answers(&ctx, None),
+                    crate::consent::lookup(elicitation.as_ref(), &ctx, &key, &held.prepared),
                 )
                 .await;
             }
-            if let Ok(Ok(page)) = page {
-                let Ok(answers) = read_answers(&page.records) else {
-                    continue;
-                };
-                for (answer_key, id, approved, digest) in answers {
-                    late_answer(history, writer, &answer_key, &id, approved, digest).await?;
+            if let Ok(Ok(answer)) = page {
+                if let Some(answer) = answer {
+                    late_answer(history, writer, &key, answer).await?;
                 }
             } else {
                 continue;
@@ -10267,29 +10538,12 @@ mod approval_gate {
             if let Ok(Ok(question)) =
                 tokio::time::timeout(Duration::from_millis(1000), elicitation.get(&ctx, &id)).await
             {
-                if let AnswerResponse::Answered((answer_key, answer_id, approved, digest)) =
-                    response(&question.record)
+                if let Ok(Some(answer)) =
+                    crate::consent::answer(&question.record, &key, &held.prepared)
                 {
-                    late_answer(history, writer, &answer_key, &answer_id, approved, digest).await?;
-                } else if question.terminal
-                    && question.record.get("answered_choice_id").is_none()
-                    && question
-                        .record
-                        .get("state")
-                        .and_then(serde_json::Value::as_str)
-                        != Some("answered")
-                {
-                    history.record(
-                        writer,
-                        WalRecord::LateApprovalRecorded {
-                            call_key: key,
-                            elicitation_id: id,
-                            decision: LateDecision::None,
-                            approval_digest: None,
-                            late_execution: None,
-                        },
-                    );
-                    writer.sync().await?;
+                    if answer.id == id {
+                        late_answer(history, writer, &key, answer).await?;
+                    }
                 }
             }
         }
@@ -10325,12 +10579,13 @@ mod approval_gate {
                 key: key.clone(),
                 prepared: projected.prepared.clone(),
                 id: projected.elicitation_id.clone(),
-                digest: match projected.late_approval.as_deref() {
+                approved: matches!(
+                    projected.late_approval.as_deref(),
                     Some(WalRecord::LateApprovalRecorded {
-                        approval_digest, ..
-                    }) => approval_digest.clone(),
-                    _ => None,
-                },
+                        decision: LateDecision::Approved,
+                        ..
+                    })
+                ),
                 filed: false,
                 retry_at: 0,
                 backoff: 50,
@@ -10352,6 +10607,13 @@ mod approval_gate {
                     },
                 );
                 writer.sync().await?;
+                let ctx = call.ctx(&BatchCtx {
+                    batch_id: BatchId(format!("late:{}", call.key)),
+                    bind: session.clone(),
+                    run_id: projected.run_id.clone().expect("originating run"),
+                    scope: None,
+                });
+                report_late(control, &ctx, &call, LateOutcome::Unknown).await;
                 continue;
             }
             if is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) {
@@ -10430,7 +10692,7 @@ mod approval_gate {
                     stop: control.stop_requested.as_ref(),
                     seal: control.shutdown_seal.as_ref(),
                 });
-            let validation = if call.digest.is_none() || (plan.is_some() && runtime.is_none()) {
+            let validation = if !call.approved || (plan.is_some() && runtime.is_none()) {
                 Some(CallResolution::plain(
                     closed(&call.call(), "pre_tool_unavailable"),
                     Some(DispatchOutcome::Completed),
@@ -10466,13 +10728,17 @@ mod approval_gate {
                     },
                 );
                 writer.sync().await?;
+                report_late(control, &ctx, &call, LateOutcome::NotSent).await;
                 continue;
             }
             history.record(
                 writer,
                 WalRecord::LateDispatchIntent {
                     call_key: key.clone(),
-                    approval_digest: call.digest.clone().expect("approval validated"),
+                    // Keep the required approval_digest field for WAL schema compatibility.
+                    // Generic consent issues no tool authorization token to put in it,
+                    // so write an empty string, not a synthetic digest.
+                    approval_digest: String::new(),
                     batch_id: ctx.batch_id.clone(),
                 },
             );
@@ -10484,13 +10750,7 @@ mod approval_gate {
             {
                 Ok(()) => {
                     plane
-                        .dispatch_approved(
-                            &ctx,
-                            &tool_call,
-                            args_jcs,
-                            &key,
-                            call.digest.as_deref().expect("approval validated"),
-                        )
+                        .dispatch_approved(&ctx, &tool_call, args_jcs, &key, "")
                         .await
                 }
                 Err(error) => DispatchResult::NotSent {
@@ -10513,56 +10773,42 @@ mod approval_gate {
                 },
             );
             writer.sync().await?;
+            report_late(control, &ctx, &call, outcome).await;
             let _ = plane.batch_finished(&ctx).await;
         }
         Ok(())
     }
 
-    type Answer = (String, String, bool, Option<String>);
-    enum AnswerResponse {
-        Unanswered,
-        Answered(Answer),
-        Unreadable,
-    }
-
-    // Validate the complete page before intake. An unreadable answered record
-    // must be retried at the same cursor, not skipped as an unanswered question.
-    fn read_answers(records: &[serde_json::Value]) -> Result<Vec<Answer>, ()> {
+    // Validate every relevant answer before accepting the page, so an unreadable
+    // record cannot advance the feed cursor past an answer that still needs recovery.
+    fn read_answers(
+        records: &[serde_json::Value],
+        history: &History,
+    ) -> Result<Vec<(String, crate::consent::ConsentAnswer)>, ()> {
         let mut answers = Vec::new();
         for record in records {
-            match response(record) {
-                AnswerResponse::Unanswered => {}
-                AnswerResponse::Answered(answer) => answers.push(answer),
-                AnswerResponse::Unreadable => return Err(()),
+            let Some(key) = record
+                .get("requester_ref")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(call) = history.projection.calls.get(key) else {
+                continue;
+            };
+            if call
+                .decision
+                .is_some_and(|decision| decision != DeferredDecision::Expired)
+            {
+                continue;
+            }
+            match crate::consent::answer(record, key, &call.prepared) {
+                Ok(Some(answer)) => answers.push((key.into(), answer)),
+                Ok(None) => {}
+                Err(_) => return Err(()),
             }
         }
         Ok(answers)
-    }
-
-    fn response(record: &serde_json::Value) -> AnswerResponse {
-        if record.get("state").and_then(serde_json::Value::as_str) != Some("answered") {
-            return AnswerResponse::Unanswered;
-        }
-        let field = |name| {
-            record
-                .get(name)
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-        };
-        let (Some(choice), Some(key), Some(id)) = (
-            field("answered_choice_id"),
-            field("call_key"),
-            field("elicitation_id"),
-        ) else {
-            return AnswerResponse::Unreadable;
-        };
-        let approved = choice == "approve";
-        let digest = match record.get("approval_digest") {
-            Some(serde_json::Value::String(value)) if !value.is_empty() => Some(value.clone()),
-            None | Some(serde_json::Value::Null) if !approved => None,
-            _ => return AnswerResponse::Unreadable,
-        };
-        AnswerResponse::Answered((key.into(), id.into(), approved, digest))
     }
 }
 

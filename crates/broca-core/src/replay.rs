@@ -398,8 +398,14 @@ impl DeferredCallProjection {
                 WalRecord::AwaitingApproval { pending, .. } => {
                     for entry in pending {
                         if let Some(call) = self.calls.get_mut(&entry.call_key) {
-                            // A stale marker can supply a filing id but cannot reopen a terminal.
-                            if call.state == OpenCallState::Deferred {
+                            // Recovery can learn an id after crash close-out. Updating identity
+                            // metadata must never reopen the closed call.
+                            if entry.elicitation_id.is_some()
+                                && (call.state == OpenCallState::Deferred
+                                    || (call.withdrawal_terminal
+                                        && !call.withdrawal_acknowledged
+                                        && call.decision.is_none()))
+                            {
                                 call.elicitation_id = entry.elicitation_id.clone();
                             }
                         }
@@ -456,8 +462,13 @@ impl DeferredCallProjection {
                         call.withdrawal_acknowledged = true;
                     }
                 }
-                WalRecord::LateApprovalRecorded { call_key, .. } => {
+                WalRecord::LateApprovalRecorded {
+                    call_key,
+                    elicitation_id,
+                    ..
+                } => {
                     if let Some(call) = self.calls.get_mut(call_key) {
+                        call.elicitation_id = Some(elicitation_id.clone());
                         call.late_approval = Some(Arc::new(frame.record.clone()));
                     }
                 }
