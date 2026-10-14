@@ -10257,3 +10257,26 @@ expect_red = ["file_wal::tests::conflicting_lineage_after_damage_is_never_repair
 file = "crates/broca-wal/src/file_wal.rs"
 old = 'expected_lineage = Some(found);'
 new = 'let _ = found; // NON-VACUITY BREAK: forget the first verified identity'
+
+[[control]]
+id = "identityless-retention-flush-no-reopen"
+guards = "a successful read-side flush without a stable file identity does not reopen a WAL racing retention deletion"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
+expect_red = ["wal_writer::retention_tests::absent_file_identity_flush_does_not_reopen_a_deleting_wal"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "        let identity = read_identity(&path)?;"
+new = """
+        let identity = read_identity(&path)?;
+        // NON-VACUITY BREAK: mistake unavailable identity for a failed durability barrier.
+        if identity.is_none() {
+            return self.retry_archived_member(
+                session,
+                |_consulted| None,
+                |member| Ok(Some(member_identity(member))),
+                || self.retry_live_flush(session),
+            );
+        }
+"""

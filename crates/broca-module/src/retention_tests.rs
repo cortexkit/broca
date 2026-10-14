@@ -2052,12 +2052,24 @@ async fn content_free_withdrawal_retries_routes_but_settles_ended_scopes_and_unk
 async fn actor_expiry_hands_owed_withdrawals_to_content_free_worker_before_releasing_lease() {
     let rig = Rig::new();
     let now = rig.service.clock.now_ms();
+    // WAL setup can outlast the one-second retention policy on slow filesystems. Keep the
+    // seed unexpired until its actor owns it, rather than letting admission delete it first.
+    fs::write(
+        rig.root.join("test-clock"),
+        serde_json::json!({"now_ms": now}).to_string(),
+    )
+    .unwrap();
+    rig.service.clock.refresh().unwrap();
     seed_owed_question_at(&rig, now, now + 60_000, Some("question"));
     rig.service.rederive(&rig.key).unwrap();
     let registry = rig.registry(None);
     registry.actor_for(&rig.key).await.unwrap();
     assert_eq!(registry.slot_counts().open, 1);
-    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":2000}"#).unwrap();
+    fs::write(
+        rig.root.join("test-clock"),
+        serde_json::json!({"now_ms": now + 2000}).to_string(),
+    )
+    .unwrap();
     rig.service.clock.refresh().unwrap();
     // The test clock wakes expiry independently of Tokio time; wait for the registry's close
     // notification instead of guessing how long the actor's teardown will take.
