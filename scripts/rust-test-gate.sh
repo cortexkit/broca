@@ -124,14 +124,29 @@ export BROCA_REQUIRE_SUBC=1
 run_with_deadline() {
   local secs="$1"
   shift
-  # A new session gives the command and its descendants a private process group.
-  # Killing only cargo's PID leaves rustc/test children alive after the deadline.
-  "$python_bin" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+  # Windows has no os.setsid, and its os.execvp spawns a child and exits instead of replacing
+  # the process, so $! would track a Python that is already gone while cargo keeps running.
+  # There the command runs directly and the deadline kills only that process, as before.
+  local deadline_new_session=0
+  if "$python_bin" -c 'import os, sys; sys.exit(0 if hasattr(os, "setsid") else 1)'; then
+    deadline_new_session=1
+  fi
+  if (( deadline_new_session )); then
+    # A new session gives the command and its descendants a private process group.
+    # Killing only cargo's PID leaves rustc/test children alive after the deadline.
+    "$python_bin" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+  else
+    "$@" &
+  fi
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if (( waited >= secs )); then
-      kill -KILL -- "-$pid" 2>/dev/null || true
+      if (( deadline_new_session )); then
+        kill -KILL -- "-$pid" 2>/dev/null || true
+      else
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
       wait "$pid" 2>/dev/null || true
       echo "gate: command exceeded its ${secs}s liveness deadline (wedged?): $*" >&2
       return 124
