@@ -3705,6 +3705,10 @@ mod tests {
         include!("transport_context_overflow_tests.rs");
     }
 
+    mod gemini_errors {
+        include!("transport_gemini_error_tests.rs");
+    }
+
     async fn assert_offloaded_render_matches_direct<F>(
         family: F,
         frozen: crate::wire::FrozenRenderConfig,

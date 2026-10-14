@@ -690,39 +690,44 @@ impl GeminiNormalizer {
         v: &Value,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
-        if let Some(error) = v.get("error") {
+        if let Some(error) = v.get("error").filter(|error| error.is_object()) {
             let code = error.get("status").and_then(Value::as_str);
             let message = error.get("message").and_then(Value::as_str).unwrap_or("");
             let status = error
                 .get("code")
                 .and_then(Value::as_u64)
                 .and_then(|status| u16::try_from(status).ok());
-            if let Some(code) = crate::normalize::context_overflow_code(
+            let overflow_code = crate::normalize::context_overflow_code(
                 crate::spec::WireFamilyId::Gemini,
                 code,
                 message,
                 status,
-            ) {
-                // Code Assist delegates its unwrapped RPC responses to this same decoder.
-                self.emitted_final = true;
-                out.push(NormalizedEvent::Control(ProviderControl::Error {
-                    error: broca_protocol::ProviderError {
-                        class: broca_protocol::ErrorClass::ContextOverflow,
-                        message: message.to_owned(),
-                        status,
-                        provider_code: Some(code.to_owned()),
-                        retry_after_secs: None,
-                        resets_at_ms: None,
-                        resets_at_source: None,
-                        limit_window: None,
-                        account_ref: None,
-                        credential_id: None,
-                        refusal: None,
-                    },
-                    retries_used: 0,
-                }));
-                return Ok(());
-            }
+            );
+            let class = if overflow_code.is_some() {
+                broca_protocol::ErrorClass::ContextOverflow
+            } else {
+                crate::normalize::classify_error_with_status_defaults(code, status)
+            };
+            // Error envelopes are terminal even when HTTP succeeded; EOF must not replace
+            // the provider's diagnosis with a generic stream-truncation error.
+            self.emitted_final = true;
+            out.push(NormalizedEvent::Control(ProviderControl::Error {
+                error: broca_protocol::ProviderError {
+                    class,
+                    message: message.to_owned(),
+                    status,
+                    provider_code: overflow_code.or(code).map(str::to_owned),
+                    retry_after_secs: None,
+                    resets_at_ms: None,
+                    resets_at_source: None,
+                    limit_window: None,
+                    account_ref: None,
+                    credential_id: None,
+                    refusal: None,
+                },
+                retries_used: 0,
+            }));
+            return Ok(());
         }
         if !self.started {
             self.started = true;

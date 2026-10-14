@@ -9151,3 +9151,16 @@ old = '''.sealed_digest
                     .as_deref()'''
 new = '''.sealed_digest
                     .as_deref().or(Some(plan.digest.as_str())) /* NON-VACUITY BREAK */'''
+
+[[control]]
+id = "gemini-in-band-error-diagnosis"
+guards = "Gemini and Code Assist retain in-band error classes and detail instead of retrying permission denials as truncation"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_gemini_error_tests.rs"
+expect_red = ["transport::tests::gemini_errors::gemini_and_codeassist_in_band_errors_keep_class_code_and_detail"]
+file = "crates/broca-provider/src/families/gemini.rs"
+old = 'if let Some(error) = v.get("error").filter(|error| error.is_object()) {'
+new = 'if let Some(error) = v.get("error").filter(|error| error.get("status").and_then(Value::as_str) == Some("INVALID_ARGUMENT") /* NON-VACUITY BREAK */) {'
