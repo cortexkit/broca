@@ -9203,3 +9203,56 @@ expect_red = ["pause_continue::auth_resume_refreezes_use_run_clock"]
 file = "crates/broca-core/src/run.rs"
 old = "writer.record(WalRecord::RunAuthRefrozen {\n                        ts_ms: control.now_ms(),"
 new = "writer.record(WalRecord::RunAuthRefrozen {\n                        ts_ms: epoch_millis(), // NON-VACUITY BREAK: bypass the run clock"
+
+[[control]]
+id = "budget-finalize-args-cut-steer-fence"
+guards = "a budget-finalize args-cut terminal closes live steer admission before becoming durable"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/terminal_regression_tests.rs"
+expect_red = ["run::terminal_regression_tests::budget_finalize_args_cut_closes_steer_inbox_before_terminal"]
+file = "crates/broca-core/src/run.rs"
+old = "// The terminal goes in the SAME barrier as the repair batch (no intermediate sync).\n    control.close_steers();"
+new = "// The terminal goes in the SAME barrier as the repair batch (no intermediate sync).\n    // NON-VACUITY BREAK: accept steers past the hard-stop terminal."
+
+[[control]]
+id = "size-refusal-terminal-steer-fence"
+guards = "size-refusal sealing fences the steer inbox even when the writer has ample append capacity"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/terminal_regression_tests.rs"
+expect_red = ["run::terminal_regression_tests::size_refusal_closes_steer_inbox_before_terminal"]
+file = "crates/broca-core/src/run.rs"
+old = "if !prior.run_finished_durable && owned {\n        control.close_steers();"
+new = "if !prior.run_finished_durable && owned {\n        // NON-VACUITY BREAK: accept steers past the size terminal."
+
+[[control]]
+id = "size-refusal-owned-durable-steer-fence"
+guards = "an already-durable owned size-refusal return closes the live steer inbox"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/terminal_regression_tests.rs"
+expect_red = ["run::terminal_regression_tests::size_refusal_already_durable_owned_return_closes_steer_inbox"]
+file = "crates/broca-core/src/run.rs"
+old = "if owned && prior.run_finished_durable {\n        control.close_steers();"
+new = "if owned && prior.run_finished_durable {\n        // NON-VACUITY BREAK: accept steers on an owned durable return."
+
+[[control]]
+id = "actor-refused-live-steer-next-turn"
+guards = "a closed live inbox queues the refused steer durably for the next turn"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/steer_terminal_tests.rs"
+expect_red = ["actor::steer_terminal_tests::refused_live_steer_is_queued_for_next_turn"]
+file = "crates/broca-module/src/actor.rs"
+old = "if !inbox.deliver(input, || {"
+new = "if false && !inbox.deliver(input, || { // NON-VACUITY BREAK: drop the late steer instead of queuing"

@@ -9587,6 +9587,10 @@ mod steer_auth_conflict_tests {
 #[path = "shutdown_tests.rs"]
 mod shutdown_tests;
 
+#[cfg(test)]
+#[path = "steer_terminal_tests.rs"]
+mod steer_terminal_tests;
+
 #[path = "pre_user.rs"]
 mod pre_user;
 

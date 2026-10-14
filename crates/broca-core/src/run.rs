@@ -2421,6 +2421,7 @@ async fn seal_size_refusal<W: WalStore>(
     // before the Error terminal below, startup commits an Interrupted orphan terminal.
     let owned = owns_prior_episode || prior.run_id.as_ref() == Some(&req.run_id);
     if owned && prior.run_finished_durable {
+        control.close_steers();
         writer.clear_size_refusal();
         if let Some((reason, usage, retries_used)) =
             records.iter().rev().find_map(|record| match record {
@@ -2444,6 +2445,7 @@ async fn seal_size_refusal<W: WalStore>(
         }
     }
     if !prior.run_finished_durable && owned {
+        control.close_steers();
         let run_id = prior
             .run_id
             .as_ref()
@@ -6991,6 +6993,7 @@ async fn finalize_hard_stop(
     writer.record(WalRecord::TurnFinished { step_id });
     record_budget_firings(writer, resolved_run_id, budget_firings);
     // The terminal goes in the SAME barrier as the repair batch (no intermediate sync).
+    control.close_steers();
     writer.record(WalRecord::RunFinished {
         ts_ms: control.now_ms(),
         reason,
@@ -8971,6 +8974,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run/terminal_regression_tests.rs"]
+mod terminal_regression_tests;
 
 #[cfg(test)]
 #[path = "run/hook_tests.rs"]
