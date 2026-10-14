@@ -1242,6 +1242,123 @@ impl broca_core::provider::Provider for CapturingProvider {
     }
 }
 
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn auth_resume_refreezes_use_run_clock() {
+    use broca_core::{
+        compute_segments, run_loop_resume_after_auth_with_control, run_loop_with_control,
+        AuthSelection, ChargeBasis, Clock, RunControl,
+    };
+
+    let dir = broca_test_support::scratch_root()
+        .join(format!("broca-refreeze-clock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("test-clock"), r#"{"now_ms":1234}"#).unwrap();
+    let clock = Clock::for_state_root(&dir).unwrap();
+    let session = BindIdentity::new(dir.join("proj"), "h", "s");
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let plane = StubToolPlane::new();
+    let initial = ProjectCapturingProvider::new(None, vec![]);
+    let (tx, _rx) = mpsc::channel(256);
+    let paused = run_loop_with_control(
+        req(&session, "hello"),
+        &initial,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        None,
+        RunControl {
+            clock: Some(clock.clone()),
+            pause_for_auth_at_start: Some(ProviderError {
+                refusal: None,
+                class: ErrorClass::Auth,
+                message: "credential unresolved".into(),
+                status: None,
+                retry_after_secs: None,
+                provider_code: None,
+                resets_at_ms: None,
+                resets_at_source: None,
+                limit_window: None,
+                account_ref: None,
+                credential_id: None,
+            }),
+            ..Default::default()
+        },
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(paused.paused, Some(PauseReason::AuthRequired));
+    assert!(initial.sent_bytes().is_empty());
+
+    std::fs::write(dir.join("test-clock"), r#"{"now_ms":5678}"#).unwrap();
+    clock.refresh().unwrap();
+    let resumed =
+        ProjectCapturingProvider::new(Some("resolved-project"), vec![text_reply("m", "done")]);
+    let summary = run_loop_resume_after_auth_with_control(
+        req(&session, "hello"),
+        &resumed,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        None,
+        RunControl {
+            clock: Some(clock),
+            auth_selection: Some(AuthSelection {
+                credential_id: "provider:key".into(),
+                account_ref: Some("account".into()),
+                resolved_credential_id: None,
+                vault_request: None,
+                account_decision: None,
+            }),
+            ..Default::default()
+        },
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(resumed.sent_bytes().len(), 1);
+    let frames = WalStore::read_records(&wal, &session).unwrap();
+    let config_times: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            WalRecord::RunConfigRefrozen { ts_ms, .. } => Some(*ts_ms),
+            _ => None,
+        })
+        .collect();
+    let auth_times: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            WalRecord::RunAuthRefrozen { ts_ms, .. } => Some(*ts_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        config_times,
+        vec![Some(5678)],
+        "render refreeze uses the run clock"
+    );
+    assert_eq!(
+        auth_times,
+        vec![Some(5678)],
+        "auth refreeze uses the run clock"
+    );
+    let segments = compute_segments(&frames, "clock-test", &|_: &str, _: &str| {
+        (ChargeBasis::Unknown, 1)
+    });
+    let freeze_times: Vec<_> = segments
+        .iter()
+        .map(|segment| segment.pricing_at_ms)
+        .collect();
+    assert_eq!(freeze_times, vec![Some(1234), Some(5678), Some(5678)]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 struct ProjectCapturingProvider {
     inner: StubProvider,
     project_id: Option<String>,

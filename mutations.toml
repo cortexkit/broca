@@ -9175,3 +9175,31 @@ expect_red = ["context::tests::resume_merge_failed_retraction_clears_prefix_fini
 file = "crates/broca-core/src/context.rs"
 old = "                        | WalRecord::Retracted {\n                            failure: Some(_),\n                            ..\n                        }"
 new = "                        | WalRecord::Retracted {\n                            failure: None, /* NON-VACUITY BREAK: ignore failed admission */\n                            ..\n                        }"
+
+[[control]]
+id = "auth-resume-render-refreeze-run-clock"
+guards = "auth-resumed renderer refreezes and their billing segments use the run clock"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/tests/it/pause_continue.rs"
+expect_red = ["pause_continue::auth_resume_refreezes_use_run_clock"]
+file = "crates/broca-core/src/run.rs"
+old = "writer.record(WalRecord::RunConfigRefrozen {\n                        ts_ms: control.now_ms(),"
+new = "writer.record(WalRecord::RunConfigRefrozen {\n                        ts_ms: epoch_millis(), // NON-VACUITY BREAK: bypass the run clock"
+
+[[control]]
+id = "auth-resume-auth-refreeze-run-clock"
+guards = "auth-resumed credential refreezes and their billing segments use the run clock"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/tests/it/pause_continue.rs"
+expect_red = ["pause_continue::auth_resume_refreezes_use_run_clock"]
+file = "crates/broca-core/src/run.rs"
+old = "writer.record(WalRecord::RunAuthRefrozen {\n                        ts_ms: control.now_ms(),"
+new = "writer.record(WalRecord::RunAuthRefrozen {\n                        ts_ms: epoch_millis(), // NON-VACUITY BREAK: bypass the run clock"
