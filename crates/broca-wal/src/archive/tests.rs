@@ -837,3 +837,20 @@ fn real_container_absent_lookup_probe() {
     samples.sort_by(f64::total_cmp);
     eprintln!("warm median: {:.6} ms", (samples[4] + samples[5]) / 2.0);
 }
+
+#[test]
+fn missing_index_legacy_container_bytes_are_pinned() {
+    let bytes = without_index(include_bytes!(
+        "../../tests/fixtures/archive/v1/fold-1001.ark"
+    ));
+    assert_eq!(bytes.len(), 827);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        "8f1c97ed5a9bc50773da34470ab138cadbe9afd5f5d09e5ce29937182bc6d118"
+    );
+    assert_eq!(&bytes[bytes.len() - 8..], b"\0\0\0\0WALK");
+    assert!(!ArchiveReader::new(Cursor::new(bytes), 4096)
+        .rescan()
+        .unwrap()
+        .is_empty());
+}
