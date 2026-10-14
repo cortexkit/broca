@@ -10683,3 +10683,18 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = '''Ok(Err(error)) if error.code == "consent_conflicting_decisions" => {'''
 new = '''Ok(Err(error)) if false && error.code == "consent_conflicting_decisions" => { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-unavailable-readback-detaches"
+guards = "every invalid known-id answered readback detaches only after its named Unavailable closure is durable"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::every_known_id_unavailable_await_release_detaches_with_original_code"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''// Invalid answered readbacks release the visible card just like transport refusals.
+                                        if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }'''
+new = '''// NON-VACUITY BREAK: discard the known card without detach'''

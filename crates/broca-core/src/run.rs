@@ -10281,14 +10281,19 @@ mod approval_gate {
                             let Slot::Held(call) = &mut slots[index] else { continue };
                             if call.approved { continue; }
                             match result {
-                                Ok(question) => match crate::consent::answer(&question.record, &call.key, &call.prepared) {
-                                    Ok(Some(answer)) if call.id.as_deref() == Some(answer.id.as_str()) => { intake(slots, index, answer, ctx, writer, control, history).await?; }
+                                Ok(question) => match crate::consent::answer(&question.record, &call.key, &call.prepared).and_then(|answer| {
+                                    if answer.as_ref().is_some_and(|answer| call.id.as_deref() != Some(answer.id.as_str())) { Err(crate::consent::refusal("consent_card_mismatch", false)) } else { Ok(answer) }
+                                }) {
+                                    Ok(Some(answer)) => { intake(slots, index, answer, ctx, writer, control, history).await?; }
                                     Ok(None) => { call.retry_at = now(control).saturating_add(50); }
                                     Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
-                                    _ => { let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("invalid answer closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?; }
+                                    Err(error) => { let held = call.clone(); let result = refusal_decision(call, &error, writer, history).await?; slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                        // Invalid answered readbacks release the visible card just like transport refusals.
+                                        if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }
+                                    }
                                 },
                                 Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
-                                Err(_) => { let held = call.clone(); let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("await refusal closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                Err(error) => { let held = call.clone(); let result = refusal_decision(call, &error, writer, history).await?; slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
                                     if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }
                                 }
                             }

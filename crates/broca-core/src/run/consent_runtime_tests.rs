@@ -550,6 +550,8 @@ async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_r
             outstanding: AtomicUsize::new(0),
             ack_calls: AtomicUsize::new(0),
             reports: Mutex::new(Vec::new()),
+            detaches: Mutex::new(Vec::new()),
+            detach_answer: Mutex::new("pending"),
             transient: false,
             cursors: Mutex::new(Vec::new()),
             answer: Mutex::new("approve"),

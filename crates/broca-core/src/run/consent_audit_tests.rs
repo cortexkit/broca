@@ -330,3 +330,42 @@ async fn late_feed_conflicting_answers_close_as_named_not_sent() {
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn every_known_id_unavailable_await_release_detaches_with_original_code() {
+    for (mode, code) in [
+        ("unreadable_binding_missing", "consent_binding_mismatch"),
+        ("unreadable_binding_type", "consent_binding_mismatch"),
+        ("unsupported_choice", "consent_choice_unsupported"),
+        ("wrong_card", "consent_card_mismatch"),
+        ("await_refusal", "route_closed"),
+    ] {
+        let rig = Rig::new("pass", mode, false, false);
+        let result = rig
+            .batch(&crate::AllowAll, vec![call("c")], None, false)
+            .await;
+        assert_eq!(
+            rig.questions.detaches.lock().unwrap().len(),
+            1,
+            "{mode}: every known-id unavailable release must detach"
+        );
+        assert!(
+            matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains(code)),
+            "{mode}: retain the original refusal code"
+        );
+        assert_eq!(rig.questions.outstanding.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+        assert!(rig.questions.reports.lock().unwrap().is_empty());
+        rig.finish().await;
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn local_expiry_detaches_the_known_visible_card() {
+    let rig = expired_run("pass").await;
+    assert_eq!(rig.questions.detaches.lock().unwrap().len(), 1);
+    assert_eq!(rig.questions.outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}

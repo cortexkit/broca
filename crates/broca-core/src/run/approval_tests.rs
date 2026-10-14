@@ -80,6 +80,8 @@ struct Questions {
     outstanding: AtomicUsize,
     ack_calls: AtomicUsize,
     reports: Mutex<Vec<(String, ApprovalExecution)>>,
+    detaches: Mutex<Vec<String>>,
+    detach_answer: Mutex<&'static str>,
     transient: bool,
     cursors: Mutex<Vec<Option<ApprovalCursor>>>,
     answer: Mutex<&'static str>,
@@ -157,6 +159,9 @@ impl ElicitationPlane for Questions {
         let frames = self.store.read_records(&ctx.bind).unwrap();
         assert!(frames.iter().any(|frame| self.head.load(Ordering::SeqCst) >= frame.seq && matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.as_deref() == Some(id)))), "card id durable before await");
         let answer = *self.answer.lock().unwrap();
+        if answer == "await_refusal" {
+            return Err(crate::consent::refusal("route_closed", false));
+        }
         if matches!(answer, "none" | "feed_only") {
             return std::future::pending().await;
         }
@@ -169,6 +174,12 @@ impl ElicitationPlane for Questions {
             .find(|frame| key.ends_with(&format!(":{}", frame.seq)))
             .unwrap();
         let mut record = json!({"state":"answered","requester_ref":key,"elicitation_id":id,"answered_choice_id":if answer == "decline" { "deny" } else { "approve" },"binding":crate::consent::binding(&prepared.record)});
+        if answer == "unsupported_choice" {
+            record["answered_choice_id"] = json!("maybe");
+        }
+        if answer == "wrong_card" {
+            record["elicitation_id"] = json!("different");
+        }
         if answer.starts_with("unreadable_") && n == 0 {
             match answer {
                 "unreadable_choice_missing" => {
@@ -194,6 +205,30 @@ impl ElicitationPlane for Questions {
     async fn ack(&self, _: &BatchCtx, _: &ApprovalCursor) -> Result<(), ApprovalRouteError> {
         self.ack_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+    async fn detach(
+        &self,
+        ctx: &BatchCtx,
+        id: &str,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        let key = id.strip_prefix("q:").unwrap();
+        let frames = self.store.read_records(&ctx.bind).unwrap();
+        assert!(frames.iter().any(|frame| self.head.load(Ordering::SeqCst) >= frame.seq && matches!(&frame.record, WalRecord::ApprovalRecorded { call_key, closing_result: Some(_), .. } if call_key == key)), "the current call's closure must be durable before detach");
+        self.detaches.lock().unwrap().push(id.into());
+        let prepared = frames
+            .iter()
+            .find(|frame| key.ends_with(&format!(":{}", frame.seq)))
+            .unwrap();
+        let choice = *self.detach_answer.lock().unwrap();
+        let record = if choice == "pending" {
+            json!({"state":"pending","requester_ref":key,"elicitation_id":id})
+        } else {
+            json!({"state":"answered","requester_ref":key,"elicitation_id":id,"answered_choice_id":choice,"binding":crate::consent::binding(&prepared.record)})
+        };
+        Ok(ApprovalQuestion {
+            terminal: choice != "pending",
+            record,
+        })
     }
     async fn report_execution(
         &self,
@@ -499,6 +534,8 @@ impl Rig {
             outstanding: AtomicUsize::new(0),
             ack_calls: AtomicUsize::new(0),
             reports: Mutex::new(Vec::new()),
+            detaches: Mutex::new(Vec::new()),
+            detach_answer: Mutex::new("pending"),
             transient,
             cursors: Mutex::new(Vec::new()),
             answer: Mutex::new(answer),
