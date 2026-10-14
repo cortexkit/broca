@@ -111,7 +111,12 @@ if [ -z "${TRAIN_PUSH_EXEC_COPY:-}" ]; then
   TRAIN_PUSH_EXEC_COPY="$train_push_copy" TRAIN_PUSH_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" \
     exec bash "$train_push_copy" "$@"
 fi
-trap 'rm -f "$TRAIN_PUSH_EXEC_COPY"' EXIT
+watch_log=""
+push_log=""
+train_lock_held=""
+# Install cleanup before acquisition: even a failed first remote lookup must release
+# our lock. An owner check keeps a refused contender from deleting another train's lock.
+trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"; if [ -n "$train_lock_held" ] && [ "$(awk "NR==1{print \$1}" "$train_lock_held/owner" 2>/dev/null || true)" = "$$" ]; then rm -rf "$train_lock_held"; fi' EXIT
 
 script_dir="$(dirname "${TRAIN_PUSH_SOURCE:-${BASH_SOURCE[0]}}")"
 repo_root="$(git rev-parse --show-toplevel)"
@@ -787,24 +792,6 @@ verified_sha=""
 
 watch_log="$(mktemp "${TMPDIR:-/tmp}/train-push-watch.XXXXXX")"
 push_log="$(mktemp "${TMPDIR:-/tmp}/train-push-push.XXXXXX")"
-# ONE EXIT TRAP, BECAUSE BASH TRAPS ARE GLOBAL AND THE LAST ONE WINS. A second
-# `trap ... EXIT` anywhere later silently REPLACES an earlier one -- I set a
-# lock-release trap in the claim branch above and this line clobbered it, which is
-# the same hazard noted in this file's header about editing it mid-run.
-#
-# RELEASING THE LOCK HERE MAKES A LEFTOVER ONE MEAN SOMETHING. Without it every
-# completed train leaves its lock and liveness recovery quietly claims it next run
-# -- correct, and it makes "a stale lock is present" the RESTING STATE, so the
-# warning carries no information. A warning that always fires is a gauge that cannot
-# move: the operator learns nothing and stops reading it.
-#
-# The owner-pid match is load-bearing: this process may have REFUSED because another
-# train holds the lock, and removing it then would dispossess a live train -- exactly
-# what the rename-based recovery above exists to prevent. Liveness stays the authority
-# for what no trap can cover: SIGKILL leaves the lock, and the next run finds it dead.
-# Replaces the EXIT trap set at the top (bash traps are global), so the private script
-# copy is named here too.
-trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"; if [ "$(awk "NR==1{print \$1}" "$train_lock_held/owner" 2>/dev/null || true)" = "$$" ]; then rm -rf "$train_lock_held"; fi' EXIT
 
 # What we believe $remote/$train_ref points at. Tracked explicitly so every
 # re-push leases against the sha WE pushed instead of trusting a remote-tracking

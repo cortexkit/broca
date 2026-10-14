@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 
@@ -166,6 +168,101 @@ fi
         log = self.log.read_text()
         for marker in ("fixture script suites", "fixture clippy output", "fixture prewarm build", "prewarm done: warmed 1 executables", "fixture stops at unit tests"):
             self.assertIn(marker, log)
+
+
+class RustGateFailures(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="broca-rust-gate-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        shutil.copy2(ROOT / "scripts/rust-test-gate.sh", scripts)
+        self.bins = self.root / "bin"
+        self.bins.mkdir()
+        self.capture = self.root / "captures"
+        self.capture.mkdir()
+        self.env = {**os.environ, "PATH": f"{self.bins}:{os.environ['PATH']}",
+                    "BROCA_ALLOW_LINUX_GATE": "1", "TMPDIR": str(self.capture)}
+        GatePhases.executable(self.bins / "cargo-nextest", "#!/bin/sh\nexit 0\n")
+        GatePhases.executable(self.bins / "sleep", "#!/bin/sh\n/bin/sleep 0.2\n")
+        GatePhases.executable(self.bins / "cargo", r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if args[:2] == ["nextest", "list"]:
+    print("invalid json" if os.environ.get("BAD_NEXTEST") else json.dumps({"test-count": 1}))
+elif args[:2] == ["nextest", "run"]:
+    print("PASS [0.1s] broca-module::it test_clock::test_clock_feature_is_enabled_for_retention_tests")
+    print("SKIP fixture_arm: sibling absent")
+    print("Summary [0.1s] 1 test run")
+    sys.exit(int(os.environ.get("FAIL_NEXTEST", "0")))
+elif "--list" in args and "--doc" in args:
+    print("unrecognised doctest inventory" if os.environ.get("BAD_DOC") else "0 tests, 0 benchmarks")
+elif "--list" in args:
+    for name in ("fixture", "live", "live_e2e"):
+        print(f"Running tests/{name}.rs (target/debug/{name})")
+        print("1 test, 0 benchmarks")
+''')
+
+    def gate(self, **env):
+        return subprocess.run(["bash", "scripts/rust-test-gate.sh"], cwd=self.root,
+                              env={**self.env, **env}, text=True, capture_output=True, timeout=10)
+
+    def test_failed_nextest_reports_skips_and_cleans_capture(self):
+        result = self.gate(FAIL_NEXTEST="17")
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertIn("1 test(s) declined to run", result.stdout)
+        self.assertEqual(list(self.capture.iterdir()), [])
+
+    def test_nextest_parser_failure_names_count_and_stops_gate(self):
+        result = self.gate(BAD_NEXTEST="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not count nextest integration tests", result.stderr)
+        self.assertNotIn("integration test count mismatch", result.stderr)
+        self.assertNotIn("0 doctests", result.stdout)
+        self.assertEqual(list(self.capture.iterdir()), [])
+
+    def test_unrecognised_doctest_inventory_fails_by_name(self):
+        result = self.gate(BAD_DOC="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("could not count doctests", result.stderr)
+        self.assertNotIn("skipped (0 doctests)", result.stdout)
+        self.assertEqual(list(self.capture.iterdir()), [])
+
+    def test_recognised_zero_doctests_still_skips(self):
+        result = self.gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("skipped (0 doctests)", result.stdout)
+
+    def test_deadline_kills_descendant_not_only_direct_child(self):
+        source = (ROOT / "scripts/rust-test-gate.sh").read_text()
+        start = source.index("run_with_deadline() {")
+        body = source[start:source.index("\n}\n", start) + 3]
+        pid_file = self.root / "descendant"
+        child = self.root / "child.py"
+        child.write_text('''import pathlib, subprocess, sys
+p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+pathlib.Path(sys.argv[1]).write_text(str(p.pid))
+p.wait()
+''')
+        result = subprocess.run(
+            ["bash", "-c", body + '\nrun_with_deadline 1 "$python_bin" "$1" "$2"',
+             "fixture", str(child), str(pid_file)],
+            env={**self.env, "python_bin": sys.executable},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        pid = int(pid_file.read_text())
+        try:
+            time.sleep(0.1)
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                   capture_output=True, text=True).stdout.strip()
+            self.assertTrue(not state or state.startswith("Z"), f"descendant {pid} still running: {state}")
+        finally:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
 
 
 if __name__ == "__main__":

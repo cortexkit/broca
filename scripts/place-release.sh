@@ -66,6 +66,14 @@ STAGED_PROVIDED=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --staged|--dest)
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "place-release: usage error: $1 requires an argument" >&2
+        exit 2
+      fi
+      ;;
+  esac
+  case "$1" in
     --staged) STAGED="${2:-}"; STAGED_PROVIDED=1; shift 2 ;;
     --dest)   DEST="${2:-}"; shift 2 ;;
     --skip-gate) SKIP_GATE=1; shift ;;

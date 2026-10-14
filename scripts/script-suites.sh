@@ -56,6 +56,10 @@ suites=(
     scripts/test-state-root.py
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.
     scripts/test-gate-phases.py
+    scripts/test-gated-commit.py
+    scripts/test-turn-harnesses.py
+    scripts/test-repro-vanished-bind-root.py
+    scripts/test-script-options.py
     # Keep Tokio test clocks dev-only and the live transport stack out of non-live graphs.
     scripts/test-dependency-features.py
     scripts/tests/test_clock_safety.py

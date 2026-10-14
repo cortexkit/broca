@@ -35,6 +35,14 @@ ROOT_ARG=""
 HARNESS_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --count|--victim|--donor|--project-root|--harness)
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "mint-lineage-specimen: usage error: $1 requires an argument" >&2
+        exit 2
+      fi
+      ;;
+  esac
+  case "$1" in
     --count)  COUNT="${2:-1}"; shift 2 ;;
     # ADOPT MODE: perform the swap on sessions someone else already owns.
     #
@@ -64,6 +72,11 @@ if [ -z "$VICTIM_ARG" ] && [ -n "$DONOR_ARG" ]; then
 fi
 if [ -n "$VICTIM_ARG" ] && [ "$VICTIM_ARG" = "$DONOR_ARG" ]; then
   echo "mint-lineage-specimen: victim and donor must differ, or there is no mismatch" >&2
+  exit 2
+fi
+
+if [ -z "$VICTIM_ARG" ] && ! command -v timeout >/dev/null 2>&1; then
+  echo "mint-lineage-specimen: timeout is required; install GNU coreutils and put timeout on PATH (macOS: brew install coreutils, then add its libexec/gnubin)" >&2
   exit 2
 fi
 
@@ -125,9 +138,11 @@ for n in $(seq 1 "$COUNT"); do
     VICTIM="lineage-specimen-$STAMP"      # the session handed out; its store rows are the stale side
     DONOR="lineage-donor-$STAMP"          # supplies a WAL with a different identity and content
 
-    run_turn "$VICTIM" "Reply with exactly: VICTIM_CONTENT_$STAMP" | grep -aq "reason=Completed" \
+    # Drain the client before searching: grep -q can close a pipe after the first
+    # completion marker and SIGPIPE a still-writing successful client.
+    TURN_OUTPUT="$(run_turn "$VICTIM" "Reply with exactly: VICTIM_CONTENT_$STAMP")" && grep -aq "reason=Completed" <<<"$TURN_OUTPUT" \
       || { echo "mint: victim turn did not complete" >&2; exit 1; }
-    run_turn "$DONOR" "Reply with exactly: DONOR_CONTENT_$STAMP" | grep -aq "reason=Completed" \
+    TURN_OUTPUT="$(run_turn "$DONOR" "Reply with exactly: DONOR_CONTENT_$STAMP")" && grep -aq "reason=Completed" <<<"$TURN_OUTPUT" \
       || { echo "mint: donor turn did not complete" >&2; exit 1; }
   fi
 

@@ -19,13 +19,25 @@ CLIENT="${BROCA_SESSION_BIN:-./target/release/broca-session}"
 MODEL="${REPRO_MODEL:-anthropic/claude-opus-5}"
 ROOT="${REPRO_ROOT:-$HOME/.local/share/cortexkit/broca-repro-$$}"
 SESSION="repro-vanished-root-$(date +%s)-$$"
+ROOT_CREATED=0
+ROOT_MARKER="$ROOT/.broca-vanished-root-owner"
 
-fail_harness() { echo "HARNESS FAILED: $*" >&2; rm -rf "$ROOT"; exit 2; }
+remove_owned_root() {
+    # A caller's path is not permission to delete it. Only remove a directory we
+    # created in this run whose marker still identifies this reproduction.
+    [ "$ROOT_CREATED" -eq 1 ] && [ ! -L "$ROOT" ] && [ ! -L "$ROOT_MARKER" ] \
+        && [ "$(cat "$ROOT_MARKER" 2>/dev/null)" = "$SESSION" ] || return 1
+    rm -rf "$ROOT"
+}
+fail_harness() { echo "HARNESS FAILED: $*" >&2; remove_owned_root; exit 2; }
 
 [ -x "$CLIENT" ] || fail_harness "no broca-session at $CLIENT (set BROCA_SESSION_BIN)"
 [ -f "$CONN" ] || fail_harness "no subc connection file at $CONN (set SUBC_CONNECTION_FILE)"
 
-mkdir -p "$ROOT" || fail_harness "could not create $ROOT"
+[ ! -e "$ROOT" ] && [ ! -L "$ROOT" ] || fail_harness "root already exists: $ROOT; choose an unused REPRO_ROOT"
+mkdir -p "$(dirname "$ROOT")" && mkdir "$ROOT" || fail_harness "could not create $ROOT"
+ROOT_CREATED=1
+printf '%s\n' "$SESSION" > "$ROOT_MARKER" || fail_harness "could not mark root ownership at $ROOT"
 echo "root    $ROOT"
 echo "session $SESSION"
 
@@ -48,7 +60,7 @@ echo "run     $RUN_ID"
     || fail_harness "status failed while the root still exists, so this harness cannot show anything"
 echo "control status reachable while the root exists"
 
-rm -rf "$ROOT"
+remove_owned_root || fail_harness "root ownership missing or changed at $ROOT; refusing removal"
 [ -d "$ROOT" ] && fail_harness "could not remove $ROOT"
 echo "removed the root"
 

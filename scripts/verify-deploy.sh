@@ -46,6 +46,14 @@ CONTROL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --marker|--control|--bin|--sha)
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "verify-deploy: usage error: $1 requires an argument" >&2
+        exit 64
+      fi
+      ;;
+  esac
+  case "$1" in
     --marker)  MARKER="${2:-}"; shift 2 ;;
     --control) CONTROL="${2:-}"; shift 2 ;;
     --bin)     BIN="${2:-}"; shift 2 ;;

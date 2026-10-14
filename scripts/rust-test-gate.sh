@@ -124,12 +124,14 @@ export BROCA_REQUIRE_SUBC=1
 run_with_deadline() {
   local secs="$1"
   shift
-  "$@" &
+  # A new session gives the command and its descendants a private process group.
+  # Killing only cargo's PID leaves rustc/test children alive after the deadline.
+  "$python_bin" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if (( waited >= secs )); then
-      kill -9 "$pid" 2>/dev/null || true
+      kill -KILL -- "-$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
       echo "gate: command exceeded its ${secs}s liveness deadline (wedged?): $*" >&2
       return 124
@@ -226,7 +228,8 @@ count_nextest_integration_tests() {
     rm -f "$tmp" "$err_tmp"
     return 1
   fi
-  "$python_bin" - "$tmp" <<'PY'
+  local rc=0
+  "$python_bin" - "$tmp" <<'PY' || rc=$?
 import json
 import sys
 
@@ -235,6 +238,10 @@ with open(sys.argv[1], encoding="utf-8") as fh:
 print(int(data["test-count"]))
 PY
   rm -f "$tmp" "$err_tmp"
+  if [[ "$rc" -ne 0 ]]; then
+    echo "gate: could not count nextest integration tests" >&2
+  fi
+  return "$rc"
 }
 
 count_doc_tests() {
@@ -245,19 +252,28 @@ count_doc_tests() {
     rm -f "$tmp"
     return 1
   fi
-  "$python_bin" - "$tmp" <<'PY'
+  local rc=0
+  "$python_bin" - "$tmp" <<'PY' || rc=$?
 import re
 import sys
 
 count = 0
+records = 0
 with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
     for raw in fh:
         m = re.match(r"^\s*(\d+)\s+tests?,\s+\d+\s+benchmarks?$", raw.rstrip("\n"))
         if m:
+            records += 1
             count += int(m.group(1))
+if records == 0:
+    sys.exit("gate: could not count doctests: unrecognised cargo test --doc listing")
 print(count)
 PY
   rm -f "$tmp"
+  if [[ "$rc" -ne 0 ]]; then
+    echo "gate: could not count doctests" >&2
+  fi
+  return "$rc"
 }
 
 run_integration_phase() {
@@ -265,8 +281,11 @@ run_integration_phase() {
   local nextest_count
   local cmd
 
-  cargo_count="$(count_cargo_integration_tests)"
-  nextest_count="$(count_nextest_integration_tests)"
+  cargo_count="$(count_cargo_integration_tests)" || {
+    echo "gate: could not count cargo integration tests" >&2
+    return 1
+  }
+  nextest_count="$(count_nextest_integration_tests)" || return 1
 
   echo "    integration tests selected: cargo-test baseline=${cargo_count}, nextest=${nextest_count}"
   # Keep independent libtest and nextest discovery: this checks that nextest's
@@ -319,8 +338,8 @@ run_integration_phase() {
   # number to re-argue.
   local out rc
   out="$(mktemp)"
-  "${cmd[@]}" --success-output final 2>&1 | tee "$out"
-  rc="${PIPESTATUS[0]}"
+  rc=0
+  "${cmd[@]}" --success-output final 2>&1 | tee "$out" || rc=$?
 
   # Discovery counts cannot notice tests compiled out of both inventories. Require the
   # feature-only clock test's PASS record, not its name in a listing or echoed command.
@@ -342,8 +361,8 @@ if passed is None:
 print("    executed test-clock sentinel: " + sentinel)
 PY_SENTINEL
   then
-    rm -f "$out"
-    return 1
+    # A missing sentinel fails the run, but still reaches skip reporting and capture cleanup.
+    [[ "$rc" -ne 0 ]] || rc=1
   fi
 
   # A CONTROL THAT NEVER RAN IS NOT A CONTROL THAT PASSED.

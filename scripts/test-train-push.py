@@ -331,6 +331,18 @@ class SameShaPushArms(unittest.TestCase):
 
 
 class ConcurrencyGuardArms(unittest.TestCase):
+    def test_early_remote_failure_releases_owned_lock(self):
+        shim = self.work / "fixturebin" / "git"
+        shim.write_text(
+            '#!/bin/sh\n'
+            'case "$1" in ls-remote) echo "fixture remote failure" >&2; exit 17;; esac\n'
+            f'exec "{shutil.which("git")}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        result = run_guard_result(self.work, "early-failure")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(held(self.work).exists(), result.stdout + result.stderr)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = pathlib.Path(self._tmp.name)
@@ -377,8 +389,7 @@ class ConcurrencyGuardArms(unittest.TestCase):
         dead.wait()
         plant_owner(self.work, dead.pid, "deadtrain")
         out = run_guard(self.work, "arm3")
-        owner = (held(self.work) / "owner").read_text()
-        self.assertNotIn("deadtrain", owner, "a stale owner must be replaced, not obeyed")
+        self.assertFalse(held(self.work).exists(), "the replacement owner releases its lock on exit")
         self.assertNotIn("deadtrain is RUNNING", out)
         self.assertNotIn("a train is already running", out)
 
@@ -401,11 +412,19 @@ class ConcurrencyGuardArms(unittest.TestCase):
 
         A lock written after the push leaves the resolve-HEAD-to-push window uncovered,
         which is the exact hole the ref-based guard had. Asserted by checking the lock
-        exists after a run that never got as far as pushing.
+        exists at the first remote lookup, before any push can occur.
         """
+        shim = self.work / "fixturebin" / "git"
+        observed = self.tmp / "observed-owner"
+        shim.write_text(
+            '#!/bin/sh\n'
+            f'if [ "$1" = ls-remote ]; then cp "{held(self.work)}/owner" "{observed}"; exit 17; fi\n'
+            f'exec "{shutil.which("git")}" "$@"\n'
+        )
+        shim.chmod(0o755)
         run_guard(self.work, "ordering")
-        owner = (held(self.work) / "owner").read_text()
-        self.assertIn("ordering", owner, "this train must own the lock even on an early stop")
+        self.assertIn("ordering", observed.read_text())
+        self.assertFalse(held(self.work).exists())
 
 
     def test_a_recycled_pid_does_not_wedge_the_lock_forever(self):
