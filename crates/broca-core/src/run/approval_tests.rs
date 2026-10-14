@@ -18,6 +18,10 @@ use std::sync::{
 mod memory_wal;
 use memory_wal::MemoryWal;
 
+// These limits catch hangs, not slow storage or approval performance. Logic tests
+// use a sync-aware memory WAL; disk crash-cut tests opt in to a file-backed rig.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn rig_records(
     store: &crate::FileWalStore,
     memory: Option<&MemoryWal>,
@@ -440,7 +444,12 @@ async fn held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer() {
 }
 impl Rig {
     fn new(second: &'static str, answer: &'static str, transient: bool, stop: bool) -> Self {
-        Self::with_memory(second, answer, transient, stop, None)
+        Self::with_memory(second, answer, transient, stop, Some(MemoryWal::new()))
+    }
+
+    #[cfg(feature = "test-clock")]
+    fn file_backed(second: &'static str) -> Self {
+        Self::with_memory(second, "none", false, false, None)
     }
 
     fn with_memory(
@@ -456,6 +465,8 @@ impl Rig {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        // The test clock still uses a control file even when the WAL is in memory.
+        std::fs::create_dir_all(&root).unwrap();
         let bind = BindIdentity::new("/project", "test", "approval");
         let store = crate::FileWalStore::new(&root);
         let wal: Box<dyn broca_wal::Wal + Send> = match &memory {
@@ -556,15 +567,28 @@ impl Rig {
             other.name = "other".into();
             tools.push(other);
         }
-        tokio::time::timeout(std::time::Duration::from_secs(3), Box::pin(approval_gate::batch(&RunId("r".into()), StepId(1), &self.bind, Some(&serde_json::from_value(json!({"owner":{"kind":"reserved", "module_id":"agent"}, "ref":"s", "scope_epoch":1})).unwrap()),
+        tokio::time::timeout(HANG_GUARD, Box::pin(approval_gate::batch(&RunId("r".into()), StepId(1), &self.bind, Some(&serde_json::from_value(json!({"owner":{"kind":"reserved", "module_id":"agent"}, "ref":"s", "scope_epoch":1})).unwrap()),
             calls, &ToolManifest::from_tools(tools), &self.tools, approval, &self.writer, resume, &[], false, &self.control, Some(&runtime), None, &out, &mut history, restart))).await.expect("scripted approval batch must resolve").unwrap()
     }
     fn frames(&self) -> Vec<broca_wal::FramedRecord> {
         rig_records(&self.tools.store, self.tools.memory.as_ref(), &self.bind).unwrap()
     }
+    fn memory_store(&self) -> &MemoryWal {
+        self.tools
+            .memory
+            .as_ref()
+            .expect("approval logic uses the memory WAL")
+    }
+    #[cfg(feature = "test-clock")]
+    fn wal_store(&self) -> &dyn crate::WalStore {
+        match &self.tools.memory {
+            Some(memory) => memory,
+            None => &self.tools.store,
+        }
+    }
     async fn finish(self) {
         let _ = self.writer.shutdown().await;
-        if self.tools.memory.is_none() {
+        if self.root.exists() {
             std::fs::remove_dir_all(self.root).unwrap();
         }
     }
@@ -764,11 +788,10 @@ async fn cancel_and_nonresuming_stop_during_second_validation_consume_approval()
             }
             token.cancel();
         };
-        let (batch, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            tokio::join!(batch, interrupt)
-        })
-        .await
-        .expect("in-wait stop must be reachable");
+        let (batch, ()) =
+            tokio::time::timeout(HANG_GUARD, async { tokio::join!(batch, interrupt) })
+                .await
+                .expect("in-wait stop must be reachable");
         assert_eq!(
             batch.interruption,
             Some(if cancel {
@@ -831,11 +854,9 @@ async fn sibling_result_is_synced_while_approval_waits_and_expiry_uses_brocas_cl
             }
         }
     };
-    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(batch, expiry)
-    })
-    .await
-    .unwrap();
+    let (result, ()) = tokio::time::timeout(HANG_GUARD, async { tokio::join!(batch, expiry) })
+        .await
+        .unwrap();
     assert_eq!(result.results.len(), 2);
     assert!(rig.frames().iter().any(|frame| matches!(
         frame.record,
@@ -1057,7 +1078,11 @@ async fn restart_wait_spend_uses_batch_cache_warmed_usage_and_starts_no_extra_wa
 
 #[cfg(feature = "test-clock")]
 async fn expired_run(second: &'static str) -> Rig {
-    let mut rig = Rig::new(second, "none", false, false);
+    expire_rig(Rig::new(second, "none", false, false)).await
+}
+
+#[cfg(feature = "test-clock")]
+async fn expire_rig(mut rig: Rig) -> Rig {
     let clock = crate::Clock::for_state_root(&rig.root).unwrap();
     rig.control.clock = Some(clock.clone());
     rig.control.manifest = Some(Arc::new(frozen(
@@ -1123,7 +1148,7 @@ async fn expired_run(second: &'static str) -> Rig {
         None,
         &out,
         None,
-        Some(&rig.tools.store),
+        Some(rig.wal_store()),
         None,
     ));
     let expire = async {
@@ -1139,11 +1164,9 @@ async fn expired_run(second: &'static str) -> Rig {
         .unwrap();
         clock.refresh().unwrap();
     };
-    let (summary, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(run, expire)
-    })
-    .await
-    .unwrap();
+    let (summary, ()) = tokio::time::timeout(HANG_GUARD, async { tokio::join!(run, expire) })
+        .await
+        .unwrap();
     assert_eq!(summary.unwrap().reason, RunFinishReason::Completed);
     assert!(rig.tools.sent.lock().unwrap().is_empty());
     rig
@@ -1151,7 +1174,7 @@ async fn expired_run(second: &'static str) -> Rig {
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_every_cut() {
-    let mut rig = expired_run("pass").await;
+    let mut rig = expire_rig(Rig::file_backed("pass")).await;
     *rig.questions.answer.lock().unwrap() = "approve";
     rig.control.manifest = Some(Arc::new(frozen(Vec::new(), None, false)));
     let before = rig.frames();
@@ -1436,11 +1459,10 @@ async fn in_wait_stop_drains_a_dispatched_sibling_before_restart_pause() {
         );
         hold.notify_one();
     };
-    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(batch, stop_and_release)
-    })
-    .await
-    .unwrap();
+    let (paused, ()) =
+        tokio::time::timeout(HANG_GUARD, async { tokio::join!(batch, stop_and_release) })
+            .await
+            .unwrap();
     assert_eq!(paused.interruption, Some(BatchInterruption::RestartPause));
     assert!(rig.frames().iter().any(|frame|matches!(&frame.record,WalRecord::ToolResult{result,..} if result.tool_call_id.0=="sibling")));
     assert!(!rig
@@ -1463,11 +1485,9 @@ async fn approved_not_dispatched_restart_resumes_only_second_validation() {
         }
         stop.cancel();
     };
-    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(batch, interrupt)
-    })
-    .await
-    .unwrap();
+    let (paused, ()) = tokio::time::timeout(HANG_GUARD, async { tokio::join!(batch, interrupt) })
+        .await
+        .unwrap();
     assert_eq!(paused.interruption, Some(BatchInterruption::RestartPause));
     assert!(paused.open[0].digest.is_some());
     let frames = rig.frames();
@@ -1598,11 +1618,10 @@ async fn answer_read_after_broca_expiry_is_classified_late_before_terminal_dedup
         }
         hold.notify_one();
     };
-    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(batch, expire_and_drain)
-    })
-    .await
-    .unwrap();
+    let (result, ()) =
+        tokio::time::timeout(HANG_GUARD, async { tokio::join!(batch, expire_and_drain) })
+            .await
+            .unwrap();
     assert_eq!(result.results.len(), 2);
     let frames = rig.frames();
     assert!(frames.iter().any(|frame| matches!(
@@ -1801,10 +1820,8 @@ async fn unreadable_answer_does_not_advance_cursor() {
         "unreadable_digest_missing",
         "unreadable_digest_type",
     ] {
-        // Cursor intake is independent of disk latency. Keep the writer's real barriers,
-        // but expose only synced records so a missing barrier still fails this test.
-        let memory = MemoryWal::new();
-        let rig = Rig::with_memory("pass", answer, false, false, Some(memory.clone()));
+        let rig = Rig::new("pass", answer, false, false);
+        let memory = rig.memory_store();
         let result = rig
             .batch(&crate::AllowAll, vec![call("c")], None, false)
             .await;
@@ -1878,7 +1895,7 @@ fn tools_for_store(store: crate::FileWalStore, bind: BindIdentity) -> Tools {
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
-    let mut rig = expired_run("pass").await;
+    let mut rig = expire_rig(Rig::file_backed("pass")).await;
     let bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -2010,7 +2027,7 @@ async fn recorded_late_approval_without_elicitation_plane_never_dispatches() {
         None,
         &out,
         None,
-        Some(&rig.tools.store),
+        Some(rig.wal_store()),
         None,
     ))
     .await;
@@ -2110,7 +2127,7 @@ impl crate::Persister for LaggingApprovalStore {
 
 #[tokio::test]
 async fn store_resume_open_batch_pause_preserves_next_request_bytes() {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(HANG_GUARD, async {
         let mut paused = Rig::new("pass", "none", false, true);
         let mut uninterrupted = Rig::new("pass", "approve", false, false);
         let manifest = Arc::new(frozen(vec![vec![
@@ -2137,7 +2154,7 @@ async fn store_resume_open_batch_pause_preserves_next_request_bytes() {
         request.scope = Some(serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"s","scope_epoch":1})).unwrap());
         let (out, _rx) = mpsc::channel(1000);
         let summary = run_loop_on_writer_admitted_with_prior_snapshot(request.clone(), &paused.writer,
-            StartMode::FreshOrResume, &resumed_model, &paused.tools, &crate::AllowAll, &paused.tools.store,
+            StartMode::FreshOrResume, &resumed_model, &paused.tools, &crate::AllowAll, paused.memory_store(),
             Some(store.clone()), paused.control.clone(), &out, None, None).await.unwrap();
         assert_eq!(summary.paused, Some(broca_protocol::PauseReason::Restart));
         let records: Vec<_> = paused.frames().into_iter().map(|frame| frame.record).collect();
@@ -2160,13 +2177,13 @@ async fn store_resume_open_batch_pause_preserves_next_request_bytes() {
         paused.control.stop_requested = None;
         *paused.questions.answer.lock().unwrap() = "approve";
         let summary = run_loop_on_writer_admitted_with_prior_snapshot(request.clone(), &paused.writer,
-            StartMode::ResumeAfterAuth, &resumed_model, &paused.tools, &crate::AllowAll, &paused.tools.store,
+            StartMode::ResumeAfterAuth, &resumed_model, &paused.tools, &crate::AllowAll, paused.memory_store(),
             Some(store.clone()), paused.control.clone(), &out, None, None).await.unwrap();
         assert_eq!(summary.reason, RunFinishReason::Completed);
         assert!(store.reads.load(Ordering::SeqCst) > 0, "the regression must execute store-assisted reconstruction");
         request.session = uninterrupted.bind.clone();
         run_loop_on_writer_admitted_with_prior_snapshot(request, &uninterrupted.writer,
-            StartMode::FreshOrResume, &control_model, &uninterrupted.tools, &crate::AllowAll, &uninterrupted.tools.store,
+            StartMode::FreshOrResume, &control_model, &uninterrupted.tools, &crate::AllowAll, uninterrupted.memory_store(),
             Some(Arc::new(LaggingApprovalStore {reads:AtomicUsize::new(0)})), uninterrupted.control.clone(), &out, None, None).await.unwrap();
         let resumed = resumed_model.calls();
         let control = control_model.calls();
