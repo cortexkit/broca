@@ -10369,3 +10369,15 @@ expect_red = ["ConsentFixtures.test_held_call_request_mapping"]
 file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
 old = '"method":"consent.request"'
 new = '"method":"consent.request NON-VACUITY BREAK"'
+
+[[control]]
+id = "session-read-reply-body-budget"
+guards = "tail and range transcript replies include their envelope within the 3 MiB budget"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/read_page_tests.rs"
+expect_red = ["serve::read_page_tests::reply_body_cap_includes_envelope_for_tail_and_range"]
+file = "crates/broca-protocol/src/lib.rs"
+old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
+new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"

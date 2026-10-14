@@ -73,40 +73,70 @@ fn ordinal_of_mid(mid: &str) -> Option<u64> {
     canonical.then(|| digits.parse().ok()).flatten()
 }
 
-/// Cut `page` to `cap` bytes, measured over each message's serialized `message`. A range page
-/// keeps its oldest messages and, when it drops any, points `next_from_ordinal` at the first
-/// dropped one; a tail page keeps its newest, so it still ends at the newest message. A page
-/// always keeps one message, however large: a message is never truncated, and its size is never
-/// a reason to refuse the read.
-fn cap_page_bytes(page: &mut broca_core::SessionReadPage, cap: u64, tail: bool) {
-    let size = |message: &broca_core::SessionReadMessage| {
-        serde_json::to_vec(&message.message).map_or(u64::MAX, |bytes| bytes.len() as u64)
-    };
-    let mut kept = 0usize;
-    let mut total = 0u64;
-    let order: Box<dyn Iterator<Item = &broca_core::SessionReadMessage>> = if tail {
-        Box::new(page.messages.iter().rev())
-    } else {
-        Box::new(page.messages.iter())
-    };
-    for message in order {
-        let next = total.saturating_add(size(message));
-        if kept > 0 && next > cap {
-            break;
+fn json_bytes(value: &impl Serialize) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            Ok(bytes.len())
         }
-        total = next;
-        kept += 1;
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    if kept == page.messages.len() {
-        return;
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_or(u64::MAX, |()| count.0)
+}
+
+// Optional cursor members are omitted entirely when absent. Include the comma, quoted key,
+// and colon when adjusting the measured reply after a cursor changes.
+fn cursor_bytes<T: Serialize>(name: &str, cursor: &Option<T>) -> u64 {
+    cursor
+        .as_ref()
+        .map_or(0, |value| name.len() as u64 + 4 + json_bytes(value))
+}
+
+/// Budget the completed wire reply, including attribution, tools, approval metadata and cursors.
+/// Ranges keep their oldest messages; tails keep their newest. Late entries share the same
+/// budget, not a second budget of their own. Keep at least one message and one late entry when
+/// present: atomic oversized items or the fixed metadata can still exceed the budget.
+fn cap_page_bytes(page: &mut SessionReadResponse, cap: u64, tail: bool) {
+    let mut total = json_bytes(page);
+    let mut start = 0;
+    let mut end = page.messages.len();
+    while total >= cap && end - start > 1 {
+        let removed = if tail {
+            start += 1;
+            &page.messages[start - 1]
+        } else {
+            end -= 1;
+            total =
+                total.saturating_sub(cursor_bytes("next_from_ordinal", &page.next_from_ordinal));
+            page.next_from_ordinal = Some(page.messages[end - 1].ordinal + 1);
+            total =
+                total.saturating_add(cursor_bytes("next_from_ordinal", &page.next_from_ordinal));
+            &page.messages[end]
+        };
+        // The array still has an item, so removing an item also removes one comma.
+        total = total.saturating_sub(json_bytes(removed).saturating_add(1));
     }
-    if tail {
-        page.messages.drain(..page.messages.len() - kept);
-    } else {
-        page.messages.truncate(kept);
-        page.next_from_ordinal = page.messages.last().map(|last| last.ordinal + 1);
+    page.messages.truncate(end);
+    page.messages.drain(..start);
+
+    if let Some(late) = &mut page.late_approvals {
+        while total >= cap && late.len() > 1 {
+            let removed = late.pop().expect("more than one late entry");
+            total = total.saturating_sub(json_bytes(&removed).saturating_add(1));
+            total = total.saturating_sub(cursor_bytes("next_late_after", &page.next_late_after));
+            page.next_late_after = late.last().map(|entry| entry.call_key.clone());
+            total = total.saturating_add(cursor_bytes("next_late_after", &page.next_late_after));
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "serve/read_page_tests.rs"]
+mod read_page_tests;
 
 /// Where a `session.subscribe` attaches from (the wire spelling: `"start" | "live" |
 /// cursor`). `live` attaches strictly after the durable head captured by the attach barrier,
@@ -1586,7 +1616,6 @@ impl ServeHandler for crate::LineageRegistry {
             page.messages.clear();
             page.next_from_ordinal = None;
         }
-        cap_page_bytes(&mut page, cap, from_ordinal.is_none());
         let prompt_len = page.prompt_len;
         let mut response = session_read_response(page, tools);
         if had_late || late_only {
@@ -1610,6 +1639,7 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
+        cap_page_bytes(&mut response, cap, from_ordinal.is_none());
         Ok(response)
     }
 

@@ -4172,3 +4172,101 @@ async fn read_counting_store_forwards_authoritative_lineage_and_wal_presence() {
     assert_eq!(full_reads.load(Ordering::SeqCst), 0);
     drop(writer);
 }
+
+#[tokio::test]
+async fn transcript_reply_body_budget_applies_to_tail_range_and_large_requests() {
+    let rig = crate::common::Rig::new(
+        "read-reply-budget",
+        crate::common::FakeExecutor::auto(),
+        Duration::from_secs(3600),
+    );
+    let key = rig.key("session");
+    let cap = 3 * 1024 * 1024;
+    // The message-only sum fits, but ordinals, mids, lineage and head push the reply over.
+    let messages: Vec<_> = (0..2)
+        .map(|_| {
+            Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "x".repeat(cap / 2 - 64),
+                }],
+            )
+        })
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .sum::<usize>()
+            < cap
+    );
+    rig.registry
+        .import(SessionImportRequest {
+            project_id: None,
+            principal: None,
+            session: key.clone(),
+            run_id: RunId("import-budget".into()),
+            messages: messages.clone(),
+            source_ref: "fixture:read-budget".into(),
+        })
+        .await
+        .unwrap();
+    for tail in [false, true] {
+        for requested_cap in [None, Some(64 * 1024 * 1024)] {
+            let mut request =
+                SessionReadRequest::new(key.clone(), if tail { None } else { Some(0) }, Some(100));
+            request.max_bytes = requested_cap;
+            let response = rig.registry.read(request).await.unwrap();
+            assert!(serde_json::to_vec(&response).unwrap().len() < cap);
+            assert_eq!(response.messages.len(), 1);
+            let ordinal = u64::from(tail);
+            assert_eq!(response.messages[0].ordinal, ordinal);
+            assert_eq!(
+                serde_json::to_value(&response.messages[0].message).unwrap(),
+                serde_json::to_value(&messages[ordinal as usize]).unwrap()
+            );
+            assert_eq!(
+                response.next_from_ordinal,
+                if tail { None } else { Some(1) }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn imported_message_larger_than_three_mib_is_served_whole() {
+    let rig = crate::common::Rig::new(
+        "read-oversized-import",
+        crate::common::FakeExecutor::auto(),
+        Duration::from_secs(3600),
+    );
+    let key = rig.key("session");
+    let message = Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "x".repeat(4 * 1024 * 1024),
+        }],
+    );
+    rig.registry
+        .import(SessionImportRequest {
+            project_id: None,
+            principal: None,
+            session: key.clone(),
+            run_id: RunId("import-oversized".into()),
+            messages: vec![message.clone()],
+            source_ref: "fixture:oversized-message".into(),
+        })
+        .await
+        .unwrap();
+    let response = rig
+        .registry
+        .read(SessionReadRequest::new(key, Some(0), Some(100)))
+        .await
+        .unwrap();
+    assert_eq!(response.messages.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&response.messages[0].message).unwrap(),
+        serde_json::to_value(&message).unwrap()
+    );
+    assert!(serde_json::to_vec(&response).unwrap().len() > 3 * 1024 * 1024);
+}
