@@ -220,6 +220,13 @@ each barrier fsync.
 ## 6. Failure handling
 
 - **WAL write failure** → FAIL LOUD + surface to user + operator.
+- **Final stop outcome** covers the actor generations still present at stop and failures
+  during that stop, within its fixed budget. A completed earlier idle close does not make a
+  later, clean shutdown incomplete. Process-lifetime failure events retain the session id,
+  stage, timestamp and error; unresolved recovery debt is reported separately, even when
+  the current shutdown is clean. Only successful recovery and sync of the affected session
+  clears its debt, never stopping the registry or recovering another session. These are
+  process-local diagnostics; they do not replace WAL replay after a process restart.
 - **Non-idempotent INDETERMINATE** → interrupt / operator recovery, never a
   silent continue.
 - **Non-tail WAL corruption** (digest/seq mismatch mid-log) → FAIL LOUD.

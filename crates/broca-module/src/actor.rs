@@ -2072,6 +2072,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if self.wal_store.check_move(&self.key, true).is_err() {
             return Ok(());
         }
+        self.recover_durable_work_inner().await?;
+        if self.registry.has_recovery_debt(&self.key) {
+            // A readable replay alone cannot discharge a failed fsync. Prove the recovered
+            // session durable before clearing only its debt; keep the historical failure event.
+            self.writer
+                .as_ref()
+                .expect("writer live during recovery")
+                .sync()
+                .await
+                .map_err(|error| error.to_string())?;
+            self.registry.report_recovered(&self.key);
+        }
+        Ok(())
+    }
+
+    async fn recover_durable_work_inner(&mut self) -> Result<(), String> {
         if !self.pending_cancels.is_empty() && matches!(self.state, RunState::Idle) {
             return self.retry_pending_cancels().await;
         }
@@ -5304,14 +5320,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
         })
         .await;
         if !matches!(result, Ok(Ok(()))) {
-            #[cfg(test)]
-            self.registry.report_seal_error(
+            let stage = if result.is_err() {
+                crate::registry::SealFailureStage::SealDeadline
+            } else if !active {
+                crate::registry::SealFailureStage::FinalSync
+            } else {
+                crate::registry::SealFailureStage::Seal
+            };
+            self.registry.report_seal_failure(
                 &self.key,
+                self.gen,
+                stage,
                 format!("bound={SHUTDOWN_SEAL_BOUND:?}; result={result:?}"),
             );
-            self.registry.report_seal_failure();
             tracing::warn!(
                 target: "lifecycle",
+                session = %self.key.session,
                 "shutdown seal incomplete; leaving WAL recovery authoritative: {result:?}"
             );
         }
@@ -5811,10 +5835,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         };
         if let Err(error) = result {
-            self.registry.report_seal_failure();
-            #[cfg(test)]
-            self.registry
-                .report_seal_error(&self.key, format!("writer shutdown failed: {error}"));
+            self.registry.report_seal_failure(
+                &self.key,
+                self.gen,
+                crate::registry::SealFailureStage::WriterShutdown,
+                format!("writer shutdown failed: {error}"),
+            );
             tracing::error!(target: "lifecycle", session = %self.key.session, "writer shutdown failed; WAL requires recovery: {error}");
         }
     }
