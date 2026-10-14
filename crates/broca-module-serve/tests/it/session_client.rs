@@ -264,7 +264,16 @@ fn wal_diagnostics_name_missing_and_undecodable_files() {
     append_session_wal(&mut output, &dir, "s1");
     assert!(output.contains("unavailable:"));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("broken.wal"), [b'x'; 128]).unwrap();
+    // A damaged final record is a recoverable torn tail, so it decodes. Damage followed by an
+    // intact record is real corruption: flip one payload byte of the first of two frames.
+    let step = |id| broca_wal::WalRecord::StepStarted {
+        step_id: broca_protocol::StepId(id),
+    };
+    let mut first = broca_wal::framing::encode(1, 0, &step(1)).unwrap();
+    let last = first.len() - 1;
+    first[last] ^= 0xff;
+    let second = broca_wal::framing::encode(2, 0, &step(2)).unwrap();
+    std::fs::write(dir.join("broken.wal"), [first, second].concat()).unwrap();
     output.clear();
     append_session_wal(&mut output, &dir, "s1");
     assert!(output.contains("broken.wal: decode error:"), "{output}");
