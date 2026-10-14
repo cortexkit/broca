@@ -143,3 +143,50 @@ The CLI returns the command's exit status; 200–204 denote refusal, unknown
 outcome, timeout, cancellation, or invalid arguments. A preflight must preserve
 those failures, never run a local fallback. This probe establishes reachability,
 not a measured warm-build hit rate.
+
+## CI layout selected from the measurements
+
+Integration execution dominates the serial Linux job, so CI now builds a
+nextest archive per platform and runs four hash partitions per platform. The
+original live-binary exclusions, live/test-clock features, required fixture
+guards, nextest concurrency groups, leak/slow timeouts, and libtest-versus-
+nextest split remain intact. The independent libtest/nextest inventory check
+runs before archiving. Each shard executes the clock sentinel additionally:
+four shards cover the original integration inventory plus four clock proofs.
+Library/binary tests stay in libtest and doctests retain independent discovery.
+
+Lint (native Linux and Windows), scripts, Postgres, archive compilation, and
+fixture compilation start independently. Real Linux release/deployment runs in
+its own lane. Required `Test (ubuntu)` / `Test (windows)` status names now
+aggregate **all** these lanes and refuse failure, cancellation, and skipping.
+Neither a successful archive nor a successful unit job alone is a green train.
+The eight mutation shards retain their diff/all/broad selection and native
+Windows coverage verifier; none waits behind a Rust-test, lint or script job.
+They depend only on the shared fixture producers.
+
+Both workflows build siblings once per platform/run (not once per shard) and
+share an exact-revision binary cache. Push/PR rigs are pinned; the daily lane
+still resolves floating sibling tips and caches their exact resolved revisions.
+Tar transport preserves Unix execute bits and includes the vault enrollment
+fixture. Cargo dependency/target caching is separate by lane/platform; mutation
+cache saves survive failed replays, including the successfully installed
+mutation runner. Summaries expose exact-hit telemetry. Post-change hit rates
+and CI wall times must come from real train runs, not from these configuration
+choices.
+
+A real Linux archive proof found **1,449 integrations in both independent
+inventories**, archived 90 binaries / 129 files in **16.98 s**, and extracted in
+**29.58 s**; its feature-clock proof passed in **0.003 s**. These are OVH numbers,
+not GitHub-hosted timings. Archive creation includes auxiliary/non-test binaries;
+only the original integration filter executes them. Hosted jobs must use the
+same absolute checkout/target layout: some tests embed `CARGO_BIN_EXE` at compile
+time, so archive consumers extract into that checkout, not a random temporary
+directory. Full cross-runner replay still requires the train proof.
+
+No larger-runner change is made. The measured ~3 s queue does not justify it;
+more cores cannot remove the intentional 55–215 s individual fault/conformance
+proofs. No measured larger-runner sample exists, so a quantified speedup from a
+larger runner would be invented. The full mutation catalogue still pays serial
+recompilation per row; its 52:34 failed baseline cannot support a promise of a
+15-minute full-green release. Train measurements below determine the remaining
+critical path.

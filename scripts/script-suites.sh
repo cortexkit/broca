@@ -56,6 +56,7 @@ suites=(
     scripts/test-state-root.py
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.
     scripts/test-gate-phases.py
+    scripts/test-ci-pipeline.py
     scripts/test-gated-commit.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py

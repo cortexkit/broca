@@ -1,0 +1,96 @@
+name: Pinned integration fixtures
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    name: Fixtures (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+          - os: Windows
+            runner: windows-latest
+    env:
+      SUBC_REV: 5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae
+      CLAUSTRUM_REV: f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      # The daily compatibility lane still exercises moving sibling tips. Its
+      # binaries are cached by the resolved SHA, never by a mutable branch name.
+      - name: Resolve nightly sibling revisions
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          subc="$(git ls-remote https://github.com/cortexkit/subconscious.git refs/heads/master)"
+          vault="$(git ls-remote https://github.com/cortexkit/claustrum.git refs/heads/master)"
+          subc="${subc%%[[:space:]]*}"
+          vault="${vault%%[[:space:]]*}"
+          [[ "$subc" =~ ^[a-f0-9]{40}$ && "$vault" =~ ^[a-f0-9]{40}$ ]]
+          echo "SUBC_REV=$subc" >> "$GITHUB_ENV"
+          echo "CLAUSTRUM_REV=$vault" >> "$GITHUB_ENV"
+      - name: Fingerprint fixture toolchain
+        id: toolchain
+        run: echo "rust=$(rustc -V | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: binaries
+        with:
+          path: fixtures
+          key: fixtures-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.rust }}-${{ env.SUBC_REV }}-${{ env.CLAUSTRUM_REV }}
+      - name: Checkout subconscious
+        if: steps.binaries.outputs.cache-hit != 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: cortexkit/subconscious
+          ref: ${{ env.SUBC_REV }}
+          path: subconscious
+      - name: Checkout claustrum
+        if: steps.binaries.outputs.cache-hit != 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: cortexkit/claustrum
+          ref: ${{ env.CLAUSTRUM_REV }}
+          path: claustrum
+      - name: Build fixtures once
+        if: steps.binaries.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path subconscious/Cargo.toml -p subc-core --bins
+          cargo build --locked --manifest-path claustrum/Cargo.toml -p credentials-module --bins
+          suffix=""
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          mkdir -p fixtures/bin fixtures/claustrum/crates/credentials-module/tests/fixtures
+          cp "subconscious/target/debug/ck-subc$suffix" "subconscious/target/debug/fake-aft-stub$suffix" fixtures/bin/
+          cp "claustrum/target/debug/ck-claustrum$suffix" "claustrum/target/debug/ck-auth$suffix" fixtures/bin/
+          cp claustrum/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json fixtures/claustrum/crates/credentials-module/tests/fixtures/
+      - name: Verify and package fixtures
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          for name in ck-subc fake-aft-stub ck-claustrum ck-auth; do
+            test -s "fixtures/bin/$name$suffix"
+          done
+          test -s fixtures/claustrum/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json
+          tar -czf "fixtures-$RUNNER_OS.tar.gz" fixtures
+          echo "Fixture cache exact hit: ${{ steps.binaries.outputs.cache-hit }}; subc=$SUBC_REV vault=$CLAUSTRUM_REV" >> "$GITHUB_STEP_SUMMARY"
+      # Tar preserves executable permissions when upload-artifact transports Unix binaries.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fixtures-${{ matrix.os }}
+          path: fixtures-${{ matrix.os }}.tar.gz
+          retention-days: 3
