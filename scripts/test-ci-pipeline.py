@@ -117,8 +117,11 @@ class WorkflowGraph(unittest.TestCase):
 
     def test_fixtures_are_pinned_and_shared_without_changing_mutation_selection(self):
         fixtures = self.workflow('fixtures.yml')['jobs']['fixtures']
+        pins = (ROOT / 'scripts/ci-fixture-revisions.conf').read_text()
         for key in ('SUBC_REV', 'CLAUSTRUM_REV'):
-            self.assertRegex(fixtures['env'][key], r'^[a-f0-9]{40}$')
+            self.assertRegex(pins, key + r'=[a-f0-9]{40}\b')
+        load = next(s for s in fixtures['steps'] if s.get('name') == 'Load shared fixture pins')
+        self.assertIn('source broca/scripts/ci-fixture-revisions.conf', load['run'])
         nightly = next(s for s in fixtures['steps'] if s.get('name') == 'Resolve nightly sibling revisions')
         self.assertEqual(nightly['if'], "github.event_name == 'schedule'")
         self.assertEqual(nightly['run'].count('git ls-remote'), 2)

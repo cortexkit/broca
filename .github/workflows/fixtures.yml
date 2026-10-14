@@ -20,13 +20,20 @@ jobs:
           - os: Windows
             runner: windows-latest
     env:
-      SUBC_REV: 5f948a56f4c4392cb29cb4bd8ed94b2cde3a5aae
-      CLAUSTRUM_REV: f22e5bd03d0c4e58a4ffaa3fc7c22a19413c99e5
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - name: Load shared fixture pins
+        run: |
+          source broca/scripts/ci-fixture-revisions.conf
+          echo "SUBC_REV=$SUBC_REV" >> "$GITHUB_ENV"
+          echo "CLAUSTRUM_REV=$CLAUSTRUM_REV" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       # The daily compatibility lane still exercises moving sibling tips. Its
       # binaries are cached by the resolved SHA, never by a mutable branch name.

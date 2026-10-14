@@ -190,3 +190,67 @@ larger runner would be invented. The full mutation catalogue still pays serial
 recompilation per row; its 52:34 failed baseline cannot support a promise of a
 15-minute full-green release. Train measurements below determine the remaining
 critical path.
+
+## Remote train preflight
+
+Before any train/probe commit push, `train-push.sh` invokes the installed
+`ck motor run` through `scripts/train-preflight.sh`. Failure prints the runner
+output and refuses the push; no Mac fallback exists. A successful preflight is
+reused only for unchanged, clean HEAD within that process. A moved-master
+rebase earns another preflight. The first-use CI trigger probe is a synthetic
+commit with the same tree as HEAD and requires the same preflight first.
+
+The runner CLI is reachable (rustc/Cargo 1.99.0), but its sibling snapshot
+transport rejects task-local nested checkouts: siblings must sit beside the
+main checkout, even when invoked from a linked worktree. A real attempt returned
+`200 snapshot_failed` before running anything. Those jobs also cannot resolve
+GitHub to fetch fixture sources. Rather than touching operator checkouts or
+building on the Mac, the preflight
+was explicitly narrowed to **cheap, fixture-independent checks**.
+
+It requests 8 vCPUs and runs fmt, Linux and Windows-GNU-target workspace/all-
+target clippy, lib/bin tests with **`--no-fail-fast`**, and portable integrations.
+`broca-provider/live`, `broca-catalog/live`, and
+`broca-module-serve/test-clock` remain enabled, so lint checks the transport and
+retention-clock code as well as the default code. Five fixture-dependent unit
+tests are explicitly excluded:
+
+- `executor::tests::session_close_releases_hook_and_compaction_routes` checks
+  route cleanup against a real subconscious daemon.
+- `vault::tests::list_scoped_strict_mirror_matches_claustrum_tip` compares the
+  enrollment wire contract with the vault checkout's fixture.
+- The three `broca-store-postgres` tests for batched projection, export-writer
+  locking and store conformance require a live database; they run in the
+  Docker-backed Postgres CI lane.
+
+The remaining unit inventory is printed,
+then actual libtest execution counts (including exclusions and ignores) are
+reported. Integration discovery prints baseline/selected/excluded/ignored counts
+per binary and every excluded test name. Zero discovery, zero execution,
+unexpected passing fixture skips, missing clock PASS proof and count mismatch
+all refuse. Fixture requirement flags remain armed to catch selector drift.
+
+`scripts/portable-test-selection.conf` names the integration families kept out
+of this cheap preflight: `broca-subc` session/resume/tool-fault daemon proofs,
+serve conformance and
+scope-daemon targets, the real-module/daemon/vault families, real-daemon plan
+admission proofs, and aimock provider families. **All still run in CI and the
+Mac pre-merge gate**, with the original fixture requirements. Doctests, scripts,
+Postgres and native Windows execution remain separate full CI lanes. The Mac
+gate continues exercising native Mac daemon/vault/mock variants; Linux CI
+covers their Linux variants, not native signing, Gatekeeper or Mac facilities.
+
+Eight environment-dependent integration probes are also excluded from the cheap
+preflight: four opt-in paid/live-provider probes, credential-store consent,
+production-catalog resolution, comparison of the deployed and tracked tool
+descriptors, and the real Magic Context client. CI retains their existing invocation/skip behavior; running
+their assertions requires the corresponding operator state, binary or explicit
+live-test opt-in. They are not portable proofs merely because they return PASS
+without that environment.
+
+Motor supplies persistent `/run/motor/target` and `/motor-home/cargo` paths.
+Successive real archive-build jobs reused compilation (`Finished test ...
+0.07 s`, then **0.06 s**), while archive compression/extraction still incurred
+work. This is observed warm-cache reuse, not a claim that every revision or
+Windows target is already warm. No sibling checkout or npm installation is
+required by the narrowed preflight.

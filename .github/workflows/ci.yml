@@ -331,7 +331,7 @@ jobs:
         shell: bash
         run: |
           source scripts/rust-test-gate.sh
-          run_phase 'lib/bin tests' cargo test --locked --workspace --lib --bins "${cargo_feature_args[@]}" --quiet
+          run_phase 'lib/bin tests' cargo test --locked --workspace --lib --bins --no-fail-fast "${cargo_feature_args[@]}" --quiet
           doc_count="$(count_doc_tests)"
           echo "doctests discovered: $doc_count"
           if [[ "$doc_count" -gt 0 ]]; then

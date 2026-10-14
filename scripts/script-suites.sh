@@ -42,6 +42,7 @@ suites=(
     # checks also run on a Linux runner.
     scripts/test-place-release-gate.py
     scripts/test-train-push.py
+    scripts/test-train-preflight.py
     scripts/test-watch-ci-resolve.py
     scripts/test-archive-read.py
     scripts/test-wal-archive-instruments.py
