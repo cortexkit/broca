@@ -48,5 +48,6 @@ else
   git tag -a "$tag" "$sha" -m "broca $version"
 fi
 echo "release: staging $tag at already-green $sha (no gate, train, or CI rerun)"
-bash scripts/stage-release.sh "${stage_args[@]}"
+# macOS ships bash 3.2, where "${arr[@]}" on an empty array trips `set -u`.
+bash scripts/stage-release.sh ${stage_args[@]+"${stage_args[@]}"}
 echo "release: staged; $tag is local. Placement/restart still requires separate approval and scripts/place-release.sh."
