@@ -9276,3 +9276,16 @@ old = '''#[serde(deny_unknown_fields)]
 struct RuntimeModelOverlay {'''
 new = '''// NON-VACUITY BREAK: accept unknown model fields
 struct RuntimeModelOverlay {'''
+
+[[control]]
+id = "catalog-default-output-below-context"
+guards = "Default output caps stay below a small known context while explicit caller caps remain unclamped"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--test default_max_output"
+test_file = "crates/broca-catalog/tests/default_max_output.rs"
+expect_red = ["gated::default_output_cap_is_below_a_small_known_context"]
+file = "crates/broca-catalog/src/live.rs"
+old = 'u64::from(FALLBACK_MAX_OUTPUT_TOKENS).min(context - 1) as u32'
+new = 'u64::from(FALLBACK_MAX_OUTPUT_TOKENS).min(context.max(u64::from(FALLBACK_MAX_OUTPUT_TOKENS))) as u32 /* NON-VACUITY BREAK */'

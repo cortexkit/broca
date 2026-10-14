@@ -69,6 +69,18 @@ mod gated {
                         row(json!(32_768), json!(64_000)),
                     ),
                     (
+                        "anthropic/small-context-null-output".into(),
+                        row(json!(16_384), Value::Null),
+                    ),
+                    (
+                        "anthropic/small-context-zero-output".into(),
+                        row(json!(16_384), json!(0)),
+                    ),
+                    (
+                        "anthropic/small-context-placeholder-output".into(),
+                        row(json!(16_384), json!(32_000)),
+                    ),
+                    (
                         "anthropic/unknown-context".into(),
                         row(Value::Null, json!(NO_CONTEXT_OUTPUT)),
                     ),
@@ -147,6 +159,30 @@ mod gated {
             frozen_cap("anthropic/output-above-context", None),
             FALLBACK_MAX_OUTPUT_TOKENS,
             "output > context is not a cap the model can honour"
+        );
+    }
+
+    #[test]
+    fn default_output_cap_is_below_a_small_known_context() {
+        for model in [
+            "anthropic/small-context-null-output",
+            "anthropic/small-context-zero-output",
+            "anthropic/small-context-placeholder-output",
+        ] {
+            let cap = frozen_cap(model, None).as_u64().unwrap();
+            assert_eq!(cap, 16_383, "{model}");
+            assert!(cap < 16_384, "output must leave room in the context window");
+            assert_eq!(frozen_cap(model, Some(100_000)), 100_000);
+        }
+        use broca_catalog::live::default_max_output_tokens;
+        assert_eq!(default_max_output_tokens(None, Some(1)), 0);
+        assert_eq!(
+            default_max_output_tokens(None, Some(0)),
+            FALLBACK_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            default_max_output_tokens(None, Some(u64::MAX)),
+            FALLBACK_MAX_OUTPUT_TOKENS
         );
     }
 
