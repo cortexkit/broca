@@ -3237,15 +3237,15 @@ new = "let detail = if false && self.retention { // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-reader-boot-enrollment"
-guards = "the real reader daemon enrolls retained WALs before its first sweep"
+guards = "the real reader daemon enrolls retained WALs before querying its first sweep's deadlines"
 runner = "command"
-command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
+command = ["bash", "-c", "git diff --stat; BROCA_REQUIRE_SUBC=1 cargo test --locked -p broca-module-serve --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 expect_red = ["ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_content"]
-file = "crates/broca-module-serve/src/main.rs"
-old = "registry\n        .boot_retention()\n        .await\n        .map_err(|error| ServeIoError(format!(\"retention boot recovery: {error}\")))?;"
-new = "if false { registry\n        .boot_retention()\n        .await\n        .map_err(|error| ServeIoError(format!(\"retention boot recovery: {error}\")))?; } // NON-VACUITY BREAK"
+file = "crates/broca-module/src/retention.rs"
+old = "if !matching {"
+new = "if false && !matching { // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-writer-admission"
