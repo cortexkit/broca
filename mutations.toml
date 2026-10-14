@@ -10301,3 +10301,17 @@ select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "    if completed.cancel.is_cancelled() {"
 new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish stale bind completion"
+
+[[control]]
+id = "websocket-policy-read-outside-session-lock"
+guards = "per-attempt transport policy refresh does not hold the session mutex"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::policy_read_does_not_hold_session_lock"]
+select = "expected"
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = "        let configured_https = policy();\n        let state = self.state.lock().unwrap();"
+new = "        let state = self.state.lock().unwrap();\n        let configured_https = policy(); // NON-VACUITY BREAK: read config under session mutex"
