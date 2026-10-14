@@ -10382,3 +10382,42 @@ select = "expected"
 file = "crates/broca-module-serve/src/main.rs"
 old = "    runtime.shutdown_background();"
 new = "    drop(runtime); // NON-VACUITY BREAK: implicitly join every blocking task"
+
+[[control]]
+id = "serve-oversized-response-is-call-local"
+guards = "an oversized success response fails its call while a sibling completes on the same connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {"
+new = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversize tears down connection"
+
+[[control]]
+id = "serve-oversized-error-is-call-local"
+guards = "an oversized error response fails its call while a sibling completes on the same connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {\n        body = serde_json::to_vec(&ErrorBody::new("
+new = "    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversized error tears down connection\n        body = serde_json::to_vec(&ErrorBody::new("
+
+[[control]]
+id = "serve-write-reset-is-classified-close"
+guards = "a write-half reset ends the connection as reset rather than a generic egress failure"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::write_half_reset_is_classified_even_with_a_request_in_flight"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        result = &mut writer => {"
+new = "        result = &mut writer, if false => { // NON-VACUITY BREAK: wait for the reader to notice closed egress"

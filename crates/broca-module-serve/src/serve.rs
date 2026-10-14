@@ -723,7 +723,7 @@ where
 {
     let stall_state = stall::connection_state();
     let (tx, rx) = broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, stall_state.egress.clone());
-    let writer = tokio::spawn(drain_writer(write_half, rx));
+    let mut writer = tokio::spawn(drain_writer(write_half, rx));
     let reader_lifetime = stall::reader_lifetime(stall_state.clone());
 
     // A connection-level cancel: when the frame loop ends (EOF / GOODBYE / error), this
@@ -732,26 +732,39 @@ where
     // lineage-scoped subscription's parked forward task would keep the egress open forever
     // and hang the connection on teardown.
     let conn_cancel = CancellationToken::new();
-    let loop_result = stall::READER
-        .scope(
-            stall_state,
-            run_frame_loop(
-                &mut read_half,
-                tx.clone(),
-                module_id,
-                handler,
-                health_registry.as_ref(),
-                vault_gauge.as_ref(),
-                catalog_cache.as_deref(),
-                conn_cancel.clone(),
-                archive,
-                &consumer_routes,
-                vault_auditor,
-                daemon_capabilities,
-                scope_describer.as_deref(),
-            ),
-        )
-        .await;
+    let frame_loop = stall::READER.scope(
+        stall_state,
+        run_frame_loop(
+            &mut read_half,
+            tx.clone(),
+            module_id,
+            handler,
+            health_registry.as_ref(),
+            vault_gauge.as_ref(),
+            catalog_cache.as_deref(),
+            conn_cancel.clone(),
+            archive,
+            &consumer_routes,
+            vault_auditor,
+            daemon_capabilities,
+            scope_describer.as_deref(),
+        ),
+    );
+    let mut writer_finished = false;
+    let loop_result = tokio::select! {
+        biased;
+        // A reset reported by the write half closes the TCP connection, not one route
+        // (RFC 9293 §3.10.7.4). Observe it before a request sees the closed egress queue.
+        result = &mut writer => {
+            writer_finished = true;
+            match result {
+                Ok(Ok(())) => Ok(ServeEnd::PeerReset),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(ServeIoError(error.to_string())),
+            }
+        }
+        result = frame_loop => result,
+    };
     drop(reader_lifetime);
     // Before the egress queue can close: the describer holds a sender on it.
     if let Some(describer) = &scope_describer {
@@ -759,7 +772,11 @@ where
     }
     conn_cancel.cancel();
     drop(tx);
-    let writer_result = writer.await;
+    let writer_result = if writer_finished {
+        Ok(Ok(()))
+    } else {
+        writer.await
+    };
 
     match (loop_result, writer_result) {
         (Err(e), _) => Err(e),
@@ -2749,6 +2766,20 @@ async fn send_json_response<T: serde::Serialize>(
 ) -> Result<(), ServeIoError> {
     let envelope = ResultEnvelope { result };
     let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;
+    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {
+        // No bytes from this reply have reached the wire, so a small correlated Error
+        // can fail this call without invalidating any sibling request on the connection.
+        return send_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "response_too_large",
+            "response exceeds the protocol frame body limit",
+        )
+        .await;
+    }
     let frame = Frame::build_with_version(
         ver,
         FrameType::Response,
@@ -3263,8 +3294,15 @@ async fn send_error_bytes(
     channel: u16,
     epoch: u32,
     corr: u64,
-    body: Vec<u8>,
+    mut body: Vec<u8>,
 ) -> Result<(), ServeIoError> {
+    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {
+        body = serde_json::to_vec(&ErrorBody::new(
+            "response_too_large",
+            "error response exceeds the protocol frame body limit",
+        ))
+        .map_err(|error| ServeIoError(error.to_string()))?;
+    }
     let frame = Frame::build_with_version(
         ver,
         FrameType::Error,
@@ -4214,7 +4252,18 @@ mod tests {
         ) -> Result<CancelResponse, ServeError> {
             unimplemented!()
         }
-        async fn status(&self, _session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+        async fn status(&self, session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            if session.session == "oversized-error-response" {
+                return Err(ServeError::Transient(
+                    "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize),
+                ));
+            }
+            if session.session == "oversized-response" {
+                return Ok(StatusResponse::Active {
+                    run_id: "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize),
+                    step: 1,
+                });
+            }
             self.entered.notify_one();
             self.release.notified().await;
             Err(ServeError::Transient("released by the test".into()))
@@ -4425,6 +4474,38 @@ mod tests {
         );
     }
 
+    struct ResetWrite<W> {
+        inner: W,
+        reset: Arc<std::sync::atomic::AtomicBool>,
+        observed: Arc<tokio::sync::Notify>,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for ResetWrite<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.reset.load(Ordering::SeqCst) {
+                self.observed.notify_one();
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
     async fn bind_test_route(daemon: &mut tokio::io::DuplexStream, session: &str) {
         let hello = read_frame(daemon).await.unwrap().unwrap();
         write_frame(
@@ -4480,6 +4561,119 @@ mod tests {
             read_frame(daemon).await.unwrap().unwrap().header.ty,
             FrameType::Response
         );
+    }
+
+    async fn test_request(daemon: &mut tokio::io::DuplexStream, method: &str, corr: u64) {
+        write_frame(
+            daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                7,
+                1,
+                corr,
+                serde_json::to_vec(&RouteRequest {
+                    method: method.into(),
+                    params: serde_json::Value::Null,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_fails_only_its_call_and_sibling_completes() {
+        for session in ["oversized-response", "oversized-error-response"] {
+            let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(module);
+            let handler = Arc::new(GatedStatusHandler {
+                gate_auth: false,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let serve = tokio::spawn(serve_connection(
+                reader,
+                writer,
+                "broca",
+                handler,
+                Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+                VaultGauge::not_in_use(),
+            ));
+            bind_test_route(&mut daemon, session).await;
+            test_request(&mut daemon, OP_STATUS, 3).await;
+            test_request(&mut daemon, OP_ROLE_DESCRIBE, 4).await;
+            let error = read_frame(&mut daemon)
+                .await
+                .unwrap()
+                .expect("oversized call lost the connection");
+            assert_eq!((error.header.ty, error.header.corr), (FrameType::Error, 3));
+            assert_eq!(
+                serde_json::from_slice::<ErrorBody>(&error.body)
+                    .unwrap()
+                    .code,
+                "response_too_large"
+            );
+            let sibling = read_frame(&mut daemon)
+                .await
+                .unwrap()
+                .expect("sibling lost the connection");
+            assert_eq!(
+                (sibling.header.ty, sibling.header.corr),
+                (FrameType::Response, 4)
+            );
+            write_frame(
+                &mut daemon,
+                &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 5, vec![]).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_half_reset_is_classified_even_with_a_request_in_flight() {
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(module);
+        let reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let serve = tokio::spawn(serve_connection(
+            reader,
+            ResetWrite {
+                inner: writer,
+                reset: reset.clone(),
+                observed: observed.clone(),
+            },
+            "broca",
+            handler.clone(),
+            Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+            VaultGauge::not_in_use(),
+        ));
+        bind_test_route(&mut daemon, "reset-response").await;
+        test_request(&mut daemon, OP_STATUS, 3).await;
+        handler.entered.notified().await;
+        reset.store(true, Ordering::SeqCst);
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        observed.notified().await;
+        handler.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), serve)
+            .await
+            .expect("write reset left the reader waiting on an unusable connection")
+            .unwrap();
+        assert_eq!(result.unwrap(), ServeEnd::PeerReset);
     }
 
     #[tokio::test]
