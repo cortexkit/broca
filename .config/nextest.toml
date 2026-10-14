@@ -11,7 +11,9 @@ test-threads = -2
 [profile.ci]
 inherits = "default"
 retries = 0
-fail-fast = true
+# CI is the only place Windows runs, and one run takes about half an hour, so report every
+# failing test instead of stopping at the first. Local runs keep fail-fast.
+fail-fast = false
 # A passed test with inherited output handles still open is a cleanup failure.
 leak-timeout = { period = "2s", result = "fail" }
 # Allow slow provider disconnect tests, but terminate a stuck test after five minutes.

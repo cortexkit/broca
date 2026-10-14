@@ -93,6 +93,25 @@ pub fn deny_acl_read(path: &Path) {
 }
 
 pub fn reset_acl(path: &Path) {
+    // `deny_acl_read` leaves the ACL unreadable, and icacls must read it before resetting.
+    // Writing a whole new DACL needs only WRITE_DAC, which the account's own full-control
+    // entry still grants, so replace it blind first and let icacls reset from there.
+    powershell(
+        path,
+        r#"
+        $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;
+        $sys=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18');
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            $s=New-Object System.Security.AccessControl.DirectorySecurity;
+            foreach ($sid in @($user,$sys)) { $s.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) };
+            [System.IO.Directory]::SetAccessControl($p,$s);
+        } else {
+            $s=New-Object System.Security.AccessControl.FileSecurity;
+            foreach ($sid in @($user,$sys)) { $s.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow'))) };
+            [System.IO.File]::SetAccessControl($p,$s);
+        }
+    "#,
+    );
     let output = Command::new("icacls.exe")
         .arg(path)
         .arg("/reset")
