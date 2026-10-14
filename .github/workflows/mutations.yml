@@ -24,7 +24,25 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
+  mutation-platforms:
+    name: Mutation test platform preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Check catalogue platforms and regression fixtures
+        working-directory: broca
+        run: |
+          python3 scripts/verify-mutation-platforms.py
+          python3 scripts/verify-mutation-platforms.py --self-test
+
   mutations:
+    needs: mutation-platforms
     name: Mutation catalogue (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -131,6 +149,7 @@ jobs:
           path: broca/target/mutations/*.json
 
   mutations-windows:
+    needs: mutation-platforms
     name: Mutation catalogue (native Windows shard ${{ matrix.shard }}/4)
     runs-on: windows-latest
     timeout-minutes: 360
