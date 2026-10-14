@@ -10249,3 +10249,55 @@ expect_red = ["single_turn_module_e2e::meta_muse_oauth_uses_responses_bearer_and
 file = "crates/broca-module-serve/src/cache_routing.rs"
 old = 'let session_key_providers = BTreeSet::from(["meta".to_string()]);'
 new = 'let session_key_providers = BTreeSet::new(); // NON-VACUITY BREAK: drop the Meta session key'
+
+[[control]]
+id = "serve-reader-authorization-off-ingress"
+guards = "health pings and GOODBYE are read while authorization waits"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_health_ping_during_authorization_and_permit_waits"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if req.method == OP_VAULT_AUDIT {"
+new = "            authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await.unwrap(); // NON-VACUITY BREAK: block ingress on authorization\n            if req.method == OP_VAULT_AUDIT {"
+
+[[control]]
+id = "serve-reader-permit-off-ingress"
+guards = "health pings and GOODBYE are read when route permits are exhausted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_health_ping_during_authorization_and_permit_waits"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if req.method == OP_VAULT_AUDIT {"
+new = "            drop(request_slots.clone().acquire_owned().await.unwrap()); // NON-VACUITY BREAK: wait for a permit on ingress\n            if req.method == OP_VAULT_AUDIT {"
+
+[[control]]
+id = "serve-bind-authorization-off-ingress"
+guards = "health pings and GOODBYE stay readable while stamped-bind ownership reads are held"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_ping_and_goodbye_while_bind_ownership_read_is_held"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                routes\n                    .bind_tasks\n                    .spawn(async move { authorize_bind(completed, registry).await });"
+new = "                let completed = authorize_bind(completed, registry).await; // NON-VACUITY BREAK: bind read blocks ingress\n                finish_bind(completed, writer, routes).await?;"
+
+[[control]]
+id = "serve-canceled-bind-cannot-publish"
+guards = "a route GOODBYE fences a late bind read from installing a binding or acknowledging it"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::pending_bind_goodbye_cannot_publish_a_late_ack"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if completed.cancel.is_cancelled() {"
+new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish stale bind completion"
