@@ -4439,7 +4439,7 @@ impl LineageRegistry {
                 }
                 Ok(Ok(None)) => {}
                 _ => {
-                    tracing::warn!(target: "retention", "deletion deferred; lease or durable operation unavailable")
+                    tracing::warn!(target: "retention", session = %broca_core::session_addr(&key), "deletion deferred; lease or durable operation unavailable")
                 }
             }
         }

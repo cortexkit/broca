@@ -9315,3 +9315,51 @@ expect_red = ["actor::wal_proof_tests::old_keyed_send_requires_proven_full_scan_
 file = "crates/broca-module/src/durable_read.rs"
 old = '            WalRangeRecords::Complete(records) => records,'
 new = '            WalRangeRecords::Complete(records) | WalRangeRecords::Unknown(records) => records, // NON-VACUITY BREAK'
+
+[[control]]
+id = "retention-sweep-continues-after-vanished-wal"
+guards = "a listed WAL that disappears does not stop enrollment of later sessions"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::sweep_handles_listed_wal_disappearance_and_enrolls_later_keys"]
+file = "crates/broca-module/src/retention.rs"
+old = '''                Ok(false) => {}
+                Err(_) => {
+                    tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                        "enrollment deferred");'''
+new = '''                Ok(false) => return Ok(replayed), // NON-VACUITY BREAK: stop at a handled vanished WAL.
+                Err(_) => {
+                    tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                        "enrollment deferred");'''
+
+[[control]]
+id = "retention-recovery-isolates-bad-key"
+guards = "persistent tombstone failure cannot prevent unrelated deletion and cache eviction"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::deletion_recovery_isolates_persistent_bad_tombstone_and_evicts_good_keys"]
+file = "crates/broca-module/src/retention.rs"
+old = '''                Err(_) => {
+                    tracing::warn!(target: "retention", session = %broca_core::session_addr(&key),
+                    "deletion recovery deferred")
+                }'''
+new = '''                Err(error) => return Err(error), // NON-VACUITY BREAK: abort all recovery on one key.'''
+
+[[control]]
+id = "retention-export-fallback-is-lazy"
+guards = "successful export discovery cannot be blocked by an unnecessary fallback query"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::successful_export_discovery_does_not_query_fallback_before_tombstone"]
+file = "crates/broca-module/src/retention.rs"
+old = '                Ok(runs) => runs,'
+new = '                Ok(runs) => { self.index.runs(&id)?; runs }, // NON-VACUITY BREAK: eager fallback query.'
