@@ -688,6 +688,7 @@ fn build_from_headers<R: Read + Seek>(
     reader: &mut ArchiveReader<R>,
     path: &Path,
 ) -> Option<Box<[[u8; 16]]>> {
+    // Only a scan that reaches the sealed member boundary can authorize cache misses.
     let headers = reader.rescan().ok()?;
     if headers.len() > MAX_MEMBERS {
         return None;

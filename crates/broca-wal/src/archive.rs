@@ -505,35 +505,37 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// not served or digest-verified. Even this metadata recovery refuses an unsealed
     /// file: its live sources still belong to the interrupted fold pass.
     pub fn rescan(&mut self) -> io::Result<Vec<MemberInfo>> {
-        let (end, _) = self.sealed_trailer()?;
-        self.scan(end)
+        let (end, index_len) = self.sealed_trailer()?;
+        self.scan(end, index_len)
     }
 
-    fn scan(&mut self, end: u64) -> io::Result<Vec<MemberInfo>> {
+    fn scan(&mut self, end: u64, index_len: u32) -> io::Result<Vec<MemberInfo>> {
+        let members_end = end
+            .checked_sub(u64::from(index_len))
+            .ok_or_else(|| invalid("invalid archive index length"))?;
         let mut entries = Vec::new();
         let mut seen = BTreeSet::new();
         let mut offset = 0;
-        while offset < end {
-            if end - offset < 4 {
-                return Err(invalid("truncated member or index"));
-            }
-            // One read per member: the whole header when it fits before `end`, otherwise
-            // the shorter remaining tail. Either way it includes the 4 magic bytes that
-            // tell a member header from the start of the index.
+        while offset < members_end {
+            // The seal's index length identifies the boundary; damaged member magic
+            // before it is never evidence that the member region ended early.
             let mut bytes = [0; MEMBER_HEADER_LEN as usize];
-            let available = (end - offset).min(MEMBER_HEADER_LEN) as usize;
-            self.read_unbuffered(offset, &mut bytes[..available])?;
-            if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != MAGIC_MEMBER {
-                break; // The first non-member is the index, which need not be decodable.
-            }
-            // After a short read the rest of `bytes` is zero filler, never used: the
-            // bounds check `parse_header` runs first rejects it as a truncated header.
-            let info = parse_header(&bytes, offset, end)?;
+            header_in_bounds(offset, members_end)?;
+            self.read_unbuffered(offset, &mut bytes)?;
+            let info = parse_header(&bytes, offset, members_end)?;
             if !seen.insert(info.session_addr.clone()) {
                 return Err(invalid("duplicate session in archive headers"));
             }
             offset += MEMBER_HEADER_LEN + info.payload_len;
             entries.push(info);
+        }
+        if index_len != 0 {
+            let v1_len = 4 + INDEX_ENTRY_LEN * entries.len() as u64;
+            if u64::from(index_len) != v1_len
+                && u64::from(index_len) != v1_len + INDEX_V2_EXTENSION_LEN
+            {
+                return Err(invalid("archive scan cannot prove member coverage"));
+            }
         }
         Ok(entries)
     }
@@ -719,11 +721,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
             Ok(IndexLookup::Miss {
                 authoritative: false,
             }) => self
-                .scan(end)?
+                .scan(end, index_len)?
                 .into_iter()
                 .find(|entry| entry.session_addr == session_addr),
             Err(error) if error.kind() == io::ErrorKind::InvalidData => self
-                .scan(end)?
+                .scan(end, index_len)?
                 .into_iter()
                 .find(|entry| entry.session_addr == session_addr),
             Err(error) => return Err(error),

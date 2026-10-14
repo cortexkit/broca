@@ -431,7 +431,8 @@ fn a_damaged_member_header_under_an_unverified_v2_index_fails_loudly() {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert_eq!(error.to_string(), "invalid archive member header");
         }
-        // The other members still resolve, and an absent address is still absent.
+        // Intact indexed members still resolve. Only a verified index can prove
+        // absence without scanning through the damaged member header.
         assert_eq!(
             read_newest_member(&paths, &addr(7), 100)
                 .unwrap()
@@ -439,14 +440,20 @@ fn a_damaged_member_header_under_an_unverified_v2_index_fails_loudly() {
                 .payload,
             b"seven"
         );
-        assert!(read_newest_member(&paths, &addr(8), 100).unwrap().is_none());
+        let absent = read_newest_member(&paths, &addr(8), 100);
+        if damage_digest {
+            assert!(absent.is_err());
+        } else {
+            assert!(absent.unwrap().is_none());
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
 /// A digest that matches never excuses geometry a v1 index would fail: a gap, a
 /// duplicate, an entry past the member region, or an index that omits a member. Each is
-/// `Invalid` and every member is still found by the header scan.
+/// `Invalid`. Header recovery still serves members when index length agrees with
+/// complete header coverage; an omitted index entry makes that coverage uncertain.
 #[test]
 fn a_matching_digest_never_excuses_bad_geometry() {
     let members = members(4);
@@ -469,11 +476,18 @@ fn a_matching_digest_never_excuses_bad_geometry() {
         assert_eq!(kind(&bytes, STAMP), Kind::Invalid, "{label}");
         let mut reader = reader(&bytes);
         for (name, payload) in &members {
-            assert_eq!(
-                &reader.read_member(name).unwrap().unwrap().payload,
-                payload,
-                "{label}"
-            );
+            if label == "omitted" {
+                assert!(
+                    reader.read_member(name).is_err(),
+                    "{label}: uncertain coverage"
+                );
+            } else {
+                assert_eq!(
+                    &reader.read_member(name).unwrap().unwrap().payload,
+                    payload,
+                    "{label}"
+                );
+            }
         }
     }
 }

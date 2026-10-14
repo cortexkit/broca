@@ -133,6 +133,9 @@ PROVIDER-INVALID (Anthropic rejects it).
     (reserved frames carrying the WAL's durable 128-bit identity, rather than run
     records) may accompany a discarded damaged record only if claimed identities
     are consistent with any identity proven in the prefix and with one another.
+    Archive lookups with a missing or invalid index must
+    prove coverage of the entire sealed member region before reporting absence or
+    caching membership; damaged member headers never justify serving older history.
 2. **`run_config` is authoritative** — rebuild the request config from it; reject
    if caller-supplied config conflicts.
 3. **Fold by TURN:**
