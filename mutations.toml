@@ -5009,6 +5009,19 @@ new = '''let mut state = self.state.lock().unwrap();
         state.synced = state.pending.clone();'''
 
 [[control]]
+id = "core-approval-logic-defaults-to-memory-wal"
+guards = "approval logic uses the sync-aware memory WAL by default rather than timing filesystem fsync"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor", "run::approval_tests::store_resume_open_batch_pause_preserves_next_request_bytes"]
+file = "crates/broca-core/src/run/approval_tests.rs"
+old = "Self::with_memory(second, answer, transient, stop, Some(MemoryWal::new()))"
+new = "Self::with_memory(second, answer, transient, stop, None) // NON-VACUITY BREAK: restore disk I/O in logic tests."
+
+[[control]]
 id = "subc-accepted-filing-unreadable-ack-retries"
 guards = "an unreadable successful filing reply refiles the accepted question under the same key"
 runner = "cargo"

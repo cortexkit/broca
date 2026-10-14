@@ -92,3 +92,18 @@ impl Wal for MemoryWal {
         Some(self.lineage)
     }
 }
+
+// Store-assisted resume must read the same synced prefix as the approval probes,
+// rather than accidentally consulting an empty file store beside the memory WAL.
+impl crate::WalStore for MemoryWal {
+    fn open(&self, _: &broca_protocol::BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+        Ok(Box::new(self.clone()))
+    }
+
+    fn read_records(
+        &self,
+        _: &broca_protocol::BindIdentity,
+    ) -> Result<Vec<FramedRecord>, WalError> {
+        self.replay()
+    }
+}
