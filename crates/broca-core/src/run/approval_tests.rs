@@ -13,6 +13,22 @@ use std::sync::{
     Mutex,
 };
 
+#[cfg(test)]
+#[path = "approval_tests/memory_wal.rs"]
+mod memory_wal;
+use memory_wal::MemoryWal;
+
+fn rig_records(
+    store: &crate::FileWalStore,
+    memory: Option<&MemoryWal>,
+    bind: &BindIdentity,
+) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+    match memory {
+        Some(memory) => broca_wal::Wal::replay(memory),
+        None => store.read_records(bind),
+    }
+}
+
 struct Hooks {
     validates: AtomicUsize,
     second: &'static str,
@@ -62,6 +78,7 @@ impl crate::HookPlane for Hooks {
 }
 struct Questions {
     store: crate::FileWalStore,
+    memory: Option<MemoryWal>,
     completed: Arc<std::sync::atomic::AtomicBool>,
     lineage: broca_wal::WalLineageId,
     head: Arc<std::sync::atomic::AtomicU64>,
@@ -93,8 +110,7 @@ impl ElicitationPlane for Questions {
             "Prepared synced before filing"
         );
         assert!(
-            self.store
-                .read_records(&ctx.bind)
+            rig_records(&self.store, self.memory.as_ref(), &ctx.bind)
                 .unwrap()
                 .iter()
                 .any(|frame| frame.seq == seq && frame.record == *record),
@@ -133,7 +149,7 @@ impl ElicitationPlane for Questions {
         self.cursors.lock().unwrap().push(cursor.cloned());
         let answer = *self.answer.lock().unwrap();
         if answer == "none" && self.completed.load(Ordering::SeqCst) {
-            let frames = self.store.read_records(&ctx.bind).unwrap();
+            let frames = rig_records(&self.store, self.memory.as_ref(), &ctx.bind).unwrap();
             let terminal=frames.iter().find(|frame| matches!(&frame.record,WalRecord::ToolResult{result,..} if result.tool_call_id.0=="sibling"));
             assert!(
                 terminal.is_some_and(|frame| self.head.load(Ordering::SeqCst) >= frame.seq),
@@ -215,6 +231,7 @@ struct Tools {
     refuse_scope: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<(String, String, BatchId)>>,
     store: crate::FileWalStore,
+    memory: Option<MemoryWal>,
     bind: BindIdentity,
 }
 #[async_trait::async_trait]
@@ -288,7 +305,7 @@ impl ToolPlane for Tools {
         key: &str,
         _: &str,
     ) -> DispatchResult {
-        let frames = self.store.read_records(&self.bind).unwrap();
+        let frames = rig_records(&self.store, self.memory.as_ref(), &self.bind).unwrap();
         let target = frames
             .iter()
             .find_map(|frame| match &frame.record {
@@ -423,6 +440,16 @@ async fn held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer() {
 }
 impl Rig {
     fn new(second: &'static str, answer: &'static str, transient: bool, stop: bool) -> Self {
+        Self::with_memory(second, answer, transient, stop, None)
+    }
+
+    fn with_memory(
+        second: &'static str,
+        answer: &'static str,
+        transient: bool,
+        stop: bool,
+        memory: Option<MemoryWal>,
+    ) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "approval-{}-{}",
@@ -431,7 +458,11 @@ impl Rig {
         ));
         let bind = BindIdentity::new("/project", "test", "approval");
         let store = crate::FileWalStore::new(&root);
-        let writer = WalHandle::spawn(store.open(&bind).unwrap(), 1).unwrap();
+        let wal: Box<dyn broca_wal::Wal + Send> = match &memory {
+            Some(memory) => Box::new(memory.clone()),
+            None => store.open(&bind).unwrap(),
+        };
+        let writer = WalHandle::spawn(wal, 1).unwrap();
         let hooks = Arc::new(Hooks {
             validates: AtomicUsize::new(0),
             second,
@@ -443,6 +474,7 @@ impl Rig {
         let questions = Arc::new(Questions {
             completed: completed.clone(),
             store: crate::FileWalStore::new(&root),
+            memory: memory.clone(),
             lineage: writer.lineage_id().unwrap(),
             head: writer.durable_head(),
             keys: Mutex::new(Vec::new()),
@@ -487,6 +519,7 @@ impl Rig {
                 refuse_scope: std::sync::atomic::AtomicBool::new(false),
                 sent: Mutex::new(Vec::new()),
                 store,
+                memory,
                 bind,
             },
             plan,
@@ -527,11 +560,13 @@ impl Rig {
             calls, &ToolManifest::from_tools(tools), &self.tools, approval, &self.writer, resume, &[], false, &self.control, Some(&runtime), None, &out, &mut history, restart))).await.expect("scripted approval batch must resolve").unwrap()
     }
     fn frames(&self) -> Vec<broca_wal::FramedRecord> {
-        self.tools.store.read_records(&self.bind).unwrap()
+        rig_records(&self.tools.store, self.tools.memory.as_ref(), &self.bind).unwrap()
     }
     async fn finish(self) {
         let _ = self.writer.shutdown().await;
-        std::fs::remove_dir_all(self.root).unwrap();
+        if self.tools.memory.is_none() {
+            std::fs::remove_dir_all(self.root).unwrap();
+        }
     }
 }
 
@@ -1224,6 +1259,7 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
         refuse_scope: std::sync::atomic::AtomicBool::new(false),
         sent: Mutex::new(Vec::new()),
         store: cut_store,
+        memory: None,
         bind: rig.bind.clone(),
     };
     let mut cut_history = approval_gate::History::new(
@@ -1765,7 +1801,10 @@ async fn unreadable_answer_does_not_advance_cursor() {
         "unreadable_digest_missing",
         "unreadable_digest_type",
     ] {
-        let rig = Rig::new("pass", answer, false, false);
+        // Cursor intake is independent of disk latency. Keep the writer's real barriers,
+        // but expose only synced records so a missing barrier still fails this test.
+        let memory = MemoryWal::new();
+        let rig = Rig::with_memory("pass", answer, false, false, Some(memory.clone()));
         let result = rig
             .batch(&crate::AllowAll, vec![call("c")], None, false)
             .await;
@@ -1800,6 +1839,20 @@ async fn unreadable_answer_does_not_advance_cursor() {
                 ..
             }
         )));
+        // Recovery, Prepared, pending/filed markers, approval, cleared marker,
+        // dispatch intent, result, and batch completion must finish syncing in order.
+        assert!(matches!(
+            frames[4].record,
+            WalRecord::ApprovalRecorded {
+                decision: broca_wal::DeferredDecision::Approved,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &frames[5].record,
+            WalRecord::AwaitingApproval { pending, .. } if pending.is_empty()
+        ));
+        assert_eq!(memory.completed_syncs(), vec![0, 2, 3, 4, 5, 6, 7, 8, 10]);
         rig.finish().await;
     }
 }
@@ -1817,6 +1870,7 @@ fn tools_for_store(store: crate::FileWalStore, bind: BindIdentity) -> Tools {
         refuse_scope: std::sync::atomic::AtomicBool::new(false),
         sent: Mutex::new(Vec::new()),
         store,
+        memory: None,
         bind,
     }
 }
