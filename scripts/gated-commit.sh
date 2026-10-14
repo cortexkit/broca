@@ -68,21 +68,29 @@ fi
 # the same reason this script exists: a verification step whose arguments are reconstructed from
 # memory each time is a verification step that will eventually be wrong.
 if [ "$#" -eq 0 ]; then
-  # Plain word-splitting rather than mapfile: macOS ships bash 3.2, where mapfile does not
-  # exist and its absence surfaces as an unbound-variable error two lines later.
-  # Root manifests and the lockfile affect compilation even when no crate source
-  # changed. Associate these root files with the broca-subc package below so
-  # scripts/quickcheck.sh verifies their resolved dependencies.
-  #
-  # Without this mapping, a root-only change skips Cargo verification entirely.
-  # Selecting broca-subc runs scripts/quickcheck.sh with --locked, so a manifest
-  # change that disagrees with Cargo.lock refuses the commit before staging.
-  root_readers=$(git status --porcelain | awk '{print $NF}' \
-    | sed -n -e 's|^Cargo.lock$|broca-subc|p' \
-        -e 's|^Cargo.toml$|broca-subc|p')
-  derived=$( { git status --porcelain | awk '{print $NF}' \
-    | sed -n 's|^crates/\([^/]*\)/.*|\1|p'; echo "$root_readers"; } \
-    | sed '/^$/d' | sort -u | tr '\n' ' ')
+  # Read NUL-delimited paths with bash 3.2's read builtin (macOS has no mapfile).
+  # Porcelain -z puts the rename destination first and its source in a second record;
+  # both paths affect the gate, especially a source renamed out of a crate.
+  # Root manifests and Cargo.lock select broca-subc to verify resolved dependencies.
+  crate_for_path() {
+    local path="$1" name
+    case "$path" in
+      Cargo.lock|Cargo.toml) echo broca-subc ;;
+      crates/*/*) name="${path#crates/}"; printf '%s\n' "${name%%/*}" ;;
+    esac
+  }
+  changed_crates() {
+    while IFS= read -r -d '' entry; do
+      crate_for_path "${entry:3}"
+      case "${entry:0:2}" in
+        *R*|*C*)
+          IFS= read -r -d '' source_path || exit 1
+          crate_for_path "$source_path"
+          ;;
+      esac
+    done < <(git status --porcelain=v1 -z)
+  }
+  derived=$(changed_crates | sort -u | tr '\n' ' ')
   if [ -n "$derived" ]; then
     # shellcheck disable=SC2086 -- deliberate split: crate names cannot contain spaces.
     set -- $derived
