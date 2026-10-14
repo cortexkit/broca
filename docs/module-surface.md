@@ -528,10 +528,12 @@ idle or terminal lineage until a later run publishes units (§16).
 Stamped `route.bind` authorization runs outside frame ingress. Until that check succeeds
 and broca acknowledges the bind, its channel/epoch is not published: a request arriving
 early is dropped as unbound (or stale if another epoch is still published), not queued
-for dispatch after authorization. Daemon routing must therefore wait for the module's
-`RouteBindAck` before forwarding requests on that generation. The staged daemon binary
-and the contracts available in this checkout do not establish that daemon-side ordering;
-it remains an integration assumption, not a verified protocol guarantee.
+for dispatch after authorization. That never drops a real request, because the daemon
+forwards nothing on a route before the module acknowledges its bind: `route.open` waits
+for the module's `RouteBindAck` before it returns the channel and epoch to the client,
+and while the bind is pending the daemon refuses any request on that channel with
+`unknown_channel` instead of forwarding it. broca records the route as bound before it
+sends `RouteBindAck`, so a client's first request after the acknowledgement finds it.
 
 A route `GOODBYE` closes only the channel/epoch it names. A pending replacement can be
 canceled without closing the published route or its stream, and closing the published
