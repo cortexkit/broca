@@ -50,6 +50,11 @@ def build_fixture(tmp):
     (work / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy2(SCRIPT, work / "scripts" / "train-push.sh")
     shutil.copy2(ROOT / "scripts" / "watch-ci.sh", work / "scripts" / "watch-ci.sh")
+    # test-train-preflight.py checks remote execution separately. These fixture
+    # repositories exercise branch/lock guards without contacting a build server.
+    (work / "scripts" / "train-preflight.sh").write_text(
+        '#!/bin/sh\necho fixture-remote-preflight\nexit "${FAIL_REMOTE_PREFLIGHT:-0}"\n'
+    )
     # The script sources siblings from its own scripts/ directory.
     for sibling in (ROOT / "scripts" / "lib").glob("*"):
         dest = work / "scripts" / "lib"
@@ -220,6 +225,7 @@ def run_push_train(remote_sha, head_sha):
 set -e
 refuse() {{ echo "REFUSED: $*"; exit 3; }}
 push_private_history_guard() {{ :; }}
+run_linux_preflight() {{ :; }}
 say() {{ :; }}
 git() {{ echo "GIT-PUSHED $*"; }}
 remote=origin
@@ -328,6 +334,45 @@ class SameShaPushArms(unittest.TestCase):
         contract is proven by behaviour in test-watch-ci-resolve.py."""
         text = SCRIPT.read_text()
         self.assertIn('WATCH_CI_NOT_BEFORE="$pushed_at" "$script_dir/watch-ci.sh"', text)
+
+
+class RemotePreflightArms(unittest.TestCase):
+    def test_failed_remote_preflight_refuses_before_even_the_probe_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = build_fixture(pathlib.Path(tmp))
+            result = run_guard_result(work, 'preflight-red', extra_env={'FAIL_REMOTE_PREFLIGHT': '17'})
+            output = result.stdout + result.stderr
+            self.assertIn('fixture-remote-preflight', output)
+            self.assertEqual(result.returncode, 2, output)
+            self.assertIn('remote Linux preflight failed; nothing was pushed', output)
+            self.assertNotIn('first train in this repo', output)
+            refs = git(work, 'ls-remote', '--heads', 'origin', 'train/*')
+            self.assertEqual(refs.stdout, '', refs.stdout + refs.stderr)
+
+    def test_same_sha_reuses_preflight_but_requeue_requires_another(self):
+        source = SCRIPT.read_text()
+        start = source.index('run_linux_preflight() {')
+        function = source[start:source.index('\n}\n', start) + 3]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp)
+            (work / 'scripts').mkdir()
+            (work / 'scripts/train-preflight.sh').write_text('echo REMOTE-CHECK-RAN\n')
+            harness = f'''
+set -euo pipefail
+linux_preflight_sha=""
+candidate_sha=first
+say() {{ :; }}
+refuse() {{ echo "REFUSED: $*"; exit 2; }}
+git() {{ if [[ "$1" == rev-parse ]]; then echo "$candidate_sha"; fi; }}
+{function}
+run_linux_preflight
+run_linux_preflight
+candidate_sha=second
+run_linux_preflight
+'''
+            result = subprocess.run(['bash', '-c', harness], cwd=work, text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count('REMOTE-CHECK-RAN'), 2)
 
 
 class ConcurrencyGuardArms(unittest.TestCase):
