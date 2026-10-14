@@ -9439,3 +9439,29 @@ expect_red = ["actor::tests::queued_restart_waiter_receives_explicit_error_on_fa
 file = "crates/broca-module/src/actor.rs"
 old = '                        self.finish_restart_waiters(Err(seal_error.clone()));'
 new = '                        // NON-VACUITY BREAK: keep restart waiters pending after failed sealing.'
+
+[[control]]
+id = "cache-table-keeps-shared-live-clocks"
+guards = "capacity eviction preserves live cache clocks in registry readings and new handles"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/registry.rs"
+expect_red = ["registry::tests::cache_table_capacity_preserves_live_clock_for_registry_and_fresh_handle", "cache::tests::capacity_evicts_only_inactive_clocks_and_reclaims_after_owners_drop"]
+file = "crates/broca-module/src/cache.rs"
+old = '                    .is_some_and(|entry| entry.clock.is_shared())'
+new = '                    .is_some_and(|entry| entry.clock.is_shared() && false) // NON-VACUITY BREAK: evict live clocks.'
+
+[[control]]
+id = "cache-table-reclaims-inactive-capacity"
+guards = "the bounded FIFO scan reclaims inactive cache entries after live owners drop"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/cache.rs"
+expect_red = ["cache::tests::capacity_evicts_only_inactive_clocks_and_reclaims_after_owners_drop"]
+file = "crates/broca-module/src/cache.rs"
+old = 'const EVICTION_SCAN_LIMIT: usize = 256;'
+new = 'const EVICTION_SCAN_LIMIT: usize = 0; // NON-VACUITY BREAK: never reclaim inactive entries.'

@@ -3358,6 +3358,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_table_capacity_preserves_live_clock_for_registry_and_fresh_handle() {
+        let registry = LineageRegistry::new(Arc::new(GaugeOpener {
+            durable_head: Mutex::new(None),
+        }));
+        let handle = registry.handle();
+        let key = BindIdentity::new("/cache", "runner", "live");
+        let live = handle.cache_clock(&key);
+        live.note_sent(100, Some(1000));
+        for n in 0..65_536 {
+            let inactive = BindIdentity::new("/cache", "runner", format!("inactive-{n}"));
+            drop(handle.cache_clock(&inactive));
+        }
+        live.note_sent(200, Some(1000));
+        assert_eq!(
+            registry.cache_clock_reading(&key).unwrap().last_sent_at_ms,
+            200
+        );
+        let fresh = handle.cache_clock(&key);
+        fresh.note_sent(300, Some(1000));
+        assert_eq!(live.read().unwrap().last_sent_at_ms, 300);
+        assert_eq!(
+            registry.cache_clock_reading(&key).unwrap().last_sent_at_ms,
+            300
+        );
+    }
+
     #[async_trait]
     impl LineageOpener for GaugeOpener {
         async fn open(
