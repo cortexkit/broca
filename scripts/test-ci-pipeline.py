@@ -90,7 +90,8 @@ class ArchiveShards(unittest.TestCase):
         for args in commands:
             self.assertEqual(args[:2], ['nextest', 'run'])
             self.assertIn('--archive-file', args)
-            self.assertEqual(args[args.index('--extract-to') + 1], str(self.root))
+            # The script resolves its root (`pwd -P`); on macOS /var is a symlink to /private/var.
+            self.assertEqual(Path(args[args.index('--extract-to') + 1]).resolve(), self.root.resolve())
             self.assertIn('--success-output', args)
         shard = commands[1]
         self.assertEqual(shard[shard.index('--partition') + 1], 'hash:3/4')

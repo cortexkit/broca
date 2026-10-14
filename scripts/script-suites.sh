@@ -12,24 +12,33 @@ cd "$(dirname "$0")/.."
 # Bytecode left in scripts/__pycache__ would trip CI's clean-worktree guard.
 export PYTHONDONTWRITEBYTECODE=1
 
-# Some suites read TOML with tomllib, which needs Python 3.11. macOS's system python3 is
-# older, so take the first interpreter on PATH that has it and refuse if none does.
+# Suites need Python 3.11+ (tomllib) and PyYAML (workflow parsing). macOS's system python3
+# is older, and Homebrew's has no PyYAML, so an operator venv is tried first. Take the first
+# interpreter that has both, and refuse with the remedy if none does.
 PY=""
-for candidate in python3 python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3; do
-    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import tomllib' 2>/dev/null; then
+suites_venv="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/broca/py-suites"
+for candidate in "${BROCA_SUITES_PYTHON:-}" "$suites_venv/bin/python3" \
+    python3 python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3; do
+    [[ -n $candidate ]] || continue
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import tomllib, yaml' 2>/dev/null; then
         PY=$(command -v "$candidate")
         break
     fi
 done
 if [[ -z $PY ]]; then
-    echo "script-suites: no Python 3.11+ (tomllib) found on PATH; install one or put it first" >&2
+    echo "script-suites: no Python 3.11+ with PyYAML found. Create one with:" >&2
+    echo "  python3.11+ -m venv $suites_venv && $suites_venv/bin/pip install PyYAML" >&2
+    echo "or set BROCA_SUITES_PYTHON to an interpreter that has tomllib and yaml." >&2
     exit 2
 fi
 # A temporary python3 link to the interpreter chosen above goes first on PATH, so a suite
 # that starts "python3" itself runs under that same interpreter.
 PY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/broca-suites-python.XXXXXX")
 trap 'rm -rf "$PY_DIR"' EXIT
-ln -s "$PY" "$PY_DIR/python3"
+# A wrapper that execs the interpreter, not a symlink: a venv's Python finds its
+# site-packages relative to the path it was started from, so a symlink elsewhere drops them.
+printf '#!/bin/sh\nexec "%s" "$@"\n' "$PY" > "$PY_DIR/python3"
+chmod +x "$PY_DIR/python3"
 export PATH="$PY_DIR:$PATH"
 echo "script-suites: $(python3 --version) at $PY"
 
