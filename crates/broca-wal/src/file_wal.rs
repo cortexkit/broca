@@ -1817,12 +1817,20 @@ mod tests {
             wal.append(1, &run_started(seq), true).unwrap();
         }
         drop(wal);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Layout: lineage frame, record 1, lineage frame, record 2. Record 1 ends where its own
+        // header says; record 2 starts one lineage frame later. Byte anchors exist only on unix,
+        // so the anchor is a cross-check where present, never the source of the offset.
+        let first = crate::framing::LINEAGE_FRAME_LEN;
+        let first_len = u32::from_le_bytes(bytes[first..first + 4].try_into().unwrap()) as usize;
+        let first_end = first + crate::framing::HEADER_LEN + first_len;
         let anchor = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)
             .unwrap()
-            .next_anchor
-            .unwrap();
-        let mut bytes = std::fs::read(&path).unwrap();
-        let second = anchor.byte_end as usize + crate::framing::LINEAGE_FRAME_LEN;
+            .next_anchor;
+        if let Some(anchor) = anchor {
+            assert_eq!(anchor.byte_end as usize, first_end);
+        }
+        let second = first_end + crate::framing::LINEAGE_FRAME_LEN;
         bytes[second..second + 4].copy_from_slice(&4096u32.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert!(matches!(
@@ -1832,7 +1840,13 @@ mod tests {
                 ..
             })
         ));
-        assert!(read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, Some(&anchor)).is_err());
+        // The anchored read skips the prefix and must still see the damage; it exists on unix.
+        if let Some(anchor) = anchor {
+            assert!(
+                read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, Some(&anchor)).is_err()
+            );
+        }
+        assert!(read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, None).is_err());
         assert!(FileWal::open(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let _ = std::fs::remove_file(path);
