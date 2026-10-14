@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_has_no_defaults() {
-        let path = std::env::temp_dir().join(format!(
+        let path = broca_test_support::scratch_root().join(format!(
             "broca-context-management-missing-{}.jsonc",
             std::process::id()
         ));

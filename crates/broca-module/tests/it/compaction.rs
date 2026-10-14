@@ -213,7 +213,8 @@ fn manifest() -> Arc<PlanManifest> {
 impl Rig {
     fn new(waiting: bool, tool_steps: u64) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        // broca's owned scratch root: on Windows it is owner-only, which the store now requires.
+        let dir = broca_test_support::scratch_root().join(format!(
             "broca-module-compaction-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
