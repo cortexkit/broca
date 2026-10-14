@@ -130,6 +130,14 @@ fn parked_runtime_workers_trigger_heartbeat_snapshot() {
         records[0]["runtime"]["blocking_pool"],
         "unavailable: requires tokio_unstable"
     );
+    // The watchdog thread writes the record before it stores the trigger in shared state
+    // (stall.rs `tick`), so the record can be visible a moment before health reports it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while witness.state.health()["last_trigger_kind"].is_null()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::park_timeout(Duration::from_millis(5));
+    }
     assert_eq!(witness.state.health()["last_trigger_kind"], "heartbeat");
 }
 
