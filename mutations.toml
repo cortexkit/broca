@@ -9151,3 +9151,27 @@ old = '''.sealed_digest
                     .as_deref()'''
 new = '''.sealed_digest
                     .as_deref().or(Some(plan.digest.as_str())) /* NON-VACUITY BREAK */'''
+
+[[control]]
+id = "resume-merge-omitted-finish-reason"
+guards = "an omitted finish reason in a committed tail step clears materialized last-step metadata"
+runner = "command"
+command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::tests::resume_merge_clears_omitted_step_finish_reason"]
+file = "crates/broca-core/src/context.rs"
+old = "WalRecord::ModelStepFinished { .. }\n                        | WalRecord::Retracted {"
+new = "WalRecord::Steered { .. } /* NON-VACUITY BREAK: ignore the explicit step update */\n                        | WalRecord::Retracted {"
+
+[[control]]
+id = "resume-merge-failed-retraction-finish-reason"
+guards = "a failed queued admission clears the materialized prefix finish reason on resume"
+runner = "command"
+command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::tests::resume_merge_failed_retraction_clears_prefix_finish_reason"]
+file = "crates/broca-core/src/context.rs"
+old = "                        | WalRecord::Retracted {\n                            failure: Some(_),\n                            ..\n                        }"
+new = "                        | WalRecord::Retracted {\n                            failure: None, /* NON-VACUITY BREAK: ignore failed admission */\n                            ..\n                        }"
