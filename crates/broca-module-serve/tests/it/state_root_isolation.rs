@@ -266,18 +266,21 @@ fn first_argument(arguments: &str) -> &str {
     arguments
 }
 
-/// Every broca spawn site in `source`, checked. A site is either a `Command` constructor or
-/// the test-support ckdev command builder, which is how most rigs now launch broca; missing
-/// the second form would leave those spawns unchecked. Programs named by a
-/// string literal without "broca" in it (pgrep, kill, sleep) and the programs in
-/// [`NOT_BROCA`] are skipped.
+/// Every broca spawn site in `source`, checked. A site is a `Command` constructor, the
+/// test-support ckdev command builder, or the rig stdio builders (`rig_command` and
+/// `tokio_rig_command`, which real-daemon rigs use to launch their daemons). Missing a builder
+/// form would leave those spawns unchecked. Programs named by a string literal without
+/// "broca" in it (pgrep, kill, sleep) and the programs in [`NOT_BROCA`] are skipped.
 fn spawn_sites(file: &Path, source: &str) -> Vec<Site> {
     if !BROCA_BINARY_MARKERS.iter().any(|m| source.contains(m)) {
         return Vec::new();
     }
+    // The rig needle also matches the tokio builder's name, and both end at the same opening
+    // parenthesis, so `dedup` below counts each site once.
     let needles = [
         ["Command", "::new("].concat(),
         ["ckdev_", "command("].concat(),
+        ["rig_", "command("].concat(),
     ];
     let mut opens: Vec<usize> = needles
         .iter()
@@ -288,13 +291,15 @@ fn spawn_sites(file: &Path, source: &str) -> Vec<Site> {
         })
         .collect();
     opens.sort_unstable();
+    opens.dedup();
     let mut sites = Vec::new();
     for open in opens {
-        // The builder's own definition is not a spawn.
-        if source[..open]
-            .strip_suffix(needles[1].as_str())
-            .is_some_and(|before| before.ends_with("fn "))
-        {
+        // A builder's own definition is not a spawn.
+        if needles.iter().any(|needle| {
+            source[..open]
+                .strip_suffix(needle.as_str())
+                .is_some_and(|before| before.ends_with("fn ") || before.ends_with("fn tokio_"))
+        }) {
             continue;
         }
         let program = strip_whitespace(first_argument(call_argument(source, open)));

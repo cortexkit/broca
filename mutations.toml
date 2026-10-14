@@ -264,6 +264,18 @@ old = '        ["ckdev_", "command("].concat(),'
 new = '        ["ckdev_", "command(NEVER"].concat(), // NON-VACUITY BREAK: ignore the ckdev builder'
 
 [[control]]
+id = "state-root-guard-sees-rig-stdio-builders"
+guards = "the state-root isolation guard checks daemon spawns made through rig_command and tokio_rig_command, so rigs that moved to the stdio builders stay checked"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/state_root_isolation.rs"
+expect_red = ["state_root_isolation::every_broca_spawn_site_pins_its_state_root"]
+file = "crates/broca-module-serve/tests/it/state_root_isolation.rs"
+old = '        ["rig_", "command("].concat(),'
+new = '        ["rig_", "command(NEVER"].concat(), // NON-VACUITY BREAK: ignore the rig stdio builders'
+
+[[control]]
 id = "vault-stand-in-auth-scheduling"
 guards = "the request-recording vault stand-in accepts ClientAuth delayed beyond the production handshake budget"
 runner = "cargo"
