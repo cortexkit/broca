@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+mod directory_sync;
 pub mod file_wal;
 pub mod floor;
 pub mod framing;

@@ -75,6 +75,14 @@ record.
 
 ## 3. The barrier (per turn's tool batch)
 
+On Unix, the first WAL barrier after **every open**, including recovery of an
+existing file, also syncs its parent directory and the parents of directories
+created by that open. A directory-open or directory-sync error refuses the barrier;
+the pending pass is cleared only after success. Feature-floor publication likewise
+syncs the renamed floor's parent (including `.` for a bare relative path), and a
+readable floor still needs that proof before a gated append. Non-Unix directory
+sync is an explicit no-op, not a best-effort attempt to open a directory as a file.
+
 1. **Resolve a per-call PLAN first** (capability validate + approval): each call is
    either *dispatchable* or *no_dispatch{reason}* (denied / schema-invalid /
    oversized / plane-unavailable-before-send / policy-blocked).

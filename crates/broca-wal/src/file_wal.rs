@@ -426,9 +426,8 @@ pub struct FileWal {
     /// compare it with an authority and does not use it to reject an append. The belt catches
     /// the residual case: a draining old writer appending AFTER a new writer already wrote.
     last_write_end: u64,
-    /// A newly-created WAL file needs ONE directory-sync pass so its name and every parent
-    /// directory created while opening it are crash-durable. Once the first file barrier has
-    /// paid that cost, later barriers only need to sync the file itself.
+    /// The first barrier after each open syncs the WAL's parent directory so the
+    /// file's name is durable, including when an earlier process did not sync it.
     dir_needs_sync: Cell<bool>,
     /// Directories that were absent before `create_dir_all`, ordered from the WAL's parent
     /// upward. The first directory-sync pass drains this list after syncing every directory
@@ -618,15 +617,14 @@ impl FileWal {
         }
         let mut create_opts = OpenOptions::new();
         create_opts.read(true).append(true).create_new(true);
-        let (mut file, dir_needs_sync, created) = match create_opts.open(&path) {
-            Ok(file) => (file, true, true),
+        let (mut file, created) = match create_opts.open(&path) {
+            Ok(file) => (file, true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
                 OpenOptions::new()
                     .read(true)
                     .append(true)
                     .open(&path)
                     .map_err(WalError::Io)?,
-                false,
                 false,
             ),
             Err(e) => return Err(WalError::Io(e)),
@@ -660,7 +658,7 @@ impl FileWal {
             file,
             next_seq,
             last_write_end,
-            dir_needs_sync: Cell::new(dir_needs_sync),
+            dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
             lineage_id,
             recovery_cap: DEFAULT_MAX_READ_BYTES,
@@ -680,9 +678,9 @@ impl FileWal {
         self
     }
 
-    /// fsync the file's data + metadata. A newly-created WAL file also pays ONE
-    /// best-effort directory-sync pass so the file name and any parent directories created by
-    /// `open` become durable too; after that, later barriers only need to sync the file itself.
+    /// The first barrier syncs the file, its parent, and parents of directories
+    /// created by this open. Unix errors fail the barrier and keep every directory
+    /// in that bottom-up list queued for the next attempt.
     fn fsync(&self) -> Result<(), WalError> {
         self.file.sync_all().map_err(WalError::Io)?;
         #[cfg(test)]
@@ -704,7 +702,7 @@ impl FileWal {
                 // The WAL file's name lives in its immediate parent.
                 sync_dirs.push(sync_path(parent));
             }
-            for created in self.newly_created_dirs.borrow_mut().drain(..) {
+            for created in self.newly_created_dirs.borrow().iter() {
                 // A newly-created directory's name lives in its own parent. The created list is
                 // bottom-up, so these parents preserve the required durability order.
                 if let Some(parent) = created.parent() {
@@ -717,19 +715,15 @@ impl FileWal {
             for dir_path in sync_dirs {
                 #[cfg(test)]
                 if let Some(probe) = &self.sync_probe {
-                    // The probe counts ATTEMPTS, not successful directory syncs: Windows cannot
-                    // open a directory via File::open, so the best-effort operation below is an
-                    // expected no-op there. The once-only attempt is the portable invariant.
+                    // Count directory-barrier attempts, including the explicit non-Unix no-op.
                     probe
                         .dir_syncs
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     probe.dir_sync_paths.lock().unwrap().push(dir_path.clone());
                 }
-                // Best-effort directory fsync (not all platforms require or permit it).
-                if let Ok(dir) = File::open(dir_path) {
-                    let _ = dir.sync_all();
-                }
+                crate::directory_sync::sync_dir(&dir_path).map_err(WalError::Io)?;
             }
+            self.newly_created_dirs.borrow_mut().clear();
             self.dir_needs_sync.set(false);
         }
         Ok(())
@@ -2287,6 +2281,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_directory_sync_failure_never_acknowledges_creation() {
+        let root = dir_sync_root("creation-eio");
+        let path = root.join("nested/wal/writer.log");
+        let probe = SyncProbe::default();
+        let mut wal = FileWal::open_with_probe(&path, probe.clone()).unwrap();
+        wal.append(1, &run_started(1), false).unwrap();
+        let pending = wal.newly_created_dirs.borrow().clone();
+        crate::directory_sync::with_failure(&root, || {
+            assert!(
+                matches!(wal.sync(), Err(WalError::Io(error)) if error.raw_os_error() == Some(5))
+            );
+            assert!(wal.dir_needs_sync.get());
+            assert_eq!(*wal.newly_created_dirs.borrow(), pending);
+        });
+        wal.sync().unwrap();
+        assert!(!wal.dir_needs_sync.get());
+        assert!(wal.newly_created_dirs.borrow().is_empty());
+        let attempts = probe.dir_syncs.load(std::sync::atomic::Ordering::SeqCst);
+        wal.sync().unwrap();
+        assert_eq!(
+            probe.dir_syncs.load(std::sync::atomic::Ordering::SeqCst),
+            attempts
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopened_unsynced_creation_syncs_parent_before_recovery_ack() {
+        let root = dir_sync_root("reopen-eio");
+        let path = root.join("writer.log");
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), false).unwrap();
+        drop(wal);
+        let recovered = FileWal::open_with_probe(&path, SyncProbe::default()).unwrap();
+        crate::directory_sync::with_failure(&root, || {
+            assert!(
+                recovered.sync().is_err(),
+                "a readable prefix does not prove its name durable"
+            );
+        });
+        assert!(recovered.dir_needs_sync.get());
+        recovered.sync().unwrap();
+        assert!(!recovered.dir_needs_sync.get());
+        assert_eq!(recovered.last_seq(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn floor_directory_eio_refuses_gated_append() {
+        let root = dir_sync_root("floor-eio");
+        let path = root.join("writer.log");
+        let floor = root.join(crate::floor::FEATURE_FLOOR_FILENAME);
+        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
+        let before = std::fs::read(&path).unwrap();
+        crate::directory_sync::with_failure(&root, || {
+            for _ in 0..2 {
+                assert!(matches!(
+                    wal.append(1, &scoped_run_started("eio"), false),
+                    Err(WalError::FeatureFloor { .. })
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(wal.last_seq(), 0);
+            }
+        });
+        assert_eq!(wal.append(1, &scoped_run_started("eio"), true).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

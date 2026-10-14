@@ -56,11 +56,16 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     let mut floor = read_floor(path)?;
     let before = floor.len();
     floor.extend(names.iter().map(|name| (*name).to_owned()));
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if floor.len() == before {
-        return Ok(());
+        // A prior process may have renamed this readable floor without syncing
+        // its parent directory. Visibility now does not prove the rename durable.
+        if path.try_exists()? {
+            std::fs::File::open(path)?.sync_all()?;
+        }
+        return crate::directory_sync::sync_dir(dir);
     }
-    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
-    if let Some(dir) = dir {
+    if !dir.as_os_str().is_empty() {
         broca_owner_only::create_dir_all(dir)?;
     }
     let temp = temp_path(path);
@@ -77,14 +82,7 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
-    if let Some(dir) = dir {
-        // Best effort, as for the WAL's own directory: not every platform lets a directory be
-        // opened for syncing.
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
-    Ok(())
+    crate::directory_sync::sync_dir(dir)
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -112,6 +110,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_floor_syncs_current_directory() {
+        let path = PathBuf::from(format!(
+            ".broca-floor-relative-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        crate::directory_sync::with_failure(Path::new("."), || {
+            assert!(raise_floor(&path, &["scope/v1"]).is_err());
+            assert!(raise_floor(&path, &["scope/v1"]).is_err());
+        });
+        raise_floor(&path, &["scope/v1"]).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A missing floor is empty; a raise writes the sorted names in the format the placement
