@@ -4992,6 +4992,22 @@ old = "AnswerResponse::Unreadable => return Err(()),"
 new = "AnswerResponse::Unreadable => continue, // NON-VACUITY BREAK"
 
 [[control]]
+id = "core-approval-cursor-fixture-requires-sync"
+guards = "the in-memory cursor fixture requires approval to complete its own sync before the cleared awaiting marker"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor"]
+file = "crates/broca-core/src/run/approval_tests/memory_wal.rs"
+old = '''let mut state = self.state.lock().unwrap();
+        state.synced = state.pending.clone();'''
+new = '''let mut state = self.state.lock().unwrap();
+        if state.pending.len() == 5 { return Ok(()); } // NON-VACUITY BREAK: skip the approval barrier.
+        state.synced = state.pending.clone();'''
+
+[[control]]
 id = "subc-accepted-filing-unreadable-ack-retries"
 guards = "an unreadable successful filing reply refiles the accepted question under the same key"
 runner = "cargo"
