@@ -520,6 +520,19 @@ faithful for step boundaries, finish reasons, tool names, and error detail.
 `cancel`/`status`/`read`. `from:"live"` is future-only and remains quietly attached on an
 idle or terminal lineage until a later run publishes units (§16).
 
+Stamped `route.bind` authorization runs outside frame ingress. Until that check succeeds
+and broca acknowledges the bind, its channel/epoch is not published: a request arriving
+early is dropped as unbound (or stale if another epoch is still published), not queued
+for dispatch after authorization. Daemon routing must therefore wait for the module's
+`RouteBindAck` before forwarding requests on that generation. The staged daemon binary
+and the contracts available in this checkout do not establish that daemon-side ordering;
+it remains an integration assumption, not a verified protocol guarantee.
+
+A route `GOODBYE` closes only the channel/epoch it names. A pending replacement can be
+canceled without closing the published route or its stream, and closing the published
+route does not cancel authorization of a different pending epoch. After the replacement
+is accepted, a `GOODBYE` naming the old epoch is stale.
+
 ## 10. Admission barrier + early failure
 
 Idle `session.send` returns `{state:"active", run_id}` **only after** the run acquires

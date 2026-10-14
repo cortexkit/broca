@@ -459,9 +459,24 @@ impl Routes {
             .reserve()
     }
 
-    fn route_closed(&mut self, channel: u16) {
-        if let Some((_, cancel)) = self.pending_binds.remove(&channel) {
-            cancel.cancel();
+    fn route_closed(&mut self, channel: u16, epoch: u32) {
+        if self
+            .pending_binds
+            .get(&channel)
+            .is_some_and(|(pending_epoch, _)| *pending_epoch == epoch)
+        {
+            if let Some((_, cancel)) = self.pending_binds.remove(&channel) {
+                cancel.cancel();
+            }
+        }
+        // A pending replacement and the published route can share a channel, but a GOODBYE
+        // names only one generation. Closing either must leave the other generation intact.
+        if !self
+            .by_channel
+            .get(&channel)
+            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)
+        {
+            return;
         }
         let departed_session = self
             .by_channel
@@ -952,7 +967,7 @@ where
             .get(&frame.header.channel)
             .is_some_and(|(epoch, _)| *epoch == frame.header.epoch)
     {
-        routes.route_closed(frame.header.channel);
+        routes.route_closed(frame.header.channel, frame.header.epoch);
         return Ok(true);
     }
     let bound_epoch = routes
@@ -1022,7 +1037,7 @@ where
         FrameType::Goodbye => {
             // A route GOODBYE: drop the channel binding and cancel any live subscribe
             // forward task on it (explicit unsubscribe → prompt teardown).
-            routes.route_closed(frame.header.channel);
+            routes.route_closed(frame.header.channel, frame.header.epoch);
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
@@ -3790,7 +3805,7 @@ mod tests {
         assert!(routes.dispatch_lanes.contains_key(&session));
         drop(ticket);
 
-        routes.route_closed(7);
+        routes.route_closed(7, 1);
         assert!(!routes.dispatch_lanes.contains_key(&session));
         assert!(routes.dispatch_lanes.is_empty());
     }
@@ -3804,7 +3819,7 @@ mod tests {
             .insert(7, (1, departed.clone(), BindObservation::default()));
         let ticket = routes.reserve_dispatch(&departed);
 
-        routes.route_closed(7);
+        routes.route_closed(7, 1);
         assert!(routes.dispatch_lanes.contains_key(&departed));
         drop(ticket);
 
@@ -3827,7 +3842,7 @@ mod tests {
             .insert(7, (1, session.clone(), BindObservation::default()));
         let first_turn = routes.reserve_dispatch(&session).wait().await;
 
-        routes.route_closed(7);
+        routes.route_closed(7, 1);
         assert!(routes.dispatch_lanes.contains_key(&session));
         routes
             .by_channel
@@ -4305,6 +4320,7 @@ mod tests {
         entered: tokio::sync::Notify,
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         finished: tokio::sync::Notify,
+        records: Vec<broca_wal::FramedRecord>,
     }
 
     impl broca_core::WalStore for HeldBindRead {
@@ -4321,7 +4337,7 @@ mod tests {
             self.entered.notify_one();
             self.release.lock().unwrap().recv().unwrap();
             self.finished.notify_one();
-            Ok(vec![])
+            Ok(self.records.clone())
         }
     }
 
@@ -4334,6 +4350,381 @@ mod tests {
         }
     }
 
+    struct BindIngress {
+        routes: Routes,
+        registry: Arc<LineageRegistry>,
+        handler: Arc<MockSubscribeHandler>,
+        writer: EgressSender<Frame>,
+        written: EgressReceiver<Frame>,
+        sinks: mpsc::Receiver<mpsc::Sender<Delivery>>,
+        requests: JoinSet<Result<(), ServeIoError>>,
+        cancel: CancellationToken,
+    }
+
+    impl BindIngress {
+        fn new(registry: Arc<LineageRegistry>) -> Self {
+            let (writer, written) = broca_diagnostics::channel(16, Arc::default());
+            let (sink_tx, sinks) = mpsc::channel(4);
+            Self {
+                routes: Routes::new(true),
+                registry,
+                handler: Arc::new(MockSubscribeHandler { sink_tx }),
+                writer,
+                written,
+                sinks,
+                requests: JoinSet::new(),
+                cancel: CancellationToken::new(),
+            }
+        }
+
+        async fn frame(&mut self, frame: Frame) {
+            handle_frame(
+                frame,
+                &self.writer,
+                &mut self.routes,
+                &self.handler,
+                &self.registry,
+                &VaultGauge::not_in_use(),
+                None,
+                &self.cancel,
+                &Arc::new(Semaphore::new(4)),
+                &mut self.requests,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn bind(&mut self, epoch: u32, session: &str, stamped: bool) {
+            let owner = subc_protocol::Principal::Reserved {
+                module_id: "agent".into(),
+            };
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: 7,
+                epoch,
+                target: subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "broca".into(),
+                },
+                identity: SubcBindIdentity::new("/tmp/project-a", "runner", session),
+                principal: Some(owner.clone()),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: stamped.then(|| {
+                    subc_protocol::scope::ScopeStamp::new(
+                        owner,
+                        "head",
+                        1,
+                        subc_protocol::scope::ScopeKind::Head,
+                    )
+                    .with_owner_authorized(true)
+                }),
+                role_versions: None,
+                call_mode: None,
+            };
+            self.frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    u64::from(epoch),
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        }
+
+        async fn complete_bind(&mut self) {
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.routes.bind_tasks.join_next(),
+            )
+            .await
+            .expect("bind authorization did not finish")
+            .unwrap()
+            .unwrap();
+            finish_bind(completed, &self.writer, &mut self.routes)
+                .await
+                .unwrap();
+        }
+
+        async fn goodbye(&mut self, epoch: u32) {
+            self.frame(
+                Frame::build(FrameType::Goodbye, control_flags(), 7, epoch, 0, vec![]).unwrap(),
+            )
+            .await;
+        }
+
+        async fn subscribe(&mut self, epoch: u32, corr: u64) -> mpsc::Sender<Delivery> {
+            self.frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    epoch,
+                    corr,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let sink = tokio::time::timeout(std::time::Duration::from_secs(5), self.sinks.recv())
+                .await
+                .expect("subscription did not reach the handler")
+                .unwrap();
+            self.assert_delivery(&sink, epoch, corr).await;
+            sink
+        }
+
+        async fn assert_delivery(&mut self, sink: &mpsc::Sender<Delivery>, epoch: u32, corr: u64) {
+            sink.send(Delivery::Display(Arc::new(
+                broca_protocol::display::DisplayEvent::DisplayReset,
+            )))
+            .await
+            .expect("the original subscription was canceled");
+            let delivered = next_written(&mut self.written).await;
+            assert_eq!(
+                (
+                    delivered.header.ty,
+                    delivered.header.epoch,
+                    delivered.header.corr
+                ),
+                (FrameType::StreamData, epoch, corr)
+            );
+        }
+    }
+
+    impl Drop for BindIngress {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    fn held_bind_registry() -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
+        held_bind_registry_with_records(vec![])
+    }
+
+    fn held_bind_registry_with_records(
+        records: Vec<broca_wal::FramedRecord>,
+    ) -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
+        let (release, read_gate) = std::sync::mpsc::channel();
+        let store = Arc::new(HeldBindRead {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(read_gate),
+            finished: tokio::sync::Notify::new(),
+            records,
+        });
+        let registry = Arc::new(LineageRegistry::new_with_reader(
+            Arc::new(RefusingOpener),
+            store.clone(),
+            None,
+        ));
+        (
+            BindIngress::new(registry),
+            store,
+            ReleaseBindRead(Some(release)),
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_generation_goodbye_preserves_published_route_and_stream() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 1);
+        let sink = ingress.subscribe(1, 10).await;
+        ingress.bind(2, "pending", true).await;
+        store.entered.notified().await;
+        ingress.goodbye(2).await;
+        assert!(!ingress.routes.pending_binds.contains_key(&7));
+        assert_eq!(ingress.routes.by_channel[&7].0, 1);
+        ingress.assert_delivery(&sink, 1, 10).await;
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 1);
+        assert!(
+            ingress.written.try_recv().is_err(),
+            "canceled bind acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_generation_goodbye_preserves_pending_bind() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let _sink = ingress.subscribe(1, 10).await;
+        let slot = ingress.routes.subscribe_cancel[&7].clone();
+        ingress.bind(2, "pending", true).await;
+        store.entered.notified().await;
+        let pending = ingress.routes.pending_binds[&7].1.clone();
+        ingress.goodbye(1).await;
+        assert!(slot.route.is_cancelled());
+        assert!(!ingress.routes.by_channel.contains_key(&7));
+        assert_eq!(ingress.routes.pending_binds[&7].0, 2);
+        assert!(!pending.is_cancelled());
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        let mut ack = next_written(&mut ingress.written).await;
+        if ack.header.corr == 10 {
+            assert_eq!((ack.header.ty, ack.header.epoch), (FrameType::StreamEnd, 1));
+            ack = next_written(&mut ingress.written).await;
+        }
+        assert_eq!((ack.header.ty, ack.header.corr), (FrameType::Response, 2));
+    }
+
+    #[tokio::test]
+    async fn accepted_replacement_makes_old_generation_goodbye_stale() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        ingress.bind(2, "replacement", true).await;
+        store.entered.notified().await;
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        let sink = ingress.subscribe(2, 20).await;
+        ingress.goodbye(1).await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
+    #[tokio::test]
+    async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
+        let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
+        let record = broca_wal::WalRecord::RunStarted {
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: broca_protocol::RunId("legacy".into()),
+            session,
+            config: Box::new(broca_wal::RunConfig {
+                model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::json!({"test": true}),
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: vec![],
+                context_management: None,
+            }),
+            input: vec![].into(),
+            origin: broca_wal::RunOrigin::Fresh,
+            submission_id: None,
+        };
+        let (mut ingress, store, release) =
+            held_bind_registry_with_records(vec![broca_wal::FramedRecord {
+                seq: 1,
+                fence: 1,
+                record,
+            }]);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        ingress.bind(2, "published", true).await;
+        store.entered.notified().await;
+        drop(release);
+        ingress.complete_bind().await;
+        let refused = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (refused.header.ty, refused.header.corr),
+            (FrameType::Error, 2)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+            "scope_adoption_refused"
+        );
+        ingress.goodbye(2).await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 1);
+        ingress.assert_delivery(&sink, 1, 10).await;
+    }
+
+    #[tokio::test]
+    async fn request_during_stamped_bind_authorization_is_unbound() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(2, "pending", true).await;
+        store.entered.notified().await;
+        ingress
+            .frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    2,
+                    20,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(ingress.routes.by_channel.is_empty());
+        assert_eq!(ingress.routes.pending_binds[&7].0, 2);
+        assert!(ingress.routes.subscribe_cancel.is_empty());
+        assert!(
+            ingress.requests.is_empty(),
+            "unbound request dispatched to a handler task"
+        );
+        assert!(ingress.sinks.try_recv().is_err());
+        assert!(ingress.written.try_recv().is_err());
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        assert!(
+            ingress.requests.is_empty(),
+            "unbound request was deferred until ack"
+        );
+        assert!(ingress.sinks.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn superseded_bind_late_authorization_preserves_replacement() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "superseded", true).await;
+        store.entered.notified().await;
+        ingress.bind(2, "replacement", false).await;
+        assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        let sink = ingress.subscribe(2, 20).await;
+        drop(release);
+        ingress.complete_bind().await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        assert_eq!(ingress.routes.by_channel[&7].1.session, "replacement");
+        assert!(
+            ingress.written.try_recv().is_err(),
+            "superseded bind acknowledged"
+        );
+        ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
     #[tokio::test]
     async fn reader_answers_ping_and_goodbye_while_bind_ownership_read_is_held() {
         let (release, read_gate) = std::sync::mpsc::channel();
@@ -4342,6 +4733,7 @@ mod tests {
             entered: tokio::sync::Notify::new(),
             release: std::sync::Mutex::new(read_gate),
             finished: tokio::sync::Notify::new(),
+            records: vec![],
         });
         let registry = Arc::new(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),

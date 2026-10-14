@@ -10421,3 +10421,55 @@ select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "        result = &mut writer => {"
 new = "        result = &mut writer, if false => { // NON-VACUITY BREAK: wait for the reader to notice closed egress"
+
+[[control]]
+id = "serve-goodbye-preserves-other-pending-generation"
+guards = "closing a published route does not cancel authorization of its pending replacement epoch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::published_generation_goodbye_preserves_pending_bind"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            .is_some_and(|(pending_epoch, _)| *pending_epoch == epoch)"
+new = "            .is_some_and(|(_, _)| true) // NON-VACUITY BREAK: cancel every pending epoch"
+
+[[control]]
+id = "serve-goodbye-preserves-other-published-generation"
+guards = "closing a pending or stale generation leaves the published route and original stream correlation intact"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::pending_generation_goodbye_preserves_published_route_and_stream"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if !self\n            .by_channel\n            .get(&channel)\n            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)"
+new = "        if false && !self // NON-VACUITY BREAK: close the published route for every epoch\n            .by_channel\n            .get(&channel)\n            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)"
+
+[[control]]
+id = "serve-pending-bind-requests-stay-unbound"
+guards = "a request while stamped-bind authorization is held cannot register a subscription or reach a handler"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::request_during_stamped_bind_authorization_is_unbound"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if frame.header.channel != 0 && bound_epoch != Some(frame.header.epoch) {"
+new = "    if false && frame.header.channel != 0 && bound_epoch != Some(frame.header.epoch) { // NON-VACUITY BREAK: dispatch before bind publication"
+
+[[control]]
+id = "serve-superseded-bind-late-authorization-is-fenced"
+guards = "a superseded bind finishing a real delayed history read cannot overwrite or acknowledge over its replacement"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::superseded_bind_late_authorization_preserves_replacement"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if completed.cancel.is_cancelled() {"
+new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish a superseded completion"
