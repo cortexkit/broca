@@ -254,3 +254,56 @@ Successive real archive-build jobs reused compilation (`Finished test ...
 work. This is observed warm-cache reuse, not a claim that every revision or
 Windows target is already warm. No sibling checkout or npm installation is
 required by the narrowed preflight.
+
+The real script-callable preflight completed in **144 s (2:24)** on the 8-vCPU
+Linux runner: **2,526 lib/bin tests** executed (2,535 listed, five explicit
+service-dependent exclusions, four ignored), and **1,191 integrations** passed
+in **94.272 s** (1,449 baseline, 254 explicit exclusions, four ignored). Its
+captured output had no passing fixture skips and included a PASS record for
+`test_clock::test_clock_feature_is_enabled_for_retention_tests`, which actually
+exercises the enabled retention-test clock.
+Both Linux and Windows-GNU clippy passed; warm compiler checks took fractions
+of a second. These are measured pre-push timings, not estimates of GitHub CI.
+
+## Release procedure
+
+1. Bump the workspace version **and Cargo.lock in the change batch**, before
+   training. Make code, dependency pins, version, and lock one reviewed batch.
+2. Run the Mac pre-merge gate once for native Mac daemon/vault/mock coverage.
+   Run `scripts/train-push.sh <name>` for the complete batch; it first runs the cheap Linux preflight,
+   then waits for CI and fast-forwards only the tested SHA to `master`.
+3. On a clean checkout at the exact `origin/master` commit, run
+   `scripts/release.sh <version> [--marker TEXT] [--control TEXT]`.
+   It fetches master, checks the workspace version, and reuses `ci-status.sh`
+   to require successful CI **and Mutation catalogue** runs for the full SHA.
+   Missing workflows, another SHA, incomplete/failed/cancelled runs, query
+   failures, or a potentially truncated run list refuse before a tag is made.
+4. The script creates (or reuses) the exact local `v<version>` tag and calls
+   `stage-release.sh`, retaining the existing locked-build/provenance/signing/
+   artifact checks. It never bumps version, runs a second gate, trains, dispatches
+   or reruns CI, or calls placement. A failed staging attempt retains the tag
+   on the same SHA so staging can be retried without moving the release.
+5. After successful staging, publish the tag through the operator's approved
+   Git path if needed. **Placement/restart is still a separate approved
+   operation** using `scripts/place-release.sh` and the staged artifact card.
+
+The workflows still observe pushes to master as well as trains. The existing
+`ci-status.sh` policy requires *all* observed runs for the exact SHA to be
+complete/successful, including the automatic master observation. The release
+script does not initiate another run or weaken that policy to hide a failure.
+Scheduled compatibility failures and optional workstation/live probes are
+distinct from a proof of native Mac behavior; the Mac gate remains necessary.
+
+## Fleet lessons
+
+Measure execution separately from build/discovery; summed concurrent test
+durations are not wall time. Cache-restored is not necessarily exact-hit or
+Cargo-fresh. Save useful dependency/tool caches even when later tests fail.
+Compile integration artifacts once, keep lib/bin tests on their existing native
+Rust test harness (including process-global state/concurrency behavior),
+and count independent discovery before partitioning. Carry executable bits and
+auxiliary binaries when transporting archives. Cheap remote checks should be
+fixture-independent and publish their exclusions, not manufacture passing skips.
+Version before CI and tag the verified commit; keep staging separate from the
+approval boundary for restart. No larger runner or quantified larger-runner
+speedup is asserted without a controlled measurement.

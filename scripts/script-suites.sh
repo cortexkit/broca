@@ -37,6 +37,7 @@ suites=(
     scripts/test-check-path-deps.py
     scripts/test-anthropic-policy-deps.py
     scripts/test-stage-release.py
+    scripts/test-release.py
     scripts/test-prune-staging.py
     # Stubs codesign, file, stat, ps and lsof, so the placement gate's macOS-only signing
     # checks also run on a Linux runner.
