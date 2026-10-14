@@ -584,7 +584,7 @@ impl Drop for DispatchTurn {
 enum PreparedRouteRequest {
     Request(RouteRequest),
     Subscribe {
-        from: SubscribeFrom,
+        params: serde_json::Value,
         slot: Arc<SubscriptionSlot>,
     },
 }
@@ -1130,20 +1130,7 @@ where
                 )
                 .await?;
             } else {
-                let Some(prepared) = prepare_route_request(
-                    req,
-                    writer,
-                    routes,
-                    channel,
-                    epoch,
-                    corr,
-                    ver,
-                    conn_cancel,
-                )
-                .await?
-                else {
-                    return Ok(true);
-                };
+                let prepared = prepare_route_request(req, routes, channel, conn_cancel);
                 let dispatch_ticket = routes.reserve_dispatch(&session);
                 if matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE)
                 {
@@ -1604,54 +1591,36 @@ async fn finish_bind(
     send(writer, response).await
 }
 
-/// Before spawning a route request, verify the state needed to manage that route. For
-/// `subscribe`, only a valid request should be allowed to replace the active stream on this
-/// channel, so a malformed retry cannot accidentally cancel the stream that is already
-/// running.
-#[allow(clippy::too_many_arguments)]
-async fn prepare_route_request(
+/// Reserve subscription teardown state on ingress so GOODBYE can cancel a queued request.
+/// Leave parameters opaque until task-side authorization; reserving a slot does not replace
+/// its active stream or reveal validation errors to an unauthorized caller.
+fn prepare_route_request(
     req: RouteRequest,
-    writer: &EgressSender<Frame>,
     routes: &mut Routes,
     channel: u16,
-    epoch: u32,
-    corr: u64,
-    ver: u8,
     conn_cancel: &CancellationToken,
-) -> Result<Option<PreparedRouteRequest>, ServeIoError> {
+) -> PreparedRouteRequest {
     if req.method != OP_SUBSCRIBE {
-        return Ok(Some(PreparedRouteRequest::Request(req)));
+        return PreparedRouteRequest::Request(req);
     }
-
-    let params: SubscribeParams = match decode_params(&req.params) {
-        Ok(p) => p,
-        Err((field, message)) => {
-            send_invalid_params(writer, ver, channel, epoch, corr, field, &message).await?;
-            return Ok(None);
-        }
-    };
-    let from = match params.from {
-        None => SubscribeFrom::Live,
-        Some(w) => match w.to_subscribe_from() {
-            Ok(f) => f,
-            Err(e) => {
-                send_invalid_params(writer, ver, channel, epoch, corr, Some("from".into()), &e)
-                    .await?;
-                return Ok(None);
-            }
-        },
-    };
-
     let slot = routes.subscribe_cancel.entry(channel).or_insert_with(|| {
         Arc::new(SubscriptionSlot {
             route: conn_cancel.child_token(),
             current: std::sync::Mutex::new(None),
         })
     });
-    Ok(Some(PreparedRouteRequest::Subscribe {
-        from,
+    PreparedRouteRequest::Subscribe {
+        params: req.params,
         slot: slot.clone(),
-    }))
+    }
+}
+
+fn subscribe_from(params: &serde_json::Value) -> Result<SubscribeFrom, (Option<String>, String)> {
+    let params: SubscribeParams = decode_params(params)?;
+    match params.from {
+        None => Ok(SubscribeFrom::Live),
+        Some(w) => w.to_subscribe_from().map_err(|e| (Some("from".into()), e)),
+    }
 }
 
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
@@ -1759,15 +1728,13 @@ where
             PreparedRouteRequest::Request(req) => req.method.as_str(),
             PreparedRouteRequest::Subscribe { .. } => OP_SUBSCRIBE,
         };
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
         let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
-                return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
-            }
-        }
-        if matches!(&prepared, PreparedRouteRequest::Subscribe { .. }) {
-            if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
             }
         }
@@ -1787,7 +1754,13 @@ where
                     result = execute_route_request(req, &writer, ver, channel, epoch, corr, session, bind, &handler) => result,
                 }
             }
-            PreparedRouteRequest::Subscribe { from, slot } => {
+            PreparedRouteRequest::Subscribe { params, slot } => {
+                let from = match subscribe_from(&params) {
+                    Ok(from) => from,
+                    Err((field, message)) => {
+                        return send_invalid_params(&writer, ver, channel, epoch, corr, field, &message).await;
+                    }
+                };
                 // Only an authorized, well-formed replacement may stop the previous stream.
                 let cancel = slot.replace();
                 tokio::select! {
@@ -1828,7 +1801,7 @@ async fn authorize_route_request<H: ServeHandler>(
     }
 }
 
-/// Handle a request on an already bound route channel by checking the request method and
+/// Handle an authorized request on an already bound route channel by checking the request method and
 /// calling the matching handler for that method.
 #[allow(clippy::too_many_arguments)]
 async fn execute_route_request<H>(
@@ -1859,11 +1832,6 @@ where
             )
             .await;
         }
-    }
-    if let Err(error) =
-        authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await
-    {
-        return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
     }
     match req.method.as_str() {
         "compaction.ready" => {
@@ -4110,10 +4078,25 @@ mod tests {
 
     struct MockSubscribeHandler {
         sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
+        refuse_session: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl ServeHandler for MockSubscribeHandler {
+        async fn authorize_session(
+            &self,
+            _session: &BrocaBindIdentity,
+            _principal: Option<&broca_protocol::BindPrincipal>,
+        ) -> Result<(), ServeError> {
+            if self.refuse_session.load(Ordering::Relaxed) {
+                Err(ServeError::ScopeRefused(
+                    broca_core::ScopeRefusal::SenderNotOwner,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
         async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
             unimplemented!()
         }
@@ -4161,7 +4144,10 @@ mod tests {
         use std::time::Duration;
 
         let (sink_tx, mut sink_rx) = mpsc::channel(1);
-        let handler = Arc::new(MockSubscribeHandler { sink_tx });
+        let handler = Arc::new(MockSubscribeHandler {
+            sink_tx,
+            refuse_session: std::sync::atomic::AtomicBool::new(false),
+        });
 
         // Bounded channel of size 1 for the writer.
         let (writer_tx, _writer_rx) = broca_diagnostics::channel::<Frame>(1, Arc::default());
@@ -4368,7 +4354,10 @@ mod tests {
             Self {
                 routes: Routes::new(true),
                 registry,
-                handler: Arc::new(MockSubscribeHandler { sink_tx }),
+                handler: Arc::new(MockSubscribeHandler {
+                    sink_tx,
+                    refuse_session: std::sync::atomic::AtomicBool::new(false),
+                }),
                 writer,
                 written,
                 sinks,
@@ -4723,6 +4712,138 @@ mod tests {
             "superseded bind acknowledged"
         );
         ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
+    #[tokio::test]
+    async fn unauthorized_subscribe_reports_authorization_before_invalid_params() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        ingress
+            .handler
+            .refuse_session
+            .store(true, Ordering::Relaxed);
+        for (corr, params) in [
+            (20, serde_json::json!({"unknown": true})),
+            (21, serde_json::json!({"from": "not-an-attach-point"})),
+        ] {
+            ingress
+                .frame(
+                    Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        7,
+                        1,
+                        corr,
+                        serde_json::to_vec(&RouteRequest {
+                            method: OP_SUBSCRIBE.into(),
+                            params,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await;
+            let refused = next_written(&mut ingress.written).await;
+            assert_eq!(
+                (refused.header.ty, refused.header.corr),
+                (FrameType::Error, corr)
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+                "sender_not_owner"
+            );
+        }
+        assert!(ingress.sinks.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_replacement_subscribe_preserves_original_stream_correlation() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        let original = ingress.routes.subscribe_cancel[&7]
+            .current
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        ingress
+            .handler
+            .refuse_session
+            .store(true, Ordering::Relaxed);
+        ingress
+            .frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    1,
+                    20,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        let refused = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (refused.header.ty, refused.header.corr),
+            (FrameType::Error, 20)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+            "sender_not_owner"
+        );
+        assert!(!original.is_cancelled());
+        assert!(
+            ingress.sinks.try_recv().is_err(),
+            "unauthorized replacement reached subscribe"
+        );
+        ingress.assert_delivery(&sink, 1, 10).await;
+    }
+
+    #[tokio::test]
+    async fn authorized_invalid_subscribe_preserves_original_stream_correlation() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        ingress
+            .frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    7,
+                    1,
+                    20,
+                    serde_json::to_vec(&RouteRequest {
+                        method: OP_SUBSCRIBE.into(),
+                        params: serde_json::json!({"unknown": true}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        let invalid = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (invalid.header.ty, invalid.header.corr),
+            (FrameType::Error, 20)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&invalid.body).unwrap()["code"],
+            "invalid_params"
+        );
+        assert!(ingress.sinks.try_recv().is_err());
+        ingress.assert_delivery(&sink, 1, 10).await;
     }
 
     #[tokio::test]

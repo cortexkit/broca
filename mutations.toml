@@ -10486,3 +10486,42 @@ select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "    if completed.cancel.is_cancelled() {"
 new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish a superseded completion"
+
+[[control]]
+id = "serve-subscribe-authorization-precedes-validation"
+guards = "an unauthorized subscriber receives sender_not_owner before schema or attach-point validation can disclose errors"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::unauthorized_subscribe_reports_authorization_before_invalid_params"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+new = "        if let PreparedRouteRequest::Subscribe { params, .. } = &prepared { // NON-VACUITY BREAK: disclose validation before authorization\n            if let Err((field, message)) = subscribe_from(params) {\n                return send_invalid_params(&writer, ver, channel, epoch, corr, field, &message).await;\n            }\n        }\n        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+
+[[control]]
+id = "serve-unauthorized-subscribe-preserves-active-stream"
+guards = "a well-formed unauthorized replacement leaves the active stream delivering on its original correlation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::unauthorized_replacement_subscribe_preserves_original_stream_correlation"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+new = "        if let PreparedRouteRequest::Subscribe { slot, .. } = &prepared { slot.replace(); } // NON-VACUITY BREAK: replace before authorization\n        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+
+[[control]]
+id = "serve-invalid-subscribe-preserves-active-stream"
+guards = "an authorized malformed subscription cannot replace the active stream before validation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::authorized_invalid_subscribe_preserves_original_stream_correlation"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                let from = match subscribe_from(&params) {"
+new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"

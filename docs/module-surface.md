@@ -533,6 +533,12 @@ canceled without closing the published route or its stream, and closing the publ
 route does not cancel authorization of a different pending epoch. After the replacement
 is accepted, a `GOODBYE` naming the old epoch is stale.
 
+Route requests authorize the caller before method parameter validation or migration
+checks. In particular, an unauthorized `session.subscribe` reports the authorization
+refusal even when its parameters are invalid. A replacement subscription cancels the
+active stream only after authorization and validation both succeed; a refusal leaves
+deliveries on the original stream correlation.
+
 ## 10. Admission barrier + early failure
 
 Idle `session.send` returns `{state:"active", run_id}` **only after** the run acquires
