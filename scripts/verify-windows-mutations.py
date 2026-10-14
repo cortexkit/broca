@@ -161,6 +161,23 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             shard_controls(controls, 0, 4)
 
+    def test_unix_retention_conformance_controls_are_not_claimed_on_windows(self):
+        root = Path(__file__).resolve().parents[1]
+        catalog = tomllib.loads((root / "mutations.toml").read_text())
+        controls = [row for row in catalog["control"]
+                    if row.get("test_file") == "crates/broca-module-serve/tests/llm_runner_conformance/retention.rs"]
+        self.assertEqual({row["id"] for row in controls}, {
+            "retention-writer-admission", "retention-own-tombstone-before-older",
+            "retention-tombstone-never-shadows-fresh-lineage-real-daemon",
+            "retention-real-daemon-marker-title", "retention-shared-clock-advances-daemon",
+            "retention-size-admission-typed-refusal",
+        })
+        for row in controls:
+            with self.subTest(control=row["id"]):
+                self.assertEqual(row.get("platforms"), ["macos", "linux"])
+                self.assertTrue(all(name.startswith("retention::ck_broca_") for name in row["expect_red"]))
+        self.assertEqual(eligible_windows(controls), {})
+
     def test_reports_actual_red_names_for_every_eligible_row(self):
         for outcome in ("CAUGHT", "CAUGHT_BROADLY", "HUB"):
             with self.subTest(outcome=outcome):

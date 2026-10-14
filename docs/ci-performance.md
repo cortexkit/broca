@@ -407,6 +407,53 @@ uploaded artifact cannot hide a later producer failure. Nextest prints failure
 output immediately and at the end, while `fail-fast = false` still executes the
 remaining tests.
 
+### Early-start shape proof
+
+[CI 38604671799](https://github.com/cortexkit/broca/actions/runs/38604671799)
+tested `bafebee5f1698001742806fb3bc1fb3e8e3ec504`. It completed in
+**717 s (11:57), red**, with the old ACL-fixture failure above. The failed test
+was printed at **17:20:23Z**, **58 seconds before** the final shard summary at
+17:21:21Z. No job was rerun for this SHA; the approved upstream fix was merged
+for a new probe instead. These are scheduling/coverage measurements, not a
+green-build claim.
+
+| Early-start lane | Start after creation | Job duration | Test execution / outcome |
+|---|---:|---:|---|
+| Linux / Windows archive | 4 / 5 s | 254 / 390 s | Both passed |
+| Linux / Windows fixtures | 5 / 5 s | 80 / 217 s | Both built; no exact binary-cache hit |
+| Linux / Windows lint | 5 / 5 s | 105 / 166 s | Passed |
+| Operator scripts | 4 s | 147 s | Passed |
+| Linux integration 1 / 2 / 3 / 4 | 4–5 s | 445 / 547 / 433 / 510 s | 355 / 379 / 372 / 341 passed |
+| Windows integration 1 / 2 / 3 / 4 | 4–5 s | 495 / 473 / 533 / 536 s | 347 / 358 / 359 / 324 passed; one failed |
+| Linux / Windows lib/bin/doc | 225 / 226 s | 159 / 479 s | 2,532 / 2,485 passed |
+| Real Linux deployment | 225 s | 176 s | Passed |
+
+Integration job durations now **include waiting for producers**: summing them
+with archive durations would double-count overlapping work. All eight consumers
+started in **4–5 s**, versus **426–431 s** in
+[CI 38571258967](https://github.com/cortexkit/broca/actions/runs/38571258967),
+which waited for every producer matrix leg before preparing consumers. The early-start
+critical path moved to the **Windows lib/bin/doc lane**, which finished
+**705 s** after creation; required-status scheduling/bookkeeping added **12 s**.
+Integration execution wall times were **103.884 / 208.781 / 148.522 / 227.427 s**
+on Linux and **87.735 / 69.816 / 104.301 / 126.401 s** on Windows.
+
+Coverage was **1,447 Linux / 1,389 Windows** integrations executed, plus four
+additional clock proofs per platform. Only the named Windows ACL test failed.
+The two-test increase per platform and one-test increase in each unit lane
+relative to the prior probe came from the newer source tree, not a changed
+workflow filter. Independent archive inventories and the original hash
+partitioning continue to protect selection.
+
+The matching [Mutation catalogue run 38604671455](https://github.com/cortexkit/broca/actions/runs/38604671455)
+lasted **1,144 s (19:04), red**. Linux mutation job durations were
+**777 / 505 / 600 / 654 s**; shard 2 reported
+`retention-reader-boot-enrollment: SURVIVED`. Native Windows job durations were
+**927 / 886 / 956 / 955 s**. Windows now passed the corrected approval-gate
+metadata and exposed another pre-existing absent-test declaration,
+`retention-shared-clock-advances-daemon`; it still cannot supply a green
+mutation-workflow after-measurement.
+
 ### Remaining limits
 
 Four hash shards preserve deterministic selection but do not balance duration:
