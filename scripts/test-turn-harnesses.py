@@ -74,7 +74,10 @@ shutil.copyfile(source, dest)
         (self.bins / "timeout").unlink()
         # Exclude any host timeout; keep only commands needed to reach the prerequisite check.
         for command in ("bash", "dirname", "date", "mktemp", "rm", "tr", "grep", "cut", "sed", "seq", "python3", "cat"):
-            os.symlink(shutil.which(command), self.bins / command)
+            path = shutil.which(command)
+            if path is None:
+                self.fail(f"fixture prerequisite missing: {command}")
+            os.symlink(path, self.bins / command)
         for script in ("acceptance-turn.sh", "mint-lineage-specimen.sh"):
             with self.subTest(script=script):
                 result = self.run_script(script, PATH=str(self.bins))

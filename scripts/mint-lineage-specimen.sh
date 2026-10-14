@@ -35,6 +35,14 @@ ROOT_ARG=""
 HARNESS_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --count|--victim|--donor|--project-root|--harness)
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "mint-lineage-specimen: usage error: $1 requires an argument" >&2
+        exit 2
+      fi
+      ;;
+  esac
+  case "$1" in
     --count)  COUNT="${2:-1}"; shift 2 ;;
     # ADOPT MODE: perform the swap on sessions someone else already owns.
     #

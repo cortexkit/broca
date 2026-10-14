@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -247,7 +248,7 @@ p.wait()
         result = subprocess.run(
             ["bash", "-c", body + '\nrun_with_deadline 1 "$python_bin" "$1" "$2"',
              "fixture", str(child), str(pid_file)],
-            env={**self.env, "python_bin": shutil.which("python3")},
+            env={**self.env, "python_bin": sys.executable},
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
