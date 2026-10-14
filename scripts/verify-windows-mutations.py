@@ -146,7 +146,8 @@ class CoverageTests(unittest.TestCase):
                          {"serve-boot-terminal-withdrawal-debt", "serve-installs-elicitation-plane"})
         for row in controls:
             with self.subTest(control=row["id"]):
-                self.assertEqual(row.get("platforms"), ["macos", "linux"])
+                # Order is not meaningful; scripts/verify-mutation-platforms.py checks the claim itself.
+                self.assertEqual(sorted(row.get("platforms") or []), ["linux", "macos"])
                 self.assertTrue(all(name.startswith("approval_gate::") for name in row["expect_red"]))
         self.assertEqual(eligible_windows(controls), {})
 
@@ -174,7 +175,8 @@ class CoverageTests(unittest.TestCase):
         })
         for row in controls:
             with self.subTest(control=row["id"]):
-                self.assertEqual(row.get("platforms"), ["macos", "linux"])
+                # Order is not meaningful; scripts/verify-mutation-platforms.py checks the claim itself.
+                self.assertEqual(sorted(row.get("platforms") or []), ["linux", "macos"])
                 self.assertTrue(all(name.startswith("retention::ck_broca_") for name in row["expect_red"]))
         self.assertEqual(eligible_windows(controls), {})
 
