@@ -183,9 +183,26 @@ where
         return Err(refusal("consent_record_unreadable", false));
     }
     durable(id_record(ctx, key, prepared, &filing.elicitation_id)).await?;
+    reconcile(plane, ctx, key, prepared, &filing.elicitation_id, durable).await
+}
+
+/// A recorded id identifies a card but does not prove that the post-filing lookup
+/// completed. Pending resumes and interrupted recovery retries reconcile it again.
+pub async fn reconcile<F, Fut>(
+    plane: &dyn ElicitationPlane,
+    ctx: &BatchCtx,
+    key: &str,
+    prepared: &WalRecord,
+    id: &str,
+    mut durable: F,
+) -> Result<RecoveredCard, ApprovalRouteError>
+where
+    F: FnMut(WalRecord) -> Fut,
+    Fut: Future<Output = Result<(), ApprovalRouteError>>,
+{
     if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
-        if answer.id != filing.elicitation_id {
-            match plane.withdraw(ctx, &filing.elicitation_id).await {
+        if answer.id != id {
+            match plane.withdraw(ctx, id).await {
                 ApprovalWithdrawal::Acknowledged | ApprovalWithdrawal::NotSent { .. } => {}
                 ApprovalWithdrawal::Retry(error) => return Err(error),
             }
@@ -197,7 +214,7 @@ where
         });
     }
     Ok(RecoveredCard {
-        id: filing.elicitation_id,
+        id: id.into(),
         answer: None,
     })
 }

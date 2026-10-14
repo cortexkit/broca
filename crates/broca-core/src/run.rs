@@ -9152,6 +9152,9 @@ mod approval_gate {
                     return Err(RunError::Wal("Prepared executor is not broca".into()));
                 }
             }
+            // An AwaitingApproval id is only identity metadata, not proof that
+            // reconciliation completed. Only ApprovalRecorded proves authorization;
+            // every still-pending resume starts through lookup before get or await.
             Ok(Held {
                 key: key.clone(),
                 prepared: call.prepared,
@@ -9223,13 +9226,44 @@ mod approval_gate {
         writer: &WalHandle,
         history: &mut History,
     ) -> Result<Option<CallResolution>, RunError> {
+        decision_reason(call, decision, digest, None, writer, history).await
+    }
+    async fn refusal_decision(
+        call: &Held,
+        error: &ApprovalRouteError,
+        writer: &WalHandle,
+        history: &mut History,
+    ) -> Result<CallResolution, RunError> {
+        Ok(decision_reason(
+            call,
+            DeferredDecision::Unavailable,
+            None,
+            Some(&error.code),
+            writer,
+            history,
+        )
+        .await?
+        .expect("refusal closes"))
+    }
+    async fn decision_reason(
+        call: &Held,
+        decision: DeferredDecision,
+        digest: Option<String>,
+        code: Option<&str>,
+        writer: &WalHandle,
+        history: &mut History,
+    ) -> Result<Option<CallResolution>, RunError> {
         let reason = match decision {
             DeferredDecision::Approved => None,
             DeferredDecision::Declined => Some("pre_tool_declined"),
             DeferredDecision::Expired => Some("pre_tool_expired"),
             DeferredDecision::Unavailable => Some(PRE_TOOL_UNAVAILABLE),
         };
-        let result = reason.map(|reason| Arc::new(closed(&call.call(), reason)));
+        let result = reason.map(|reason| {
+            let reason =
+                code.map_or_else(|| reason.to_string(), |code| format!("{reason}: {code}"));
+            Arc::new(closed(&call.call(), &reason))
+        });
         history.record(
             writer,
             WalRecord::ApprovalRecorded {
@@ -10102,22 +10136,25 @@ mod approval_gate {
                             _ = cancelled_token(control.cancel.as_ref()) => Err(ApprovalRouteError { code: "cancelled".into(), retryable: true }),
                             _ = cancelled_token(control.stop_requested.as_ref()) => Err(ApprovalRouteError { code: "stopped".into(), retryable: true }),
                             result = tokio::time::timeout(Duration::from_millis(held.expires().saturating_sub(timestamp).min(10_000)), async {
+                                let durable = |record| {
+                                    let saved = saved.clone();
+                                    async move {
+                                        let id = match &record { WalRecord::AwaitingApproval { pending, .. } => pending[0].elicitation_id.clone(), _ => None };
+                                        writer.record(record).into_result().map_err(|_| crate::consent::refusal("wal_write_failed", true))?;
+                                        *saved.lock().expect("recovery id lock") = id;
+                                        writer.sync().await.map_err(|_| crate::consent::refusal("wal_sync_failed", true))?;
+                                        Ok(())
+                                    }
+                                };
                                 if let Some(id) = &held.id {
-                                    let question = elicitation.get(&filing_ctx, id).await?;
+                                    let card = crate::consent::reconcile(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, durable).await?;
+                                    if card.answer.is_some() { return Ok(card); }
+                                    let question = elicitation.get(&filing_ctx, &card.id).await?;
                                     let answer = crate::consent::answer(&question.record, &held.key, &held.prepared)?;
-                                    if answer.as_ref().is_some_and(|answer| &answer.id != id) { return Err(crate::consent::refusal("consent_card_mismatch", false)); }
-                                    Ok(crate::consent::RecoveredCard { id: id.clone(), answer })
+                                    if answer.as_ref().is_some_and(|answer| answer.id != card.id) { return Err(crate::consent::refusal("consent_card_mismatch", false)); }
+                                    Ok(crate::consent::RecoveredCard { id: card.id, answer })
                                 } else {
-                                    crate::consent::recover(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, timestamp, |record| {
-                                        let saved = saved.clone();
-                                        async move {
-                                            let id = match &record { WalRecord::AwaitingApproval { pending, .. } => pending[0].elicitation_id.clone(), _ => None };
-                                            writer.record(record).into_result().map_err(|_| crate::consent::refusal("wal_write_failed", true))?;
-                                            *saved.lock().expect("recovery id lock") = id;
-                                            writer.sync().await.map_err(|_| crate::consent::refusal("wal_sync_failed", true))?;
-                                            Ok(())
-                                        }
-                                    }).await
+                                    crate::consent::recover(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, timestamp, durable).await
                                 }
                             }) => result.unwrap_or_else(|_| Err(ApprovalRouteError { code: "timeout".into(), retryable: true })),
                         };
@@ -10235,7 +10272,7 @@ mod approval_gate {
                                     if let Some(answer) = reply.answer { intake(slots, index, answer, ctx, writer, control, history).await?; }
                                 }
                                 Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(call.backoff); call.backoff = (call.backoff * 2).min(1000); }
-                                Err(_) => { let held = call.clone(); let result = decision(call, DeferredDecision::Unavailable, None, writer, history).await?.expect("refusal closes"); slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                Err(error) => { let held = call.clone(); let result = refusal_decision(call, &error, writer, history).await?; slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
                                     if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; })); }
                                 }
                             }
@@ -10294,7 +10331,7 @@ mod approval_gate {
                         Ok(page) => {
                             let Ok(answers)=read_answers(&page.records, history) else {continue};
                             for (key,answer) in answers {
-                                if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && !call.approved)) {
+                                if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && call.filed && !call.approved)) {
                                     if let Some(token) = waits.remove(&index) { token.cancel(); }
                                     intake(slots, index, answer, ctx, writer, control, history).await?;
                                 } else { late_answer(history, writer, &key, answer).await?; }

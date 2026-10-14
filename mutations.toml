@@ -10387,9 +10387,9 @@ expect_red = ["run::approval_tests::consent_runtime_tests::pending_restart_pause
 select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = '''if let Some(id) = &held.id {
-                                    let question = elicitation.get(&filing_ctx, id).await?;'''
+                                    let card = crate::consent::reconcile'''
 new = '''if let Some(id) = None::<&String> { // NON-VACUITY BREAK
-                                    let question = elicitation.get(&filing_ctx, id).await?;'''
+                                    let card = crate::consent::reconcile'''
 
 [[control]]
 id = "core-consent-answers-before-refile"
@@ -10417,9 +10417,9 @@ expect_red = ["consent::tests::second_lookup_adopts_settlement_and_withdraws_dup
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
-        if answer.id != filing.elicitation_id {'''
+        if answer.id != id {'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
-        if answer.id != filing.elicitation_id {'''
+        if answer.id != id {'''
 
 [[control]]
 id = "core-consent-conflicting-decisions-refuse"
@@ -10600,3 +10600,17 @@ select = "expected"
 file = "crates/broca-core/src/replay.rs"
 old = "|| (call.withdrawal_terminal"
 new = "|| (false && call.withdrawal_terminal // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-provisional-resume-reconciles"
+guards = "a recorded pending card id is provisional until ApprovalRecorded and resumes through conflict-checked lookup"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::provisional_id_resume_reconciles_conflicting_settlements_before_get"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''let card = crate::consent::reconcile(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, durable).await?;'''
+new = '''let card = crate::consent::RecoveredCard { id: id.clone(), answer: None }; // NON-VACUITY BREAK'''

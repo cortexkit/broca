@@ -16,6 +16,9 @@ use std::sync::{
 #[path = "consent_runtime_tests.rs"]
 mod consent_runtime_tests;
 
+#[path = "consent_audit_tests.rs"]
+mod consent_audit_tests;
+
 struct Hooks {
     validates: AtomicUsize,
     second: &'static str,
@@ -71,6 +74,7 @@ struct Questions {
     keys: Mutex<Vec<String>>,
     attempts: AtomicUsize,
     polls: AtomicUsize,
+    settlement_pages: AtomicUsize,
     awaits: AtomicUsize,
     gets: AtomicUsize,
     outstanding: AtomicUsize,
@@ -218,7 +222,7 @@ impl ElicitationPlane for Questions {
     ) -> Result<ApprovalPage, ApprovalRouteError> {
         self.cursors.lock().unwrap().push(cursor.cloned());
         let answer = *self.answer.lock().unwrap();
-        if answer == "feed_only" {
+        if answer == "feed_only" && self.gets.load(Ordering::SeqCst) > 0 {
             while self.outstanding.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
@@ -266,7 +270,8 @@ impl ElicitationPlane for Questions {
                 )
             });
         let mut records = if cursor.is_some()
-            || (self.awaits.load(Ordering::SeqCst) == 0 && !after_expiry)
+            || (answer == "feed_only" && self.gets.load(Ordering::SeqCst) == 0)
+            || (self.outstanding.load(Ordering::SeqCst) == 0 && !after_expiry)
             || matches!(answer, "none" | "terminal")
         {
             Vec::new()
@@ -296,6 +301,9 @@ impl ElicitationPlane for Questions {
                 "unreadable_binding_type" => records[0]["binding"] = json!(7),
                 _ => unreachable!(),
             }
+        }
+        if !records.is_empty() {
+            self.settlement_pages.fetch_add(1, Ordering::SeqCst);
         }
         Ok(ApprovalPage {
             records,
@@ -485,6 +493,7 @@ impl Rig {
             keys: Mutex::new(Vec::new()),
             attempts: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
+            settlement_pages: AtomicUsize::new(0),
             awaits: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
             outstanding: AtomicUsize::new(0),

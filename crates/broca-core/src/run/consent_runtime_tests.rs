@@ -59,7 +59,9 @@ async fn pending_restart_pause_gets_then_awaits_the_same_durable_card() {
         }
         token.cancel();
     };
-    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    // Preparing and syncing a pause is not the one-second transport-close bound.
+    // The separate route-drop test measures that bound after cancellation.
+    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         tokio::join!(batch, stop)
     })
     .await
@@ -542,6 +544,7 @@ async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_r
             keys: Mutex::new(Vec::new()),
             attempts: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
+            settlement_pages: AtomicUsize::new(0),
             awaits: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
             outstanding: AtomicUsize::new(0),
@@ -708,6 +711,7 @@ async fn one_held_and_one_expired_call_use_one_await_one_page_and_drop_settled_w
     rig.questions.keys.lock().unwrap().push(key);
     *rig.questions.answer.lock().unwrap() = "feed_only";
     let polls = rig.questions.polls.load(Ordering::SeqCst);
+    let pages = rig.questions.settlement_pages.load(Ordering::SeqCst);
     let awaits = rig.questions.awaits.load(Ordering::SeqCst);
     let resume = ResumeCtx {
         batch_already_started: true,
@@ -721,7 +725,13 @@ async fn one_held_and_one_expired_call_use_one_await_one_page_and_drop_settled_w
     };
     rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;
-    assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 1);
+    // A pending resume rechecks the empty settlement head before get; the live
+    // wait still consumes exactly one nonempty page for the held and expired calls.
+    assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 2);
+    assert_eq!(
+        rig.questions.settlement_pages.load(Ordering::SeqCst),
+        pages + 1
+    );
     assert_eq!(rig.questions.awaits.load(Ordering::SeqCst), awaits + 1);
     assert_eq!(rig.questions.outstanding.load(Ordering::SeqCst), 0);
     assert_eq!(rig.frames().iter().filter(|frame| matches!(&frame.record, WalRecord::ApprovalRecorded { call_id, .. } if call_id.0 == "held")).count(), 1);
