@@ -1642,6 +1642,53 @@ async fn routed_chatgpt_refuses_a_different_vault_account_identity() {
     daemon.assert_healthy();
 }
 
+#[tokio::test]
+async fn account_mismatch_does_not_populate_lkg() {
+    let root = fresh_vault_root("chatgpt-mismatch-cache");
+    let daemon = CapturingVaultDaemon::start_expiring(&root, ExpiryScript {
+        account_id: Some("chatgpt-wrong"), ..ExpiryScript::default()
+    }).await;
+    let mut executor = executor_with_capturing_vault(&root, &daemon).await;
+    let choice = routed_chatgpt_choice().await;
+    let credential_id = "chatgpt:openai:second";
+    match executor.decide_auth_with_account("openai", None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
+        Err(RunError::Config(message)) => assert!(message.starts_with("account_identity_mismatch:"), "{message}"),
+        _ => panic!("a token for another account must refuse admission"),
+    }
+    assert!(executor.vault.as_ref().unwrap().cache.get(credential_id).is_none(),
+        "the refused account must not enter the shared fallback cache");
+    daemon.assert_healthy();
+
+    // Keep the same cache, but point its client at a restarting vault that cannot open
+    // a route. Both routed and static admissions must refuse rather than resurrect it.
+    let outage_root = fresh_vault_root("chatgpt-mismatch-outage");
+    let outage_daemon = CapturingVaultDaemon::start_with(&outage_root,
+        RouteOpenScript::RefuseForever("target_unavailable")).await;
+    let mut outage_executor = executor_with_capturing_vault_within(
+        &outage_root, &outage_daemon, Duration::from_millis(100)).await;
+    let outage_vault = Arc::try_unwrap(outage_executor.vault.take().unwrap())
+        .unwrap_or_else(|_| panic!("outage fixture must own its vault"));
+    Arc::get_mut(executor.vault.as_mut().unwrap()).unwrap().client = outage_vault.client;
+
+    assert!(matches!(executor.decide_auth_with_account("openai", None, true,
+        Some(AuthMethod::Chatgpt), None, &choice, None).await,
+        Err(RunError::Config(message)) if message.starts_with("credential not configured or unusable:")),
+        "a routed admission must not serve the mismatched token during an outage");
+    assert!(matches!(executor.decide_auth("openai", None, true,
+        Some(AuthMethod::Chatgpt), Some("second")).await,
+        Err(RunError::Config(message)) if message.starts_with("credential not configured or unusable:")),
+        "a static admission sharing the credential key must not serve the mismatched token");
+    assert!(outage_daemon.requests().is_empty());
+    assert!(outage_daemon.route_open_count() >= 2);
+    outage_daemon.assert_healthy();
+    drop(executor);
+    drop(outage_executor);
+    drop(daemon);
+    drop(outage_daemon);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(outage_root);
+}
+
 
 /// Collect formatted credentials events while exercising a real refresher.
 async fn capture_credential_logs<F: std::future::Future>(future: F) -> (F::Output, Vec<String>) {

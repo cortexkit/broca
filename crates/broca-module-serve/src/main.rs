@@ -1586,7 +1586,16 @@ mod executor {
 
     impl VaultLkgCache {
         fn insert(&self, credential_id: String, token: VaultToken) {
-            self.entries.lock().unwrap().insert(credential_id, token);
+            let mut entries = self.entries.lock().unwrap();
+            // Reads and refreshes from different runs can finish out of order. Compare
+            // while holding the insertion lock so a late reply cannot roll back the cache.
+            if entries
+                .get(&credential_id)
+                .is_some_and(|current| current.record_version > token.record_version)
+            {
+                return;
+            }
+            entries.insert(credential_id, token);
         }
 
         fn get(&self, credential_id: &str) -> Option<VaultToken> {
@@ -1737,6 +1746,25 @@ mod executor {
                 }
             }
         }
+    }
+
+    fn validate_routed_account(
+        token: &VaultToken,
+        routed_vault_id: &str,
+        routed_account: &str,
+    ) -> Result<(), RunError> {
+        if token
+            .account_id
+            .as_deref()
+            .is_some_and(|served| served != routed_account)
+        {
+            return Err(RunError::Config(format!(
+                "account_identity_mismatch: routing chose account {routed_account} \
+                 for credential {routed_vault_id}, but the vault served account {}",
+                token.account_id.as_deref().unwrap_or_default()
+            )));
+        }
+        Ok(())
     }
 
     /// The credential the run actually USED, paired with the record_version of the token it
@@ -2623,6 +2651,14 @@ mod executor {
                 // Decided from the vault's own answer, before the cache fallback below can
                 // replace a failure with a token the vault did not serve for this request.
                 let recorded_request = recorded_vault_request(&got, vault_request);
+                // Reject a different account before it can enter the shared cache: static
+                // admissions using the same credential key do not have a routed-account check.
+                if let (Some((_, routed_vault_id, routed_account, ..)), Ok(token)) =
+                    (&routed, &got.result)
+                {
+                    vault.gauge.stamp_ok();
+                    validate_routed_account(token, routed_vault_id, routed_account)?;
+                }
                 let outcome = resolve_vault_outcome(
                     &vault.cache,
                     vault.gauge.as_ref(),
@@ -2662,18 +2698,7 @@ mod executor {
                     }
                     // A credential that resolves to another account than the one routing chose
                     // would spend on an account nobody selected.
-                    Ok(token)
-                        if token
-                            .account_id
-                            .as_deref()
-                            .is_some_and(|served| served != routed_account.as_str()) =>
-                    {
-                        return Err(RunError::Config(format!(
-                            "account_identity_mismatch: routing chose account {routed_account} \
-                             for credential {routed_vault_id}, but the vault served account {}",
-                            token.account_id.as_deref().unwrap_or_default()
-                        )));
-                    }
+                    Ok(token) => validate_routed_account(token, routed_vault_id, routed_account)?,
                     _ => {}
                 }
             }
@@ -4655,6 +4680,65 @@ mod executor {
             )
             .unwrap();
             assert_eq!(fallback, token);
+        }
+
+        #[test]
+        fn late_older_vault_reply_cannot_regress_lkg() {
+            let credential_id = "apikey:openai";
+            let cache = VaultLkgCache::default();
+            let gauge = broca_module_serve::serve::VaultGauge::disconnected();
+            let now_ms = 1_000_000;
+            let mut older = cached_token(None);
+            older.record_version = 1;
+            let mut newer = cached_token(Some(now_ms + VAULT_MIN_TTL_MS));
+            newer.record_version = 2;
+
+            // The newer read finishes first; the older reply still belongs to its run,
+            // but must not replace the shared fallback for subsequent admissions.
+            for reply in [newer.clone(), older] {
+                let version = reply.record_version;
+                let served = resolve_vault_outcome(
+                    &cache,
+                    gauge.as_ref(),
+                    credential_id,
+                    Ok(reply),
+                    now_ms,
+                    VAULT_MIN_TTL_MS,
+                )
+                .unwrap();
+                assert_eq!(served.record_version, version);
+            }
+            let fallback = resolve_vault_outcome(
+                &cache,
+                gauge.as_ref(),
+                credential_id,
+                Err(VaultError::Transport("credentials offline".into())),
+                now_ms,
+                VAULT_MIN_TTL_MS,
+            )
+            .unwrap();
+            assert_eq!(fallback.record_version, 2);
+
+            // An equal-version expiry update is useful even without a token rotation.
+            newer.expires_at_ms = Some(now_ms + 2 * VAULT_MIN_TTL_MS);
+            cache.insert(credential_id.into(), newer);
+            assert_eq!(
+                cache.get(credential_id).unwrap().expires_at_ms,
+                Some(now_ms + 2 * VAULT_MIN_TTL_MS)
+            );
+            super::evict_for_provider_rejection(&cache, credential_id, 401, 1);
+            assert_eq!(cache.get(credential_id).unwrap().record_version, 2);
+            super::evict_for_provider_rejection(&cache, credential_id, 401, 2);
+            assert!(cache.get(credential_id).is_none());
+            assert!(resolve_vault_outcome(
+                &cache,
+                gauge.as_ref(),
+                credential_id,
+                Err(VaultError::Transport("credentials offline".into())),
+                now_ms,
+                VAULT_MIN_TTL_MS,
+            )
+            .is_err());
         }
 
         #[test]
