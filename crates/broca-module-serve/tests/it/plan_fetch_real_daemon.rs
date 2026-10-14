@@ -207,8 +207,8 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     )
     .unwrap();
     let connection_file = runtime_dir.join("subc-connection.json");
-    let mut daemon = broca_test_support::retry_executable_file_busy(|| {
-        tokio::process::Command::new(&daemon_bin)
+    let daemon = broca_test_support::retry_executable_file_busy(|| {
+        broca_test_support::tokio_rig_command(&daemon_bin, &root, "daemon")?
             .env("XDG_CONFIG_HOME", &config_home)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("XDG_DATA_HOME", &data_home)
@@ -220,6 +220,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
             .spawn()
     })
     .expect("spawn ck-subc");
+    let mut daemon = broca_test_support::RigChild::new(daemon, &root, "daemon");
     let deadline = Instant::now() + Duration::from_secs(20);
     while !connection_file.exists() {
         assert!(
@@ -325,5 +326,6 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
         task.abort();
     }
     let _ = daemon.kill().await;
+    drop(daemon);
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -662,7 +662,7 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
 // ---- the rig -----------------------------------------------------------------------------------
 
 struct Rig {
-    daemon: tokio::process::Child,
+    daemon: broca_test_support::RigChild,
     connection_file: PathBuf,
     state_root: PathBuf,
     project_root: PathBuf,
@@ -689,7 +689,7 @@ impl Drop for Rig {
                     .status();
             }
         }
-        let _ = self.daemon.start_kill();
+        broca_test_support::kill_and_reap(&mut self.daemon);
     }
 }
 
@@ -850,7 +850,7 @@ impl Rig {
         .unwrap();
         let connection_file = runtime_dir.join("subc-connection.json");
         let daemon = broca_test_support::retry_executable_file_busy(|| {
-            tokio::process::Command::new(&daemon_bin)
+            broca_test_support::tokio_rig_command(&daemon_bin, &root, "daemon")?
                 .env("XDG_CONFIG_HOME", &config_home)
                 .env("XDG_RUNTIME_DIR", &runtime_dir)
                 .env("XDG_DATA_HOME", &data_home)
@@ -863,6 +863,7 @@ impl Rig {
                 .spawn()
         })
         .expect("spawn ck-subc");
+        let daemon = broca_test_support::RigChild::new(daemon, &root, "daemon");
         let deadline = Instant::now() + Duration::from_secs(20);
         while !connection_file.exists() {
             assert!(
