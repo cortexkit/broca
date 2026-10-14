@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 MARKER = "BROCA_TEST_CLOCK_RETENTION_CLOCK_OVERRIDE_V1"
 SENTINEL = "test_clock::test_clock_feature_is_enabled_for_retention_tests"
@@ -171,12 +173,18 @@ class TestClockGate(unittest.TestCase):
 
     def test_ci_workspace_matrix_uses_the_clock_armed_gate(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        matrix_job = workflow.split("  postgres-conformance:", 1)[0]
-        self.assertIn("os: ubuntu", matrix_job)
-        self.assertIn("os: windows", matrix_job)
-        self.assertIn("run: ./scripts/rust-test-gate.sh", matrix_job)
+        jobs = yaml.load(workflow, Loader=yaml.BaseLoader)["jobs"]
+        self.assertEqual(jobs["integration"]["strategy"]["matrix"]["os"], ["ubuntu", "windows"])
+        build_steps = "\n".join(s.get("run", "") for s in jobs["integration-build"]["steps"])
+        run_steps = "\n".join(s.get("run", "") for s in jobs["integration"]["steps"])
+        self.assertIn("scripts/ci-integration.sh build", build_steps)
+        self.assertIn("scripts/ci-integration.sh run", run_steps)
+        shard_gate = (ROOT / "scripts/ci-integration.sh").read_text()
+        self.assertIn("source scripts/rust-test-gate.sh", shard_gate)
+        self.assertIn(SENTINEL, shard_gate)
+        self.assertIn("test-clock sentinel did not execute successfully", shard_gate)
         # The suite list lives in scripts/script-suites.sh, which CI and the local gate call.
-        self.assertIn("run: scripts/script-suites.sh", matrix_job)
+        self.assertIn("scripts/script-suites.sh", jobs["scripts"]["steps"][2]["run"])
         suites = (ROOT / "scripts/script-suites.sh").read_text()
         self.assertIn("scripts/tests/test_clock_safety.py", suites)
 

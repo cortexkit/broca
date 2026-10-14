@@ -32,7 +32,7 @@ if [[ -z "$python_bin" ]]; then
   exit 127
 fi
 
-if ! command -v cargo-nextest >/dev/null 2>&1; then
+if [[ "${BASH_SOURCE[0]}" == "$0" ]] && ! command -v cargo-nextest >/dev/null 2>&1; then
   echo "cargo-nextest is required; install it with: cargo install cargo-nextest --locked" >&2
   exit 127
 fi
@@ -417,6 +417,12 @@ PY_SENTINEL
   rm -f "$out"
   return "$rc"
 }
+
+# CI's archive builder reuses the independent inventory parsers, but does not
+# run the local, serial gate when importing this file.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return
+fi
 
 run_phase "cargo fmt --all -- --check" \
   cargo fmt --all -- --check

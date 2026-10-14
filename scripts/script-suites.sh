@@ -37,11 +37,13 @@ suites=(
     scripts/test-check-path-deps.py
     scripts/test-anthropic-policy-deps.py
     scripts/test-stage-release.py
+    scripts/test-release.py
     scripts/test-prune-staging.py
     # Stubs codesign, file, stat, ps and lsof, so the placement gate's macOS-only signing
     # checks also run on a Linux runner.
     scripts/test-place-release-gate.py
     scripts/test-train-push.py
+    scripts/test-train-preflight.py
     scripts/test-watch-ci-resolve.py
     scripts/test-archive-read.py
     scripts/test-wal-archive-instruments.py
@@ -56,6 +58,7 @@ suites=(
     scripts/test-state-root.py
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.
     scripts/test-gate-phases.py
+    scripts/test-ci-pipeline.py
     scripts/test-gated-commit.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py

@@ -24,7 +24,11 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
+  fixtures:
+    uses: ./.github/workflows/fixtures.yml
+
   mutations:
+    needs: fixtures
     name: Mutation catalogue (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -41,10 +45,11 @@ jobs:
       BROCA_REQUIRE_SUBC: "1"
       BROCA_REQUIRE_VAULT: "1"
       BROCA_REQUIRE_AIMOCK: "1"
-      SUBC_CORE_BIN: ${{ github.workspace }}/subconscious/target/debug/ck-subc
-      FAKE_AFT_STUB_BIN: ${{ github.workspace }}/subconscious/target/debug/fake-aft-stub
-      CK_CLAUSTRUM_BIN: ${{ github.workspace }}/claustrum/target/debug/ck-claustrum
-      CK_AUTH_BIN: ${{ github.workspace }}/claustrum/target/debug/ck-auth
+      SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
+      FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub
+      CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum
+      CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth
+      CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
     defaults:
       run:
         working-directory: broca
@@ -58,47 +63,41 @@ jobs:
           persist-credentials: false
           path: broca
           fetch-depth: 0
-      # Same fixture checkouts/builds as the integration job in ci.yml. subc-core's
-      # bins include the ck CLI used to send the real module restart command.
-      - name: Checkout subconscious
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          repository: cortexkit/subconscious
-          path: subconscious
-      - name: Checkout claustrum
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          repository: cortexkit/claustrum
-          path: claustrum
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
       - run: npm ci
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cargo-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            broca/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-mutations-${{ hashFiles('broca/Cargo.lock') }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-mutations-
-      - name: Build subc binaries (real-subc spine tests)
-        working-directory: subconscious
-        run: cargo build -p subc-core --bins
-      - name: Build claustrum binaries (credential e2e arms)
-        working-directory: claustrum
-        run: cargo build -p credentials-module --bins
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+          workspaces: broca -> target
+          shared-key: mutations
+          cache-on-failure: 'true'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fixtures-${{ runner.os }}
+          path: ${{ runner.temp }}/fixtures
+      - name: Unpack pinned fixtures
+        shell: bash
+        run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" -C "$GITHUB_WORKSPACE"
+      - name: Cargo cache telemetry
+        shell: bash
+        run: echo "Mutation cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: mutate-cache
         with:
           path: ~/.cargo/bin/ckdev-mutate
           key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
       - name: Install pinned mutation runner
+        id: install-mutator
         if: steps.mutate-cache.outputs.cache-hit != 'true'
         run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: steps.mutate-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cargo/bin/ckdev-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
       - name: Validate catalogue
         run: ckdev-mutate check
       - name: Replay selected proofs
@@ -131,6 +130,7 @@ jobs:
           path: broca/target/mutations/*.json
 
   mutations-windows:
+    needs: fixtures
     name: Mutation catalogue (native Windows shard ${{ matrix.shard }}/4)
     runs-on: windows-latest
     timeout-minutes: 360
@@ -143,11 +143,11 @@ jobs:
       BROCA_REQUIRE_SUBC: "1"
       BROCA_REQUIRE_VAULT: "1"
       BROCA_REQUIRE_AIMOCK: "1"
-      SUBC_CORE_BIN: ${{ github.workspace }}/subconscious/target/debug/ck-subc.exe
-      FAKE_AFT_STUB_BIN: ${{ github.workspace }}/subconscious/target/debug/fake-aft-stub.exe
-      CK_CLAUSTRUM_BIN: ${{ github.workspace }}/claustrum/target/debug/ck-claustrum.exe
-      CK_AUTH_BIN: ${{ github.workspace }}/claustrum/target/debug/ck-auth.exe
-      CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/claustrum
+      SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc.exe
+      FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub.exe
+      CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum.exe
+      CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth.exe
+      CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
     defaults:
       run:
         working-directory: broca
@@ -158,18 +158,6 @@ jobs:
           persist-credentials: false
           path: broca
           fetch-depth: 0
-      - name: Checkout subconscious
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          repository: cortexkit/subconscious
-          path: subconscious
-      - name: Checkout claustrum
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          repository: cortexkit/claustrum
-          path: claustrum
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -178,28 +166,36 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cargo-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            broca/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-mutations-${{ hashFiles('broca/Cargo.lock') }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-mutations-
-      - name: Build subc binaries (real-subc spine tests)
-        working-directory: subconscious
-        run: cargo build -p subc-core --bins
-      - name: Build claustrum binaries (credential e2e arms)
-        working-directory: claustrum
-        run: cargo build -p credentials-module --bins
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+          workspaces: broca -> target
+          shared-key: mutations
+          cache-on-failure: 'true'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fixtures-${{ runner.os }}
+          path: ${{ runner.temp }}/fixtures
+      - name: Unpack pinned fixtures
+        shell: bash
+        run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" -C "$GITHUB_WORKSPACE"
+      - name: Cargo cache telemetry
+        shell: bash
+        run: echo "Mutation cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: mutate-cache
         with:
           path: ~/.cargo/bin/ckdev-mutate.exe
           key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
       - name: Install pinned mutation runner
+        id: install-mutator
         if: steps.mutate-cache.outputs.cache-hit != 'true'
         run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: steps.mutate-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cargo/bin/ckdev-mutate.exe
+          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
       - name: Validate catalogue
         run: ckdev-mutate check
       - name: Test Windows report verifier
