@@ -9151,3 +9151,41 @@ old = '''.sealed_digest
                     .as_deref()'''
 new = '''.sealed_digest
                     .as_deref().or(Some(plan.digest.as_str())) /* NON-VACUITY BREAK */'''
+
+[[control]]
+id = "vault-cancelled-route-opener-releases-waiters"
+guards = "cancelling the single vault route opener releases joined waiters and permits a fresh open"
+runner = "command"
+command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-subc --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-subc/src/vault.rs"
+expect_red = ["vault::tests::cancelled_vault_opener_releases_waiters"]
+expect_message = "cancelled route opener must release its waiter"
+file = "crates/broca-subc/src/vault.rs"
+old = "            completed: false,"
+new = "            completed: true, // NON-VACUITY BREAK: disable cancelled-opener cleanup"
+
+[[control]]
+id = "vault-lkg-rejects-late-older-reply"
+guards = "an older vault reply cannot overwrite a newer shared last-known-good credential version"
+runner = "command"
+command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --bin ck-broca \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["executor::tests::late_older_vault_reply_cannot_regress_lkg"]
+file = "crates/broca-module-serve/src/main.rs"
+old = ".is_some_and(|current| current.record_version > token.record_version)"
+new = ".is_some_and(|current| false && current.record_version > token.record_version) // NON-VACUITY BREAK: allow cache regression"
+
+[[control]]
+id = "vault-routed-account-validated-before-lkg"
+guards = "a routed token for a different account is refused before populating the shared fallback cache"
+runner = "command"
+command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --bin ck-broca \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module-serve/src/vault_request_tests.rs"
+expect_red = ["executor::tests::account_mismatch_does_not_populate_lkg"]
+expect_message = "the refused account must not enter the shared fallback cache"
+file = "crates/broca-module-serve/src/main.rs"
+old = "                    vault.gauge.stamp_ok();\n                    validate_routed_account(token, routed_vault_id, routed_account)?;"
+new = "                    vault.gauge.stamp_ok();\n                    let _ = (token, routed_vault_id, routed_account); // NON-VACUITY BREAK: cache before validation"

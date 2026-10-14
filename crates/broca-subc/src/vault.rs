@@ -702,6 +702,29 @@ impl RouteOpenAttempt {
     }
 }
 
+struct RouteOpenGuard<'a> {
+    state: &'a std::sync::Mutex<RouteState>,
+    attempt: Arc<RouteOpenAttempt>,
+    completed: bool,
+}
+
+impl Drop for RouteOpenGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // A caller's timeout or task abort can drop the open future. Release its waiters
+        // and let the next caller retry, without disturbing any replacement attempt.
+        let mut state = self.state.lock().unwrap();
+        if matches!(&*state, RouteState::Opening(current) if Arc::ptr_eq(current, &self.attempt)) {
+            *state = RouteState::Empty;
+        }
+        self.attempt.complete(Err(VaultError::Transport(
+            "credentials route open was cancelled".into(),
+        )));
+    }
+}
+
 pub struct VaultClient {
     conn: Arc<dyn VaultConnection>,
     module_id: String,
@@ -843,6 +866,11 @@ impl VaultClient {
             return attempt.wait().await;
         }
 
+        let mut open_guard = RouteOpenGuard {
+            state: &self.route,
+            attempt: Arc::clone(&attempt),
+            completed: false,
+        };
         let result = self.resolve_route().await;
         {
             let mut state = self.route.lock().unwrap();
@@ -854,6 +882,7 @@ impl VaultClient {
             }
         }
         attempt.complete(result.clone());
+        open_guard.completed = true;
         result
     }
 
@@ -1216,6 +1245,47 @@ mod tests {
         replies: std::sync::Mutex<VecDeque<Result<serde_json::Value, ConnError>>>,
         closes: std::sync::Mutex<Vec<RouteHandle>>,
         sent: std::sync::Mutex<Vec<(RouteHandle, Vec<u8>)>>,
+    }
+
+    struct GatedOpenConnection {
+        attempts: AtomicUsize,
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl VaultConnection for GatedOpenConnection {
+        async fn catalog_contains(&self, _module_id: &str) -> Result<bool, ConnError> {
+            Ok(true)
+        }
+
+        async fn route_open_management(
+            &self,
+            _module_id: &str,
+            _identity: &broca_protocol::BindIdentity,
+            _retry: RouteOpenRetry,
+        ) -> Result<RouteHandle, ConnError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(RouteHandle::synthetic(33))
+        }
+
+        async fn route_request(
+            &self,
+            _route: &RouteHandle,
+            _body: Vec<u8>,
+        ) -> Result<Vec<u8>, ConnError> {
+            unreachable!("route-open tests do not send a request")
+        }
+
+        async fn route_close(&self, _route: &RouteHandle) -> Result<(), ConnError> {
+            unreachable!("route-open tests do not close a route")
+        }
+
+        fn consumer_module_id(&self) -> Option<String> {
+            None
+        }
     }
 
     #[async_trait]
@@ -1837,6 +1907,59 @@ mod tests {
             Err(VaultError::Transport(_))
         ));
         assert_eq!(conn.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_vault_opener_releases_waiters() {
+        use std::{future::Future, task::Poll};
+
+        let conn = Arc::new(GatedOpenConnection {
+            attempts: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let client = Arc::new(test_client(conn.clone(), RouteState::Empty));
+        let opener = {
+            let client = client.clone();
+            tokio::spawn(async move { client.route().await })
+        };
+        conn.started.notified().await;
+
+        let mut waiter = Box::pin(client.route());
+        // Poll the caller into the shared attempt before aborting its opener. This proves
+        // it is a waiter without relying on elapsed time or scheduler luck.
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(conn.attempts.load(Ordering::SeqCst), 1);
+        opener.abort();
+        assert!(opener.await.unwrap_err().is_cancelled());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("cancelled route opener must release its waiter");
+        assert!(matches!(result, Err(VaultError::Transport(_))));
+        assert!(matches!(*client.route.lock().unwrap(), RouteState::Empty));
+
+        let fresh = {
+            let client = client.clone();
+            tokio::spawn(async move { client.route().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), conn.started.notified())
+            .await
+            .expect("a fresh caller must start another route open");
+        conn.release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), fresh)
+                .await
+                .expect("the fresh open must complete")
+                .unwrap()
+                .unwrap(),
+            RouteHandle::synthetic(33)
+        );
+        assert_eq!(conn.attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
