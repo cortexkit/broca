@@ -3237,18 +3237,19 @@ new = "let detail = if false && self.retention { // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-reader-boot-enrollment"
-guards = "the real reader daemon enrolls retained WALs before its first sweep"
+guards = "the real reader daemon enrolls retained WALs before querying its first sweep's deadlines"
 runner = "command"
-command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
+command = ["bash", "-c", "git diff --stat; BROCA_REQUIRE_SUBC=1 cargo test --locked -p broca-module-serve --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 expect_red = ["ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_content"]
-file = "crates/broca-module-serve/src/main.rs"
-old = "registry\n        .boot_retention()\n        .await\n        .map_err(|error| ServeIoError(format!(\"retention boot recovery: {error}\")))?;"
-new = "if false { registry\n        .boot_retention()\n        .await\n        .map_err(|error| ServeIoError(format!(\"retention boot recovery: {error}\")))?; } // NON-VACUITY BREAK"
+file = "crates/broca-module/src/retention.rs"
+old = "if !matching {"
+new = "if false && !matching { // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-writer-admission"
+platforms = ["macos", "linux"]
 guards = "a retained first send reaches real admission instead of the reader-only refusal"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --features test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -3716,6 +3717,7 @@ new = "                .map(|exists| exists) // NON-VACUITY BREAK: invert tombst
 
 [[control]]
 id = "retention-own-tombstone-before-older"
+platforms = ["macos", "linux"]
 guards = "the live lineage's own tombstone answers before an older lineage's lower-sequence tombstone, on the real daemon"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -3732,6 +3734,7 @@ new = "            // NON-VACUITY BREAK: consult the oldest tombstone instead of
 # tombstone answers only for its own lineage.
 [[control]]
 id = "retention-tombstone-never-shadows-fresh-lineage-real-daemon"
+platforms = ["macos", "linux"]
 guards = "an older lineage's tombstone never shadows the fresh forever lineage at its address, live or folded into the archive, on the real daemon"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -3744,6 +3747,7 @@ new = "                // NON-VACUITY BREAK: let the older lineage's tombstone s
 
 [[control]]
 id = "retention-real-daemon-marker-title"
+platforms = ["macos", "linux"]
 guards = "the real-daemon marker scan catches a retention title written to run-index.db"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -5898,6 +5902,7 @@ new = "&& false && handler.frozen_plan_requires_approval(&session).await // NON-
 
 [[control]]
 id = "serve-boot-terminal-withdrawal-debt"
+platforms = ["macos", "linux"]
 guards = "boot opens actors with terminal withdrawal debt without a send or restart-resume candidate"
 runner = "cargo"
 package = "broca-module-serve"
@@ -5912,6 +5917,7 @@ new = "for row in candidates.into_iter().take(0) { // NON-VACUITY BREAK: abandon
 
 [[control]]
 id = "serve-installs-elicitation-plane"
+platforms = ["macos", "linux"]
 guards = "the production executor exposes the scoped question plane to both the session actor and run loop"
 runner = "cargo"
 package = "broca-module-serve"
@@ -6208,6 +6214,7 @@ new = 'ErrorBody::new("open_failed", err.to_string()) // NON-VACUITY BREAK'
 
 [[control]]
 id = "retention-shared-clock-advances-daemon"
+platforms = ["macos", "linux"]
 guards = "the shared retention hook advances broca timers and awaits physical deletion rather than proxy timestamps"
 runner = "cargo"
 package = "broca-module-serve"
@@ -6222,6 +6229,7 @@ new = "let _ = milliseconds; self.advance_retention(session, 0).await // NON-VAC
 
 [[control]]
 id = "retention-size-admission-typed-refusal"
+platforms = ["macos", "linux"]
 guards = "a refused first append answers retained_session_too_large through real serve instead of dropping the admission reply"
 runner = "cargo"
 package = "broca-module-serve"
@@ -7097,15 +7105,28 @@ new = "self.resolved = true;\n        {\n            let mut slots = self.inner.
 [[control]]
 id = "ckdev-exec-internal-disk"
 platforms = ["macos"]
-guards = "on macOS, executables a rig launches are published under /tmp/broca-exec on the internal disk, never under the build folder"
+guards = "on macOS, published executables follow TMPDIR when present or use /tmp, stay outside Cargo's build tree, and never resolve onto /Volumes"
 runner = "cargo"
 package = "broca-test-support"
 target = "--lib"
 test_file = "crates/broca-test-support/src/ckdev.rs"
 expect_red = ["ckdev::tests::macos_publishes_outside_the_build_on_the_internal_disk"]
 file = "crates/broca-test-support/src/ckdev.rs"
-old = '    if cfg!(target_os = "macos") {'
-new = '    if false && cfg!(target_os = "macos") { // NON-VACUITY BREAK: publish under the build folder'
+old = '        macos_exec_root(std::env::var_os("TMPDIR"))'
+new = '        profile_directory(_binary) // NON-VACUITY BREAK: publish under the build folder'
+
+[[control]]
+id = "ckdev-exec-target-directory"
+platforms = ["macos"]
+guards = "on macOS, reject executable roots that resolve inside Cargo's target directory, including paths reached through symlinks"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+test_file = "crates/broca-test-support/src/ckdev.rs"
+expect_red = ["ckdev::tests::macos_publishes_outside_the_build_on_the_internal_disk"]
+file = "crates/broca-test-support/src/ckdev.rs"
+old = '        macos_exec_root(std::env::var_os("TMPDIR"))'
+new = '        std::env::current_exe().expect("test executable").ancestors().nth(3).expect("Cargo target directory").join("broca-exec") // NON-VACUITY BREAK: publish in Cargo target directory'
 
 [[control]]
 id = "anthropic-policy-beta-dedupe"
@@ -10249,3 +10270,135 @@ expect_red = ["single_turn_module_e2e::meta_muse_oauth_uses_responses_bearer_and
 file = "crates/broca-module-serve/src/cache_routing.rs"
 old = 'let session_key_providers = BTreeSet::from(["meta".to_string()]);'
 new = 'let session_key_providers = BTreeSet::new(); // NON-VACUITY BREAK: drop the Meta session key'
+
+[[control]]
+id = "consent-fixtures-mapping-exactly-once"
+guards = "vendored README maps each of the eighteen HeldCallRequest fields exactly once"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_mapping_exactly_once"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = '| `executor` | dropped |'
+new = '| `tool` | dropped <!-- NON-VACUITY BREAK: duplicate a mapping field --> |'
+
+[[control]]
+id = "consent-fixtures-independent-upstream-pin"
+guards = "upstream manifest pins in README match the independent pins in the verifier"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_upstream_pins"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = 'd276eaed5330b95923166d006b2f1b5d83a9a95e050cfe99446d685b22c2e568'
+new = '0000000000000000000000000000000000000000000000000000000000000000 <!-- NON-VACUITY BREAK: alter the source pin -->'
+
+[[control]]
+id = "consent-fixtures-raw-upstream-bytes"
+guards = "vendored requester readbacks retain exact upstream bytes under their pinned manifest"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_upstream_coverage_and_bytes"]
+file = "crates/broca-subc/tests/fixtures/consent/upstream/consent-requester-v2/cerebellum-ref-get-reply.json"
+old = '"elicitation_id":"el_1"'
+new = '"elicitation_id":"NON-VACUITY BREAK"'
+
+[[control]]
+id = "consent-fixtures-complete-local-coverage"
+guards = "root checksum coverage includes README and the verifier as well as all fixture payloads"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_local_coverage_and_bytes"]
+file = "crates/broca-subc/tests/fixtures/consent/SHA256SUMS"
+old = '  verify.py'
+new = '  NON-VACUITY BREAK verify.py'
+
+[[control]]
+id = "consent-fixtures-ledger-blocks-escalation"
+guards = "an unsettled contract ledger entry prevents downstream readiness"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_ledger_settled"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = '| L6 | Settled |'
+new = '| L6 | Escalated <!-- NON-VACUITY BREAK --> |'
+
+[[control]]
+id = "consent-fixtures-no-identity-in-body"
+guards = "broca-authored generic request contains no requester or subject identity fields"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_no_identity_in_body"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
+old = '"params":{"args_digest":'
+new = '"params":{"owner":"NON-VACUITY BREAK","args_digest":'
+
+[[control]]
+id = "consent-fixtures-args-byte-binding"
+guards = "broca binding uses the exact frozen argument bytes rather than parsed and reserialized JSON"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_binding_exact_argument_bytes"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
+old = '"binding":{"args_hash":"68cb3925e8c7384994607e6d1ee1fad72b4c9af5b0354ea9fca91900b9ee7413"'
+new = '"binding":{"args_hash":"NON-VACUITY BREAK"'
+
+[[control]]
+id = "consent-fixtures-expired-metadata-never-approval"
+guards = "the declared broca rendering of legacy expired-choice metadata never authorizes dispatch"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_deny_on_expiry"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/expired-rendering.json"
+old = '"late_decision":"none"'
+new = '"late_decision":"approved NON-VACUITY BREAK"'
+
+[[control]]
+id = "consent-fixtures-selected-ack-branch"
+guards = "vendored consent contract selects the owner-feed no-ack branch and names its provider"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_ack_branch_and_provider"]
+file = "crates/broca-subc/tests/fixtures/consent/README.md"
+old = 'Selected ack branch: **C**.'
+new = 'Selected ack branch: **A**. <!-- NON-VACUITY BREAK -->'
+
+[[control]]
+id = "consent-fixtures-held-call-golden-mapping"
+guards = "the broca-authored golden retains the mapped held-call request envelope and bounded correlation key"
+runner = "command"
+command = ["python3", "-B", "crates/broca-subc/tests/fixtures/consent/verify.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "crates/broca-subc/tests/fixtures/consent/verify.py"
+expect_red = ["ConsentFixtures.test_held_call_request_mapping"]
+file = "crates/broca-subc/tests/fixtures/consent/broca/held-call-request.json"
+old = '"method":"consent.request"'
+new = '"method":"consent.request NON-VACUITY BREAK"'
+
+[[control]]
+id = "session-read-reply-body-budget"
+guards = "tail and range transcript replies include their envelope within the 3 MiB budget"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/read_page_tests.rs"
+expect_red = ["serve::read_page_tests::reply_body_cap_includes_envelope_for_tail_and_range"]
+file = "crates/broca-protocol/src/lib.rs"
+old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
+new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"

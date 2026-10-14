@@ -135,25 +135,37 @@ impl Source {
 
 /// Where published copies live.
 ///
-/// On macOS this is `/tmp/broca-exec`, on the internal disk, whatever disk the build is on. A
-/// rig launches these copies as their own responsible process (the daemon spawns the module), so
-/// a copy executed from a removable volume, where build folders may live, asks the user for
-/// removable-volume access once per build, and while that prompt is open every process's listing
-/// of the volume hangs. `/tmp` rather than the per-user temporary folder, because `codesign`
-/// hangs on unsigned files there. Elsewhere copies stay beside the build, in its profile
-/// directory.
-fn exec_root(binary: &Path) -> PathBuf {
+/// On macOS copies go under the per-task temporary directory when `TMPDIR` is set, or under
+/// `/tmp` when it is not. Both locations are on the internal disk, unlike build folders that may
+/// live on removable volumes. A rig launches these copies as their own responsible process (the
+/// daemon spawns the module), so a copy executed from a removable volume asks the user for access
+/// once per build, and while that prompt is open every process's listing of the volume hangs.
+/// Elsewhere copies stay beside the build, in its profile directory.
+fn exec_root(_binary: &Path) -> PathBuf {
     #[cfg(test)]
     if let Some(root) = TEST_EXEC_ROOT.with(|root| root.borrow().clone()) {
         return root;
     }
-    if cfg!(target_os = "macos") {
-        PathBuf::from("/tmp/broca-exec")
-    } else {
-        profile_directory(binary)
+    #[cfg(target_os = "macos")]
+    {
+        macos_exec_root(std::env::var_os("TMPDIR"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        profile_directory(_binary)
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_exec_root(tmpdir: Option<OsString>) -> PathBuf {
+    tmpdir
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("broca-exec")
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
 fn profile_directory(binary: &Path) -> PathBuf {
     let source = fs::canonicalize(binary).unwrap_or_else(|error| {
         panic!("resolving test binary {} failed: {error}", binary.display())
@@ -873,21 +885,50 @@ mod tests {
         assert_eq!(profile_directory(&staged), scratch.join("rigs"));
     }
 
-    /// On macOS a published copy never lives under the build, which may be on a removable
-    /// volume; it lives under `/tmp/broca-exec` on the internal disk.
+    /// Published executables stay outside Cargo's build tree and removable volumes.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_publishes_outside_the_build_on_the_internal_disk() {
         let scratch = fixture("internal");
         TEST_EXEC_ROOT.with(|slot| *slot.borrow_mut() = None);
         let built = source(&scratch, "target/debug/ck-probe", b"internal disk");
-        let published = ckdev_binary(&built, &scratch);
-        assert!(
-            published.starts_with("/tmp/broca-exec/ckdev-exec"),
-            "{}",
-            published.display()
+        let worker_tmpdir = scratch.join("worker temp").into_os_string();
+        assert_eq!(
+            macos_exec_root(Some(worker_tmpdir.clone())),
+            PathBuf::from(&worker_tmpdir).join("broca-exec")
         );
-        assert!(!published.starts_with(&scratch));
+        assert_eq!(macos_exec_root(None), PathBuf::from("/tmp/broca-exec"));
+        assert_eq!(
+            macos_exec_root(Some(OsString::new())),
+            PathBuf::from("/tmp/broca-exec")
+        );
+
+        let expected_root = macos_exec_root(std::env::var_os("TMPDIR"));
+        let selected_root = exec_root(&built);
+        let published = ckdev_binary(&built, &scratch);
+        assert!(published.starts_with(selected_root.join("ckdev-exec")));
+
+        let resolved_published = fs::canonicalize(&published).unwrap();
+        let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let target_dir = fs::canonicalize(
+            executable
+                .ancestors()
+                .nth(3)
+                .expect("test executable lives below Cargo's target directory"),
+        )
+        .unwrap();
+        assert!(
+            !resolved_published.starts_with(&target_dir),
+            "published executable resolves inside Cargo's target directory: {}",
+            resolved_published.display()
+        );
+        assert!(
+            !resolved_published.starts_with("/Volumes"),
+            "published executable resolves on a removable volume: {}",
+            resolved_published.display()
+        );
+        assert_eq!(selected_root, expected_root);
+        assert!(published.starts_with(expected_root.join("ckdev-exec")));
     }
 
     #[test]

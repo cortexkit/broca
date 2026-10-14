@@ -16,6 +16,9 @@
 /// Admission and execution share a 30 s ceiling so frozen hook budgets are executable.
 pub const STEP_TRANSFORM_HOOK_CAP: u64 = 30_000;
 
+/// Shared `session.read` reply-body budget: 3 MiB, before transport framing.
+pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;
+
 pub mod approval;
 pub mod caller;
 pub mod canonical;

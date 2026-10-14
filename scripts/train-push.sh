@@ -658,6 +658,23 @@ if ! git merge-base --is-ancestor "$remote_default" "$head_sha"; then
   refuse "HEAD is not a descendant of $remote/$default_branch (rebase onto $remote/$default_branch first)"
 fi
 
+# Validate before the trigger probe too: it is the first push in a new clone.
+# A moved-main requeue changes HEAD and must earn a new portable preflight.
+linux_preflight_sha=""
+run_linux_preflight() {
+  local candidate dirty
+  candidate="$(git rev-parse HEAD)" || refuse "could not resolve the preflight SHA"
+  dirty="$(git status --porcelain)" || refuse "could not read worktree status before Linux preflight"
+  [[ -z "$dirty" ]] || refuse "dirty worktree before Linux preflight"
+  [[ "$linux_preflight_sha" != "$candidate" ]] || return 0
+  say "portable preflight on remote Linux for $candidate"
+  bash scripts/train-preflight.sh || refuse "remote Linux preflight failed; nothing was pushed (see output above)"
+  dirty="$(git status --porcelain)" || refuse "could not read worktree status after Linux preflight"
+  [[ "$(git rev-parse HEAD)" == "$candidate" && -z "$dirty" ]] || refuse "HEAD/worktree changed during Linux preflight"
+  linux_preflight_sha="$candidate"
+}
+run_linux_preflight
+
 # ---------------------------------------------------------------------------
 # First-run self-check: prove the trigger instead of believing the YAML
 # ---------------------------------------------------------------------------
@@ -802,6 +819,7 @@ if git rev-parse --verify -q "refs/remotes/$remote/$train_ref" >/dev/null; then
 fi
 
 push_train() {
+  run_linux_preflight
   push_private_history_guard "$head_sha"
   # Taken BEFORE the push, so the run it starts is created after this instant by
   # construction. The watch refuses any older run for the same sha -- see WATCH_CI_NOT_BEFORE

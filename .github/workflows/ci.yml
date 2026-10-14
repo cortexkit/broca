@@ -2,6 +2,7 @@ name: CI
 
 permissions:
   contents: read
+  actions: read
 
 on:
   push:
@@ -35,6 +36,231 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  fixtures:
+    uses: ./.github/workflows/fixtures.yml
+
+  lint:
+    name: Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+    defaults:
+      run:
+        working-directory: broca
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: broca -> target
+          shared-key: lint
+          cache-on-failure: 'true'
+      - name: fmt and clippy (same features as the tests)
+        run: |
+          source scripts/rust-test-gate.sh
+          run_phase fmt cargo fmt --all -- --check
+          run_phase clippy cargo clippy --locked --workspace --all-targets "${cargo_feature_args[@]}" -- -D warnings
+      - name: Verify clean worktree
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
+  scripts:
+    name: Operator scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Train preconditions
+        run: python3 scripts/check-train-preconditions.py
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: scripts
+          cache-on-failure: 'true'
+      # Dependency graph suites deliberately use --offline. Fetch their pinned
+      # sources here; an independent job cannot borrow another job's Cargo home.
+      - name: Prefetch locked dependencies for offline script checks
+        run: cargo fetch --locked
+      - name: Operator script suites and deploy/export self-tests
+        run: scripts/script-suites.sh
+      - name: Verify clean worktree
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
+  integration-build:
+    name: Archive (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+    defaults:
+      run:
+        working-directory: broca
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: taiki-e/install-action@2eb6de229bc778f7df20e106e4b34e9a364c73e6 # nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cargo-cache
+        with:
+          workspaces: broca -> target
+          shared-key: archive
+          cache-on-failure: 'true'
+      - name: Compile and compare independent integration inventories
+        env:
+          NEXTEST_PROFILE: ci
+        run: bash scripts/ci-integration.sh build "$RUNNER_TEMP/integration.tar.zst"
+      - name: Cargo cache telemetry
+        run: echo "Archive cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-${{ matrix.os }}
+          path: ${{ runner.temp }}/integration.tar.zst
+          compression-level: 0
+          retention-days: 3
+      - name: Verify clean worktree
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
+  integration:
+    name: Integration (${{ matrix.os }} ${{ matrix.shard }}/4)
+    # Prepare consumers alongside producers; each shard waits only for its own
+    # platform's artifacts, not the other platform's matrix jobs or cache saves.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+        include:
+          - os: ubuntu
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+        os: [ubuntu, windows]
+    defaults:
+      run:
+        working-directory: broca
+        shell: bash
+    env:
+      BROCA_REQUIRE_SUBC: '1'
+      BROCA_REQUIRE_AIMOCK: '1'
+      BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
+      SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ matrix.os == 'windows' && '.exe' || '' }}
+      FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub${{ matrix.os == 'windows' && '.exe' || '' }}
+      CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-claustrum', github.workspace) || '' }}
+      CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-auth', github.workspace) || '' }}
+      CK_CLAUSTRUM_CHECKOUT: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/claustrum', github.workspace) || '' }}
+      NEXTEST_TEST_THREADS: num-cpus
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: taiki-e/install-action@2eb6de229bc778f7df20e106e4b34e9a364c73e6 # nextest
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Wait for this platform's fixtures and test archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/wait-ci-artifacts.py "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fixtures-${{ runner.os }}
+          path: ${{ runner.temp }}/fixtures
+      - run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" "$GITHUB_WORKSPACE"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: integration-${{ matrix.os }}
+          path: ${{ runner.temp }}/archive
+      - name: Replay integration shard from archive (no compilation)
+        run: bash scripts/ci-integration.sh run "$RUNNER_TEMP/archive/integration.tar.zst" "${{ matrix.shard }}/4"
+      - name: Verify clean worktree
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
+  linux-deploy:
+    name: Real Linux ELF deployment
+    needs: fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: broca
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: broca -> target
+          shared-key: release-deploy
+          cache-on-failure: 'true'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fixtures-Linux
+          path: ${{ runner.temp }}/fixtures
+      - run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-Linux.tar.gz" "$GITHUB_WORKSPACE"
+      - name: Real Linux ELF deployment under subc
+        env:
+          SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
+          BROCA_DEPLOY_TEST_BIN: ${{ github.workspace }}/broca/target/release/ck-broca
+          BROCA_REQUIRE_LINUX_DEPLOY: '1'
+        run: |
+          cargo build --release --locked -p broca-module-serve
+          python3 -B scripts/test-place-release-gate.py LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v
+      - name: Verify clean worktree
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
+  # Preserve the required status names, and refuse a skipped/red dependency.
+  test:
+    name: Test (${{ matrix.os }})
+    if: always()
+    needs: [lint, scripts, unit, integration-build, fixtures, integration, linux-deploy]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu, windows]
+    steps:
+      - name: Require every lane
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          lanes = json.loads(os.environ['NEEDS_JSON'])
+          print(f"Inspected {len(lanes)} required lanes: {lanes}")
+          if not lanes or any(lane['result'] != 'success' for lane in lanes.values()):
+              sys.exit('A required lane failed, was cancelled, or was skipped')
+          PY
+
   # Linux + Windows matrix. Windows is the load-bearing leg: the cfg(windows) paths
   # (e.g. the lease's ERROR_LOCK_VIOLATION contention check, the subc-binary .exe
   # suffix) cannot be exercised by local macOS/Linux development. macOS is intentionally
@@ -42,8 +268,9 @@ jobs:
   # + clippy) and macOS-vs-Linux divergence risk is low (both POSIX).
   #
   # Every job runs on GitHub-hosted runners.
-  test:
-    name: Test (${{ matrix.os }})
+  unit:
+    needs: fixtures
+    name: Lib/bin/doc (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -58,12 +285,6 @@ jobs:
       run:
         working-directory: broca
     steps:
-      # A GitHub-hosted Linux runner starts with roughly 14 GB free; the workspace's test
-      # build plus the daemon and vault fixtures need more. These preinstalled SDKs are unused.
-      - name: Free runner disk
-        if: matrix.os == 'ubuntu'
-        working-directory: /
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
 
       - name: Checkout broca
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -71,50 +292,12 @@ jobs:
           persist-credentials: false
           path: broca
 
-      # FIRST after checkout, and BEFORE the sibling checkouts, so trigger drift fails in
-      # seconds rather than after a full matrix build (ENGRAM's placement).
-      #
-      # ONE LEG ONLY, and that is not an optimisation. This asserts facts about a FILE, so its
-      # answer cannot differ by platform -- and on a Windows leg `pwsh` SOURCES a script rather
-      # than executing it and exits 0, so the step reports success having run nothing. That is
-      # the worse half of the trap: CKTUI hit the loud version (a red leg gets investigated)
-      # and QTA hit the green one, on the very check the fleet added to stop preconditions
-      # rotting unnoticed. `matrix.os` is a platform guard, not the path-dependent condition
-      # the checker itself forbids -- it is identical however the push arrived.
-      #
-      # The checker prints what it EXAMINED (branches, jobs, conditions) rather than a verdict,
-      # so a run that parsed nothing cannot print the same reassuring line as a healthy one.
-      # That denominator is what made the silent-pass visible: one summary line for two legs.
-      - name: Train preconditions
-        if: matrix.os == 'ubuntu'
-        run: python3 scripts/check-train-preconditions.py
 
-      # Sibling checkouts supply test rig binaries only. Linked fleet crates are
-      # resolved from exact registry releases or pinned git revisions.
-      - name: Checkout subconscious
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          repository: cortexkit/subconscious
-          path: subconscious
-
-      # The credential arms boot a real claustrum beside broca. Without this checkout they
-      # skip -- and a skipped test here reports PASS, so CI showed green on them at 0.007s,
-      # which is not enough time to spawn a daemon let alone a vault. They were dark for two
-      # days behind that PASS while a catalog change stopped them reaching credentials at all.
-      - name: Checkout claustrum
-        if: matrix.os == 'ubuntu'
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          repository: cortexkit/claustrum
-          path: claustrum
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
           components: clippy, rustfmt
 
-      - uses: taiki-e/install-action@2eb6de229bc778f7df20e106e4b34e9a364c73e6 # nextest tag
 
       # The provider-family e2e tests boot the pinned @copilotkit/aimock devDep (a
       # Node mock LLM server) from node_modules, which is gitignored. Without it the
@@ -128,133 +311,48 @@ jobs:
       - name: Install aimock (npm ci)
         run: npm ci
 
-      # The real-subc spine tests (dogfood, resume_spine, tool_fault_spine) spawn the
-      # subc-core daemon + fake-aft-stub as subprocesses. Both are bins in the sibling
-      # subc-core crate, so one build produces them; the rig probes
-      # ../../../subconscious/target/debug, which matches this checkout layout. Without
-      # this step the tests skip — and BROCA_REQUIRE_SUBC (set on the Rust gate step)
-      # turns that skip into a loud failure, so a future drop of this step can't silently
-      # zero the spine coverage while showing green.
-      - name: Build subc binaries (real-subc spine tests)
-        working-directory: subconscious
-        run: cargo build -p subc-core --bins
-
-      # Debug, not release: the rig's default path is release only because that is what a
-      # workstation has lying around, and CK_CLAUSTRUM_BIN/CK_AUTH_BIN below point at debug
-      # so CI pays a debug build instead of an optimised one it gains nothing from.
-      #
-      # Linux only, matching the deploy-gate self-test. The credential arms exercise the vault
-      # pause/resume path, which is not platform-specific, so one leg proves it -- and pinning
-      # a binary path per platform to gain nothing would just add a way for Windows to fail.
-      - name: Build claustrum binaries (credential e2e arms)
-        if: matrix.os == 'ubuntu'
-        working-directory: claustrum
-        run: cargo build -p credentials-module --bins
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fixtures-${{ runner.os }}
+          path: ${{ runner.temp }}/fixtures
+      - name: Unpack pinned fixtures
+        shell: bash
+        run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" "$GITHUB_WORKSPACE"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cargo-cache
+        with:
+          workspaces: broca -> target
+          shared-key: units
+          cache-on-failure: 'true'
+      - name: Cargo cache telemetry
+        shell: bash
+        run: echo "Unit cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check linked dependency sources
         run: python3 scripts/check-path-deps.py && python3 scripts/test-check-path-deps.py
         shell: bash
 
-      - name: Real Linux ELF deployment under subc
-        if: matrix.os == 'ubuntu'
-        timeout-minutes: 15
-        env:
-          SUBC_CORE_BIN: ${{ github.workspace }}/subconscious/target/debug/ck-subc
-          BROCA_DEPLOY_TEST_BIN: ${{ github.workspace }}/broca/target/release/ck-broca
-          BROCA_REQUIRE_LINUX_DEPLOY: "1"
-        run: |
-          cargo build --release --locked -p broca-module-serve
-          python3 -B scripts/test-place-release-gate.py LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v
-        shell: bash
-
-      - name: Check shared Anthropic policy dependencies
-        if: matrix.os == 'ubuntu'
-        run: python3 scripts/test-anthropic-policy-deps.py
-
-      - name: Rust test gate (live and test-clock, fmt, clippy, units, integrations, doctests)
-        # On GitHub's hosted Windows runner this step takes 24-29 minutes (build plus about
-        # 1,300 tests, measured over six green runs on 2026-10-10). The bound exists to stop a
-        # leaked child holding the output pipe open after the tests finish; a single stuck test
-        # is already terminated after five minutes by the nextest profile.
+      - name: Lib/bin tests and doctests (live and test-clock)
         timeout-minutes: 45
-        # The checked-in default nextest profile reserves two cores for local workstation
-        # headroom. CI runners are otherwise idle, so use every core here.
         env:
-          # Anti-masking guard: missing subc binaries MUST fail in CI rather than silently
-          # skipping the real-daemon spine suite.
           BROCA_REQUIRE_SUBC: "1"
-          # Anti-masking guard: missing aimock/node_modules MUST fail in CI rather than
-          # silently skipping the provider-family mock matrix.
           BROCA_REQUIRE_AIMOCK: "1"
-          # Anti-masking guard, and the reason the checkout above is worth its build time: a
-          # missing vault MUST fail here rather than skipping. Without this the credential
-          # arms report PASS in single-digit milliseconds, which is indistinguishable from
-          # having run -- the exact shape that hid them for two days.
           BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
-          CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/claustrum/target/debug/ck-claustrum', github.workspace) || '' }}
-          CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/claustrum/target/debug/ck-auth', github.workspace) || '' }}
-          NEXTEST_PROFILE: ci
-          NEXTEST_TEST_THREADS: num-cpus
-        run: ./scripts/rust-test-gate.sh
+          SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ runner.os == 'Windows' && '.exe' || '' }}
+          FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub${{ runner.os == 'Windows' && '.exe' || '' }}
+          CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-claustrum', github.workspace) || '' }}
+          CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-auth', github.workspace) || '' }}
+          CK_CLAUSTRUM_CHECKOUT: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/claustrum', github.workspace) || '' }}
         shell: bash
+        run: |
+          source scripts/rust-test-gate.sh
+          run_phase 'lib/bin tests' cargo test --locked --workspace --lib --bins --no-fail-fast "${cargo_feature_args[@]}" --quiet
+          doc_count="$(count_doc_tests)"
+          echo "doctests discovered: $doc_count"
+          if [[ "$doc_count" -gt 0 ]]; then
+            run_phase 'doctests' cargo test --locked --workspace --doc "${cargo_feature_args[@]}" --quiet
+          fi
 
-      # The deploy gate decides whether restarting broca would cut a live run. Its one failure
-      # mode is approving a restart that does, and the r104 fix -- refusing on an unreadable WAL
-      # rather than reading it as sealed -- is the guard against reaching that by a permission
-      # change or transient IO error.
-      #
-      # It carries a self-test and nothing ran it. A script exercised only by hand is checked
-      # exactly when someone remembers, which is not a schedule. Verified to DISCRIMINATE before
-      # being wired here: planting the r104 fail-open (return False for an unreadable WAL) turns
-      # `self-test passed` into `self-test FAILED ... must raise, not report a state`, exit 1.
-      #
-      # Linux only. The gate reads a POSIX state root and CI has no WAL tree; the self-test
-      # builds its own scratch files, so one platform proves the logic.
-      - name: Deploy-gate self-test
-        if: runner.os == 'Linux'
-        run: python3 scripts/live-runs.py --self-test
-        shell: bash
-
-      # audit-export-lane.py compares its terminal-state allowlist with broca-core in
-      # both directions. An omitted state could disable the audit for a whole database.
-      # The self-test reads source and an in-memory database, so one platform suffices.
-      - name: Export-lane enumeration self-test
-        if: runner.os == 'Linux'
-        run: python3 scripts/audit-export-lane.py --self-test
-        shell: bash
-
-      # SIX EXECUTABLE SCRIPT SUITES EXISTED AND NOTHING RAN ANY OF THEM. Found while fixing
-      # issue #20: they are run when someone remembers, which is the property their own
-      # docstrings argue against -- test-train-push.py exists precisely because the previous
-      # arms "proved the change once and could never prove it again", and an unrun suite has
-      # the same defect one level up.
-      #
-      # These guard operator tooling that touches SHARED STATE: the release seam another seat
-      # places from, the train lock, the WAL archive readers, a destructive re-key. A
-      # regression there is found by an operator mid-operation, which is the worst place.
-      #
-      # Linux only, and DELIBERATELY so for one of them: test-stage-release.py stubs `uname`
-      # rather than reading the host's, so it reproduces the macOS-only defect ON LINUX. A
-      # platform-specific bug whose arm only runs on that platform is an arm that cannot fail
-      # in CI; stubbing is what lets one runner prove both.
-      #
-      # test-watch-ci.py is NOT here on purpose: it needs network and an authenticated gh, and
-      # refuses loudly when unarmed rather than skipping. Wiring it would turn a correct
-      # refusal into a red build. Its hermetic sibling test-watch-ci-resolve.py IS here: it
-      # serves the run list from a fake gh and applies the script's own --jq with real jq.
-      - name: Operator script suites
-        if: runner.os == 'Linux'
-        shell: bash
-        # Python bytecode written by these suites would show up as untracked files and fail the
-        # clean-worktree check below. PYTHONDONTWRITEBYTECODE, unlike `python3 -B`, reaches
-        # suites that start Python themselves. It is not ignored in .gitignore, so that check
-        # still sees any other file a suite leaves.
-        #
-        # The list lives in scripts/script-suites.sh, which the local gate also runs, so a
-        # suite cannot pass locally and fail only here.
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: scripts/script-suites.sh
 
       # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
       # every run since the repo existed and nothing showed it COULD go red:

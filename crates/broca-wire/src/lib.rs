@@ -573,10 +573,13 @@ pub struct ReadParams {
     /// session's current one is refused `lineage_changed`, whatever its mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_id: Option<String>,
-    /// A byte cap on the page: serialized messages for transcript reads, serialized entries
-    /// (source plus message) for model reads. Absent means [`READ_DEFAULT_MAX_BYTES`]; a
-    /// value above [`READ_MAXIMUM_MAX_BYTES`] is capped to it. One oversized message or
-    /// replacement group is served whole rather than truncated.
+    /// A byte cap on the page. Transcript reads budget the complete serialized reply body,
+    /// with a default and maximum of 3 MiB (3,145,728 bytes); larger requests are capped to
+    /// [`READ_MAXIMUM_MAX_BYTES`]. Messages and late approvals share that budget, including all
+    /// metadata and continuation cursors. One message and one late entry, when present, are
+    /// kept whole; oversized atomic items or fixed metadata can therefore exceed the cap.
+    /// Model reads separately budget serialized entries (source plus message), currently with
+    /// a 4 MiB default and 16 MiB maximum, and serve replacement groups whole rather than truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
     /// Ask for the values a hook replaced on each message it changed. broca runs no hooks yet,

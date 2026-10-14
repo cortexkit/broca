@@ -12,24 +12,33 @@ cd "$(dirname "$0")/.."
 # Bytecode left in scripts/__pycache__ would trip CI's clean-worktree guard.
 export PYTHONDONTWRITEBYTECODE=1
 
-# Some suites read TOML with tomllib, which needs Python 3.11. macOS's system python3 is
-# older, so take the first interpreter on PATH that has it and refuse if none does.
+# Suites need Python 3.11+ (tomllib) and PyYAML (workflow parsing). macOS's system python3
+# is older, and Homebrew's has no PyYAML, so an operator venv is tried first. Take the first
+# interpreter that has both, and refuse with the remedy if none does.
 PY=""
-for candidate in python3 python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3; do
-    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import tomllib' 2>/dev/null; then
+suites_venv="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/broca/py-suites"
+for candidate in "${BROCA_SUITES_PYTHON:-}" "$suites_venv/bin/python3" \
+    python3 python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3; do
+    [[ -n $candidate ]] || continue
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import tomllib, yaml' 2>/dev/null; then
         PY=$(command -v "$candidate")
         break
     fi
 done
 if [[ -z $PY ]]; then
-    echo "script-suites: no Python 3.11+ (tomllib) found on PATH; install one or put it first" >&2
+    echo "script-suites: no Python 3.11+ with PyYAML found. Create one with:" >&2
+    echo "  python3.11+ -m venv $suites_venv && $suites_venv/bin/pip install PyYAML" >&2
+    echo "or set BROCA_SUITES_PYTHON to an interpreter that has tomllib and yaml." >&2
     exit 2
 fi
 # A temporary python3 link to the interpreter chosen above goes first on PATH, so a suite
 # that starts "python3" itself runs under that same interpreter.
 PY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/broca-suites-python.XXXXXX")
 trap 'rm -rf "$PY_DIR"' EXIT
-ln -s "$PY" "$PY_DIR/python3"
+# A wrapper that execs the interpreter, not a symlink: a venv's Python finds its
+# site-packages relative to the path it was started from, so a symlink elsewhere drops them.
+printf '#!/bin/sh\nexec "%s" "$@"\n' "$PY" > "$PY_DIR/python3"
+chmod +x "$PY_DIR/python3"
 export PATH="$PY_DIR:$PATH"
 echo "script-suites: $(python3 --version) at $PY"
 
@@ -37,11 +46,13 @@ suites=(
     scripts/test-check-path-deps.py
     scripts/test-anthropic-policy-deps.py
     scripts/test-stage-release.py
+    scripts/test-release.py
     scripts/test-prune-staging.py
     # Stubs codesign, file, stat, ps and lsof, so the placement gate's macOS-only signing
     # checks also run on a Linux runner.
     scripts/test-place-release-gate.py
     scripts/test-train-push.py
+    scripts/test-train-preflight.py
     scripts/test-watch-ci-resolve.py
     scripts/test-archive-read.py
     scripts/test-wal-archive-instruments.py
@@ -56,6 +67,7 @@ suites=(
     scripts/test-state-root.py
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.
     scripts/test-gate-phases.py
+    scripts/test-ci-pipeline.py
     scripts/test-gated-commit.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py
@@ -63,6 +75,8 @@ suites=(
     # Keep Tokio test clocks dev-only and the live transport stack out of non-live graphs.
     scripts/test-dependency-features.py
     scripts/tests/test_clock_safety.py
+    # Vendored Cingulate consent contract: checksums, pins and broca's mapping.
+    crates/broca-subc/tests/fixtures/consent/verify.py
 )
 
 # A rename must not quietly shrink this to a no-op that keeps passing.

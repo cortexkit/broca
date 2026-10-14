@@ -20,12 +20,13 @@
 # full sha, and REFUSE with exit 2 when the result set is empty — because "no runs" and "the
 # query did not match" are the same output and only one of them is safe to act on.
 #
-# Usage: ci-status.sh [<commit-ish>]      default HEAD
+# Usage: ci-status.sh [<commit-ish> [required-workflow-name ...]]  default HEAD
 # Exit 0 all runs concluded success · 1 a run failed or is still going · 2 cannot compare.
 
 set -euo pipefail
 
 REF="${1:-HEAD}"
+if [[ "$#" -gt 0 ]]; then shift; fi
 
 command -v gh >/dev/null 2>&1 || {
   echo "ci-status: gh not on PATH -- cannot compare" >&2
@@ -41,7 +42,7 @@ fi
 # ever attached to one. That form returns an empty set for a release that CI passed.
 
 RUN_LIMIT=100
-RUNS="$(gh run list --commit "$FULL" --limit "$RUN_LIMIT" --json conclusion,status,name,databaseId 2>/dev/null || true)"
+RUNS="$(gh run list --commit "$FULL" --limit "$RUN_LIMIT" --json conclusion,status,name,databaseId,headSha 2>/dev/null || true)"
 if [ -z "$RUNS" ]; then
   echo "ci-status: gh returned nothing for ${FULL:0:12} -- cannot compare" >&2
   exit 2
@@ -73,7 +74,7 @@ RUNS_FILE="$(mktemp)"
 trap 'rm -f "$RUNS_FILE"' EXIT
 printf '%s' "$RUNS" > "$RUNS_FILE"
 
-python3 - "$FULL" "$RUNS_FILE" <<'PY'
+python3 - "$FULL" "$RUNS_FILE" "$@" <<'PY'
 import json, sys
 full = sys.argv[1]
 with open(sys.argv[2]) as fh:
@@ -89,6 +90,14 @@ if not runs:
     raise SystemExit(2)
 
 print(f"    commit {full[:12]}   runs {len(runs)}")
+# A green unrelated workflow cannot stand in for a missing required workflow.
+missing = set(sys.argv[3:]) - {r.get("name") for r in runs}
+if missing:
+    print("ci-status: missing required workflows: " + ", ".join(sorted(missing)), file=sys.stderr)
+    raise SystemExit(2)
+if any(r.get("headSha") != full for r in runs):
+    print("ci-status: a returned run names a different commit -- cannot compare", file=sys.stderr)
+    raise SystemExit(2)
 bad = []
 for r in runs:
     concl = r.get("conclusion") or "-"

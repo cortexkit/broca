@@ -19,11 +19,19 @@ Two optional, additive fields page that separate stream:
 - Response **`next_late_after`**: when more late entries remain, pass this value
   as the next request's `late_after`. The last page omits it.
 
-Each late entry is atomic and counted by its complete serialized wire size
-against `max_bytes`. A single entry larger than the cap is returned whole,
+Transcript reads budget the **complete serialized reply body** against `max_bytes`,
+including messages, late entries, tools, attribution, metadata and continuation
+cursors. The default and maximum are both **3 MiB (3,145,728 bytes)**; larger
+requests are capped to that maximum. Late entries share the message page's budget.
+Each late entry is atomic. A single entry larger than the cap is returned whole,
 **alone on its late page**; it is never truncated or dropped. The call-key order
 is stable for a durable snapshot. New late records are observed by a new default
 read; this is not a permanently pinned multi-request snapshot.
+
+A nonempty page keeps at least one message and, when reporting late entries, one
+late entry. Oversized atomic items, their combined minimum, or unpaged metadata
+can still exceed the budget. `run.result` is unpaged and returns the final text
+whole; the read budget does not bound it.
 
 An unavailable cursor (including one removed by retention) is refused as a typed
 `invalid_params` body with `detail.field: "late_after"`, not answered as an empty
