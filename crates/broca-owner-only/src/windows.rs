@@ -12,8 +12,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
+        ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     },
     Security::{
         AddAccessAllowedAceEx,
@@ -34,6 +34,14 @@ use windows_sys::Win32::{
         FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        JobObjects::IsProcessInJob,
+        Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    },
 };
 
 // Win32's simple access-allowed ACE header type (winnt.h).
@@ -48,6 +56,78 @@ impl Drop for Handle {
         }
     }
 }
+
+pub(super) fn process_snapshot() -> io::Result<Vec<crate::test_support::ProcessDetails>> {
+    // SAFETY: Toolhelp accepts a process-snapshot flag and no caller-owned pointers.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        // SAFETY: GetLastError reads the calling thread's last Win32 error.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ));
+    }
+    let _snapshot = Handle(snapshot);
+
+    // SAFETY: PROCESSENTRY32W is a plain Win32 output structure; dwSize is set below.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: snapshot is a live Toolhelp process snapshot and entry is writable.
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        // SAFETY: GetLastError reads the calling thread's last Win32 error.
+        let error = unsafe { GetLastError() };
+        if error == ERROR_NO_MORE_FILES {
+            return Ok(Vec::new());
+        }
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+
+    let mut processes = Vec::new();
+    loop {
+        let image_end = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        processes.push(crate::test_support::ProcessDetails {
+            image: String::from_utf16_lossy(&entry.szExeFile[..image_end]),
+            pid: entry.th32ProcessID,
+            parent_pid: entry.th32ParentProcessID,
+        });
+        // SAFETY: snapshot is a live Toolhelp process snapshot and entry is writable.
+        if unsafe { Process32NextW(snapshot, &mut entry) } != 0 {
+            continue;
+        }
+        // SAFETY: GetLastError reads the calling thread's last Win32 error.
+        let error = unsafe { GetLastError() };
+        if error == ERROR_NO_MORE_FILES {
+            break;
+        }
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    Ok(processes)
+}
+
+pub(super) fn process_is_in_job(pid: u32) -> io::Result<bool> {
+    // SAFETY: OpenProcess receives a PID and requests read-only process query access.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        // SAFETY: GetLastError reads the calling thread's last Win32 error.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ));
+    }
+    let process = Handle(process);
+    let mut in_job = 0;
+    // SAFETY: process is a live handle and in_job is a writable BOOL output.
+    if unsafe { IsProcessInJob(process.0, null_mut(), &mut in_job) } == 0 {
+        // SAFETY: GetLastError reads the calling thread's last Win32 error.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ));
+    }
+    Ok(in_job != 0)
+}
+
 struct Descriptor(*mut std::ffi::c_void);
 impl Drop for Descriptor {
     fn drop(&mut self) {

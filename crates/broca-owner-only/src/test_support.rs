@@ -1,10 +1,30 @@
-//! Native Windows fixtures. PowerShell reads ACLs independently of the production validator.
+//! Native Windows fixtures and process inspection for test diagnostics.
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessDetails {
+    /// Executable image name captured from the Toolhelp snapshot.
+    pub image: String,
+    /// Process identifier from the snapshot.
+    pub pid: u32,
+    /// Parent process identifier from the snapshot.
+    pub parent_pid: u32,
+}
+
+/// Read one process snapshot with image names and parent process identifiers.
+pub fn process_snapshot() -> std::io::Result<Vec<ProcessDetails>> {
+    crate::windows::process_snapshot()
+}
+
+/// Report whether a process belongs to any Windows job object.
+pub fn process_is_in_job(pid: u32) -> std::io::Result<bool> {
+    crate::windows::process_is_in_job(pid)
+}
 
 fn powershell(path: &Path, script: &str) -> String {
     let quoted = path.to_string_lossy().replace('\'', "''");

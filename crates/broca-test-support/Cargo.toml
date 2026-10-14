@@ -9,7 +9,7 @@ description = "Test-only helpers for the broca workspace: one owned, self-reclai
 publish = false
 
 [target.'cfg(windows)'.dependencies]
-broca-owner-only.workspace = true
+broca-owner-only = { workspace = true, features = ["test-support"] }
 
 [dependencies]
 sha2.workspace = true
