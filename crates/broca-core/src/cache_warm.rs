@@ -88,6 +88,13 @@ impl CacheClock {
         Self::default()
     }
 
+    /// Whether another handle currently shares this clock. A cache table may
+    /// discard a table-only clock while holding the lock that protects cloning
+    /// its entries; shared clocks must remain discoverable while owners update them.
+    pub fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
     /// A request started sending at `sent_at_ms`. The clock never moves backwards, so a slow
     /// attempt that reports late cannot undo a later send.
     pub fn note_sent(&self, sent_at_ms: u64, ttl_ms: Option<u64>) {

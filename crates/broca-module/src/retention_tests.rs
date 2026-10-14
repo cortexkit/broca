@@ -62,13 +62,16 @@ impl Rig {
         }
     }
     fn seed(&self, seconds: u64, start: u64, finish: Option<u64>) -> String {
+        self.seed_run("r1", seconds, start, finish)
+    }
+    fn seed_run(&self, run: &str, seconds: u64, start: u64, finish: Option<u64>) -> String {
         let _lease = self.service.lease(&self.key).unwrap();
         let mut wal = self
             .service
             .wal
             .open_with_retention(&self.key, Some(seconds))
             .unwrap();
-        wal.append(1, &started(&self.key, "r1", Some(seconds), start), true)
+        wal.append(1, &started(&self.key, run, Some(seconds), start), true)
             .unwrap();
         if let Some(ts) = finish {
             wal.append(1, &finished(ts), true).unwrap();
@@ -3669,4 +3672,135 @@ fn migration_sidecars_prevent_retention_deletion_and_boot_enrollment() {
     assert!(rig.service.delete_expired(&rig.key, 1200).is_err());
     assert_eq!(std::fs::read(&retained).unwrap(), before);
     assert!(portable.with_extension("moving").exists());
+}
+
+#[tokio::test]
+async fn sweep_handles_listed_wal_disappearance_and_enrolls_later_keys() {
+    let mut rig = Rig::new();
+    let mut keys = Vec::new();
+    for name in ["a", "b", "c"] {
+        rig.key = BindIdentity::new(rig.root.join("project"), "runner", name);
+        rig.seed_run(name, 1, 100, Some(200));
+        keys.push(rig.key.clone());
+    }
+    let removed = Arc::new(Mutex::new(None));
+    *rig.service.before_enroll.lock().unwrap() = Some(Arc::new({
+        let removed = removed.clone();
+        move |path| {
+            let mut removed = removed.lock().unwrap();
+            if removed.is_none() {
+                fs::remove_file(path).unwrap();
+                *removed = Some(path.to_owned());
+            }
+        }
+    }));
+    assert_eq!(rig.registry(None).sweep_once(1200).await.unwrap(), 2);
+    let removed = removed.lock().unwrap().clone().unwrap();
+    for key in keys {
+        let path = rig.service.wal.ephemeral_wal_path(&key);
+        assert!(!path.exists());
+        if path != removed {
+            assert!(rig.service.tombstones(&key).unwrap()[0]
+                .completed_at_ms
+                .is_some());
+        }
+    }
+    assert_eq!(rig.service.unreadable_sessions(), 0);
+}
+
+#[test]
+fn deletion_recovery_isolates_persistent_bad_tombstone_and_evicts_good_keys() {
+    let mut rig = Rig::new();
+    let mut keys = Vec::new();
+    for name in ["a", "b", "c"] {
+        rig.key = BindIdentity::new(rig.root.join("project"), "runner", name);
+        let id = rig.seed_run(name, 1, 100, Some(200));
+        rig.service
+            .write_tombstone(
+                &rig.key,
+                &Tombstone {
+                    lineage_id: id.clone(),
+                    expired_at_ms: 1200,
+                    seq: 1,
+                    completed_at_ms: None,
+                },
+            )
+            .unwrap();
+        if name == "b" {
+            fs::write(
+                rig.service.wal.tombstone_path(&rig.key, &id),
+                b"bad tombstone",
+            )
+            .unwrap();
+        }
+        keys.push(rig.key.clone());
+    }
+    let evicted = Arc::new(Mutex::new(Vec::new()));
+    rig.service.set_evictor(Arc::new({
+        let evicted = evicted.clone();
+        move |key| evicted.lock().unwrap().push(key.clone())
+    }));
+    let completed = rig.service.resume_deletions(1200).unwrap();
+    assert_eq!(completed.len(), 2);
+    for key in [&keys[0], &keys[2]] {
+        assert!(completed.contains(key));
+        assert!(evicted.lock().unwrap().contains(key));
+        assert!(!rig.service.wal.ephemeral_wal_path(key).exists());
+        assert!(rig.service.tombstones(key).unwrap()[0]
+            .completed_at_ms
+            .is_some());
+    }
+    assert!(rig.service.wal.ephemeral_wal_path(&keys[1]).exists());
+    assert!(!evicted.lock().unwrap().contains(&keys[1]));
+    assert!(rig.service.resume_deletions(1200).unwrap().is_empty());
+}
+
+#[cfg(feature = "test-clock")]
+#[test]
+fn successful_export_discovery_does_not_query_fallback_before_tombstone() {
+    struct RunsUnavailable(Arc<SqliteStore>);
+    impl RetentionIndex for RunsUnavailable {
+        fn live(&self, key: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+            RetentionIndex::live(self.0.as_ref(), key)
+        }
+        fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+            RetentionIndex::lineage(self.0.as_ref(), id)
+        }
+        fn runs(&self, _: &str) -> Result<Vec<RetentionRunRow>, String> {
+            Err("fallback unavailable".into())
+        }
+        fn candidates(&self, now: u64) -> Result<Vec<RetentionLineageRow>, String> {
+            RetentionIndex::candidates(self.0.as_ref(), now)
+        }
+        fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+            RetentionIndex::run(self.0.as_ref(), id)
+        }
+        fn upsert(
+            &self,
+            row: &RetentionLineageRow,
+            runs: &[RetentionRunRow],
+        ) -> Result<(), String> {
+            RetentionIndex::upsert(self.0.as_ref(), row, runs)
+        }
+    }
+    let mut rig = Rig::new();
+    let id = rig.seed(1, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    refuse_retention_reader(&mut rig);
+    rig.service = Arc::new(
+        RetentionService::new(
+            rig.service.wal.clone(),
+            Arc::new(RunsUnavailable(rig.store.clone())),
+            rig.leases.clone(),
+            rig.store.clone(),
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+        )
+        .unwrap(),
+    );
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    // Deletion completion needs indexed runs when the WAL is unreadable. But a
+    // successful export-discovery query needs no fallback run-index query: an
+    // unavailable fallback must not prevent the deletion tombstone from being written.
+    assert!(rig.service.delete_expired(&rig.key, 1200).is_err());
+    assert!(rig.service.wal.tombstone_path(&rig.key, &id).exists());
 }

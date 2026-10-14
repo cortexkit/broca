@@ -338,7 +338,12 @@ pub struct RetentionService {
     acquire: Arc<AcquireLease>,
     export: Arc<dyn broca_core::ExportIndex>,
     resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
+    #[cfg(test)]
+    before_enroll: Mutex<Option<Arc<EnrollmentHook>>>,
 }
+
+#[cfg(test)]
+type EnrollmentHook = dyn Fn(&Path) + Send + Sync;
 
 impl RetentionService {
     pub fn new<L: LeaseStore + 'static>(
@@ -354,6 +359,8 @@ impl RetentionService {
             withdrawal_wake: tokio::sync::Notify::new(),
             evict: std::sync::OnceLock::new(),
             unreadable: Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            before_enroll: Mutex::new(None),
             wal,
             index,
             clock,
@@ -386,9 +393,12 @@ impl RetentionService {
         for entry in entries {
             let path = entry.map_err(|e| e.to_string())?.path();
             if path.is_file() && path.extension().is_none() {
-                let stone: Tombstone =
-                    serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())?;
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let stone: Tombstone = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
                 if path.file_name().and_then(|s| s.to_str()) != Some(&stone.lineage_id) {
                     return Err("tombstone identity mismatch".into());
                 }
@@ -588,18 +598,16 @@ impl RetentionService {
             let Ok(_lease) = self.lease(&key) else {
                 continue;
             };
-            if let Err(error) = self.rederive(&key) {
-                let path = self
-                    .wal
-                    .resolve_live_path(&key)
-                    .map_err(|e| e.to_string())?;
+            if self.rederive(&key).is_err() {
+                let path = self.wal.resolve_live_path(&key).ok().flatten();
                 if let Some(path) = path.filter(|path| self.read_path(path).is_err()) {
                     if self.current_indexed(&key, &path, None).is_err() {
                         self.mark_unreadable(&key);
                     }
                     continue;
                 }
-                return Err(error);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(&key),
+                    "discovery repair deferred");
             }
         }
         Ok(())
@@ -654,69 +662,85 @@ impl RetentionService {
     pub fn enroll(&self) -> Result<usize, String> {
         let mut replayed = 0;
         for path in self.ephemeral_files("wal")? {
-            let portable = self
-                .wal
-                .root()
-                .join(path.file_name().ok_or("retention WAL filename")?);
-            if portable
-                .with_extension("moving")
-                .try_exists()
-                .map_err(|e| e.to_string())?
-                || portable
-                    .with_extension("moved")
-                    .try_exists()
-                    .map_err(|e| e.to_string())?
-            {
-                continue;
+            #[cfg(test)]
+            if let Some(hook) = self.before_enroll.lock().unwrap().as_ref() {
+                hook(&path);
             }
-            // The hashed address is not reversible. New writers leave a content-free identity
-            // sidecar; older WALs without one need replay to discover their session.
-            let (first, discovered) = match self.read_first_session(&path) {
-                Ok(found) => found,
+            match self.enroll_path(&path) {
+                Ok(true) => replayed += 1,
+                Ok(false) => {}
                 Err(_) => {
-                    self.mark_unreadable_address(
-                        path.file_stem()
-                            .ok_or("retention address missing")?
-                            .to_string_lossy()
-                            .into(),
-                    );
-                    continue;
-                }
-            };
-            let Some(key) = first else { continue };
-            if self.wal.check_move(&key, true).is_err() {
-                continue;
-            }
-            let bytes = fs::metadata(&path).map_err(|e| e.to_string())?.len();
-            let matching = self
-                .index
-                .live(&key)?
-                .is_some_and(|row| row.wal_bytes == bytes);
-            if matching && !discovered {
-                continue;
-            }
-            let _lease = match self.lease(&key) {
-                Ok(lease) => lease,
-                Err(_) => {
-                    tracing::warn!(target: "retention", "enrollment lease held; retry on sweep");
-                    continue;
-                }
-            };
-            if discovered {
-                self.remember_session(&key)?;
-            }
-            if !matching {
-                if let Err(error) = self.rederive(&key) {
-                    if self.read_path(&path).is_err() {
-                        self.mark_unreadable(&key);
-                        continue;
-                    }
-                    return Err(error);
+                    tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                        "enrollment deferred");
                 }
             }
-            replayed += 1;
         }
         Ok(replayed)
+    }
+
+    fn enroll_path(&self, path: &Path) -> Result<bool, String> {
+        let bytes = match fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        let portable = self
+            .wal
+            .root()
+            .join(path.file_name().ok_or("retention WAL filename")?);
+        if portable
+            .with_extension("moving")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+            || portable
+                .with_extension("moved")
+                .try_exists()
+                .map_err(|e| e.to_string())?
+        {
+            return Ok(false);
+        }
+        // The hashed address is not reversible. Writers leave a content-free identity
+        // sidecar; older WALs without one need replay to discover their session.
+        let (first, discovered) = match self.read_first_session(path) {
+            Ok(found) => found,
+            Err(error) => {
+                if path.try_exists().is_ok_and(|exists| !exists) {
+                    return Ok(false);
+                }
+                self.mark_unreadable_address(
+                    path.file_stem()
+                        .ok_or("retention address missing")?
+                        .to_string_lossy()
+                        .into(),
+                );
+                return Err(error);
+            }
+        };
+        let Some(key) = first else { return Ok(false) };
+        self.wal.check_move(&key, true).map_err(|e| e.to_string())?;
+        let matching = self
+            .index
+            .live(&key)?
+            .is_some_and(|row| row.wal_bytes == bytes);
+        if matching && !discovered {
+            return Ok(false);
+        }
+        let _lease = self.lease(&key)?;
+        if discovered {
+            self.remember_session(&key)?;
+        }
+        if !matching {
+            if let Err(error) = self.rederive(&key) {
+                if path.try_exists().is_ok_and(|exists| !exists) {
+                    return Ok(false);
+                }
+                if self.read_path(path).is_err() {
+                    self.mark_unreadable(&key);
+                }
+                return Err(error);
+            }
+        }
+        Ok(true)
     }
 
     fn ephemeral_files(&self, extension: &str) -> Result<Vec<PathBuf>, String> {
@@ -843,22 +867,21 @@ impl RetentionService {
                 }
             }
         } else {
-            failed_exports = self
-                .export
-                .missing_terminal_runs()
-                .map(|runs| {
-                    runs.into_iter()
-                        .filter(|run| run.session == *key)
-                        .map(|run| run.run_id.0)
-                        .collect()
-                })
-                .unwrap_or(
-                    self.index
-                        .runs(&id)?
-                        .into_iter()
-                        .map(|run| run.run.run_id)
-                        .collect(),
-                );
+            let discovered = self.export.missing_terminal_runs().map(|runs| {
+                runs.into_iter()
+                    .filter(|run| run.session == *key)
+                    .map(|run| run.run_id.0)
+                    .collect()
+            });
+            failed_exports = match discovered {
+                Ok(runs) => runs,
+                Err(_) => self
+                    .index
+                    .runs(&id)?
+                    .into_iter()
+                    .map(|run| run.run.run_id)
+                    .collect(),
+            };
         }
         if !failed_exports.is_empty() {
             // Retry billing facts normally emitted at run completion, but delete expired
@@ -998,41 +1021,58 @@ impl RetentionService {
         Ok(())
     }
 
-    /// Finish incomplete tombstones before accepting requests. Addresses whose leases
-    /// another process holds are retried by the sweep.
+    /// Finish incomplete tombstones, retrying failed keys on later sweeps without
+    /// preventing unrelated sessions from completing their deletion.
     pub fn resume_deletions(&self, now_ms: u64) -> Result<Vec<BindIdentity>, String> {
         let mut completed = Vec::new();
         for key in self.known_sessions()? {
-            let stones = self.tombstones(&key)?;
-            if stones.iter().all(|s| s.completed_at_ms.is_some()) {
-                continue;
-            }
-            let _lease = match self.lease(&key) {
-                Ok(lease) => lease,
-                Err(_) => {
-                    tracing::warn!(target: "retention", "deletion recovery lease held");
-                    continue;
+            let result = (|| {
+                let stones = self.tombstones(&key)?;
+                if stones.iter().all(|s| s.completed_at_ms.is_some()) {
+                    return Ok(false);
                 }
-            };
-            for stone in stones.into_iter().filter(|s| s.completed_at_ms.is_none()) {
-                self.complete(&key, stone, now_ms)?;
+                let _lease = self.lease(&key)?;
+                for stone in stones.into_iter().filter(|s| s.completed_at_ms.is_none()) {
+                    self.complete(&key, stone, now_ms)?;
+                }
+                Ok::<_, String>(true)
+            })();
+            match result {
+                Ok(true) => completed.push(key),
+                Ok(false) => {}
+                Err(_) => {
+                    tracing::warn!(target: "retention", session = %broca_core::session_addr(&key),
+                    "deletion recovery deferred")
+                }
             }
-            completed.push(key);
         }
         Ok(completed)
     }
 
     fn known_sessions(&self) -> Result<Vec<BindIdentity>, String> {
-        let mut sessions = self
-            .ephemeral_files("session")?
-            .into_iter()
-            .map(|path| {
-                serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())
-            })
-            .collect::<Result<std::collections::HashSet<BindIdentity>, String>>()?;
-        // After deletion there is no session sidecar. Durable identity-only rows still
-        // discover an interrupted tombstone completion without needing any transcript.
+        let mut sessions = std::collections::HashSet::new();
+        for path in self.ephemeral_files("session")? {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                        "session discovery deferred");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<BindIdentity>(&bytes) {
+                Ok(key) => {
+                    sessions.insert(key);
+                }
+                Err(_) => {
+                    tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                    "session discovery deferred")
+                }
+            }
+        }
+        // Durable identity-only rows discover interrupted tombstone completion even
+        // after deletion has removed the content-free sidecar.
         sessions.extend(self.index.retained_sessions()?);
         Ok(sessions.into_iter().collect())
     }
