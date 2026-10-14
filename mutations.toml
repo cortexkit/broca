@@ -9761,3 +9761,39 @@ expect_red = ["endpoint_connect_tests::ipv6_endpoint_connects_after_failed_first
 file = "crates/broca-module-serve/src/main.rs"
 old = '            .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),'
 new = '            .take(1).map(|endpoint| (endpoint.host.as_str(), endpoint.port)), // NON-VACUITY BREAK'
+
+[[control]]
+id = "websocket-idle-keepalives"
+guards = "257 acknowledged idle Pings cannot block the next response.create on a retained socket"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::pump_tests::idle_ping_gap_does_not_block_next_response_create"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '                    if !*activity.borrow_and_update() { continue; }'
+new = '                    if false { continue; } // NON-VACUITY BREAK'
+
+[[control]]
+id = "websocket-completed-keepalive-unblocks"
+guards = "Completion interrupts a keepalive send blocked on the receive queue"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::pump_tests::completed_attempt_interrupts_congested_keepalive_delivery"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '                        _ = activity.changed() => continue,'
+new = '                        _ = std::future::pending::<()>() => continue, // NON-VACUITY BREAK'
+
+[[control]]
+id = "websocket-attempt-activity-retires"
+guards = "The production attempt driver retires keepalive consumption after response.completed"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::pump_tests::idle_ping_gap_does_not_block_next_response_create"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '        self.0.send_replace(false);'
+new = '        self.0.send_replace(true); // NON-VACUITY BREAK'

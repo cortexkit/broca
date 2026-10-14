@@ -193,6 +193,22 @@ struct Socket {
     generation: u64,
     established_at: Instant,
     last_completed_at: Mutex<Option<Instant>>,
+    attempt_active: tokio::sync::watch::Sender<bool>,
+}
+
+struct AttemptActivity(tokio::sync::watch::Sender<bool>);
+
+impl AttemptActivity {
+    fn begin(socket: &Socket) -> Self {
+        socket.attempt_active.send_replace(true);
+        Self(socket.attempt_active.clone())
+    }
+}
+
+impl Drop for AttemptActivity {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
 }
 
 async fn connect(
@@ -250,6 +266,7 @@ async fn connect(
     let shutdown = CancellationToken::new();
     let closed = Arc::new(AtomicBool::new(false));
     let close_code = Arc::new(AtomicU16::new(0));
+    let (attempt_active, activity) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         send,
         recv: tokio::sync::Mutex::new(recv),
@@ -260,8 +277,11 @@ async fn connect(
         generation,
         established_at: established_at + connecting_at.elapsed(),
         last_completed_at: Mutex::new(None),
+        attempt_active,
     });
-    spawn_pump(stream, commands, messages, shutdown, closed, close_code);
+    spawn_pump(
+        stream, commands, messages, shutdown, closed, close_code, activity,
+    );
     Ok((socket, turn_state))
 }
 
@@ -272,6 +292,7 @@ fn spawn_pump<S>(
     shutdown: CancellationToken,
     closed: Arc<AtomicBool>,
     close_code: Arc<AtomicU16>,
+    mut activity: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -330,6 +351,18 @@ where
                     )),
                 };
                 let failed = record.is_err();
+                if record.as_ref().is_ok_and(Vec::is_empty) {
+                    // Keepalives refresh an active attempt's idle window, but have no consumer
+                    // between attempts. Dropping them there keeps the next send command runnable.
+                    if !*activity.borrow_and_update() { continue; }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        _ = activity.changed() => continue,
+                        result = messages.send(record) => if result.is_err() { break },
+                    }
+                    continue;
+                }
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     result = messages.send(record) => if result.is_err() { break },
@@ -474,6 +507,7 @@ async fn drive_socket(
     trace.websocket_close_code = Some(Arc::clone(&socket.close_code));
     trace.sent_at_ms = Some(now_millis());
     trace.sent_at = Some(std::time::Instant::now());
+    let _activity = AttemptActivity::begin(&socket);
     let (result, receive) = oneshot::channel();
     let sent = tokio::time::timeout(STREAM_IDLE_TIMEOUT, async {
         socket
@@ -652,6 +686,7 @@ pub(super) fn frame_record(raw: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod pump_tests {
     use super::*;
+    use crate::wire::HttpMethod;
 
     #[tokio::test(start_paused = true)]
     async fn cancel_interrupts_a_blocked_socket_write() {
@@ -673,6 +708,7 @@ mod pump_tests {
             shutdown.clone(),
             Arc::clone(&closed),
             Arc::new(AtomicU16::new(0)),
+            tokio::sync::watch::channel(false).1,
         );
         let (result, mut receive) = oneshot::channel();
         send.send(SendCommand {
@@ -696,5 +732,189 @@ mod pump_tests {
             "cancel must interrupt the write, not wait for the peer to read"
         );
         assert!(closed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_ping_gap_does_not_block_next_response_create() {
+        use crate::families::{openai_responses_chatgpt_frozen_config, OpenAiResponsesChatgpt};
+        let (io, peer) = tokio::io::duplex(4096);
+        let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer,
+            tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (send, commands) = mpsc::channel(1);
+        let (messages, records) = mpsc::channel(256);
+        let shutdown = CancellationToken::new();
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_code = Arc::new(AtomicU16::new(0));
+        let (attempt_active, activity) = tokio::sync::watch::channel(false);
+        let socket = Arc::new(Socket {
+            send,
+            recv: tokio::sync::Mutex::new(records),
+            shutdown: shutdown.clone(),
+            closed: Arc::clone(&closed),
+            close_code: Arc::clone(&close_code),
+            headers: Vec::new(),
+            generation: 1,
+            established_at: Instant::now(),
+            last_completed_at: Mutex::new(None),
+            attempt_active,
+        });
+        let task = spawn_pump(
+            stream,
+            commands,
+            messages,
+            shutdown.clone(),
+            closed,
+            close_code,
+            activity,
+        );
+        let session = Session::default();
+        session.state.lock().unwrap().socket = Some(Arc::clone(&socket));
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let gap_done = Arc::new(tokio::sync::Notify::new());
+        let done_gate = Arc::clone(&completed);
+        let gap_gate = Arc::clone(&gap_done);
+        let peer_task = tokio::spawn(async move {
+            let completion = r#"{"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+            let first = server.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(ref text) if text.contains("response.create")));
+            server.send(Message::Text(completion.into())).await.unwrap();
+            done_gate.notified().await;
+            for n in 0..257u16 {
+                let payload = n.to_be_bytes().to_vec();
+                server
+                    .send(Message::Ping(payload.clone().into()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), server.next())
+                        .await
+                        .expect("every idle Ping must be acknowledged")
+                        .unwrap()
+                        .unwrap(),
+                    Message::Pong(payload.into())
+                );
+            }
+            gap_gate.notify_one();
+            let next = server.next().await.unwrap().unwrap();
+            assert!(matches!(next, Message::Text(ref text) if text.contains("response.create")));
+            server.send(Message::Text(completion.into())).await.unwrap();
+            server
+        });
+        let request: PreparedHttpRequest = HttpRequest {
+            method: HttpMethod::Post,
+            url: "http://unused.test/responses".into(),
+            headers: Vec::new(),
+            body: br#"{"model":"m","input":[]}"#.to_vec(),
+        }
+        .into();
+        let client = reqwest::Client::new();
+        let clock = Clock::default();
+        let (tx, _rx) = mpsc::channel(256);
+        for step in 1..=2 {
+            let normalizer = OpenAiResponsesChatgpt
+                .normalizer(&openai_responses_chatgpt_frozen_config("m"), StepId(step));
+            let mut trace = AttemptTrace::default();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                drive_socket(
+                    &session, &client, &request, &clock, normalizer, &tx, &mut trace,
+                ),
+            )
+            .await
+            .expect("response.create must complete without reaching the 300s send timeout")
+            .unwrap();
+            assert!(!result.is_empty());
+            assert_eq!(trace.socket_reused, Some(true));
+            assert!(!*socket.attempt_active.borrow());
+            if step == 1 {
+                completed.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), gap_done.notified())
+                    .await
+                    .expect("257 idle Pings must complete");
+                assert!(
+                    socket.recv.lock().await.is_empty(),
+                    "idle keepalives must not accumulate before the next attempt"
+                );
+            }
+        }
+        let server = peer_task.await.unwrap();
+        assert!(
+            socket.recv.lock().await.is_empty(),
+            "idle keepalives must not consume receive slots"
+        );
+        session.close();
+        drop(server);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_attempt_interrupts_congested_keepalive_delivery() {
+        let (io, peer) = tokio::io::duplex(4096);
+        let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer,
+            tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (send, commands) = mpsc::channel(1);
+        let (messages, mut records) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        let (active, activity) = tokio::sync::watch::channel(true);
+        let task = spawn_pump(
+            stream,
+            commands,
+            messages.clone(),
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU16::new(0)),
+            activity,
+        );
+        server.send(Message::Ping(vec![1].into())).await.unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Pong(vec![1].into())
+        );
+        assert!(
+            records.recv().await.unwrap().unwrap().is_empty(),
+            "active keepalive must reach the idle-window driver"
+        );
+        messages.try_send(Ok(b"completed".to_vec())).unwrap();
+        server.send(Message::Ping(vec![2].into())).await.unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Pong(vec![2].into())
+        );
+        active.send_replace(false);
+        let (result, received) = oneshot::channel();
+        send.send(SendCommand {
+            text: "next".into(),
+            result,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("ending an attempt must release congested keepalive delivery")
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+        drop(server);
+        task.await.unwrap();
     }
 }
