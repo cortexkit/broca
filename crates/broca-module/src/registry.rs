@@ -909,13 +909,6 @@ impl LineageRegistry {
         }
     }
 
-    pub fn new_with_caps(
-        opener: Arc<dyn LineageOpener>,
-        cap_store: Arc<dyn broca_core::CapStore>,
-    ) -> Self {
-        Self::new_with_reader_and_caps(opener, None, None, Some(cap_store))
-    }
-
     /// Install the admitter for sends carrying a fetch plan. Set once, before serving; only the
     /// first installation takes effect.
     pub fn set_plan_admitter(&self, admitter: Arc<dyn broca_fetch_plan::PlanAdmitter>) {
@@ -4351,13 +4344,6 @@ impl LineageRegistry {
             }
         }));
         let _ = self.inner.retention.set(service);
-    }
-
-    pub fn retention_clock(&self) -> Option<broca_core::Clock> {
-        self.inner
-            .retention
-            .get()
-            .map(|service| service.clock.clone())
     }
 
     pub async fn boot_retention(&self) -> Result<usize, OpenError> {

@@ -2677,11 +2677,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // these two are the serve loop's process-side inbound frame drops.
         "serve_frames_dropped_unbound_channel",
         "serve_frames_dropped_stale_epoch",
-        // Present at zero, and this one is the point rather than a convention: an override is
-        // silent in the dangerous direction, so a field that vanished at zero could not
-        // distinguish "nothing is overridden" from "this daemon does not report overrides" --
-        // and the second state is precisely the one this field exists to end.
-        "catalog_overrides",
         // BOTH refusal fields, and the pair is the point. The streak is a current-state gauge
         // that resets on the first success; the total survives recovery. Streak zero with a
         // non-zero total is "occurred and recovered", which neither field can say alone.
@@ -2744,7 +2739,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
     assert!(metrics["catalog_age_ms"].as_i64().unwrap() >= 5_000);
     assert_eq!(metrics["catalog_source"], serde_json::json!("lkg"));
-    assert_eq!(metrics["catalog_overrides"], serde_json::json!(0));
     assert_eq!(metrics["catalog_refusals"], serde_json::json!(0));
     assert_eq!(metrics["catalog_refusals_total"], serde_json::json!(0));
     assert_eq!(metrics["charge_basis_overrides"], serde_json::json!("none"));

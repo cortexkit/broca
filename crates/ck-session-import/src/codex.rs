@@ -67,10 +67,6 @@ impl CodexReader {
             .join(".codex/sessions")
     }
 
-    pub fn sessions_path(&self) -> &Path {
-        &self.sessions_root
-    }
-
     fn rollout_paths(&self) -> ReaderResult<Vec<PathBuf>> {
         let mut paths = Vec::new();
         collect_rollout_paths(&self.sessions_root, &mut paths)?;

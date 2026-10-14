@@ -131,12 +131,11 @@ pub use cache_warm::{
 };
 pub use run::{
     input_transformations_reported, load_prior_wal_snapshot, read_prior_run_config,
-    recover_prior_run_config, run_loop, run_loop_append_episode,
-    run_loop_append_episode_under_lease, run_loop_on_writer, run_loop_on_writer_admitted,
-    run_loop_on_writer_admitted_with_prior_snapshot, run_loop_resume_after_auth,
-    run_loop_resume_after_auth_with_control, run_loop_under_lease, run_loop_with_control,
-    run_loop_with_store, AccountSelectionRefusal, OutputEvent, PriorWalSnapshot, RunControl,
-    RunError, RunRequest, RunSummary, StartMode,
+    recover_prior_run_config, run_loop, run_loop_append_episode, run_loop_on_writer,
+    run_loop_on_writer_admitted, run_loop_on_writer_admitted_with_prior_snapshot,
+    run_loop_resume_after_auth, run_loop_resume_after_auth_with_control, run_loop_under_lease,
+    run_loop_with_control, run_loop_with_store, AccountSelectionRefusal, OutputEvent,
+    PriorWalSnapshot, RunControl, RunError, RunRequest, RunSummary, StartMode,
 };
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::SteerInbox;

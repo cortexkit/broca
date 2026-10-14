@@ -99,7 +99,7 @@ supervisor can respawn it.
 | `broca-provider` | Wire families, rendering, normalization, retry transport and tool aliases. |
 | `broca-catalog` | Model/provider resolution and catalog cache. |
 | `broca-fetch-plan` | First-send catalog/system-text fetches and the admission manifest. |
-| `broca-ck` | Message codec for prompt-reduction transforms. |
+| `broca-ck` | CK-Message wire types for prompt-reduction transforms. |
 | `broca-owner-only` | Owner-only private-state creation and validation. |
 | `broca-diagnostics` | Blocking-job and egress instrumentation. |
 | `cortexkit-anthropic-policy` | Shared Anthropic auth, header and quota policy. |

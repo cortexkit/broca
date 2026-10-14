@@ -440,16 +440,6 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         Self::with_client_and_clock(build_provider_http_client(), family, frozen, auth, clock)
     }
 
-    /// Construct a provider over a caller-owned HTTP client, preserving its connection pool.
-    pub fn with_client(
-        client: ProviderHttpClient,
-        family: F,
-        frozen: FrozenRenderConfig,
-        auth: AuthHandle,
-    ) -> Self {
-        Self::with_client_and_clock(client, family, frozen, auth, Clock::default())
-    }
-
     pub(crate) fn with_client_and_clock(
         client: ProviderHttpClient,
         family: F,

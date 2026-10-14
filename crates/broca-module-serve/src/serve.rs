@@ -131,11 +131,6 @@ impl VaultGauge {
         Self::with_state(Self::DISCONNECTED)
     }
 
-    /// A vault known reachable from a completed call.
-    pub fn connected() -> Arc<Self> {
-        Self::with_state(Self::CONNECTED)
-    }
-
     fn with_state(state: u8) -> Arc<Self> {
         Arc::new(Self {
             state: std::sync::atomic::AtomicU8::new(state),
@@ -1444,18 +1439,6 @@ async fn handle_control_request(
                 // dials it and the served LKG remains a complete catalog.
                 metrics["catalog_age_ms"] = serde_json::json!(catalog.age_ms);
                 metrics["catalog_source"] = serde_json::json!(catalog.source.as_str());
-                // How many facts we serve at a value the upstream did not publish.
-                //
-                // Emitted at zero, by the rule two comments down: "nothing is overridden" is a
-                // real reading and the one an operator most wants confirmed. A field that
-                // vanishes at zero cannot distinguish "no overrides" from "this daemon does not
-                // report overrides", which is exactly the state this whole path exists to end.
-                //
-                // The count only, not the entries: this is a health probe, and the identities,
-                // both values and the quoted authority are long enough that putting them here
-                // would push a reader past the rest of the report. A non-zero count is the
-                // pointer; the poll log carries the detail.
-                metrics["catalog_overrides"] = serde_json::json!(catalog.overrides);
                 // Emitted at zero for the same reason as the counters above: "refreshing
                 // cleanly" is a real reading and a field that vanishes when healthy cannot be
                 // told from one that was never wired.

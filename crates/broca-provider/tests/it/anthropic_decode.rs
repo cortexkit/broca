@@ -1,143 +1,17 @@
 use broca_ck::{
-    project, CkMessage, ContentBlock as CkContentBlock, ContentKind, OpaqueArcKind, OpaqueArcRole,
+    CkMessage, ContentBlock as CkContentBlock, ContentKind, OpaqueArcKind, OpaqueArcRole,
     ResultBlockKind, Role, ToolResultOutputKind,
 };
 use broca_protocol::{
     content::{ContentBlock as CanonContentBlock, Message, ToolOutput, ToolResult},
-    request::{CallOptions, ToolChoice},
+    request::CallOptions,
     ToolCallId,
 };
 use broca_provider::{
     families::{anthropic_decode, anthropic_frozen_config, AnthropicMessages},
-    policy::SystemPromptPolicy,
     wire::WireFamily,
 };
 use serde_json::{json, Value};
-
-const GOLDEN: &str = include_str!("../fixtures/anthropic_render_golden.json");
-
-#[test]
-fn decode_project_render_round_trips_render_golden_body() {
-    let decoded = anthropic_decode::decode(GOLDEN.trim_end_matches('\n').as_bytes()).unwrap();
-    let projected = project(&decoded.messages).unwrap();
-    let mut opts = CallOptions::new(projected);
-    opts.tools = decoded.tools.into();
-    opts.tool_choice = ToolChoice::Auto.into();
-
-    let mut frozen = anthropic_frozen_config(decoded.wire_model_id);
-    // The decoder carries every top-level system block as CK system content. The current
-    // Claude-subscription render helper still injects the identity lead from its frozen config,
-    // so disabling only that legacy injection prevents the identity from being emitted twice.
-    frozen.system_prompt = SystemPromptPolicy::TopLevelField;
-
-    let rendered = String::from_utf8(AnthropicMessages.render(&frozen, &opts)).unwrap();
-    assert_eq!(rendered, GOLDEN.trim_end_matches('\n'));
-}
-
-fn decode_project_render(body: &Value) -> (Vec<Message>, Value) {
-    let decoded =
-        anthropic_decode::decode(&serde_json::to_vec(body).unwrap()).expect("request decodes");
-    let projected = project(&decoded.messages).expect("decoded messages project");
-    let rendered = AnthropicMessages.render(
-        &anthropic_frozen_config(decoded.wire_model_id),
-        &CallOptions::new(projected.clone()),
-    );
-    (projected, serde_json::from_slice(&rendered).unwrap())
-}
-
-#[test]
-fn mixed_tool_result_and_text_user_turn_renders_both_blocks_in_source_order() {
-    let body = json!({
-        "model": "claude-sonnet-4-20250514",
-        "messages": [
-            {
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "t1",
-                    "name": "lookup",
-                    "input": {"id": 1}
-                }]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "t1",
-                        "content": "ok",
-                        "is_error": false
-                    },
-                    {"type": "text", "text": "Now summarize"}
-                ]
-            }
-        ]
-    });
-
-    let (projected, rendered) = decode_project_render(&body);
-    assert_eq!(projected[1].role, Role::User);
-    assert!(matches!(
-        projected[1].content.as_slice(),
-        [
-            CanonContentBlock::ToolResult(_),
-            CanonContentBlock::Text { .. }
-        ]
-    ));
-    assert_eq!(
-        rendered["messages"][1]["content"],
-        json!([
-            {
-                "type": "tool_result",
-                "tool_use_id": "t1",
-                "content": "ok",
-                "is_error": false
-            },
-            {"type": "text", "text": "Now summarize"}
-        ])
-    );
-}
-
-#[test]
-fn mixed_user_tool_result_keeps_error_state_and_uses_the_tool_id_alias() {
-    let body = json!({
-        "model": "claude-sonnet-4-20250514",
-        "messages": [
-            {
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "bad:id",
-                    "name": "lookup",
-                    "input": {}
-                }]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "bad:id",
-                        "content": "boom",
-                        "is_error": true
-                    },
-                    {"type": "text", "text": "Recover"}
-                ]
-            }
-        ]
-    });
-
-    let (projected, rendered) = decode_project_render(&body);
-    assert_eq!(projected[1].role, Role::User);
-    let wire_call_id = rendered["messages"][0]["content"][0]["id"]
-        .as_str()
-        .unwrap();
-    let result = &rendered["messages"][1]["content"][0];
-    assert_ne!(wire_call_id, "bad:id");
-    assert_eq!(result["tool_use_id"], wire_call_id);
-    assert_eq!(result["content"], "boom");
-    assert_eq!(result["is_error"], true);
-    assert_eq!(rendered["messages"][1]["content"][1]["text"], "Recover");
-}
 
 #[test]
 fn assistant_and_system_tool_results_remain_dropped() {

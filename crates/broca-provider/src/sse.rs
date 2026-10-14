@@ -38,15 +38,6 @@ pub fn parse_data_events(raw: &str) -> Result<Vec<String>, NormalizeError> {
     Ok(events)
 }
 
-/// Extract the joined `data:` payload from ONE SSE record (the text between
-/// blank-line separators). `None` if the record carries no data, is empty, or is
-/// the `[DONE]` sentinel. Applies the same field rules as [`SseDecoder`], which both the
-/// live stream and [`parse_data_events`] use.
-pub fn record_data_payload(record: &str) -> Option<String> {
-    let payload = record_data(record)?;
-    (!payload.is_empty() && payload != "[DONE]").then_some(payload)
-}
-
 /// Split a record into fields using the SAME end-of-line grammar as the record
 /// separator, which `str::lines()` does not: it splits LF and CRLF and treats a BARE
 /// CR as ordinary text.
