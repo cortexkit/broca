@@ -1140,6 +1140,9 @@ pub struct LineageActor<W: WalStore> {
     /// One-shot policy retained across same-process retries or pause finalization for a run.
     /// Reopen defaults to materialization because this execution hint is deliberately not durable.
     skip_materialization_runs: HashSet<RunId>,
+    // An acknowledged cancel remains work until the WAL proves a terminal, even
+    // if a racing pause or a transient storage failure delays its finalizer.
+    pending_cancels: HashMap<RunId, bool>,
     /// Submission tombstones observed in the complete WAL. A deterministic send id is a logical
     /// identity, so its tombstone remains authoritative after the actor's pending cache drops it.
     retracted_submissions: HashSet<broca_protocol::SubmissionId>,
@@ -1358,6 +1361,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
             skip_materialization_runs: HashSet::new(),
+            pending_cancels: HashMap::new(),
             retracted_submissions: HashSet::new(),
             recorded_send_keys: HashMap::new(),
             recorded_steers: HashMap::new(),
@@ -2058,6 +2062,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
     async fn recover_durable_work(&mut self) -> Result<(), String> {
         if self.wal_store.check_move(&self.key, true).is_err() {
             return Ok(());
+        }
+        if !self.pending_cancels.is_empty() && matches!(self.state, RunState::Idle) {
+            return self.retry_pending_cancels().await;
         }
         self.refresh_admission_view().await?;
         if self.seal_crash_orphan().await? {
@@ -4431,6 +4438,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             if active == run_id {
                 cancel.cancel();
+                self.pending_cancels.insert(
+                    run_id.clone(),
+                    self.skip_materialization_runs.contains(run_id),
+                );
                 return CancelOutcome::Ack;
             }
         }
@@ -4439,7 +4450,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(state) => state,
             Err(error) => {
                 tracing::warn!(target: "lifecycle", "cancel lifecycle resolution failed: {error}");
-                return CancelOutcome::NotActive;
+                return CancelOutcome::Error(error);
             }
         };
         if !resolved.is_some_and(|state| state.state == RunIndexState::Paused) {
@@ -4447,6 +4458,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let skip_materialization = self.skip_materialization_runs.contains(run_id);
+        self.pending_cancels
+            .insert(run_id.clone(), skip_materialization);
         match self
             .start_paused_cancel_finalizer(run_id, skip_materialization)
             .await
@@ -4457,9 +4470,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     target: "lifecycle",
                     "paused-run cancel finalizer failed to start: {error}"
                 );
-                CancelOutcome::NotActive
+                CancelOutcome::Error(error)
             }
         }
+    }
+
+    async fn retry_pending_cancels(&mut self) -> Result<(), String> {
+        let pending: Vec<_> = self
+            .pending_cancels
+            .iter()
+            .map(|(run, skip)| (run.clone(), *skip))
+            .collect();
+        for (run, skip) in pending {
+            self.start_paused_cancel_finalizer(&run, skip).await?;
+            if matches!(self.state, RunState::Active { .. }) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn start_paused_cancel_finalizer(
@@ -4470,6 +4498,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Rebuild the original episode from the durable admission view. This works both after a
         // same-process pause and after the actor has closed and reopened with no in-memory request.
         self.refresh_admission_view().await?;
+        if self
+            .prior_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.checkpoint_at_head.last_episode.as_ref())
+            .is_some_and(|episode| {
+                episode.run_id == *run_id && episode.disposition == EpisodeDisposition::Finished
+            })
+        {
+            self.pending_cancels.remove(run_id);
+            return Ok(());
+        }
         let episode = self
             .prior_snapshot
             .as_ref()
@@ -4778,6 +4817,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // its paused summary. If RunPaused won that narrow durability race, immediately redrive the
         // durable AuthRequired episode with a pre-cancelled token instead of collapsing to Idle.
         if active_cancelled && summary.paused.is_some() {
+            self.pending_cancels
+                .insert(run_id.clone(), skip_materialization);
             self.set_idle();
             if let Err(error) = self
                 .start_paused_cancel_finalizer(&run_id, skip_materialization)
@@ -4792,6 +4833,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let index_state = run_index_terminal_state(summary);
+        if index_state.is_terminal() {
+            self.pending_cancels.remove(&run_id);
+        }
 
         // Update the durable run-index to the terminal state BEFORE going Idle (so a
         // status/cancel lookup after the run never sees a stale Active for a finished run
@@ -4996,6 +5040,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "startup durable-work recovery failed on idle tick; keeping actor open: {error}"
             );
             return false;
+        }
+
+        if matches!(self.state, RunState::Idle) && !self.pending_cancels.is_empty() {
+            if let Err(error) = self.retry_pending_cancels().await {
+                tracing::warn!(target: "lifecycle", "pending cancel finalizer deferred: {error}");
+            }
+            if !self.pending_cancels.is_empty() {
+                return false;
+            }
         }
 
         // Don't close while a run is active or a live subscriber is observing the session.
@@ -9031,6 +9084,7 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    include!("cancel_lifecycle_tests.rs");
 }
 
 #[cfg(test)]

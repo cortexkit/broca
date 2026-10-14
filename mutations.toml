@@ -9363,3 +9363,34 @@ expect_red = ["retention::tests::successful_export_discovery_does_not_query_fall
 file = "crates/broca-module/src/retention.rs"
 old = '                Ok(runs) => runs,'
 new = '                Ok(runs) => { self.index.runs(&id)?; runs }, // NON-VACUITY BREAK: eager fallback query.'
+
+[[control]]
+id = "cancel-pause-keeps-pending-intent"
+guards = "acknowledged cancellation survives a racing durable pause and one failed finalizer read"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/cancel_lifecycle_tests.rs"
+expect_red = ["actor::tests::acknowledged_cancel_retries_paused_finalizer_after_one_read_failure"]
+file = "crates/broca-module/src/actor.rs"
+old = '''        if active_cancelled && summary.paused.is_some() {
+            self.pending_cancels
+                .insert(run_id.clone(), skip_materialization);'''
+new = '''        if active_cancelled && summary.paused.is_some() {
+            self.pending_cancels.remove(&run_id); // NON-VACUITY BREAK: forget acknowledged intent at pause.'''
+
+[[control]]
+id = "cancel-lookup-errors-are-not-negative-answers"
+guards = "lookup failure returns CancelOutcome::Error while real absence remains NotActive"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/cancel_lifecycle_tests.rs"
+expect_red = ["actor::tests::cancel_lookup_failure_is_error_but_healthy_absence_is_not_active"]
+file = "crates/broca-module/src/actor.rs"
+old = '''                tracing::warn!(target: "lifecycle", "cancel lifecycle resolution failed: {error}");
+                return CancelOutcome::Error(error);'''
+new = '''                tracing::warn!(target: "lifecycle", "cancel lifecycle resolution failed: {error}");
+                return CancelOutcome::NotActive; // NON-VACUITY BREAK: turn failed lookup into absence.'''

@@ -221,6 +221,7 @@ impl Fixture {
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
             skip_materialization_runs: HashSet::new(),
+            pending_cancels: HashMap::new(),
             retracted_submissions: HashSet::new(),
             recorded_send_keys: HashMap::new(),
             recorded_steers: HashMap::new(),
