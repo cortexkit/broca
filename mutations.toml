@@ -9315,3 +9315,141 @@ expect_red = ["actor::wal_proof_tests::old_keyed_send_requires_proven_full_scan_
 file = "crates/broca-module/src/durable_read.rs"
 old = '            WalRangeRecords::Complete(records) => records,'
 new = '            WalRangeRecords::Complete(records) | WalRangeRecords::Unknown(records) => records, // NON-VACUITY BREAK'
+
+[[control]]
+id = "gemini-in-band-error-diagnosis"
+guards = "Gemini and Code Assist retain in-band error classes and detail instead of retrying permission denials as truncation"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_gemini_error_tests.rs"
+expect_red = ["transport::tests::gemini_errors::gemini_and_codeassist_in_band_errors_keep_class_code_and_detail"]
+file = "crates/broca-provider/src/families/gemini.rs"
+old = 'if let Some(error) = v.get("error").filter(|error| error.is_object()) {'
+new = 'if let Some(error) = v.get("error").filter(|error| error.get("status").and_then(Value::as_str) == Some("INVALID_ARGUMENT") /* NON-VACUITY BREAK */) {'
+
+[[control]]
+id = "chatgpt-upstream-key-safe-diagnostic"
+guards = "ChatGPT upstream-key 401 diagnostics retain safe status and code without raw keys or response-body tails"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::chatgpt_upstream_key_diagnostic_does_not_copy_body"]
+file = "crates/broca-provider/src/transport.rs"
+old = "the account's OAuth token, not a key); not a credential failure.\""
+new = "the account's OAuth token, not a key); not a credential failure. body: {body}\" /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "dump-retention-only-owned-filenames"
+guards = "Dump age and size retention never prune unrelated files sharing BROCA_DUMP_REQUEST_DIR"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::dump_sweep_preserves_foreign_files_under_age_and_size_pressure"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''            .is_some_and(is_request_dump_filename)'''
+new = '''            .is_some_and(|name| is_request_dump_filename(name) || !name.is_empty() /* NON-VACUITY BREAK */)'''
+
+[[control]]
+id = "catalog-overlay-authored-warm-prices"
+guards = "Compiled overlay-only models retain authored input output and cache prices"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::compiled_overlay_only_model_retains_authored_warm_prices"]
+select = "expected"
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'model.cost = crate::map_cost(value.as_ref());'
+new = 'model.cost = crate::map_cost(value.as_ref().filter(|_| false /* NON-VACUITY BREAK */));'
+
+[[control]]
+id = "catalog-overlay-existing-price-replacement"
+guards = "An authored cost patch replaces an existing model price schedule including context tiers"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::existing_model_overlay_replaces_prices_and_preserves_name_and_structured_output"]
+select = "expected"
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'model.cost = crate::map_cost(value.as_ref());'
+new = 'model.cost = crate::map_cost(value.as_ref().filter(|_| false /* NON-VACUITY BREAK */));'
+
+[[control]]
+id = "catalog-serving-model-keeps-price-schedule"
+guards = "The compact serving boundary materializes the retained cost schedule for billing"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::existing_model_overlay_replaces_prices_and_preserves_name_and_structured_output"]
+select = "expected"
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'cost: self.cost.clone(),'
+new = 'cost: CostSchedule::default(), // NON-VACUITY BREAK'
+
+[[control]]
+id = "catalog-overlay-keeps-authored-name"
+guards = "Runtime model name patches are supported rather than silently discarded"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::existing_model_overlay_replaces_prices_and_preserves_name_and_structured_output"]
+select = "expected"
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'model.display_name = name.clone().unwrap_or_default();'
+new = 'model.display_name = name.clone().filter(|_| false /* NON-VACUITY BREAK */).unwrap_or_default();'
+
+[[control]]
+id = "catalog-overlay-keeps-structured-output"
+guards = "Runtime structured-output patches reach the served model spec"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::existing_model_overlay_replaces_prices_and_preserves_name_and_structured_output"]
+select = "expected"
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'model.structured_output = value;'
+new = 'model.structured_output = value.filter(|_| false /* NON-VACUITY BREAK */);'
+
+[[control]]
+id = "catalog-overlay-refuses-unknown-model-fields"
+guards = "Runtime overlay schema mistakes are refused rather than silently ignored"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::runtime_overlay_refuses_unknown_keys"]
+select = "expected"
+file = "crates/broca-catalog/src/runtime.rs"
+old = '''#[serde(deny_unknown_fields)]
+struct RuntimeModelOverlay {'''
+new = '''// NON-VACUITY BREAK: accept unknown model fields
+struct RuntimeModelOverlay {'''
+
+[[control]]
+id = "catalog-default-output-below-context"
+guards = "Default output caps stay below a small known context while explicit caller caps remain unclamped"
+runner = "cargo"
+package = "broca-catalog"
+features = ["live"]
+target = "--test default_max_output"
+test_file = "crates/broca-catalog/tests/default_max_output.rs"
+expect_red = ["gated::default_output_cap_is_below_a_small_known_context"]
+file = "crates/broca-catalog/src/live.rs"
+old = 'u64::from(FALLBACK_MAX_OUTPUT_TOKENS).min(context - 1) as u32'
+new = 'u64::from(FALLBACK_MAX_OUTPUT_TOKENS).min(context.max(u64::from(FALLBACK_MAX_OUTPUT_TOKENS))) as u32 /* NON-VACUITY BREAK */'

@@ -600,16 +600,22 @@ pub const MAX_DEFAULT_OUTPUT_TOKENS: u32 = 131_072;
 /// exactly like an unknown limit. When the context window itself is unknown there is nothing to
 /// compare against, so the output limit is used as served.
 ///
-/// Zero is treated as unknown too. fusiform already serves a zero as null, but this rule must
-/// not render `max_tokens: 0` if some other source ever hands one through. A limit that does
-/// not fit the wire's u32 is not a real cap either and falls back.
+/// Zero is treated as an unknown output limit too. A limit that does not fit the wire's
+/// u32 is not a real cap either and falls back. The fallback stays strictly below a known
+/// positive context window; an unknown or zero context does not constrain it.
 pub fn default_max_output_tokens(output_limit: Option<u64>, context_limit: Option<u64>) -> u32 {
     output_limit
         .filter(|&output| output > 0)
         .filter(|&output| context_limit.is_none_or(|context| output < context))
         .and_then(|output| u32::try_from(output).ok())
         .map(|output| output.min(MAX_DEFAULT_OUTPUT_TOKENS))
-        .unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS)
+        .unwrap_or_else(|| {
+            context_limit
+                .filter(|&context| context > 0)
+                .map_or(FALLBACK_MAX_OUTPUT_TOKENS, |context| {
+                    u64::from(FALLBACK_MAX_OUTPUT_TOKENS).min(context - 1) as u32
+                })
+        })
 }
 
 impl EpisodeRenderConfig<'_> {
@@ -711,8 +717,8 @@ fn resolve_provider_inner(
     // 2. On a resume, the cap this episode froze at start (`episode_render.max_output_tokens`),
     //    so a catalog value that moved since admission cannot trip the drift guard.
     // 3. The model's own maximum from the catalog when it is a usable cap, else
-    //    `FALLBACK_MAX_OUTPUT_TOKENS` (see `default_max_output_tokens`). The mode below decides
-    //    which catalog limits are known; this closure is the one place the rule is applied.
+    //    the fallback bounded below a known context (see `default_max_output_tokens`). The mode
+    //    below decides which catalog limits are known; this closure applies the rule.
     let restored_max_tokens = episode_render.max_output_tokens;
     let max_tokens_for = |output_limit: Option<u64>, context_limit: Option<u64>| {
         caller_max_tokens

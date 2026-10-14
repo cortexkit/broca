@@ -24,3 +24,19 @@ fn sanitize_filename_component(value: &str) -> String {
         })
         .collect()
 }
+
+/// Only names the dump writer can generate are eligible for retention pruning.
+/// Other files may share the configured directory and do not belong to broca.
+#[cfg(feature = "live")]
+pub(crate) fn is_request_dump_filename(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    let Some((run_id, step)) = stem.rsplit_once("-s") else {
+        return false;
+    };
+    run_id == sanitize_filename_component(run_id)
+        && step
+            .parse::<u64>()
+            .is_ok_and(|index| index.to_string() == step)
+}

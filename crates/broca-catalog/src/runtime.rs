@@ -194,6 +194,8 @@ struct DraftServingProvider {
 /// explicit `null` still fails closed when a family would consume it.
 #[derive(Clone)]
 struct ServingModel {
+    display_name: String,
+    structured_output: Option<bool>,
     cost: CostSchedule,
     context_limit: Option<u64>,
     /// The model's published maximum output, `None` when fusiform serves null (its spelling of
@@ -217,6 +219,8 @@ struct ServingModel {
 impl Default for ServingModel {
     fn default() -> Self {
         Self {
+            display_name: String::new(),
+            structured_output: None,
             cost: CostSchedule::default(),
             context_limit: None,
             output_limit: None,
@@ -237,6 +241,8 @@ impl ServingModel {
         provider_family: WireFamilyId,
     ) -> Self {
         Self {
+            display_name: model.display_name.clone(),
+            structured_output: model.overlay.structured_output,
             cost: model.cost.clone(),
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
@@ -254,7 +260,7 @@ impl ServingModel {
     fn to_spec(&self, model_id: &str) -> ModelSpec {
         ModelSpec {
             id: model_id.to_string(),
-            display_name: String::new(),
+            display_name: self.display_name.clone(),
             family: None,
             capabilities: Capabilities {
                 attachment: self.attachment,
@@ -268,11 +274,13 @@ impl ServingModel {
                 max_input: None,
                 max_output: self.output_limit,
             },
-            cost: Default::default(),
+            cost: self.cost.clone(),
             reasoning_options: self.reasoning_options.clone(),
             release_date: None,
             status: None,
-            overlay: Overlay::default(),
+            overlay: Overlay {
+                structured_output: self.structured_output,
+            },
             raw: Value::Null,
         }
     }
@@ -447,6 +455,8 @@ impl ServingCatalog {
                             .insert(model_id.clone());
                     } else {
                         let mut model = ServingModel {
+                            display_name: String::new(),
+                            structured_output: None,
                             cost: warm_cost_fact(facts),
                             context_limit: context_fact(identity, facts)?,
                             output_limit: output_fact(identity, facts)?,
@@ -685,6 +695,7 @@ fn serving_provider_spec(
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeOverlay {
     #[serde(default)]
     patch: BTreeMap<String, RuntimeProviderOverlay>,
@@ -713,7 +724,14 @@ impl RuntimeOverlay {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeProviderOverlay {
+    #[serde(default, rename = "base_url_source")]
+    _base_url_source: Option<String>,
+    #[serde(default, rename = "wire_family_source")]
+    _wire_family_source: Option<String>,
+    #[serde(default, rename = "wire_family_reason")]
+    _wire_family_reason: Option<String>,
     #[serde(default)]
     base_url: Patch<Option<String>>,
     #[serde(default)]
@@ -756,7 +774,16 @@ impl RuntimeProviderOverlay {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeModelOverlay {
+    #[serde(default, rename = "id")]
+    _id: Option<String>,
+    #[serde(default)]
+    name: Patch<Option<String>>,
+    #[serde(default)]
+    structured_output: Patch<Option<bool>>,
+    #[serde(default)]
+    cost: Patch<Option<RuntimeCostOverlay>>,
     #[serde(default)]
     attachment: Patch<CapabilityFlag>,
     #[serde(default)]
@@ -771,6 +798,16 @@ struct RuntimeModelOverlay {
 
 impl RuntimeModelOverlay {
     fn apply(&self, model: &mut ServingModel) {
+        if let Patch::Set(name) = &self.name {
+            model.display_name = name.clone().unwrap_or_default();
+        }
+        if let Patch::Set(value) = self.structured_output {
+            model.structured_output = value;
+        }
+        if let Patch::Set(cost) = &self.cost {
+            let value = cost.as_ref().map(|cost| serde_json::json!(cost));
+            model.cost = crate::map_cost(value.as_ref());
+        }
         if let Patch::Set(value) = self.attachment {
             model.attachment = value;
         }
@@ -801,7 +838,43 @@ impl RuntimeModelOverlay {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCostOverlay {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    reasoning: Option<f64>,
+    input_audio: Option<f64>,
+    output_audio: Option<f64>,
+    tiers: Option<Vec<RuntimeCostTierOverlay>>,
+    // The shipped overlay also records the same context rates under this legacy label.
+    // Only the explicit tiers array determines the serving schedule.
+    #[serde(default, rename = "context_over_200k", skip_serializing)]
+    _context_over_200k: Option<Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCostTierOverlay {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    tier: RuntimeCostTierThreshold,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCostTierThreshold {
+    size: u64,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeLimitOverlay {
     #[serde(default)]
     context: Patch<Option<u64>>,
@@ -2234,6 +2307,87 @@ mod tests {
             after.priced_modes("anthropic", "claude-sonnet-4-5"),
             vec!["fast".to_string()]
         );
+    }
+
+    #[test]
+    fn compiled_overlay_only_model_retains_authored_warm_prices() {
+        let mut response = response(10);
+        let facts = response.models["anthropic/claude-sonnet-4-5"].clone();
+        response.models.insert("xai/fixture-base".into(), facts);
+        assert!(!response.models.contains_key("xai/grok-composer-2.5-fast"));
+        let cache = CatalogCache::empty();
+        cache.refresh(response).expect("shipped overlay must load");
+        let snapshot = cache.snapshot().unwrap();
+        let cost = snapshot
+            .warm_cost_schedule("xai", "grok-composer-2.5-fast")
+            .unwrap();
+        assert_eq!(cost.input, Some(0.5));
+        assert_eq!(cost.output, Some(2.5));
+        assert_eq!(cost.cache_read, Some(0.2));
+        assert_eq!(cost.cache_write, None);
+        let (_, model) = snapshot
+            .model_for_serving("xai", "grok-composer-2.5-fast")
+            .unwrap();
+        assert_eq!(model.cost, cost);
+        assert_eq!(model.display_name, "Grok Composer 2.5 Fast");
+    }
+
+    #[test]
+    fn existing_model_overlay_replaces_prices_and_preserves_name_and_structured_output() {
+        let mut response = response(10);
+        let facts = response
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap();
+        facts.insert("rate.input".into(), priced_rate(9_000_000));
+        let overlay: RuntimeOverlay = serde_json::from_str(r#"{"patch":{"anthropic":{
+            "base_url_source":"authored", "wire_family_source":"authored", "wire_family_reason":"first party",
+            "models":{"claude-sonnet-4-5":{
+                "id":"claude-sonnet-4-5", "name":"Authored name", "structured_output":true,
+                "cost":{"input":1.5,"output":7.5,"cache_read":0.15,"cache_write":0,
+                    "reasoning":3,"input_audio":4,"output_audio":5,
+                    "tiers":[{"tier":{"type":"context","size":200000},"input":2,"output":10,"cache_read":0.2}]}
+            }}}}}"#).unwrap();
+        let (catalog, _) =
+            ServingCatalog::from_fusiform_with_overlay(&response.models, overlay).unwrap();
+        let cost = &catalog.providers["anthropic"].models["claude-sonnet-4-5"].cost;
+        assert_eq!(cost.input, Some(1.5));
+        assert_eq!(cost.output, Some(7.5));
+        assert_eq!(cost.cache_read, Some(0.15));
+        assert_eq!(cost.cache_write, Some(0.0));
+        assert_eq!(cost.reasoning, Some(3.0));
+        assert_eq!(cost.input_audio, Some(4.0));
+        assert_eq!(cost.output_audio, Some(5.0));
+        assert_eq!(cost.tiers.len(), 1);
+        assert_eq!(cost.tiers[0].min_context, 200000);
+        assert_eq!(cost.tiers[0].input, Some(2.0));
+        assert_eq!(cost.tiers[0].output, Some(10.0));
+        assert_eq!(cost.tiers[0].cache_read, Some(0.2));
+        assert_eq!(cost.tiers[0].cache_write, None);
+        let (_, model) = catalog
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(model.cost, *cost);
+        assert_eq!(model.display_name, "Authored name");
+        assert_eq!(model.overlay.structured_output, Some(true));
+    }
+
+    #[test]
+    fn runtime_overlay_refuses_unknown_keys() {
+        for overlay in [
+            r#"{"patch":{"anthropic":{"models":{"m":{"coast":{"input":1}}}}}}"#,
+            r#"{"patch":{"anthropic":{"base_urll":"https://example.test"}}}"#,
+            r#"{"patchh":{}}"#,
+            r#"{"patch":{"anthropic":{"models":{"m":{"limit":{"outpt":1}}}}}}"#,
+            r#"{"patch":{"anthropic":{"models":{"m":{"cost":{"inpt":1}}}}}}"#,
+            r#"{"patch":{"anthropic":{"models":{"m":{"cost":{"tiers":[{"inputt":1,"tier":{"size":1,"type":"context"}}]}}}}}}"#,
+            r#"{"patch":{"anthropic":{"models":{"m":{"cost":{"tiers":[{"tier":{"size":1,"type":"context","typo":true}}]}}}}}}"#,
+        ] {
+            let error = serde_json::from_str::<RuntimeOverlay>(overlay)
+                .err()
+                .expect("unknown overlay field must be refused");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]
