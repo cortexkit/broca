@@ -2915,6 +2915,9 @@ old = '''        let output = Command::new("/bin/cp")
             .stdin(std::process::Stdio::from(source.file.try_clone()?))
             .output()?;
         if !output.status.success() {
+            if !temporary.directory.is_dir() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
             return Err(io::Error::other(format!(
                 "copying test executable to {} failed ({}): {}",
                 temporary.path.display(),
@@ -2943,6 +2946,19 @@ platforms = ["linux"]
 file = "crates/broca-test-support/src/ckdev.rs"
 old = "const EXECUTABLE_FILE_BUSY_RETRIES: usize = 40;"
 new = "const EXECUTABLE_FILE_BUSY_RETRIES: usize = 0; // NON-VACUITY BREAK: disable executable-busy retries."
+
+[[control]]
+id = "test-rig-ckdev-disable-prune"
+guards = "publishing a test executable removes unused cache copies older than 24 hours"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+test_file = "crates/broca-test-support/src/ckdev.rs"
+expect_red = ["ckdev::tests::pruning_removes_old_unused_copies"]
+expect_message = "unused copy older than 24 hours survived"
+file = "crates/broca-test-support/src/ckdev.rs"
+old = "        prune_copies(&cache, &directory, SystemTime::now());"
+new = "        // NON-VACUITY BREAK: disable executable cache pruning."
 
 [[control]]
 id = "stall-heartbeat-staleness"

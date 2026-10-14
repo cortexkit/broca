@@ -7,9 +7,12 @@ use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+static PRUNE_ONCE: OnceLock<()> = OnceLock::new();
+const UNUSED_COPY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Run a build through a reusable, non-production executable name.
 ///
@@ -19,6 +22,10 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 /// and publish it by atomic rename, so concurrent rigs never see an incomplete executable.
 /// See [`exec_root`] for where that is on each platform. `scratch_dir` is retained for caller
 /// compatibility.
+///
+/// Copies unused for 24 hours may be pruned. A path handed out more than 24 hours before its
+/// launch, without an intervening `ckdev_binary` call, can vanish. A stale scan can also race
+/// reuse between its mtime read and rename; call `ckdev_binary` again to recreate a missing copy.
 pub fn ckdev_binary(binary: impl AsRef<Path>, _scratch_dir: impl AsRef<Path>) -> PathBuf {
     publish_binaries(&[(binary.as_ref(), dev_file_name(binary.as_ref()))]).remove(0)
 }
@@ -164,6 +171,13 @@ fn profile_directory(binary: &Path) -> PathBuf {
 }
 
 fn publish_binaries(binaries: &[(&Path, OsString)]) -> Vec<PathBuf> {
+    publish_binaries_with_pruning(binaries, &PRUNE_ONCE)
+}
+
+fn publish_binaries_with_pruning(
+    binaries: &[(&Path, OsString)],
+    prune_once: &OnceLock<()>,
+) -> Vec<PathBuf> {
     let mut sources: Vec<_> = binaries
         .iter()
         .map(|(path, _)| {
@@ -185,26 +199,115 @@ fn publish_binaries(binaries: &[(&Path, OsString)]) -> Vec<PathBuf> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let directory = exec_root(binaries[0].0).join("ckdev-exec").join(prefix);
-    fs::create_dir_all(&directory).unwrap_or_else(|error| {
-        panic!(
-            "creating test executable cache {} failed: {error}",
-            directory.display()
-        )
+    let cache = exec_root(binaries[0].0).join("ckdev-exec");
+    let directory = cache.join(prefix);
+    prune_once.get_or_init(|| {
+        prune_copies(&cache, &directory, SystemTime::now());
     });
-    binaries
-        .iter()
-        .zip(&mut sources)
-        .map(|((path, name), source)| {
-            publish_copy(source, &directory, name).unwrap_or_else(|error| {
-                panic!(
-                    "publishing test executable {} in {} failed: {error}",
-                    path.display(),
-                    directory.display()
-                )
+    // A pruner in another process may have inspected the old mtime before our reuse.
+    // Recreate the entire group if its directory disappears, including during a copy.
+    for attempt in 0..4 {
+        let result = (|| -> io::Result<Vec<PathBuf>> {
+            fs::create_dir_all(&directory)?;
+            let paths = binaries
+                .iter()
+                .zip(&mut sources)
+                .map(|((_, name), source)| {
+                    source.file.rewind()?;
+                    publish_copy(source, &directory, name)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            touch_directory(&directory, SystemTime::now())?;
+            if paths.iter().any(|path| !path.is_file()) {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            Ok(paths)
+        })();
+        match result {
+            Ok(paths) => return paths,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && attempt < 3 => continue,
+            Err(error) => panic!(
+                "publishing test executables in {} failed: {error}",
+                directory.display()
+            ),
+        }
+    }
+    unreachable!()
+}
+
+fn touch_directory(directory: &Path, now: SystemTime) -> io::Result<()> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Opening a directory for SetFileTime requires backup semantics and attribute access.
+        options.custom_flags(0x02000000).access_mode(0x100);
+    }
+    options
+        .open(directory)?
+        .set_times(fs::FileTimes::new().set_modified(now))
+}
+
+fn prune_copies(cache: &Path, current: &Path, now: SystemTime) {
+    let entries = match fs::read_dir(cache) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "pruning test executable cache {} failed: {error}",
+                cache.display()
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let result = (|| -> io::Result<()> {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            // Only direct copy directories and tombstones from interrupted pruning belong to
+            // this cache. Do not follow directory symlinks or remove unrelated files.
+            if path == current
+                || !name.to_str().is_some_and(is_copy_directory)
+                || !entry.file_type()?.is_dir()
+            {
+                return Ok(());
+            }
+            let modified = entry.metadata()?.modified()?;
+            if now.duration_since(modified).unwrap_or_default() < UNUSED_COPY_AGE {
+                return Ok(());
+            }
+            #[cfg(test)]
+            BEFORE_PRUNE.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook(&path);
+                }
+            });
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let tombstone = cache.join(format!(".prune-{}-{sequence}", std::process::id()));
+            fs::rename(&path, &tombstone)?;
+            fs::remove_dir_all(tombstone)
+        })();
+        if let Err(error) = result {
+            eprintln!(
+                "pruning test executable cache {} failed: {error}",
+                cache.display()
+            );
+        }
+    }
+}
+
+fn is_copy_directory(name: &str) -> bool {
+    (name.len() == 16 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || name.strip_prefix(".prune-").is_some_and(|suffix| {
+            suffix.split_once('-').is_some_and(|(pid, sequence)| {
+                !pid.is_empty()
+                    && !sequence.is_empty()
+                    && pid.bytes().all(|byte| byte.is_ascii_digit())
+                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
             })
         })
-        .collect()
 }
 
 fn dev_file_name(binary: &Path) -> OsString {
@@ -299,6 +402,9 @@ fn fill_copy(source: &mut Source, temporary: &TemporaryCopy, destination: &Path)
             .stdin(std::process::Stdio::from(source.file.try_clone()?))
             .output()?;
         if !output.status.success() {
+            if !temporary.directory.is_dir() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
             return Err(io::Error::other(format!(
                 "copying test executable to {} failed ({}): {}",
                 temporary.path.display(),
@@ -325,6 +431,12 @@ fn fill_copy(source: &mut Source, temporary: &TemporaryCopy, destination: &Path)
         io::copy(&mut source.file, &mut file)?;
         file.sync_all()?;
     }
+    #[cfg(all(test, not(unix)))]
+    AFTER_COPY.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(&temporary.path);
+        }
+    });
     // Signing changes Mach-O bytes, so validate the copied build before signing it.
     let copied = Source::open(&temporary.path)?;
     if copied.size != source.size || copied.digest != source.digest {
@@ -419,6 +531,7 @@ type BeforeCopy = Option<Box<dyn Fn(&Path)>>;
 thread_local! {
     static BEFORE_COPY: std::cell::RefCell<BeforeCopy> = const { std::cell::RefCell::new(None) };
     static AFTER_COPY: std::cell::RefCell<BeforeCopy> = const { std::cell::RefCell::new(None) };
+    static BEFORE_PRUNE: std::cell::RefCell<BeforeCopy> = const { std::cell::RefCell::new(None) };
     /// A unit test's own publish root, so its copies start fresh in its scratch directory
     /// rather than meeting another run's copies in the shared `/tmp` root.
     static TEST_EXEC_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -447,6 +560,250 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn publish_pruning_once(built: &Path, once: &OnceLock<()>) -> PathBuf {
+        publish_binaries_with_pruning(&[(built, dev_file_name(built))], once).remove(0)
+    }
+
+    fn age_directory(path: &Path) {
+        touch_directory(
+            path,
+            SystemTime::now() - UNUSED_COPY_AGE - Duration::from_secs(60),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pruning_removes_old_unused_copies() {
+        let scratch = fixture("prune-old");
+        let built = source(&scratch, "target/debug/ck-probe", b"current");
+        let cache = exec_root(&built).join("ckdev-exec");
+        let old = cache.join("0000000000000000");
+        let recent = cache.join("1111111111111111");
+        let unrelated = cache.join("not-a-copy");
+        let outside = cache.parent().unwrap().join("2222222222222222");
+        for path in [&old, &recent, &unrelated, &outside] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("executable"), b"keep contents outside old copy").unwrap();
+        }
+        for path in [&old, &unrelated, &outside] {
+            age_directory(path);
+        }
+        let published = publish_pruning_once(&built, &OnceLock::new());
+        assert!(!old.exists(), "unused copy older than 24 hours survived");
+        for path in [&recent, &unrelated, &outside] {
+            assert!(
+                path.join("executable").is_file(),
+                "removed {}",
+                path.display()
+            );
+        }
+        assert!(published.is_file());
+        assert!(fs::read_dir(&cache).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".prune-")
+        }));
+    }
+
+    #[test]
+    fn pruning_keeps_recently_reused_copies() {
+        let scratch = fixture("prune-reuse");
+        let built = source(&scratch, "target/debug/ck-probe", b"reused");
+        let once = OnceLock::new();
+        let published = publish_pruning_once(&built, &once);
+        let directory = published.parent().unwrap();
+        age_directory(directory);
+        let old_mtime = fs::metadata(directory).unwrap().modified().unwrap();
+        assert_eq!(publish_pruning_once(&built, &once), published);
+        let refreshed = fs::metadata(directory).unwrap().modified().unwrap();
+        assert!(refreshed > old_mtime, "reuse did not refresh the directory");
+        let other = source(&scratch, "target/debug/ck-other", b"other build");
+        publish_pruning_once(&other, &OnceLock::new());
+        assert!(published.is_file(), "recently reused copy was pruned");
+    }
+
+    #[test]
+    fn pruning_retries_old_tombstones() {
+        let scratch = fixture("prune-tombstone");
+        let built = source(&scratch, "target/debug/ck-probe", b"current");
+        let old = exec_root(&built).join("ckdev-exec/.prune-123-0");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("executable"), b"left by a failed deletion").unwrap();
+        age_directory(&old);
+        publish_pruning_once(&built, &OnceLock::new());
+        assert!(!old.exists(), "failed deletion was never retried");
+    }
+
+    #[test]
+    fn pruning_keeps_the_copy_being_published() {
+        let scratch = fixture("prune-current");
+        let built = source(&scratch, "target/debug/ck-probe", b"current");
+        let published = publish_pruning_once(&built, &OnceLock::new());
+        age_directory(published.parent().unwrap());
+        let copied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = copied.clone();
+        BEFORE_COPY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                observed.store(true, Ordering::Relaxed);
+            }));
+        });
+        let reused = publish_pruning_once(&built, &OnceLock::new());
+        BEFORE_COPY.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(reused, published);
+        assert!(
+            !copied.load(Ordering::Relaxed),
+            "current copy was pruned and recopied"
+        );
+        assert_eq!(fs::read(reused).unwrap(), b"current");
+    }
+
+    #[test]
+    fn pruning_runs_at_most_once() {
+        let scratch = fixture("prune-once");
+        let built = source(&scratch, "target/debug/ck-probe", b"current");
+        let once = OnceLock::new();
+        let published = publish_pruning_once(&built, &once);
+        let old = published
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("0000000000000000");
+        fs::create_dir(&old).unwrap();
+        age_directory(&old);
+        publish_pruning_once(&built, &once);
+        assert!(old.is_dir(), "a second publish pruned again");
+        publish_pruning_once(&built, &OnceLock::new());
+        assert!(
+            !old.exists(),
+            "fresh prune control did not remove the old copy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_does_not_follow_directory_symlinks() {
+        let scratch = fixture("prune-symlink");
+        let built = source(&scratch, "target/debug/ck-probe", b"current");
+        let cache = exec_root(&built).join("ckdev-exec");
+        fs::create_dir_all(&cache).unwrap();
+        let outside = scratch.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"outside cache").unwrap();
+        age_directory(&outside);
+        let link = cache.join("0000000000000000");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        publish_pruning_once(&built, &OnceLock::new());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside cache");
+    }
+
+    #[test]
+    fn pruning_failures_do_not_prevent_publication() {
+        let scratch = fixture("prune-failure");
+        let built = source(&scratch, "target/debug/ck-probe", b"current");
+        let cache = exec_root(&built).join("ckdev-exec");
+        let old = cache.join("0000000000000000");
+        fs::create_dir_all(&old).unwrap();
+        age_directory(&old);
+        BEFORE_PRUNE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|path| {
+                // Another pruner wins the rename, so our rename must fail harmlessly.
+                fs::remove_dir(path).unwrap();
+            }));
+        });
+        let published = publish_pruning_once(&built, &OnceLock::new());
+        BEFORE_PRUNE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(fs::read(published).unwrap(), b"current");
+    }
+
+    #[test]
+    fn publication_recovers_when_pruned_during_copy() {
+        let scratch = fixture("prune-copy-race");
+        let built = source(&scratch, "target/debug/ck-probe", b"complete executable");
+        let pruned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = pruned.clone();
+        AFTER_COPY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |temporary| {
+                if !observed.swap(true, Ordering::Relaxed) {
+                    let directory = temporary.parent().unwrap();
+                    #[cfg(unix)]
+                    let directory = directory.parent().unwrap();
+                    age_directory(directory);
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| {
+                                prune_copies(
+                                    directory.parent().unwrap(),
+                                    Path::new(""),
+                                    SystemTime::now(),
+                                );
+                                assert!(!directory.exists());
+                            })
+                            .join()
+                            .unwrap();
+                    });
+                }
+            }));
+        });
+        let published = publish_pruning_once(&built, &OnceLock::new());
+        AFTER_COPY.with(|hook| *hook.borrow_mut() = None);
+        assert!(pruned.load(Ordering::Relaxed), "copy race was not reached");
+        assert_eq!(fs::read(published).unwrap(), b"complete executable");
+    }
+
+    #[test]
+    fn concurrent_launch_recovers_after_pruning() {
+        let scratch = fixture("prune-launch-race");
+        let built = scratch.join(format!("ck-probe{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(std::env::current_exe().unwrap(), &built).unwrap();
+        let published = ckdev_binary(&built, &scratch);
+        let directory = published.parent().unwrap();
+        age_directory(directory);
+        let inspected = Arc::new(Barrier::new(2));
+        let reused = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let (pruner_inspected, pruner_reused) = (inspected.clone(), reused.clone());
+            let pruner = scope.spawn(|| {
+                BEFORE_PRUNE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |_| {
+                        pruner_inspected.wait();
+                        pruner_reused.wait();
+                    }));
+                });
+                prune_copies(
+                    directory.parent().unwrap(),
+                    Path::new(""),
+                    SystemTime::now(),
+                );
+                BEFORE_PRUNE.with(|hook| *hook.borrow_mut() = None);
+            });
+            inspected.wait();
+            let mut command = ckdev_command(&built, &scratch);
+            reused.wait();
+            pruner.join().unwrap();
+            assert_eq!(
+                command.arg("--list").output().unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            let recreated = ckdev_binary(&built, &scratch);
+            assert_eq!(recreated, published);
+            let output =
+                retry_executable_file_busy(|| Command::new(&recreated).arg("--list").output())
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("ckdev::tests::concurrent_launch_recovers_after_pruning: test"));
+        });
     }
 
     #[test]
