@@ -7097,15 +7097,28 @@ new = "self.resolved = true;\n        {\n            let mut slots = self.inner.
 [[control]]
 id = "ckdev-exec-internal-disk"
 platforms = ["macos"]
-guards = "on macOS, executables a rig launches are published under /tmp/broca-exec on the internal disk, never under the build folder"
+guards = "on macOS, published executables follow TMPDIR when present or use /tmp, stay outside Cargo's build tree, and never resolve onto /Volumes"
 runner = "cargo"
 package = "broca-test-support"
 target = "--lib"
 test_file = "crates/broca-test-support/src/ckdev.rs"
 expect_red = ["ckdev::tests::macos_publishes_outside_the_build_on_the_internal_disk"]
 file = "crates/broca-test-support/src/ckdev.rs"
-old = '    if cfg!(target_os = "macos") {'
-new = '    if false && cfg!(target_os = "macos") { // NON-VACUITY BREAK: publish under the build folder'
+old = '        macos_exec_root(std::env::var_os("TMPDIR"))'
+new = '        profile_directory(_binary) // NON-VACUITY BREAK: publish under the build folder'
+
+[[control]]
+id = "ckdev-exec-target-directory"
+platforms = ["macos"]
+guards = "on macOS, reject executable roots that resolve inside Cargo's target directory, including paths reached through symlinks"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+test_file = "crates/broca-test-support/src/ckdev.rs"
+expect_red = ["ckdev::tests::macos_publishes_outside_the_build_on_the_internal_disk"]
+file = "crates/broca-test-support/src/ckdev.rs"
+old = '        macos_exec_root(std::env::var_os("TMPDIR"))'
+new = '        std::env::current_exe().expect("test executable").ancestors().nth(3).expect("Cargo target directory").join("broca-exec") // NON-VACUITY BREAK: publish in Cargo target directory'
 
 [[control]]
 id = "anthropic-policy-beta-dedupe"
