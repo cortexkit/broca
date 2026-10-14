@@ -9164,3 +9164,16 @@ expect_red = ["transport::tests::gemini_errors::gemini_and_codeassist_in_band_er
 file = "crates/broca-provider/src/families/gemini.rs"
 old = 'if let Some(error) = v.get("error").filter(|error| error.is_object()) {'
 new = 'if let Some(error) = v.get("error").filter(|error| error.get("status").and_then(Value::as_str) == Some("INVALID_ARGUMENT") /* NON-VACUITY BREAK */) {'
+
+[[control]]
+id = "chatgpt-upstream-key-safe-diagnostic"
+guards = "ChatGPT upstream-key 401 diagnostics retain safe status and code without raw keys or response-body tails"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::chatgpt_upstream_key_diagnostic_does_not_copy_body"]
+file = "crates/broca-provider/src/transport.rs"
+old = "the account's OAuth token, not a key); not a credential failure.\""
+new = "the account's OAuth token, not a key); not a credential failure. body: {body}\" /* NON-VACUITY BREAK */"

@@ -3185,8 +3185,8 @@ fn classify_chatgpt_upstream_key_rejection(
         refusal: None,
         class: ErrorClass::Transient,
         message: format!(
-            "{status}: the ChatGPT backend rejected an OpenAI API key on its own side (broca sent \
-             the account's OAuth token, not a key); not a credential failure. body: {body}"
+            "{status}: {CHATGPT_UPSTREAM_KEY_REJECTED}: the ChatGPT backend rejected an OpenAI API key on its own side (broca sent \
+             the account's OAuth token, not a key); not a credential failure."
         ),
         status: Some(status),
         retry_after_secs: error.retry_after_secs,
@@ -7381,6 +7381,32 @@ mod tests {
         .await
         .expect_err("aggregate stream above the per-step limit must be rejected");
         assert_eq!(error.error.class, ErrorClass::Transient);
+    }
+
+    #[test]
+    fn chatgpt_upstream_key_diagnostic_does_not_copy_body() {
+        use super::{classify_chatgpt_upstream_key_rejection, CHATGPT_UPSTREAM_KEY_REJECTED};
+        let marker = "PRIVATE_BODY_TAIL";
+        let body = serde_json::json!({"error": {
+            "message": format!("Incorrect API key provided: sk-private-key. {}{marker}", "x".repeat(600)),
+            "code": "invalid_api_key"
+        }}).to_string();
+        assert!(body.find(marker).unwrap() > 512);
+        let error = classify_chatgpt_upstream_key_rejection(
+            WireFamilyId::OpenAiResponsesChatgpt,
+            401,
+            &body,
+            classify_http_error(401, &body, None, None),
+        );
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert_eq!(error.status, Some(401));
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some(CHATGPT_UPSTREAM_KEY_REJECTED)
+        );
+        assert!(!error.message.contains(marker));
+        assert!(!error.message.contains("sk-"));
+        assert!(error.message.contains("not a credential failure"));
     }
 
     /// The ChatGPT backend's own rejected API key, captured live, is transient and never an
