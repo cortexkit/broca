@@ -10369,3 +10369,16 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "                    answer_poll.completed(now(control));"
 new = "                    answer_poll.completed(now(control)); answer_poll.next = now(control).saturating_add(10000); // NON-VACUITY BREAK: oversleep answer arrival in the real waiter"
+
+[[control]]
+id = "serve-exit-does-not-join-unrelated-blocking-jobs"
+guards = "process exit explicitly joins durability but does not wait for unrelated blocking tasks"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["runtime_shutdown_tests::runtime_exit_joins_durability_but_not_unrelated_blocking_jobs"]
+select = "expected"
+file = "crates/broca-module-serve/src/main.rs"
+old = "    runtime.shutdown_background();"
+new = "    drop(runtime); // NON-VACUITY BREAK: implicitly join every blocking task"
