@@ -2059,6 +2059,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
     }
 
+    fn finish_restart_waiters(&mut self, result: Result<(), String>) {
+        for reply in std::mem::take(&mut self.restart_waiters) {
+            let _ = reply.send(result.clone());
+        }
+    }
+
     async fn recover_durable_work(&mut self) -> Result<(), String> {
         if self.wal_store.check_move(&self.key, true).is_err() {
             return Ok(());
@@ -2137,15 +2143,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .await;
             match result {
                 Ok(_) => {
-                    for reply in std::mem::take(&mut self.restart_waiters) {
-                        let _ = reply.send(Ok(()));
-                    }
+                    self.finish_restart_waiters(Ok(()));
                     tracing::info!(target: "lifecycle", "restart resume: resumed run '{}' in session '{}'", episode_run_id.0, self.key.session);
                     return Ok(());
                 }
                 Err(StartRunFailure::Shutdown) => {
                     // Sealing, not dependency refusal, interrupted this boot admission. Keep
                     // the active task owned so the normal shutdown path aborts and joins it.
+                    self.finish_restart_waiters(Err(
+                        "shutdown interrupted restart admission".into()
+                    ));
                     return Ok(());
                 }
                 Err(error) => {
@@ -2162,17 +2169,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         account_ref: None,
                         credential_id: None,
                     };
-                    self.write_interrupted_seal_with_error(
-                        None,
-                        SealCause::CrashOrphan,
-                        Some(refusal),
-                    )
-                    .await?;
-                    tracing::info!(target: "lifecycle", "restart resume: sealed run '{}' interrupted in session '{}': {error}", episode_run_id.0, self.key.session);
-                    self.refresh_admission_view().await?;
-                    for reply in std::mem::take(&mut self.restart_waiters) {
-                        let _ = reply.send(Ok(()));
+                    let sealed = async {
+                        self.write_interrupted_seal_with_error(
+                            None,
+                            SealCause::CrashOrphan,
+                            Some(refusal),
+                        )
+                        .await?;
+                        self.refresh_admission_view().await
                     }
+                    .await;
+                    if let Err(seal_error) = sealed {
+                        self.finish_restart_waiters(Err(seal_error.clone()));
+                        return Err(seal_error);
+                    }
+                    tracing::info!(target: "lifecycle", "restart resume: sealed run '{}' interrupted in session '{}': {error}", episode_run_id.0, self.key.session);
+                    self.finish_restart_waiters(Ok(()));
                     return self.drain_queue_one().await;
                 }
             }
@@ -3789,22 +3801,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
             tokio::select! {
                 _ = expiry => {
                     if self.retention_deadline.is_some_and(|deadline| deadline <= expiry_clock.now_ms()) {
-                        let records = self.read_wal_framed_records().await.map_err(StartRunFailure::Infrastructure)?;
+                        let records = match self.read_wal_framed_records().await {
+                            Ok(records) => records,
+                            Err(error) => break Err(StartRunFailure::Infrastructure(error)),
+                        };
                         self.retention_deadline = crate::retention::policy(&records).and_then(|(_, _, deadline)| deadline);
                         if self.retention_deadline.is_none_or(|deadline| deadline > expiry_clock.now_ms()) { admission_expiry = None; continue; }
                         // Waiting for a dependency writes no durable send and cannot extend expiry.
                         // Stop that task before closing the writer so it cannot append into
                         // an expired file after a fresh lineage has acquired the lease.
-                        if let Some(RunState::Active { handle, .. }) = pending_active.take() { handle.abort(); let _ = handle.await; }
-                        return Err(StartRunFailure::Expired);
+                        break Err(StartRunFailure::Expired);
                     }
                 }
                 _ = expiry_changes.changed() => {},
                 _ = seal.cancelled(), if restart_resuming => {
-                    self.restart_admitting = false;
-                    return Err(StartRunFailure::Shutdown);
+                    break Err(StartRunFailure::Shutdown);
                 }
-                admission = &mut admit_rx => break admission,
+                admission = &mut admit_rx => break match admission {
+                    Ok(Ok(id)) => Ok(id),
+                    Ok(Err(error)) => Err(StartRunFailure::Admission(error)),
+                    Err(_) => Err(StartRunFailure::Infrastructure("run ended before admission".into())),
+                },
                 Some(command) = self.rx.recv(), if restart_resuming => {
                     Box::pin(self.handle_cmd(command)).await;
                 }
@@ -3813,20 +3830,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         self.restart_admitting = false;
         // A dropped acknowledgement means execution ended before the durable admission point.
         let admitted_run_id = match admission {
-            Ok(Ok(id)) => id,
-            Ok(Err(error)) => {
-                if restart_resuming {
+            Ok(id) => id,
+            // Shutdown leaves the restart task in self.state so seal_for_shutdown
+            // can stop and join it before durably recording the episode's end.
+            Err(StartRunFailure::Shutdown) => return Err(StartRunFailure::Shutdown),
+            Err(error) => {
+                if let Some(RunState::Active { handle, .. }) = pending_active.take() {
+                    handle.abort();
+                    let _ = handle.await;
+                } else {
+                    self.stop_active_run().await;
                     self.set_idle();
                 }
-                return Err(StartRunFailure::Admission(error));
-            }
-            Err(_) => {
-                if restart_resuming {
-                    self.set_idle();
-                }
-                return Err(StartRunFailure::Infrastructure(
-                    "run ended before admission".into(),
-                ));
+                return Err(error);
             }
         };
 
@@ -5243,6 +5259,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// appends. The registry returns false at its total deadline; process exit then ends those
     /// tasks and threads and leaves the WAL authoritative for the next boot's recovery.
     async fn seal_for_shutdown(&mut self) {
+        self.finish_restart_waiters(Err("shutdown interrupted restart admission".into()));
         let seal_deadline = tokio::time::Instant::now() + SHUTDOWN_SEAL_BOUND;
         let active = matches!(self.state, RunState::Active { .. });
         let mut sealed_attempt = None;
@@ -9085,6 +9102,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     include!("cancel_lifecycle_tests.rs");
+    include!("admission_lifecycle_tests.rs");
 }
 
 #[cfg(test)]

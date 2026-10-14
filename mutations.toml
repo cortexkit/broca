@@ -9394,3 +9394,48 @@ old = '''                tracing::warn!(target: "lifecycle", "cancel lifecycle r
                 return CancelOutcome::Error(error);'''
 new = '''                tracing::warn!(target: "lifecycle", "cancel lifecycle resolution failed: {error}");
                 return CancelOutcome::NotActive; // NON-VACUITY BREAK: turn failed lookup into absence.'''
+
+[[control]]
+id = "admission-expiry-failure-joins-attempt"
+guards = "an expiry read failure cannot detach a nonrestart executor before later admission"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/admission_lifecycle_tests.rs"
+expect_red = ["actor::tests::expiry_read_failure_joins_nonrestart_admission_before_next_attempt"]
+file = "crates/broca-module/src/actor.rs"
+old = '''                if let Some(RunState::Active { handle, .. }) = pending_active.take() {
+                    handle.abort();
+                    let _ = handle.await;'''
+new = '''                if let Some(RunState::Active { handle, .. }) = pending_active.take() {
+                    drop(handle); // NON-VACUITY BREAK: detach the executor on failed admission.'''
+
+[[control]]
+id = "restart-waiter-shutdown-is-explicit-error"
+guards = "queued restart waiters receive an explicit failure on shutdown instead of sender disappearance"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/admission_lifecycle_tests.rs"
+expect_red = ["actor::tests::queued_restart_waiter_receives_explicit_error_on_shutdown"]
+file = "crates/broca-module/src/actor.rs"
+old = '''    fn finish_restart_waiters(&mut self, result: Result<(), String>) {
+        for reply'''
+new = '''    fn finish_restart_waiters(&mut self, result: Result<(), String>) {
+        if result.as_ref().is_err_and(|error| error.contains("shutdown")) { return; } // NON-VACUITY BREAK
+        for reply'''
+
+[[control]]
+id = "restart-waiter-seal-failure-is-explicit-error"
+guards = "failed restart refusal sealing resolves waiters even while the actor remains live"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/admission_lifecycle_tests.rs"
+expect_red = ["actor::tests::queued_restart_waiter_receives_explicit_error_on_failed_seal"]
+file = "crates/broca-module/src/actor.rs"
+old = '                        self.finish_restart_waiters(Err(seal_error.clone()));'
+new = '                        // NON-VACUITY BREAK: keep restart waiters pending after failed sealing.'
