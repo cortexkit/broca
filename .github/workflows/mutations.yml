@@ -80,7 +80,7 @@ jobs:
           path: ${{ runner.temp }}/fixtures
       - name: Unpack pinned fixtures
         shell: bash
-        run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" -C "$GITHUB_WORKSPACE"
+        run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" "$GITHUB_WORKSPACE"
       - name: Cargo cache telemetry
         shell: bash
         run: echo "Mutation cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
@@ -178,7 +178,7 @@ jobs:
           path: ${{ runner.temp }}/fixtures
       - name: Unpack pinned fixtures
         shell: bash
-        run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" -C "$GITHUB_WORKSPACE"
+        run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" "$GITHUB_WORKSPACE"
       - name: Cargo cache telemetry
         shell: bash
         run: echo "Mutation cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"

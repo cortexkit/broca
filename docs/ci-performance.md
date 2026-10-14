@@ -155,7 +155,7 @@ runs before archiving. Each shard executes the clock sentinel additionally:
 four shards cover the original integration inventory plus four clock proofs.
 Library/binary tests stay in libtest and doctests retain independent discovery.
 
-Lint (native Linux and Windows), scripts, Postgres, archive compilation, and
+Lint (native Linux and Windows), scripts, archive compilation, and
 fixture compilation start independently. Real Linux release/deployment runs in
 its own lane. Required `Test (ubuntu)` / `Test (windows)` status names now
 aggregate **all** these lanes and refuse failure, cancellation, and skipping.
@@ -212,8 +212,8 @@ It requests 8 vCPUs and runs fmt, Linux and Windows-GNU-target workspace/all-
 target clippy, lib/bin tests with **`--no-fail-fast`**, and portable integrations.
 `broca-provider/live`, `broca-catalog/live`, and
 `broca-module-serve/test-clock` remain enabled, so lint checks the transport and
-retention-clock code as well as the default code. Five fixture-dependent unit
-tests are explicitly excluded:
+retention-clock code as well as the default code. Before the newer-master merge,
+five fixture-dependent unit tests were explicitly excluded:
 
 - `executor::tests::session_close_releases_hook_and_compaction_routes` checks
   route cleanup against a real subconscious daemon.
@@ -221,7 +221,8 @@ tests are explicitly excluded:
   enrollment wire contract with the vault checkout's fixture.
 - The three `broca-store-postgres` tests for batched projection, export-writer
   locking and store conformance require a live database; they run in the
-  Docker-backed Postgres CI lane.
+  historical Docker-backed Postgres CI lane. Newer master deleted that backend,
+  so the current selector retains only the first two unit exclusions.
 
 The remaining unit inventory is printed,
 then actual libtest execution counts (including exclusions and ignores) are
@@ -235,8 +236,9 @@ of this cheap preflight: `broca-subc` session/resume/tool-fault daemon proofs,
 serve conformance and
 scope-daemon targets, the real-module/daemon/vault families, real-daemon plan
 admission proofs, and aimock provider families. **All still run in CI and the
-Mac pre-merge gate**, with the original fixture requirements. Doctests, scripts,
-Postgres and native Windows execution remain separate full CI lanes. The Mac
+Mac pre-merge gate**, with the original fixture requirements. Doctests stay in
+the lib/bin jobs; scripts have an independent job. Native Windows execution
+remains a separate full CI lane. The Mac
 gate continues exercising native Mac daemon/vault/mock variants; Linux CI
 covers their Linux variants, not native signing, Gatekeeper or Mac facilities.
 
@@ -307,3 +309,45 @@ fixture-independent and publish their exclusions, not manufacture passing skips.
 Version before CI and tag the verified commit; keep staging separate from the
 approval boundary for restart. No larger runner or quantified larger-runner
 speedup is asserted without a controlled measurement.
+
+## Probe reconciliation with newer master
+
+The first real probe tests **8cce024bdcece162948862764b8d7733885a6124** on
+`train/ci-perf-probe`, merging the implementation tip with newer master. Its
+upstream changes include Windows retention fixes, the test-clock configuration
+fix, a Windows `setsid` fallback, and **deletion of the PostgreSQL backend**.
+That probe merge removed the obsolete Postgres CI job and aggregate dependency
+because its upstream master no longer contains the backend.
+The historical measurements above retain that lane; its removal is an upstream
+product change, not a performance tradeoff. The portable selector and workflow
+self-tests now follow that updated package inventory.
+
+Probe run [38563395563](https://github.com/cortexkit/broca/actions/runs/38563395563)
+exposed a prerequisite hidden by the old serial job: the independent script
+lane's offline dependency-graph check lacked Cargo's pinned git sources. It
+failed after **6 s**, naming `test_dependency_graph_stays_transport_free` and
+the unavailable offline tungstenite checkout. The script lane now installs the
+same Rust toolchain and prefetches **`cargo fetch --locked`**, with its own
+dependency cache, before the unchanged offline checks. It still starts without
+waiting behind compilation or tests. No check was relaxed to make that probe
+pass.
+
+The failed probe finished in **772 s (12:52)**, versus the private green
+baseline median **2,026 s (33:46)**. This is **not a green speedup claim**:
+Windows consumers stopped before executing tests. GNU tar interpreted the
+native `D:` archive path as a remote host (`Cannot connect to D`). All fixture
+consumers now use a shared unpack helper that converts Windows paths with
+`cygpath`; Linux extraction and executable permissions are unchanged. Tests
+extract a real tiny archive through both paths and reject conversion failure.
+
+Completed first-probe stages: Linux/Windows archives **223 / 408 s**, native
+lint **88 / 187 s**, Linux/Windows fixture producers **96 / 224 s**, Linux
+lib/bin/doc **200 s**, and real Linux deployment **267 s**. The four Linux
+integration shards passed **354 + 379 + 372 + 340 = 1,445 tests**, plus four
+executed clock proofs; independent archive inventories agreed at **1,449**
+(four ignored). Windows archive inventories agreed at **1,390**, but execution
+coverage was **zero** because unpacking failed. Archive/unit caches were cold
+and both fixture lookups missed. The first critical path was the Windows
+archive (**6:48**) followed by Linux shard 2 (**5:50**, including **297.768 s** of
+test execution). A corrected train must finish successfully before its timings
+can be reported as a green CI speedup or its warm-cache hit rate measured.

@@ -184,7 +184,7 @@ class TestClockGate(unittest.TestCase):
         self.assertIn(SENTINEL, shard_gate)
         self.assertIn("test-clock sentinel did not execute successfully", shard_gate)
         # The suite list lives in scripts/script-suites.sh, which CI and the local gate call.
-        self.assertIn("scripts/script-suites.sh", jobs["scripts"]["steps"][2]["run"])
+        self.assertTrue(any(step.get("run") == "scripts/script-suites.sh" for step in jobs["scripts"]["steps"]))
         suites = (ROOT / "scripts/script-suites.sh").read_text()
         self.assertIn("scripts/tests/test_clock_safety.py", suites)
 

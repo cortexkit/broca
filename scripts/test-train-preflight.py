@@ -41,13 +41,13 @@ elif '--list' in args:
     if os.environ.get('LIST_EXIT'):
         print('fixture list compilation failed')
         sys.exit(int(os.environ['LIST_EXIT']))
-    for name in ('fixture_unit', 'executor::tests::session_close_releases_hook_and_compaction_routes', 'vault::tests::list_scoped_strict_mirror_matches_claustrum_tip', 'tests::batched_projection_crosses_boundaries_and_updates_conflicts', 'tests::export_writers_lock_before_allocating_sequences', 'tests::postgres_store_conformance'):
+    for name in ('fixture_unit', 'executor::tests::session_close_releases_hook_and_compaction_routes', 'vault::tests::list_scoped_strict_mirror_matches_claustrum_tip'):
         print(name + ': test')
 elif '--version' in args: print('fixture cargo 1.99 / nextest 0.9')
 elif args[0] == 'test':
     count = 0 if os.environ.get('ZERO_UNITS') else 1
     if os.environ.get('PASSING_SKIP'): print('SKIP fixture_arm: daemon absent')
-    print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.01s')
+    print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s')
     sys.exit(int(os.environ.get('UNIT_EXIT', '0')))
 '''
 
@@ -142,7 +142,7 @@ sys.exit(int(os.environ.get('MOTOR_EXIT', '0')))
         self.assertTrue(any(c[:2] == ['nextest', 'run'] for c in commands))
         unit_run = next(c for c in commands if c[0] == 'test' and '--list' not in c)
         self.assertIn('--no-fail-fast', unit_run)
-        self.assertEqual(unit_run.count('--skip'), 5)
+        self.assertEqual(unit_run.count('--skip'), 2)
         self.assertIn('lib/bin executed=1', result.stdout)
         self.assertIn('integration executed=1', result.stdout)
         self.assertIn('excluded=1', result.stdout)

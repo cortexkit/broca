@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise archive/shard guards and the workflow dependency graph without compiling."""
 import json
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tarfile
 import unittest
 
 import yaml
@@ -110,10 +112,17 @@ class WorkflowGraph(unittest.TestCase):
 
     def test_portable_lanes_start_without_waiting_for_tests(self):
         jobs = self.workflow('ci.yml')['jobs']
-        for name in ('lint', 'scripts', 'postgres-conformance', 'integration-build', 'fixtures'):
+        for name in ('lint', 'scripts', 'integration-build', 'fixtures'):
             self.assertNotIn('needs', jobs[name], name)
         self.assertEqual(jobs['integration']['strategy']['matrix']['shard'], ['1', '2', '3', '4'])
         self.assertEqual(jobs['integration']['strategy']['matrix']['os'], ['ubuntu', 'windows'])
+
+    def test_scripts_prefetch_locked_dependencies_before_offline_suites(self):
+        steps = self.workflow('ci.yml')['jobs']['scripts']['steps']
+        fetch = next(i for i, step in enumerate(steps) if step.get('run') == 'cargo fetch --locked')
+        suites = next(i for i, step in enumerate(steps) if step.get('run') == 'scripts/script-suites.sh')
+        self.assertLess(fetch, suites)
+        self.assertTrue(any(step.get('uses', '').startswith('dtolnay/rust-toolchain@') for step in steps[:fetch]))
 
     def test_fixtures_are_pinned_and_shared_without_changing_mutation_selection(self):
         fixtures = self.workflow('fixtures.yml')['jobs']['fixtures']
@@ -149,6 +158,58 @@ class WorkflowGraph(unittest.TestCase):
             run = subprocess.run(['bash', '-c', script], env={**os.environ, 'NEEDS_JSON': json.dumps(lanes)},
                                  text=True, capture_output=True, timeout=5)
             self.assertEqual(run.returncode == 0, result == 'success', run.stdout + run.stderr)
+
+
+class FixtureUnpack(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-fixture-unpack-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.archive = self.root / 'archive with spaces.tar.gz'
+        self.destination = self.root / 'destination with spaces'
+        self.destination.mkdir()
+        content = b'#!/bin/sh\nexit 0\n'
+        with tarfile.open(self.archive, 'w:gz') as tar:
+            member = tarfile.TarInfo('fixtures/bin/ck')
+            member.mode = 0o755
+            member.size = len(content)
+            tar.addfile(member, io.BytesIO(content))
+        bins = self.root / 'bin'
+        bins.mkdir()
+        cygpath = bins / 'cygpath'
+        cygpath.write_text(r'''#!/usr/bin/env python3
+import os, sys
+assert sys.argv[1] == '-u'
+assert sys.argv[2].startswith('D:'), 'must translate the original native drive path'
+if os.environ.get('CYGPATH_EXIT'): sys.exit(int(os.environ['CYGPATH_EXIT']))
+print(os.environ['TEST_ARCHIVE'] if sys.argv[2].endswith('.tar.gz') else os.environ['TEST_DESTINATION'])
+''')
+        cygpath.chmod(0o755)
+        self.env = {**os.environ, 'PATH': f'{bins}:{os.environ["PATH"]}',
+                    'TEST_ARCHIVE': str(self.archive), 'TEST_DESTINATION': str(self.destination)}
+
+    def run_unpack(self, os_name, **env):
+        archive, destination = ((r'D:\temp\fixtures.tar.gz', r'D:\workspace') if os_name == 'Windows'
+                                else (str(self.archive), str(self.destination)))
+        return subprocess.run(['bash', str(ROOT / 'scripts/unpack-fixtures.sh'), archive, destination],
+                              env={**self.env, 'RUNNER_OS': os_name, **env}, text=True, capture_output=True, timeout=10)
+
+    def test_linux_archive_extracts_with_executable_permissions(self):
+        result = self.run_unpack('Linux')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        binary = self.destination / 'fixtures/bin/ck'
+        self.assertEqual(binary.read_bytes(), b'#!/bin/sh\nexit 0\n')
+        self.assertTrue(os.access(binary, os.X_OK))
+
+    def test_windows_drive_paths_are_converted_before_tar(self):
+        result = self.run_unpack('Windows')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.destination / 'fixtures/bin/ck').exists())
+
+    def test_path_conversion_failure_refuses_without_extraction(self):
+        result = self.run_unpack('Windows', CYGPATH_EXIT='17')
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertFalse((self.destination / 'fixtures/bin/ck').exists())
 
 
 if __name__ == '__main__':

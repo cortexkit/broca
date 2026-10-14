@@ -85,6 +85,15 @@ jobs:
           persist-credentials: false
       - name: Train preconditions
         run: python3 scripts/check-train-preconditions.py
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: scripts
+          cache-on-failure: 'true'
+      # Dependency graph suites deliberately use --offline. Fetch their pinned
+      # sources here; an independent job cannot borrow another job's Cargo home.
+      - name: Prefetch locked dependencies for offline script checks
+        run: cargo fetch --locked
       - name: Operator script suites and deploy/export self-tests
         run: scripts/script-suites.sh
       - name: Verify clean worktree
@@ -178,7 +187,7 @@ jobs:
         with:
           name: fixtures-${{ runner.os }}
           path: ${{ runner.temp }}/fixtures
-      - run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" -C "$GITHUB_WORKSPACE"
+      - run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" "$GITHUB_WORKSPACE"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: integration-${{ matrix.os }}
@@ -212,7 +221,7 @@ jobs:
         with:
           name: fixtures-Linux
           path: ${{ runner.temp }}/fixtures
-      - run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-Linux.tar.gz" -C "$GITHUB_WORKSPACE"
+      - run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-Linux.tar.gz" "$GITHUB_WORKSPACE"
       - name: Real Linux ELF deployment under subc
         env:
           SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
@@ -302,7 +311,7 @@ jobs:
           path: ${{ runner.temp }}/fixtures
       - name: Unpack pinned fixtures
         shell: bash
-        run: tar -xzf "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" -C "$GITHUB_WORKSPACE"
+        run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-$RUNNER_OS.tar.gz" "$GITHUB_WORKSPACE"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: cargo-cache
         with:
