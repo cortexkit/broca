@@ -218,7 +218,7 @@ async fn import_materializes_paged_history_and_retry_is_idempotent() {
         "retry must not append or duplicate the import"
     );
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -242,7 +242,7 @@ async fn repaired_dangling_import_projection_matches_final_wal() {
     )
     .await
     .expect("create source import");
-    source_writer.shutdown().await;
+    let _ = source_writer.shutdown().await;
     let dangling_start = source_wal
         .read_records(&session)
         .expect("read source import")
@@ -298,7 +298,7 @@ async fn repaired_dangling_import_projection_matches_final_wal() {
         full_replay_page(&wal_store, &session, 0, 100)
     );
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -326,7 +326,7 @@ async fn import_repair_keeps_a_gated_dangling_seed_byte_for_byte() {
     )
     .await
     .expect("create source import");
-    source_writer.shutdown().await;
+    let _ = source_writer.shutdown().await;
     let dangling_start = source_wal
         .read_records(&session)
         .expect("read source import")
@@ -361,7 +361,7 @@ async fn import_repair_keeps_a_gated_dangling_seed_byte_for_byte() {
     )
     .await
     .expect("repair the dangling seed and import");
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 
     let after = std::fs::read(&path).unwrap();
     assert!(

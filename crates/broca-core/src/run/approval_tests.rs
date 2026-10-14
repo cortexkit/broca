@@ -459,7 +459,7 @@ impl Rig {
         self.tools.store.read_records(&self.bind).unwrap()
     }
     async fn finish(self) {
-        self.writer.shutdown().await;
+        let _ = self.writer.shutdown().await;
         std::fs::remove_dir_all(self.root).unwrap();
     }
 }
@@ -1182,7 +1182,7 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
                 ..
             }
         )));
-    cut_writer.shutdown().await;
+    let _ = cut_writer.shutdown().await;
     rig.finish().await;
 }
 #[cfg(feature = "test-clock")]
@@ -1832,7 +1832,7 @@ async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
     );
     assert!(tools.sent.lock().unwrap().is_empty());
     assert_eq!(tools.store.read_records(&rig.bind).unwrap(), before);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     rig.finish().await;
 }
 

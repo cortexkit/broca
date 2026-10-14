@@ -1050,6 +1050,6 @@ mod reply_tests {
                 CompactionDisposition::SupersededRequest
             );
         }
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }

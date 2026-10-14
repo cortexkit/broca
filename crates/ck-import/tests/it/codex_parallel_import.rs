@@ -38,7 +38,7 @@ async fn parallel_codex_tools_import_without_synthesizing_or_dropping_results() 
     .unwrap();
     assert_eq!(outcome.synthesized_tool_results, 0);
     assert_eq!(outcome.dropped_orphan_tool_results, 0);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 
     let records = store
         .read_records(&session)

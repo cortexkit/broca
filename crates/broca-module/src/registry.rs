@@ -4195,7 +4195,7 @@ mod tests {
             "idle read: cache-covered candidate without identity support takes a fresh bounded proof"
         );
 
-        Arc::try_unwrap(writer)
+        let _ = Arc::try_unwrap(writer)
             .unwrap_or_else(|_| panic!("test owns the only writer handle"))
             .shutdown()
             .await;

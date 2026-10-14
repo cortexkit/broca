@@ -112,7 +112,7 @@ async fn import_replays_idle_and_is_idempotent() {
         state.prompt
     );
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -134,7 +134,7 @@ async fn dangling_import_is_interrupted_then_repaired_and_tool_pairs_are_normali
     )
     .await
     .expect("source import");
-    source_writer.shutdown().await;
+    let _ = source_writer.shutdown().await;
     let started = source_store
         .read_records(&source_session)
         .expect("read source")
@@ -224,7 +224,7 @@ async fn dangling_import_is_interrupted_then_repaired_and_tool_pairs_are_normali
     assert_eq!(result.tool_call_id, call_id);
     assert!(result.is_error);
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(source_root);
 }
@@ -318,7 +318,7 @@ async fn materialized_import_prefix_merges_with_a_following_episode_tail() {
     assert_eq!(merged.prompt, full.prompt);
     assert_eq!(merged.resolution, full.resolution);
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -338,7 +338,7 @@ async fn repair_retry_survives_a_crash_after_every_repair_record() {
     )
     .await
     .expect("create complete import records");
-    source_writer.shutdown().await;
+    let _ = source_writer.shutdown().await;
     let complete_records: Vec<_> = source_store
         .read_records(&source_session)
         .expect("read source")
@@ -409,7 +409,7 @@ async fn repair_retry_survives_a_crash_after_every_repair_record() {
         let mut expected = imported.clone();
         broca_protocol::content::stamp_ordinals(&mut expected);
         assert_eq!(state.prompt, expected, "repair cut {cut}");
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
     let _ = std::fs::remove_dir_all(source_root);
@@ -609,7 +609,7 @@ async fn import_rejects_an_empty_canonical_message_with_its_ordinal() {
     );
     assert!(store.read_records(&session).expect("read WAL").is_empty());
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -667,7 +667,7 @@ async fn duplicate_tool_call_ids_are_tracked_as_a_multiset() {
         .count();
     assert_eq!(result_count, 2);
 
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
 

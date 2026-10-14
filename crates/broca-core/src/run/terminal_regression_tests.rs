@@ -226,7 +226,7 @@ async fn budget_finalize_args_cut_closes_steer_inbox_before_terminal() {
         .unwrap()
         .iter()
         .any(|frame| matches!(frame.record, WalRecord::Steered { .. })));
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
 }
 
 #[tokio::test]
@@ -287,7 +287,7 @@ async fn size_refusal_closes_steer_inbox_before_terminal() {
         .unwrap()
         .iter()
         .any(|frame| matches!(frame.record, WalRecord::Steered { .. })));
-    Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
 }
 
 #[tokio::test]
@@ -348,5 +348,5 @@ async fn size_refusal_already_durable_owned_return_closes_steer_inbox() {
         2,
         "no steer or replacement terminal"
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }

@@ -2022,7 +2022,7 @@ async fn check_held_attempt_durability(outcome: broca_protocol::AttemptOutcome, 
     assert_eq!(result.unwrap().reason, RunFinishReason::Completed);
     drop(tx);
     collector.await.unwrap();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     assert_eq!(
         wal.sync_calls(),
         provider.baseline_syncs.load(Ordering::SeqCst) + 1 + usize::from(expect_sync),
@@ -3805,7 +3805,7 @@ async fn prior_frames_snapshot_skips_reconstruct_read() {
         1,
         "core reconstruction reused the executor snapshot instead of reading the WAL again"
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -3862,7 +3862,7 @@ async fn stale_prior_frames_fall_back_to_reconstruct_read() {
         2,
         "stale snapshot forced one fresh reconstruct read"
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
 

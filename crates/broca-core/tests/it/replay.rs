@@ -1714,7 +1714,7 @@ async fn drive_with_admission(
     .await;
     drop(tx);
     collector.await.unwrap();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let admitted = admit_rx.await.expect("admission ack fired");
     (result, admitted)
 }
@@ -2710,7 +2710,7 @@ async fn append_episode_with_different_system_fails_before_admission_and_persist
     .await;
     drop(tx);
     collector.await.unwrap();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let admitted = admit_rx.await.expect("admission ack fired");
 
     assert!(matches!(result, Err(RunError::SystemPromptChanged)));
@@ -2770,7 +2770,7 @@ async fn append_episode_cannot_introduce_a_system_prompt_mid_lineage() {
     .await;
     drop(tx);
     collector.await.unwrap();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let admitted = admit_rx.await.expect("admission ack fired");
 
     assert!(matches!(result, Err(RunError::SystemPromptChanged)));
@@ -3195,7 +3195,7 @@ async fn imported_lineage_auto_appends_on_the_next_plain_send() {
     )
     .await
     .expect("import");
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 
     let lease = FileLeaseStore::new(dir.join("lease"));
     let provider = StubProvider::new(vec![text_reply("m-next", "continued answer")]);
@@ -3274,7 +3274,7 @@ async fn first_send_after_import_can_introduce_its_harness_system_prompt() {
     )
     .await
     .expect("import");
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 
     let lease = FileLeaseStore::new(dir.join("lease"));
     let provider = StubProvider::new(vec![text_reply("m-system", "continued answer")]);

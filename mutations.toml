@@ -3011,6 +3011,8 @@ expect_red = ["wal_writer::tests::idle_writers_leave_tiny_blocking_pool_availabl
 expect_message = "idle WAL writers starved a finite blocking job"
 file = "crates/broca-core/src/wal_writer.rs"
 old = '''            .spawn(move || {
+                // writer_loop drops its WAL before the lease is released, even on unwind.
+                let _lease = lease;
                 writer_loop(
                     wal,
                     fence,
@@ -3027,6 +3029,7 @@ new = '''            .spawn({
                     // NON-VACUITY BREAK: the resident writer occupies Tokio's shared pool again.
                     runtime.block_on(async move {
                         tokio::task::spawn_blocking(move || {
+                            let _lease = lease;
                             writer_loop(
                                 wal,
                                 fence,
@@ -9256,3 +9259,95 @@ expect_red = ["actor::steer_terminal_tests::refused_live_steer_is_queued_for_nex
 file = "crates/broca-module/src/actor.rs"
 old = "if !inbox.deliver(input, || {"
 new = "if false && !inbox.deliver(input, || { // NON-VACUITY BREAK: drop the late steer instead of queuing"
+
+[[control]]
+id = "wal-shutdown-final-fsync-error"
+guards = "a dirty shutdown reports a final fsync failure and still joins its writer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/shutdown_tests.rs"
+expect_red = ["wal_writer::shutdown_tests::shutdown_reports_final_fsync_failure"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "let result = if dirty {\n                    sync_result(&*wal, &poison)"
+new = "let result = if dirty {\n                    sync_result(&*wal, &poison).or(Ok(())) // NON-VACUITY BREAK: swallow final fsync failure"
+
+[[control]]
+id = "wal-shutdown-final-error-latch"
+guards = "a final fsync failure latches the same fatal poison as an ordinary barrier failure"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/shutdown_tests.rs"
+expect_red = ["wal_writer::shutdown_tests::shutdown_reports_final_fsync_failure"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "let result = result.map_err(|error| {\n                    set_poison(&poisoned, error.clone());"
+new = "let result = result.map_err(|error| {\n                    // NON-VACUITY BREAK: leave final failure unlatched."
+
+[[control]]
+id = "wal-shutdown-writer-join-error"
+guards = "shutdown preserves a writer thread panic as the join failure, rather than a missing ack"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/shutdown_tests.rs"
+expect_red = ["wal_writer::shutdown_tests::shutdown_reports_writer_join_failure"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "if join.join().is_err() {"
+new = "if { let _ = join.join(); false } { // NON-VACUITY BREAK: discard the writer panic"
+
+[[control]]
+id = "wal-dropped-run-final-sync-and-join"
+guards = "cancelling a public run drains, syncs and joins its writer before the owner finishes dropping"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/shutdown_tests.rs"
+expect_red = ["wal_writer::shutdown_tests::cancelled_run_keeps_lease_until_blocked_append_and_final_sync_finish"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "impl Drop for WalHandle {\n    fn drop(&mut self) {\n        if self.join.is_some() {"
+new = "impl Drop for WalHandle {\n    fn drop(&mut self) {\n        if false && self.join.is_some() { // NON-VACUITY BREAK: detach without final sync"
+
+[[control]]
+id = "wal-cancelled-run-writer-owns-lease"
+guards = "the per-run lease remains held through a blocked append and final sync after cancellation"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/shutdown_tests.rs"
+expect_red = ["wal_writer::shutdown_tests::cancelled_run_keeps_lease_until_blocked_append_and_final_sync_finish"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "let _lease = lease;"
+new = "drop(lease); // NON-VACUITY BREAK: release lease before the writer exits"
+
+[[control]]
+id = "wal-cancelled-shutdown-writer-owns-lease"
+guards = "cancelling the shutdown await cannot release a lease while its detached blocking join still runs"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/shutdown_tests.rs"
+expect_red = ["wal_writer::shutdown_tests::cancelled_shutdown_keeps_lease_until_writer_exit"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "let _lease = lease;"
+new = "drop(lease); // NON-VACUITY BREAK: release lease before the writer exits"
+
+[[control]]
+id = "actor-writer-shutdown-error-propagation"
+guards = "an actor's final writer sync failure makes registry shutdown unsuccessful after joining"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::actor_reports_final_writer_shutdown_failure"]
+file = "crates/broca-module/src/actor.rs"
+old = "if let Err(error) = result {\n            self.registry.report_seal_failure();"
+new = "if let Err(error) = result {\n            // NON-VACUITY BREAK: report a successful registry shutdown."

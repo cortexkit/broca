@@ -281,7 +281,7 @@ async fn mutated_input_is_revalidated_before_validate_and_terminal_is_not_rehook
     )
     .await;
     assert_eq!(seen.lock().unwrap().len(), 1);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 struct Narrow;
@@ -366,7 +366,7 @@ async fn validate_sees_approved_narrowed_args_and_denial_is_one_intentless_barri
         .any(|r| matches!(r,WalRecord::ToolDispatchIntent{tool_call_id,..}if tool_call_id.0=="c")));
     assert_eq!(seen.lock().unwrap().len(), 4);
     drop(records);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -403,7 +403,7 @@ async fn mutated_input_cannot_bypass_approval_deny() {
     .await;
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(records.lock().unwrap().iter().any(|r|matches!(r,WalRecord::ToolNoDispatch{reason:NoDispatchReason::Denied{..},hooks:Some(h),..}if h.final_value==Some(json!({"f":"mutated"})))));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -434,7 +434,7 @@ async fn pre_tool_unavailable_refuse_is_a_single_completed_intentless_result() {
         WalRecord::ToolDispatchIntent { .. } | WalRecord::ToolNoDispatch { .. }
     )));
     drop(records);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -479,7 +479,7 @@ async fn pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_bat
         plane.log().last(),
         Some(crate::StubEvent::BatchFinished)
     ));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -511,7 +511,7 @@ async fn json_between_limits_stays_structured_with_zero_post_tool_calls() {
         ToolOutput::Json { value: expected }
     );
     assert!(seen.lock().unwrap().is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -544,7 +544,7 @@ async fn headroom_subject_is_capped_once_before_hook_and_final_append_is_not_rec
     assert!(text.ends_with(&"!".repeat(16_384)));
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(records.lock().unwrap().iter().any(|r|matches!(r,WalRecord::ToolResult{hooks:Some(h),..}if h.original.as_ref().unwrap()["output"]["text"].as_str().unwrap().len()==1_032_192)));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 async fn post_answer(
@@ -571,7 +571,7 @@ async fn post_answer(
         None,
     )
     .await;
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let records = records.lock().unwrap().clone();
     (result.results[0].clone(), records)
 }
@@ -651,7 +651,7 @@ async fn post_tool_cancel_applies_remaining_refuse_policy_without_calling_later_
     assert!(!message.contains("secret"));
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(records.lock().unwrap().iter().any(|r|matches!(r,WalRecord::ToolResult{reason:Some(reason),hooks:Some(h),..}if reason=="post_tool_unavailable"&&h.unavailable==Some(vec!["p0".into()]))));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -682,7 +682,7 @@ async fn end_to_end_budget_is_capped_even_when_plan_budget_is_larger() {
     assert_eq!(output.trace.unavailable, vec!["p0"]);
     assert_eq!(seen.lock().unwrap().len(), 1);
     drop(chain);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -721,7 +721,7 @@ async fn tool_call_only_ops_are_unavailable_and_all_non_text_parts_stay_byte_ide
         .blocks()
         .unwrap()
         .is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 pub(super) fn request() -> RunRequest {
@@ -893,7 +893,7 @@ async fn post_assistant_record_control_next_prompt_and_display_all_use_final_mes
             );
         }
         assert_eq!(seen.lock().unwrap().len(), 2);
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 
@@ -936,7 +936,7 @@ async fn frozen_transform_resume_without_plane_neither_dispatches_nor_writes() {
     )
     .await
     .unwrap();
-    seed_writer.shutdown().await;
+    let _ = seed_writer.shutdown().await;
     let mut prefix = Vec::new();
     for record in seed.lock().unwrap().iter() {
         prefix.push(record.clone());
@@ -983,7 +983,7 @@ async fn frozen_transform_resume_without_plane_neither_dispatches_nor_writes() {
     assert!(records.lock().unwrap().is_empty());
     assert!(requests.lock().unwrap().is_empty());
     assert!(plane.log().is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1024,7 +1024,7 @@ async fn post_assistant_cancel_keeps_accepted_ops_and_marks_entire_remaining_cha
     assert_eq!(output.subject.blocks().unwrap(), ["originalaccepted"]);
     assert_eq!(output.trace.unavailable, vec!["p1", "p2"]);
     assert_eq!(seen.lock().unwrap().len(), 2);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1071,7 +1071,7 @@ async fn sequential_post_tool_finishes_before_next_dispatch() {
             "hook:second"
         ]
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 async fn excluded_case(kind: &str) {
@@ -1125,7 +1125,7 @@ async fn excluded_case(kind: &str) {
     calls.push(call("sibling"));
     batch(calls, &plane, &crate::AllowAll, &writer, &runtime, resume).await;
     assert!(seen.lock().unwrap().is_empty(), "{kind}");
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 #[tokio::test]
 async fn no_post_tool_for_no_dispatch() {
@@ -1182,7 +1182,7 @@ async fn excluded_unknown(interrupted: bool) {
     assert_eq!(result.interruption, Some(BatchInterruption::Ambiguous));
     assert_eq!(plane.exec_count(&ToolCallId("interrupted".into())), 0);
     assert!(seen.lock().unwrap().is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 fn result_record(id: &str, text: &str) -> WalRecord {
@@ -1244,7 +1244,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
             result_record("a", "fallback-a")
         ]
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 #[tokio::test]
 async fn loop_wins_handover_and_seal_writes_no_second_terminal() {
@@ -1263,7 +1263,7 @@ async fn loop_wins_handover_and_seal_writes_no_second_terminal() {
         *records.lock().unwrap(),
         vec![result_record("a", "answered")]
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 #[tokio::test]
 async fn lost_model_handover_parks_without_any_write() {
@@ -1282,7 +1282,7 @@ async fn lost_model_handover_parks_without_any_write() {
     .await;
     assert!(result.is_err());
     assert!(records.lock().unwrap().is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1315,7 +1315,7 @@ async fn answers_are_checked_against_frozen_declaration_without_redeclaration() 
     .await;
     assert!(output.results[0].is_error);
     assert_eq!(seen.lock().unwrap().len(), 1);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1340,7 +1340,7 @@ async fn post_assistant_replace_without_reduction_owner_is_unavailable() {
         .await;
     assert_eq!(output.subject.blocks().unwrap(), ["original"]);
     assert_eq!(output.trace.unavailable, ["p0"]);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 struct BlockingHooks {
@@ -1421,7 +1421,7 @@ async fn seal_during_post_assistant_preserves_fallback_and_parks_before_dispatch
         )));
         assert!(plane.log().is_empty());
     }
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 async fn sealed_post_tool(
@@ -1527,7 +1527,7 @@ async fn sealed_post_tool(
             WalRecord::ToolBatchFinished { .. } | WalRecord::TurnFinished { .. }
         )));
     }
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 #[tokio::test]
 async fn seal_during_post_tool_pass_writes_one_fallback() {
@@ -1591,7 +1591,7 @@ async fn first_pre_user_omits_lineage_then_recorded_session_supplies_it() {
         seen.lock().unwrap()[1].1.lineage_id,
         Some(writer.lineage_id().unwrap().to_string())
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1660,7 +1660,7 @@ async fn post_tool_call_key_is_the_durable_intent_key_and_input_render_stays_ori
     .await
     .unwrap();
     let lineage = writer.lineage_id().unwrap().to_string();
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
     let records = broca_wal::FileWal::open(path).unwrap().replay().unwrap();
     let intent = records
         .iter()
@@ -1726,7 +1726,7 @@ async fn matching_tool_coverage_and_phase_call_only_the_selected_subscription() 
         seen.lock().unwrap()[0].1.subject.phase(),
         Some(Phase::Validate)
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1764,7 +1764,7 @@ async fn answers_must_obey_the_subscription_operation_and_subject_kind() {
             .await;
         assert_eq!(output.subject.blocks().unwrap(), ["original"]);
         assert_eq!(output.trace.unavailable, ["p0"]);
-        writer.shutdown().await;
+        let _ = writer.shutdown().await;
     }
 }
 
@@ -1798,7 +1798,7 @@ async fn pre_user_seal_cancellation_returns_discardable_output_instead_of_parkin
     assert!(seen.lock().unwrap().is_empty());
     assert!(records.lock().unwrap().is_empty());
     drop(chain);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1826,7 +1826,7 @@ async fn input_hook_cancel_is_not_unavailability_and_never_applies_refuse_policy
     assert!(output.cancellation.is_some());
     assert!(output.refusal.is_none());
     assert!(output.trace.unavailable.is_empty());
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 struct DropTracked {
@@ -1879,7 +1879,7 @@ async fn seal_cancels_pending_hook_immediately_and_parks_without_an_input_slot()
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     assert!(records.lock().unwrap().is_empty());
     drop(chain);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1917,7 +1917,7 @@ async fn pre_tool_stop_during_hook_writes_no_intent_and_finishes_batch() {
         plane.log().last(),
         Some(crate::StubEvent::BatchFinished)
     ));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1942,7 +1942,7 @@ async fn post_tool_subscriber_is_not_called_for_other_subjects() {
         runtime.chain(subject, Trace::default(), |_| true).await;
         assert!(seen.lock().unwrap().is_empty());
     }
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -2003,7 +2003,7 @@ async fn providers_apply_in_frozen_order_not_lexical_order() {
             .collect::<Vec<_>>(),
         ["z", "a"]
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -2034,7 +2034,7 @@ async fn catalog_permissions_are_scoped_to_the_selected_tool_owner() {
     )
     .await;
     assert!(result.results[0].is_error);
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[test]
@@ -2154,7 +2154,7 @@ async fn pre_tool_terminal_cause(caller: bool) {
         plane.log().last(),
         Some(crate::StubEvent::BatchFinished)
     ));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 #[tokio::test]
 async fn caller_cancel_during_pre_tool_finishes_cancelled() {
@@ -2204,7 +2204,7 @@ async fn lost_dispatch_intent_stays_interrupted_even_when_caller_cancel_is_ready
     )
     .await
     .unwrap();
-    seed_writer.shutdown().await;
+    let _ = seed_writer.shutdown().await;
     let mut prefix = Vec::new();
     for record in seed.lock().unwrap().iter() {
         prefix.push(record.clone());
@@ -2265,7 +2265,7 @@ async fn lost_dispatch_intent_stays_interrupted_even_when_caller_cancel_is_ready
             ..
         }
     )));
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -2300,7 +2300,7 @@ async fn lost_post_tool_handover_parks_before_batch_or_turn_markers() {
         *records.lock().unwrap(),
         vec![result_record("c", "fallback")]
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -2371,7 +2371,7 @@ async fn actor_input_hooks_are_rendered_and_recorded_without_final_metadata() {
         requests.lock().unwrap()[0].prompt[0].content,
         final_input[0].content
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -2414,7 +2414,7 @@ async fn actor_input_refusal_is_durable_before_any_provider_request() {
     assert!(
         matches!(&records[1], WalRecord::RunFinished { error: Some(recorded), .. } if recorded == &error)
     );
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -2507,5 +2507,5 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
             .any(|r| matches!(r, WalRecord::ToolDispatchIntent { .. })));
         assert!(plane.log().is_empty());
     }
-    writer.shutdown().await;
+    let _ = writer.shutdown().await;
 }
