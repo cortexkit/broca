@@ -815,6 +815,7 @@ impl Fixture {
             },
             WalRecord::StepStarted { step_id: StepId(1) },
             WalRecord::ModelAttemptFinished {
+                content_progress: Default::default(),
                 step_id: StepId(1),
                 attempt: 0,
                 request_body_len: 10,

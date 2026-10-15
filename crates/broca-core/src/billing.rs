@@ -1785,6 +1785,7 @@ mod tests {
             frame(
                 seq,
                 WalRecord::ModelAttemptFinished {
+                    content_progress: Default::default(),
                     step_id: StepId(step),
                     attempt: 0,
                     request_body_len: 10,

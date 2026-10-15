@@ -2168,6 +2168,7 @@ async fn session_read_and_control_projection_skip_provider_attempt_records() {
                 (1, broca_protocol::AttemptOutcome::Complete),
             ] {
                 with_attempts.push(WalRecord::ModelAttemptFinished {
+                    content_progress: Default::default(),
                     step_id: *step_id,
                     attempt,
                     request_body_len: 10,

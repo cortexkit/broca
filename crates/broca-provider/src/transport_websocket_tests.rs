@@ -1241,6 +1241,7 @@ async fn logged_step(
         None,
         None,
         || ToolNameRestoringNormalizer {
+            live_progress: None,
             inner: provider.family.normalizer(&provider.frozen, StepId(1)),
             names: Arc::new(crate::tool_name_alias::ToolNameMap::build(&[], &[])),
         },

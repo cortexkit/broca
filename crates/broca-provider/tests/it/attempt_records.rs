@@ -617,6 +617,7 @@ mod gated {
                 input_transformations: _,
                 credential_refresh,
                 served_account_ref,
+                content_progress: _,
             } = record
             else {
                 unreachable!()

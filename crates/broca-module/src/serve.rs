@@ -522,6 +522,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     });
     match state.state {
         State::Active => RunStatusResponse::Active {
+            step: state.live_step,
             title,
             awaiting_approval: None,
         },
@@ -1893,6 +1894,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    live_step: None,
                     title: None,
                     state: broca_core::RunIndexState::Paused,
                     undelivered_steers: None,

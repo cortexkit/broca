@@ -1237,6 +1237,7 @@ async fn a_record_type_from_a_newer_build_changes_nothing_replay_reads() {
 /// A provider attempt record as the live loop writes it.
 fn attempt_record(step_id: StepId, attempt: u32, outcome: AttemptOutcome) -> WalRecord {
     WalRecord::ModelAttemptFinished {
+        content_progress: Default::default(),
         step_id,
         attempt,
         request_body_len: 999,
