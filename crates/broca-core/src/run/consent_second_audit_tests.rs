@@ -113,3 +113,133 @@ async fn healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await() {
     );
     rig.finish().await;
 }
+
+struct AwaitConflict {
+    key: String,
+    prepared: WalRecord,
+    mode: &'static str,
+    awaits: AtomicUsize,
+    older_denied: std::sync::atomic::AtomicBool,
+    new_approved: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl ElicitationPlane for AwaitConflict {
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        cursor: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        let records = if cursor.is_some() || !self.older_denied.load(Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            let mut records = vec![
+                json!({"state":"answered","requester_ref":self.key,"elicitation_id":"old","answered_choice_id":"deny","binding":crate::consent::binding(&self.prepared)}),
+            ];
+            if self.new_approved.load(Ordering::SeqCst) {
+                records.push(json!({"state":"answered","requester_ref":self.key,"elicitation_id":"new","answered_choice_id":"approve","binding":crate::consent::binding(&self.prepared)}));
+            }
+            records
+        };
+        Ok(ApprovalPage {
+            records,
+            cursor: ApprovalCursor {
+                provider_incarnation: "owner".into(),
+                seq: 1,
+            },
+        })
+    }
+    async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        Ok(ApprovalQuestion {
+            terminal: false,
+            record: json!({"state":"pending","requester_ref":self.key,"elicitation_id":"new"}),
+        })
+    }
+    async fn r#await(
+        &self,
+        _: &BatchCtx,
+        _: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        let n = self.awaits.fetch_add(1, Ordering::SeqCst);
+        self.older_denied.store(true, Ordering::SeqCst);
+        if n == 0 && self.mode != "first" {
+            if self.mode == "unreadable" {
+                return Ok(ApprovalQuestion {
+                    terminal: true,
+                    record: json!({"state":"answered","requester_ref":self.key,"elicitation_id":"new","binding":crate::consent::binding(&self.prepared)}),
+                });
+            }
+            return Err(crate::consent::refusal(
+                if self.mode == "timeout" {
+                    "timeout"
+                } else {
+                    "route_reloading"
+                },
+                true,
+            ));
+        }
+        self.new_approved.store(true, Ordering::SeqCst);
+        Ok(ApprovalQuestion {
+            terminal: true,
+            record: json!({"state":"answered","requester_ref":self.key,"elicitation_id":"new","answered_choice_id":"approve","binding":crate::consent::binding(&self.prepared)}),
+        })
+    }
+}
+async fn await_conflict(mode: &'static str) {
+    let mut rig = Rig::new("pass", "none", false, false);
+    let (key, prepared) = seed_known_call(&rig);
+    rig.writer.sync().await.unwrap();
+    let cards = Arc::new(AwaitConflict {
+        key,
+        prepared: prepared.clone(),
+        mode,
+        awaits: AtomicUsize::new(0),
+        older_denied: std::sync::atomic::AtomicBool::new(false),
+        new_approved: std::sync::atomic::AtomicBool::new(false),
+    });
+    rig.control.elicitation_plane = Some(cards.clone());
+    let resume = ResumeCtx {
+        batch_already_started: true,
+        existing: Default::default(),
+        prepared: vec![crate::replay::PreparedCall {
+            record_index: 0,
+            prepared: Arc::new(prepared),
+            approval: None,
+            elicitation_id: Some("new".into()),
+        }],
+    };
+    let result = rig
+        .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)
+        .await;
+    assert!(
+        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")),
+        "a filed await approval must check every settlement before intake"
+    );
+    assert_eq!(
+        cards.awaits.load(Ordering::SeqCst),
+        if mode == "first" { 1 } else { 2 }
+    );
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    assert!(!rig.frames().iter().any(|frame| matches!(
+        frame.record,
+        WalRecord::ApprovalRecorded {
+            decision: broca_wal::DeferredDecision::Approved,
+            ..
+        }
+    )));
+    rig.finish().await;
+}
+#[tokio::test]
+async fn filed_await_timeout_then_approve_refuses_older_denial() {
+    await_conflict("timeout").await;
+}
+#[tokio::test]
+async fn first_filed_await_approval_checks_settlements_after_scan() {
+    await_conflict("first").await;
+}
+#[tokio::test]
+async fn filed_retryable_or_unreadable_await_approval_checks_settlements() {
+    for mode in ["retry", "unreadable"] {
+        await_conflict(mode).await;
+    }
+}

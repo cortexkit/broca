@@ -10387,9 +10387,9 @@ expect_red = ["run::approval_tests::consent_runtime_tests::pending_restart_pause
 select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = '''if let Some(id) = &held.id {
-                                    let card = crate::consent::reconcile'''
+                                    let pending = scan.lock()'''
 new = '''if let Some(id) = None::<&String> { // NON-VACUITY BREAK
-                                    let card = crate::consent::reconcile'''
+                                    let pending = scan.lock()'''
 
 [[control]]
 id = "core-consent-answers-before-refile"
@@ -10696,7 +10696,7 @@ expect_red = ["run::approval_tests::consent_audit_tests::every_known_id_unavaila
 select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = '''// Invalid answered readbacks release the visible card just like transport refusals.
-                                        if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }'''
+                                    if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }'''
 new = '''// NON-VACUITY BREAK: discard the known card without detach'''
 
 [[control]]
@@ -10867,3 +10867,31 @@ old = '''state.cursor = cursor.clone();
         state.found = found.clone();'''
 new = '''state.cursor = cursor.clone();
         state.found = None; // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-filed-await-approval-rechecks-settlements"
+guards = "an approval after a filed await timeout checks the complete owner feed before intake"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::filed_await_timeout_then_approve_refuses_older_denial"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "lookup_with_progress(plane, ctx, key, prepared, progress).await?;"
+new = "// NON-VACUITY BREAK: accept the approving readback without its settlement snapshot"
+
+[[control]]
+id = "core-consent-first-await-approval-rechecks-settlements"
+guards = "even the first approval readback checks settlements that arrived after the initial pending scan"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::first_filed_await_approval_checks_settlements_after_scan"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "lookup_with_progress(plane, ctx, key, prepared, progress).await?;"
+new = "// NON-VACUITY BREAK: accept the first approving readback without its settlement snapshot"

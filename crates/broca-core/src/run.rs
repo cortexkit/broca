@@ -9052,7 +9052,7 @@ mod approval_gate {
             Result<crate::consent::RecoveredCard, ApprovalRouteError>,
             Option<String>,
         ),
-        Awaited(Result<crate::tool_plane::ApprovalQuestion, ApprovalRouteError>),
+        Awaited(Result<Option<crate::consent::ConsentAnswer>, ApprovalRouteError>),
     }
     enum Feedback {
         Reported,
@@ -10175,11 +10175,15 @@ mod approval_gate {
                                     }
                                 };
                                 if let Some(id) = &held.id {
+                                    let pending = scan.lock().expect("consent scan progress").expected();
+                                    if let Some(candidate) = pending {
+                                        let answer = crate::consent::verify_readback(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, candidate, scan.as_ref()).await?;
+                                        return Ok(crate::consent::RecoveredCard { id: id.clone(), answer: Some(answer) });
+                                    }
                                     let card = crate::consent::reconcile_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, scan.as_ref(), durable).await?;
                                     if card.answer.is_some() { return Ok(card); }
                                     let question = elicitation.get(&filing_ctx, &card.id).await?;
-                                    let answer = crate::consent::answer(&question.record, &held.key, &held.prepared)?;
-                                    if answer.as_ref().is_some_and(|answer| answer.id != card.id) { return Err(crate::consent::refusal("consent_card_mismatch", false)); }
+                                    let answer = check_readback(elicitation.as_ref(), &filing_ctx, &held, question, scan.as_ref()).await?;
                                     Ok(crate::consent::RecoveredCard { id: card.id, answer })
                                 } else {
                                     crate::consent::recover_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, timestamp, scan.as_ref(), durable).await
@@ -10194,6 +10198,7 @@ mod approval_gate {
                         continue;
                     };
                     let held = call.clone();
+                    let scan = history.scan(&held.key);
                     let wait_cancel = CancellationToken::new();
                     waits.insert(index, wait_cancel.clone());
                     active.insert(index);
@@ -10205,7 +10210,16 @@ mod approval_gate {
                             _ = wait_cancel.cancelled() => Err(crate::consent::refusal("stopped", true)),
                             _ = cancelled_token(control.cancel.as_ref()) => Err(crate::consent::refusal("cancelled", true)),
                             _ = cancelled_token(control.stop_requested.as_ref()) => Err(crate::consent::refusal("stopped", true)),
-                            result = tokio::time::timeout(Duration::from_millis(wait_ms), elicitation.r#await(&await_ctx, held.id.as_deref().expect("durable card id"), wait_ms)) => result.unwrap_or_else(|_| Err(crate::consent::refusal("timeout", true))),
+                            result = tokio::time::timeout(Duration::from_millis(wait_ms), async {
+                                let pending = scan.lock().expect("consent scan progress").expected();
+                                if let Some(candidate) = pending {
+                                    let budget = held.expires().saturating_sub(now(control)).min(10_000);
+                                    return tokio::time::timeout(Duration::from_millis(budget), crate::consent::verify_readback(elicitation.as_ref(), &await_ctx, &held.key, &held.prepared, candidate, scan.as_ref())).await.map_err(|_| crate::consent::refusal("timeout", true))?.map(Some);
+                                }
+                                let question = elicitation.r#await(&await_ctx, held.id.as_deref().expect("durable card id"), wait_ms).await?;
+                                let budget = held.expires().saturating_sub(now(control)).min(10_000);
+                                tokio::time::timeout(Duration::from_millis(budget), check_readback(elicitation.as_ref(), &await_ctx, &held, question, scan.as_ref())).await.map_err(|_| crate::consent::refusal("timeout", true))?
+                            }) => result.unwrap_or_else(|_| Err(crate::consent::refusal("timeout", true))),
                         };
                         (index, Work::Awaited(result))
                     }));
@@ -10303,19 +10317,11 @@ mod approval_gate {
                             let Slot::Held(call) = &mut slots[index] else { continue };
                             if call.approved { continue; }
                             match result {
-                                Ok(question) => match crate::consent::answer(&question.record, &call.key, &call.prepared).and_then(|answer| {
-                                    if answer.as_ref().is_some_and(|answer| call.id.as_deref() != Some(answer.id.as_str())) { Err(crate::consent::refusal("consent_card_mismatch", false)) } else { Ok(answer) }
-                                }) {
-                                    Ok(Some(answer)) => { intake(slots, index, answer, ctx, writer, control, history).await?; }
-                                    Ok(None) => { call.retry_at = now(control).saturating_add(50); }
-                                    Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
-                                    Err(error) => { let held = call.clone(); let result = refusal_decision(call, &error, writer, history).await?; slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
-                                        // Invalid answered readbacks release the visible card just like transport refusals.
-                                        if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }
-                                    }
-                                },
+                                Ok(Some(answer)) => { intake(slots, index, answer, ctx, writer, control, history).await?; }
+                                Ok(None) => { call.retry_at = now(control).saturating_add(50); }
                                 Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
                                 Err(error) => { let held = call.clone(); let result = refusal_decision(call, &error, writer, history).await?; slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
+                                    // Invalid answered readbacks release the visible card just like transport refusals.
                                     if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }
                                 }
                             }
@@ -10390,6 +10396,36 @@ mod approval_gate {
     }
     async fn cancelled_token(token: Option<&CancellationToken>) {
         cancelled(token).await
+    }
+    async fn check_readback(
+        plane: &dyn crate::tool_plane::ElicitationPlane,
+        ctx: &BatchCtx,
+        held: &Held,
+        question: crate::tool_plane::ApprovalQuestion,
+        scan: &std::sync::Mutex<crate::consent::LookupProgress>,
+    ) -> Result<Option<crate::consent::ConsentAnswer>, ApprovalRouteError> {
+        let answer = crate::consent::answer(&question.record, &held.key, &held.prepared)?;
+        if answer
+            .as_ref()
+            .is_some_and(|answer| held.id.as_deref() != Some(answer.id.as_str()))
+        {
+            return Err(crate::consent::refusal("consent_card_mismatch", false));
+        }
+        match answer {
+            Some(candidate) if candidate.decision == crate::consent::ConsentDecision::Approved => {
+                crate::consent::verify_readback(
+                    plane,
+                    ctx,
+                    &held.key,
+                    &held.prepared,
+                    candidate,
+                    scan,
+                )
+                .await
+                .map(Some)
+            }
+            answer => Ok(answer),
+        }
     }
     fn execution(result: &CallResolution) -> crate::tool_plane::ApprovalExecution {
         use crate::tool_plane::ApprovalExecution;

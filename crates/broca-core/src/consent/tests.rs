@@ -674,3 +674,51 @@ async fn lookup_cursor_change_restarts_progress_and_discards_old_settlements() {
     assert_eq!(found.decision, ConsentDecision::Approved);
     assert_eq!(feed.cursors.lock().unwrap()[2], None);
 }
+
+#[tokio::test]
+async fn readback_candidate_survives_snapshot_retry_and_cursor_change() {
+    let feed = ProgressPages {
+        pages: Mutex::new(
+            vec![
+                Err(refusal("feed_busy", true)),
+                Err(refusal("cursor_incarnation_changed", false)),
+                progress_page(Vec::new(), 1),
+            ]
+            .into(),
+        ),
+        cursors: Mutex::new(Vec::new()),
+    };
+    let progress = Mutex::new(LookupProgress::default());
+    let candidate = ConsentAnswer {
+        id: "new".into(),
+        decision: ConsentDecision::Approved,
+    };
+    assert!(
+        verify_readback(
+            &feed,
+            &ctx(),
+            "key",
+            &prepared(),
+            candidate.clone(),
+            &progress
+        )
+        .await
+        .unwrap_err()
+        .retryable
+    );
+    assert_eq!(progress.lock().unwrap().expected(), Some(candidate.clone()));
+    assert_eq!(
+        verify_readback(
+            &feed,
+            &ctx(),
+            "key",
+            &prepared(),
+            candidate.clone(),
+            &progress
+        )
+        .await
+        .unwrap(),
+        candidate
+    );
+    assert_eq!(*feed.cursors.lock().unwrap(), [None, None, None]);
+}

@@ -1927,8 +1927,8 @@ async fn unreadable_await_retries_same_card_without_refile() {
         assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
         assert_eq!(
             *rig.questions.cursors.lock().unwrap(),
-            vec![None, None],
-            "both reads start at the same cursor position"
+            vec![None, None, None],
+            "filing and the corrected approval's fresh conflict check all start at zero"
         );
         assert_eq!(rig.questions.awaits.load(Ordering::SeqCst), 2);
         let frames = rig.frames();

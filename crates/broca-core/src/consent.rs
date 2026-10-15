@@ -120,12 +120,17 @@ pub struct LookupProgress {
     cursor: Option<ApprovalCursor>,
     found: Option<ConsentAnswer>,
     complete: bool,
+    expected: Option<ConsentAnswer>,
 }
 impl LookupProgress {
     pub fn restart(&mut self) {
         self.cursor = None;
         self.found = None;
         self.complete = false;
+        self.expected = None;
+    }
+    pub fn expected(&self) -> Option<ConsentAnswer> {
+        self.expected.clone()
     }
 }
 
@@ -154,8 +159,12 @@ pub async fn lookup_with_progress(
         let page = match plane.answers(ctx, cursor.as_ref()).await {
             Err(error) if error.code == "cursor_incarnation_changed" && !reset => {
                 cursor = None;
-                found = None;
-                progress.lock().expect("consent scan progress").restart();
+                let mut state = progress.lock().expect("consent scan progress");
+                let expected = state.expected.clone();
+                state.restart();
+                state.expected = expected.clone();
+                state.found = expected.clone();
+                found = expected;
                 reset = true;
                 continue;
             }
@@ -189,6 +198,35 @@ pub async fn lookup_with_progress(
         state.cursor = cursor.clone();
         state.found = found.clone();
     }
+}
+
+/// An approving get/await readback is a candidate, not authorization. Start a
+/// fresh settlement snapshot including that candidate, retaining this snapshot's
+/// progress if its budget expires before every continuation has been checked.
+pub async fn verify_readback(
+    plane: &dyn ElicitationPlane,
+    ctx: &BatchCtx,
+    key: &str,
+    prepared: &WalRecord,
+    candidate: ConsentAnswer,
+    progress: &Mutex<LookupProgress>,
+) -> Result<ConsentAnswer, ApprovalRouteError> {
+    {
+        let mut state = progress.lock().expect("consent scan progress");
+        let expected_binding = binding(prepared);
+        if state.expected.as_ref() != Some(&candidate)
+            || state.key.as_deref() != Some(key)
+            || state.binding.as_ref() != Some(&expected_binding)
+        {
+            state.restart();
+            state.key = Some(key.into());
+            state.binding = Some(expected_binding);
+            state.expected = Some(candidate.clone());
+            state.found = Some(candidate.clone());
+        }
+    }
+    lookup_with_progress(plane, ctx, key, prepared, progress).await?;
+    Ok(candidate)
 }
 
 #[derive(Debug, Clone)]
