@@ -289,17 +289,21 @@ impl Rig {
     }
 
     async fn status(&self) -> StepStatus {
-        tokio::time::timeout(Duration::from_secs(5), self.statuses.lock().await.recv())
-            .await
-            .expect("compaction status")
-            .unwrap()
+        broca_test_support::event_timeout("status", self.statuses.lock().await.recv(), || {
+            format!("session={:?}", self.key)
+        })
+        .await
+        .expect("compaction status")
+        .unwrap()
     }
 
     async fn prompt(&self) -> Vec<Message> {
-        tokio::time::timeout(Duration::from_secs(5), self.prompts.lock().await.recv())
-            .await
-            .expect("model prompt")
-            .unwrap()
+        broca_test_support::event_timeout("prompt", self.prompts.lock().await.recv(), || {
+            format!("session={:?}", self.key)
+        })
+        .await
+        .expect("model prompt")
+        .unwrap()
     }
 
     async fn ready(

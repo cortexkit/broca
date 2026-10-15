@@ -12,7 +12,6 @@ use crate::scenarios;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
@@ -102,21 +101,21 @@ fn later_send() -> SendRequest {
 }
 
 async fn wait_for_finished(path: &Path, finished: usize) -> Vec<WalRecord> {
-    for _ in 0..500 {
-        let records = LogImage::read(path).records();
-        let ended = records
-            .iter()
-            .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-            .count();
-        if ended >= finished {
-            return records;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!(
-        "{finished} episodes never finished under {}",
-        path.display()
-    );
+    broca_test_support::wait_until(
+        &format!("{finished} finished episodes at {}", path.display()),
+        || async {
+            let records = LogImage::read(path).records();
+            let ended = records
+                .iter()
+                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
+                .count();
+            if ended >= finished {
+                return Ok(records);
+            }
+            Err(format!("records={}, finished={ended}", records.len()))
+        },
+    )
+    .await
 }
 
 #[tokio::test]

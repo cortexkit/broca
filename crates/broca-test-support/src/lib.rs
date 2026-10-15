@@ -33,6 +33,7 @@ mod process;
 mod rig_logs;
 mod rig_stdio;
 mod tracing_capture;
+mod wait;
 pub use ckdev::{
     ckdev_binary, ckdev_binary_pair, ckdev_binary_with_companion, ckdev_command,
     retry_executable_file_busy,
@@ -43,6 +44,9 @@ pub use rig_stdio::{
     dump_rig_process_logs_on_failure, rig_command, rig_process_logs, tokio_rig_command, RigChild,
 };
 pub use tracing_capture::{capture_logs, LogCapture, LogEvent};
+pub use wait::{
+    event_timeout, record_kinds, wait_for, wait_until, wait_until_sync, EVENT_HANG_GUARD,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

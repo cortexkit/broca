@@ -300,11 +300,21 @@ impl Rig {
         self.store.lookup_run("r").unwrap().unwrap()
     }
     async fn eventually(&self, test: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        broca_test_support::event_timeout(
+            "eventually",
+            async {
+                while !test() {
+                    tokio::task::yield_now().await;
+                }
+            },
+            || {
+                format!(
+                    "run_index={:?}; {}",
+                    self.store.lookup_run("r"),
+                    broca_test_support::record_kinds(self.frames().iter().map(|f| &f.record))
+                )
+            },
+        )
         .await
         .expect("approval state did not converge");
     }
@@ -647,14 +657,14 @@ async fn pending_status_uses_call_states_and_the_latest_filing_marker() {
     rig.registry.route_status(&rig.key).await.unwrap();
     // A complete marker frame on disk may still be awaiting fsync. Wait on the served,
     // durable status instead of treating a raw WAL read as proof that filing was synced.
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
+    let status = broca_test_support::event_timeout("pending_status_uses_call_states_and_the_latest_filing_marker", async {
         loop {
             let status = rig.registry.run_status(&rig.key, RunId("r".into())).await.unwrap();
             if matches!(&status, broca_wire::RunStatusResponse::Active { awaiting_approval: Some(pending), .. }
                 if pending.pending.iter().any(|entry| entry.elicitation_id.is_some())) { break status; }
             tokio::task::yield_now().await;
         }
-    }).await.expect("filing marker was not reported durably");
+    }, || format!("run_index={:?}; {}", rig.store.lookup_run("r"), broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record)))).await.expect("filing marker was not reported durably");
     let page = rig
         .registry
         .read(crate::serve::SessionReadRequest::new(
@@ -992,20 +1002,30 @@ async fn idle_writes_skip_withdrawal_reads_but_new_debt_wakes_the_task() {
     writer.record(Rig::closed_result(&key, true));
     writer.sync().await.unwrap();
     task.wake();
-    let sent = tokio::time::timeout(Duration::from_secs(1), async {
-        while rig
-            .executor
-            .questions
-            .as_ref()
-            .unwrap()
-            .withdrawals
-            .lock()
-            .unwrap()
-            .is_empty()
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    let sent = broca_test_support::event_timeout(
+        "idle_writes_skip_withdrawal_reads_but_new_debt_wakes_the_task",
+        async {
+            while rig
+                .executor
+                .questions
+                .as_ref()
+                .unwrap()
+                .withdrawals
+                .lock()
+                .unwrap()
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+        || {
+            format!(
+                "run_index={:?}; {}",
+                rig.store.lookup_run("r"),
+                broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record))
+            )
+        },
+    )
     .await;
     task.stop().await;
     let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
@@ -1104,9 +1124,19 @@ async fn withdrawal_stop_joins_read_and_flag_jobs_before_writer_shutdown() {
             rig.executor.questions.as_ref().unwrap().clone(),
             broca_core::Clock::default(),
         );
-        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-            .await
-            .unwrap();
+        broca_test_support::event_timeout(
+            "withdrawal_stop_joins_read_and_flag_jobs_before_writer_shutdown",
+            gate.entered.notified(),
+            || {
+                format!(
+                    "run_index={:?}; {}",
+                    rig.store.lookup_run("r"),
+                    broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record))
+                )
+            },
+        )
+        .await
+        .unwrap();
         let mut stopping = tokio::spawn(task.stop());
         let early = tokio::time::timeout(Duration::from_millis(50), &mut stopping).await;
         let returned_early = early.is_ok();
@@ -1117,9 +1147,19 @@ async fn withdrawal_stop_joins_read_and_flag_jobs_before_writer_shutdown() {
         } else {
             stopping.await.unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(5), gate.finished.notified())
-            .await
-            .unwrap();
+        broca_test_support::event_timeout(
+            "withdrawal_stop_joins_read_and_flag_jobs_before_writer_shutdown",
+            gate.finished.notified(),
+            || {
+                format!(
+                    "run_index={:?}; {}",
+                    rig.store.lookup_run("r"),
+                    broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record))
+                )
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             !returned_early,
             "stop returned while blocking job {at} held {owners_at_return} writer owners"
@@ -1143,9 +1183,18 @@ async fn reader_unmarked_running_prepared_calls_close_regardless_of_restart_poli
         for approved in [false, true] {
             let rig = Rig::new(false);
             rig.seed(resume, false, approved, false);
-            let status =
-                tokio::time::timeout(Duration::from_secs(3), rig.registry.route_status(&rig.key))
-                    .await;
+            let status = broca_test_support::event_timeout(
+                "reader_unmarked_running_prepared_calls_close_regardless_of_restart_policy",
+                rig.registry.route_status(&rig.key),
+                || {
+                    format!(
+                        "run_index={:?}; {}",
+                        rig.store.lookup_run("r"),
+                        broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record))
+                    )
+                },
+            )
+            .await;
             let completed = status.is_ok();
             rig.stop().await;
             assert!(
@@ -1279,12 +1328,12 @@ async fn active_approval_status_polls_do_not_read_the_wal() {
     let rig = Rig::new(true);
     rig.seed(true, false, false, false);
     rig.registry.route_status(&rig.key).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    broca_test_support::event_timeout("active_approval_status_polls_do_not_read_the_wal", async {
         loop {
             if matches!(rig.registry.run_status(&rig.key, RunId("r".into())).await.unwrap(), broca_wire::RunStatusResponse::Active { awaiting_approval: Some(pending), .. } if pending.pending[0].elicitation_id.is_some()) { break; }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    }, || format!("run_index={:?}; {}", rig.store.lookup_run("r"), broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record)))).await.unwrap();
     rig.full_reads.store(0, Ordering::SeqCst);
     for _ in 0..5 {
         assert!(matches!(
@@ -1717,11 +1766,21 @@ async fn reopen_clears_acknowledged_discovery_without_more_question_ops() {
         .unwrap();
     rig.store.index_run_withdrawals_owed("r", true).unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
-    let cleared = tokio::time::timeout(Duration::from_secs(1), async {
-        while rig.row().withdrawals_owed {
-            tokio::task::yield_now().await;
-        }
-    })
+    let cleared = broca_test_support::event_timeout(
+        "reopen_clears_acknowledged_discovery_without_more_question_ops",
+        async {
+            while rig.row().withdrawals_owed {
+                tokio::task::yield_now().await;
+            }
+        },
+        || {
+            format!(
+                "run_index={:?}; {}",
+                rig.store.lookup_run("r"),
+                broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record))
+            )
+        },
+    )
     .await;
     rig.stop().await;
     assert!(
@@ -1997,11 +2056,21 @@ async fn cleanup_failure_retries_without_traffic_after_question_acknowledgement(
             WalRecord::QuestionWithdrawalAcknowledged { .. }
         )));
         index.fail.store(false, Ordering::SeqCst);
-        let repaired = tokio::time::timeout(Duration::from_secs(1), async {
-            while rig.row().withdrawals_owed {
-                tokio::task::yield_now().await;
-            }
-        })
+        let repaired = broca_test_support::event_timeout(
+            "cleanup_failure_retries_without_traffic_after_question_acknowledgement",
+            async {
+                while rig.row().withdrawals_owed {
+                    tokio::task::yield_now().await;
+                }
+            },
+            || {
+                format!(
+                    "run_index={:?}; {}",
+                    rig.store.lookup_run("r"),
+                    broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record))
+                )
+            },
+        )
         .await;
         task.stop().await;
         let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;

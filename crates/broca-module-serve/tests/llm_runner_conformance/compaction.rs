@@ -441,64 +441,69 @@ impl BrocaSubject {
         let root = self.compaction_root(session)?;
         // Each return names why the work counts as settled, so a failure dump can tell an early
         // return from a genuine one.
-        let settled = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let now = *self
-                    .shared
-                    .compaction_clocks
-                    .lock()
-                    .unwrap()
-                    .get(&root)
-                    .unwrap_or(&0);
-                let ready = {
-                    let states = self.shared.compaction.lock().unwrap();
-                    let Some(state) = states.get(session) else {
-                        return "no compaction script installed".to_owned();
-                    };
-                    if !state.gates.is_empty() {
-                        Some(format!("{} held model call(s)", state.gates.len()))
-                    } else {
-                        state.calls.last().and_then(|call| {
-                            (state.senders.contains_key(&(state.calls.len() - 1))
-                                && now - state.start_ms < call.deadline_ms)
-                                .then(|| {
-                                    format!(
-                                        "provider call {} held before its deadline {} \
-                                         (adapter clock {})",
-                                        state.calls.len() - 1,
-                                        call.deadline_ms,
-                                        now - state.start_ms
-                                    )
-                                })
-                        })
-                    }
-                };
-                if let Some(reason) = ready {
-                    return reason;
-                }
-                let frames = broca_core::FileWalStore::new(root.join("wal"))
-                    .read_records(&self.bind_identity(session))
-                    .unwrap_or_default();
-                if let Some(last) = frames.last() {
-                    use broca_wal::WalRecord as R;
-                    if matches!(last.record, R::RunFinished { .. }) {
-                        return format!("RunFinished is the last WAL record (seq {})", last.seq);
-                    }
-                    if let R::CompactionAnswer {
-                        disposition: broca_wal::CompactionDisposition::Wait,
-                        ..
-                    } = last.record
-                    {
+        let settled = broca_test_support::event_timeout(
+            "compaction work settles",
+            async {
+                loop {
+                    let now = *self
+                        .shared
+                        .compaction_clocks
+                        .lock()
+                        .unwrap()
+                        .get(&root)
+                        .unwrap_or(&0);
+                    let ready = {
                         let states = self.shared.compaction.lock().unwrap();
-                        let state = states.get(session).unwrap();
-                        let call = state.calls.last().unwrap();
-                        let cap_end = call.issued_at_ms
-                            + state
-                                .script
-                                .wait_cap_ms
-                                .min(state.script.prompt_cache_lifetime_ms);
-                        if now - state.start_ms < cap_end {
+                        let Some(state) = states.get(session) else {
+                            return "no compaction script installed".to_owned();
+                        };
+                        if !state.gates.is_empty() {
+                            Some(format!("{} held model call(s)", state.gates.len()))
+                        } else {
+                            state.calls.last().and_then(|call| {
+                                (state.senders.contains_key(&(state.calls.len() - 1))
+                                    && now - state.start_ms < call.deadline_ms)
+                                    .then(|| {
+                                        format!(
+                                            "provider call {} held before its deadline {} \
+                                         (adapter clock {})",
+                                            state.calls.len() - 1,
+                                            call.deadline_ms,
+                                            now - state.start_ms
+                                        )
+                                    })
+                            })
+                        }
+                    };
+                    if let Some(reason) = ready {
+                        return reason;
+                    }
+                    let frames = broca_core::FileWalStore::new(root.join("wal"))
+                        .read_records(&self.bind_identity(session))
+                        .unwrap_or_default();
+                    if let Some(last) = frames.last() {
+                        use broca_wal::WalRecord as R;
+                        if matches!(last.record, R::RunFinished { .. }) {
                             return format!(
+                                "RunFinished is the last WAL record (seq {})",
+                                last.seq
+                            );
+                        }
+                        if let R::CompactionAnswer {
+                            disposition: broca_wal::CompactionDisposition::Wait,
+                            ..
+                        } = last.record
+                        {
+                            let states = self.shared.compaction.lock().unwrap();
+                            let state = states.get(session).unwrap();
+                            let call = state.calls.last().unwrap();
+                            let cap_end = call.issued_at_ms
+                                + state
+                                    .script
+                                    .wait_cap_ms
+                                    .min(state.script.prompt_cache_lifetime_ms);
+                            if now - state.start_ms < cap_end {
+                                return format!(
                                 "WAIT is the last WAL record (seq {}); adapter clock {} is before \
                                  cap end {cap_end} of call {} issued at {}",
                                 last.seq,
@@ -506,15 +511,25 @@ impl BrocaSubject {
                                 state.calls.len() - 1,
                                 call.issued_at_ms
                             );
+                            }
                         }
                     }
+                    if root.join("test-compaction-reached").exists() {
+                        return "test-compaction-reached marker exists".to_owned();
+                    }
+                    sleep(Duration::from_millis(10)).await;
                 }
-                if root.join("test-compaction-reached").exists() {
-                    return "test-compaction-reached marker exists".to_owned();
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+            || {
+                broca_test_support::record_kinds(
+                    broca_core::FileWalStore::new(root.join("wal"))
+                        .read_records(&self.bind_identity(session))
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|f| &f.record),
+                )
+            },
+        )
         .await;
         match settled {
             Ok(reason) => {
@@ -522,7 +537,8 @@ impl BrocaSubject {
                 Ok(())
             }
             Err(_) => {
-                self.shared.note(session, "did not settle within 10 s");
+                self.shared
+                    .note(session, "compaction settle hang guard expired");
                 Err(HarnessError::new(format!(
                     "compaction work did not settle for {session}"
                 )))
@@ -596,15 +612,17 @@ impl BrocaSubject {
                 &serde_json::to_vec(&json!({"original_request_id":original,"answer":answer}))
                     .unwrap(),
             )?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !directory.join("ack").exists() {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .map_err(|_| {
-                HarnessError::new("duplicate receipt did not reach durable discard consumer")
-            })
+            broca_test_support::wait_until(
+                "duplicate receipt durable discard acknowledgement",
+                || async {
+                    let ack = directory.join("ack");
+                    ack.exists()
+                        .then_some(())
+                        .ok_or_else(|| format!("{} is absent", ack.display()))
+                },
+            )
+            .await;
+            Ok(())
         }
     }
     pub(super) async fn release_model_compaction(&self, session: &str) -> Result<(), HarnessError> {
@@ -756,17 +774,26 @@ impl BrocaSubject {
         atomic_write(&gate, point.as_str().as_bytes())?;
         tokio::pin!(trigger);
         let mut done = false;
-        let arrival = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if let Ok(bytes) = std::fs::read(&reached) {
-                    break serde_json::from_slice::<Value>(&bytes).unwrap();
+        let arrival = broca_test_support::event_timeout(
+            "pre-model compaction kill point",
+            async {
+                loop {
+                    if let Ok(bytes) = std::fs::read(&reached) {
+                        break serde_json::from_slice::<Value>(&bytes).unwrap();
+                    }
+                    tokio::select! {
+                        _ = &mut trigger, if !done => done=true,
+                        _ = sleep(Duration::from_millis(5)) => {},
+                    }
                 }
-                tokio::select! {
-                    _ = &mut trigger, if !done => done=true,
-                    _ = sleep(Duration::from_millis(5)) => {},
-                }
-            }
-        })
+            },
+            || {
+                format!(
+                    "kill_point={point:?}, marker={:?}",
+                    std::fs::metadata(&reached).map(|m| m.len())
+                )
+            },
+        )
         .await
         .map_err(|_| HarnessError::new(format!("runner never reached pre-model {point}")))?;
         let session = arrival["session"].as_str().unwrap();
@@ -925,13 +952,16 @@ impl BrocaSubject {
         let root = self.compaction_root(session)?;
         // A previous episode's terminal is not evidence that a newly admitted send settled.
         // Wait for this send's real durable start before considering model/provider gates.
-        tokio::time::timeout(Duration::from_secs(10),async {
-            loop {
-                let records=broca_core::FileWalStore::new(root.join("wal")).read_records(&self.bind_identity(session)).unwrap_or_default();
-                if records.iter().any(|frame|matches!(&frame.record,broca_wal::WalRecord::RunStarted {send_id:Some(id),..} if id==send_id)) {return}
-                sleep(Duration::from_millis(5)).await;
+        broca_test_support::wait_until(&format!("durable start for compaction send {send_id}"), || async {
+            let records = broca_core::FileWalStore::new(root.join("wal"))
+                .read_records(&self.bind_identity(session)).unwrap_or_default();
+            if records.iter().any(|frame| matches!(&frame.record, broca_wal::WalRecord::RunStarted { send_id: Some(id), .. } if id == send_id)) {
+                Ok(())
+            } else {
+                Err(broca_test_support::record_kinds(records.iter().map(|f| &f.record)))
             }
-        }).await.map_err(|_|HarnessError::new(format!("no durable start for compaction send {send_id}")))
+        }).await;
+        Ok(())
     }
 }
 

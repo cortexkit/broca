@@ -2383,18 +2383,29 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
     assert!(!live_path.with_extension("session").exists());
     let live = subject.start(&root).await.unwrap();
     let stone = wal_store.tombstone_path(&key, &lineage);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if !live_path.exists() && stone.exists() {
-                let value: Value = serde_json::from_slice(&std::fs::read(&stone).unwrap()).unwrap();
-                if value.get("completed_at_ms").is_some() {
-                    assert_eq!(value["expired_at_ms"], 1200);
-                    break;
+    broca_test_support::event_timeout(
+        "ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_content",
+        async {
+            loop {
+                if !live_path.exists() && stone.exists() {
+                    let value: Value =
+                        serde_json::from_slice(&std::fs::read(&stone).unwrap()).unwrap();
+                    if value.get("completed_at_ms").is_some() {
+                        assert_eq!(value["expired_at_ms"], 1200);
+                        break;
+                    }
                 }
+                sleep(Duration::from_millis(25)).await;
             }
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+        || {
+            format!(
+                "live_exists={}, stone_exists={}",
+                live_path.exists(),
+                stone.exists()
+            )
+        },
+    )
     .await
     .expect("startup enrollment and the first sweep must delete the WAL without a session read");
     let route = subject
@@ -2644,21 +2655,25 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
     let params = Value::Object(params);
     let admitted = response(route.request("session.send", params.clone()).await.unwrap());
     let run_id = admitted["run_id"].as_str().unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let reply = response(
-                route
-                    .request("run.result", json!({"run_id":run_id}))
-                    .await
-                    .unwrap(),
-            );
-            if reply["state"] == "completed" {
-                assert_eq!(reply["final_message"]["text"], "answer-hooked");
-                break;
+    broca_test_support::event_timeout(
+        "production_executor_installs_hooks_and_describes_ordered_phases",
+        async {
+            loop {
+                let reply = response(
+                    route
+                        .request("run.result", json!({"run_id":run_id}))
+                        .await
+                        .unwrap(),
+                );
+                if reply["state"] == "completed" {
+                    assert_eq!(reply["final_message"]["text"], "answer-hooked");
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
             }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+        || broca_test_support::record_kinds(subject.records(&live, session)),
+    )
     .await
     .unwrap();
     let records = subject.records(&live, session);
@@ -2826,11 +2841,15 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
             .await
             .unwrap(),
     );
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while state.tool_calls.lock().unwrap().is_empty() {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "reader_release_reads_writer_records_and_refuses_hooked_advancement",
+        async {
+            while state.tool_calls.lock().unwrap().is_empty() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || broca_test_support::record_kinds(subject.records(&writer, session)),
+    )
     .await
     .unwrap();
     for (id, delivery) in [("steer", "steer"), ("queued", "queue")] {
@@ -2838,20 +2857,24 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
     }
     state.held.lock().unwrap().clear();
     state.release.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let records = subject.records(&writer, session);
-            if records
-                .iter()
-                .filter(|r| matches!(r, broca_wal::WalRecord::RunFinished { .. }))
-                .count()
-                >= 2
-            {
-                break;
+    broca_test_support::event_timeout(
+        "reader_release_reads_writer_records_and_refuses_hooked_advancement",
+        async {
+            loop {
+                let records = subject.records(&writer, session);
+                if records
+                    .iter()
+                    .filter(|r| matches!(r, broca_wal::WalRecord::RunFinished { .. }))
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
             }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+        || broca_test_support::record_kinds(subject.records(&writer, session)),
+    )
     .await
     .unwrap();
     let records = subject.records(&writer, session);

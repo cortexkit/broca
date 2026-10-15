@@ -108,13 +108,24 @@ impl Server {
     }
 
     async fn wait_for(&self, count: usize) {
-        for _ in 0..400 {
-            if self.bodies.lock().unwrap().len() >= count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the server never received {count} requests");
+        broca_test_support::wait_for(
+            "wait_for",
+            async {
+                loop {
+                    if self.bodies.lock().unwrap().len() >= count {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || {
+                format!(
+                    "requests={}, wanted={count}",
+                    self.bodies.lock().unwrap().len()
+                )
+            },
+        )
+        .await
     }
 }
 
@@ -719,13 +730,19 @@ impl Fixture {
     }
 
     async fn wait_idle(&self) {
-        for _ in 0..500 {
-            if self.registry.route_status(&self.key).await.unwrap() == LineageStatus::Idle {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the session never went idle");
+        broca_test_support::wait_for(
+            "wait_idle",
+            async {
+                loop {
+                    if self.registry.route_status(&self.key).await.unwrap() == LineageStatus::Idle {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || format!("WAL records={}", self.records().len()),
+        )
+        .await
     }
 
     async fn warm(&self, lineage_id: Option<String>) -> Result<broca_wire::WarmReply, ServeError> {
@@ -973,13 +990,20 @@ async fn a_warm_after_the_run_re_sends_its_last_request_and_records_it() {
 
     // The export index holds the run's ordinary fact and one warm fact.
     let mut facts = Vec::new();
-    for _ in 0..200 {
-        facts = fixture.export.read_page(None, 10).unwrap().facts;
-        if facts.iter().any(|fact| fact.segment.warm) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "a_warm_after_the_run_re_sends_its_last_request_and_records_it",
+        async {
+            loop {
+                facts = fixture.export.read_page(None, 10).unwrap().facts;
+                if facts.iter().any(|fact| fact.segment.warm) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || format!("WAL records={}", fixture.records().len()),
+    )
+    .await;
     let warm_facts: Vec<_> = facts.iter().filter(|fact| fact.segment.warm).collect();
     assert_eq!(warm_facts.len(), 1, "{facts:?}");
     assert_eq!(warm_facts[0].segment.usage.cached_input_tokens, Some(4000));
@@ -1796,20 +1820,27 @@ async fn a_warm_finishing_after_the_next_run_started_is_still_recorded() {
     assert_eq!(run_id.0, "r1");
     assert_eq!(request_body_sha256, &reply.request_body_sha256);
     let mut warm_facts = 0;
-    for _ in 0..200 {
-        warm_facts = fixture
-            .export
-            .read_page(None, 10)
-            .unwrap()
-            .facts
-            .iter()
-            .filter(|fact| fact.segment.warm && fact.segment.run_id.0 == "r1")
-            .count();
-        if warm_facts == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "a_warm_finishing_after_the_next_run_started_is_still_recorded",
+        async {
+            loop {
+                warm_facts = fixture
+                    .export
+                    .read_page(None, 10)
+                    .unwrap()
+                    .facts
+                    .iter()
+                    .filter(|fact| fact.segment.warm && fact.segment.run_id.0 == "r1")
+                    .count();
+                if warm_facts == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || format!("WAL records={}", fixture.records().len()),
+    )
+    .await;
     assert_eq!(warm_facts, 1);
 }
 
@@ -1867,12 +1898,12 @@ impl Fixture {
             .await
             .unwrap();
         assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
-        tokio::time::timeout(
-            Duration::from_secs(4),
+        broca_test_support::wait_for(
+            "held automatic run starts",
             self.executor.held.started.notified(),
+            || self.warm_diagnostics(),
         )
-        .await
-        .unwrap();
+        .await;
     }
     fn warm_requests(&self) -> usize {
         self.server
@@ -1890,35 +1921,25 @@ impl Fixture {
             .collect()
     }
     async fn wait_quota_observations(&self, wanted: usize) {
-        tokio::time::timeout(Duration::from_secs(4), async {
-            while self.executor.quota_headers.lock().unwrap().len() < wanted {
-                tokio::task::yield_now().await;
-            }
+        broca_test_support::wait_until("automatic warm quota observations", || async {
+            let observed = self.executor.quota_headers.lock().unwrap().len();
+            (observed >= wanted)
+                .then_some(())
+                .ok_or_else(|| self.warm_diagnostics())
         })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "quota observations: {}, wanted: {wanted}, warm records: {}, skips: {}",
-                self.executor.quota_headers.lock().unwrap().len(),
-                self.warm_records().len(),
-                self.executor.skips.load(Ordering::SeqCst)
-            )
-        });
+        .await;
     }
     async fn wait_warms(&self, count: usize) {
-        tokio::time::timeout(Duration::from_secs(4), async {
-            while self.warm_records().len() < count {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        broca_test_support::wait_until("automatic warm records", || async {
+            let observed = self.warm_records().len();
+            (observed >= count).then_some(()).ok_or_else(|| {
+                format!(
+                    "warm_records={observed}, wanted={count}; {}",
+                    self.warm_diagnostics()
+                )
+            })
         })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "warm records observed: {}, wanted: {count}; {}",
-                self.warm_records().len(),
-                self.warm_diagnostics()
-            )
-        });
+        .await;
     }
     fn warm_diagnostics(&self) -> String {
         format!(
@@ -1931,28 +1952,26 @@ impl Fixture {
         )
     }
     async fn wait_warm_stop(&self, reason: &str) -> WarmStop {
-        tokio::time::timeout(Duration::from_secs(4), async {
-            loop {
-                let stop = self.executor.stops.0.lock().unwrap().last().cloned();
-                if let Some(stop) = stop {
-                    assert_eq!(
-                        stop.reason,
-                        reason,
-                        "expected keep_warm stop {reason}; {}",
-                        self.warm_diagnostics()
-                    );
-                    return stop;
+        broca_test_support::wait_for(
+            "automatic warm stops",
+            async {
+                loop {
+                    let stop = self.executor.stops.0.lock().unwrap().last().cloned();
+                    if let Some(stop) = stop {
+                        assert_eq!(
+                            stop.reason,
+                            reason,
+                            "expected keep_warm stop {reason}; {}",
+                            self.warm_diagnostics()
+                        );
+                        return stop;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+            || self.warm_diagnostics(),
+        )
         .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "no keep_warm stop {reason} observed; {}",
-                self.warm_diagnostics()
-            )
-        })
     }
     async fn hold_first_warm_past_short_ttl(&self, release: &tokio::sync::Notify) {
         self.server.wait_for(2).await;
@@ -2176,19 +2195,12 @@ async fn automatic_keep_warm_shares_the_real_manual_warm_flight() {
         .executor
         .hold_automatic
         .store(false, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(4), async {
-        while fixture.executor.skips.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+    broca_test_support::wait_until("automatic warm skip", || async {
+        (fixture.executor.skips.load(Ordering::SeqCst) > 0)
+            .then_some(())
+            .ok_or_else(|| fixture.warm_diagnostics())
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "expected automatic skip; skips: {}, warm records: {}",
-            fixture.executor.skips.load(Ordering::SeqCst),
-            fixture.warm_records().len()
-        )
-    });
+    .await;
     assert_eq!(
         fixture.warm_requests(),
         1,
@@ -2278,12 +2290,12 @@ async fn automatic_keep_warm_rebuilds_the_clock_and_request_for_resumed_tools() 
         .await
         .unwrap();
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
-    tokio::time::timeout(
-        Duration::from_secs(4),
+    broca_test_support::wait_for(
+        "restarted held automatic run starts",
         fixture.executor.held.started.notified(),
+        || fixture.warm_diagnostics(),
     )
-    .await
-    .unwrap();
+    .await;
     fixture.wait_warms(1).await;
     assert_eq!(
         fixture.warm_requests(),

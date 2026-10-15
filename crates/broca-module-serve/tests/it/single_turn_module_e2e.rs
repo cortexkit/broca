@@ -1211,23 +1211,24 @@ impl Daemon {
     /// test removes vault connectivity.
     #[cfg(unix)]
     async fn wait_for_vault_needs_reauth(&self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        broca_test_support::wait_until("vault applies provider auth failure", || async {
             let output = broca_test_support::retry_executable_file_busy(|| {
                 self.ck_auth_command().arg("status").output()
             });
-            if let Ok(output) = output {
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                if output.status.success() && text.contains("needs_reauth") {
-                    return true;
+            match output {
+                Ok(output) => {
+                    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    text.push_str(&String::from_utf8_lossy(&output.stderr));
+                    if output.status.success() && text.contains("needs_reauth") {
+                        Ok(true)
+                    } else {
+                        Err(format!("auth status={}, output={text}", output.status))
+                    }
                 }
+                Err(error) => Err(format!("auth status probe: {error}")),
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        })
+        .await
     }
 
     #[cfg(unix)]
@@ -1431,8 +1432,7 @@ impl ConcurrencyProbe {
 /// WAL has not yet committed, and a test that proceeds on the report races the fsync it
 /// actually depends on.
 async fn wait_for_wal_marker(wal_dir: &Path, markers: &[&str]) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    broca_test_support::wait_until("durable WAL markers", || async {
         let hit = std::fs::read_dir(wal_dir)
             .ok()
             .into_iter()
@@ -1442,14 +1442,10 @@ async fn wait_for_wal_marker(wal_dir: &Path, markers: &[&str]) -> bool {
                 let text = String::from_utf8_lossy(&bytes);
                 markers.iter().all(|m| text.contains(m))
             });
-        if hit {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        hit.then_some(true)
+            .ok_or_else(|| format!("wal_dir={}, missing markers={markers:?}", wal_dir.display()))
+    })
+    .await
 }
 
 async fn run_client(
@@ -2572,19 +2568,14 @@ fn session_wal_text(wal_dir: &Path, session: &str) -> String {
 /// before the coordinator retires the run; a send in that moment is QUEUED, and its admission
 /// (and any refusal) happens at drain rather than in the send reply this test reads.
 async fn wait_until_session_idle(daemon: &Daemon, project_root: &Path, session: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    broca_test_support::wait_until(&format!("session {session} becomes idle"), || async {
         let status = run_client(daemon, project_root, session, &["status"]).await;
-        if status.saw("STATUS Idle") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "session {session} never went idle: {:?}",
-            status.lines
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        status
+            .saw("STATUS Idle")
+            .then_some(())
+            .ok_or_else(|| format!("status lines={:?}", status.lines))
+    })
+    .await;
 }
 
 /// Context management is a per-session choice frozen at the session's first episode.

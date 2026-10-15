@@ -401,18 +401,29 @@ fn registry_with_parking_index(
 }
 
 async fn wait_for_index_state(rig: &Rig, run_id: &str, expected: RunIndexState) {
-    for _ in 0..40 {
-        let state = rig
-            .run_index
-            .lookup_run(run_id)
-            .unwrap()
-            .map(|row| row.state);
-        if state == Some(expected.clone()) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("timed out waiting for run-index state {expected:?} on {run_id}");
+    broca_test_support::wait_for(
+        "wait_for_index_state",
+        async {
+            loop {
+                let state = rig
+                    .run_index
+                    .lookup_run(run_id)
+                    .unwrap()
+                    .map(|row| row.state);
+                if state == Some(expected.clone()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "index={:?}, expected={expected:?}",
+                rig.run_index.lookup_run(run_id).map(|r| r.map(|r| r.state))
+            )
+        },
+    )
+    .await
 }
 
 async fn wait_for_resolved_state(
@@ -421,28 +432,54 @@ async fn wait_for_resolved_state(
     run_id: &str,
     expected: RunIndexState,
 ) {
-    for _ in 0..40 {
-        let state = rig
-            .registry
-            .route_run_state(key, broca_protocol::RunId(run_id.into()))
-            .await
-            .unwrap();
-        if state.map(|resolved| resolved.state) == Some(expected.clone()) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("timed out waiting for resolved state {expected:?} on {run_id}");
+    broca_test_support::wait_for(
+        "wait_for_resolved_state",
+        async {
+            loop {
+                let state = rig
+                    .registry
+                    .route_run_state(key, broca_protocol::RunId(run_id.into()))
+                    .await
+                    .unwrap();
+                if state.map(|resolved| resolved.state) == Some(expected.clone()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, started={}, finished={}",
+                rig.registry.slot_state(key),
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await
 }
 
 async fn wait_for_actor_close(rig: &Rig, key: &broca_protocol::BindIdentity) {
-    for _ in 0..40 {
-        if rig.registry.slot_state(key).is_none() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("timed out waiting for actor close");
+    broca_test_support::wait_for(
+        "wait_for_actor_close",
+        async {
+            loop {
+                if rig.registry.slot_state(key).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, started={}, finished={}",
+                rig.registry.slot_state(key),
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await
 }
 
 /// The in-flight gauge must flip at durable admission, before the run-index active write
@@ -465,7 +502,7 @@ async fn runs_in_flight_gauge_is_one_while_index_active_write_is_outstanding() {
     // Block until the actor has entered the index write (post-admission).
     tokio::task::spawn_blocking(move || {
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(broca_test_support::EVENT_HANG_GUARD)
             .expect("index_run_active did not start")
     })
     .await
@@ -491,12 +528,25 @@ async fn runs_in_flight_gauge_is_one_while_index_active_write_is_outstanding() {
     );
 
     gate.release().await;
-    for _ in 0..100 {
-        if exec.finished_count() >= 1 && registry.slot_counts().runs_in_flight == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "runs_in_flight_gauge_is_one_while_index_active_write_is_outstanding",
+        async {
+            loop {
+                if exec.finished_count() >= 1 && registry.slot_counts().runs_in_flight == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "finished={}, in_flight={}",
+                exec.finished_count(),
+                registry.slot_counts().runs_in_flight
+            )
+        },
+    )
+    .await;
     assert_eq!(
         registry.slot_counts().runs_in_flight,
         0,
@@ -540,12 +590,25 @@ async fn failing_index_active_write_still_leaves_run_in_flight() {
     );
 
     gate.release().await;
-    for _ in 0..100 {
-        if exec.finished_count() >= 1 && registry.slot_counts().runs_in_flight == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "failing_index_active_write_still_leaves_run_in_flight",
+        async {
+            loop {
+                if exec.finished_count() >= 1 && registry.slot_counts().runs_in_flight == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "finished={}, in_flight={}",
+                exec.finished_count(),
+                registry.slot_counts().runs_in_flight
+            )
+        },
+    )
+    .await;
     assert_eq!(
         registry.slot_counts().runs_in_flight,
         0,
@@ -687,12 +750,25 @@ async fn active_send_retry_is_idempotent() {
     );
 
     gate.release().await;
-    for _ in 0..50 {
-        if exec.finished_count() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "active_send_retry_is_idempotent",
+        async {
+            loop {
+                if exec.finished_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                exec.started_count(),
+                exec.finished_count()
+            )
+        },
+    )
+    .await;
     assert_eq!(exec.finished_count(), 1);
 
     let records: Vec<_> = store
@@ -804,12 +880,25 @@ async fn pending_send_retry_is_idempotent() {
     assert_eq!(exec.started_count(), 1);
 
     gate.release().await;
-    for _ in 0..50 {
-        if exec.started_count() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "pending_send_retry_is_idempotent",
+        async {
+            loop {
+                if exec.started_count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                exec.started_count(),
+                exec.finished_count()
+            )
+        },
+    )
+    .await;
     gate.release().await;
 }
 
@@ -897,15 +986,29 @@ async fn idle_resume_rejects_changed_generation() {
         .route_send(&key, req(&key, "r1"), RunKind::FreshOrResume)
         .await
         .unwrap();
-    for _ in 0..100 {
-        if matches!(
-            rig.registry.route_status(&key).await.unwrap(),
-            LineageStatus::Idle
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "idle_resume_rejects_changed_generation",
+        async {
+            loop {
+                if matches!(
+                    rig.registry.route_status(&key).await.unwrap(),
+                    LineageStatus::Idle
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, started={}, finished={}",
+                rig.registry.slot_state(&key),
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await;
 
     let mut changed = req(&key, "r1");
     changed.generation.top_p = Some(0.5);
@@ -1163,12 +1266,19 @@ async fn crash_recovery_preserves_send_identity_for_retry() {
         SendOutcome::Active { .. }
     ));
     gate.release().await;
-    for _ in 0..40 {
-        if registry.slot_state(&key).is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "crash_recovery_preserves_send_identity_for_retry",
+        async {
+            loop {
+                if registry.slot_state(&key).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || format!("slot={:?}", registry.slot_state(&key)),
+    )
+    .await;
     assert_eq!(
         registry.slot_state(&key),
         None,
@@ -1238,12 +1348,19 @@ async fn crash_recovery_preserves_send_identity_for_retry() {
         SendOutcome::SendIdReuse { differing: "input" }
     );
 
-    for _ in 0..40 {
-        if registry.slot_state(&key).is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "crash_recovery_preserves_send_identity_for_retry",
+        async {
+            loop {
+                if registry.slot_state(&key).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || format!("slot={:?}", registry.slot_state(&key)),
+    )
+    .await;
     drop(registry);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1333,17 +1450,28 @@ async fn send_while_active_queues_durably() {
     // process the terminal, update its index and admit r2 before drain is observable.
     // Executor entry precedes admission, so wait for actor status, not started_count.
     let mut last_status = None;
-    let drained = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let status = rig.registry.route_status(&key).await.unwrap();
-            let is_r2 = matches!(&status, LineageStatus::Active { run_id, .. } if run_id.0 == "r2");
-            last_status = Some(status);
-            if is_r2 {
-                break;
+    let drained = broca_test_support::event_timeout(
+        "send_while_active_queues_durably",
+        async {
+            loop {
+                let status = rig.registry.route_status(&key).await.unwrap();
+                let is_r2 =
+                    matches!(&status, LineageStatus::Active { run_id, .. } if run_id.0 == "r2");
+                last_status = Some(status);
+                if is_r2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
+    )
     .await;
     assert!(
         drained.is_ok(),
@@ -1358,11 +1486,21 @@ async fn send_while_active_queues_durably() {
 
     gate.release().await;
     // Keep the rig alive until the drained run's terminal is handled as well.
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while rig.registry.route_status(&key).await.unwrap() != LineageStatus::Idle {
-            tokio::task::yield_now().await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "send_while_active_queues_durably",
+        async {
+            while rig.registry.route_status(&key).await.unwrap() != LineageStatus::Idle {
+                tokio::task::yield_now().await;
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
+    )
     .await
     .expect("drained r2 did not become idle after its gate was released");
 }
@@ -1585,9 +1723,16 @@ async fn reopened_actor_resolves_permanent_queue_failure_and_serves_commands() {
     // Revert check: the old unconditional startup retry never reached this subscribe command,
     // so this bounded await timed out forever on the permanently invalid queue head.
     let (sink, mut deliveries) = tokio::sync::mpsc::channel(16);
-    tokio::time::timeout(
-        Duration::from_secs(1),
+    broca_test_support::event_timeout(
+        "reopened_actor_resolves_permanent_queue_failure_and_serves_commands",
         rig.registry.route_subscribe(&key, FromCursor::Start, sink),
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
     )
     .await
     .expect("startup recovery must not starve the actor command loop")
@@ -1595,34 +1740,46 @@ async fn reopened_actor_resolves_permanent_queue_failure_and_serves_commands() {
 
     let mut saw_failed_start = false;
     let mut saw_failed_error = false;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match deliveries.recv().await {
-                Some(Delivery::Control(event)) => match &event.1 {
-                    ControlUnit::RunStarted {
-                        run_id,
-                        submission_id,
-                    } => {
-                        saw_failed_start = run_id.0 == "b"
-                            && submission_id.as_ref().is_some_and(|id| id.0 == "sub-b");
+    broca_test_support::event_timeout(
+        "reopened_actor_resolves_permanent_queue_failure_and_serves_commands",
+        async {
+            loop {
+                match deliveries.recv().await {
+                    Some(Delivery::Control(event)) => match &event.1 {
+                        ControlUnit::RunStarted {
+                            run_id,
+                            submission_id,
+                        } => {
+                            saw_failed_start = run_id.0 == "b"
+                                && submission_id.as_ref().is_some_and(|id| id.0 == "sub-b");
+                        }
+                        ControlUnit::Error { error } if saw_failed_start => {
+                            saw_failed_error =
+                                error.provider_code.as_deref() == Some("queued_admission_failed");
+                        }
+                        ControlUnit::RunFinished {
+                            reason: broca_protocol::caller::RunFinishReason::Error,
+                            ..
+                        } if saw_failed_start && saw_failed_error => break,
+                        _ => {}
+                    },
+                    Some(Delivery::Detached) => {
+                        panic!("subscriber detached during failed terminal")
                     }
-                    ControlUnit::Error { error } if saw_failed_start => {
-                        saw_failed_error =
-                            error.provider_code.as_deref() == Some("queued_admission_failed");
-                    }
-                    ControlUnit::RunFinished {
-                        reason: broca_protocol::caller::RunFinishReason::Error,
-                        ..
-                    } if saw_failed_start && saw_failed_error => break,
-                    _ => {}
-                },
-                Some(Delivery::Detached) => panic!("subscriber detached during failed terminal"),
-                Some(Delivery::Error(error)) => panic!("subscriber replay failed: {error}"),
-                Some(_) => {}
-                None => panic!("subscriber ended before queued failure terminal"),
+                    Some(Delivery::Error(error)) => panic!("subscriber replay failed: {error}"),
+                    Some(_) => {}
+                    None => panic!("subscriber ended before queued failure terminal"),
+                }
             }
-        }
-    })
+        },
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
+    )
     .await
     .expect("queued failure must be subscriber-visible");
 
@@ -1675,10 +1832,20 @@ async fn permanent_poison_head_is_consumed_before_younger_queue_work() {
     let key = rig.key("s1");
     seed_completed_run_with_queue(&rig, &key, &["b", "c"]);
 
-    tokio::time::timeout(Duration::from_secs(1), rig.registry.route_status(&key))
-        .await
-        .expect("actor must enter its command loop after draining recovered FIFO")
-        .unwrap();
+    broca_test_support::event_timeout(
+        "permanent_poison_head_is_consumed_before_younger_queue_work",
+        rig.registry.route_status(&key),
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
+    )
+    .await
+    .expect("actor must enter its command loop after draining recovered FIFO")
+    .unwrap();
     wait_for_resolved_state(&rig, &key, "b", RunIndexState::Error).await;
     wait_for_resolved_state(&rig, &key, "c", RunIndexState::Completed).await;
 
@@ -1733,10 +1900,20 @@ async fn transient_queued_admission_retries_without_consuming_the_head() {
     let key = rig.key("s1");
     seed_completed_run_with_queue(&rig, &key, &["b"]);
 
-    tokio::time::timeout(Duration::from_secs(1), rig.registry.route_status(&key))
-        .await
-        .expect("transient startup retry must recover")
-        .unwrap();
+    broca_test_support::event_timeout(
+        "transient_queued_admission_retries_without_consuming_the_head",
+        rig.registry.route_status(&key),
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
+    )
+    .await
+    .expect("transient startup retry must recover")
+    .unwrap();
     wait_for_resolved_state(&rig, &key, "b", RunIndexState::Completed).await;
 
     let store = broca_core::FileWalStore::new(rig.dir.join("wal"));
@@ -1869,12 +2046,25 @@ async fn reopened_actor_redrives_unfinished_run_before_accepting_a_new_send() {
         "the new r2 send must never be acknowledged as r1's recovery"
     );
 
-    for _ in 0..40 {
-        if exec.started_count() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "reopened_actor_redrives_unfinished_run_before_accepting_a_new_send",
+        async {
+            loop {
+                if exec.started_count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                exec.started_count(),
+                exec.finished_count()
+            )
+        },
+    )
+    .await;
     assert_eq!(exec.started_count(), 2, "r1 recovery and r2 each run once");
     let records = store.read_records(&key).unwrap();
     assert!(records.iter().any(|framed| {
@@ -1981,12 +2171,25 @@ async fn reopened_actor_seals_indeterminate_run_before_draining_new_send() {
         "a new send must not be acknowledged as the ambiguous run's recovery"
     );
 
-    for _ in 0..100 {
-        if exec.started_count() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "reopened_actor_seals_indeterminate_run_before_draining_new_send",
+        async {
+            loop {
+                if exec.started_count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                exec.started_count(),
+                exec.finished_count()
+            )
+        },
+    )
+    .await;
     assert_eq!(exec.started_count(), 2, "recovery seals r1 before r2 runs");
     wait_until_idle(&rig, &key).await;
 
@@ -2144,19 +2347,32 @@ async fn drained_submission_is_marked_consumed_in_the_durable_wal() {
     gate.release().await;
     // Wait for the drain's consuming run to have started + recorded its RunStarted.
     let mut consumed = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let recs: Vec<_> = store
-            .read_records(&key)
-            .unwrap()
-            .into_iter()
-            .map(|f| f.record)
-            .collect();
-        if pending_submissions(&recs).is_empty() && rig.exec.started_count() >= 2 {
-            consumed = true;
-            break;
-        }
-    }
+    broca_test_support::wait_for(
+        "drained_submission_is_marked_consumed_in_the_durable_wal",
+        async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let recs: Vec<_> = store
+                    .read_records(&key)
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| f.record)
+                    .collect();
+                if pending_submissions(&recs).is_empty() && rig.exec.started_count() >= 2 {
+                    consumed = true;
+                    break;
+                }
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await;
     gate.release().await; // let the drained run finish too
     assert!(
         consumed,
@@ -2195,27 +2411,37 @@ async fn live_subscriber_pins_idle_actor_and_receives_later_run() {
         .unwrap();
     assert!(matches!(outcome, SendOutcome::Active { .. }));
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let mut saw_later_run = false;
-        loop {
-            match deliveries.recv().await {
-                Some(Delivery::Control(event)) => match &event.1 {
-                    ControlUnit::RunStarted {
-                        run_id,
-                        submission_id,
-                    } => {
-                        saw_later_run = run_id.0 == "r-late" && submission_id.is_none();
-                    }
-                    ControlUnit::RunFinished { .. } if saw_later_run => break,
-                    _ => {}
-                },
-                Some(Delivery::Detached) => panic!("pinned subscriber detached unexpectedly"),
-                Some(Delivery::Error(error)) => panic!("subscriber replay failed: {error}"),
-                Some(_) => {}
-                None => panic!("pinned subscriber stream ended before the later run"),
+    broca_test_support::event_timeout(
+        "live_subscriber_pins_idle_actor_and_receives_later_run",
+        async {
+            let mut saw_later_run = false;
+            loop {
+                match deliveries.recv().await {
+                    Some(Delivery::Control(event)) => match &event.1 {
+                        ControlUnit::RunStarted {
+                            run_id,
+                            submission_id,
+                        } => {
+                            saw_later_run = run_id.0 == "r-late" && submission_id.is_none();
+                        }
+                        ControlUnit::RunFinished { .. } if saw_later_run => break,
+                        _ => {}
+                    },
+                    Some(Delivery::Detached) => panic!("pinned subscriber detached unexpectedly"),
+                    Some(Delivery::Error(error)) => panic!("subscriber replay failed: {error}"),
+                    Some(_) => {}
+                    None => panic!("pinned subscriber stream ended before the later run"),
+                }
             }
-        }
-    })
+        },
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                rig.registry.slot_state(&key),
+                rig.registry.slot_counts().runs_in_flight
+            )
+        },
+    )
     .await
     .expect("the original subscriber stream must receive the later run");
 
@@ -2261,13 +2487,27 @@ async fn idle_close_releases_then_reopens() {
     // sleep, so a loaded scheduler (e.g. parallel compilation in CI) slow to run the actor
     // task doesn't false-fail — the property is "it DOES close", not "within 300ms".
     let mut closed = false;
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if rig.registry.slot_state(&key).is_none() {
-            closed = true;
-            break;
-        }
-    }
+    broca_test_support::wait_for(
+        "idle_close_releases_then_reopens",
+        async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if rig.registry.slot_state(&key).is_none() {
+                    closed = true;
+                    break;
+                }
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, started={}, finished={}",
+                rig.registry.slot_state(&key),
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await;
     assert!(closed, "actor closed after idle TTL");
 
     // A new op re-opens cleanly (the lease was released, so re-acquire succeeds).
@@ -2365,12 +2605,26 @@ async fn coordinator_cancel_is_durably_cancelled_and_allows_a_new_episode() {
         CancelOutcome::Ack
     );
 
-    for _ in 0..40 {
-        if store.lookup_run("r1").unwrap().map(|row| row.state) == Some(RunIndexState::Cancelled) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "coordinator_cancel_is_durably_cancelled_and_allows_a_new_episode",
+        async {
+            loop {
+                if store.lookup_run("r1").unwrap().map(|row| row.state)
+                    == Some(RunIndexState::Cancelled)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "index={:?}",
+                store.lookup_run("r1").map(|r| r.map(|r| r.state))
+            )
+        },
+    )
+    .await;
     assert_eq!(
         store.lookup_run("r1").unwrap().map(|row| row.state),
         Some(RunIndexState::Cancelled),
@@ -2415,15 +2669,22 @@ async fn coordinator_cancel_is_durably_cancelled_and_allows_a_new_episode() {
         }
     ));
 
-    for _ in 0..40 {
-        if matches!(
-            registry.route_status(&key).await.unwrap(),
-            LineageStatus::Idle
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "coordinator_cancel_is_durably_cancelled_and_allows_a_new_episode",
+        async {
+            loop {
+                if matches!(
+                    registry.route_status(&key).await.unwrap(),
+                    LineageStatus::Idle
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || format!("slot={:?}", registry.slot_state(&key)),
+    )
+    .await;
     assert!(matches!(
         registry.route_status(&key).await.unwrap(),
         LineageStatus::Idle
@@ -2436,12 +2697,26 @@ async fn coordinator_cancel_is_durably_cancelled_and_allows_a_new_episode() {
         SendOutcome::Active { run_id, .. } if run_id.0 == "r2"
     ));
 
-    for _ in 0..40 {
-        if store.lookup_run("r2").unwrap().map(|row| row.state) == Some(RunIndexState::Completed) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "coordinator_cancel_is_durably_cancelled_and_allows_a_new_episode",
+        async {
+            loop {
+                if store.lookup_run("r2").unwrap().map(|row| row.state)
+                    == Some(RunIndexState::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "index={:?}",
+                store.lookup_run("r2").map(|r| r.map(|r| r.state))
+            )
+        },
+    )
+    .await;
     assert_eq!(
         store.lookup_run("r2").unwrap().map(|row| row.state),
         Some(RunIndexState::Completed),
@@ -2652,15 +2927,29 @@ async fn two_sequential_episodes_do_not_trip_integrity_belt() {
     // Wait for the first run to finish and the actor to go Idle by polling status (a fixed
     // sleep races a loaded scheduler: if the first run hasn't finished, the second send
     // would QUEUE instead of starting a fresh episode, breaking this test's premise).
-    for _ in 0..100 {
-        if matches!(
-            rig.registry.route_status(&key).await.unwrap(),
-            LineageStatus::Idle
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "two_sequential_episodes_do_not_trip_integrity_belt",
+        async {
+            loop {
+                if matches!(
+                    rig.registry.route_status(&key).await.unwrap(),
+                    LineageStatus::Idle
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, started={}, finished={}",
+                rig.registry.slot_state(&key),
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await;
 
     // Episode 2 over the SAME open actor (same session writer). If the writer model were
     // per-run with a re-seed, OR if a second writer were spawned, the integrity belt could
@@ -2676,12 +2965,25 @@ async fn two_sequential_episodes_do_not_trip_integrity_belt() {
     );
     // Wait for both episodes to have run by polling (a fixed sleep would race a loaded
     // scheduler and could assert before the second episode's executor recorded its finish).
-    for _ in 0..100 {
-        if rig.exec.finished_count() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "two_sequential_episodes_do_not_trip_integrity_belt",
+        async {
+            loop {
+                if rig.exec.finished_count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await;
     assert_eq!(
         rig.exec.started_count(),
         2,
@@ -2925,14 +3227,26 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
         "renderer-drift recovery send returned {outcome:?}"
     );
 
-    for _ in 0..80 {
-        if store.lookup_run("r-drift").unwrap().map(|row| row.state)
-            == Some(RunIndexState::Interrupted)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "renderer_drift_reaches_subscriber_and_run_status",
+        async {
+            loop {
+                if store.lookup_run("r-drift").unwrap().map(|row| row.state)
+                    == Some(RunIndexState::Interrupted)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "index={:?}",
+                store.lookup_run("r-drift").map(|r| r.map(|r| r.state))
+            )
+        },
+    )
+    .await;
     assert_eq!(
         store.lookup_run("r-drift").unwrap().map(|row| row.state),
         Some(RunIndexState::Interrupted)
@@ -2946,10 +3260,20 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
     let mut typed_error = false;
     let mut terminal = false;
     for _ in 0..8 {
-        let delivery = tokio::time::timeout(Duration::from_secs(1), deliveries.recv())
-            .await
-            .expect("drift projection must not wedge")
-            .expect("subscriber remains attached");
+        let delivery = broca_test_support::event_timeout(
+            "renderer_drift_reaches_subscriber_and_run_status",
+            deliveries.recv(),
+            || {
+                format!(
+                    "slot={:?}, in_flight={}",
+                    registry.slot_state(&key),
+                    registry.slot_counts().runs_in_flight
+                )
+            },
+        )
+        .await
+        .expect("drift projection must not wedge")
+        .expect("subscriber remains attached");
         if let Delivery::Control(event) = delivery {
             match &event.1 {
                 ControlUnit::Error { error } => {
@@ -3037,21 +3361,31 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
         }
     ));
 
-    let fact = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let page = store
-                .read_export_page(None, 10)
-                .expect("read renderer-drift usage export");
-            if let Some(fact) = page
-                .facts
-                .into_iter()
-                .find(|fact| fact.segment.run_id.0 == "r-drift")
-            {
-                return fact;
+    let fact = broca_test_support::event_timeout(
+        "renderer_drift_reaches_subscriber_and_run_status",
+        async {
+            loop {
+                let page = store
+                    .read_export_page(None, 10)
+                    .expect("read renderer-drift usage export");
+                if let Some(fact) = page
+                    .facts
+                    .into_iter()
+                    .find(|fact| fact.segment.run_id.0 == "r-drift")
+                {
+                    return fact;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+        || {
+            format!(
+                "slot={:?}, in_flight={}",
+                registry.slot_state(&key),
+                registry.slot_counts().runs_in_flight
+            )
+        },
+    )
     .await
     .expect("renderer-drift terminal eventually emits an immutable usage fact");
     assert_eq!(
@@ -3165,14 +3499,26 @@ async fn same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop() {
         .route_run_state(&key, original.run_id.clone())
         .await
         .expect("open the lineage and start recovery");
-    for _ in 0..80 {
-        if store.lookup_run("r-drift").unwrap().map(|row| row.state)
-            == Some(RunIndexState::Interrupted)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop",
+        async {
+            loop {
+                if store.lookup_run("r-drift").unwrap().map(|row| row.state)
+                    == Some(RunIndexState::Interrupted)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "index={:?}",
+                store.lookup_run("r-drift").map(|r| r.map(|r| r.state))
+            )
+        },
+    )
+    .await;
     let drift_row = store
         .lookup_run("r-drift")
         .unwrap()
@@ -3251,14 +3597,26 @@ async fn same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop() {
         ),
         "a fresh send identity opens the next episode"
     );
-    for _ in 0..80 {
-        if store.lookup_run("r-next").unwrap().map(|row| row.state)
-            == Some(RunIndexState::Completed)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop",
+        async {
+            loop {
+                if store.lookup_run("r-next").unwrap().map(|row| row.state)
+                    == Some(RunIndexState::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            format!(
+                "index={:?}",
+                store.lookup_run("r-next").map(|r| r.map(|r| r.state))
+            )
+        },
+    )
+    .await;
     assert_eq!(
         store.lookup_run("r-next").unwrap().map(|row| row.state),
         Some(RunIndexState::Completed)
@@ -3901,13 +4259,26 @@ fn submission_with_tools(
 }
 
 async fn wait_until_idle(rig: &Rig, key: &broca_protocol::BindIdentity) {
-    for _ in 0..100 {
-        if rig.registry.route_status(key).await.unwrap() == LineageStatus::Idle {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("lineage did not become idle");
+    broca_test_support::wait_for(
+        "wait_until_idle",
+        async {
+            loop {
+                if rig.registry.route_status(key).await.unwrap() == LineageStatus::Idle {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "slot={:?}, started={}, finished={}",
+                rig.registry.slot_state(key),
+                rig.exec.started_count(),
+                rig.exec.finished_count()
+            )
+        },
+    )
+    .await
 }
 
 fn frozen_tool_configs(rig: &Rig, key: &broca_protocol::BindIdentity) -> Vec<broca_wal::RunConfig> {
@@ -4065,19 +4436,45 @@ async fn fresh_omission_and_queued_omission_resolve_at_episode_start() {
     }
 
     gate.release().await;
-    for _ in 0..100 {
-        if executor.started_count() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "fresh_omission_and_queued_omission_resolve_at_episode_start",
+        async {
+            loop {
+                if executor.started_count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                executor.started_count(),
+                executor.finished_count()
+            )
+        },
+    )
+    .await;
     gate.release().await;
-    for _ in 0..100 {
-        if executor.finished_count() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "fresh_omission_and_queued_omission_resolve_at_episode_start",
+        async {
+            loop {
+                if executor.finished_count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "started={}, finished={}",
+                executor.started_count(),
+                executor.finished_count()
+            )
+        },
+    )
+    .await;
     wait_until_idle(&queued, &queued_key).await;
     let queued_configs = frozen_tool_configs(&queued, &queued_key);
     assert_eq!(queued_configs.len(), 2);

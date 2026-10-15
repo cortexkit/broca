@@ -29,20 +29,14 @@ fn seed(rig: &Rig, key: &BindIdentity) {
 }
 
 async fn backfilled(rig: &Rig, key: &BindIdentity) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if rig
-                .store
-                .read_page_with_watermark(key, Some(0), 10, broca_core::ReadView::Raw)
-                .is_ok()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    broca_test_support::wait_until("lazy attribution backfill completes", || async {
+        let page = rig
+            .store
+            .read_page_with_watermark(key, Some(0), 10, broca_core::ReadView::Raw);
+        page.map(|_| ())
+            .map_err(|e| format!("page remains unavailable: {e}"))
     })
-    .await
-    .expect("lazy attribution backfill completes");
+    .await;
 }
 
 struct CountingPages {
@@ -221,7 +215,7 @@ impl Persister for HeldProjection {
         self.release
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(broca_test_support::EVENT_HANG_GUARD)
             .map_err(|e| e.to_string())?;
         Persister::project_range(self.inner.as_ref(), key, range)
     }
@@ -258,9 +252,13 @@ async fn a_send_waits_for_attribution_repair_instead_of_receiving_a_lease_refusa
         .route_read(&key, Some(0), Some(10))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
-        .await
-        .unwrap();
+    broca_test_support::event_timeout(
+        "a_send_waits_for_attribution_repair_instead_of_receiving_a_lease_refusal",
+        held.entered.notified(),
+        || format!("slot={:?}", rig.registry.slot_state(&key)),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             FileLeaseStore::new(&rig.lease_dir).acquire(&broca_core::lease_key_for(&key)),
@@ -278,9 +276,13 @@ async fn a_send_waits_for_attribution_repair_instead_of_receiving_a_lease_refusa
         "send must wait, not return an error while repair holds the lease"
     );
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), &mut pending)
-        .await
-        .expect("send is admitted after repair");
+    broca_test_support::event_timeout(
+        "a_send_waits_for_attribution_repair_instead_of_receiving_a_lease_refusal",
+        &mut pending,
+        || format!("slot={:?}", rig.registry.slot_state(&key)),
+    )
+    .await
+    .expect("send is admitted after repair");
     wait_status(&rig, &key, "new", "completed").await;
     let frames = rig.wal_store.read_records(&key).unwrap();
     assert_eq!(frames.iter().filter(|frame| matches!(&frame.record, WalRecord::RunStarted { run_id, .. } if run_id.0 == "new")).count(), 1, "the waiting send is admitted exactly once");

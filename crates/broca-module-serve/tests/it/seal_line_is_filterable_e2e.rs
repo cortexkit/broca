@@ -270,23 +270,21 @@ async fn the_shutdown_seal_line_carries_a_component_so_a_filter_can_reach_it() {
     rig.child.start_kill().expect("kill the daemon");
 
     let logs_dir = rig.logs_dir();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let line = loop {
+    let line = broca_test_support::wait_until("shutdown seal log record", || async {
         let segment = read_segment(&logs_dir);
         if let Some(line) = segment
             .lines()
             .find(|line| line.contains("shutdown seal") || line.contains("shutdown incomplete"))
         {
-            break line.to_string();
+            return Ok(line.to_string());
         }
-        assert!(
-            Instant::now() < deadline,
-            "no seal record reached {}; the module either never sealed or never logged it. \
-             Segment so far:\n{segment}",
-            logs_dir.display()
-        );
-        sleep(Duration::from_millis(100)).await;
-    };
+        Err(format!(
+            "logs_dir={}, tail={}",
+            logs_dir.display(),
+            segment.lines().rev().take(8).collect::<Vec<_>>().join("\n")
+        ))
+    })
+    .await;
 
     let record = cortexkit_log::parse_line(&line)
         .unwrap_or_else(|error| panic!("the seal record is not a readable line: {error}: {line}"));

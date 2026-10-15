@@ -12275,3 +12275,23 @@ expect_red = ["catalog_refresh::tests::repeated_page_token_fails_closed"]
 file = "crates/broca-module-serve/src/catalog_refresh.rs"
 old = "if !tokens.insert(token.clone()) {"
 new = "if false && !tokens.insert(token.clone()) { // NON-VACUITY BREAK: accept cursor cycles"
+
+[[control]]
+id = "test-event-waits-reject-short-real-time-polls"
+guards = "new short wall-clock polling loops in workspace tests must be classified or use the shared diagnostic hang guard"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test event_wait_guard"
+test_file = "crates/broca-test-support/tests/event_wait_guard.rs"
+expect_red = ["short_real_time_polls_are_classified"]
+expect_message = "delivery_rig/mod.rs"
+file = "crates/broca-module-serve/tests/delivery_rig/mod.rs"
+old = '''    pub async fn wait_idle(&mut self) {
+        let wal_path = self.wal_path.clone();'''
+new = '''    pub async fn wait_idle(&mut self) {
+        // NON-VACUITY BREAK: reintroduce a two-second disk-state poll outside the shared helper.
+        for _ in 0..100 {
+            let _ = self.records();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let wal_path = self.wal_path.clone();'''

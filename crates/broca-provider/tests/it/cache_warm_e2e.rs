@@ -108,14 +108,27 @@ mod gated {
         }
 
         async fn wait_for_requests(&self, count: usize) {
-            for _ in 0..200 {
-                let notified = self.received.notified();
-                if self.bodies.lock().unwrap().len() >= count {
-                    return;
-                }
-                let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
-            }
-            panic!("the server never received {count} requests");
+            broca_test_support::wait_for(
+                "warm request reaches provider",
+                async {
+                    loop {
+                        let notified = self.received.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if self.bodies.lock().unwrap().len() >= count {
+                            return;
+                        }
+                        notified.await;
+                    }
+                },
+                || {
+                    format!(
+                        "expected_requests={count}, observed_requests={}",
+                        self.bodies.lock().unwrap().len()
+                    )
+                },
+            )
+            .await;
         }
     }
 

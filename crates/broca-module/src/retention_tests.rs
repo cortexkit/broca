@@ -481,14 +481,18 @@ async fn all_delivery_modes_validate_before_any_wal_write() {
 }
 
 async fn wait_idle(registry: &crate::registry::LineageRegistry, key: &BindIdentity) {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if registry.route_status(key).await.unwrap() == crate::actor::LineageStatus::Idle {
-                return;
+    broca_test_support::event_timeout(
+        "wait_idle",
+        async {
+            loop {
+                if registry.route_status(key).await.unwrap() == crate::actor::LineageStatus::Idle {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+        || format!("slot={:?}", registry.slot_state(key)),
+    )
     .await
     .expect("run finishes");
 }
@@ -579,15 +583,28 @@ async fn expiry_timer_ends_subscriptions_releases_lease_and_fresh_send_completes
     )
     .unwrap();
     rig.service.clock.refresh().unwrap();
-    let expired_at = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if let Some(crate::fanout::Delivery::Expired { expired_at_ms }) =
-                deliveries.recv().await
-            {
-                return expired_at_ms;
+    let expired_at = broca_test_support::event_timeout(
+        "expiry_timer_ends_subscriptions_releases_lease_and_fresh_send_completes_deletion",
+        async {
+            loop {
+                if let Some(crate::fanout::Delivery::Expired { expired_at_ms }) =
+                    deliveries.recv().await
+                {
+                    return expired_at_ms;
+                }
             }
-        }
-    })
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .expect("subscriber does not keep lineage alive");
     let old_id = rig
@@ -597,11 +614,24 @@ async fn expiry_timer_ends_subscriptions_releases_lease_and_fresh_send_completes
         .unwrap()
         .lineage_id
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while registry.slot_counts().open + registry.slot_counts().closing > 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "expiry_timer_ends_subscriptions_releases_lease_and_fresh_send_completes_deletion",
+        async {
+            while registry.slot_counts().open + registry.slot_counts().closing > 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .expect("expiry finishes actor teardown");
     let lease = rig
@@ -872,11 +902,24 @@ async fn failed_enrollment_and_active_write_are_repaired_without_a_read_or_resta
         .unwrap();
     // Wait for the session actor to clear the lineage registry's in-flight count,
     // without a read that could itself repair the missing run-index row.
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while registry.slot_counts().runs_in_flight > 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "failed_enrollment_and_active_write_are_repaired_without_a_read_or_restart",
+        async {
+            while registry.slot_counts().runs_in_flight > 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .unwrap();
     assert!(rig.store.lookup_run("r1").unwrap().is_none());
@@ -1213,9 +1256,22 @@ async fn send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_li
         let registry = registry.clone();
         async move { registry.sweep_once(1200).await }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(3), export.entered.notified())
-        .await
-        .unwrap();
+    broca_test_support::event_timeout(
+        "send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_lineage",
+        export.entered.notified(),
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
+    .await
+    .unwrap();
     let mut send = tokio::spawn({
         let registry = registry.clone();
         let key = rig.key.clone();
@@ -1237,11 +1293,24 @@ async fn send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_li
         "a racing send waits, rather than refusing or writing into the expired WAL"
     );
     sweep.await.unwrap().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), send)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    broca_test_support::event_timeout(
+        "send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_lineage",
+        send,
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     wait_idle(&registry, &rig.key).await;
     let stone = rig
         .service
@@ -1358,10 +1427,23 @@ async fn resumed_retention_actor_redacts_warm_detail_before_the_run_seeds_its_wr
     registry.set_retention_service(rig.service.clone());
     registry.set_cache_declarer(Arc::new(WarmDeclaration));
     registry.actor_for(&rig.key).await.unwrap();
-    let tick = tokio::time::timeout(std::time::Duration::from_secs(3), observed.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let tick = broca_test_support::event_timeout(
+        "resumed_retention_actor_redacts_warm_detail_before_the_run_seeds_its_writer",
+        observed.recv(),
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         matches!(tick, broca_core::keep_warm_wait::WarmTick::Stop { detail: Some(detail), .. } if detail == "quota")
     );
@@ -2145,16 +2227,29 @@ async fn content_free_worker_retries_without_actor_or_wal_traffic() {
     ));
     let service = rig.service.clone();
     let worker = tokio::spawn(async move { service.run_withdrawal_worker().await });
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !rig
-            .store
-            .pending_retention_withdrawals()
-            .unwrap()
-            .is_empty()
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "content_free_worker_retries_without_actor_or_wal_traffic",
+        async {
+            while !rig
+                .store
+                .pending_retention_withdrawals()
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .expect("content-free retry parked without session traffic");
     worker.abort();
@@ -2257,15 +2352,28 @@ async fn retained_size_refusal_seals_error_and_expires_within_deletion_bound() {
         registry.route_status(&rig.key).await,
         Err(crate::registry::OpenError::Expired { .. })
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while path.exists() {
-            registry
-                .sweep_once(rig.service.clock.now_ms())
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "retained_size_refusal_seals_error_and_expires_within_deletion_bound",
+        async {
+            while path.exists() {
+                registry
+                    .sweep_once(rig.service.clock.now_ms())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .expect("expiry releases the actor lease and deletion completes");
     assert!(!path.exists());
@@ -2317,15 +2425,28 @@ async fn size_refusal_crash_cut_reopens_with_room_for_orphan_seal() {
     assert!(fs::metadata(&path).unwrap().len() <= cap as u64);
     fs::write(rig.root.join("test-clock"), br#"{"offset_ms":11000}"#).unwrap();
     rig.service.clock.refresh().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while path.exists() {
-            registry
-                .sweep_once(rig.service.clock.now_ms())
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    broca_test_support::event_timeout(
+        "size_refusal_crash_cut_reopens_with_room_for_orphan_seal",
+        async {
+            while path.exists() {
+                registry
+                    .sweep_once(rig.service.clock.now_ms())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .expect("expiry releases the actor lease and deletion completes");
     assert!(!path.exists());
@@ -2662,9 +2783,19 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         std::time::SystemTime::now() + std::time::Duration::from_secs(1),
     );
     let logs = broca_test_support::LogCapture::observe(|_| true);
-    let sweep = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+    let sweep = broca_test_support::event_timeout(
+        "assert_tight_crash_recovery",
         registry.seal_marked_crash_orphans(sweep),
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
     )
     .await
     .expect("tight-cap crash recovery terminates");
@@ -2980,29 +3111,42 @@ async fn attached_subscriber_receives_error_and_run_finished_for_size_refusal() 
             .unwrap(),
         crate::actor::SendOutcome::Active { .. }
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut error = false;
-        loop {
-            let delivery = deliveries
-                .recv()
-                .await
-                .expect("subscriber remains attached through terminal");
-            if let crate::fanout::Delivery::Control(event) = delivery {
-                match &event.1 {
-                    broca_protocol::ControlUnit::Error { .. } => error = true,
-                    broca_protocol::ControlUnit::RunFinished {
-                        run_id: Some(id),
-                        reason: RunFinishReason::Error,
-                        ..
-                    } if id.0 == "subscriber-size" => {
-                        assert!(error);
-                        break;
+    broca_test_support::event_timeout(
+        "attached_subscriber_receives_error_and_run_finished_for_size_refusal",
+        async {
+            let mut error = false;
+            loop {
+                let delivery = deliveries
+                    .recv()
+                    .await
+                    .expect("subscriber remains attached through terminal");
+                if let crate::fanout::Delivery::Control(event) = delivery {
+                    match &event.1 {
+                        broca_protocol::ControlUnit::Error { .. } => error = true,
+                        broca_protocol::ControlUnit::RunFinished {
+                            run_id: Some(id),
+                            reason: RunFinishReason::Error,
+                            ..
+                        } if id.0 == "subscriber-size" => {
+                            assert!(error);
+                            break;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-    })
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.service
+                    .wal
+                    .read_records(&rig.key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
     .await
     .expect("attached subscriber receives terminal");
     assert!(registry.stop_and_seal().await);
@@ -3123,7 +3267,7 @@ async fn status_never_expires_a_new_active_run_from_a_captured_old_head() {
     let copy = registry.clone();
     let key = rig.key.clone();
     let mut pending = tokio::spawn(async move { copy.route_status(&key).await });
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let result = broca_test_support::event_timeout("open", async {
         let captured = tokio::select! {
             _ = entered.notified() => true,
             result = &mut pending => { assert_eq!(result.unwrap().unwrap(), crate::actor::LineageStatus::Idle); false },
@@ -3134,7 +3278,7 @@ async fn status_never_expires_a_new_active_run_from_a_captured_old_head() {
         fs::write(rig.root.join("test-clock"), serde_json::json!({"now_ms":now + 501}).to_string()).unwrap(); rig.service.clock.refresh().unwrap();
         release.send(()).ok();
         if captured { pending.await.unwrap() } else { registry.route_status(&rig.key).await }
-    }).await.expect("status interleaving terminates");
+    }, || broca_test_support::record_kinds(rig.service.wal.read_records(&rig.key).unwrap().iter().map(|f| &f.record))).await.expect("status interleaving terminates");
     assert!(
         matches!(result, Ok(crate::actor::LineageStatus::Active { run_id, .. }) if run_id.0 == "r2")
     );

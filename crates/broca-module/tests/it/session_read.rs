@@ -542,7 +542,7 @@ async fn send_with_materialization(
 }
 
 async fn wait_status(rig: &Rig, key: &BindIdentity, run: &str, want: &str) {
-    for _ in 0..80 {
+    broca_test_support::wait_until(&format!("run {run} reaches {want}"), || async {
         let state = rig
             .registry
             .run_status(key, RunId(run.into()))
@@ -553,11 +553,11 @@ async fn wait_status(rig: &Rig, key: &BindIdentity, run: &str, want: &str) {
             .unwrap()
             .to_string();
         if got == want {
-            return;
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("run {run} never reached {want}");
+        Err(format!("run_state={got}"))
+    })
+    .await;
 }
 
 fn append_seed(wal_store: &FileWalStore, key: &BindIdentity, records: &[WalRecord]) {
@@ -2964,10 +2964,14 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
 
     let mut actual = Vec::new();
     for _ in 0..expected.len() {
-        match tokio::time::timeout(Duration::from_secs(1), stream.recv())
-            .await
-            .expect("post-head unit arrives")
-            .expect("stream stays open")
+        match broca_test_support::event_timeout(
+            "read_head_resumes_subscribe_without_gaps_or_duplicates",
+            stream.recv(),
+            || format!("remaining_units={}", expected.len()),
+        )
+        .await
+        .expect("post-head unit arrives")
+        .expect("stream stays open")
         {
             Delivery::Control(event) => actual.push(event.as_ref().clone()),
             Delivery::Display(_) => {}

@@ -1419,10 +1419,21 @@ mod tests {
         writer.record(run_finished());
         writer.sync().await.expect("sync post-barrier record");
 
-        let delivery = tokio::time::timeout(std::time::Duration::from_secs(1), deliveries.recv())
-            .await
-            .expect("post-barrier record arrives")
-            .expect("subscriber remains attached");
+        let delivery = broca_test_support::event_timeout(
+            "live_seed_matches_full_projection_and_buffers_the_first_post_barrier_record",
+            deliveries.recv(),
+            || {
+                wal_store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("post-barrier record arrives")
+        .expect("subscriber remains attached");
         assert!(matches!(
             delivery,
             Delivery::Control(event)
@@ -1679,10 +1690,21 @@ mod tests {
         writer.record(run_finished());
         writer.sync().await.expect("sync post-barrier terminal");
 
-        let delivery = tokio::time::timeout(std::time::Duration::from_secs(1), deliveries.recv())
-            .await
-            .expect("slow-path subscriber receives the next record")
-            .expect("subscriber remains attached");
+        let delivery = broca_test_support::event_timeout(
+            "live_attach_without_a_persisted_seed_falls_back_to_full_replay",
+            deliveries.recv(),
+            || {
+                wal_store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("slow-path subscriber receives the next record")
+        .expect("subscriber remains attached");
         assert!(matches!(
             delivery,
             Delivery::Control(event)
@@ -1843,16 +1865,36 @@ mod tests {
 
         writer.record(run_started(&session));
         writer.sync().await.expect("sync run start");
-        let control_a =
-            tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_a.recv())
-                .await
-                .expect("subscriber A receives control")
-                .expect("subscriber A remains attached");
-        let control_b =
-            tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_b.recv())
-                .await
-                .expect("subscriber B receives control")
-                .expect("subscriber B remains attached");
+        let control_a = broca_test_support::event_timeout(
+            "multiple_subscribers_receive_identical_shared_live_payloads",
+            deliveries_a.recv(),
+            || {
+                store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("subscriber A receives control")
+        .expect("subscriber A remains attached");
+        let control_b = broca_test_support::event_timeout(
+            "multiple_subscribers_receive_identical_shared_live_payloads",
+            deliveries_b.recv(),
+            || {
+                store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("subscriber B receives control")
+        .expect("subscriber B remains attached");
         match (control_a, control_b) {
             (Delivery::Control(event_a), Delivery::Control(event_b)) => {
                 assert_eq!(event_a.as_ref(), event_b.as_ref());
@@ -1870,16 +1912,36 @@ mod tests {
             .display_sender()
             .send(Arc::clone(&display))
             .expect("display ring has two receivers");
-        let display_a =
-            tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_a.recv())
-                .await
-                .expect("subscriber A receives display")
-                .expect("subscriber A remains attached");
-        let display_b =
-            tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_b.recv())
-                .await
-                .expect("subscriber B receives display")
-                .expect("subscriber B remains attached");
+        let display_a = broca_test_support::event_timeout(
+            "multiple_subscribers_receive_identical_shared_live_payloads",
+            deliveries_a.recv(),
+            || {
+                store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("subscriber A receives display")
+        .expect("subscriber A remains attached");
+        let display_b = broca_test_support::event_timeout(
+            "multiple_subscribers_receive_identical_shared_live_payloads",
+            deliveries_b.recv(),
+            || {
+                store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("subscriber B receives display")
+        .expect("subscriber B remains attached");
         match (display_a, display_b) {
             (Delivery::Display(event_a), Delivery::Display(event_b)) => {
                 assert_eq!(event_a.as_ref(), event_b.as_ref());
@@ -1924,10 +1986,21 @@ mod tests {
         );
         writer.record(run_started(&session));
         writer.sync().await.expect("sync run start");
-        let delivery = tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_a.recv())
-            .await
-            .expect("subscriber A receives promptly")
-            .expect("subscriber A remains attached");
+        let delivery = broca_test_support::event_timeout(
+            "gate_reopen_reseeds_state_before_live_terminal",
+            deliveries_a.recv(),
+            || {
+                store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await
+        .expect("subscriber A receives promptly")
+        .expect("subscriber A remains attached");
         assert!(matches!(
             delivery,
             Delivery::Control(event)
@@ -1936,11 +2009,22 @@ mod tests {
 
         // Detach A, then commit the state-changing step while the observer gate is disabled.
         drop(deliveries_a);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while fanout.has_live_subscribers() {
-                tokio::task::yield_now().await;
-            }
-        })
+        broca_test_support::event_timeout(
+            "gate_reopen_reseeds_state_before_live_terminal",
+            async {
+                while fanout.has_live_subscribers() {
+                    tokio::task::yield_now().await;
+                }
+            },
+            || {
+                store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
         .await
         .expect("subscriber A releases the observer gate");
         writer.record(tool_step());
@@ -1961,10 +2045,21 @@ mod tests {
             None,
         );
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_b.recv())
-                .await
-                .expect("subscriber B replay completes")
-                .expect("subscriber B remains attached")
+            match broca_test_support::event_timeout(
+                "gate_reopen_reseeds_state_before_live_terminal",
+                deliveries_b.recv(),
+                || {
+                    store
+                        .read_records(&session)
+                        .map(|frames| {
+                            broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                        })
+                        .unwrap_or_else(|e| format!("WAL read: {e}"))
+                },
+            )
+            .await
+            .expect("subscriber B replay completes")
+            .expect("subscriber B remains attached")
             {
                 Delivery::Control(event)
                     if matches!(
@@ -1987,10 +2082,21 @@ mod tests {
         writer.record(run_finished());
         writer.sync().await.expect("sync live terminal");
         let terminal_finish_reason = loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), deliveries_b.recv())
-                .await
-                .expect("live terminal arrives")
-                .expect("subscriber B remains attached")
+            match broca_test_support::event_timeout(
+                "gate_reopen_reseeds_state_before_live_terminal",
+                deliveries_b.recv(),
+                || {
+                    store
+                        .read_records(&session)
+                        .map(|frames| {
+                            broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                        })
+                        .unwrap_or_else(|e| format!("WAL read: {e}"))
+                },
+            )
+            .await
+            .expect("live terminal arrives")
+            .expect("subscriber B remains attached")
             {
                 Delivery::Control(event) => {
                     if let ControlUnit::RunFinished {

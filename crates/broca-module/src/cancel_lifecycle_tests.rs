@@ -60,14 +60,14 @@ async fn acknowledged_cancel_retries_paused_finalizer_after_one_read_failure() {
     registry.route_send(&key, text_req(&key, "r"), RunKind::FreshOrResume).await.unwrap();
     assert_eq!(registry.route_cancel(&key, RunId("r".into())).await.unwrap(), CancelOutcome::Ack);
     executor.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(15), async {
+    broca_test_support::event_timeout("acknowledged_cancel_retries_paused_finalizer_after_one_read_failure", async {
         loop {
             if wal.durable_records(&key).iter().any(|frame| matches!(
                 frame.record, WalRecord::RunFinished { reason: RunFinishReason::Cancelled, .. }
             )) { break; }
             tokio::task::yield_now().await;
         }
-    }).await.expect("acknowledged cancellation must finish without another command");
+    }, || broca_test_support::record_kinds(wal.durable_records(&key).iter().map(|f| &f.record))).await.expect("acknowledged cancellation must finish without another command");
     assert_eq!(executor.attempts.load(Ordering::SeqCst), 2);
     assert!(registry.stop_and_seal().await);
     let _ = std::fs::remove_dir_all(dir);

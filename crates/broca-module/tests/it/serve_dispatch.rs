@@ -215,7 +215,10 @@ async fn subscribe_attaches_and_delivers() {
         .unwrap();
 
     // The subscriber receives at least the RunStarted control unit (the fake writes one).
-    let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let got =
+        broca_test_support::event_timeout("subscribe_attaches_and_delivers", rx.recv(), || {
+            format!("slot={:?}", rig.registry.slot_state(&key))
+        })
         .await
         .expect("a delivery must arrive")
         .expect("the sink is open");

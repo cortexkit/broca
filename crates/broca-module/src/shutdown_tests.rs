@@ -778,13 +778,13 @@ impl broca_wal::Wal for GatedSyncWal {
 }
 
 async fn wait_for_closed(f: &Fixture) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while f.registry.slot_counts().open != 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    broca_test_support::wait_until("released operation lets teardown close slots", || async {
+        let open = f.registry.slot_counts().open;
+        (open == 0)
+            .then_some(())
+            .ok_or_else(|| format!("open_slots={open}"))
     })
-    .await
-    .expect("releasing the held operation lets teardown finish");
+    .await;
 }
 
 fn assert_total_deadline(f: &Fixture, sealed: bool, elapsed: Duration, total: Duration) -> String {
@@ -982,9 +982,13 @@ async fn shutdown_budget_bounds_stalled_replay_and_leaves_unsealed_wal() {
             .stop_and_seal_with_budget(Duration::ZERO, Duration::from_millis(50))
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), f.wal.entered.notified())
-        .await
-        .expect("shutdown must reach the real WAL read");
+    broca_test_support::event_timeout(
+        "shutdown reaches held real WAL read",
+        f.wal.entered.notified(),
+        || format!("open_slots={}", f.registry.slot_counts().open),
+    )
+    .await
+    .expect("shutdown must reach the real WAL read");
     assert!(!tokio::time::timeout(Duration::from_secs(1), stopping)
         .await
         .expect("stalled replay cannot hold exit hostage")
@@ -995,13 +999,7 @@ async fn shutdown_budget_bounds_stalled_replay_and_leaves_unsealed_wal() {
         .any(|r| matches!(r, WalRecord::RunFinished { .. })));
     // Production exits here. Release the blocked reader only to let the test runtime clean up.
     drop(release);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while f.registry.slot_counts().open != 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_closed(&f).await;
 }
 
 #[tokio::test]
