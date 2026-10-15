@@ -317,14 +317,20 @@ impl Daemon {
         }
         assert!(
             daemon.wait_for_module_live().await,
-            "broca module never became live"
+            "broca module never became live\n{}",
+            broca_test_support::rig_log_diagnostics(
+                &runtime_dir.join("data-home"),
+                &daemon.broca_state_root()
+            )
         );
         daemon
     }
 
     async fn wait_for_module_live(&self) -> bool {
         let probe = broca_protocol::BindIdentity::new(&self.dir, "probe", "readiness");
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // A hang guard, not a readiness budget: on a loaded Windows runner the module's boot has
+        // taken longer than 15 s. A failure dumps broca's own logs (see `start`).
+        let deadline = Instant::now() + broca_test_support::EVENT_HANG_GUARD;
         while Instant::now() < deadline {
             if let Ok(conn) = broca_subc::SubcConnection::connect(&self.connection_file).await {
                 if conn.route_open_management("broca", &probe).await.is_ok() {
