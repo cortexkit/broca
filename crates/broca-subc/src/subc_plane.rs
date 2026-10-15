@@ -2184,6 +2184,25 @@ impl ToolPlane for SubcToolPlane {
         _approval_digest: &str,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
+        // Preserve a completed result even if the route or approved input has
+        // since become unavailable. Only a new call can be classified NotSent.
+        let fence_key = (Self::session_key(&ctx.bind), call.tool_call_id.clone());
+        if let Some(prior) = self.fence.lock().unwrap().get(&fence_key) {
+            return DispatchResult::Completed(prior);
+        }
+        let route = self
+            .batch_routes
+            .lock()
+            .unwrap()
+            .get(&Self::batch_route_key(ctx))
+            .and_then(|routes| routes.get(&call.tool_call_id))
+            .cloned()
+            .or_else(|| self.default_module_id.clone().map(ToolRoute::Module));
+        if !matches!(route, Some(ToolRoute::Module(_))) {
+            return DispatchResult::NotSent {
+                reason: "route_unresolved".into(),
+            };
+        }
         if serde_json::from_str::<serde_json::Value>(args_jcs).is_err() {
             return DispatchResult::NotSent {
                 reason: "approval_args_invalid".into(),
@@ -2905,6 +2924,71 @@ mod tests {
         fn route_is_open(&self, route: &RouteHandle) -> bool {
             !self.closed.lock().unwrap().contains(&route.channel)
         }
+    }
+
+    #[tokio::test]
+    async fn approved_route_failure_is_not_sent() {
+        let conn = ScriptedToolPlaneConnection::new(vec![], vec![]);
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("approved-unresolved");
+        let call = call("edit");
+        plane.batch_routes.lock().unwrap().insert(
+            SubcToolPlane::batch_route_key(&ctx),
+            HashMap::from([(
+                call.tool_call_id.clone(),
+                ToolRoute::Failure("missing provider".into()),
+            )]),
+        );
+        let result = plane
+            .dispatch_approved(&ctx, &call, "{}", "key", "", &Default::default())
+            .await;
+        assert!(
+            matches!(result, DispatchResult::NotSent { reason } if reason == "route_unresolved")
+        );
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 0);
+        assert!(plane
+            .fence
+            .lock()
+            .unwrap()
+            .get(&(SubcToolPlane::session_key(&ctx.bind), call.tool_call_id))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn approved_fence_precedes_route_and_input_checks() {
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![vec![catalog_entry("aft", &["edit"])]],
+            vec![successful_tool_reply("original provider output")],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("approved-repeat");
+        let call = call("edit");
+        let DispatchResult::Completed(prior) = plane
+            .dispatch_approved(&ctx, &call, "{}", "key", "", &Default::default())
+            .await
+        else {
+            panic!("first approved dispatch must complete")
+        };
+        plane.batch_routes.lock().unwrap().insert(
+            SubcToolPlane::batch_route_key(&ctx),
+            HashMap::from([(
+                call.tool_call_id.clone(),
+                ToolRoute::Failure("provider disappeared".into()),
+            )]),
+        );
+        let result = plane
+            .dispatch_approved(&ctx, &call, "not json", "key", "", &Default::default())
+            .await;
+        let DispatchResult::Completed(repeated) = result else {
+            panic!("fenced call must return its prior result")
+        };
+        assert_eq!(
+            serde_json::to_value(repeated).unwrap(),
+            serde_json::to_value(prior).unwrap()
+        );
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -27,7 +27,11 @@
 
 pub mod compaction_plane;
 pub mod connection;
-pub mod elicitation;
+pub mod consent;
+/// Keeps the existing broca-module-serve install API; its implementation is consent v2.
+pub mod elicitation {
+    pub use crate::consent::ScopedConsentPlane as ScopedElicitationPlane;
+}
 pub mod hook_plane;
 pub mod plan_fetch;
 mod role_route;
@@ -44,10 +48,9 @@ pub use connection::{
     ModuleHealthSnapshot, RouteHandle, RouteOpenRetry, SubcConnection, SubscribeStream,
     FRAME_DROPS, ROUTE_OPEN_ATTEMPT_TIMEOUT, ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL,
 };
-pub use elicitation::{
-    AnswersCursor, AnswersPage, ElicitationClient, ElicitationError, ElicitationExecutor,
-    ElicitationOption, ElicitationRecord, ElicitationState, ElicitationTarget, FilingReply,
-    HeldCallRequest, WithdrawalReply,
+pub use consent::{
+    AnswersPage, ConsentClient, ConsentError, ConsentRecord, ConsentState, FilingReply,
+    ScopedConsentPlane, WithdrawalReply,
 };
 pub use hook_plane::SubcHookPlane;
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
