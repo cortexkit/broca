@@ -423,7 +423,16 @@ impl ElicitationPlane for Questions {
         })
     }
 }
+#[derive(Clone, Copy)]
+enum DispatchSignalPolicy {
+    Enforce,
+    // Model an adapter that does not honor cancellation, so the core fence must stand alone.
+    #[cfg(feature = "test-clock")]
+    Ignore,
+}
+
 struct Tools {
+    dispatch_signal_policy: DispatchSignalPolicy,
     interrupt_on_recheck: Mutex<Option<CancellationToken>>,
     interrupt_on_open: Mutex<Option<CancellationToken>>,
     default_module: Mutex<String>,
@@ -515,7 +524,9 @@ impl ToolPlane for Tools {
         _: &str,
         signals: &DispatchSignals,
     ) -> DispatchResult {
-        if signals.interrupted() {
+        if matches!(self.dispatch_signal_policy, DispatchSignalPolicy::Enforce)
+            && signals.interrupted()
+        {
             return DispatchResult::NotSent {
                 reason: "approved_dispatch_stopped_before_send".into(),
             };
@@ -927,6 +938,7 @@ impl Rig {
             root,
             bind: bind.clone(),
             tools: Tools {
+                dispatch_signal_policy: DispatchSignalPolicy::Enforce,
                 interrupt_on_recheck: Mutex::new(None),
                 interrupt_on_open: Mutex::new(None),
                 default_module: Mutex::new("aft".into()),
@@ -1714,6 +1726,7 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
     std::fs::write(&path, &bytes[..offset]).unwrap();
     let cut_writer = WalHandle::spawn(cut_store.open(&rig.bind).unwrap(), 2).unwrap();
     let cut_tools = Tools {
+        dispatch_signal_policy: DispatchSignalPolicy::Enforce,
         interrupt_on_recheck: Mutex::new(None),
         interrupt_on_open: Mutex::new(None),
         default_module: Mutex::new("aft".into()),
@@ -2364,6 +2377,7 @@ async fn unreadable_await_retries_same_card_without_refile() {
 #[cfg(feature = "test-clock")]
 fn tools_for_store(store: crate::FileWalStore, bind: BindIdentity) -> Tools {
     Tools {
+        dispatch_signal_policy: DispatchSignalPolicy::Enforce,
         interrupt_on_recheck: Mutex::new(None),
         interrupt_on_open: Mutex::new(None),
         default_module: Mutex::new("aft".into()),

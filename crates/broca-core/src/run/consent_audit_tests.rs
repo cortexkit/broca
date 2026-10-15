@@ -1023,8 +1023,20 @@ impl broca_wal::Wal for IntentSyncWal {
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent() {
+    late_dispatch_during_intent_sync(DispatchSignalPolicy::Enforce).await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn late_core_fence_stops_noncompliant_adapter_after_intent_sync() {
+    late_dispatch_during_intent_sync(DispatchSignalPolicy::Ignore).await;
+}
+
+#[cfg(feature = "test-clock")]
+async fn late_dispatch_during_intent_sync(dispatch_signal_policy: DispatchSignalPolicy) {
     for cancel in [true, false] {
         let mut rig = copied_pending_late_episode(false).await;
+        rig.tools.dispatch_signal_policy = dispatch_signal_policy;
         rig.writer.shutdown().await.unwrap();
         let gate = Arc::new(IntentSyncGate {
             entered: tokio::sync::Notify::new(),
@@ -1068,10 +1080,8 @@ async fn late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent() {
             token.cancel();
             gate.release();
         };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            tokio::join!(admission, interrupt)
-        })
-        .await;
+        let result =
+            tokio::time::timeout(HANG_GUARD, async { tokio::join!(admission, interrupt) }).await;
         gate.release();
         let (result, ()) = result.expect("the intent barrier must be released");
         result.unwrap();
@@ -1098,8 +1108,20 @@ async fn late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent() {
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn late_dispatch_cancel_or_stop_during_route_open_is_not_sent() {
+    late_dispatch_during_route_open(DispatchSignalPolicy::Enforce).await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn late_core_fence_stops_noncompliant_adapter_after_route_open() {
+    late_dispatch_during_route_open(DispatchSignalPolicy::Ignore).await;
+}
+
+#[cfg(feature = "test-clock")]
+async fn late_dispatch_during_route_open(dispatch_signal_policy: DispatchSignalPolicy) {
     for cancel in [true, false] {
         let mut rig = copied_pending_late_episode(false).await;
+        rig.tools.dispatch_signal_policy = dispatch_signal_policy;
         let token = CancellationToken::new();
         if cancel {
             rig.control.cancel = Some(token.clone());
