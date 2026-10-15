@@ -123,6 +123,34 @@ pub enum DispatchResult {
     },
 }
 
+/// Run signals carried to an approved adapter's final physical-send boundary.
+/// Clones observe the same tokens while route and flow-control waits are pending.
+#[derive(Clone, Default)]
+pub struct DispatchSignals {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    stop: Option<tokio_util::sync::CancellationToken>,
+}
+impl DispatchSignals {
+    pub fn new(
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        stop: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            cancel: cancel.cloned(),
+            stop: stop.cloned(),
+        }
+    }
+    pub fn interrupted(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || self
+                .stop
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+}
+
 /// The tool-dispatch contract. One batch = one assistant turn's tool calls.
 #[async_trait]
 pub trait ToolPlane: Send + Sync {
@@ -151,6 +179,8 @@ pub trait ToolPlane: Send + Sync {
     /// verifies that the answer binds to these arguments; consent issues no tool token.
     /// The legacy digest argument is empty, and adapters must omit `approval_digest`
     /// from the tool request even when reading a WAL with an older digest.
+    /// Check `signals` after all pre-send waits, immediately before the physical
+    /// request. An interrupted unsent request returns `NotSent`, never Unknown.
     /// Until the daemon installs an approval-capable adapter, approval fails closed.
     async fn dispatch_approved(
         &self,
@@ -159,6 +189,7 @@ pub trait ToolPlane: Send + Sync {
         _args_jcs: &str,
         _call_key: &str,
         _approval_digest: &str,
+        _signals: &DispatchSignals,
     ) -> DispatchResult {
         DispatchResult::NotSent {
             reason: "approved_dispatch_unavailable".into(),

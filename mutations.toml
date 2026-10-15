@@ -10974,3 +10974,29 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "let before_send_cancel = control.cancel.as_ref();"
 new = "let before_send_cancel = None::<&CancellationToken>; // NON-VACUITY BREAK"
+
+[[control]]
+id = "subc-approved-pre-send-cancel-after-route-wait"
+guards = "approved adapter rechecks both run signals after ensure_route before any physical call"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_cancel_or_stop_during_ensure_route_sends_nothing"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "if args.signals.interrupted() {"
+new = "if false && args.signals.interrupted() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "subc-approved-pre-send-cancel-after-permit-wait"
+guards = "approved adapter rechecks both run signals after flow-control credit before any physical call"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_cancel_or_stop_during_permit_wait_sends_nothing"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "if args.signals.interrupted() {"
+new = "if false && args.signals.interrupted() { // NON-VACUITY BREAK"

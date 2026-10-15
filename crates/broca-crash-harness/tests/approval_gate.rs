@@ -235,6 +235,7 @@ impl ToolPlane for Tools {
         bytes: &str,
         key: &str,
         _: &str,
+        _: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
         assert_eq!(bytes, r#"{"n":0.000001}"#);
         let frames = FileWalStore::new(&self.root)

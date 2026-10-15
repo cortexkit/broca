@@ -477,7 +477,13 @@ impl ToolPlane for Tools {
         bytes: &str,
         key: &str,
         _: &str,
+        signals: &DispatchSignals,
     ) -> DispatchResult {
+        if signals.interrupted() {
+            return DispatchResult::NotSent {
+                reason: "approved_dispatch_stopped_before_send".into(),
+            };
+        }
         let frames = self.store.read_records(&self.bind).unwrap();
         let target = frames
             .iter()

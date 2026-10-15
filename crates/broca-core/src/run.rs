@@ -6799,6 +6799,7 @@ async fn resolve<T: ToolPlane>(
             // The writer normally releases its shallow Arc before acknowledging the intent
             // barrier. If a live WAL observer retained the record, clone only after durability.
             let approved = call.approved.clone();
+            let is_approved = approved.is_some();
             let key = call.call_key.clone();
             let call = call.into_tool_call();
             let result = match approved {
@@ -6810,6 +6811,7 @@ async fn resolve<T: ToolPlane>(
                             &bytes,
                             key.as_deref().expect("approved call has Prepared key"),
                             &digest,
+                            &crate::tool_plane::DispatchSignals::new(cancel, stop),
                         )
                         .await
                 }
@@ -6822,10 +6824,16 @@ async fn resolve<T: ToolPlane>(
                     resolution.plane_subject = true;
                     resolution
                 }
-                DispatchResult::NotSent { reason } => CallResolution::plain(
-                    error_result(&call, &format!("tool not dispatched: {reason}")),
-                    Some(DispatchOutcome::Completed),
-                ),
+                DispatchResult::NotSent { reason } => {
+                    let mut result = CallResolution::plain(
+                        error_result(&call, &format!("tool not dispatched: {reason}")),
+                        Some(DispatchOutcome::Completed),
+                    );
+                    if is_approved {
+                        result.reason = Some(reason);
+                    }
+                    result
+                }
                 DispatchResult::SentButOutcomeUnknown { reason } => {
                     let mut resolution = CallResolution::plain(
                         unknown_result(&call, &reason),
@@ -11191,7 +11199,19 @@ mod approval_gate {
                 reason: "late_execution_stopped".into(),
             };
         }
-        plane.dispatch_approved(ctx, call, args_jcs, key, "").await
+        plane
+            .dispatch_approved(
+                ctx,
+                call,
+                args_jcs,
+                key,
+                "",
+                &crate::tool_plane::DispatchSignals::new(
+                    control.cancel.as_ref(),
+                    control.stop_requested.as_ref(),
+                ),
+            )
+            .await
     }
     fn late_stopped(control: &RunControl) -> bool {
         is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())

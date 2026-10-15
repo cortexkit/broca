@@ -476,6 +476,12 @@ struct ApprovedArgs {
     bytes: String,
     key: String,
     digest: String,
+    signals: broca_core::tool_plane::DispatchSignals,
+}
+
+enum SendAttempt {
+    NotSent { reason: String },
+    Reply(Result<serde_json::Value, ConnError>),
 }
 
 /// The real subc tool plane. A caller can hint a tool's target module, otherwise the
@@ -549,7 +555,7 @@ impl SubcToolPlane {
         route: &RouteHandle,
         call: &ToolCall,
         deadline: Duration,
-    ) -> Result<serde_json::Value, ConnError> {
+    ) -> SendAttempt {
         let args = self
             .approved_args
             .lock()
@@ -559,20 +565,31 @@ impl SubcToolPlane {
             .cloned();
         let preset = self.frozen_preset(ctx, module);
         if let Some(args) = args {
-            self.conn
-                .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
-                .await
+            // This is after every route, permit and stale-route recovery wait.
+            // Only approved calls carry run signals; ordinary dispatch is unchanged.
+            if args.signals.interrupted() {
+                return SendAttempt::NotSent {
+                    reason: "approved_dispatch_stopped_before_send".into(),
+                };
+            }
+            SendAttempt::Reply(
+                self.conn
+                    .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
+                    .await,
+            )
         } else {
-            self.conn
-                .tool_call(
-                    route,
-                    &call.tool_name,
-                    &call.input,
-                    Some(&call.tool_call_id.0),
-                    deadline,
-                    preset.as_deref(),
-                )
-                .await
+            SendAttempt::Reply(
+                self.conn
+                    .tool_call(
+                        route,
+                        &call.tool_name,
+                        &call.input,
+                        Some(&call.tool_call_id.0),
+                        deadline,
+                        preset.as_deref(),
+                    )
+                    .await,
+            )
         }
     }
 
@@ -1154,9 +1171,13 @@ impl SubcToolPlane {
             }
         };
         let reply_deadline = self.reply_deadline(ctx, module_id, call);
-        let outcome = self
+        let outcome = match self
             .send_call(ctx, module_id, &fresh, call, reply_deadline)
-            .await;
+            .await
+        {
+            SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
+            SendAttempt::Reply(reply) => reply,
+        };
         self.finish_dispatch(
             ctx,
             call,
@@ -2028,9 +2049,13 @@ impl ToolPlane for SubcToolPlane {
         // That last case is why the reply deadline is sized per call rather than fixed: a
         // deadline shorter than the work turns a healthy call into an ambiguous one.
         let reply_deadline = self.reply_deadline(ctx, &module_id, call);
-        let first = self
+        let first = match self
             .send_call(ctx, &module_id, &route_handle, call, reply_deadline)
-            .await;
+            .await
+        {
+            SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
+            SendAttempt::Reply(reply) => reply,
+        };
         let route_is_known_stale = matches!(&first, Err(ConnError::StaleRouteHandle(_)))
             || matches!(&first, Err(ConnError::Rejected(msg)) if crate::connection::classify_tool_route_refusal(msg) == crate::connection::ToolRouteRefusal::Reopen);
         let endpoint_is_reloading = matches!(
@@ -2095,8 +2120,15 @@ impl ToolPlane for SubcToolPlane {
                             };
                         }
                     };
-                    self.send_call(ctx, &module_id, &fresh_handle, call, reply_deadline)
+                    match self
+                        .send_call(ctx, &module_id, &fresh_handle, call, reply_deadline)
                         .await
+                    {
+                        SendAttempt::NotSent { reason } => {
+                            return DispatchResult::NotSent { reason }
+                        }
+                        SendAttempt::Reply(reply) => reply,
+                    }
                 }
                 Err(e) => {
                     self.latch_open_refusal(ctx, &e);
@@ -2127,6 +2159,7 @@ impl ToolPlane for SubcToolPlane {
         args_jcs: &str,
         call_key: &str,
         approval_digest: &str,
+        signals: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
         if serde_json::from_str::<serde_json::Value>(args_jcs).is_err() {
             return DispatchResult::NotSent {
@@ -2144,6 +2177,7 @@ impl ToolPlane for SubcToolPlane {
                     bytes: args_jcs.into(),
                     key: call_key.into(),
                     digest: approval_digest.into(),
+                    signals: signals.clone(),
                 },
             );
         self.dispatch(ctx, call).await
@@ -2818,9 +2852,177 @@ mod tests {
             Ok(self.capabilities.lock().unwrap().clone())
         }
 
+        async fn tool_call_approved(
+            &self,
+            route: &RouteHandle,
+            call: &ToolCall,
+            deadline: Duration,
+            preset: Option<&str>,
+            args: &ApprovedArgs,
+        ) -> Result<serde_json::Value, ConnError> {
+            let arguments = serde_json::from_str(&args.bytes).expect("approved fixture arguments");
+            self.tool_call(
+                route,
+                &call.tool_name,
+                &arguments,
+                Some(&call.tool_call_id.0),
+                deadline,
+                preset,
+            )
+            .await
+        }
+
         fn route_is_open(&self, route: &RouteHandle) -> bool {
             !self.closed.lock().unwrap().contains(&route.channel)
         }
+    }
+
+    #[tokio::test]
+    async fn approved_cancel_or_stop_during_ensure_route_sends_nothing() {
+        for cancel in [true, false] {
+            let conn = ScriptedToolPlaneConnection::new(
+                vec![vec![catalog_entry("aft", &["edit"])]],
+                vec![successful_tool_reply("must not send")],
+            );
+            let gate = conn.gate_route_open("aft");
+            let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+            let ctx = batch_ctx("approved-open");
+            let call = call("edit");
+            let token = CancellationToken::new();
+            let signals = broca_core::tool_plane::DispatchSignals::new(
+                if cancel { Some(&token) } else { None },
+                if cancel { None } else { Some(&token) },
+            );
+            let dispatch =
+                plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals);
+            let interrupt = async {
+                gate.entered.notified().await;
+                token.cancel();
+                gate.release.notify_one();
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(dispatch, interrupt)
+            })
+            .await;
+            gate.release.notify_one();
+            let (result, ()) = result.expect("held approved route must finish");
+            assert_eq!(
+                conn.tool_calls.load(Ordering::SeqCst),
+                0,
+                "cancelled approved route-open wait must make zero physical sends"
+            );
+            assert!(
+                matches!(result, DispatchResult::NotSent { ref reason } if reason == "approved_dispatch_stopped_before_send")
+            );
+            assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_cancel_or_stop_during_permit_wait_sends_nothing() {
+        use futures::FutureExt;
+        for cancel in [true, false] {
+            let conn = ScriptedToolPlaneConnection::new(
+                vec![vec![catalog_entry("aft", &["edit"])]],
+                vec![successful_tool_reply("must not send")],
+            );
+            let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+            let ctx = batch_ctx("approved-permit");
+            let call = call("edit");
+            let (_, sem) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let token = CancellationToken::new();
+            let signals = broca_core::tool_plane::DispatchSignals::new(
+                if cancel { Some(&token) } else { None },
+                if cancel { None } else { Some(&token) },
+            );
+            let mut dispatch = Box::pin(
+                plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals),
+            );
+            assert!(
+                dispatch.as_mut().now_or_never().is_none(),
+                "cached route is ready and the only wait is flow-control credit"
+            );
+            assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+            token.cancel();
+            drop(permit);
+            let result = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.tool_calls.load(Ordering::SeqCst),
+                0,
+                "cancelled approved permit wait must make zero physical sends"
+            );
+            assert!(
+                matches!(result, DispatchResult::NotSent { ref reason } if reason == "approved_dispatch_stopped_before_send")
+            );
+            assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn uncancelled_approved_dispatch_still_physically_sends_once() {
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![vec![catalog_entry("aft", &["edit"])]],
+            vec![successful_tool_reply("sent")],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        assert!(matches!(
+            plane
+                .dispatch_approved(
+                    &batch_ctx("approved-live"),
+                    &call("edit"),
+                    "{}",
+                    "key",
+                    "digest",
+                    &broca_core::tool_plane::DispatchSignals::default()
+                )
+                .await,
+            DispatchResult::Completed(_)
+        ));
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_approved_fence_still_wins_over_later_cancel_signal() {
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![vec![catalog_entry("aft", &["edit"])]],
+            vec![successful_tool_reply("prior")],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("approved-fence");
+        let call = call("edit");
+        assert!(matches!(
+            plane
+                .dispatch_approved(
+                    &ctx,
+                    &call,
+                    "{}",
+                    "key",
+                    "digest",
+                    &broca_core::tool_plane::DispatchSignals::default()
+                )
+                .await,
+            DispatchResult::Completed(_)
+        ));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            plane
+                .dispatch_approved(
+                    &ctx,
+                    &call,
+                    "{}",
+                    "key",
+                    "digest",
+                    &broca_core::tool_plane::DispatchSignals::new(Some(&cancel), None)
+                )
+                .await,
+            DispatchResult::Completed(_)
+        ));
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
     }
 
     fn batch_ctx(batch_id: &str) -> BatchCtx {
