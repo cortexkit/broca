@@ -8750,8 +8750,8 @@ target = "--lib"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::freeze_is_exclusive_and_abort_never_removes_another_cuts_owner"]
 file = "crates/broca-wal/src/migration.rs"
-old = 'options.write(true).create_new(true);'
-new = 'options.write(true).create(true); // NON-VACUITY BREAK: overwrite the freeze owner'
+old = 'fs::hard_link(temp, destination)'
+new = 'fs::rename(temp, destination) // NON-VACUITY BREAK: replace a late freeze owner'
 
 [[control]]
 id = "move-abort-owner"
@@ -13206,3 +13206,49 @@ only = false
 file = "crates/broca-module/src/move_install.rs"
 old = '.record_imported_runs(session, cut_id, &imported)'
 new = '.record_imported_runs(item.session, cut_id, &imported) /* NON-VACUITY BREAK: file foreign history under the installation identity */'
+
+[[control]]
+id = "agent-data-freeze-retry-barriers"
+guards = "a same-owner freeze retry re-syncs both the file and WAL directory before success"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::same_owner_freeze_retry_reestablishes_both_barriers"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = '''sync_file(&file)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+    Ok(Some(Ok(owner)))'''
+new = '''// NON-VACUITY BREAK: readable cached JSON is not a durability barrier
+    Ok(Some(Ok(owner)))'''
+
+[[control]]
+id = "agent-data-freeze-sync-before-publish"
+guards = "a freeze is not visible before its complete temp inode is synced"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::freeze_publishes_only_a_complete_synced_sidecar"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = '''sync_file(&file)?;
+        // A same-directory hard link'''
+new = '''// NON-VACUITY BREAK: publish an unsynced inode
+        // A same-directory hard link'''
+
+[[control]]
+id = "agent-data-freeze-no-replacing-fallback"
+guards = "unsupported hard links fail closed instead of publishing via replacing rename"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::unsupported_freeze_publication_fails_closed_without_a_rename_fallback"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = 'result.map_err(|error: io::Error| {'
+new = '''result.or_else(|error: io::Error| { // NON-VACUITY BREAK: unsupported publication falls back to rename
+        if error.kind() == io::ErrorKind::Unsupported { fs::rename(temp, destination) } else { Err(error) }
+    }).map_err(|error: io::Error| {'''

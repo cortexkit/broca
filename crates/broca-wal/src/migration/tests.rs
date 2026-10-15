@@ -26,6 +26,26 @@ fn freeze_is_exclusive_and_abort_never_removes_another_cuts_owner() {
     assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
     abort_freeze(&wal, "a").unwrap();
     assert!(!wal.with_extension("moving").exists());
+    let late = root.join("wal/late.wal");
+    let destination = late.with_extension("moving");
+    let other = owner("late-owner");
+    let copy = other.clone();
+    let path = destination.clone();
+    let mut injected = false;
+    let _trace = super::io_trace::install(move |event| {
+        if event == super::io_trace::Event::FileSync && !injected {
+            injected = true;
+            fs::write(&path, serde_json::to_vec(&copy).unwrap())?;
+        }
+        Ok(())
+    });
+    assert_eq!(
+        freeze(&late, &owner("a")).unwrap(),
+        Err(MoveRefusal::Moving {
+            cut_id: "late-owner".into()
+        })
+    );
+    assert_eq!(read_json::<Freeze>(&destination).unwrap(), Some(other));
 }
 
 #[test]
@@ -209,4 +229,119 @@ fn real_process_kill_keeps_the_intent_and_tombstone_owned_after_restart() {
         "kill"
     );
     assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn same_owner_freeze_retry_reestablishes_both_barriers() {
+    use super::io_trace::{self, Event};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let wal = root("retry-barriers").join("wal/a.wal");
+    let directory = wal.parent().unwrap().to_owned();
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        wal.with_extension("moving"),
+        serde_json::to_vec(&owner("a")).unwrap(),
+    )
+    .unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let fail = Rc::new(Cell::new(true));
+    let observed = events.clone();
+    let _trace = io_trace::install(move |event| {
+        observed.borrow_mut().push(event.clone());
+        if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
+            return Err(io::Error::other("injected freeze directory barrier"));
+        }
+        Ok(())
+    });
+    assert!(freeze(&wal, &owner("a"))
+        .unwrap_err()
+        .to_string()
+        .contains("injected freeze directory barrier"));
+    assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
+    assert_eq!(
+        *events.borrow(),
+        vec![
+            Event::FileSync,
+            Event::DirectorySync(directory.clone()),
+            Event::FileSync,
+            Event::DirectorySync(directory)
+        ]
+    );
+}
+
+#[test]
+fn freeze_publishes_only_a_complete_synced_sidecar() {
+    use super::io_trace::{self, Event};
+    use std::{cell::RefCell, rc::Rc};
+    let wal = root("atomic-freeze").join("wal/a.wal");
+    let moving = wal.with_extension("moving");
+    fs::create_dir_all(wal.parent().unwrap()).unwrap();
+    {
+        let target = moving.clone();
+        let _trace = io_trace::install(move |event| {
+            if event == Event::FileSync {
+                assert!(
+                    !target.exists(),
+                    "freeze became visible before its file barrier"
+                );
+                return Err(io::Error::other("injected before freeze publication"));
+            }
+            Ok(())
+        });
+        assert!(freeze(&wal, &owner("a"))
+            .unwrap_err()
+            .to_string()
+            .contains("injected before freeze publication"));
+    }
+    assert!(!moving.exists());
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let target = moving.clone();
+    let _trace = io_trace::install(move |event| {
+        if event == Event::FileSync {
+            assert!(!target.exists());
+        }
+        if matches!(event, Event::Published(_)) {
+            assert_eq!(read_json::<Freeze>(&target)?, Some(owner("a")));
+        }
+        observed.borrow_mut().push(event);
+        Ok(())
+    });
+    assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
+    assert_eq!(
+        *events.borrow(),
+        vec![
+            Event::FileSync,
+            Event::BeforePublish(moving.clone()),
+            Event::Published(moving),
+            Event::DirectorySync(wal.parent().unwrap().to_owned())
+        ]
+    );
+}
+
+#[test]
+fn unsupported_freeze_publication_fails_closed_without_a_rename_fallback() {
+    let wal = root("no-hard-links").join("wal/a.wal");
+    let marker = wal.with_extension("moving");
+    fs::create_dir_all(wal.parent().unwrap()).unwrap();
+    let _trace = super::io_trace::install(|event| {
+        if matches!(event, super::io_trace::Event::BeforePublish(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "injected unsupported links",
+            ));
+        }
+        Ok(())
+    });
+    let error = freeze(&wal, &owner("a")).unwrap_err();
+    assert!(
+        !marker.exists(),
+        "unsupported publication exposed a freeze marker"
+    );
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("cannot publish freeze"));
+    assert!(error.to_string().contains(marker.to_str().unwrap()));
 }

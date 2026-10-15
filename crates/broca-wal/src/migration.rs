@@ -64,6 +64,8 @@ pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::Wa
 /// directory itself, and a failure must propagate.
 #[cfg(unix)]
 pub fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    io_trace::observe(io_trace::Event::DirectorySync(path.to_owned()))?;
     fs::File::open(path)?.sync_all()
 }
 
@@ -72,7 +74,15 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
 /// the same rule as the WAL fold's directory sync.
 #[cfg(not(unix))]
 pub fn sync_dir(_path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    io_trace::observe(io_trace::Event::DirectorySync(_path.to_owned()))?;
     Ok(())
+}
+
+fn sync_file(file: &fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    io_trace::observe(io_trace::Event::FileSync)?;
+    file.sync_all()
 }
 
 /// Every newly created parent is synced too: a synced file in an uncommitted
@@ -134,6 +144,74 @@ pub fn unlink(path: &Path) -> io::Result<()> {
     }
 }
 
+fn existing_freeze(
+    path: &Path,
+    wanted: &Freeze,
+) -> io::Result<Option<Result<Freeze, MoveRefusal>>> {
+    let file = match broca_owner_only::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let owner: Freeze = serde_json::from_reader(&file).map_err(invalid)?;
+    if owner.cut_id != wanted.cut_id {
+        return Ok(Some(Err(MoveRefusal::Moving {
+            cut_id: owner.cut_id,
+        })));
+    }
+    // A prior process may have published the entry but died before its directory
+    // barrier. Complete both barriers even when the cached JSON is readable.
+    sync_file(&file)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+    Ok(Some(Ok(owner)))
+}
+
+struct FreezeTemp(PathBuf);
+impl Drop for FreezeTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+fn freeze_temp(path: &Path) -> io::Result<(fs::File, FreezeTemp)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("moving.{}.{id}.tmp", std::process::id()));
+        match broca_owner_only::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((file, FreezeTemp(temp))),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn publication_ready(_destination: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    io_trace::observe(io_trace::Event::BeforePublish(_destination.to_owned()))?;
+    Ok(())
+}
+
+fn exclusive_link(temp: &Path, destination: &Path) -> io::Result<()> {
+    let result = publication_ready(destination).and_then(|()| fs::hard_link(temp, destination));
+    result.map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot publish freeze {} with an exclusive hard link: {error}",
+                destination.display()
+            ),
+        )
+    })
+}
+
 pub fn freeze(wal: &Path, wanted: &Freeze) -> io::Result<Result<Freeze, MoveRefusal>> {
     if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {
         return Ok(Err(MoveRefusal::Moved {
@@ -141,28 +219,34 @@ pub fn freeze(wal: &Path, wanted: &Freeze) -> io::Result<Result<Freeze, MoveRefu
         }));
     }
     let path = wal.with_extension("moving");
-    durable_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    durable_dir(parent)?;
     let bytes = serde_json::to_vec(wanted).map_err(invalid)?;
-    let mut options = broca_owner_only::OpenOptions::new();
-    options.write(true).create_new(true);
-    match options.open(&path) {
-        Ok(mut file) => {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            sync_dir(path.parent().unwrap())?;
-            Ok(Ok(wanted.clone()))
+    loop {
+        if let Some(owner) = existing_freeze(&path, wanted)? {
+            return Ok(owner);
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let owner = read_json::<Freeze>(&path)?.ok_or_else(|| invalid("freeze disappeared"))?;
-            if owner.cut_id == wanted.cut_id {
-                Ok(Ok(owner))
-            } else {
-                Ok(Err(MoveRefusal::Moving {
-                    cut_id: owner.cut_id,
-                }))
+        let (mut file, temp) = freeze_temp(&path)?;
+        file.write_all(&bytes)?;
+        sync_file(&file)?;
+        // A same-directory hard link publishes the complete, synced inode and
+        // fails exclusively if another cut already owns the destination.
+        match exclusive_link(&temp.0, &path) {
+            Ok(()) => {
+                #[cfg(test)]
+                io_trace::observe(io_trace::Event::Published(path.clone()))?;
+                drop(file);
+                match fs::remove_file(&temp.0) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                sync_dir(parent)?;
+                return Ok(Ok(wanted.clone()));
             }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -342,5 +426,7 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(test)]
+mod io_trace;
 #[cfg(test)]
 mod tests;
