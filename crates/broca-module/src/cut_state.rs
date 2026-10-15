@@ -415,6 +415,10 @@ impl CutStore {
                     Op::Prepare | Op::Import => {
                         artifacts.rollback(&request, &state).await?;
                         state.intent = None;
+                        // A refused first prepare/import commits no session-ref
+                        // set for this cutId. Forget the failed request's refs
+                        // before admitting the next first request.
+                        state.refs = None;
                         self.save(cut_id, &state)?;
                     }
                     Op::Export => {

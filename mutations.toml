@@ -13312,3 +13312,17 @@ only = false
 file = "crates/broca-wal/src/migration.rs"
 old = 'Some(ancestor) => parent = ancestor,'
 new = 'Some(_) => return Ok(()), // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-refused-first-op-clears-refs"
+guards = "a rolled-back refused first prepare/import cannot capture stale refs for a later first request"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["refused_first_prepare_does_not_capture_refs_for_the_next_request"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'state.refs = None;'
+new = '// NON-VACUITY BREAK: retain the refused first request as a hidden ref-set latch'

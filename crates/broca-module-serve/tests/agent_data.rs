@@ -74,6 +74,7 @@ struct FakeDoor {
     calls: AtomicUsize,
     read_limit: AtomicUsize,
     drift: AtomicBool,
+    fail_cover_once: AtomicBool,
 }
 impl FakeDoor {
     fn seal(&self, cut: &str) {
@@ -95,6 +96,12 @@ impl FakeDoor {
 impl SessionDoor for FakeDoor {
     async fn cover(&self, reference: &str) -> Result<u64, SessionDoorError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_cover_once.swap(false, Ordering::SeqCst) {
+            return Err(SessionDoorError {
+                door_code: Some("unavailable".into()),
+                message: "injected cover failure".into(),
+            });
+        }
         Ok(self
             .streams
             .lock()
@@ -2140,4 +2147,38 @@ async fn import_refuses_an_unknown_wal_frame_version_before_staging() {
     let error = assert_code(wire.call("import", params).await, "incompatible_version");
     assert_eq!(error["detail"]["found"], "broca-wal/v99");
     assert_nothing_staged(&rig);
+}
+
+#[tokio::test]
+async fn refused_first_prepare_does_not_capture_refs_for_the_next_request() {
+    let rig = Rig::new("new-first-refs", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a-run", true);
+    rig.seed(&b, "b-run", true);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    rig.door.fail_cover_once.store(true, Ordering::SeqCst);
+    assert_code(
+        wire.call("prepare", rig.params(CUT, std::slice::from_ref(&a)))
+            .await,
+        "unavailable",
+    );
+    assert!(!rig.wal.wal_path(&a).with_extension("moving").exists());
+    let params = rig.params(CUT, std::slice::from_ref(&b));
+    let prepared = wire.call("prepare", params.clone()).await.unwrap();
+    assert_eq!(prepared["items"][0]["ref"], params["refs"][0]["ref"]);
+    assert!(!rig.wal.wal_path(&a).with_extension("moving").exists());
+    assert!(rig.wal.wal_path(&b).with_extension("moving").exists());
+    assert_eq!(
+        wire.call("prepare", params.clone()).await.unwrap(),
+        prepared
+    );
+    let exported = wire.call("export", params.clone()).await.unwrap();
+    assert_eq!(exported["items"][0]["sessionRef"], params["refs"][0]["ref"]);
+    wire.call("abort", params.clone()).await.unwrap();
+    assert!(!rig.wal.wal_path(&b).with_extension("moving").exists());
+    assert_eq!(
+        wire.call("status", params).await.unwrap(),
+        json!({"step":"aborted"})
+    );
 }

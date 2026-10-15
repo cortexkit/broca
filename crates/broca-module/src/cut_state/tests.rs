@@ -608,3 +608,44 @@ async fn changed_ref_set_is_refused_before_the_intent_or_any_export_changes() {
     assert_eq!(std::fs::read(store.path(CUT)).unwrap(), before);
     assert_eq!(artifacts.calls.load(Ordering::SeqCst), calls);
 }
+
+#[tokio::test]
+async fn rolled_back_first_prepare_and_import_clear_the_uncommitted_ref_set() {
+    for op in [Op::Prepare, Op::Import] {
+        let root = root(op.method());
+        let store = CutStore::new(&root);
+        let artifacts = Artifacts::new(root);
+        artifacts.fail_after.store(1, Ordering::SeqCst);
+        let a = json!({"cutId":CUT,"refs":[params()["refs"][0]]});
+        assert_eq!(
+            store
+                .execute("reserved:entorhinal", op.method(), &a, &artifacts)
+                .await
+                .unwrap_err()
+                .code
+                .as_str(),
+            "unavailable"
+        );
+        let state = store.load(CUT).unwrap();
+        assert_eq!(state.step, Step::None);
+        assert!(state.intent.is_none());
+        assert!(
+            state.refs.is_none(),
+            "refused {op:?} retained a hidden first-request binding"
+        );
+        artifacts.fail_after.store(usize::MAX, Ordering::SeqCst);
+        let b = json!({"cutId":CUT,"refs":[params()["refs"][1]]});
+        store
+            .execute("reserved:entorhinal", op.method(), &b, &artifacts)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load(CUT).unwrap().refs.unwrap(),
+            serde_json::from_value::<Refs>(b["refs"].clone()).unwrap()
+        );
+        store
+            .execute("reserved:entorhinal", Op::Abort.method(), &b, &artifacts)
+            .await
+            .unwrap();
+    }
+}
