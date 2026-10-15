@@ -3,8 +3,8 @@ use super::*;
 use crate::opener::DefaultOpener;
 use crate::registry::LineageRegistry;
 use broca_core::tool_plane::{
-    ApprovalCursor, ApprovalFiling, ApprovalPage, ApprovalRouteError, ApprovalWithdrawal,
-    ElicitationPlane,
+    ApprovalCursor, ApprovalFiling, ApprovalPage, ApprovalQuestion, ApprovalRouteError,
+    ApprovalWithdrawal, ElicitationPlane,
 };
 use broca_core::{
     AllowAll, BatchCtx, DispatchResult, FileLeaseStore, FileWalStore, StartMode, StubProvider,
@@ -16,6 +16,9 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct Questions {
     retrying: std::sync::atomic::AtomicBool,
+    await_started: tokio::sync::Notify,
+    await_refusal: tokio::sync::Notify,
+    await_refused: std::sync::atomic::AtomicBool,
     requests: Mutex<Vec<String>>,
     withdrawals: Mutex<Vec<String>>,
     replies: Mutex<std::collections::VecDeque<ApprovalWithdrawal>>,
@@ -54,6 +57,23 @@ impl ElicitationPlane for Questions {
                 provider_incarnation: "p".into(),
                 seq: 0,
             },
+        })
+    }
+    async fn r#await(
+        &self,
+        _: &BatchCtx,
+        id: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        assert_eq!(id, "recovered-id");
+        self.await_started.notify_one();
+        // An empty settlement feed does not hold consent.await. Keep the card open
+        // until the test explicitly releases the nonretryable transport refusal.
+        self.await_refusal.notified().await;
+        self.await_refused.store(true, Ordering::Release);
+        Err(ApprovalRouteError {
+            code: "elicitation_unavailable".into(),
+            retryable: false,
         })
     }
     async fn withdraw(&self, _: &BatchCtx, id: &str) -> ApprovalWithdrawal {
@@ -298,6 +318,43 @@ impl Rig {
     }
     fn row(&self) -> RunIndexRow {
         self.store.lookup_run("r").unwrap().unwrap()
+    }
+    async fn awaiting_approval(&self) -> broca_wire::AwaitingApproval {
+        use crate::serve::ServeHandler;
+        broca_test_support::event_timeout(
+            "durable approval status",
+            async {
+                loop {
+                    if let broca_wire::RunStatusResponse::Active {
+                        awaiting_approval: Some(pending),
+                        ..
+                    } = self
+                        .registry
+                        .run_status(&self.key, RunId("r".into()))
+                        .await
+                        .unwrap()
+                    {
+                        if pending
+                            .pending
+                            .iter()
+                            .any(|entry| entry.elicitation_id.is_some())
+                        {
+                            return pending;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            },
+            || {
+                format!(
+                    "run_index={:?}; {}",
+                    self.store.lookup_run("r"),
+                    broca_test_support::record_kinds(self.frames().iter().map(|f| &f.record))
+                )
+            },
+        )
+        .await
+        .unwrap()
     }
     async fn eventually(&self, test: impl Fn() -> bool) {
         broca_test_support::event_timeout(
@@ -1326,26 +1383,42 @@ impl WalStore for CountedWal {
 async fn active_approval_status_polls_do_not_read_the_wal() {
     use crate::serve::ServeHandler;
     let rig = Rig::new(true);
-    rig.seed(true, false, false, false);
+    let key = rig.seed(true, false, false, false);
+    let questions = rig.executor.questions.as_ref().unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
-    broca_test_support::event_timeout("active_approval_status_polls_do_not_read_the_wal", async {
-        loop {
-            if matches!(rig.registry.run_status(&rig.key, RunId("r".into())).await.unwrap(), broca_wire::RunStatusResponse::Active { awaiting_approval: Some(pending), .. } if pending.pending[0].elicitation_id.is_some()) { break; }
-            tokio::task::yield_now().await;
-        }
-    }, || format!("run_index={:?}; {}", rig.store.lookup_run("r"), broca_test_support::record_kinds(rig.frames().iter().map(|f| &f.record)))).await.unwrap();
+    broca_test_support::event_timeout(
+        "active approval await entered",
+        questions.await_started.notified(),
+        || format!("run_index={:?}", rig.store.lookup_run("r")),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !questions.await_refused.load(Ordering::Acquire),
+        "consent.await returned a refusal instead of holding the card"
+    );
+    rig.awaiting_approval().await;
     rig.full_reads.store(0, Ordering::SeqCst);
     for _ in 0..5 {
-        assert!(matches!(
-            rig.registry
-                .run_status(&rig.key, RunId("r".into()))
-                .await
-                .unwrap(),
-            broca_wire::RunStatusResponse::Active {
-                awaiting_approval: Some(_),
-                ..
-            }
-        ));
+        assert!(
+            !questions.await_refused.load(Ordering::Acquire),
+            "the approval await must remain held throughout the status polls"
+        );
+        let status = rig
+            .registry
+            .run_status(&rig.key, RunId("r".into()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &status,
+                broca_wire::RunStatusResponse::Active { awaiting_approval: Some(pending), .. }
+                    if pending.pending.len() == 1
+                        && pending.pending[0].call_key == key
+                        && pending.pending[0].elicitation_id.as_deref() == Some("recovered-id")
+            ),
+            "held approval disappeared: {status:?}"
+        );
     }
     let reads = rig.full_reads.load(Ordering::SeqCst);
     rig.registry
@@ -1356,6 +1429,65 @@ async fn active_approval_status_polls_do_not_read_the_wal() {
         .await;
     rig.stop().await;
     assert_eq!(reads, 0, "active status reread the entire WAL");
+}
+
+#[tokio::test]
+async fn unavailable_approval_await_closes_a_previously_reported_pending_call() {
+    use crate::serve::ServeHandler;
+    let rig = Rig::new(true);
+    let key = rig.seed(true, false, false, false);
+    let questions = rig.executor.questions.as_ref().unwrap();
+    rig.registry.route_status(&rig.key).await.unwrap();
+    broca_test_support::event_timeout(
+        "approval await entered before refusal",
+        questions.await_started.notified(),
+        || format!("run_index={:?}", rig.store.lookup_run("r")),
+    )
+    .await
+    .unwrap();
+    let before = rig.awaiting_approval().await;
+    assert_eq!(before.pending.len(), 1);
+    assert_eq!(before.pending[0].call_key, key);
+    assert_eq!(
+        before.pending[0].elicitation_id.as_deref(),
+        Some("recovered-id")
+    );
+    assert!(!rig
+        .frames()
+        .iter()
+        .any(|frame| matches!(frame.record, WalRecord::ApprovalRecorded { .. })));
+
+    // Model the immediate refusal from ElicitationPlane's default await, but gate
+    // its return to force closure between status reads without a scheduling race.
+    questions.await_refusal.notify_one();
+    rig.eventually(|| rig.row().state == RunIndexState::Error)
+        .await;
+    let after = rig
+        .registry
+        .run_status(&rig.key, RunId("r".into()))
+        .await
+        .unwrap();
+    assert!(matches!(after, broca_wire::RunStatusResponse::Error { .. }));
+    let decisions: Vec<_> = rig
+        .frames()
+        .into_iter()
+        .filter_map(|frame| match frame.record {
+            WalRecord::ApprovalRecorded {
+                call_key,
+                elicitation_id,
+                decision,
+                closing_result,
+                ..
+            } => Some((call_key, elicitation_id, decision, closing_result)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].0, key);
+    assert_eq!(decisions[0].1.as_deref(), Some("recovered-id"));
+    assert_eq!(decisions[0].2, broca_wal::DeferredDecision::Unavailable);
+    assert!(decisions[0].3.as_ref().unwrap().is_error);
+    rig.stop().await;
 }
 
 #[derive(Default)]
