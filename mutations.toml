@@ -9130,12 +9130,12 @@ new = 'ErrorBody::new("wrong_moved", err.to_string()) /* NON-VACUITY BREAK */'
 
 [[control]]
 id = "move-early-serve-fence"
-guards = "write fencing precedes authorization reads that would see a partial release tombstone"
+guards = "the early write fence runs before parameter validation, so a mutation on a moved session refuses session_moved, never invalid_params"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/wire.rs"
-expect_red = ["wire::pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads"]
+expect_red = ["wire::authorized_moved_sessions_keep_operation_specific_fences"]
 file = "crates/broca-module-serve/src/serve.rs"
 old = 'if write || session_read {'
 new = 'if false && (write || session_read) { // NON-VACUITY BREAK'
