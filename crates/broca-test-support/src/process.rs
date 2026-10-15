@@ -11,6 +11,33 @@ struct ProcessInfo {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProcessWaitOutcome {
+    Exited,
+    TimedOut,
+    OpenFailedInvalidParameter,
+    Failed(String),
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProcessWaitClassification {
+    Exited,
+    StillAlive,
+    Failed(String),
+}
+
+#[cfg(any(windows, test))]
+fn classify_process_wait(outcome: ProcessWaitOutcome) -> ProcessWaitClassification {
+    match outcome {
+        ProcessWaitOutcome::Exited => ProcessWaitClassification::Exited,
+        ProcessWaitOutcome::OpenFailedInvalidParameter => ProcessWaitClassification::Exited,
+        ProcessWaitOutcome::TimedOut => ProcessWaitClassification::StillAlive,
+        ProcessWaitOutcome::Failed(error) => ProcessWaitClassification::Failed(error),
+    }
+}
+
+#[cfg(any(windows, test))]
 fn format_survivor_block(root_pid: u32, survivors: &[ProcessInfo]) -> Option<String> {
     if survivors.is_empty() {
         return None;
@@ -70,7 +97,10 @@ fn append_cleanup_diagnostic(message: &str) -> std::io::Result<()> {
 
 #[cfg(windows)]
 mod windows_processes {
-    use super::ProcessInfo;
+    use super::{classify_process_wait, Duration, Instant, ProcessInfo, ProcessWaitClassification};
+
+    // OpenProcess uses ERROR_INVALID_PARAMETER when the PID has already exited.
+    const ERROR_INVALID_PARAMETER_CODE: i32 = 87;
 
     pub(super) struct ProcessTreeDiagnostic {
         pub root_pid: u32,
@@ -99,7 +129,13 @@ mod windows_processes {
             .filter(|process| tree_pids.contains(&process.pid))
             .collect();
         for process in &mut tree {
-            process.in_job = process_job_status(process.pid, &mut errors);
+            match process_job_status(process.pid) {
+                Ok(in_job) => process.in_job = in_job,
+                Err(error) => errors.push(format!(
+                    "could not query job membership for {}: {error}",
+                    process.pid
+                )),
+            }
         }
         ProcessTreeDiagnostic {
             root_pid,
@@ -116,15 +152,50 @@ mod windows_processes {
         let observed = diagnostic.tree.len();
         let root_pid = diagnostic.root_pid;
         let processes = process_snapshot(&mut errors);
-        let mut survivors: Vec<_> = processes
+        let candidates: Vec<_> = processes
             .into_iter()
             .filter(|process| {
                 tree_pids.contains(&process.pid) || tree_pids.contains(&process.parent_pid)
             })
             .collect();
-        for process in &mut survivors {
-            process.in_job = process_job_status(process.pid, &mut errors);
+
+        // Share one deadline across every candidate so a large tree cannot multiply the wait.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut survivors = Vec::new();
+        for process in candidates {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+            match classify_process_wait(process_wait_outcome(process.pid, timeout_ms)) {
+                ProcessWaitClassification::Exited => {}
+                ProcessWaitClassification::StillAlive => survivors.push(process),
+                ProcessWaitClassification::Failed(error) => {
+                    errors.push(format!(
+                        "could not wait for process {}: {error}",
+                        process.pid
+                    ));
+                }
+            }
         }
+
+        let mut confirmed_survivors = Vec::new();
+        for mut process in survivors {
+            match process_job_status(process.pid) {
+                Ok(Some(in_job)) => {
+                    process.in_job = Some(in_job);
+                    confirmed_survivors.push(process);
+                }
+                // A process may exit between the wait and the job-membership query.
+                Ok(None) => {}
+                Err(error) => {
+                    errors.push(format!(
+                        "could not query job membership for {}: {error}",
+                        process.pid
+                    ));
+                    confirmed_survivors.push(process);
+                }
+            }
+        }
+        let survivors = confirmed_survivors;
         if let Some(block) = super::format_survivor_block(diagnostic.root_pid, &survivors) {
             super::report_cleanup_diagnostic(&block);
         }
@@ -170,13 +241,31 @@ mod windows_processes {
         }
     }
 
-    fn process_job_status(pid: u32, errors: &mut Vec<String>) -> Option<bool> {
-        match broca_owner_only::test_support::process_is_in_job(pid) {
-            Ok(in_job) => Some(in_job),
-            Err(error) => {
-                errors.push(format!("could not query job membership for {pid}: {error}"));
-                None
+    fn process_wait_outcome(pid: u32, timeout_ms: u32) -> super::ProcessWaitOutcome {
+        use broca_owner_only::test_support::ProcessWaitError;
+
+        match broca_owner_only::test_support::process_wait_for_exit(pid, timeout_ms) {
+            Ok(true) => super::ProcessWaitOutcome::Exited,
+            Ok(false) => super::ProcessWaitOutcome::TimedOut,
+            Err(ProcessWaitError::Open(error))
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER_CODE) =>
+            {
+                super::ProcessWaitOutcome::OpenFailedInvalidParameter
             }
+            Err(ProcessWaitError::Open(error)) => {
+                super::ProcessWaitOutcome::Failed(format!("OpenProcess failed: {error}"))
+            }
+            Err(ProcessWaitError::Wait(error)) => {
+                super::ProcessWaitOutcome::Failed(format!("WaitForSingleObject failed: {error}"))
+            }
+        }
+    }
+
+    fn process_job_status(pid: u32) -> Result<Option<bool>, std::io::Error> {
+        match broca_owner_only::test_support::process_is_in_job(pid) {
+            Ok(in_job) => Ok(Some(in_job)),
+            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER_CODE) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 }
@@ -612,6 +701,46 @@ mod tests {
         assert!(block.contains("pid=22"), "{block}");
         assert!(block.contains("parent_pid=11"), "{block}");
         assert!(block.contains("in_job=Some(false)"), "{block}");
+    }
+
+    #[test]
+    fn process_wait_classifies_signaled_process_as_exited() {
+        assert_eq!(
+            classify_process_wait(ProcessWaitOutcome::Exited),
+            ProcessWaitClassification::Exited
+        );
+    }
+
+    #[test]
+    fn process_wait_classifies_open_failed_gone_process_as_exited() {
+        assert_eq!(
+            classify_process_wait(ProcessWaitOutcome::OpenFailedInvalidParameter),
+            ProcessWaitClassification::Exited
+        );
+    }
+
+    #[test]
+    fn process_wait_classifies_timeout_as_still_alive() {
+        assert_eq!(
+            classify_process_wait(ProcessWaitOutcome::TimedOut),
+            ProcessWaitClassification::StillAlive
+        );
+    }
+
+    #[test]
+    fn process_wait_preserves_unexpected_errors() {
+        assert_eq!(
+            classify_process_wait(ProcessWaitOutcome::Failed("access denied".to_owned())),
+            ProcessWaitClassification::Failed("access denied".to_owned())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_wait_times_out_for_the_current_process() {
+        let still_alive =
+            broca_owner_only::test_support::process_wait_for_exit(std::process::id(), 0).unwrap();
+        assert!(!still_alive);
     }
 
     #[cfg(unix)]
