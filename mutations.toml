@@ -6779,6 +6779,24 @@ old = "let error = (cause == SealCause::CrashOrphan).then(|| ProviderError {"
 new = "let error = false.then(|| ProviderError { // NON-VACUITY BREAK: drop startup cause"
 
 [[control]]
+id = "shutdown-stopping-state-refuses-admission"
+guards = "sends through an existing actor handle are refused once the registry is stopping"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/shutdown_tests.rs"
+expect_red = ["actor::shutdown_tests::shutdown_rejects_new_admission"]
+expect_message = "buffered Send admitted while stopping"
+file = "crates/broca-module/src/registry.rs"
+old = """    pub(crate) fn is_stopping(&self) -> bool {
+        self.inner.stopping.is_cancelled()
+    }"""
+new = """    pub(crate) fn is_stopping(&self) -> bool {
+        false // NON-VACUITY BREAK: hide stopping from actor admission guards
+    }"""
+
+[[control]]
 id = "graceful-seal-never-claims-previous-process"
 guards = "graceful shutdown seals do not acquire the startup orphan cause"
 runner = "cargo"
