@@ -10842,3 +10842,63 @@ select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                let from = match subscribe_from(&params) {"
 new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"
+
+[[control]]
+id = "catalog-page-version-pinned"
+guards = "catalog pages cannot mix versions and must restart from page one"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::catalog_version_mismatch_restarts_without_mixing_pages"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "page.catalog.catalog_version != first.catalog_version"
+new = "false /* NON-VACUITY BREAK: ignore page version drift */"
+
+[[control]]
+id = "catalog-page-instant-pinned"
+guards = "catalog pages cannot mix resolved instants even when their versions agree"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::resolved_instant_mismatch_restarts_without_mixing_pages"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "page.catalog.resolved_at_ms != first.resolved_at_ms"
+new = "false /* NON-VACUITY BREAK: ignore page instant drift */"
+
+[[control]]
+id = "catalog-page-refusal-restarts"
+guards = "a changed-catalog tool refusal restarts the whole read without mixing pages"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::changed_catalog_refusal_restarts_without_mixing_pages"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "return Err(ReadError::Changed(message.into()));"
+new = 'return Err(PollError::Refused(message.into()).into()); // NON-VACUITY BREAK: do not restart'
+
+[[control]]
+id = "catalog-page-routed-refusal-restarts"
+guards = "a changed-catalog routed refusal restarts the whole read without mixing pages"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::routed_changed_catalog_refusal_restarts_without_mixing_pages"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "return Err(ReadError::Changed(reason.into()));"
+new = 'return Err(PollError::Refused(reason.into()).into()); // NON-VACUITY BREAK: do not restart'
+
+[[control]]
+id = "catalog-page-repeated-token-refused"
+guards = "a repeated opaque catalog continuation token fails closed"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::repeated_page_token_fails_closed"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "if !tokens.insert(token.clone()) {"
+new = "if false && !tokens.insert(token.clone()) { // NON-VACUITY BREAK: accept cursor cycles"

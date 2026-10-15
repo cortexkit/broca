@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -11,11 +12,15 @@ use serde::Deserialize;
 pub const FUSIFORM_MODULE_ID: &str = "fusiform";
 pub const FUSIFORM_CATALOG_TOOL: &str = "catalog.get";
 pub const CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const MAX_CATALOG_PAGES: usize = 256;
+const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CATALOG_RESTARTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollError {
     Transport(String),
     Protocol(String),
+    Refused(String),
     Cache(String),
 }
 
@@ -24,6 +29,7 @@ impl std::fmt::Display for PollError {
         match self {
             Self::Transport(error) => write!(f, "fusiform transport: {error}"),
             Self::Protocol(error) => write!(f, "fusiform protocol: {error}"),
+            Self::Refused(error) => write!(f, "fusiform refused: {error}"),
             Self::Cache(error) => write!(f, "catalog cache: {error}"),
         }
     }
@@ -129,11 +135,27 @@ impl CatalogPoller {
     }
 
     pub async fn poll(&self) -> Result<(), PollError> {
+        let response = self
+            .read_catalog(MAX_CATALOG_PAGES, MAX_CATALOG_BYTES)
+            .await?;
+        // Only a complete, pinned read reaches the existing parser and durable cache path.
+        self.cache
+            .refresh(response)
+            .map_err(|error| PollError::Cache(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_catalog(
+        &self,
+        max_pages: usize,
+        max_bytes: usize,
+    ) -> Result<FusiformCatalogResponse, PollError> {
         let arguments = serde_json::json!({
             "fact_prefixes": FUSIFORM_FACT_PREFIXES,
             // Preserve the known-negative state. With the default false, an upstream withdrawal
             // is indistinguishable from a model id that never existed.
             "include_retired": true,
+            "paged": true,
             // DO NOT ADD `at_ms` HERE. A point-in-time read looks like a good idea for
             // reproducibility and would wedge the catalog permanently.
             //
@@ -156,7 +178,94 @@ impl CatalogPoller {
                     .map_err(conn_error)?,
             );
         }
-        let handle = handle.expect("route was opened above");
+        let mut handle = handle.expect("route was opened above");
+        let mut transport_retried = false;
+        // Charge abandoned attempts too: a changing producer must not bypass the read bounds.
+        let mut pages = 0;
+        let mut bytes = 0;
+        for restart in 0..=MAX_CATALOG_RESTARTS {
+            let mut arguments = arguments.clone();
+            let mut tokens = BTreeSet::new();
+            let mut assembled: Option<FusiformCatalogResponse> = None;
+            loop {
+                let result = self
+                    .call_page(
+                        &mut handle,
+                        &mut transport_retried,
+                        &arguments,
+                        &mut pages,
+                        max_pages,
+                    )
+                    .await;
+                let page = match result {
+                    Ok(value) => {
+                        bytes += serde_json::to_vec(&value)
+                            .map_err(|error| PollError::Protocol(error.to_string()))?
+                            .len();
+                        if bytes > max_bytes {
+                            return Err(PollError::Refused(
+                                "catalog.get byte limit exceeded".into(),
+                            ));
+                        }
+                        decode_tool_response(value)
+                    }
+                    Err(error) => Err(error),
+                };
+                let page = match page.and_then(|page| {
+                    if let Some(first) = &assembled {
+                        if page.catalog.catalog_version != first.catalog_version
+                            || page.catalog.resolved_at_ms != first.resolved_at_ms
+                        {
+                            return Err(ReadError::Changed(
+                                "catalog.get version or resolved instant changed between pages"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    Ok(page)
+                }) {
+                    Ok(page) => page,
+                    Err(ReadError::Changed(reason)) => {
+                        if restart == MAX_CATALOG_RESTARTS {
+                            return Err(PollError::Refused(format!(
+                                "catalog.get snapshot restart limit exceeded: {reason}"
+                            )));
+                        }
+                        break;
+                    }
+                    Err(ReadError::Failed(error)) => return Err(error),
+                };
+                match &mut assembled {
+                    Some(first) => merge_page(first, page.catalog)?,
+                    None => {
+                        validate_qualifications(&page.catalog)?;
+                        assembled = Some(page.catalog);
+                    }
+                }
+                match page.next_page_token {
+                    Some(token) => {
+                        if !tokens.insert(token.clone()) {
+                            return Err(PollError::Protocol(
+                                "catalog.get repeated next_page_token".into(),
+                            ));
+                        }
+                        arguments["page_token"] = token.into();
+                    }
+                    None => return Ok(assembled.expect("first page was assembled")),
+                }
+            }
+        }
+        unreachable!("the last restart either completes or refuses")
+    }
+
+    async fn call_page(
+        &self,
+        handle: &mut PollRouteHandle,
+        transport_retried: &mut bool,
+        arguments: &serde_json::Value,
+        pages: &mut usize,
+        max_pages: usize,
+    ) -> Result<serde_json::Value, ReadError> {
         // EVICT AND RETRY ONCE, which is what every other route consumer here does.
         //
         // The tool plane and the vault client both re-open and retry on this class; this
@@ -168,29 +277,39 @@ impl CatalogPoller {
         // Retrying needs no error classification here, unlike a tool dispatch: `catalog.get`
         // is a pure read, so a second attempt cannot double an effect. The only cost of a
         // needless retry is one round trip.
-        let mut handle = handle;
-        let mut attempt = 0;
         let response = loop {
+            if *pages == max_pages {
+                return Err(PollError::Refused("catalog.get page limit exceeded".into()).into());
+            }
+            *pages += 1;
             match self
                 .route
-                .call(&handle, FUSIFORM_CATALOG_TOOL, &arguments)
+                .call(handle, FUSIFORM_CATALOG_TOOL, arguments)
                 .await
             {
                 Ok(response) => break response,
                 Err(error) => {
-                    self.handle.lock().unwrap().take();
-                    if attempt == 1 {
-                        return Err(conn_error(error));
+                    if let ConnError::Rejected(message) = &error {
+                        if let Some(("refused", reason)) = message.split_once(" — ") {
+                            if catalog_changed(reason) {
+                                *self.handle.lock().unwrap() = Some(handle.clone());
+                                return Err(ReadError::Changed(reason.into()));
+                            }
+                        }
                     }
-                    attempt += 1;
+                    self.handle.lock().unwrap().take();
+                    if *transport_retried {
+                        return Err(conn_error(error).into());
+                    }
+                    *transport_retried = true;
                     // A FRESH route, not the evicted one. Re-calling on the same handle
                     // would retry the exact condition that just failed.
-                    handle = match self.route.open(FUSIFORM_MODULE_ID, &self.identity).await {
+                    *handle = match self.route.open(FUSIFORM_MODULE_ID, &self.identity).await {
                         Ok(reopened) => reopened,
                         // Report the ORIGINAL failure: it is the one that describes what
                         // went wrong with the catalog, and a reopen failure on top of it
                         // is a symptom of the same outage.
-                        Err(_) => return Err(conn_error(error)),
+                        Err(_) => return Err(conn_error(error).into()),
                     };
                 }
             }
@@ -198,11 +317,7 @@ impl CatalogPoller {
         // A well-formed terminal proves the route is alive even when the application payload or
         // cache validation fails. Retain it so one bad document cannot leak a route every poll.
         *self.handle.lock().unwrap() = Some(handle.clone());
-        let response = decode_tool_response(response)?;
-        self.cache
-            .refresh(response)
-            .map_err(|error| PollError::Cache(error.to_string()))?;
-        Ok(())
+        Ok(response)
     }
 }
 
@@ -218,7 +333,7 @@ impl CatalogPoller {
 /// read; the bug it replaced was four lines of my own, shipped the same evening.
 fn counts_at_the_loop(error: &PollError) -> bool {
     match error {
-        PollError::Transport(_) | PollError::Protocol(_) => true,
+        PollError::Transport(_) | PollError::Protocol(_) | PollError::Refused(_) => true,
         PollError::Cache(_) => false,
     }
 }
@@ -266,29 +381,111 @@ struct ToolResult {
     is_error: bool,
 }
 
-fn decode_tool_response(value: serde_json::Value) -> Result<FusiformCatalogResponse, PollError> {
-    // Tool providers normally return CallToolResult text content. Accept the direct response too:
-    // fusiform's source-level route tests use it, and keeping decoding explicit makes either
-    // contract change fail as a protocol error rather than loading an empty catalog.
-    if value.get("models").is_some() {
-        return serde_json::from_value(value)
-            .map_err(|error| PollError::Protocol(format!("decode catalog.get response: {error}")));
+#[derive(Debug)]
+enum ReadError {
+    Changed(String),
+    Failed(PollError),
+}
+
+impl From<PollError> for ReadError {
+    fn from(error: PollError) -> Self {
+        Self::Failed(error)
     }
-    let result: ToolResult = serde_json::from_value(value)
-        .map_err(|error| PollError::Protocol(format!("decode tool result envelope: {error}")))?;
-    if result.is_error {
+}
+
+struct CatalogPage {
+    catalog: FusiformCatalogResponse,
+    next_page_token: Option<String>,
+}
+
+fn catalog_changed(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("catalog changed") && message.contains("first page")
+}
+
+fn decode_tool_response(mut value: serde_json::Value) -> Result<CatalogPage, ReadError> {
+    // Decode both routed tool envelopes and direct replies through the same catalog parser.
+    let mut is_error = false;
+    if value.get("content").is_some() {
+        let result: ToolResult = serde_json::from_value(value).map_err(|error| {
+            PollError::Protocol(format!("decode tool result envelope: {error}"))
+        })?;
+        is_error = result.is_error;
+        let text = result
+            .content
+            .iter()
+            .find(|content| content.kind == "text")
+            .map(|content| content.text.as_str())
+            .ok_or_else(|| PollError::Protocol("catalog.get returned no text content".into()))?;
+        value = serde_json::from_str(text)
+            .map_err(|error| PollError::Protocol(format!("decode catalog.get text: {error}")))?;
+    }
+    if value.get("code").and_then(|code| code.as_str()) == Some("refused") {
+        let message = value
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("");
+        if catalog_changed(message) {
+            return Err(ReadError::Changed(message.into()));
+        }
+        return Err(PollError::Refused(format!("catalog.get: {message}")).into());
+    }
+    if is_error {
+        return Err(PollError::Protocol("catalog.get returned an application error".into()).into());
+    }
+    let next_page_token = match value.get("next_page_token") {
+        None => None,
+        Some(serde_json::Value::String(token)) => Some(token.clone()),
+        Some(_) => {
+            return Err(
+                PollError::Protocol("catalog.get next_page_token is not a string".into()).into(),
+            )
+        }
+    };
+    let catalog = serde_json::from_value(value)
+        .map_err(|error| PollError::Protocol(format!("decode catalog.get response: {error}")))?;
+    Ok(CatalogPage {
+        catalog,
+        next_page_token,
+    })
+}
+
+fn validate_qualifications(catalog: &FusiformCatalogResponse) -> Result<(), PollError> {
+    for (name, rows) in [
+        ("withheld", &catalog.withheld),
+        ("uncertain", &catalog.uncertain),
+    ] {
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            if !seen.insert(row.to_string()) {
+                return Err(PollError::Protocol(format!(
+                    "catalog.get duplicate {name} row"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_page(
+    assembled: &mut FusiformCatalogResponse,
+    page: FusiformCatalogResponse,
+) -> Result<(), PollError> {
+    if assembled.source != page.source {
         return Err(PollError::Protocol(
-            "catalog.get returned an application error".to_string(),
+            "catalog.get source changed between pages".into(),
         ));
     }
-    let text = result
-        .content
-        .iter()
-        .find(|content| content.kind == "text")
-        .map(|content| content.text.as_str())
-        .ok_or_else(|| PollError::Protocol("catalog.get returned no text content".to_string()))?;
-    serde_json::from_str(text)
-        .map_err(|error| PollError::Protocol(format!("decode catalog.get text: {error}")))
+    for (model, facts) in page.models {
+        if assembled.models.insert(model.clone(), facts).is_some() {
+            return Err(PollError::Protocol(format!(
+                "catalog.get duplicate model {model}"
+            )));
+        }
+    }
+    assembled.withheld.extend(page.withheld);
+    assembled.uncertain.extend(page.uncertain);
+    validate_qualifications(assembled)
 }
 
 fn conn_error(error: ConnError) -> PollError {
@@ -308,6 +505,7 @@ mod tests {
         opens: AtomicUsize,
         delay: Mutex<Option<Duration>>,
         last_arguments: Mutex<Option<serde_json::Value>>,
+        arguments: Mutex<Vec<serde_json::Value>>,
         responses: Mutex<VecDeque<Result<serde_json::Value, ConnError>>>,
     }
 
@@ -332,6 +530,7 @@ mod tests {
         {
             Box::pin(async move {
                 *self.last_arguments.lock().unwrap() = Some(arguments.clone());
+                self.arguments.lock().unwrap().push(arguments.clone());
                 let delay = *self.delay.lock().unwrap();
                 if let Some(delay) = delay {
                     tokio::time::sleep(delay).await;
@@ -402,10 +601,409 @@ mod tests {
             Some(&serde_json::json!(true)),
             "withdrawal must stay distinguishable from never-existed"
         );
+        assert_eq!(object.get("paged"), Some(&serde_json::json!(true)));
+        assert!(!object.contains_key("page_token"));
     }
 
     fn identity() -> BindIdentity {
         BindIdentity::new("/tmp", "broca", "catalog-refresh")
+    }
+
+    fn test_dir() -> std::path::PathBuf {
+        static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+        let dir = broca_test_support::scratch_root().join(format!(
+            "catalog-paging-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn full_response(version: i64, instant: i64) -> FusiformCatalogResponse {
+        let mut full = response(instant);
+        full.catalog_version = version;
+        full.models.insert(
+            "openai/gpt-4o".into(),
+            full.models["anthropic/claude-sonnet-4-5"].clone(),
+        );
+        full
+    }
+
+    fn split_pages(full: &FusiformCatalogResponse) -> [serde_json::Value; 2] {
+        let mut first = full.clone();
+        let mut last = full.clone();
+        first
+            .models
+            .retain(|model, _| model.starts_with("anthropic/"));
+        last.models
+            .retain(|model, _| !model.starts_with("anthropic/"));
+        last.withheld = first.withheld.split_off(full.withheld.len() / 2);
+        last.uncertain = first.uncertain.split_off(full.uncertain.len() / 2);
+        let mut first = serde_json::to_value(first).unwrap();
+        // The cursor is deliberately not a version or an offset; the consumer must echo it.
+        first["next_page_token"] = serde_json::json!("opaque +/?= cursor ☃");
+        [first, serde_json::to_value(last).unwrap()]
+    }
+
+    fn tool_reply(value: serde_json::Value, is_error: bool) -> serde_json::Value {
+        serde_json::json!({
+            "content": [{"type": "text", "text": value.to_string()}],
+            "isError": is_error,
+        })
+    }
+
+    fn scripted_route(responses: Vec<Result<serde_json::Value, ConnError>>) -> Arc<FakeRoute> {
+        Arc::new(FakeRoute {
+            responses: Mutex::new(responses.into()),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn paged_catalog_is_byte_identical_to_unpaged_lkg() {
+        let full = full_response(7, 10);
+        let [first, last] = split_pages(&full);
+        let route = scripted_route(vec![
+            Ok(tool_reply(first, false)),
+            Ok(tool_reply(last, false)),
+        ]);
+        let dir = test_dir();
+        let paged_path = dir.join("paged.json");
+        let cache = Arc::new(CatalogCache::open(&paged_path));
+        CatalogPoller::with_route(route.clone(), identity(), cache.clone())
+            .poll()
+            .await
+            .unwrap();
+
+        let unpaged_path = dir.join("unpaged.json");
+        let unpaged = Arc::new(CatalogCache::open(&unpaged_path));
+        let old_route = scripted_route(vec![Ok(serde_json::to_value(&full).unwrap())]);
+        CatalogPoller::with_route(old_route, identity(), unpaged)
+            .poll()
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&paged_path).unwrap(),
+            std::fs::read(unpaged_path).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(paged_path).unwrap(),
+            serde_json::to_vec(&full).unwrap()
+        );
+        assert!(cache
+            .snapshot()
+            .unwrap()
+            .model_for_serving("openai", "gpt-4o")
+            .is_some());
+        assert_eq!(cache.total_refusals(), 0);
+        let arguments = route.arguments.lock().unwrap();
+        assert_eq!(arguments.len(), 2);
+        assert!(arguments[0].get("page_token").is_none());
+        assert_eq!(arguments[1]["page_token"], "opaque +/?= cursor ☃");
+        for args in arguments.iter() {
+            assert_eq!(args["paged"], true);
+            assert_eq!(args["include_retired"], true);
+            assert_eq!(
+                args["fact_prefixes"],
+                serde_json::json!(FUSIFORM_FACT_PREFIXES)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn page_qualifications_are_merged_before_the_existing_cache_refusal() {
+        let mut full = full_response(7, 10);
+        full.withheld = vec![
+            serde_json::json!({"model": "anthropic/hidden"}),
+            serde_json::json!({"model": "openai/hidden"}),
+        ];
+        full.uncertain = vec![
+            serde_json::json!({"model": "anthropic/uncertain"}),
+            serde_json::json!({"model": "openai/uncertain"}),
+        ];
+        let pages = split_pages(&full);
+        let route = scripted_route(pages.iter().cloned().map(Ok).collect());
+        let cache = Arc::new(CatalogCache::empty());
+        let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
+        let assembled = poller
+            .read_catalog(MAX_CATALOG_PAGES, MAX_CATALOG_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&assembled).unwrap(),
+            serde_json::to_vec(&full).unwrap()
+        );
+        route
+            .responses
+            .lock()
+            .unwrap()
+            .extend(pages.into_iter().map(Ok));
+        assert!(matches!(poller.poll().await, Err(PollError::Cache(_))));
+        assert_eq!(cache.total_refusals(), 1);
+        assert!(cache.snapshot().is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_qualifications_across_pages_are_protocol_errors() {
+        for field in ["withheld", "uncertain"] {
+            let [mut first, mut last] = split_pages(&full_response(7, 10));
+            first[field] = serde_json::json!([{"model": "duplicate"}]);
+            last[field] = first[field].clone();
+            let route = scripted_route(vec![Ok(first), Ok(last)]);
+            let poller =
+                CatalogPoller::with_route(route, identity(), Arc::new(CatalogCache::empty()));
+            assert!(
+                matches!(poller.poll().await, Err(PollError::Protocol(message)) if message.contains(field))
+            );
+        }
+    }
+
+    async fn assert_restarts_without_mixing(trigger: Result<serde_json::Value, ConnError>) {
+        let abandoned = full_response(7, 10);
+        let fresh = full_response(8, 20);
+        let [first, _] = split_pages(&abandoned);
+        let [fresh_first, fresh_last] = split_pages(&fresh);
+        let route = scripted_route(vec![Ok(first), trigger, Ok(fresh_first), Ok(fresh_last)]);
+        let dir = test_dir();
+        let path = dir.join("catalog.json");
+        let cache = Arc::new(CatalogCache::open(&path));
+        CatalogPoller::with_route(route.clone(), identity(), cache.clone())
+            .poll()
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            serde_json::to_vec(&fresh).unwrap()
+        );
+        assert_eq!(
+            cache.total_refusals(),
+            0,
+            "abandoned reads are not failed polls"
+        );
+        let args = route.arguments.lock().unwrap();
+        assert_eq!(args.len(), 4);
+        assert!(
+            args[2].get("page_token").is_none(),
+            "restart must return to page one"
+        );
+        assert_eq!(
+            route.opens.load(Ordering::Relaxed),
+            1,
+            "a snapshot refusal is not a dead route"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_catalog_refusal_restarts_without_mixing_pages() {
+        assert_restarts_without_mixing(Ok(tool_reply(
+            serde_json::json!({
+                "code": "refused",
+                "message": "catalog changed since the first page; restart from page one",
+            }),
+            true,
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn routed_changed_catalog_refusal_restarts_without_mixing_pages() {
+        assert_restarts_without_mixing(Err(ConnError::Rejected(
+            "refused — catalog changed since the first page; restart from page one".into(),
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn catalog_version_mismatch_restarts_without_mixing_pages() {
+        let [_, mut last] = split_pages(&full_response(7, 10));
+        last["catalog_version"] = serde_json::json!(8);
+        assert_restarts_without_mixing(Ok(last)).await;
+    }
+
+    #[tokio::test]
+    async fn resolved_instant_mismatch_restarts_without_mixing_pages() {
+        let [_, mut last] = split_pages(&full_response(7, 10));
+        last["resolved_at_ms"] = serde_json::json!(11);
+        assert_restarts_without_mixing(Ok(last)).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_page_token_fails_closed() {
+        let last = serde_json::to_value(response(10)).unwrap();
+        let mut first = last.clone();
+        first["models"] = serde_json::json!({});
+        first["next_page_token"] = serde_json::json!("same");
+        let route = scripted_route(vec![Ok(first.clone()), Ok(first), Ok(last)]);
+        let cache = Arc::new(CatalogCache::empty());
+        cache
+            .install_for_test(response(1), CatalogSource::Fusiform)
+            .unwrap();
+        let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
+        let error = poller.poll().await.unwrap_err();
+        assert!(
+            matches!(error, PollError::Protocol(ref message) if message.contains("repeated next_page_token")),
+            "{error}"
+        );
+        assert_eq!(route.arguments.lock().unwrap().len(), 2);
+        assert_eq!(cache.snapshot().unwrap().resolved_at_ms(), 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_page_limit_is_refused() {
+        let mut empty = response(10);
+        empty.models.clear();
+        let route = scripted_route(
+            (0..MAX_CATALOG_PAGES)
+                .map(|index| {
+                    let mut page = serde_json::to_value(&empty).unwrap();
+                    page["next_page_token"] = serde_json::json!(format!("page-{index}"));
+                    Ok(page)
+                })
+                .collect(),
+        );
+        let cache = Arc::new(CatalogCache::empty());
+        let poller = CatalogPoller::with_route(route.clone(), identity(), cache);
+        let error = poller.poll().await.unwrap_err();
+        assert!(
+            matches!(error, PollError::Refused(ref message) if message.contains("page limit")),
+            "{error}"
+        );
+        assert_eq!(route.arguments.lock().unwrap().len(), MAX_CATALOG_PAGES);
+    }
+
+    #[tokio::test]
+    async fn catalog_byte_limit_is_refused() {
+        let route = scripted_route(vec![Ok(serde_json::to_value(response(10)).unwrap())]);
+        let poller = CatalogPoller::with_route(route, identity(), Arc::new(CatalogCache::empty()));
+        let error = poller.read_catalog(MAX_CATALOG_PAGES, 1).await.unwrap_err();
+        assert!(
+            matches!(error, PollError::Refused(ref message) if message.contains("byte limit")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_bounds_charge_continuations_restarts_and_transport_retries() {
+        let [first, last] = split_pages(&full_response(7, 10));
+        let max_single_page = serde_json::to_vec(&first)
+            .unwrap()
+            .len()
+            .max(serde_json::to_vec(&last).unwrap().len());
+        let route = scripted_route(vec![Ok(first.clone()), Ok(last.clone())]);
+        let poller =
+            CatalogPoller::with_route(route.clone(), identity(), Arc::new(CatalogCache::empty()));
+        assert!(
+            matches!(poller.read_catalog(MAX_CATALOG_PAGES, max_single_page).await,
+            Err(PollError::Refused(message)) if message.contains("byte limit"))
+        );
+        assert_eq!(route.arguments.lock().unwrap().len(), 2);
+
+        let mut mismatch = last;
+        mismatch["catalog_version"] = serde_json::json!(8);
+        mismatch["resolved_at_ms"] = serde_json::json!(11);
+        let route = scripted_route(vec![Ok(first.clone()), Ok(mismatch), Ok(first)]);
+        let poller =
+            CatalogPoller::with_route(route.clone(), identity(), Arc::new(CatalogCache::empty()));
+        assert!(matches!(poller.read_catalog(3, MAX_CATALOG_BYTES).await,
+            Err(PollError::Refused(message)) if message.contains("page limit")));
+        assert_eq!(route.arguments.lock().unwrap().len(), 3);
+
+        let route = scripted_route(vec![
+            Err(ConnError::Transport("lost route".into())),
+            Ok(serde_json::to_value(response(10)).unwrap()),
+        ]);
+        let poller =
+            CatalogPoller::with_route(route.clone(), identity(), Arc::new(CatalogCache::empty()));
+        assert!(matches!(poller.read_catalog(1, MAX_CATALOG_BYTES).await,
+            Err(PollError::Refused(message)) if message.contains("page limit")));
+        assert_eq!(route.arguments.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_restart_limit_keeps_lkg_and_counts_one_failed_poll() {
+        let full = full_response(7, 10);
+        let [first, mut last] = split_pages(&full);
+        last["catalog_version"] = serde_json::json!(8);
+        last["resolved_at_ms"] = serde_json::json!(11);
+        let route = scripted_route(
+            (0..=MAX_CATALOG_RESTARTS)
+                .flat_map(|_| [Ok(first.clone()), Ok(last.clone())])
+                .collect(),
+        );
+        let dir = test_dir();
+        let path = dir.join("catalog.json");
+        let cache = Arc::new(CatalogCache::open(&path));
+        cache.refresh(full).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
+        let error = poller.poll().await.unwrap_err();
+        assert!(
+            matches!(error, PollError::Refused(ref message) if message.contains("snapshot restart limit")),
+            "{error}"
+        );
+        assert!(counts_at_the_loop(&error));
+        cache.note_poll_failure(error.to_string());
+        assert_eq!(cache.total_refusals(), 1);
+        assert_eq!(cache.consecutive_refusals().0, 1);
+        assert_eq!(cache.snapshot().unwrap().resolved_at_ms(), 10);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(
+            route.arguments.lock().unwrap().len(),
+            2 * (MAX_CATALOG_RESTARTS + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_or_duplicate_pages_fail_closed_without_restart() {
+        let full = full_response(7, 10);
+        let [first, last] = split_pages(&full);
+        let mut invalid_pages = Vec::new();
+        for field in ["source", "models", "catalog_version", "resolved_at_ms"] {
+            let mut missing = last.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            invalid_pages.push(missing);
+        }
+        let mut invalid_token = last.clone();
+        invalid_token["next_page_token"] = serde_json::Value::Null;
+        invalid_pages.push(invalid_token);
+        let mut changed_source = last.clone();
+        changed_source["source"] = serde_json::json!("other source");
+        invalid_pages.push(changed_source);
+        let mut duplicate_model = last.clone();
+        duplicate_model["models"] = first["models"].clone();
+        invalid_pages.push(duplicate_model);
+        for field in ["withheld", "uncertain"] {
+            let mut duplicate_row = last.clone();
+            duplicate_row[field] = serde_json::json!([{"model": "same"}, {"model": "same"}]);
+            invalid_pages.push(duplicate_row);
+        }
+        for invalid in invalid_pages {
+            let route = scripted_route(vec![Ok(first.clone()), Ok(invalid.clone())]);
+            let cache = Arc::new(CatalogCache::empty());
+            let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
+            let error = poller.poll().await.unwrap_err();
+            assert!(
+                matches!(error, PollError::Protocol(_)),
+                "{invalid}: {error}"
+            );
+            assert_eq!(route.arguments.lock().unwrap().len(), 2);
+            assert!(cache.snapshot().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_refusal_does_not_restart() {
+        let route = scripted_route(vec![Ok(tool_reply(
+            serde_json::json!({
+                "code": "refused", "message": "catalog.get denied by policy",
+            }),
+            true,
+        ))]);
+        let poller =
+            CatalogPoller::with_route(route.clone(), identity(), Arc::new(CatalogCache::empty()));
+        assert!(matches!(poller.poll().await, Err(PollError::Refused(_))));
+        assert_eq!(route.arguments.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -612,6 +1210,7 @@ mod tests {
             Some(&serde_json::json!({
                 "fact_prefixes": FUSIFORM_FACT_PREFIXES,
                 "include_retired": true,
+                "paged": true,
             }))
         );
     }
