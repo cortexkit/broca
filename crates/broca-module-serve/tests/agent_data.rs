@@ -9,7 +9,7 @@ use broca_module_serve::{
     serve::{self, VaultGauge},
 };
 use broca_protocol::{BindIdentity, RunFinishReason, RunId, Usage};
-use broca_subc::session_door::{DoorRead, SessionDoorError, MAX_READ_BYTES};
+use broca_subc::session_door::{DoorRead, SessionDoorError, MAX_CALL_BYTES};
 use broca_wal::{RunConfig, RunOrigin, WalRecord};
 use broca_wire::agent_data as contract;
 use serde_json::{json, Value};
@@ -139,7 +139,7 @@ impl SessionDoor for FakeDoor {
             })?;
         let configured = self.read_limit.load(Ordering::SeqCst);
         let limit = if configured == 0 {
-            MAX_READ_BYTES
+            MAX_CALL_BYTES
         } else {
             configured
         };
@@ -1888,58 +1888,78 @@ async fn activation_busy_freeze_has_typed_refs_and_preserves_staging() {
 #[tokio::test]
 async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
     use broca_module::cut_state::{CutState, CutStore, Intent};
-    let (rig, mut params, bytes) = incoming_rig("abort-partial-import");
-    let session = rig.session("incoming");
-    let other_session = rig.session("other-unheld");
-    params["refs"].as_array_mut().unwrap().push(
-        serde_json::to_value(contract::session_reference(
-            &other_session.harness,
-            &other_session.project_root.to_string_lossy(),
-            &other_session.session,
-        ))
-        .unwrap(),
-    );
-    let staged = broca_wal::migration::staging_path(
-        rig.wal.root(),
-        CUT,
-        &broca_core::session_addr(&session),
-    )
-    .unwrap();
-    broca_wal::migration::stage(&staged, &bytes, &broca_wal::migration::digest(&bytes)).unwrap();
-    let other = rig
-        .root
-        .join("wal-staging")
-        .join(BACK)
-        .join("unrelated.wal");
-    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-    std::fs::write(&other, b"other cut").unwrap();
-    let state = CutState {
-        step: contract::step::Step::None,
-        refs: Some(serde_json::from_value(params["refs"].clone()).unwrap()),
-        intent: Some(Intent {
-            op: "import".into(),
-            request: params.clone(),
-        }),
-        sessions: recorded_sessions(&[session.clone(), other_session]),
-        replies: Default::default(),
-    };
-    let authority = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&authority, &state).unwrap();
-    *rig.door.refusal.lock().unwrap() = Some("unavailable".into());
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    wire.call("abort", params.clone()).await.unwrap();
-    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
-    assert!(!staged.exists());
-    assert_eq!(std::fs::read(other).unwrap(), b"other cut");
-    let state: CutState = serde_json::from_slice(&std::fs::read(authority).unwrap()).unwrap();
-    assert_eq!(state.step, contract::step::Step::Aborted);
-    assert!(state.intent.is_none());
-    assert!(!state.replies.contains_key("agent_data.import"));
-    rig.service.reconcile_boot().await.unwrap();
-    assert_eq!(
-        wire.call("status", params).await.unwrap(),
-        json!({"step":"aborted"})
-    );
+    for truncated in [false, true] {
+        let (rig, mut params, bytes) = incoming_rig("abort-partial-import");
+        let session = rig.session("incoming");
+        let other_session = rig.session("other-unheld");
+        params["refs"].as_array_mut().unwrap().push(
+            serde_json::to_value(contract::session_reference(
+                &other_session.harness,
+                &other_session.project_root.to_string_lossy(),
+                &other_session.session,
+            ))
+            .unwrap(),
+        );
+        let staged = broca_wal::migration::staging_path(
+            rig.wal.root(),
+            CUT,
+            &broca_core::session_addr(&session),
+        )
+        .unwrap();
+        let staged_bytes = if truncated { &[][..] } else { &bytes };
+        broca_wal::migration::stage(
+            &staged,
+            staged_bytes,
+            &broca_wal::migration::digest(staged_bytes),
+        )
+        .unwrap();
+        if truncated {
+            // Damaged private WALs can be empty. Abort must discard them without
+            // interpreting its content-free cleanup plans as a completed import.
+            let other_staged = broca_wal::migration::staging_path(
+                rig.wal.root(),
+                CUT,
+                &broca_core::session_addr(&other_session),
+            )
+            .unwrap();
+            broca_wal::migration::stage(&other_staged, &[], &broca_wal::migration::digest(&[]))
+                .unwrap();
+        }
+        let other = rig
+            .root
+            .join("wal-staging")
+            .join(BACK)
+            .join("unrelated.wal");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"other cut").unwrap();
+        let state = CutState {
+            step: contract::step::Step::None,
+            refs: Some(serde_json::from_value(params["refs"].clone()).unwrap()),
+            intent: Some(Intent {
+                op: "import".into(),
+                request: params.clone(),
+            }),
+            sessions: recorded_sessions(&[session.clone(), other_session]),
+            replies: Default::default(),
+        };
+        let authority = CutStore::new(&rig.root).path(CUT);
+        broca_wal::migration::atomic_json(&authority, &state).unwrap();
+        *rig.door.refusal.lock().unwrap() = Some("unavailable".into());
+        let mut wire = Wire::new(&rig, entorhinal(), true).await;
+        wire.call("abort", params.clone()).await.unwrap();
+        assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(other).unwrap(), b"other cut");
+        let state: CutState = serde_json::from_slice(&std::fs::read(authority).unwrap()).unwrap();
+        assert_eq!(state.step, contract::step::Step::Aborted);
+        assert!(state.intent.is_none());
+        assert!(!state.replies.contains_key("agent_data.import"));
+        rig.service.reconcile_boot().await.unwrap();
+        assert_eq!(
+            wire.call("status", params).await.unwrap(),
+            json!({"step":"aborted"})
+        );
+    }
 }
 #[tokio::test]
 async fn boot_keeps_an_unreadable_cut_pending_and_status_read_only() {

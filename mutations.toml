@@ -8545,8 +8545,8 @@ select = "expected"
 test_file = "crates/broca-subc/tests/it/session_door.rs"
 expect_red = ["session_door::admit_chunks_at_the_broca_cap_and_resumes_from_cover"]
 file = "crates/broca-subc/src/session_door.rs"
-old = 'pub const MAX_ADMIT_BYTES: usize = 3_145_697;'
-new = 'pub const MAX_ADMIT_BYTES: usize = 3 * 1024 * 1024; // NON-VACUITY BREAK'
+old = 'pub const MAX_CALL_BYTES: usize = 1_048_576;'
+new = 'pub const MAX_CALL_BYTES: usize = 3 * 1024 * 1024; // NON-VACUITY BREAK'
 
 [[control]]
 id = "subc-door-internal-service"
@@ -13515,3 +13515,27 @@ only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
 old = 'Ok(None) => continue,'
 new = 'Ok(None) => { let _ = self.incoming(&reference.r#ref, cut_id).await; continue; }, // NON-VACUITY BREAK: read a cut despite absent local WAL bytes'
+
+[[control]]
+id = "subc-door-read-raw-byte-cap"
+guards = "oversize session-door reads are refused before routing and the exact 1 MiB raw-byte boundary is accepted"
+runner = "cargo"
+package = "broca-subc"
+target = "--test it"
+test_file = "crates/broca-subc/tests/it/session_door.rs"
+expect_red = ["session_door::read_limits_use_the_raw_byte_cap_before_opening_the_door"]
+file = "crates/broca-subc/src/session_door.rs"
+old = 'if limit == 0 || limit > MAX_CALL_BYTES {'
+new = 'if limit == 0 { // NON-VACUITY BREAK: route over-cap reads'
+
+[[control]]
+id = "subc-door-record-too-large-terminal"
+guards = "record_too_large is a client bug and never retried by cover, admit or read"
+runner = "cargo"
+package = "broca-subc"
+target = "--test it"
+test_file = "crates/broca-subc/tests/it/session_door.rs"
+expect_red = ["session_door::record_too_large_is_never_retried_for_any_door_method"]
+file = "crates/broca-subc/src/session_door.rs"
+old = 'if error.code == "lease_unavailable" || error.code == "lease_acquiring" =>'
+new = 'if error.code == "lease_unavailable" || error.code == "lease_acquiring" || error.code == "record_too_large" => // NON-VACUITY BREAK: retry a client bug'

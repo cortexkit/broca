@@ -10,7 +10,7 @@ use std::{
 };
 
 use broca_protocol::BindIdentity;
-use broca_subc::{session_door::MAX_ADMIT_BYTES, SessionDoorClient, SubcConnection};
+use broca_subc::{session_door::MAX_CALL_BYTES, SessionDoorClient, SubcConnection};
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
@@ -256,12 +256,12 @@ async fn direct_consumers_are_refused_before_opening_or_reading() {
 #[tokio::test]
 async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
     // Literal lengths make this test independent of the client's cap constant.
-    let wal: Vec<u8> = (0..3_145_702).map(|index| (index % 256) as u8).collect();
+    let wal: Vec<u8> = (0..1_048_581).map(|index| (index % 256) as u8).collect();
     let door = FakeDoor::start(vec![
         cover(2, 1),
-        cover(3_145_699, 5),
-        cover(3_145_702, 5),
-        cover(3_145_702, 5),
+        cover(1_048_578, 5),
+        cover(1_048_581, 5),
+        cover(1_048_581, 5),
     ])
     .await;
     let client = door.client(true).await;
@@ -279,16 +279,17 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
         "a repeat only covers, never resends durable bytes"
     );
     assert_eq!(sent[1]["params"]["fromOffset"], 2);
-    assert_eq!(sent[2]["params"]["fromOffset"], 3_145_699);
+    assert_eq!(sent[2]["params"]["fromOffset"], 1_048_578);
     for (request, expected) in [
-        (&sent[1], &wal[2..3_145_699]),
-        (&sent[2], &wal[3_145_699..]),
+        (&sent[1], &wal[2..1_048_578]),
+        (&sent[2], &wal[1_048_578..]),
     ] {
         assert_eq!(request["method"], "session.admit");
         assert_eq!(request["params"].as_object().unwrap().len(), 3);
         assert_eq!(request["params"]["sessionRef"], SESSION_REF);
         let hex = request["params"]["bytes"].as_str().unwrap();
-        assert!(hex.len() <= 2 * 3_145_697);
+        assert!(hex.len() <= 2 * 1_048_576);
+        assert!(serde_json::to_vec(request).unwrap().len() < 4 * 1024 * 1024);
         let decoded: Vec<_> = hex
             .as_bytes()
             .as_chunks::<2>()
@@ -298,7 +299,7 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
             .collect();
         assert_eq!(decoded, expected);
     }
-    assert_eq!(MAX_ADMIT_BYTES, 3_145_697);
+    assert_eq!(MAX_CALL_BYTES, 1_048_576);
 }
 
 #[tokio::test]
@@ -433,6 +434,66 @@ async fn terminal_door_refusals_are_unavailable_with_the_code_without_retry() {
         assert!(error.to_string().contains("unavailable"));
         assert!(error.to_string().contains(code));
         assert_eq!(door.sent().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn read_limits_use_the_raw_byte_cap_before_opening_the_door() {
+    let door = FakeDoor::start(vec![Answer::Result(json!({
+        "bytes": "00".repeat(1_048_576), "fromOffset": 0,
+        "endOffset": 1_048_576, "streamEnd": 1_048_576, "digest": DIGEST,
+    }))])
+    .await;
+    let client = door.client(true).await;
+    for limit in [0, 1_048_577] {
+        let error = client
+            .read(SESSION_REF, 0, limit, CUT_ID, deadline())
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("1..=1048576"));
+        assert!(door.sent().is_empty());
+        assert!(door.opens.lock().unwrap().is_empty());
+    }
+    let page = client
+        .read(SESSION_REF, 0, 1_048_576, CUT_ID, deadline())
+        .await
+        .unwrap();
+    assert_eq!(page.bytes.len(), 1_048_576);
+    assert_eq!(page.end_offset, page.stream_end);
+    assert_eq!(door.sent()[0]["params"]["limit"], 1_048_576);
+}
+
+#[tokio::test]
+async fn record_too_large_is_never_retried_for_any_door_method() {
+    for method in ["session.cover", "session.admit", "session.read"] {
+        let refusal = Answer::Refuse(json!({"error": "record_too_large", "cap": 1048576}));
+        let answers = match method {
+            "session.admit" => vec![cover(0, 0), refusal, cover(3, 0)],
+            "session.read" => vec![refusal, Answer::Result(read_reply())],
+            _ => vec![refusal, cover(0, 0)],
+        };
+        let door = FakeDoor::start(answers).await;
+        let client = door.client(true).await;
+        let error = match method {
+            "session.admit" => client
+                .admit(SESSION_REF, b"abc", deadline())
+                .await
+                .unwrap_err(),
+            "session.read" => client
+                .read(SESSION_REF, 0, 3, CUT_ID, deadline())
+                .await
+                .unwrap_err(),
+            _ => client.cover(SESSION_REF, deadline()).await.unwrap_err(),
+        };
+        assert_eq!(error.door_code.as_deref(), Some("record_too_large"));
+        assert!(error.to_string().contains("record_too_large"));
+        assert_eq!(
+            door.sent()
+                .iter()
+                .filter(|call| call["method"] == method)
+                .count(),
+            1
+        );
     }
 }
 

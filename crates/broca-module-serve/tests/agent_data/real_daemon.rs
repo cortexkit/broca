@@ -62,7 +62,7 @@ impl subc_client_rs::ModuleHandler for DoorProvider {
             "session.admit" => {
                 assert_eq!(params["fromOffset"], stream.len() as u64);
                 let chunk = unhex(params["bytes"].as_str().unwrap());
-                assert!(chunk.len() <= broca_subc::session_door::MAX_ADMIT_BYTES);
+                assert!(chunk.len() <= broca_subc::session_door::MAX_CALL_BYTES);
                 let mut log = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -104,7 +104,7 @@ impl subc_client_rs::ModuleHandler for DoorProvider {
                 };
                 let from = params["fromOffset"].as_u64().unwrap() as usize;
                 let limit = params["limit"].as_u64().unwrap() as usize;
-                if !(1..=MAX_READ_BYTES).contains(&limit) || from > bytes.len() {
+                if !(1..=MAX_CALL_BYTES).contains(&limit) || from > bytes.len() {
                     return HandlerOutcome::Error {
                         code: "unavailable".into(),
                         message: "sealed range cannot be produced in full".into(),

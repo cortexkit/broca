@@ -15,7 +15,7 @@ use broca_module::{
     move_install, LineageRegistry,
 };
 use broca_protocol::BindIdentity;
-use broca_subc::session_door::{DoorRead, SessionDoorClient, SessionDoorError, MAX_READ_BYTES};
+use broca_subc::session_door::{DoorRead, SessionDoorClient, SessionDoorError, MAX_CALL_BYTES};
 use broca_wire::agent_data::{self as contract, errors::ErrorBody, refs::Refs, Op};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -60,7 +60,7 @@ impl SessionDoor for SessionDoorClient {
         self.read(
             reference,
             offset,
-            MAX_READ_BYTES,
+            MAX_CALL_BYTES,
             cut_id,
             Instant::now() + Duration::from_secs(60),
         )
