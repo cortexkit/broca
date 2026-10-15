@@ -5541,6 +5541,19 @@ old = "*awaiting_approval = self.cached_awaiting_approval(session, &run_id);"
 new = "let _ = self.read_durable_wal(session).await; *awaiting_approval = self.cached_awaiting_approval(session, &run_id); // NON-VACUITY BREAK: hot full scan"
 
 [[control]]
+id = "approval-status-rig-holds-consent-await"
+guards = "five status polls without full WAL reads observe the same held consent card, not a transport refusal racing closure"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/approval_tests.rs"
+expect_red = ["actor::approval_tests::active_approval_status_polls_do_not_read_the_wal"]
+file = "crates/broca-module/src/approval_tests.rs"
+old = "self.await_refusal.notified().await;"
+new = "/* NON-VACUITY BREAK: return the default consent.await refusal without holding */"
+
+[[control]]
 id = "approval-audit-ordinary-terminal-no-wal-read"
 guards = "a proven ordinary episode skips the terminal withdrawal WAL scan"
 runner = "cargo"
