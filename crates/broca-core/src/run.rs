@@ -2871,9 +2871,8 @@ where
         .flatten();
     // The bounded reply channel owns queue storage for the whole run. Allocate it only
     // for a frozen compaction plan, so ordinary tool steps do not retain unused capacity.
-    let compaction_replies = compaction_item
-        .as_ref()
-        .map(|_| crate::compaction::runtime::CompactionReplies::new());
+    let compaction_replies =
+        crate::compaction::runtime::CompactionReplies::for_plan(compaction_item.is_some());
     #[cfg(feature = "test-clock")]
     let compaction_replies = compaction_replies.map(|replies| {
         replies.with_test_root(

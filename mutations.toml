@@ -4742,13 +4742,13 @@ id = "compaction-inbox-only-for-planned-runs"
 guards = "ordinary tool runs do not retain an unused compaction reply queue at the assistant WAL seam"
 runner = "cargo"
 package = "broca-core"
-target = "--test input_allocation"
+target = "--lib"
 select = "expected"
-test_file = "crates/broca-core/tests/input_allocation.rs"
-expect_red = ["tool_step_does_not_retain_a_second_assistant_message_copy"]
-file = "crates/broca-core/src/run.rs"
-old = "let compaction_replies = compaction_item\n        .as_ref()\n        .map(|_| crate::compaction::runtime::CompactionReplies::new());"
-new = "let compaction_replies = Some(crate::compaction::runtime::CompactionReplies::new()); // NON-VACUITY BREAK"
+test_file = "crates/broca-core/src/compaction/runtime.rs"
+expect_red = ["compaction::runtime::reply_tests::replies_are_allocated_only_for_a_frozen_compaction_plan"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "planned.then(Self::new)"
+new = "{ let _ = planned; Some(Self::new()) } // NON-VACUITY BREAK: allocate an inbox without a frozen plan"
 
 [[control]]
 id = "core-approval-prepared-before-filing"

@@ -953,7 +953,7 @@ impl Daemon {
                             "write claustrum outage wrapper",
                             std::fs::write(
                                 &wrapper,
-                                "#!/bin/sh\nif [ -e \"$CK_TEST_VAULT_DISABLED\" ]; then\n  exit 75\nfi\nexec \"$CK_REAL_CLAUSTRUM_BIN\" \"$@\"\n",
+                                "#!/bin/sh\nif [ -e \"$CK_TEST_VAULT_DISABLED\" ]; then\n  exit 75\nfi\necho $$ > \"$CK_TEST_VAULT_PID_PATH\"\nexec \"$CK_REAL_CLAUSTRUM_BIN\" \"$@\"\n",
                             )
                             .ok(),
                         )?;
@@ -984,6 +984,7 @@ impl Daemon {
                     "CK_MASTER_KEY_PATH": key_path.to_string_lossy(),
                     "CK_REAL_CLAUSTRUM_BIN": vault_binary.to_string_lossy(),
                     "CK_TEST_VAULT_DISABLED": dir.join("vault-disabled").to_string_lossy(),
+                    "CK_TEST_VAULT_PID_PATH": dir.join("vault.pid").to_string_lossy(),
                 },
                 "enabled": true,
             });
@@ -1234,19 +1235,15 @@ impl Daemon {
         if std::fs::write(self.dir.join("vault-disabled"), b"disabled").is_err() {
             return false;
         }
-        let Some(supervisor_pid) = self.child.borrow().id() else {
-            return false;
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if kill_supervised_vault_processes(supervisor_pid).await > 0 {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let pid = std::fs::read_to_string(self.dir.join("vault.pid"))
+            .expect("the live vault wrapper must publish its PID")
+            .trim()
+            .parse::<i32>()
+            .expect("vault PID must be numeric");
+        assert!(pid > 1, "vault PID must identify a child process");
+        // The wrapper execs the vault. Signal its published PID rather than
+        // depending on a process listing's executable name and parent matching.
+        unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
     }
 
     /// The module's WAL directory, under the BROCA_STATE_ROOT the rig gives the module.
@@ -1257,35 +1254,6 @@ impl Daemon {
             .join("broca-state")
             .join("wal")
     }
-}
-
-#[cfg(unix)]
-async fn kill_supervised_vault_processes(supervisor_pid: u32) -> usize {
-    let process_name = "ckdev-claustrum";
-    let children = Command::new("pgrep")
-        .arg("-P")
-        .arg(supervisor_pid.to_string())
-        .arg("-f")
-        .arg(process_name)
-        .output()
-        .await;
-    let Ok(children) = children else {
-        return 0;
-    };
-
-    let mut killed = 0;
-    for child_pid in String::from_utf8_lossy(&children.stdout).lines() {
-        if Command::new("kill")
-            .arg("-9")
-            .arg(child_pid.trim())
-            .status()
-            .await
-            .is_ok_and(|status| status.success())
-        {
-            killed += 1;
-        }
-    }
-    killed
 }
 
 /// Unwrap a rig SETUP step, refusing to continue silently when the run is required.
