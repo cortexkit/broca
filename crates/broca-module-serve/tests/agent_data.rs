@@ -2113,6 +2113,12 @@ async fn diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import
     use broca_module::cut_state::{CutState, CutStore, Intent};
     let (rig, params, _) = incoming_rig("unheld-no-door");
     *rig.door.refusal.lock().unwrap() = Some("verify_failed".into());
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    assert_eq!(
+        wire.call("diverged", params.clone()).await.unwrap(),
+        json!({"refs":[{"state":"at_cut"}]})
+    );
+    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
     let state = CutState {
         step: contract::step::Step::None,
         refs: Some(serde_json::from_value(params["refs"].clone()).unwrap()),
@@ -2126,7 +2132,6 @@ async fn diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import
     let authority = CutStore::new(&rig.root).path(CUT);
     broca_wal::migration::atomic_json(&authority, &state).unwrap();
     let before = std::fs::read(&authority).unwrap();
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
     assert_eq!(
         wire.call("diverged", params).await.unwrap(),
         json!({"refs":[{"state":"at_cut"}]})

@@ -13501,3 +13501,17 @@ only = false
 file = "crates/broca-module/src/move_files.rs"
 old = 'staging_digest_failure(cut_id, step, session)'
 new = '{ let _ = (cut_id, step, session); unavailable("NON-VACUITY BREAK: hide activation corruption as a transient outage") }'
+
+[[control]]
+id = "agent-data-diverged-known-address-no-door"
+guards = "a pending import's recorded address without local WAL bytes is absent and needs no door read for divergence"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Ok(None) => continue,'
+new = 'Ok(None) => { let _ = self.incoming(&reference.r#ref, cut_id).await; continue; }, // NON-VACUITY BREAK: read a cut despite absent local WAL bytes'
