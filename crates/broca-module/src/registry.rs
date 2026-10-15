@@ -711,6 +711,12 @@ struct ReadSources {
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
 }
 
+#[derive(Clone, Copy)]
+enum ReadPurpose {
+    Session,
+    Authorization,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotCounts {
     pub open: usize,
@@ -984,7 +990,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
     ) -> Result<Option<Option<broca_protocol::BindPrincipal>>, OpenError> {
-        match self.check_expired(key, None).await {
+        match self.check_authorization_expired(key).await {
             Err(OpenError::Expired { .. }) => return Ok(None),
             Err(error) => return Err(error),
             Ok(()) => {}
@@ -1018,7 +1024,9 @@ impl LineageRegistry {
                 }
             }
         }
-        let (records, _) = self.read_durable_wal(key).await?;
+        let (records, _) = self
+            .read_durable_wal_for(key, ReadPurpose::Authorization)
+            .await?;
         let sender = records.iter().find_map(|frame| match &frame.record {
             broca_wal::WalRecord::RunStarted { principal, .. }
             | broca_wal::WalRecord::Queued { principal, .. } => Some(principal.clone()),
@@ -1040,7 +1048,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
-        self.check_expired(key, None).await?;
+        self.check_authorization_expired(key).await?;
         let live = {
             let slots = self.inner.slots.lock().unwrap();
             match slots.get(key) {
@@ -1094,7 +1102,7 @@ impl LineageRegistry {
         // so their owner lookup reads the WAL. A failed store read needs the same fallback,
         // not an assumption that no owner was recorded.
         let range = self
-            .read_durable_range(reader, key, 0, None, live_head)
+            .read_durable_range_for(reader, key, 0, None, live_head, ReadPurpose::Authorization)
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
@@ -1132,12 +1140,13 @@ impl LineageRegistry {
             return Ok(None);
         }
         let range = match self
-            .read_durable_range(
+            .read_durable_range_for(
                 reader,
                 key,
                 snapshot.watermark_seq,
                 snapshot.anchor,
                 live_head,
+                ReadPurpose::Authorization,
             )
             .await
         {
@@ -1866,12 +1875,43 @@ impl LineageRegistry {
         anchor: Option<broca_wal::WalByteAnchor>,
         live_head: Option<u64>,
     ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        self.read_durable_range_for(
+            reader,
+            key,
+            after_seq,
+            anchor,
+            live_head,
+            ReadPurpose::Session,
+        )
+        .await
+    }
+
+    async fn read_durable_range_for(
+        &self,
+        reader: &ReadSources,
+        key: &LineageKey,
+        after_seq: u64,
+        anchor: Option<broca_wal::WalByteAnchor>,
+        live_head: Option<u64>,
+        purpose: ReadPurpose,
+    ) -> Result<broca_wal::WalRangeRead, OpenError> {
         let range_read = |through_seq| {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             let read_anchor = anchor;
-            spawn_blocking(JobKind::WalRead, move || {
-                wal_store.read_records_range(&session, after_seq, through_seq, read_anchor.as_ref())
+            spawn_blocking(JobKind::WalRead, move || match purpose {
+                ReadPurpose::Session => wal_store.read_records_range(
+                    &session,
+                    after_seq,
+                    through_seq,
+                    read_anchor.as_ref(),
+                ),
+                ReadPurpose::Authorization => wal_store.read_records_range_for_authorization(
+                    &session,
+                    after_seq,
+                    through_seq,
+                    read_anchor.as_ref(),
+                ),
             })
         };
 
@@ -1891,7 +1931,10 @@ impl LineageRegistry {
         let identity_before = spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
-            move || wal_store.file_identity(&session)
+            move || match purpose {
+                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
+            }
         })
         .await
         .ok()
@@ -1929,7 +1972,10 @@ impl LineageRegistry {
         let flush_identity = match spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
-            move || wal_store.flush_for_read(&session)
+            move || match purpose {
+                ReadPurpose::Session => wal_store.flush_for_read(&session),
+                ReadPurpose::Authorization => wal_store.flush_for_authorization(&session),
+            }
         })
         .await
         {
@@ -1970,7 +2016,10 @@ impl LineageRegistry {
         let identity_after = spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
-            move || wal_store.file_identity(&session)
+            move || match purpose {
+                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
+            }
         })
         .await
         .ok()
@@ -2156,7 +2205,24 @@ impl LineageRegistry {
         ),
         OpenError,
     > {
-        self.check_expired(key, None).await?;
+        self.read_durable_wal_for(key, ReadPurpose::Session).await
+    }
+
+    async fn read_durable_wal_for(
+        &self,
+        key: &LineageKey,
+        purpose: ReadPurpose,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+        ),
+        OpenError,
+    > {
+        match purpose {
+            ReadPurpose::Session => self.check_expired(key, None).await?,
+            ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
+        }
         let Some(reader) = &self.inner.reader else {
             return Err(OpenError::Open(
                 "session.read reader is not configured".into(),
@@ -2172,7 +2238,7 @@ impl LineageRegistry {
             }
         };
         let range = self
-            .read_durable_range(reader, key, 0, None, live_head)
+            .read_durable_range_for(reader, key, 0, None, live_head, purpose)
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
@@ -4663,6 +4729,15 @@ impl LineageRegistry {
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) fn expiry_probe_for_test(&self, probe: Arc<dyn Fn() + Send + Sync>) {
         *self.inner.expiry_read_probe.lock().unwrap() = Some(probe);
+    }
+
+    async fn check_authorization_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.check_expired(key, None).await {
+            // Ownership must be checked against the old copy before disclosing a move or cut.
+            // The request's operation-specific move check runs after authorization succeeds.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => Ok(()),
+            result => result,
+        }
     }
 
     async fn check_expired(&self, key: &LineageKey, run: Option<&str>) -> Result<(), OpenError> {
