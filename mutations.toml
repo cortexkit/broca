@@ -11078,3 +11078,16 @@ select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = ".filter(|answer| answer.id == id && question.terminal)"
 new = ".filter(|answer| answer.id == id) // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-approved-decision-reaches-crash-harness"
+guards = "the real approval-boundary crash harness exercises core consent authorization rather than an inert fixture"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test approval_gate"
+test_file = "crates/broca-crash-harness/tests/approval_gate.rs"
+expect_red = ["every_approval_record_boundary_resumes_without_second_dispatch_or_model_step"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''Some("approve") => ConsentDecision::Approved,'''
+new = '''Some("approve") => ConsentDecision::Declined, // NON-VACUITY BREAK'''
