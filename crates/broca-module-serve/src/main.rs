@@ -325,12 +325,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     .with_compaction_plane(Arc::new(broca_subc::SubcCompactionPlane::new(
         plan_conn.clone(),
     )))
-    .with_elicitation_plane(Arc::new(
-        broca_subc::elicitation::ScopedElicitationPlane::new(
-            plan_conn.clone(),
-            broca_subc::RouteOpenRetry::default_patience(),
-        ),
-    ))
+    .with_elicitation_plane(Arc::new(broca_subc::consent::ScopedConsentPlane::new(
+        plan_conn.clone(),
+        broca_subc::RouteOpenRetry::default_patience(),
+    )))
     .with_methods(auth_methods.clone())
     .with_provider_overrides(provider_overrides);
     let cache_table =
@@ -2357,7 +2355,7 @@ mod executor {
         /// the remaining phases and resumed work against the frozen declarations.
         hooks: Option<Arc<broca_subc::SubcHookPlane>>,
         compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
-        elicitation_plane: Option<Arc<broca_subc::elicitation::ScopedElicitationPlane>>,
+        elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
         /// One process-long HTTP client. Every per-run provider gets a cheap clone so sequential
         /// episodes retain the same DNS, TCP, TLS, and HTTP connection pool.
         provider_client: ProviderHttpClient,
@@ -2435,7 +2433,7 @@ mod executor {
 
         pub fn with_elicitation_plane(
             mut self,
-            elicitation: Arc<broca_subc::elicitation::ScopedElicitationPlane>,
+            elicitation: Arc<broca_subc::consent::ScopedConsentPlane>,
         ) -> Self {
             self.elicitation_plane = Some(elicitation);
             self

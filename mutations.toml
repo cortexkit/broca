@@ -11936,3 +11936,46 @@ old = '''let fence_key = (Self::session_key(&ctx.bind), call.tool_call_id.clone(
         if let Some(prior) = self.fence.lock().unwrap().get(&fence_key) {'''
 new = '''let fence_key = (Self::session_key(&ctx.bind), call.tool_call_id.clone());
         if let Some(prior) = self.fence.lock().unwrap().get(&fence_key).filter(|_| false) { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "serve-installs-consent-plane"
+platforms = ["linux", "macos"]
+guards = "production installs the scoped consent adapter so an approved held call reaches the provider once with its saved bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/it/approval_gate.rs"
+select = "expected"
+expect_red = ["approval_gate::approved_question_dispatches_saved_bytes_once"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "self.elicitation_plane = Some(elicitation);"
+new = "let _ = elicitation; self.elicitation_plane = None; // NON-VACUITY BREAK: omit the production consent plane"
+
+[[control]]
+id = "serve-required-cingulate-build-cannot-skip"
+platforms = ["linux", "macos"]
+guards = "a required but missing Cingulate build fails instead of returning a passing skip"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/approval_gate.rs"
+select = "expected"
+expect_red = ["approval_gate::missing_cingulate_build_skips_only_when_not_required"]
+file = "crates/broca-module-serve/tests/it/approval_gate.rs"
+old = "None if required => Err("
+new = "None if required && false => Err( // NON-VACUITY BREAK: allow a required build to skip\n"
+
+[[control]]
+id = "wal-consent-writer-admission-is-required"
+guards = "the source fence recognizes the consent authorization helper's AwaitingApproval constructor without exempting its other record variants"
+runner = "cargo"
+package = "broca-wal"
+target = "--test it"
+test_file = "crates/broca-wal/tests/it/compaction_source.rs"
+select = "expected"
+expect_red = ["compaction_source::no_production_path_writes_deferred_call_records"]
+expect_message = "broca-core/src/consent.rs"
+file = "crates/broca-wal/tests/it/compaction_source.rs"
+old = '''found.retain(|variant| variant != "AwaitingApproval");'''
+new = '''found.retain(|variant| variant != "NON-VACUITY BREAK");'''

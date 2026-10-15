@@ -31,11 +31,17 @@ pub(super) fn sources(dir: &Path, result: &mut Vec<PathBuf>) {
     }
 }
 
-/// Whether `path` is an out-of-line module declared under `#[cfg(test)]`, either by its parent
-/// as `mod <name>;` or by a sibling file through `#[path = "<file name>"] mod <any name>;`.
-/// The lexer skips cfg(test) items inside a file, but a test module kept in its own file has no
-/// attribute of its own; only the declaring file shows it is compiled for tests alone.
+/// Whether an out-of-line module is declared under `#[cfg(test)]`, directly or through
+/// another test-only module. Follow declarations rather than filenames: a test module's
+/// children inherit its configuration even when their own declarations have only `#[path]`.
 pub(super) fn is_cfg_test_module_file(path: &Path) -> bool {
+    cfg_test_module_file(path, &mut std::collections::HashSet::new())
+}
+
+fn cfg_test_module_file(path: &Path, seen: &mut std::collections::HashSet<PathBuf>) -> bool {
+    if !seen.insert(path.to_path_buf()) {
+        return false;
+    }
     let (Some(dir), Some(name), Some(file_name)) = (
         path.parent(),
         path.file_stem().and_then(|s| s.to_str()),
@@ -68,34 +74,44 @@ pub(super) fn is_cfg_test_module_file(path: &Path) -> bool {
     let by_parent = parents
         .iter()
         .filter(|parent| parent.as_path() != path)
-        .filter_map(|parent| std::fs::read_to_string(parent).ok())
-        .any(|source| {
+        .filter_map(|parent| {
+            std::fs::read_to_string(parent)
+                .ok()
+                .map(|source| (parent, source))
+        })
+        .any(|(parent, source)| {
             let lines: Vec<&str> = source.lines().map(str::trim).collect();
             lines.iter().enumerate().any(|(at, line)| {
                 is_module(line)
                     && line.ends_with(&format!("mod {name};"))
-                    && attributes(&lines, at).iter().any(|a| a == "#[cfg(test)]")
+                    && (attributes(&lines, at).iter().any(|a| a == "#[cfg(test)]")
+                        || cfg_test_module_file(parent, seen))
             })
         });
     if by_parent {
         return true;
     }
-    // A `#[path]` module is declared in a sibling file under whatever name that file chooses,
-    // so look for a cfg(test) declaration whose `#[path]` names this file.
+    // A sibling can declare a `#[path]` module under any name; its test-only
+    // configuration also applies to the file it names.
     let path_attribute = format!("#[path = \"{file_name}\"]");
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|sibling| sibling != path && sibling.extension().is_some_and(|ext| ext == "rs"))
-        .filter_map(|sibling| std::fs::read_to_string(sibling).ok())
-        .any(|source| {
+        .filter_map(|sibling| {
+            std::fs::read_to_string(&sibling)
+                .ok()
+                .map(|source| (sibling, source))
+        })
+        .any(|(sibling, source)| {
             let lines: Vec<&str> = source.lines().map(str::trim).collect();
             lines.iter().enumerate().any(|(at, line)| {
                 let attrs = attributes(&lines, at);
                 is_module(line)
                     && attrs.contains(&path_attribute)
-                    && attrs.iter().any(|a| a == "#[cfg(test)]")
+                    && (attrs.iter().any(|a| a == "#[cfg(test)]")
+                        || cfg_test_module_file(&sibling, seen))
             })
         })
 }
@@ -388,14 +404,16 @@ fn constructor_detector_recognizes_compaction_variants() {
 #[test]
 fn only_cfg_test_module_files_are_excluded_from_source_scans() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    // Real out-of-line test modules, each declared `#[cfg(test)] [pub(crate)] mod ..;`, the last
-    // two by a sibling file through `#[path]`.
+    // These out-of-line test modules include direct, #[path], and inherited declarations.
     for test_file in [
         "crates/broca-core/src/wal_fold/tests.rs",
         "crates/broca-core/src/retention/tests.rs",
         "crates/broca-core/src/run/hook_tests.rs",
         "crates/broca-module/src/approval_tests.rs",
         "crates/broca-module/src/retention_tests.rs",
+        "crates/broca-core/src/run/consent_fourth_audit_tests.rs",
+        "crates/broca-core/src/run/consent_runtime_tests.rs",
+        "crates/broca-core/src/run/consent_audit_tests.rs",
     ] {
         assert!(
             is_cfg_test_module_file(&root.join(test_file)),
@@ -405,6 +423,8 @@ fn only_cfg_test_module_files_are_excluded_from_source_scans() {
     // Production modules, including ones whose parent also declares test modules.
     for production in [
         "crates/broca-core/src/run.rs",
+        "crates/broca-core/src/consent.rs",
+        "crates/broca-core/src/replay.rs",
         "crates/broca-core/src/retention.rs",
         "crates/broca-core/src/wal_writer/extraction.rs",
     ] {
@@ -446,6 +466,29 @@ fn only_cfg_test_module_files_are_excluded_from_source_scans() {
     assert!(is_cfg_test_module_file(
         &scratch.join("flat/owner_tests.rs")
     ));
+    // Test configuration propagates to both ordinary and #[path] children, not to
+    // an otherwise identical production module's children.
+    for parent in ["tests", "shipped"] {
+        std::fs::create_dir_all(scratch.join("parent").join(parent)).unwrap();
+        std::fs::write(
+            scratch.join(format!("parent/{parent}.rs")),
+            format!("mod child;\n#[path = \"{parent}_flat_child.rs\"]\nmod renamed;\n"),
+        )
+        .unwrap();
+        for child in [
+            format!("parent/{parent}/child.rs"),
+            format!("parent/{parent}_flat_child.rs"),
+        ] {
+            let path = scratch.join(child);
+            std::fs::write(&path, "").unwrap();
+            assert_eq!(
+                is_cfg_test_module_file(&path),
+                parent == "tests",
+                "{}",
+                path.display()
+            );
+        }
+    }
     std::fs::remove_dir_all(&scratch).unwrap();
 }
 
@@ -466,12 +509,11 @@ fn no_production_path_writes_deferred_call_records() {
     let store_lib = std::fs::read_to_string(root.join("crates/broca-store/src/lib.rs")).unwrap();
     assert!(store_lib
         .contains("#[cfg(any(test, feature = \"test-conformance\"))]\npub mod conformance;"));
-    // The approval gate's core writer, the only production code allowed to write these
-    // records. Every other production file, in any crate, must not construct them. The run
-    // loop itself writes none while no elicitation plane is installed: core's
-    // absent_elicitation_adapter_closes_before_prepared_and_installed_plane_prepares proves
-    // that behaviourally.
+    // Core's run loop writes the deferred-call records. Other production files may
+    // construct only the specific helper records admitted below.
     let writer = root.join("crates/broca-core/src/run.rs");
+    // Consent's authorization helper builds the approval ID records the run loop writes.
+    let consent = root.join("crates/broca-core/src/consent.rs");
     // The session actor's restart seal decides how core closes an open Deferred call that still
     // owes a withdrawal: it returns `DeferredCloseKind::WithdrawElicitation(..)` to core, and
     // core writes the record through the session's single writer. Choosing that close kind is
@@ -484,6 +526,9 @@ fn no_production_path_writes_deferred_call_records() {
         .filter_map(|path| {
             let source = std::fs::read_to_string(path).unwrap();
             let mut found = scan_constructors(&source, DEFERRED_VARIANTS, true);
+            if *path == consent {
+                found.retain(|variant| variant != "AwaitingApproval");
+            }
             if *path == actor {
                 found.retain(|variant| *variant != "WithdrawElicitation");
             }

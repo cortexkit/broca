@@ -28,10 +28,6 @@
 pub mod compaction_plane;
 pub mod connection;
 pub mod consent;
-/// Keeps the existing broca-module-serve install API; its implementation is consent v2.
-pub mod elicitation {
-    pub use crate::consent::ScopedConsentPlane as ScopedElicitationPlane;
-}
 pub mod hook_plane;
 pub mod plan_fetch;
 mod role_route;
