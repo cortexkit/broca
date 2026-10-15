@@ -693,6 +693,7 @@ async fn readback_candidate_survives_snapshot_retry_and_cursor_change() {
     let candidate = ConsentAnswer {
         id: "new".into(),
         decision: ConsentDecision::Approved,
+        record: record("new", "approve"),
     };
     assert!(
         verify_readback(
@@ -730,6 +731,7 @@ fn live_candidate_cannot_erase_an_opposing_buffered_readback() {
     let current = ConsentAnswer {
         id: "new".into(),
         decision: ConsentDecision::Approved,
+        record: record("new", "approve"),
     };
     progress
         .seed_candidate("key", &prepared(), &current)
@@ -737,6 +739,7 @@ fn live_candidate_cannot_erase_an_opposing_buffered_readback() {
     let older = ConsentAnswer {
         id: "old".into(),
         decision: ConsentDecision::Declined,
+        record: record("old", "deny"),
     };
     assert_eq!(
         progress
@@ -961,6 +964,7 @@ fn completed_candidate_keeps_authorization_progress_across_admission_retry() {
     let candidate = ConsentAnswer {
         id: "new".into(),
         decision: ConsentDecision::Approved,
+        record: record("new", "approve"),
     };
     let mut progress = LookupProgress::default();
     progress
@@ -1051,4 +1055,67 @@ async fn acknowledged_withdrawal_requires_matching_terminal_readback() {
             "an opaque acknowledgement is not identity/binding proof: {name}"
         );
     }
+}
+
+struct EmptyAuthorizationFeed;
+#[async_trait::async_trait]
+impl ElicitationPlane for EmptyAuthorizationFeed {
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        _: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        Ok(ApprovalPage {
+            records: vec![],
+            cursor: ApprovalCursor {
+                provider_incarnation: "empty".into(),
+                seq: 0,
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn authorization_rejects_foreign_requester_record() {
+    let raw = record("approved", "approve");
+    let candidate = answer(&raw, "key", &prepared()).unwrap().unwrap();
+    let result = authorize_candidate(
+        &EmptyAuthorizationFeed,
+        &ctx(),
+        "another-call",
+        &prepared(),
+        None,
+        &candidate.record,
+        &Mutex::new(LookupProgress::default()),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an answer for A cannot authorize B even when the owner feed is empty"
+    );
+}
+
+#[tokio::test]
+async fn authorization_rejects_foreign_binding_record() {
+    let raw = record("approved", "approve");
+    let candidate = answer(&raw, "key", &prepared()).unwrap().unwrap();
+    let mut other = prepared();
+    let WalRecord::ToolCallDeferred { module, .. } = &mut other else {
+        unreachable!()
+    };
+    *module = Some("another-module".into());
+    let result = authorize_candidate(
+        &EmptyAuthorizationFeed,
+        &ctx(),
+        "key",
+        &other,
+        None,
+        &candidate.record,
+        &Mutex::new(LookupProgress::default()),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "the authorizer must validate the raw record against B's frozen binding"
+    );
 }

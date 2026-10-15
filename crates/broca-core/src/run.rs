@@ -9313,7 +9313,7 @@ mod approval_gate {
     ) -> Result<Option<CallResolution>, RunError> {
         decision_reason(call, decision, digest, None, None, writer, history).await
     }
-    async fn approved_decision(
+    pub(super) async fn approved_decision(
         call: &Held,
         authorization: &crate::consent::AuthorizedAnswer,
         writer: &WalHandle,
@@ -9361,6 +9361,7 @@ mod approval_gate {
             && !authorization.is_some_and(|proof| {
                 proof.value().decision == crate::consent::ConsentDecision::Approved
                     && call.id.as_deref() == Some(proof.value().id.as_str())
+                    && proof.matches(&call.key, &call.prepared)
             })
         {
             return Err(RunError::Wal(
@@ -10775,7 +10776,7 @@ mod approval_gate {
             biased;
             _ = cancelled_token(control.cancel.as_ref()) => Err(crate::consent::refusal("cancelled", true)),
             _ = cancelled_token(control.stop_requested.as_ref()) => Err(crate::consent::refusal("stopped", true)),
-            result = tokio::time::timeout(Duration::from_secs(1), crate::consent::authorize_candidate(plane.as_ref(), &ctx, &held.key, &held.prepared, held.id.as_deref(), candidate, scan.as_ref())) => result.unwrap_or_else(|_| Err(crate::consent::refusal("consent_authorization_timeout", true))),
+            result = tokio::time::timeout(Duration::from_secs(1), crate::consent::authorize_candidate(plane.as_ref(), &ctx, &held.key, &held.prepared, held.id.as_deref(), &candidate.record, scan.as_ref())) => result.unwrap_or_else(|_| Err(crate::consent::refusal("consent_authorization_timeout", true))),
         }
     }
 
@@ -10920,13 +10921,24 @@ mod approval_gate {
         record_late_answer(history, writer, key, authorized_late, late_execution).await
     }
 
-    async fn record_late_answer(
+    pub(super) async fn record_late_answer(
         history: &mut History,
         writer: &WalHandle,
         key: &str,
         authorization: crate::consent::AuthorizedAnswer,
         late_execution: LateExecution,
     ) -> Result<(), RunError> {
+        let prepared = &history
+            .projection
+            .calls
+            .get(key)
+            .ok_or_else(|| RunError::Wal("late approval lacks a prepared call".into()))?
+            .prepared;
+        if !authorization.matches(key, prepared) {
+            return Err(RunError::Wal(
+                "late_approval_capability_mismatch: call key or binding differs".into(),
+            ));
+        }
         let answer = authorization.value();
         history.record(
             writer,

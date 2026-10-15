@@ -26,6 +26,10 @@ mod consent_second_audit_tests;
 #[path = "consent_third_audit_tests.rs"]
 mod consent_third_audit_tests;
 
+#[cfg(feature = "test-clock")]
+#[path = "consent_fourth_audit_tests.rs"]
+mod consent_fourth_audit_tests;
+
 #[cfg(test)]
 #[path = "approval_tests/memory_wal.rs"]
 mod memory_wal;
@@ -159,12 +163,18 @@ impl ElicitationPlane for Questions {
             args_hash: args_hash.clone(),
         })
     }
-    async fn get(&self, _: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+    async fn get(&self, ctx: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         let terminal = *self.answer.lock().unwrap() == "terminal";
+        let key = id.strip_prefix("q:").unwrap();
+        let frames = rig_records(&self.store, self.memory.as_ref(), &ctx.bind).unwrap();
+        let prepared = frames
+            .iter()
+            .find(|frame| key.ends_with(&format!(":{}", frame.seq)))
+            .unwrap();
         Ok(ApprovalQuestion {
             terminal,
-            record: json!({"state":if terminal { "expired" } else { "pending" },"elicitation_id":id,"requester_ref":id.strip_prefix("q:").unwrap(),"answered_choice_id":"approve","answered_at_ms":1}),
+            record: json!({"state":if terminal { "expired" } else { "pending" },"elicitation_id":id,"requester_ref":key,"answered_choice_id":"approve","answered_at_ms":1,"binding":crate::consent::binding(&prepared.record)}),
         })
     }
     async fn r#await(
@@ -1765,9 +1775,16 @@ async fn late_none_requires_terminal_get_and_later_approval_is_not_lost_at_strea
         frame.record,
         WalRecord::LateApprovalRecorded {
             decision: broca_wal::LateDecision::None,
+            late_execution: Some(_),
             ..
         }
     )));
+    assert!(
+        !rig.frames()
+            .iter()
+            .any(|frame| matches!(frame.record, WalRecord::LateResult { .. })),
+        "a valid unanswered terminal is not an authorization refusal"
+    );
     assert!(rig.tools.sent.lock().unwrap().is_empty());
     rig.finish().await;
     let rig = expired_run("pass").await;

@@ -15,11 +15,23 @@ pub enum ConsentDecision {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConsentAnswer {
     pub id: String,
     pub decision: ConsentDecision,
+    pub record: Value,
 }
+impl PartialEq for ConsentAnswer {
+    fn eq(&self, other: &Self) -> bool {
+        // Feed and get replies can format metadata differently. Retained progress
+        // follows the decision's immutable identity and authorization scope.
+        self.id == other.id
+            && self.decision == other.decision
+            && self.record.get("requester_ref") == other.record.get("requester_ref")
+            && self.record.get("binding") == other.record.get("binding")
+    }
+}
+impl Eq for ConsentAnswer {}
 
 pub fn refusal(code: &str, retryable: bool) -> ApprovalRouteError {
     ApprovalRouteError {
@@ -87,6 +99,7 @@ pub fn answer(
     Ok(Some(ConsentAnswer {
         id: id.into(),
         decision,
+        record: record.clone(),
     }))
 }
 
@@ -273,15 +286,35 @@ pub async fn verify_readback(
 }
 
 /// Capability produced only by `authorize_candidate` and accepted by approval writers.
-pub(crate) struct AuthorizedAnswer(ConsentAnswer);
+pub(crate) struct AuthorizedAnswer {
+    answer: ConsentAnswer,
+    call_key: String,
+    binding: Value,
+}
 
 impl AuthorizedAnswer {
     pub(crate) fn value(&self) -> &ConsentAnswer {
-        &self.0
+        &self.answer
     }
     fn into_value(self) -> ConsentAnswer {
-        self.0
+        self.answer
     }
+    pub(crate) fn matches(&self, key: &str, prepared: &WalRecord) -> bool {
+        self.call_key == key && self.binding == binding(prepared)
+    }
+}
+
+fn validated_candidate(
+    record: &Value,
+    key: &str,
+    prepared: &WalRecord,
+) -> Result<ConsentAnswer, ApprovalRouteError> {
+    let candidate = answer(record, key, prepared)?
+        .ok_or_else(|| refusal("consent_authorization_record_mismatch", false))?;
+    if record.get("binding") != Some(&binding(prepared)) {
+        return Err(refusal("consent_binding_mismatch", false));
+    }
+    Ok(candidate)
 }
 
 /// Check every settlement and prove the recorded duplicate closed before adoption.
@@ -291,9 +324,10 @@ pub(crate) async fn authorize_candidate(
     key: &str,
     prepared: &WalRecord,
     recorded_id: Option<&str>,
-    candidate: ConsentAnswer,
+    record: &Value,
     progress: &Mutex<LookupProgress>,
 ) -> Result<AuthorizedAnswer, ApprovalRouteError> {
+    let candidate = validated_candidate(record, key, prepared)?;
     {
         let mut state = progress.lock().expect("consent authorization progress");
         // A candidate obtained from this completed scan is already part of its
@@ -319,7 +353,11 @@ pub(crate) async fn authorize_candidate(
                 .push(id.into());
         }
     }
-    Ok(AuthorizedAnswer(answer))
+    Ok(AuthorizedAnswer {
+        answer,
+        call_key: key.into(),
+        binding: binding(prepared),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +422,7 @@ where
     Fut: Future<Output = Result<(), ApprovalRouteError>>,
 {
     if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
-        let answer = authorize_candidate(plane, ctx, key, prepared, None, answer, progress)
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, &answer.record, progress)
             .await?
             .into_value();
         durable(id_record(ctx, key, prepared, &answer.id)).await?;
@@ -451,9 +489,17 @@ where
     Fut: Future<Output = Result<(), ApprovalRouteError>>,
 {
     if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
-        let answer = authorize_candidate(plane, ctx, key, prepared, Some(id), answer, progress)
-            .await?
-            .into_value();
+        let answer = authorize_candidate(
+            plane,
+            ctx,
+            key,
+            prepared,
+            Some(id),
+            &answer.record,
+            progress,
+        )
+        .await?
+        .into_value();
         durable(id_record(ctx, key, prepared, &answer.id)).await?;
         return Ok(RecoveredCard {
             id: answer.id.clone(),

@@ -4920,7 +4920,7 @@ expect_red = ["run::approval_tests::late_none_requires_terminal_get_and_later_ap
 select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "crate::consent::answer(&question.record, &key, &held.prepared)"
-new = '''crate::consent::answer(&question.record, &key, &held.prepared).map(|answer| answer.or_else(|| Some(crate::consent::ConsentAnswer { id: id.clone(), decision: crate::consent::ConsentDecision::None }))) // NON-VACUITY BREAK'''
+new = '''crate::consent::answer(&question.record, &key, &held.prepared).map(|answer| answer.or_else(|| Some(crate::consent::ConsentAnswer { id: id.clone(), decision: crate::consent::ConsentDecision::None, record: question.record.clone() }))) // NON-VACUITY BREAK'''
 
 [[control]]
 id = "core-approval-late-at-most-once"
@@ -10808,9 +10808,9 @@ expect_red = ["consent::tests::settled_lookup_precedes_refile_and_recovers_witho
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
-        let answer = authorize_candidate(plane, ctx, key, prepared, None, answer, progress)'''
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, &answer.record, progress)'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
-        let answer = authorize_candidate(plane, ctx, key, prepared, None, answer, progress)'''
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, &answer.record, progress)'''
 
 [[control]]
 id = "core-consent-second-lookup-adopts"
@@ -10823,9 +10823,25 @@ expect_red = ["consent::tests::second_lookup_adopts_settlement_and_withdraws_dup
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
-        let answer = authorize_candidate(plane, ctx, key, prepared, Some(id), answer, progress)'''
+        let answer = authorize_candidate(
+            plane,
+            ctx,
+            key,
+            prepared,
+            Some(id),
+            &answer.record,
+            progress,
+        )'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
-        let answer = authorize_candidate(plane, ctx, key, prepared, Some(id), answer, progress)'''
+        let answer = authorize_candidate(
+            plane,
+            ctx,
+            key,
+            prepared,
+            Some(id),
+            &answer.record,
+            progress,
+        )'''
 
 [[control]]
 id = "core-consent-conflicting-decisions-refuse"
@@ -11043,7 +11059,7 @@ expect_red = ["consent::tests::unproven_duplicate_withdrawal_does_not_adopt_an_o
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''.ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;'''
-new = '''.or_else(|| Some(ConsentAnswer { id: id.into(), decision: older })) // NON-VACUITY BREAK
+new = '''.or_else(|| Some(ConsentAnswer { id: id.into(), decision: older, record: question.record.clone() })) // NON-VACUITY BREAK
         .ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;'''
 
 [[control]]
@@ -11635,12 +11651,20 @@ expect_red = ["run::approval_tests::consent_third_audit_tests::late_approving_ge
 select = "expected"
 [[control.edits]]
 file = "crates/broca-core/src/consent.rs"
-old = "pub(crate) struct AuthorizedAnswer(ConsentAnswer);"
-new = "pub(crate) struct AuthorizedAnswer(pub(crate) ConsentAnswer); // NON-VACUITY BREAK: make an unchecked capability constructible"
+old = '''pub(crate) struct AuthorizedAnswer {
+    answer: ConsentAnswer,
+    call_key: String,
+    binding: Value,
+}'''
+new = '''pub(crate) struct AuthorizedAnswer { // NON-VACUITY BREAK: make an unchecked capability constructible
+    pub(crate) answer: ConsentAnswer,
+    pub(crate) call_key: String,
+    pub(crate) binding: Value,
+}'''
 [[control.edits]]
 file = "crates/broca-core/src/run.rs"
 old = "let authorized_late = match authorize_answer(&held, answer, ctx, control, history).await {"
-new = "let authorized_late = match Ok::<_, ApprovalRouteError>(crate::consent::AuthorizedAnswer(answer)) { // NON-VACUITY BREAK: bypass authorize_candidate on the late path"
+new = "let authorized_late = match Ok::<_, ApprovalRouteError>(crate::consent::AuthorizedAnswer { answer, call_key: held.key.clone(), binding: crate::consent::binding(&held.prepared) }) { // NON-VACUITY BREAK: bypass authorize_candidate on the late path"
 
 [[control]]
 id = "core-consent-retain-candidate-after-settlement-scan"
@@ -11708,3 +11732,57 @@ select = "expected"
 file = "crates/broca-subc/src/elicitation.rs"
 old = "record.elicitation_id == elicitation_id"
 new = "true /* NON-VACUITY BREAK: accept a different card's withdrawn reply */"
+
+[[control]]
+id = "core-consent-authorizer-validates-raw-requester"
+guards = "the shared authorizer validates the raw requester_ref itself instead of trusting a parsed bare answer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::authorization_rejects_foreign_requester_record"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "let candidate = validated_candidate(record, key, prepared)?;"
+new = '''let candidate = ConsentAnswer { id: record["elicitation_id"].as_str().unwrap().into(), decision: ConsentDecision::Approved, record: record.clone() }; // NON-VACUITY BREAK: trust an unchecked raw record'''
+
+[[control]]
+id = "core-consent-authorizer-validates-raw-binding"
+guards = "the shared authorizer validates the raw record against the frozen binding itself"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::authorization_rejects_foreign_binding_record"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "let candidate = validated_candidate(record, key, prepared)?;"
+new = '''let candidate = ConsentAnswer { id: record["elicitation_id"].as_str().unwrap().into(), decision: ConsentDecision::Approved, record: record.clone() }; // NON-VACUITY BREAK: trust an unchecked raw record'''
+
+[[control]]
+id = "core-consent-ordinary-writer-checks-capability-scope"
+guards = "ordinary Approved records require a capability for their own call key and binding"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::ordinary_approval_writer_rejects_capability_for_another_call_or_binding"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "&& proof.matches(&call.key, &call.prepared)"
+new = "&& true /* NON-VACUITY BREAK: transpose an approval capability between calls */"
+
+[[control]]
+id = "core-consent-late-writer-checks-capability-scope"
+guards = "late Approved records require a capability for their own call key and binding"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::late_approval_writer_rejects_capability_for_another_call_or_binding"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "if !authorization.matches(key, prepared) {"
+new = "if false && !authorization.matches(key, prepared) { // NON-VACUITY BREAK: transpose a late capability between calls"
