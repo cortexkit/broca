@@ -10009,6 +10009,7 @@ mod approval_gate {
         let mut waits = HashMap::<usize, CancellationToken>::new();
         let mut card_ids = HashMap::<usize, Arc<std::sync::Mutex<Option<String>>>>::new();
         let mut approved_calls = HashMap::<usize, Held>::new();
+        let mut adoptions = HashMap::<usize, crate::consent::ConsentAnswer>::new();
         let mut feedback: FuturesUnordered<Pin<Box<dyn Future<Output = Feedback> + Send + '_>>> =
             FuturesUnordered::new();
         if slots.iter().any(|slot| matches!(slot, Slot::Held(_))) {
@@ -10150,6 +10151,7 @@ mod approval_gate {
                     let held = call.clone();
                     let timestamp = now(control);
                     let scan = history.scan(&held.key);
+                    let adoption = adoptions.remove(&index);
                     active.insert(index);
                     let wait_cancel = CancellationToken::new();
                     waits.insert(index, wait_cancel.clone());
@@ -10174,9 +10176,11 @@ mod approval_gate {
                                         Ok(())
                                     }
                                 };
+                                if let Some(candidate) = adoption { scan.lock().expect("consent scan progress").seed_candidate(&held.key, &held.prepared, &candidate)?; }
                                 if let Some(id) = &held.id {
                                     let pending = scan.lock().expect("consent scan progress").expected();
                                     if let Some(candidate) = pending {
+                                        if candidate.id != *id { return crate::consent::reconcile_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, scan.as_ref(), durable).await; }
                                         let answer = crate::consent::verify_readback(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, candidate, scan.as_ref()).await?;
                                         return Ok(crate::consent::RecoveredCard { id: id.clone(), answer: Some(answer) });
                                     }
@@ -10314,6 +10318,7 @@ mod approval_gate {
                         }
                         Work::Awaited(result) => {
                             if stopping || is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) { continue; }
+                            if adoptions.contains_key(&index) { continue; }
                             let Slot::Held(call) = &mut slots[index] else { continue };
                             if call.approved { continue; }
                             match result {
@@ -10380,7 +10385,14 @@ mod approval_gate {
                                 };
                                 if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && call.filed && !call.approved)) {
                                     if let Some(token) = waits.remove(&index) { token.cancel(); }
-                                    intake(slots, index, answer, ctx, writer, control, history).await?;
+                                    let Slot::Held(call) = &mut slots[index] else { unreachable!() };
+                                    if call.id.as_deref() != Some(answer.id.as_str()) {
+                                        // Before adopting this older answer, withdraw the card
+                                        // already recorded for the call. If it was answered first,
+                                        // read that answer and require agreement before changing ids.
+                                        call.filed = false; call.retry_at = 0;
+                                        adoptions.insert(index, answer);
+                                    } else { intake(slots, index, answer, ctx, writer, control, history).await?; }
                                 } else { late_answer(history, writer, &key, answer).await?; }
                             }
                             // Intake, including the marker updates, is durable before advancing.

@@ -10895,3 +10895,17 @@ select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = "lookup_with_progress(plane, ctx, key, prepared, progress).await?;"
 new = "// NON-VACUITY BREAK: accept the first approving readback without its settlement snapshot"
+
+[[control]]
+id = "core-consent-live-adoption-proves-recorded-duplicate"
+guards = "a different-id live answer cannot replace the recorded card without withdrawal and agreeing terminal readback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "if call.id.as_deref() != Some(answer.id.as_str()) {"
+new = "if false && call.id.as_deref() != Some(answer.id.as_str()) { // NON-VACUITY BREAK"

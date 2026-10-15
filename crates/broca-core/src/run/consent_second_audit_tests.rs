@@ -243,3 +243,130 @@ async fn filed_retryable_or_unreadable_await_approval_checks_settlements() {
         await_conflict(mode).await;
     }
 }
+
+#[cfg(feature = "test-clock")]
+struct LiveAdoptionRace {
+    key: String,
+    prepared: WalRecord,
+    gets: AtomicUsize,
+    entered: std::sync::atomic::AtomicBool,
+    withdrew: std::sync::atomic::AtomicBool,
+}
+#[cfg(feature = "test-clock")]
+#[async_trait::async_trait]
+impl ElicitationPlane for LiveAdoptionRace {
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        cursor: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        if self.gets.load(Ordering::SeqCst) == 0 {
+            return Ok(ApprovalPage {
+                records: Vec::new(),
+                cursor: ApprovalCursor {
+                    provider_incarnation: "owner".into(),
+                    seq: 0,
+                },
+            });
+        }
+        while !self.entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let mut records = if cursor.is_none() {
+            vec![
+                json!({"state":"answered","requester_ref":self.key,"elicitation_id":"old","answered_choice_id":"approve","binding":crate::consent::binding(&self.prepared)}),
+            ]
+        } else {
+            Vec::new()
+        };
+        if cursor.is_none() && self.withdrew.load(Ordering::SeqCst) {
+            records.push(json!({"state":"answered","requester_ref":self.key,"elicitation_id":"new","answered_choice_id":"deny","binding":crate::consent::binding(&self.prepared)}));
+        }
+        Ok(ApprovalPage {
+            records,
+            cursor: ApprovalCursor {
+                provider_incarnation: "owner".into(),
+                seq: 1,
+            },
+        })
+    }
+    async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        Ok(if self.withdrew.load(Ordering::SeqCst) {
+            ApprovalQuestion {
+                terminal: true,
+                record: json!({"state":"answered","requester_ref":self.key,"elicitation_id":"new","answered_choice_id":"deny","binding":crate::consent::binding(&self.prepared)}),
+            }
+        } else {
+            ApprovalQuestion {
+                terminal: false,
+                record: json!({"state":"pending","requester_ref":self.key,"elicitation_id":"new"}),
+            }
+        })
+    }
+    async fn r#await(
+        &self,
+        _: &BatchCtx,
+        _: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.entered.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+    async fn withdraw(&self, _: &BatchCtx, id: &str) -> ApprovalWithdrawal {
+        assert_eq!(id, "new");
+        self.withdrew.store(true, Ordering::SeqCst);
+        ApprovalWithdrawal::NotSent {
+            reason: "answered".into(),
+        }
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption() {
+    let mut rig = expired_run("pass").await;
+    let mut prepared = rig
+        .frames()
+        .iter()
+        .find(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
+        .unwrap()
+        .record
+        .clone();
+    let WalRecord::ToolCallDeferred { call_id, ask, .. } = &mut prepared else {
+        unreachable!()
+    };
+    *call_id = ToolCallId("held".into());
+    ask.expires_at_ms += 60_000;
+    let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
+    rig.writer.sync().await.unwrap();
+    let cards = Arc::new(LiveAdoptionRace {
+        key: crate::context::call_key(rig.writer.lineage_id().unwrap(), seq),
+        prepared: prepared.clone(),
+        gets: AtomicUsize::new(0),
+        entered: std::sync::atomic::AtomicBool::new(false),
+        withdrew: std::sync::atomic::AtomicBool::new(false),
+    });
+    rig.control.elicitation_plane = Some(cards.clone());
+    let resume = ResumeCtx {
+        batch_already_started: true,
+        existing: Default::default(),
+        prepared: vec![crate::replay::PreparedCall {
+            record_index: 0,
+            prepared: Arc::new(prepared),
+            approval: None,
+            elicitation_id: Some("new".into()),
+        }],
+    };
+    let result = rig
+        .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
+        .await;
+    assert!(
+        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")),
+        "live adoption must prove the recorded duplicate did not answer oppositely"
+    );
+    assert!(cards.withdrew.load(Ordering::SeqCst));
+    assert_eq!(cards.gets.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}

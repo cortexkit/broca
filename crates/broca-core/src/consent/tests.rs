@@ -722,3 +722,27 @@ async fn readback_candidate_survives_snapshot_retry_and_cursor_change() {
     );
     assert_eq!(*feed.cursors.lock().unwrap(), [None, None, None]);
 }
+
+#[test]
+fn live_candidate_cannot_erase_an_opposing_buffered_readback() {
+    let mut progress = LookupProgress::default();
+    let current = ConsentAnswer {
+        id: "new".into(),
+        decision: ConsentDecision::Approved,
+    };
+    progress
+        .seed_candidate("key", &prepared(), &current)
+        .unwrap();
+    let older = ConsentAnswer {
+        id: "old".into(),
+        decision: ConsentDecision::Declined,
+    };
+    assert_eq!(
+        progress
+            .seed_candidate("key", &prepared(), &older)
+            .unwrap_err()
+            .code,
+        "consent_conflicting_decisions"
+    );
+    assert_eq!(progress.expected(), Some(current));
+}

@@ -132,6 +132,32 @@ impl LookupProgress {
     pub fn expected(&self) -> Option<ConsentAnswer> {
         self.expected.clone()
     }
+    pub fn seed_candidate(
+        &mut self,
+        key: &str,
+        prepared: &WalRecord,
+        candidate: &ConsentAnswer,
+    ) -> Result<(), ApprovalRouteError> {
+        let expected_binding = binding(prepared);
+        if self.key.as_deref() != Some(key) || self.binding.as_ref() != Some(&expected_binding) {
+            self.restart();
+            self.key = Some(key.into());
+            self.binding = Some(expected_binding);
+        }
+        if self
+            .expected
+            .as_ref()
+            .is_some_and(|old| old.decision != candidate.decision)
+        {
+            return Err(refusal("consent_conflicting_decisions", false));
+        }
+        if self.expected.as_ref() != Some(candidate) {
+            self.restart();
+            self.expected = Some(candidate.clone());
+            self.found = Some(candidate.clone());
+        }
+        Ok(())
+    }
 }
 
 pub async fn lookup_with_progress(
@@ -213,17 +239,7 @@ pub async fn verify_readback(
 ) -> Result<ConsentAnswer, ApprovalRouteError> {
     {
         let mut state = progress.lock().expect("consent scan progress");
-        let expected_binding = binding(prepared);
-        if state.expected.as_ref() != Some(&candidate)
-            || state.key.as_deref() != Some(key)
-            || state.binding.as_ref() != Some(&expected_binding)
-        {
-            state.restart();
-            state.key = Some(key.into());
-            state.binding = Some(expected_binding);
-            state.expected = Some(candidate.clone());
-            state.found = Some(candidate.clone());
-        }
+        state.seed_candidate(key, prepared, &candidate)?;
     }
     lookup_with_progress(plane, ctx, key, prepared, progress).await?;
     Ok(candidate)
