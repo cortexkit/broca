@@ -8711,6 +8711,42 @@ new = '''if false && write { // NON-VACUITY BREAK: drop durable-intent fencing
         if let Some(cut_id) = cut_fence'''
 
 [[control]]
+id = "move-authorization-defers-read-fence"
+guards = "ownership authorization cannot let a read-side tombstone outrank the pending-release write fence"
+runner = "cargo"
+package = "broca-module-serve"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads"]
+file = "crates/broca-module/src/registry.rs"
+old = 'Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => Ok(()),'
+new = 'Err(error @ (OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. })) => Err(error), // NON-VACUITY BREAK: restore the read fence before operation admission'
+
+[[control]]
+id = "move-authorization-before-details"
+guards = "unauthorized callers learn neither migration details nor parameter errors from moved sessions"
+runner = "cargo"
+package = "broca-module-serve"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::authorization_precedes_migration_and_validation_for_moved_sessions"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = '''        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);'''
+new = '''        // NON-VACUITY BREAK: disclose the move fence before checking the caller.
+        if let Err(error) = handler.check_migration(&session, true).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);'''
+
+[[control]]
 id = "move-existing-writer-freeze"
 guards = "already-open writers refuse every append after a freeze"
 runner = "cargo"
