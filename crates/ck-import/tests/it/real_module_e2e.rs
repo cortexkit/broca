@@ -358,16 +358,14 @@ async fn imports_reads_and_continues_on_real_module_rig() {
             panic!("idle imported lineage unexpectedly queued {submission_id}")
         }
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    broca_test_support::wait_until("imported session continuation completes", || async {
         match client.run_status(&run_id).await.unwrap() {
-            RunStatusResponse::Completed { .. } => break,
-            RunStatusResponse::Active { .. } if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            RunStatusResponse::Completed { .. } => Ok(()),
+            status @ RunStatusResponse::Active { .. } => Err(format!("{status:?}")),
             status => panic!("continuation did not complete: {status:?}"),
         }
-    }
+    })
+    .await;
     let continued = client.read(None, None).await.unwrap();
     assert!(transcript_contains(
         &continued.messages,

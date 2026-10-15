@@ -442,6 +442,18 @@ def python_tests(path):
     return tests
 
 
+def bare_bash_launches(path):
+    """Find unqualified Bash subprocess launches, including shared test helpers."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
+            and node.func.attr in {"run", "Popen", "call", "check_call", "check_output"}
+            and node.args and isinstance(node.args[0], (ast.List, ast.Tuple))
+            and node.args[0].elts and isinstance(node.args[0].elts[0], ast.Constant)
+            and node.args[0].elts[0].value == "bash"]
+
+
 def command_args(row):
     command = row.get("command", [])
     if command[:3] == ["python3", "-B", "scripts/mutation-bash.py"]:
@@ -564,6 +576,10 @@ def verify_catalogue(root, catalogue):
                 for name in named:
                     if name not in cache[path]:
                         raise ValueError(f"test {name}: not found in {path}")
+                bare_bash = bare_bash_launches(path)
+                if "windows" in platforms and bare_bash:
+                    raise ValueError(f"{path}:{bare_bash[0]}: bare bash subprocess can resolve to the Windows WSL launcher; "
+                                     "use the explicit native launcher or restrict platforms to linux/macos")
                 count += len(named) * len(platforms)
                 continue
             package, target_arg, requested, defaults, all_features = invocation
@@ -794,6 +810,26 @@ macro_rules! case { ($name:ident, $path:literal) => { #[test] fn $name() {} }; }
         self.row["command"] = ["magic-runner", "proof.py"]
         self.assertIn("unsupported command test runner", self.check()[0])
 
+    def test_python_bare_bash_helpers_cannot_claim_windows(self):
+        self.put("proof.py", 'import subprocess\ndef helper():\n    subprocess.run(["bash", "operator.sh"])\n'
+                 'class Proof:\n    def test_probe(self):\n        helper()\n')
+        self.row.update(runner="command", test_file="proof.py", expect_red=["Proof.test_probe"],
+                        command=["python3", "-B", "proof.py", "{test}"])
+        errors = self.check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("proof.py:3: bare bash subprocess", errors[0])
+        self.row["command"] = ["python3", "-B", "scripts/mutation-bash.py", "-c",
+                               'git diff --stat; python3 -B proof.py "$1"', "--", "{test}"]
+        errors = self.check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("bare bash subprocess", errors[0])
+        self.row["platforms"] = ["linux", "macos"]
+        self.assertEqual(self.check(), [])
+        self.row.pop("platforms")
+        self.put("proof.py", 'import subprocess\nclass Proof:\n    def test_probe(self):\n'
+                 '        subprocess.run(["python3", "scripts/mutation-bash.py", "operator.sh"])\n')
+        self.assertEqual(self.check(), [])
+
 
 class CatalogueTests(unittest.TestCase):
     root = Path(__file__).resolve().parent.parent
@@ -816,6 +852,19 @@ class CatalogueTests(unittest.TestCase):
         for error in errors:
             self.assertIn("does not compile on windows", error)
             self.assertIn("cfg(unix)", error)
+
+    def test_operator_shell_platform_reversions_are_rejected(self):
+        rows = {"retention-test-clock-staging-fence", "retention-test-clock-execution-sentinel",
+                "train-push-private-history-public-refuses", "train-push-live-owner-refuses-concurrent-racer"}
+        catalogue = tomllib.loads((self.root / "mutations.toml").read_text(encoding="utf-8"))
+        for row in catalogue["control"]:
+            if row["id"] in rows:
+                row.pop("platforms")
+        errors, _ = verify_catalogue(self.root, catalogue)
+        self.assertEqual({error.split(":", 1)[0] for error in errors}, rows)
+        self.assertEqual(len(errors), len(rows))
+        for error in errors:
+            self.assertIn("bare bash subprocess", error)
 
     def test_six_retention_platform_reversions_in_fixture_copy_are_rejected(self):
         rows = {

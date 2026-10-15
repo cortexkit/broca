@@ -535,27 +535,30 @@ async fn a_queued_send_waits_in_the_wal_for_the_next_process() {
         matches!(outcome, SendOutcome::Pending { .. }),
         "the recovered queued send runs first: {outcome:?}"
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let records = next.records();
-        if terminals(&records).len() >= 2 {
-            assert_eq!(
-                &run_started_ids(&records)[..2],
-                ["graceful-run", "queued-run"],
-                "the queued send is the next run"
-            );
-            assert_eq!(
-                &terminals(&records)[..2],
-                [RunFinishReason::Interrupted, RunFinishReason::Completed]
-            );
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the queued send never ran after the reopen"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "queued run completes after reopen",
+        async {
+            loop {
+                let records = next.records();
+                if terminals(&records).len() >= 2 {
+                    assert_eq!(
+                        &run_started_ids(&records)[..2],
+                        ["graceful-run", "queued-run"],
+                        "the queued send is the next run"
+                    );
+                    assert_eq!(
+                        &terminals(&records)[..2],
+                        [RunFinishReason::Interrupted, RunFinishReason::Completed]
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || broca_test_support::record_kinds(next.records()),
+    )
+    .await;
     assert!(
         next.registry
             .stop_and_seal_with_budget(Duration::from_secs(5), TOTAL)
@@ -660,35 +663,44 @@ async fn drain_stops_admission_and_queue_without_sealing_restart_pause() {
     assert!(!seal.is_cancelled());
     assert_eq!(f.registry.slot_counts().runs_in_flight, 1);
     f.plane.release.notify_one();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let records = f.records();
-        if records.iter().any(|r| {
-            matches!(
-                r,
-                WalRecord::RunPaused {
-                    reason: broca_protocol::PauseReason::Restart,
-                    ..
+    broca_test_support::wait_for(
+        "restart pause and cleared in-flight gauge",
+        async {
+            loop {
+                let records = f.records();
+                if records.iter().any(|r| {
+                    matches!(
+                        r,
+                        WalRecord::RunPaused {
+                            reason: broca_protocol::PauseReason::Restart,
+                            ..
+                        }
+                    )
+                }) && f.registry.slot_counts().runs_in_flight == 0
+                {
+                    assert_eq!(
+                        records
+                            .iter()
+                            .filter(|r| matches!(r, WalRecord::RunStarted { .. }))
+                            .count(),
+                        1,
+                        "durable queued work must wait for the replacement process"
+                    );
+                    break;
                 }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "in_flight={}, {}",
+                f.registry.slot_counts().runs_in_flight,
+                broca_test_support::record_kinds(f.records())
             )
-        }) && f.registry.slot_counts().runs_in_flight == 0
-        {
-            assert_eq!(
-                records
-                    .iter()
-                    .filter(|r| matches!(r, WalRecord::RunStarted { .. }))
-                    .count(),
-                1,
-                "durable queued work must wait for the replacement process"
-            );
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "run did not pause: {records:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        },
+    )
+    .await;
     assert_eq!(
         f.registry.slot_counts().open,
         1,
@@ -919,11 +931,13 @@ async fn restart_pause_queues_plain_send_and_delivers_steer_on_boot() {
             .await,
         (1, 0)
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while terminals(&next.records()).len() < 2 {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_until("resumed restart and queued run terminals", || async {
+        let records = next.records();
+        (terminals(&records).len() >= 2)
+            .then_some(())
+            .ok_or_else(|| broca_test_support::record_kinds(records))
+    })
+    .await;
     assert_eq!(
         run_started_ids(&next.records()),
         vec!["restart-run", "queued-run"]
@@ -947,11 +961,13 @@ async fn restart_pause_can_be_cancelled_before_boot_resume() {
         .route_cancel(&next.key, RunId("restart-run".into()))
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while terminals(&next.records()).is_empty() {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_until("cancelled restart pause terminal", || async {
+        let records = next.records();
+        (!terminals(&records).is_empty())
+            .then_some(())
+            .ok_or_else(|| broca_test_support::record_kinds(records))
+    })
+    .await;
     assert_eq!(terminals(&next.records()), vec![RunFinishReason::Cancelled]);
     assert!(next.provider.calls().is_empty());
     assert!(next.registry.stop_and_seal().await);

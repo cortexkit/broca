@@ -16,6 +16,13 @@ pub struct ProcessDetails {
     pub parent_pid: u32,
 }
 
+/// Distinguish a failure to open a process from a failure to wait on its handle.
+#[derive(Debug)]
+pub enum ProcessWaitError {
+    Open(std::io::Error),
+    Wait(std::io::Error),
+}
+
 /// Read one process snapshot with image names and parent process identifiers.
 pub fn process_snapshot() -> std::io::Result<Vec<ProcessDetails>> {
     crate::windows::process_snapshot()
@@ -24,6 +31,11 @@ pub fn process_snapshot() -> std::io::Result<Vec<ProcessDetails>> {
 /// Report whether a process belongs to any Windows job object.
 pub fn process_is_in_job(pid: u32) -> std::io::Result<bool> {
     crate::windows::process_is_in_job(pid)
+}
+
+/// Wait for a Windows process to exit, returning `false` when the timeout expires.
+pub fn process_wait_for_exit(pid: u32, timeout_ms: u32) -> Result<bool, ProcessWaitError> {
+    crate::windows::process_wait_for_exit(pid, timeout_ms)
 }
 
 fn powershell(path: &Path, script: &str) -> String {

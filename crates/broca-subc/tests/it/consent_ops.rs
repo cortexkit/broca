@@ -1,19 +1,21 @@
-//! Real ck-subc + module SDK route operations, with independently pinned C9 payload bytes.
+//! Consent requester bodies cross real daemon routes without a compatibility envelope.
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use broca_protocol::BindIdentity;
-use broca_subc::{
-    AnswersCursor, ElicitationClient, HeldCallRequest, RouteOpenRetry, WithdrawalReply,
-};
+use broca_subc::{ConsentClient, RouteOpenRetry, WithdrawalReply};
 use serde_json::{json, Value};
 
 use super::common::Rig;
 
 fn fixture(name: &str) -> Value {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elicitation");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/consent");
     serde_json::from_slice(&std::fs::read(root.join(name)).unwrap()).unwrap()
+}
+
+fn exchange(request: &str, reply: &str) -> Value {
+    json!({"request":fixture(request), "reply":fixture(reply)})
 }
 
 struct Script {
@@ -44,16 +46,13 @@ impl subc_client_rs::ModuleHandler for Provider {
             .expect("no unscripted op");
         assert_eq!(
             body,
-            serde_json::to_vec(&json!({
-                "method": vector["method"], "params": vector["request"],
-            }))
-            .unwrap(),
+            serde_json::to_vec(&vector["request"]).unwrap(),
             "real provider must receive the pinned parameter bytes"
         );
         if let Some(error) = vector.get("error") {
             subc_client_rs::HandlerOutcome::Error {
                 code: error["code"].as_str().unwrap().into(),
-                message: "scripted C9 refusal".into(),
+                message: "scripted consent refusal".into(),
             }
         } else {
             subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&vector["reply"]).unwrap())
@@ -62,7 +61,7 @@ impl subc_client_rs::ModuleHandler for Provider {
 }
 
 struct Serving {
-    client: ElicitationClient,
+    client: ConsentClient,
     script: Arc<Script>,
     serve: tokio::task::JoinHandle<()>,
     _rig: Rig,
@@ -84,13 +83,16 @@ async fn start(tag: &str, exchanges: Vec<Value>) -> Option<Serving> {
         exchanges: Mutex::new(exchanges.into()),
         bodies: Mutex::new(vec![]),
     });
-    let manifest = ModuleManifest::builder("prefrontal-core", env!("CARGO_PKG_VERSION"))
+    let manifest = ModuleManifest::builder("cingulate", env!("CARGO_PKG_VERSION"))
         .provides(vec![ProviderRole::ManagementSurface {
             operations: [
-                "elicitation.request",
-                "elicitation.answers",
-                "elicitation.get",
-                "elicitation.withdraw",
+                "consent.request",
+                "consent.answers",
+                "consent.get",
+                "consent.withdraw",
+                "consent.await",
+                "consent.report_execution",
+                "consent.detach",
             ]
             .into_iter()
             .map(|name| ManagementOperation {
@@ -113,23 +115,17 @@ async fn start(tag: &str, exchanges: Vec<Value>) -> Option<Serving> {
     .await
     .unwrap();
     let serve = tokio::spawn(async move {
-        serve
-            .await
-            .expect("scripted elicitation provider serve loop");
+        serve.await.expect("scripted consent provider serve loop");
     });
-    let identity = BindIdentity::new(&rig.dir, "broca", "broca-elicitation");
-    // The SDK scripted provider accepts the bind. Production uses ElicitationClient::open
+    let identity = BindIdentity::new(&rig.dir, "broca", "broca-consent");
+    // The SDK scripted provider accepts the bind. Production uses ConsentClient::open
     // with a daemon-attested scope; these tests pin the actual route request/ERROR transport.
     let route = conn
-        .route_open_management_within(
-            "prefrontal-core",
-            &identity,
-            RouteOpenRetry::default_patience(),
-        )
+        .route_open_management_within("cingulate", &identity, RouteOpenRetry::default_patience())
         .await
         .unwrap();
     Some(Serving {
-        client: ElicitationClient::on_route(conn, route, Duration::from_secs(2)),
+        client: ConsentClient::on_route(conn, route, Duration::from_secs(2)),
         script,
         serve,
         _rig: rig,
@@ -150,11 +146,20 @@ fn assert_drained(serving: &Serving, count: usize) {
 
 #[tokio::test]
 async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
-    let filing = fixture("c9/request.json");
-    let get = fixture("requester/get.json");
-    let withdraw = fixture("requester/withdraw.json");
+    let filing = exchange(
+        "broca/held-call-request.json",
+        "upstream/consent-requester-v2/cerebellum-reply.json",
+    );
+    let get = exchange(
+        "upstream/consent-requester-v2/cerebellum-get-request.json",
+        "upstream/consent-requester-v2/cerebellum-get-reply.json",
+    );
+    let withdraw = exchange(
+        "upstream/consent-requester-v1/withdraw-request.json",
+        "upstream/consent-requester-v1/withdraw-reply.json",
+    );
     let Some(serving) = start(
-        "elicitation-vectors",
+        "consent-vectors",
         vec![
             filing.clone(),
             get.clone(),
@@ -166,16 +171,28 @@ async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
     else {
         return;
     };
-    let request: HeldCallRequest = serde_json::from_value(filing["request"].clone()).unwrap();
-    let reply = serving.client.request(&request).await.unwrap();
-    assert_eq!(serde_json::to_value(reply).unwrap(), filing["reply"]);
-    let record = serving.client.get("@ELICITATION_ID@").await.unwrap();
+    let reply = serving
+        .client
+        .request(&filing["request"]["params"])
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(reply).unwrap(),
+        filing["reply"]["result"]
+    );
+    let record = serving.client.get("el_1").await.unwrap();
     assert!(!record.is_terminal());
-    assert_eq!(serde_json::to_value(record).unwrap(), get["reply"]);
+    assert_eq!(
+        serde_json::to_value(record).unwrap(),
+        get["reply"]["result"]
+    );
     for _ in 0..2 {
-        match serving.client.withdraw("@ELICITATION_ID@").await {
+        match serving.client.withdraw("el_2").await {
             WithdrawalReply::Acknowledged(record) => {
-                assert_eq!(serde_json::to_value(record).unwrap(), withdraw["reply"])
+                assert_eq!(
+                    serde_json::to_value(record).unwrap(),
+                    withdraw["reply"]["result"]
+                )
             }
             other => panic!("withdrawal should acknowledge, including a repeat: {other:?}"),
         }
@@ -185,48 +202,46 @@ async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
 }
 
 #[tokio::test]
-async fn old_incarnation_refusal_surfaces_and_fresh_read_keeps_answers() {
-    let old = fixture("c9/answers-old-incarnation.json");
-    let mut fresh = fixture("c9/answers-incarnation.json");
-    fresh["reply"]["records"] = json!([{
-        "elicitation_id": "el_call", "call_key": "br:episode:17", "state": "answered",
-        "answered_choice_id": "approve", "approval_digest": fixture("c9/request.json")["reply"]["approval_digest"],
-    }]);
-    let object = fixture("c9/answers-object.json");
-    let Some(serving) = start(
-        "elicitation-cursor",
-        vec![old.clone(), fresh.clone(), object.clone()],
-    )
-    .await
-    else {
+async fn answers_and_await_match_upstream_requester_bodies() {
+    let fresh = exchange(
+        "upstream/consent-requester-v2/cerebellum-ref-answers-request.json",
+        "upstream/consent-requester-v2/cerebellum-ref-answers-reply.json",
+    );
+    let wait = exchange(
+        "upstream/consent-requester-v2/cerebellum-ref-await-request.json",
+        "upstream/consent-requester-v2/cerebellum-ref-await-reply.json",
+    );
+    let Some(serving) = start("consent-feed", vec![fresh.clone(), wait.clone()]).await else {
         return;
     };
-    let cursor: AnswersCursor = serde_json::from_value(old["request"]["since"].clone()).unwrap();
-    let error = serving
-        .client
-        .answers(Some(&cursor))
-        .await
-        .expect_err("old incarnation is not an empty page");
-    assert_eq!(error.code(), old["error"]["code"].as_str());
-    let page = serving.client.answers(None).await.unwrap();
+    let page = serving.client.answers(0).await.unwrap();
     assert_eq!(page.records.len(), 1);
-    assert_eq!(serde_json::to_value(&page).unwrap(), fresh["reply"]);
-    let page = serving.client.answers(Some(&page.cursor)).await.unwrap();
-    assert_eq!(serde_json::to_value(page).unwrap(), object["reply"]);
-    assert_drained(&serving, 3);
+    assert_eq!(
+        serde_json::to_value(&page).unwrap(),
+        fresh["reply"]["result"]
+    );
+    let record = serving.client.r#await("el_1", 0).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(record).unwrap(),
+        wait["reply"]["result"]
+    );
+    assert_drained(&serving, 2);
 }
 
 #[tokio::test]
 async fn withdrawal_stop_and_retry_classes_cross_real_error_frames() {
-    let mut answered = fixture("requester/withdraw.json");
-    answered["reply"]["state"] = json!("answered");
+    let mut answered = exchange(
+        "upstream/consent-requester-v1/withdraw-request.json",
+        "upstream/consent-requester-v1/withdraw-reply.json",
+    );
+    answered["reply"]["result"]["state"] = json!("answered");
     let mut expired = answered.clone();
-    expired["reply"]["state"] = json!("expired");
+    expired["reply"]["result"]["state"] = json!("expired");
     let codes = [
         "elicitation_not_owner",
         "elicitation_not_found",
         "elicitation_store_error",
-        "elicitation_unavailable",
+        "consent_unavailable",
         "scope_not_synced",
         "scope_changed",
         "scope_ended",
@@ -235,16 +250,16 @@ async fn withdrawal_stop_and_retry_classes_cross_real_error_frames() {
     let mut exchanges = vec![answered, expired];
     exchanges.extend(codes.iter().map(|code| {
         json!({
-            "method": "elicitation.withdraw", "request": {"elicitation_id": "el_call"},
+            "request": {"method": "consent.withdraw", "params": {"elicitation_id": "el_call"}},
             "error": {"code": code},
         })
     }));
-    let Some(serving) = start("elicitation-withdraw-classes", exchanges).await else {
+    let Some(serving) = start("consent-withdraw-classes", exchanges).await else {
         return;
     };
     for state in ["answered", "expired"] {
         assert!(
-            matches!(serving.client.withdraw("@ELICITATION_ID@").await, WithdrawalReply::NoLongerOpen { code } if code == state)
+            matches!(serving.client.withdraw("el_2").await, WithdrawalReply::NoLongerOpen { code } if code == state)
         );
     }
     for code in codes {
@@ -254,7 +269,7 @@ async fn withdrawal_stop_and_retry_classes_cross_real_error_frames() {
                 matches!(reply, WithdrawalReply::NoLongerOpen { code: actual } if actual == code)
             ),
             "elicitation_store_error"
-            | "elicitation_unavailable"
+            | "consent_unavailable"
             | "scope_not_synced"
             | "scope_changed" => assert!(
                 matches!(reply, WithdrawalReply::Retryable(error) if error.code() == Some(code))
@@ -345,7 +360,14 @@ async fn approved_raw_dispatch_reaches_a_real_provider_without_reserializing_sav
         .unwrap();
     assert!(matches!(
         plane
-            .dispatch_approved(&ctx, &call, bytes, "lineage:7", "digest")
+            .dispatch_approved(
+                &ctx,
+                &call,
+                bytes,
+                "lineage:7",
+                "digest",
+                &broca_core::tool_plane::DispatchSignals::default()
+            )
             .await,
         broca_core::DispatchResult::Completed(_)
     ));
@@ -355,7 +377,7 @@ async fn approved_raw_dispatch_reaches_a_real_provider_without_reserializing_sav
     assert!(raw.contains(&format!("\"arguments\":{bytes}")));
     let envelope: Value = serde_json::from_slice(&bodies[0]).unwrap();
     assert_eq!(envelope["call_key"], "lineage:7");
-    assert_eq!(envelope["approval_digest"], "digest");
+    assert!(envelope.get("approval_digest").is_none());
     plane.batch_finished(&ctx).await.unwrap();
     serve.abort();
 }

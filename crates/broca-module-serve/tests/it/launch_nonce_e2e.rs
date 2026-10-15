@@ -273,14 +273,19 @@ async fn with_only_the_descriptor_hello_registers_and_a_later_route_is_attested_
         "the tool-bearing send was not admitted: {outcome:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let attaches = loop {
-        let attaches = attach_events(&rig.aft_events);
-        if !attaches.is_empty() || Instant::now() >= deadline {
-            break attaches;
-        }
-        sleep(Duration::from_millis(100)).await;
-    };
+    let attaches =
+        broca_test_support::wait_until("tool route attach after admitted send", || async {
+            let attaches = attach_events(&rig.aft_events);
+            if !attaches.is_empty() {
+                Ok(attaches)
+            } else {
+                Err(format!(
+                    "attach_events=0, path={}",
+                    rig.aft_events.display()
+                ))
+            }
+        })
+        .await;
     assert!(
         !attaches.is_empty(),
         "broca opened no route to the tool module after HELLO"

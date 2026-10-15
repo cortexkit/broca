@@ -6,10 +6,11 @@
 //! against that contract, not live Engram interop.
 use super::*;
 use broca_subc::{RouteHandle, RouteOpenRetry, SubcConnection};
-use std::{io::Write, os::unix::fs::PermissionsExt, path::Path};
+use broca_test_support::{event_timeout, wait_until, EVENT_HANG_GUARD};
+use std::{io::Write, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use subc_control::ConsumerIdentity;
 use subc_protocol::manifest::{InternalTransport, ModuleManifest, ProviderRole};
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::Instant;
 
 struct DoorProvider(PathBuf);
 fn hex(bytes: &[u8]) -> String {
@@ -200,19 +201,24 @@ impl Live {
             .spawn()
             .unwrap();
         let mut daemon = broca_test_support::RigChild::new(child, &root, "daemon");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !connection.exists() || !nonce.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "daemon did not become ready: {}",
-                broca_test_support::rig_process_logs(&root, "daemon")
-            );
+        wait_until("agent-data daemon connection and Entorhinal nonce", || {
             assert!(
                 daemon.try_wait().unwrap().is_none(),
-                "daemon exited during boot"
+                "daemon exited during boot: {}",
+                broca_test_support::rig_process_logs(&root, "daemon")
             );
-            sleep(Duration::from_millis(25)).await;
-        }
+            std::future::ready(if connection.exists() && nonce.exists() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "connection={}, nonce={}; {}",
+                    connection.exists(),
+                    nonce.exists(),
+                    broca_test_support::rig_process_logs(&root, "daemon")
+                ))
+            })
+        })
+        .await;
         let identity = ConsumerIdentity {
             module_id: "entorhinal".into(),
             launch_nonce: std::fs::read_to_string(&nonce).unwrap().trim().into(),
@@ -228,7 +234,7 @@ impl Live {
                 "agent-data",
                 &BindIdentity::new("/driver", "fake-entorhinal", "move"),
                 RouteOpenRetry {
-                    deadline,
+                    deadline: Instant::now() + EVENT_HANG_GUARD,
                     max_interval: Duration::from_millis(200),
                 },
             )
@@ -247,7 +253,7 @@ impl Live {
                 .unwrap();
         let answer = self
             .conn
-            .route_unary_reply(&self.route, request, Duration::from_secs(30))
+            .route_unary_reply(&self.route, request, EVENT_HANG_GUARD)
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -283,74 +289,83 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
         eprintln!("SKIP real agent-data lane: daemon rigs are absent");
         return;
     }
-    timeout(Duration::from_secs(150), async {
-        let shared = root("real-door");
-        std::fs::create_dir_all(&shared).unwrap();
-        let source = Rig::new("real-source", Arc::new(FakeDoor::default()));
-        let receiver = Rig::new("real-receiver", Arc::new(FakeDoor::default()));
-        let session = source.session("real-move");
-        source.seed_tool_run(&session, "source-tool-run");
-        let params = source.params(CUT, std::slice::from_ref(&session));
-        let reference = params["refs"][0]["ref"].as_str().unwrap();
-        let before = source.bytes(&session);
-        let from = Live::start(&source, &shared, &daemon_bin, &fake_bin).await;
-        let to = Live::start(&receiver, &shared, &daemon_bin, &fake_bin).await;
-        from.call("prepare", params.clone()).await.unwrap();
-        let exported = from.call("export", params.clone()).await.unwrap();
-        assert_eq!(from.call("export", params.clone()).await.unwrap(), exported);
-        assert_eq!(
-            std::fs::read(shared.join("streams").join(reference)).unwrap(),
-            before
-        );
-        seal_door(&shared, CUT, reference);
-        std::fs::write(
-            shared.join("omit-digest"),
-            b"missing required sealed digest",
-        )
-        .unwrap();
-        assert_code(to.call("import", params.clone()).await, "unavailable");
-        assert!(!receiver.root.join("wal-staging").exists());
-        std::fs::remove_file(shared.join("omit-digest")).unwrap();
-        to.call("import", params.clone()).await.unwrap();
-        to.call("activate", params.clone()).await.unwrap();
-        assert_eq!(receiver.bytes(&session), before);
-        let mut release = params.clone();
-        release["holder"] = json!("receiver-mac");
-        from.call("release", release).await.unwrap();
-        assert!(source.wal.check_move(&session, false).is_err());
-        receiver.seed_tool_run(&session, "receiver-tool-run");
-        let extended = receiver.bytes(&session);
-        assert!(extended.starts_with(&before));
-        let back = receiver.params(BACK, std::slice::from_ref(&session));
-        to.call("prepare", back.clone()).await.unwrap();
-        to.call("export", back.clone()).await.unwrap();
-        seal_door(&shared, BACK, reference);
-        assert_eq!(
-            from.call("diverged", back.clone()).await.unwrap(),
-            json!({"refs":[{"state":"at_cut"}]})
-        );
-        from.call("import", back.clone()).await.unwrap();
-        from.call("activate", back).await.unwrap();
-        assert_eq!(source.bytes(&session), extended);
-        assert!(source.wal.check_move(&session, true).is_ok());
-        source.seed_tool_run(&session, "source-fork-after-rejoin");
-        let fork_cut = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        seal_door(&shared, fork_cut, reference);
-        let fork = source.params(fork_cut, std::slice::from_ref(&session));
-        let fork_bytes = source.bytes(&session);
-        assert_eq!(
-            from.call("diverged", fork.clone()).await.unwrap(),
-            json!({"refs":[{"state":"advanced"}]})
-        );
-        assert_code(from.call("import", fork).await, "local_advanced");
-        assert_eq!(source.bytes(&session), fork_bytes);
-        assert_eq!(
-            std::fs::read_to_string(shared.join("broca-principal-observed")).unwrap(),
-            "reserved:broca"
-        );
-        from.stop().await;
-        to.stop().await;
-    })
+    event_timeout(
+        "two real agent-data daemons move and move back",
+        async {
+            let shared = root("real-door");
+            std::fs::create_dir_all(&shared).unwrap();
+            let source = Rig::new("real-source", Arc::new(FakeDoor::default()));
+            let receiver = Rig::new("real-receiver", Arc::new(FakeDoor::default()));
+            let session = source.session("real-move");
+            source.seed_tool_run(&session, "source-tool-run");
+            let params = source.params(CUT, std::slice::from_ref(&session));
+            let reference = params["refs"][0]["ref"].as_str().unwrap();
+            let before = source.bytes(&session);
+            let from = Live::start(&source, &shared, &daemon_bin, &fake_bin).await;
+            let to = Live::start(&receiver, &shared, &daemon_bin, &fake_bin).await;
+            from.call("prepare", params.clone()).await.unwrap();
+            let exported = from.call("export", params.clone()).await.unwrap();
+            assert_eq!(from.call("export", params.clone()).await.unwrap(), exported);
+            assert_eq!(
+                std::fs::read(shared.join("streams").join(reference)).unwrap(),
+                before
+            );
+            seal_door(&shared, CUT, reference);
+            std::fs::write(
+                shared.join("omit-digest"),
+                b"missing required sealed digest",
+            )
+            .unwrap();
+            assert_code(to.call("import", params.clone()).await, "unavailable");
+            assert!(!receiver.root.join("wal-staging").exists());
+            std::fs::remove_file(shared.join("omit-digest")).unwrap();
+            to.call("import", params.clone()).await.unwrap();
+            to.call("activate", params.clone()).await.unwrap();
+            assert_eq!(receiver.bytes(&session), before);
+            let mut release = params.clone();
+            release["holder"] = json!("receiver-mac");
+            from.call("release", release).await.unwrap();
+            assert!(source.wal.check_move(&session, false).is_err());
+            receiver.seed_tool_run(&session, "receiver-tool-run");
+            let extended = receiver.bytes(&session);
+            assert!(extended.starts_with(&before));
+            let back = receiver.params(BACK, std::slice::from_ref(&session));
+            to.call("prepare", back.clone()).await.unwrap();
+            to.call("export", back.clone()).await.unwrap();
+            seal_door(&shared, BACK, reference);
+            assert_eq!(
+                from.call("diverged", back.clone()).await.unwrap(),
+                json!({"refs":[{"state":"at_cut"}]})
+            );
+            from.call("import", back.clone()).await.unwrap();
+            from.call("activate", back).await.unwrap();
+            assert_eq!(source.bytes(&session), extended);
+            assert!(source.wal.check_move(&session, true).is_ok());
+            source.seed_tool_run(&session, "source-fork-after-rejoin");
+            let fork_cut = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            seal_door(&shared, fork_cut, reference);
+            let fork = source.params(fork_cut, std::slice::from_ref(&session));
+            let fork_bytes = source.bytes(&session);
+            assert_eq!(
+                from.call("diverged", fork.clone()).await.unwrap(),
+                json!({"refs":[{"state":"advanced"}]})
+            );
+            assert_code(from.call("import", fork).await, "local_advanced");
+            assert_eq!(source.bytes(&session), fork_bytes);
+            assert_eq!(
+                std::fs::read_to_string(shared.join("broca-principal-observed")).unwrap(),
+                "reserved:broca"
+            );
+            from.stop().await;
+            to.stop().await;
+        },
+        || {
+            format!(
+                "rig logs under {}",
+                broca_test_support::scratch_root().display()
+            )
+        },
+    )
     .await
     .expect("agent-data real-daemon lane exceeded its own deadline");
 }
@@ -358,8 +373,8 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
 #[tokio::test]
 async fn required_daemon_lane_refuses_to_skip_missing_binaries() {
     let missing = root("required-missing-rigs");
-    let output = timeout(
-        Duration::from_secs(15),
+    let output = event_timeout(
+        "required agent-data lane rejects missing rigs",
         tokio::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -371,6 +386,7 @@ async fn required_daemon_lane_refuses_to_skip_missing_binaries() {
             .env("FAKE_AFT_STUB_BIN", missing.join("no-fake"))
             .kill_on_drop(true)
             .output(),
+        || format!("missing-rig fixture {}", missing.display()),
     )
     .await
     .expect("required-lane self-test deadline")

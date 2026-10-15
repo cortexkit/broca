@@ -20,7 +20,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
 };
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{read_frame, write_frame};
@@ -478,11 +477,16 @@ impl Wire {
         wire
     }
     async fn next(&mut self) -> Frame {
-        tokio::time::timeout(Duration::from_secs(10), read_frame(&mut self.stream))
-            .await
-            .expect("serve reply deadline")
-            .unwrap()
-            .unwrap()
+        let corr = self.corr;
+        broca_test_support::event_timeout(
+            "agent-data wire reply",
+            read_frame(&mut self.stream),
+            || format!("correlation {corr}"),
+        )
+        .await
+        .expect("serve reply deadline")
+        .unwrap()
+        .unwrap()
     }
     async fn send(&mut self, channel: u16, epoch: u32, corr: u64, ty: FrameType, body: Value) {
         write_frame(

@@ -19,7 +19,6 @@ use crate::scenarios;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
@@ -288,22 +287,22 @@ fn owner_send() -> SendRequest {
 }
 
 async fn wait_for_records(path: &Path, finished: usize) -> LogImage {
-    for _ in 0..500 {
-        let log = LogImage::read(path);
-        let ended = log
-            .records()
-            .iter()
-            .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-            .count();
-        if ended >= finished {
-            return log;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!(
-        "{finished} episodes never finished under {}",
-        path.display()
-    );
+    broca_test_support::wait_until(
+        &format!("{finished} finished episodes at {}", path.display()),
+        || async {
+            let log = LogImage::read(path);
+            let ended = log
+                .records()
+                .iter()
+                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
+                .count();
+            if ended >= finished {
+                return Ok(log);
+            }
+            Err(format!("records={}, finished={ended}", log.records().len()))
+        },
+    )
+    .await
 }
 
 /// The migration test: every cut of an unscoped episode, resumed, then the owner's stamped

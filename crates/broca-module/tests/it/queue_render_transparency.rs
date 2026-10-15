@@ -444,13 +444,24 @@ fn rig(tag: &str, gate_run: Option<&str>) -> Rig {
 }
 
 async fn wait_for_bytes(slot: &SentMap, run: &str) -> Vec<u8> {
-    for _ in 0..100 {
-        if let Some(b) = slot.lock().unwrap().get(run) {
-            return b.clone();
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("run '{run}' never recorded its first-step render bytes");
+    broca_test_support::wait_for(
+        "first-step render bytes",
+        async {
+            loop {
+                if let Some(b) = slot.lock().unwrap().get(run) {
+                    return b.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            format!(
+                "recorded runs={:?}, wanted={run}",
+                slot.lock().unwrap().keys().collect::<Vec<_>>()
+            )
+        },
+    )
+    .await
 }
 
 async fn run_started_submission_id(
@@ -458,9 +469,11 @@ async fn run_started_submission_id(
     expected_run_id: &str,
 ) -> Option<SubmissionId> {
     loop {
-        let delivery = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let delivery =
+            broca_test_support::wait_for("control stream announces RunStarted", rx.recv(), || {
+                format!("expected_run_id={expected_run_id}")
+            })
             .await
-            .expect("the control stream must announce the started run")
             .expect("the control stream remains open");
         match delivery {
             Delivery::Control(event) => {
@@ -698,17 +711,32 @@ async fn crash_recovery_preserves_stop_before_tool_dispatch() {
     let _ = rig.registry.route_status(&key).await.unwrap();
 
     let mut terminal_reason = None;
-    for _ in 0..100 {
-        let records = rig.wal_store.read_records(&key).unwrap();
-        terminal_reason = records.iter().find_map(|frame| match &frame.record {
-            broca_wal::WalRecord::RunFinished { reason, .. } => Some(*reason),
-            _ => None,
-        });
-        if terminal_reason.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "recovered crash-cut terminal",
+        async {
+            loop {
+                let records = rig.wal_store.read_records(&key).unwrap();
+                terminal_reason = records.iter().find_map(|frame| match &frame.record {
+                    broca_wal::WalRecord::RunFinished { reason, .. } => Some(*reason),
+                    _ => None,
+                });
+                if terminal_reason.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            broca_test_support::record_kinds(
+                rig.wal_store
+                    .read_records(&key)
+                    .unwrap()
+                    .iter()
+                    .map(|f| &f.record),
+            )
+        },
+    )
+    .await;
 
     assert_eq!(
         terminal_reason,

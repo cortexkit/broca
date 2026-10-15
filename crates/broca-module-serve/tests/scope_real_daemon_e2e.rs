@@ -323,20 +323,15 @@ impl Rig {
     }
 
     async fn wait_for_file(&self, path: &Path) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
+        broca_test_support::wait_until("scope rig marker file", || async {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if !text.is_empty() {
-                    return text;
+                    return Ok(text);
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "{} never appeared",
-                path.display()
-            );
-            sleep(Duration::from_millis(25)).await;
-        }
+            Err(format!("{} absent or empty", path.display()))
+        })
+        .await
     }
 
     /// Have the owner sync one head scope listing the carrier, and wait for the daemon to
@@ -1492,8 +1487,8 @@ async fn active_status_reports_held_model_step_and_content() {
     assert!(step.get("last_content_at_ms").is_none());
 
     model.content.send(()).await.unwrap();
-    let status = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    let status =
+        broca_test_support::wait_until("live actor sees content during held HTTP call", || async {
             let status = scope_request(
                 &basal,
                 &route,
@@ -1503,13 +1498,12 @@ async fn active_status_reports_held_model_step_and_content() {
             .await
             .unwrap();
             if status["result"]["step"]["last_content_at_ms"].is_u64() {
-                break status;
+                Ok(status)
+            } else {
+                Err(status.to_string())
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("live actor sees real content while the HTTP call remains held");
+        })
+        .await;
     let step = &status["result"]["step"];
     assert_eq!(step["started_at_ms"], started_at);
     assert_eq!(step["attempt_started_at_ms"], attempt_at);
@@ -1537,25 +1531,22 @@ async fn active_status_reports_held_model_step_and_content() {
     .await
     .unwrap();
     assert_eq!(cancelled["result"], "ack", "{cancelled}");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let status = scope_request(
-                &basal,
-                &route,
-                "run.status",
-                serde_json::json!({"run_id":run_id}),
-            )
-            .await
-            .unwrap();
-            if status["result"]["state"] != "active" {
-                assert!(status["result"].get("step").is_none());
-                break;
-            }
-            tokio::task::yield_now().await;
+    broca_test_support::wait_until("cancelled active run retires its live step", || async {
+        let status = scope_request(
+            &basal,
+            &route,
+            "run.status",
+            serde_json::json!({"run_id":run_id}),
+        )
+        .await
+        .unwrap();
+        if status["result"]["state"] != "active" {
+            assert!(status["result"].get("step").is_none());
+            return Ok(());
         }
+        Err(status.to_string())
     })
-    .await
-    .expect("cancelled run leaves active state");
+    .await;
 }
 
 async fn owner_op(

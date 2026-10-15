@@ -343,15 +343,18 @@ impl Session {
     }
 
     async fn wait_entered(&self) {
-        tokio::time::timeout(Duration::from_secs(20), self.script.entered.notified())
-            .await
-            .expect("the run reached the held point");
+        broca_test_support::wait_for(
+            "run reached the held point",
+            self.script.entered.notified(),
+            || format!("WAL records={}", self.log().records().len()),
+        )
+        .await;
     }
 
     /// Wait until the actor is idle, nothing is queued, and every episode has ended (or is
     /// paused): nothing more will be written without a new send.
     async fn settle(&self) -> LogImage {
-        for _ in 0..2000 {
+        broca_test_support::wait_until("idle session with no pending or open episodes", || async {
             let idle = matches!(
                 self.registry.status(&session()).await,
                 Ok(StatusResponse::Idle)
@@ -359,15 +362,17 @@ impl Session {
             let log = self.log();
             let records = log.records();
             if idle && broca_core::pending_submissions(&records).is_empty() && all_ended(&records) {
-                return log;
+                return Ok(log);
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!(
-            "the session under {} never settled: {:?}",
-            self.root.display(),
-            self.log().records()
-        );
+            Err(format!(
+                "root={}, idle={idle}, records={}, pending={}, all_ended={}",
+                self.root.display(),
+                records.len(),
+                broca_core::pending_submissions(&records).len(),
+                all_ended(&records)
+            ))
+        })
+        .await
     }
 }
 

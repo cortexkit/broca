@@ -20,6 +20,7 @@ pub mod capability;
 pub mod caps;
 pub mod clock;
 pub mod compaction;
+pub mod consent;
 pub mod context;
 pub mod hooks;
 pub mod import;

@@ -807,27 +807,28 @@ async fn send_anthropic_turn(
         ),
         "an idle session starts the run: {outcome:?}"
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(frames) = session_frames(&daemon.wal_dir(), session) {
-            let started = frames.iter().find_map(|record| match record {
-                broca_wal::WalRecord::RunStarted { config, .. } => Some((**config).clone()),
-                _ => None,
-            });
-            let finished = frames
-                .iter()
-                .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. }));
-            if let (Some(config), true) = (started, finished) {
-                return Ok(config);
+    broca_test_support::wait_for(
+        "variant run durably finishes",
+        async {
+            loop {
+                if let Some(frames) = session_frames(&daemon.wal_dir(), session) {
+                    let started = frames.iter().find_map(|record| match record {
+                        broca_wal::WalRecord::RunStarted { config, .. } => Some((**config).clone()),
+                        _ => None,
+                    });
+                    let finished = frames
+                        .iter()
+                        .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. }));
+                    if let (Some(config), true) = (started, finished) {
+                        return Ok(config);
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
             }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run with variant {variant:?} never finished. WALs present: {}",
-            describe_wal_dir(&daemon.wal_dir())
-        );
-        sleep(Duration::from_millis(50)).await;
-    }
+        },
+        || describe_wal_dir(&daemon.wal_dir()),
+    )
+    .await
 }
 
 /// The records of the WAL whose `RunStarted` names `session`, found by SCANNING the WAL

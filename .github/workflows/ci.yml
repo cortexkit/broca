@@ -200,6 +200,13 @@ jobs:
           path: ${{ runner.temp }}/archive
       - name: Replay integration shard from archive (no compilation)
         run: bash scripts/ci-integration.sh run "$RUNNER_TEMP/archive/integration.tar.zst" "${{ matrix.shard }}/4"
+      - name: Upload process cleanup diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rig-survivors-integration-${{ matrix.os }}-${{ matrix.shard }}
+          path: broca/target/rig-survivors/*.txt
+          if-no-files-found: ignore
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
 
@@ -353,6 +360,14 @@ jobs:
             run_phase 'doctests' cargo test --locked --workspace --doc "${cargo_feature_args[@]}" --quiet
           fi
 
+
+      - name: Upload process cleanup diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rig-survivors-unit-${{ matrix.os }}
+          path: broca/target/rig-survivors/*.txt
+          if-no-files-found: ignore
 
       # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
       # every run since the repo existed and nothing showed it COULD go red:

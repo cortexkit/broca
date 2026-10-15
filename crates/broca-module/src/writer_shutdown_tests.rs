@@ -156,12 +156,22 @@ impl Fixture {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(61)).await;
         tokio::time::resume();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            self.opener.executor.0.notified().await;
-            while self.registry.slot_counts().closing != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        broca_test_support::event_timeout(
+            "idle close releases slot",
+            async {
+                self.opener.executor.0.notified().await;
+                while self.registry.slot_counts().closing != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || {
+                format!(
+                    "closing={}, open={}",
+                    self.registry.slot_counts().closing,
+                    self.registry.slot_counts().open
+                )
+            },
+        )
         .await
         .expect("idle close releases the slot");
         assert_eq!(self.registry.slot_counts().open, 0);
