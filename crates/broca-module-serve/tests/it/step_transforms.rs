@@ -617,19 +617,23 @@ async fn pre_user_steer_falling_back_to_queue_keeps_one_suffix() {
     let release = tokio::spawn(async move {
         shared.entered.notified().await;
         script.hold_model(false);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let records =
-                    broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-                if records
-                    .iter()
-                    .any(|f| matches!(f.record, WalRecord::RunFinished { .. }))
-                {
-                    break;
+        broca_test_support::event_timeout(
+            "pre_user_steer_falling_back_to_queue_keeps_one_suffix",
+            async {
+                loop {
+                    let records =
+                        broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
+                    if records
+                        .iter()
+                        .any(|f| matches!(f.record, WalRecord::RunFinished { .. }))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+            },
+            || format!("WAL bytes={:?}", std::fs::metadata(&path).map(|m| m.len())),
+        )
         .await
         .unwrap();
         shared.held.lock().unwrap().clear();

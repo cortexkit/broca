@@ -734,16 +734,28 @@ impl Rig {
 
     /// Wait until the session's actor reports no run in flight. A paused session is idle.
     pub async fn wait_idle(&mut self) {
-        for _ in 0..1000 {
-            let reply = self
-                .request(7, serde_json::json!({"method": "run.status", "params": {}}))
-                .await;
-            if result(&reply)["state"] == "idle" {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the session never became idle");
+        let wal_path = self.wal_path.clone();
+        broca_test_support::wait_for(
+            "session actor becomes idle",
+            async {
+                loop {
+                    let reply = self
+                        .request(7, serde_json::json!({"method": "run.status", "params": {}}))
+                        .await;
+                    if result(&reply)["state"] == "idle" {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || {
+                format!(
+                    "WAL bytes={:?}",
+                    std::fs::metadata(&wal_path).map(|m| m.len())
+                )
+            },
+        )
+        .await
     }
 
     /// `run.cancel` for `run_id`; returns the reply's result.
@@ -802,68 +814,91 @@ impl Rig {
     /// before the run's `StepStarted` is written, so without this a WAL snapshot taken at the
     /// hold can still grow by that record.
     async fn wait_latest_step_started(&self) {
-        for _ in 0..2_000 {
-            let records = self.records();
-            let last_start = records
-                .iter()
-                .rposition(|record| matches!(record, WalRecord::RunStarted { .. }));
-            if last_start.is_some_and(|start| {
-                records[start..]
-                    .iter()
-                    .any(|record| matches!(record, WalRecord::StepStarted { .. }))
-            }) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the latest episode's step start never reached the WAL within 20 s");
+        broca_test_support::wait_for(
+            "latest episode durable StepStarted",
+            async {
+                loop {
+                    let records = self.records();
+                    let last_start = records
+                        .iter()
+                        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }));
+                    if last_start.is_some_and(|start| {
+                        records[start..]
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::StepStarted { .. }))
+                    }) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
     }
 
     /// Wait until the WAL holds at least `n` episode terminals.
     pub async fn wait_for_finished(&self, n: usize) -> Vec<WalRecord> {
-        for _ in 0..1000 {
-            let records = self.records();
-            let finished = records
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record,
-                        WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
-                    )
-                })
-                .count();
-            if finished >= n {
-                return records;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!(
-            "{n} episodes never ended: errors={:?}; records={:?}",
-            self.script.failures.lock().unwrap(),
-            self.records()
-        );
+        broca_test_support::wait_for(
+            "durable episode terminals",
+            async {
+                loop {
+                    let records = self.records();
+                    let finished = records
+                        .iter()
+                        .filter(|record| {
+                            matches!(
+                                record,
+                                WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
+                            )
+                        })
+                        .count();
+                    if finished >= n {
+                        return records;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
     }
 
     /// Wait until the provider or the tool plane is holding a call, and the latest episode's step
     /// start is on disk. Tests snapshot the WAL here to prove a later call writes nothing.
     pub async fn wait_entered(&self) {
-        tokio::time::timeout(Duration::from_secs(20), self.script.entered.notified())
-            .await
-            .expect("the run reached the held call");
+        broca_test_support::event_timeout(
+            "provider or tool reaches held call",
+            self.script.entered.notified(),
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
+        .expect("the run reached the held call");
         self.wait_latest_step_started().await;
     }
 
     /// Wait for idle lineage actors to release their leases before folding their WALs.
     pub async fn wait_closed(&self) {
-        tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let counts = self.registry.slot_counts();
-                if counts.open + counts.opening + counts.closing == 0 {
-                    break;
+        broca_test_support::event_timeout(
+            "idle lineage actors release leases",
+            async {
+                loop {
+                    let counts = self.registry.slot_counts();
+                    if counts.open + counts.opening + counts.closing == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+            || {
+                format!(
+                    "open={}, opening={}, closing={}",
+                    self.registry.slot_counts().open,
+                    self.registry.slot_counts().opening,
+                    self.registry.slot_counts().closing
+                )
+            },
+        )
         .await
         .expect("idle session actors closed");
     }

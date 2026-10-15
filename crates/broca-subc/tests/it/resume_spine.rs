@@ -45,7 +45,7 @@ use broca_subc::SubcToolPlane;
 use serde_json::{json, Value};
 use tokio::{
     sync::mpsc,
-    time::{sleep, Duration, Instant},
+    time::{sleep, Duration},
 };
 
 use common::{wait_for_aft, Rig};
@@ -388,22 +388,18 @@ async fn wait_for_expected_event_counts(
     expected: &BTreeMap<String, usize>,
     label: &str,
 ) -> BTreeMap<String, usize> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
+    broca_test_support::wait_until(label, || async {
         let counts = event_counts(&read_tool_exec_events(path));
         assert_no_extra_events(&counts, expected, label);
         if &counts == expected {
-            return counts;
+            return Ok(counts);
         }
-        if Instant::now() >= deadline {
-            assert_eq!(
-                &counts, expected,
-                "{label}: fake-aft execution events did not reach the expected counts before timeout"
-            );
-            return counts;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
+        Err(format!(
+            "execution_events={counts:?}, expected={expected:?}, path={}",
+            path.display()
+        ))
+    })
+    .await
 }
 
 async fn settle_event_counts(

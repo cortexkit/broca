@@ -2,7 +2,6 @@ use super::*;
 use std::{
     fs,
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
 };
 
 fn probe() -> Option<(PathBuf, String)> {
@@ -13,15 +12,11 @@ fn probe() -> Option<(PathBuf, String)> {
 }
 
 fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "floor child did not reach {}",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    broca_test_support::wait_until_sync("floor child marker", || {
+        path.exists()
+            .then_some(())
+            .ok_or_else(|| format!("{} is absent", path.display()))
+    });
 }
 
 pub(super) fn before_lock(lock: &std::fs::File) {

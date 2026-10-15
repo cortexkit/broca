@@ -4406,17 +4406,31 @@ mod tests {
             .expect("install live slot");
         writer.record(started_record(&session));
         writer.record(assistant_record());
-        for _ in 0..100 {
-            if file_store
-                .read_records(&session)
-                .expect("read flushed WAL")
-                .len()
-                == 2
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        broca_test_support::wait_for(
+            "file WAL exposes both flushed records before sync",
+            async {
+                loop {
+                    if file_store
+                        .read_records(&session)
+                        .expect("read flushed WAL")
+                        .len()
+                        == 2
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            },
+            || {
+                file_store
+                    .read_records(&session)
+                    .map(|frames| {
+                        broca_test_support::record_kinds(frames.iter().map(|f| &f.record))
+                    })
+                    .unwrap_or_else(|e| format!("WAL read: {e}"))
+            },
+        )
+        .await;
         let unbounded = file_store
             .read_records_range(&session, 0, None, None)
             .expect("unbounded revert-check read");

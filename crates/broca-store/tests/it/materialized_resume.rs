@@ -701,8 +701,7 @@ async fn lagging_projector_does_not_change_resume_state() {
         summary
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+    broca_test_support::wait_until("model loop advances with its first projection blocked", || async {
             let sent_turns = provider.sent.lock().unwrap().len();
             let terminal_is_durable = FileWalStore::new(dir.join("wal"))
                 .read_records(&request(&dir).session)
@@ -712,13 +711,11 @@ async fn lagging_projector_does_not_change_resume_state() {
                     })
                 });
             if store.entered.load(Ordering::SeqCst) && sent_turns >= 3 && terminal_is_durable {
-                break;
+                return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+            Err(format!("projector_entered={}, sent_turns={sent_turns}, terminal_durable={terminal_is_durable}", store.entered.load(Ordering::SeqCst)))
     })
-    .await
-    .expect("the model loop advances while its first projection is blocked");
+    .await;
     let returned_before_projector_release = run.is_finished();
 
     let session = request(&dir).session;
@@ -752,9 +749,15 @@ async fn lagging_projector_does_not_change_resume_state() {
         !returned_before_projector_release,
         "a durable terminal does not return before the projector is joined"
     );
-    let summary = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+    let summary =
+        broca_test_support::wait_for("projector drain completes after release", run, || {
+            format!(
+                "projector_entered={}, sent_turns={}",
+                store.entered.load(Ordering::SeqCst),
+                provider.sent.lock().unwrap().len()
+            )
+        })
         .await
-        .expect("projector drain completes after release")
         .expect("run task joins")
         .expect("WAL-authoritative run succeeds");
     assert_eq!(summary.reason, RunFinishReason::Completed);
@@ -1330,8 +1333,8 @@ async fn non_budgeted_tool_loop_keeps_per_batch_projection_schedule() {
     // On this single-threaded runtime, finish_run's send fits in the output channel and
     // the run body enqueues the terminal head before the collector can release the write.
     // Thus both the second batch and the terminal arrive while the first write is held.
-    let summary = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+    let summary = broca_test_support::event_timeout(
+        "held projection run completes",
         run_loop_with_store(
             req,
             &provider,
@@ -1342,6 +1345,7 @@ async fn non_budgeted_tool_loop_keeps_per_batch_projection_schedule() {
             Some(store.clone() as Arc<dyn broca_core::SessionStore>),
             &tx,
         ),
+        || format!("projection_calls={}", store.projection_calls()),
     )
     .await;
     drop(release);

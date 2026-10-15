@@ -901,14 +901,21 @@ fn receipt(frame: &Frame) -> Option<cortexkit_role_llm_runner::send::Delivered> 
 /// broca never answers `pending` or `unknown`, only absent until a durable step has rendered
 /// the steer.
 async fn retry_until_receipted(rig: &mut Rig, send_id: &str, prompt: &str) -> Frame {
-    for _ in 0..500 {
-        let reply = rig.send(send_id, prompt, Some("steer")).await;
-        if receipt(&reply).is_some() {
-            return reply;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("no retry of {send_id} ever carried a delivery receipt");
+    let path = rig.dir.clone();
+    broca_test_support::wait_for(
+        "durable steer delivery receipt",
+        async {
+            loop {
+                let reply = rig.send(send_id, prompt, Some("steer")).await;
+                if receipt(&reply).is_some() {
+                    return reply;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || format!("send_id={send_id}, state_root={}", path.display()),
+    )
+    .await
 }
 
 /// A steer's retry while the run it joined is still running: no receipt while the run is
@@ -1425,12 +1432,25 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
             .read_page_with_watermark(&rig.session, None, 1, broca_core::context::ReadView::Raw)
             .unwrap()
     };
-    for _ in 0..500 {
-        if projected().watermark_seq as usize >= rig.records().len() - 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "title projected through WAL head",
+        async {
+            loop {
+                if projected().watermark_seq as usize >= rig.records().len() - 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "watermark={}, records={}",
+                projected().watermark_seq,
+                rig.records().len()
+            )
+        },
+    )
+    .await;
     let page = projected();
     assert!(
         page.watermark_seq as usize >= rig.records().len() - 1,

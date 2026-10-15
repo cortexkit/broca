@@ -158,8 +158,8 @@ fn concurrent_membership_misses_build_once_without_blocking_other_containers() {
             pending_entry.members.get_or_init(|| {
                 started_tx.send(()).unwrap();
                 done_rx
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
+                    .recv_timeout(broca_test_support::EVENT_HANG_GUARD)
+                    .expect("another container lookup releases the held membership initializer");
                 None
             });
         });

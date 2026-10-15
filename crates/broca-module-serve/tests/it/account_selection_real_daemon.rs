@@ -947,16 +947,17 @@ impl Rig {
     }
 
     async fn wait_held(&self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while self.upstream.held.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < deadline, "provider was never held");
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        broca_test_support::wait_until("provider call held", || async {
+            let held = self.upstream.held.load(std::sync::atomic::Ordering::SeqCst);
+            (held > 0)
+                .then_some(())
+                .ok_or_else(|| format!("held_calls={held}"))
+        })
+        .await;
     }
 
     async fn finished_run(&self, name: &str, id: &str) -> Vec<FramedRecord> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
+        broca_test_support::wait_until(&format!("terminal for {name}/{id}"), || async {
             let frames = self.frames(name);
             let mut in_run = false;
             let done = frames.iter().any(|f| match &f.record {
@@ -968,14 +969,13 @@ impl Rig {
                 _ => false,
             });
             if done {
-                return frames;
+                return Ok(frames);
             }
-            assert!(
-                Instant::now() < deadline,
-                "{id}: no terminal in {frames:#?}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            Err(broca_test_support::record_kinds(
+                frames.iter().map(|f| &f.record),
+            ))
+        })
+        .await
     }
 
     /// The session's WAL bytes, empty when it has no WAL yet.
@@ -1082,18 +1082,17 @@ impl Rig {
         what: &str,
         done: impl Fn(&WalRecord) -> bool,
     ) -> Vec<FramedRecord> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
+        broca_test_support::wait_until(&format!("{name}: {what}"), || async {
             let frames = self.frames(name);
             if frames.iter().any(|frame| done(&frame.record)) {
-                return frames;
+                Ok(frames)
+            } else {
+                Err(broca_test_support::record_kinds(
+                    frames.iter().map(|f| &f.record),
+                ))
             }
-            assert!(
-                Instant::now() < deadline,
-                "{name}: no {what} in {frames:#?}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        })
+        .await
     }
 
     async fn finished(&self, name: &str) -> Vec<FramedRecord> {
@@ -1105,21 +1104,28 @@ impl Rig {
 
     /// Wait until routing has every report kind in `kinds` for `admission_id`.
     async fn reports(&self, admission_id: &str, kinds: &[&str]) -> Vec<(String, String, Value)> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let seen = self.routing.for_admission(admission_id);
-            let have: Vec<&str> = seen.iter().map(|(_, kind, _)| kind.as_str()).collect();
-            if kinds.iter().all(|kind| have.contains(kind)) {
-                // Long enough for an unexpected extra report to arrive as well.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                return self.routing.for_admission(admission_id);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{admission_id}: reports {have:?}, want {kinds:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        broca_test_support::wait_for(
+            "routing report kinds",
+            async {
+                loop {
+                    let seen = self.routing.for_admission(admission_id);
+                    let have: Vec<&str> = seen.iter().map(|(_, kind, _)| kind.as_str()).collect();
+                    if kinds.iter().all(|kind| have.contains(kind)) {
+                        // Long enough for an unexpected extra report to arrive as well.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        return self.routing.for_admission(admission_id);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+            || {
+                format!(
+                    "reports={:?}, expected={kinds:?}",
+                    self.routing.for_admission(admission_id)
+                )
+            },
+        )
+        .await
     }
 
     async fn broca_metrics(&self) -> Value {
@@ -1426,17 +1432,15 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     rig.routing.set(RoutingMode::Disabled);
     // The pause is durable before the session's actor has seen its run end; a retry sent in
     // between would join the still-active run instead of resuming it.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !matches!(
-        client.status().await,
-        Ok(broca_module::serve::StatusResponse::Idle)
-    ) {
-        assert!(
-            Instant::now() < deadline,
-            "the paused session never went idle"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    broca_test_support::wait_until("paused session becomes idle", || async {
+        let status = client.status().await;
+        if matches!(status, Ok(broca_module::serve::StatusResponse::Idle)) {
+            Ok(())
+        } else {
+            Err(format!("{status:?}"))
+        }
+    })
+    .await;
     let resumed = send(&client, "send-login", None).await;
     assert_eq!(resumed, run_id);
     rig.finished("login").await;
@@ -1463,14 +1467,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let client = rig.client("crash").await;
         let run_id = send(&client, "send-crash", None).await;
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while rig.upstream.held.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "the run never reached the provider"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        rig.wait_held().await;
         let broca_pids = children(rig.daemon.id().unwrap());
         assert!(!broca_pids.is_empty(), "broca is supervised by the daemon");
         for pid in &broca_pids {
@@ -1547,14 +1544,13 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
         refused.to_string().contains("account_selection_refused"),
         "{refused}"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while rig.vault.list_calls() == lists_before {
-        assert!(
-            Instant::now() < deadline,
-            "broca never re-listed after the not_found"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_until("vault re-list after not_found", || async {
+        let calls = rig.vault.list_calls();
+        (calls != lists_before)
+            .then_some(())
+            .ok_or_else(|| format!("list_calls={calls}, before={lists_before}"))
+    })
+    .await;
     rig.vault.not_found.lock().unwrap().clear();
     let run_id = send(&client, "send-relisted", None).await;
     let frames = rig.finished("relisted").await;
@@ -1636,14 +1632,15 @@ async fn caller_conversation_key_reaches_routing_and_retry_identity() {
     let id = first["run_id"].as_str().unwrap();
     let frames = rig.finished_run("keyed", id).await;
     let client = rig.client("keyed").await;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !matches!(
-        client.status().await,
-        Ok(broca_module::serve::StatusResponse::Idle)
-    ) {
-        assert!(Instant::now() < deadline, "finished run never became idle");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_until("finished keyed run becomes idle", || async {
+        let status = client.status().await;
+        if matches!(status, Ok(broca_module::serve::StatusResponse::Idle)) {
+            Ok(())
+        } else {
+            Err(format!("{status:?}"))
+        }
+    })
+    .await;
     rig.assert_affinity(id, "consult:42:subject:phase");
     assert_eq!(
         selection(&frames)["account_decision"]["conversation_key_source"],
@@ -1925,17 +1922,15 @@ async fn later_send_inherits_conversation_key_after_restart() {
         // A durable terminal precedes the actor's idle transition; wait for admission readiness
         // so the next send starts an episode instead of joining the pending queue.
         let client = rig.client(name).await;
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(
-            client.status().await,
-            Ok(broca_module::serve::StatusResponse::Idle)
-        ) {
-            assert!(
-                Instant::now() < deadline,
-                "session did not become idle before {send_id}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        broca_test_support::wait_until(&format!("session idle before {send_id}"), || async {
+            let status = client.status().await;
+            if matches!(status, Ok(broca_module::serve::StatusResponse::Idle)) {
+                Ok(())
+            } else {
+                Err(format!("{status:?}"))
+            }
+        })
+        .await;
         let extra = key
             .map(|key| json!({"conversation_key": key}))
             .unwrap_or_else(|| json!({}));
@@ -2017,15 +2012,18 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
             .map(String::as_str),
         Some("oauth:anthropic:acct-b")
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Paused { .. }) {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "run.status never paused");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "paused_auth_routed_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Paused { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     let bytes = serde_json::to_vec(&status).unwrap();
     use sha2::{Digest, Sha256};
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2064,18 +2062,18 @@ async fn session_too_large_status_matches_golden_through_real_serve() {
     assert!(
         matches!(&frames.last().unwrap().record, WalRecord::RunFinished { error: Some(error), .. } if error.provider_code.as_deref() == Some("session_too_large"))
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run.status never reached the size-limit error"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "session_too_large_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["error"]["provider_code"], "session_too_large");
     assert_eq!(value["error"]["class"], "permanent");
@@ -2120,18 +2118,18 @@ async fn output_ceiling_status_matches_golden_through_real_serve() {
         1
     );
     assert_eq!(rig.upstream.authorized_as.lock().unwrap().len(), 1);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run.status never reached the output-ceiling error"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "output_ceiling_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["state"], "error");
     assert_eq!(value["error"]["class"], "permanent");
@@ -2176,18 +2174,18 @@ async fn context_overflow_anthropic_status_matches_golden_through_real_serve() {
         1
     );
     assert_eq!(rig.upstream.authorized_as.lock().unwrap().len(), 1);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run.status never reached the context-overflow error"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "context_overflow_anthropic_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["state"], "error");
     assert_eq!(value["error"]["class"], "context_overflow");
@@ -2235,18 +2233,18 @@ async fn billing_exhausted_xai_status_matches_golden_through_real_serve() {
             .count(),
         1
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run.status never reached the billing-exhausted error"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "billing_exhausted_xai_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["state"], "error");
     assert_eq!(value["error"]["class"], "permanent");
@@ -2297,18 +2295,18 @@ async fn pinned_anthropic_apikey_error_status(rig: &Rig, name: &str) -> (Value, 
             .all(|id| id == "apikey:anthropic:work"),
         "every provider call carried the pinned key"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run.status never reached the {name} error"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "pinned_anthropic_apikey_error_status: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     // Neither the out-of-credit 400 nor the rate-limit 429 says the key itself is invalid, so the
     // daemon must not report it to the vault: the only vault calls are credential list/get reads.
     assert!(
@@ -2433,18 +2431,18 @@ async fn account_limit_exhausted_code_assist_status_matches_golden_through_real_
             .count(),
         1
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run.status never reached the Code Assist account-limit error"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "account_limit_exhausted_code_assist_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["state"], "error");
     assert_eq!(value["error"]["class"], "transient");
@@ -2487,15 +2485,18 @@ async fn paused_auth_unrouted_status_reports_the_frozen_default_path() {
         })
         .await;
     assert_eq!(selection(&frames)["account_decision"]["path"], "disabled");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let status = client.run_status(&run_id).await.unwrap();
-        if matches!(status, broca_wire::RunStatusResponse::Paused { .. }) {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "run.status never paused");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = broca_test_support::wait_until(
+        "paused_auth_unrouted_status_reports_the_frozen_default_path: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Paused { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
     assert_eq!(
         serde_json::to_value(status).unwrap()["auth"],
         json!({"credential_id": "oauth:anthropic", "path": "default"})

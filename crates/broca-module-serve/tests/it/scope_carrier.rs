@@ -406,39 +406,61 @@ impl Rig {
 
     /// [`Rig::send_ok_once_idle`], returning the admitted reply's frame.
     async fn send_once_idle(&mut self, channel: u16, send_id: &str) -> Frame {
-        for _ in 0..200 {
-            let reply = self.send(channel, send_id).await;
-            if reply.header.ty == FrameType::Error {
-                let (code, body) = error_body(&reply);
-                assert_eq!(code, "scope_freeze_busy", "{body}");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-            return reply;
-        }
-        panic!("the session never became idle");
+        let wal_path = self.wal_path.clone();
+        broca_test_support::wait_for(
+            "scope freeze admits send after idle",
+            async {
+                loop {
+                    let reply = self.send(channel, send_id).await;
+                    if reply.header.ty == FrameType::Error {
+                        let (code, body) = error_body(&reply);
+                        assert_eq!(code, "scope_freeze_busy", "{body}");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    return reply;
+                }
+            },
+            || {
+                format!(
+                    "WAL bytes={:?}",
+                    std::fs::metadata(&wal_path).map(|m| m.len())
+                )
+            },
+        )
+        .await
     }
 
     /// Wait until the gated first run's provider has reached its gate.
     async fn wait_until_held(&self) {
-        tokio::time::timeout(Duration::from_secs(20), self.held.notified())
-            .await
-            .expect("the first run's provider never reached its gate within 20 s");
+        broca_test_support::event_timeout(
+            "first provider reaches held gate",
+            self.held.notified(),
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
+        .expect("the first run's provider reaches its gate");
     }
 
     /// Wait until the WAL on disk holds the first run's step start.
     async fn wait_for_step_started(&self) {
-        for _ in 0..2_000 {
-            if self
-                .records()
-                .iter()
-                .any(|record| matches!(record, WalRecord::StepStarted { .. }))
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the first run's step start never reached the WAL within 20 s");
+        broca_test_support::wait_for(
+            "durable StepStarted",
+            async {
+                loop {
+                    if self
+                        .records()
+                        .iter()
+                        .any(|record| matches!(record, WalRecord::StepStarted { .. }))
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
     }
 
     fn wal_bytes(&self) -> Vec<u8> {
@@ -454,23 +476,29 @@ impl Rig {
     }
 
     async fn wait_for_finished(&self, n: usize) -> Vec<WalRecord> {
-        for _ in 0..500 {
-            let records = self.records();
-            let finished = records
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record,
-                        WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
-                    )
-                })
-                .count();
-            if finished >= n {
-                return records;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("{n} episodes never ended: {:?}", self.records());
+        broca_test_support::wait_for(
+            "durable RunFinished or RunPaused",
+            async {
+                loop {
+                    let records = self.records();
+                    let finished = records
+                        .iter()
+                        .filter(|record| {
+                            matches!(
+                                record,
+                                WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
+                            )
+                        })
+                        .count();
+                    if finished >= n {
+                        return records;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
     }
 
     fn floor(&self) -> Option<String> {

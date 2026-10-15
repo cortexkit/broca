@@ -1086,26 +1086,30 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
         .subscribe(broca_module::SubscribeFrom::Start)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let mut diagnostic = None;
-        while let Some(body) = stream.next().await.unwrap() {
-            let event = broca_wire::decode_subscribe_event(&body).unwrap();
-            if let broca_wire::SubscribeEvent::Control { unit, .. } = event {
-                match unit {
-                    broca_protocol::ControlUnit::Error { error } => {
-                        diagnostic = Some(serde_json::to_value(error).unwrap());
+    broca_test_support::event_timeout(
+        "crash-orphan terminal subscription replay",
+        async {
+            let mut diagnostic = None;
+            while let Some(body) = stream.next().await.unwrap() {
+                let event = broca_wire::decode_subscribe_event(&body).unwrap();
+                if let broca_wire::SubscribeEvent::Control { unit, .. } = event {
+                    match unit {
+                        broca_protocol::ControlUnit::Error { error } => {
+                            diagnostic = Some(serde_json::to_value(error).unwrap());
+                        }
+                        broca_protocol::ControlUnit::RunFinished { reason, .. } => {
+                            assert_eq!(reason, RunFinishReason::Interrupted);
+                            assert_eq!(diagnostic.as_ref(), Some(&value["error"]));
+                            return;
+                        }
+                        _ => {}
                     }
-                    broca_protocol::ControlUnit::RunFinished { reason, .. } => {
-                        assert_eq!(reason, RunFinishReason::Interrupted);
-                        assert_eq!(diagnostic.as_ref(), Some(&value["error"]));
-                        return;
-                    }
-                    _ => {}
                 }
             }
-        }
-        panic!("subscription ended without the interrupted terminal");
-    })
+            panic!("subscription ended without the interrupted terminal");
+        },
+        || format!("WAL directory={}", rig.wal_dir().display()),
+    )
     .await
     .expect("crash-orphan terminal replay timed out");
 
@@ -1122,25 +1126,22 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
         state, "interrupted",
         "the diagnostic must not reclassify the run index"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let facts: Vec<Value> = loop {
-        let mut stmt = db
-            .prepare("SELECT segment_json FROM export_facts WHERE run_id = ?1")
-            .unwrap();
-        let facts: Vec<Value> = stmt
-            .query_map([&run_id], |row| row.get::<_, String>(0))
-            .unwrap()
-            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
-            .collect();
-        if !facts.is_empty() {
-            break facts;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "crash-orphan export facts were not persisted"
-        );
-        sleep(Duration::from_millis(25)).await;
-    };
+    let facts: Vec<Value> =
+        broca_test_support::wait_until("crash-orphan export facts persisted", || async {
+            let mut stmt = db
+                .prepare("SELECT segment_json FROM export_facts WHERE run_id = ?1")
+                .unwrap();
+            let facts: Vec<Value> = stmt
+                .query_map([&run_id], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+                .collect();
+            if !facts.is_empty() {
+                return Ok(facts);
+            }
+            Err(format!("run_id={run_id}, export_facts={}", facts.len()))
+        })
+        .await;
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0]["terminal_reason"], "interrupted");
     assert!(

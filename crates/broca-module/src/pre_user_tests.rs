@@ -326,11 +326,15 @@ impl Fixture {
         );
     }
     async fn idle(&self) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while self.registry.route_status(&self.key).await.unwrap() != LineageStatus::Idle {
-                tokio::task::yield_now().await;
-            }
-        })
+        broca_test_support::event_timeout(
+            "idle",
+            async {
+                while self.registry.route_status(&self.key).await.unwrap() != LineageStatus::Idle {
+                    tokio::task::yield_now().await;
+                }
+            },
+            || format!("slot={:?}", self.registry.slot_state(&self.key)),
+        )
         .await
         .expect("run completes");
     }

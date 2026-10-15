@@ -335,7 +335,11 @@ fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
 async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<ControlUnit> {
     let mut units = Vec::new();
     let mut last_cursor: Option<broca_core::Cursor> = None;
-    while let Ok(Some(d)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    while let Ok(Some(d)) =
+        broca_test_support::event_timeout("collect_until_terminal", rx.recv(), || {
+            format!("collected_units={}", units.len())
+        })
+        .await
     {
         match d {
             Delivery::Control(event) => {
@@ -561,15 +565,22 @@ async fn live_attach_skips_idle_history_and_receives_the_next_run() {
         advance.notify_one();
         emitted.notified().await;
     }
-    for _ in 0..100 {
-        if matches!(
-            registry.route_status(&key).await.unwrap(),
-            LineageStatus::Idle
-        ) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "history run goes idle",
+        async {
+            loop {
+                if matches!(
+                    registry.route_status(&key).await.unwrap(),
+                    LineageStatus::Idle
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+        || format!("slot={:?}", registry.slot_state(&key)),
+    )
+    .await;
     assert!(
         matches!(
             registry.route_status(&key).await.unwrap(),

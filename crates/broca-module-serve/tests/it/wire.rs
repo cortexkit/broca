@@ -1780,14 +1780,26 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
     assert_eq!(send.header.ty, FrameType::Response);
 
     let mut page = None;
-    for _ in 0..200 {
-        let candidate = store.read_export_page(None, 10).unwrap();
-        if !candidate.facts.is_empty() {
-            page = Some(candidate);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    broca_test_support::wait_for(
+        "retired_usage_export_is_unknown_and_terminal_facts_remain",
+        async {
+            loop {
+                let candidate = store.read_export_page(None, 10).unwrap();
+                if !candidate.facts.is_empty() {
+                    page = Some(candidate);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || {
+            format!(
+                "export_facts={:?}",
+                store.read_export_page(None, 10).map(|p| p.facts.len())
+            )
+        },
+    )
+    .await;
     let page = page.expect("terminal emission should publish one usage fact");
     assert_eq!(page.facts.len(), 1);
     assert_eq!(page.facts[0].segment.charge_basis, ChargeBasis::Unknown);
@@ -3748,12 +3760,19 @@ async fn same_send_id_same_prompt_reuses_one_episode() {
     assert_eq!(terminal["usage"]["input_tokens"], 11);
     assert_eq!(terminal["usage"]["output_tokens"], 4);
 
-    for _ in 0..40 {
-        if reg.slot_state(&session).is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "same_send_id_same_prompt_reuses_one_episode",
+        async {
+            loop {
+                if reg.slot_state(&session).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || format!("slot={:?}", reg.slot_state(&session)),
+    )
+    .await;
     assert_eq!(
         reg.slot_state(&session),
         None,
@@ -3971,23 +3990,34 @@ async fn chatgpt_needs_reauth_pauses_and_resumes_original_send() {
         wait_for_completed_run(&mut creader, &mut cwriter, 7, &original_run_id, 200).await;
     assert_eq!(terminal["state"], "completed");
 
-    for _ in 0..80 {
-        let records = wal.read_records(&session).unwrap();
-        let record_values = records
-            .iter()
-            .map(|frame| frame.record.clone())
-            .collect::<Vec<_>>();
-        let queued_called = {
-            let calls = provider_calls.lock().unwrap();
-            calls
-                .iter()
-                .any(|(run_id, count)| run_id != &original_run_id && *count == 1)
-        };
-        if broca_core::pending_submissions(&record_values).is_empty() && queued_called {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_for(
+        "chatgpt_needs_reauth_pauses_and_resumes_original_send",
+        async {
+            loop {
+                let records = wal.read_records(&session).unwrap();
+                let record_values = records
+                    .iter()
+                    .map(|frame| frame.record.clone())
+                    .collect::<Vec<_>>();
+                let queued_called = {
+                    let calls = provider_calls.lock().unwrap();
+                    calls
+                        .iter()
+                        .any(|(run_id, count)| run_id != &original_run_id && *count == 1)
+                };
+                if broca_core::pending_submissions(&record_values).is_empty() && queued_called {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || {
+            wal.read_records(&session)
+                .map(|frames| broca_test_support::record_kinds(frames.iter().map(|f| &f.record)))
+                .unwrap_or_else(|e| format!("WAL read: {e}"))
+        },
+    )
+    .await;
 
     {
         let calls = provider_calls.lock().unwrap();
@@ -4050,17 +4080,28 @@ async fn chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run() {
         first,
         SendResponse::Active { run_id, .. } if run_id == "run-chatgpt-reauth"
     ));
-    for _ in 0..100 {
-        if wal.read_records(&session).unwrap().iter().any(|frame| {
-            matches!(
-                &frame.record,
-                WalRecord::RunPaused { run_id, .. } if run_id.0 == "run-chatgpt-reauth"
-            )
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run",
+        async {
+            loop {
+                if wal.read_records(&session).unwrap().iter().any(|frame| {
+                    matches!(
+                        &frame.record,
+                        WalRecord::RunPaused { run_id, .. } if run_id.0 == "run-chatgpt-reauth"
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            wal.read_records(&session)
+                .map(|frames| broca_test_support::record_kinds(frames.iter().map(|f| &f.record)))
+                .unwrap_or_else(|e| format!("WAL read: {e}"))
+        },
+    )
+    .await;
     let paused_records = wal.read_records(&session).unwrap();
     assert!(paused_records
         .iter()
@@ -4081,18 +4122,29 @@ async fn chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run() {
         0,
         "pause-only construction must not call the provider"
     );
-    for _ in 0..100 {
-        if matches!(
-            registry
-                .run_status(&session, RunId("run-chatgpt-reauth".into()))
-                .await
-                .unwrap(),
-            RunStatusResponse::Paused { .. }
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run",
+        async {
+            loop {
+                if matches!(
+                    registry
+                        .run_status(&session, RunId("run-chatgpt-reauth".into()))
+                        .await
+                        .unwrap(),
+                    RunStatusResponse::Paused { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            wal.read_records(&session)
+                .map(|frames| broca_test_support::record_kinds(frames.iter().map(|f| &f.record)))
+                .unwrap_or_else(|e| format!("WAL read: {e}"))
+        },
+    )
+    .await;
     assert!(matches!(
         registry
             .run_status(&session, RunId("run-chatgpt-reauth".into()))
@@ -4107,18 +4159,29 @@ async fn chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run() {
         resumed,
         SendResponse::Active { run_id, .. } if run_id == "run-chatgpt-reauth"
     ));
-    for _ in 0..100 {
-        if provider_calls
-            .lock()
-            .unwrap()
-            .get("run-chatgpt-reauth")
-            .copied()
-            == Some(1)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run",
+        async {
+            loop {
+                if provider_calls
+                    .lock()
+                    .unwrap()
+                    .get("run-chatgpt-reauth")
+                    .copied()
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            wal.read_records(&session)
+                .map(|frames| broca_test_support::record_kinds(frames.iter().map(|f| &f.record)))
+                .unwrap_or_else(|e| format!("WAL read: {e}"))
+        },
+    )
+    .await;
     assert_eq!(
         provider_calls
             .lock()
@@ -4176,25 +4239,40 @@ async fn queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned() {
     assert!(matches!(queued, SendResponse::Pending { .. }));
     first_run_release.notify_one();
 
-    for _ in 0..100 {
-        let records = wal.read_records(&session).unwrap();
-        if records.iter().any(|frame| {
+    // This waits for an event, not a speed: the queued run starts only after the first run's
+    // records are fsynced on a real file WAL, and one fsync on a busy CI disk has taken over a
+    // second. The bound is a hang guard, so a run that never pauses still fails by name.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let paused = |records: &[FramedRecord]| {
+        records.iter().any(|frame| {
             matches!(
                 &frame.record,
                 WalRecord::RunPaused { run_id, .. } if run_id.0 == "run-queued-reauth"
             )
-        }) {
-            break;
+        })
+    };
+    let records = loop {
+        let records = wal.read_records(&session).unwrap();
+        if paused(&records) || std::time::Instant::now() >= deadline {
+            break records;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let records = wal.read_records(&session).unwrap();
-    assert!(records.iter().any(|frame| {
-        matches!(
-            &frame.record,
-            WalRecord::RunPaused { run_id, .. } if run_id.0 == "run-queued-reauth"
-        )
-    }));
+    };
+    assert!(
+        paused(&records),
+        "queued run never paused for reauth; records: {:?}",
+        records
+            .iter()
+            .map(|frame| {
+                let debug = format!("{:?}", frame.record);
+                debug
+                    .split([' ', '(', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    );
     assert!(!records.iter().any(|frame| {
         matches!(
             &frame.record,
@@ -4214,18 +4292,29 @@ async fn queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned() {
         0,
         "the queued run pauses before any provider call"
     );
-    for _ in 0..100 {
-        if matches!(
-            registry
-                .run_status(&session, RunId("run-queued-reauth".into()))
-                .await
-                .unwrap(),
-            RunStatusResponse::Paused { .. }
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned",
+        async {
+            loop {
+                if matches!(
+                    registry
+                        .run_status(&session, RunId("run-queued-reauth".into()))
+                        .await
+                        .unwrap(),
+                    RunStatusResponse::Paused { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            wal.read_records(&session)
+                .map(|frames| broca_test_support::record_kinds(frames.iter().map(|f| &f.record)))
+                .unwrap_or_else(|e| format!("WAL read: {e}"))
+        },
+    )
+    .await;
 
     credential_ready.store(true, Ordering::SeqCst);
     let resumed = registry.send(queued_request).await.unwrap();
@@ -4233,18 +4322,29 @@ async fn queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned() {
         resumed,
         SendResponse::Active { run_id, .. } if run_id == "run-queued-reauth"
     ));
-    for _ in 0..100 {
-        if provider_calls
-            .lock()
-            .unwrap()
-            .get("run-queued-reauth")
-            .copied()
-            == Some(1)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    broca_test_support::wait_for(
+        "queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned",
+        async {
+            loop {
+                if provider_calls
+                    .lock()
+                    .unwrap()
+                    .get("run-queued-reauth")
+                    .copied()
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || {
+            wal.read_records(&session)
+                .map(|frames| broca_test_support::record_kinds(frames.iter().map(|f| &f.record)))
+                .unwrap_or_else(|e| format!("WAL read: {e}"))
+        },
+    )
+    .await;
     assert_eq!(
         provider_calls
             .lock()
@@ -5401,18 +5501,24 @@ impl PrincipalRig {
     /// Wait until `n` episodes have a durable terminal. Read from the WAL, so a queued send
     /// is waited for without asking the wire about a run that may not have started yet.
     async fn wait_for_finished(&self, n: usize) -> Vec<WalRecord> {
-        for _ in 0..400 {
-            let records = self.records();
-            let finished = records
-                .iter()
-                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-                .count();
-            if finished >= n {
-                return records;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("{n} episodes never finished: {:?}", self.records());
+        broca_test_support::wait_for(
+            "wait_for_finished",
+            async {
+                loop {
+                    let records = self.records();
+                    let finished = records
+                        .iter()
+                        .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
+                        .count();
+                    if finished >= n {
+                        return records;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
     }
 
     async fn finish(self) {
@@ -6166,29 +6272,48 @@ impl SendKeyRig {
     }
 
     async fn wait_for_finished(&self, n: usize) -> Vec<WalRecord> {
-        for _ in 0..400 {
-            let records = self.records();
-            let finished = records
-                .iter()
-                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-                .count();
-            if finished >= n {
-                return records;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("{n} episodes never finished: {:?}", self.records());
+        broca_test_support::wait_for(
+            "wait_for_finished",
+            async {
+                loop {
+                    let records = self.records();
+                    let finished = records
+                        .iter()
+                        .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
+                        .count();
+                    if finished >= n {
+                        return records;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || broca_test_support::record_kinds(self.records()),
+        )
+        .await
     }
 
     /// Drop every piece of in-memory state, once no actor holds the session (so the next
     /// process can take its lease), and return the directory the restart reopens.
     async fn crash(self) -> std::path::PathBuf {
-        for _ in 0..400 {
-            if self.registry.slot_state(&self.session).is_none() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        broca_test_support::wait_for(
+            "crash",
+            async {
+                loop {
+                    if self.registry.slot_state(&self.session).is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || {
+                format!(
+                    "slot={:?}; {}",
+                    self.registry.slot_state(&self.session),
+                    broca_test_support::record_kinds(self.records())
+                )
+            },
+        )
+        .await;
         assert_eq!(
             self.registry.slot_state(&self.session),
             None,
