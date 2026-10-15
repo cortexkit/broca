@@ -104,10 +104,40 @@ pub fn install_verified(
                     None => Vec::new(),
                 }
             };
-            let imported = broca_core::imported_run_ids(&incoming, &local);
+            let imported: std::collections::BTreeSet<_> =
+                broca_core::imported_run_ids(&incoming, &local)
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect();
+            let mut by_session = std::collections::BTreeMap::new();
+            // Re-keying preserves historical RunStarted triples. Billing uses
+            // those triples, not the address at which this cut is installed.
+            for frame in &incoming {
+                if let broca_wal::WalRecord::RunStarted {
+                    session, run_id, ..
+                } = &frame.record
+                {
+                    if imported.contains(&run_id.0) {
+                        by_session
+                            .entry((
+                                session.project_root.clone(),
+                                session.harness.clone(),
+                                session.session.clone(),
+                            ))
+                            .or_insert_with(|| (session, Vec::new()))
+                            .1
+                            .push(run_id.clone());
+                    }
+                }
+            }
             export
-                .record_imported_runs(item.session, cut_id, &imported)
+                .record_imported_runs(item.session, cut_id, &[])
                 .map_err(unavailable)?;
+            for (session, imported) in by_session.into_values() {
+                export
+                    .record_imported_runs(session, cut_id, &imported)
+                    .map_err(unavailable)?;
+            }
             let parent = item
                 .live
                 .parent()

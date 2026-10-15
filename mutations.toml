@@ -9024,8 +9024,8 @@ target = "--lib"
 test_file = "crates/broca-module/src/move_install/tests.rs"
 expect_red = ["move_install::tests::billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable"]
 file = "crates/broca-module/src/move_install.rs"
-old = '.record_imported_runs(item.session, cut_id, &imported)'
-new = '.record_imported_runs(item.session, cut_id, &[]) /* NON-VACUITY BREAK: omit imported ids */'
+old = '.record_imported_runs(session, cut_id, &imported)'
+new = '.record_imported_runs(session, cut_id, &[]) /* NON-VACUITY BREAK: omit imported ids */'
 
 [[control]]
 id = "move-receiver-digest"
@@ -13193,3 +13193,16 @@ new = '''    pub async fn wait_idle(&mut self) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let wal_path = self.wal_path.clone();'''
+
+[[control]]
+id = "agent-data-historical-run-billing-identity"
+guards = "each imported run's floor uses its RunStarted identity, including historical re-keyed triples"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/move_install/tests.rs"
+expect_red = ["move_install::tests::mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_run"]
+only = false
+file = "crates/broca-module/src/move_install.rs"
+old = '.record_imported_runs(session, cut_id, &imported)'
+new = '.record_imported_runs(item.session, cut_id, &imported) /* NON-VACUITY BREAK: file foreign history under the installation identity */'
