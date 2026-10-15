@@ -1,5 +1,10 @@
 //! Scoped approval gates through the production broca process and a real ck-subc daemon.
-//! Scripted providers log route operations; assertions use those logs and durable WAL order.
+//! A scripted Cingulate consent service fills checked-in wire examples with each call's
+//! tool identity and argument hash. The tests check that those fields bind the person's
+//! answer to the saved call, whose exact argument bytes reach the tool only after approval
+//! is durable. Consent issues no digest, so tool requests must omit approval_digest.
+//! Set CK_CINGULATE_BIN (or place .test-rigs/ck-cingulate) to test the real service;
+//! BROCA_REQUIRE_CINGULATE makes a missing build fail rather than skip.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,7 +28,12 @@ const OWNER: &str = "approval-owner";
 const TOOLS: &str = "approval-tools";
 const APPROVED_BYTES: &str = r#"{"a":2,"f":"approved","z":0.000001}"#;
 const QUESTION: &str = "el-scripted";
-const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn consent_vector(path: &str) -> Value {
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../broca-subc/tests/fixtures/consent");
+    serde_json::from_slice(&std::fs::read(root.join(path)).unwrap()).unwrap()
+}
 
 struct Script {
     wal: broca_core::FileWalStore,
@@ -35,6 +45,7 @@ struct Script {
     answer: Mutex<Option<&'static str>>,
     withdraw_enabled: Mutex<bool>,
     expiry_ms: u64,
+    created_at_ms: u128,
 }
 impl Script {
     fn records(&self) -> Vec<FramedRecord> {
@@ -43,7 +54,7 @@ impl Script {
     fn log(&self, event: Value) {
         if !matches!(
             event["event"].as_str(),
-            Some("elicitation.answers" | "question_bind")
+            Some("consent.answers" | "question_bind")
         ) {
             println!("APPROVAL EVENT {event}");
         }
@@ -118,13 +129,15 @@ impl ModuleHandler for Tools {
                         ..
                     }
                 )));
-                assert!(frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent {approval_digest: Some(digest), ..} if digest == DIGEST)));
+                assert!(frames
+                    .iter()
+                    .any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { .. })));
                 assert!(
                     String::from_utf8_lossy(&body)
                         .contains(&format!("\"arguments\":{APPROVED_BYTES}")),
                     "approved bytes must cross the real route unchanged"
                 );
-                assert_eq!(request["approval_digest"], DIGEST);
+                assert!(request.get("approval_digest").is_none());
                 self.0.dispatches.lock().unwrap().push(body);
                 response(json!({"content":[{"type":"text","text":"worked"}], "isError":false}))
             }
@@ -133,9 +146,42 @@ impl ModuleHandler for Tools {
     }
 }
 
-struct Questions(Arc<Script>);
+struct Consent(Arc<Script>);
+
+impl Script {
+    fn consent_record(&self) -> Value {
+        let record = if self.answer.lock().unwrap().is_some() {
+            consent_vector("upstream/consent-requester-v2/cerebellum-ref-answers-reply.json")
+                ["result"]["records"][0]
+                .clone()
+        } else {
+            consent_vector("upstream/consent-requester-v2/cerebellum-ref-await-reply.json")
+                ["result"]
+                .clone()
+        };
+        let mut record = record;
+        let filings = self.filings.lock().unwrap();
+        let filing = filings.first().expect("card exists before readback");
+        for (key, value) in filing.as_object().unwrap() {
+            record[key] = value.clone();
+        }
+        record["elicitation_id"] = json!(QUESTION);
+        record["requester_label"] = json!("reserved:broca");
+        record["scope"] =
+            json!({"owner":{"kind":"reserved","module_id":OWNER},"ref":"approval-head"});
+        record["subject"] = json!({"agent_id":"approval-head","head_agent_id":"approval-head"});
+        record["created_at_ms"] = json!(self.created_at_ms);
+        record["expires_at_ms"] = json!(self.created_at_ms + u128::from(self.expiry_ms));
+        if let Some(choice) = *self.answer.lock().unwrap() {
+            record["answered_at_ms"] = json!(self.created_at_ms + 1);
+            record["state"] = json!("answered");
+            record["answered_choice_id"] = json!(choice);
+        }
+        record
+    }
+}
 #[async_trait::async_trait]
-impl ModuleHandler for Questions {
+impl ModuleHandler for Consent {
     async fn on_bind(
         &self,
         req: &subc_client_rs::RouteBindRequest,
@@ -158,60 +204,124 @@ impl ModuleHandler for Questions {
         self.0
             .log(json!({"event":request["method"], "params":params}));
         match request["method"].as_str().unwrap() {
-            "elicitation.request" => {
+            "consent.request" => {
                 let frames = self.0.records();
                 let prepared = frames
                     .iter()
                     .find(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
                     .expect("Prepared must be durable before filing");
-                assert!(params["call_key"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with(&format!(":{}", prepared.seq)));
-                assert_eq!(params["args_jcs"], APPROVED_BYTES);
+                let WalRecord::ToolCallDeferred {
+                    args_jcs,
+                    args_hash,
+                    ..
+                } = &prepared.record
+                else {
+                    unreachable!()
+                };
+                assert_eq!(args_jcs, APPROVED_BYTES);
+                let call_key = params["requester_ref"].as_str().unwrap();
+                assert!(call_key.ends_with(&format!(":{}", prepared.seq)));
+                assert_eq!(params["dedup_key"], call_key);
                 use sha2::{Digest, Sha256};
                 assert_eq!(
-                    params["args_hash"],
-                    format!("{:x}", Sha256::digest(APPROVED_BYTES.as_bytes()))
+                    args_hash,
+                    &format!("{:x}", Sha256::digest(APPROVED_BYTES.as_bytes()))
                 );
-                assert_eq!(params["executor"], "runner");
-                assert_eq!(params["module"], TOOLS);
-                assert_eq!(params["tool"], "work");
-                let mut filings = self.0.filings.lock().unwrap();
-                if let Some(first) = filings.first() {
-                    assert_eq!(
-                        params["call_key"], first["call_key"],
-                        "resume must re-file the same key"
-                    );
+                assert_eq!(params["args_digest"], *args_hash);
+                assert_eq!(
+                    params["binding"],
+                    json!({"args_hash":args_hash,"module":TOOLS,"tool":"work","schema_pin":null})
+                );
+                let mut expected = consent_vector("broca/held-call-request.json")["params"].clone();
+                for (key, value) in [
+                    ("requester_ref", json!(call_key)),
+                    ("dedup_key", json!(call_key)),
+                    ("binding", params["binding"].clone()),
+                    ("args_digest", json!(args_hash)),
+                    ("prompt", json!("Allow work?")),
+                    ("title", json!("Run work")),
+                    ("target", json!({"kind":"module","label":TOOLS})),
+                    ("material_damage", json!(false)),
+                    ("late_execution", json!("notify_only")),
+                    ("expires_in_ms", params["expires_in_ms"].clone()),
+                ] {
+                    expected[key] = value;
                 }
+                assert_eq!(
+                    *params, expected,
+                    "serve uses the held-call consent mapping, without identity or raw arguments"
+                );
+                assert!(params["expires_in_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms > 0 && ms <= self.0.expiry_ms));
+                let mut filings = self.0.filings.lock().unwrap();
+                assert!(
+                    filings.is_empty(),
+                    "a recorded card is read back, not re-filed"
+                );
                 filings.push(params.clone());
-                response(
-                    json!({"elicitation_id":QUESTION, "args_hash":params["args_hash"], "approval_digest":DIGEST}),
-                )
+                let mut reply =
+                    consent_vector("upstream/consent-requester-v2/cerebellum-reply.json");
+                reply["result"]["elicitation_id"] = json!(QUESTION);
+                response(reply)
             }
-            "elicitation.answers" => {
-                assert!(params["since"].is_null() || params["since"].is_object());
-                let answer = *self.0.answer.lock().unwrap();
-                let records = answer.map_or_else(Vec::new, |choice| {
-                    let filings = self.0.filings.lock().unwrap();
-                    filings.first().map_or_else(Vec::new, |filing| vec![json!({"state":"answered", "call_key":filing["call_key"],
-                        "elicitation_id":QUESTION, "answered_choice_id":choice, "approval_digest":DIGEST})])
-                });
-                response(
-                    json!({"records":records, "cursor":{"provider_incarnation":"scripted-core", "seq":u64::from(answer.is_some())}}),
-                )
+            "consent.answers" => {
+                assert!(params["since"].is_u64());
+                let answered = self.0.answer.lock().unwrap().is_some();
+                let mut reply = consent_vector(
+                    "upstream/consent-requester-v2/cerebellum-ref-answers-reply.json",
+                );
+                reply["result"]["records"] = if answered && params["since"].as_u64().unwrap() < 1 {
+                    json!([self.0.consent_record()])
+                } else {
+                    json!([])
+                };
+                reply["result"]["cursor"] = json!(u64::from(answered));
+                response(reply)
             }
-            "elicitation.withdraw" => {
+            "consent.get" | "consent.await" => {
+                assert_eq!(params["elicitation_id"], QUESTION);
+                assert!(self.0.records().iter().any(|frame| matches!(&frame.record,
+                    WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.as_deref() == Some(QUESTION)))),
+                    "card id is durable before get or await");
+                if request["method"] == "consent.await" {
+                    let wait_ms = params["timeout_ms"].as_u64().unwrap();
+                    assert!(wait_ms <= 120_000);
+                    let _ = tokio::time::timeout(Duration::from_millis(wait_ms), async {
+                        while self.0.answer.lock().unwrap().is_none() {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    })
+                    .await;
+                }
+                let record = self.0.consent_record();
+                self.0
+                    .log(json!({"event":"consent_reply", "record":record}));
+                response(json!({"result":record}))
+            }
+            "consent.withdraw" => {
                 assert_eq!(params["elicitation_id"], QUESTION);
                 if !*self.0.withdraw_enabled.lock().unwrap() {
                     return HandlerOutcome::Error {
-                        code: "elicitation_unavailable".into(),
+                        code: "consent_unavailable".into(),
                         message: "retry withdrawal on next boot".into(),
                     };
                 }
-                response(json!({"elicitation_id":QUESTION, "state":"withdrawn"}))
+                let mut record = self.0.consent_record();
+                record["state"] = json!("withdrawn");
+                response(json!({"result":record}))
             }
-            other => panic!("unexpected elicitation op: {other}"),
+            "consent.report_execution" => {
+                assert_eq!(params["elicitation_id"], QUESTION);
+                assert_eq!(params["execution"], "executed");
+                assert!(self
+                    .0
+                    .records()
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::ToolResult { .. })));
+                response(json!({"result":self.0.consent_record()}))
+            }
+            other => panic!("unexpected consent op: {other}"),
         }
     }
 }
@@ -267,11 +377,21 @@ impl Drop for Rig {
 }
 impl Rig {
     async fn start(tag: &str, provider: bool) -> Option<Self> {
+        Self::start_with_cingulate(tag, provider, None).await
+    }
+
+    async fn start_with_cingulate(
+        tag: &str,
+        provider: bool,
+        cingulate: Option<PathBuf>,
+    ) -> Option<Self> {
         let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         if !subc.exists() || !stub.exists() {
             assert!(
-                std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
+                std::env::var_os("BROCA_REQUIRE_SUBC").is_none()
+                    && (cingulate.is_none()
+                        || std::env::var_os("BROCA_REQUIRE_CINGULATE").is_none()),
                 "approval rig requires ck-subc and fake-aft-stub: {subc:?}, {stub:?}"
             );
             println!(
@@ -296,7 +416,15 @@ impl Rig {
             model_requests: Mutex::new(vec![]),
             answer: Mutex::new(None),
             withdraw_enabled: Mutex::new(true),
-            expiry_ms: if provider { 600_000 } else { 3_000 },
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            expiry_ms: if provider || cingulate.is_some() {
+                600_000
+            } else {
+                3_000
+            },
         });
         let (model_url, model_task) = model(script.clone()).await;
         let config_path = dir.join("config/cortexkit/subc.jsonc");
@@ -307,20 +435,25 @@ impl Rig {
         std::fs::write(
             &scopes,
             serde_json::to_vec(
-                &json!([{"ref":"approval-head", "scope_epoch":1, "kind":"head", "attributes":{},
+                &json!([{"ref":"approval-head", "scope_epoch":1, "kind":"head", "attributes":{"agent_id":"approval-head"},
             "carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]}]),
             )
             .unwrap(),
         )
         .unwrap();
         let module = broca_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-broca"), &dir);
-        let config = json!({"version":1, "scope_authority_owners":[OWNER], "modules":{
+        let mut config = json!({"version":1, "scope_authority_owners":[OWNER], "modules":{
             "broca":{"program":module, "args":[], "enabled":true, "reserved":true,
                 "env":{"BROCA_STATE_ROOT":dir.join("state"), "BROCA_PROVIDER_BASE_URL":model_url}},
             OWNER:{"program":stub, "args":[], "enabled":true, "reserved":true,
                 "env":{"FAKE_AFT_MODULE_ID":OWNER, "FAKE_AFT_SCOPE_SYNC_PATH":scopes, "FAKE_AFT_EVENTS_PATH":dir.join("owner-events.jsonl"),
                     "FAKE_AFT_LAUNCH_NONCE_PATH":dir.join("owner.nonce")}}
         }});
+        if let Some(binary) = cingulate {
+            let binary = broca_test_support::ckdev_binary(binary, &dir);
+            config["modules"]["cingulate"] =
+                json!({"program":binary,"args":[],"enabled":true,"reserved":true});
+        }
         std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let (subc, cli) = broca_test_support::ckdev_binary_with_companion(subc, cli, &dir);
         let daemon = broca_test_support::retry_executable_file_busy(|| {
@@ -381,13 +514,15 @@ impl Rig {
         rig.tasks
             .push(tokio::spawn(async move { serving.await.unwrap() }));
         if provider {
-            let manifest = ModuleManifest::builder("prefrontal-core", env!("CARGO_PKG_VERSION"))
+            let manifest = ModuleManifest::builder("cingulate", env!("CARGO_PKG_VERSION"))
                 .provides(vec![ProviderRole::ManagementSurface {
                     operations: [
-                        "elicitation.request",
-                        "elicitation.answers",
-                        "elicitation.get",
-                        "elicitation.withdraw",
+                        "consent.request",
+                        "consent.answers",
+                        "consent.get",
+                        "consent.withdraw",
+                        "consent.await",
+                        "consent.report_execution",
                     ]
                     .into_iter()
                     .map(|name| ManagementOperation {
@@ -405,7 +540,7 @@ impl Rig {
             let (_, serving) = subc_client_rs::serve_with_handle(
                 &rig.connection,
                 manifest,
-                Questions(rig.script.clone()),
+                Consent(rig.script.clone()),
             )
             .await
             .unwrap();
@@ -690,9 +825,9 @@ fn approved(rig: &Rig, records: &[WalRecord]) {
     let call: Value = serde_json::from_slice(&calls[0]).unwrap();
     assert_eq!(
         call["call_key"],
-        rig.script.filings.lock().unwrap()[0]["call_key"]
+        rig.script.filings.lock().unwrap()[0]["requester_ref"]
     );
-    assert_eq!(call["approval_digest"], DIGEST);
+    assert!(call.get("approval_digest").is_none());
     for predicate in [
         (|r: &WalRecord| matches!(r, WalRecord::ToolCallDeferred { .. })) as fn(&WalRecord) -> bool,
         |r| {
@@ -727,7 +862,7 @@ fn approved(rig: &Rig, records: &[WalRecord]) {
     let logs = rig.script.logs.lock().unwrap();
     let filing = logs
         .iter()
-        .position(|entry| entry["event"] == "elicitation.request")
+        .position(|entry| entry["event"] == "consent.request")
         .unwrap();
     let dispatch = logs
         .iter()
@@ -799,7 +934,16 @@ async fn graceful_restart_keeps_question_open_and_resumes_same_wait() {
         rig.filed(1).await;
         let first = rig.pending().await;
         rig.restart().await;
-        rig.filed(2).await;
+        wait("recorded card read back on resume", || {
+            let logs = rig.script.logs.lock().unwrap();
+            logs.iter().any(|entry| entry["event"] == "consent.get")
+                && logs
+                    .iter()
+                    .filter(|entry| entry["event"] == "consent.await")
+                    .count()
+                    >= 2
+        })
+        .await;
         let resumed = rig.pending().await;
         assert_eq!(
             first["awaiting_approval"], resumed["awaiting_approval"],
@@ -842,13 +986,13 @@ async fn graceful_restart_keeps_question_open_and_resumes_same_wait() {
             .lock()
             .unwrap()
             .iter()
-            .any(|entry| entry["event"] == "elicitation.withdraw"));
+            .any(|entry| entry["event"] == "consent.withdraw"));
         *rig.script.answer.lock().unwrap() = Some("approve");
         approved(&rig, &rig.finished().await);
         assert_eq!(
             rig.script.filings.lock().unwrap().len(),
-            2,
-            "one original filing and one re-filing"
+            1,
+            "resume must use the recorded card rather than file a second one"
         );
         let Some(control) = Rig::start("restart-control", true).await else {
             panic!("control requires the same daemon fixtures")
@@ -917,7 +1061,7 @@ async fn process_kill_seals_interrupted_and_boot_withdraws_terminal_debt() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|entry| entry["event"] == "elicitation.withdraw")
+                .any(|entry| entry["event"] == "consent.withdraw")
         })
         .await;
         let store = broca_store::SqliteStore::open(rig.dir.join("state/run-index.db")).unwrap();
@@ -973,7 +1117,7 @@ async fn process_kill_seals_interrupted_and_boot_withdraws_terminal_debt() {
         assert!(logs
             .iter()
             .skip(killed + 1)
-            .any(|entry| entry["event"] == "elicitation.withdraw"));
+            .any(|entry| entry["event"] == "consent.withdraw"));
         dump(&records);
     })
     .await
@@ -1036,4 +1180,62 @@ async fn unreachable_provider_closes_unavailable_after_prepared_without_dispatch
     })
     .await
     .expect("bounded real daemon unavailable scenario");
+}
+
+fn cingulate_build(path: Option<PathBuf>, required: bool) -> Result<Option<PathBuf>, String> {
+    match path.filter(|path| path.is_file()) {
+        Some(path) => Ok(Some(path.canonicalize().map_err(|error| error.to_string())?)),
+        None if required => Err("real Cingulate test requires a placed build: set CK_CINGULATE_BIN or place .test-rigs/ck-cingulate (BROCA_REQUIRE_CINGULATE is set)".into()),
+        None => Ok(None),
+    }
+}
+
+#[test]
+fn missing_cingulate_build_skips_only_when_not_required() {
+    assert_eq!(cingulate_build(None, false).unwrap(), None);
+    let error = cingulate_build(None, true).unwrap_err();
+    assert!(error.contains("CK_CINGULATE_BIN"), "{error}");
+    assert!(error.contains("BROCA_REQUIRE_CINGULATE"), "{error}");
+    let missing = broca_test_support::scratch_root().join("absent-cingulate-build");
+    assert!(!missing.exists());
+    assert_eq!(cingulate_build(Some(missing.clone()), false).unwrap(), None);
+    assert!(cingulate_build(Some(missing), true).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_cingulate_holds_and_withdraws_unanswered_call() {
+    let path = std::env::var_os("CK_CINGULATE_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../../.test-rigs/ck-cingulate{}",
+                std::env::consts::EXE_SUFFIX
+            )))
+        });
+    let Some(build) = cingulate_build(path, std::env::var_os("BROCA_REQUIRE_CINGULATE").is_some())
+        .unwrap_or_else(|error| {
+            panic!("real_cingulate_holds_and_withdraws_unanswered_call: {error}")
+        })
+    else {
+        println!("SKIP real_cingulate_holds_and_withdraws_unanswered_call: no placed Cingulate build (set CK_CINGULATE_BIN; BROCA_REQUIRE_CINGULATE makes this fail)");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let Some(rig) = Rig::start_with_cingulate("real-cingulate", false, Some(build)).await else {
+            println!("SKIP real_cingulate_holds_and_withdraws_unanswered_call: no SUBC fixtures (BROCA_REQUIRE_SUBC makes this fail)");
+            return;
+        };
+        let reply = rig.send(true).await.unwrap();
+        let run_id = reply["result"]["run_id"].as_str().unwrap();
+        wait("real Cingulate card recorded", || rig.records().iter().any(|record| matches!(record,
+            WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some())))).await;
+        assert!(rig.script.dispatches.lock().unwrap().is_empty());
+        let conn = rig.owner().await;
+        let route = rig.route(&conn, true).await;
+        conn.route_request(&route, serde_json::to_vec(&json!({"method":"run.cancel", "params":{"run_id":run_id}})).unwrap()).await.unwrap();
+        let records = rig.finished().await;
+        no_dispatch(&rig, &records);
+        wait("real Cingulate withdrawal acknowledged", || rig.records().iter().any(|record| matches!(record,
+            WalRecord::QuestionWithdrawalAcknowledged { answer: broca_wal::WithdrawalAnswer::Acknowledged, .. }))).await;
+    }).await.expect("bounded placed Cingulate scenario");
 }

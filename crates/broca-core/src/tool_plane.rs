@@ -123,6 +123,46 @@ pub enum DispatchResult {
     },
 }
 
+/// Run signals carried to an approved adapter's final physical-send boundary.
+/// Clones observe the same tokens while route and flow-control waits are pending.
+#[derive(Clone, Default)]
+pub struct DispatchSignals {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    stop: Option<tokio_util::sync::CancellationToken>,
+}
+impl DispatchSignals {
+    pub fn new(
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        stop: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            cancel: cancel.cloned(),
+            stop: stop.cloned(),
+        }
+    }
+    pub fn interrupted(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || self
+                .stop
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+    pub async fn cancelled(&self) {
+        async fn wait(token: Option<&tokio_util::sync::CancellationToken>) {
+            match token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            _ = wait(self.cancel.as_ref()) => {}
+            _ = wait(self.stop.as_ref()) => {}
+        }
+    }
+}
+
 /// The tool-dispatch contract. One batch = one assistant turn's tool calls.
 #[async_trait]
 pub trait ToolPlane: Send + Sync {
@@ -147,7 +187,12 @@ pub trait ToolPlane: Send + Sync {
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult;
 
     /// Dispatch approved arguments without parsing and reserializing them. Adapters must
-    /// preserve `args_jcs` verbatim and forward the Prepared key and approval digest.
+    /// preserve `args_jcs` verbatim and forward the deferred call's `call_key`. Core
+    /// verifies that the answer binds to these arguments; consent issues no tool token.
+    /// The legacy digest argument is empty, and adapters must omit `approval_digest`
+    /// from the tool request even when reading a WAL with an older digest.
+    /// Check `signals` after all pre-send waits, immediately before the physical
+    /// request. An interrupted unsent request returns `NotSent`, never Unknown.
     /// Until the daemon installs an approval-capable adapter, approval fails closed.
     async fn dispatch_approved(
         &self,
@@ -156,6 +201,7 @@ pub trait ToolPlane: Send + Sync {
         _args_jcs: &str,
         _call_key: &str,
         _approval_digest: &str,
+        _signals: &DispatchSignals,
     ) -> DispatchResult {
         DispatchResult::NotSent {
             reason: "approved_dispatch_unavailable".into(),
@@ -220,6 +266,15 @@ pub struct ApprovalQuestion {
     pub record: serde_json::Value,
 }
 
+/// An error shown to the model may be synthesized before any provider request, so
+/// execution feedback must distinguish actual execution from the displayed result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalExecution {
+    Executed,
+    ApprovedNotExecuted,
+    OutcomeUnknown,
+}
+
 #[derive(Debug, Clone)]
 pub enum ApprovalWithdrawal {
     Acknowledged,
@@ -255,6 +310,51 @@ pub trait ElicitationPlane: Send + Sync {
         })
     }
     async fn get(
+        &self,
+        _ctx: &BatchCtx,
+        _elicitation_id: &str,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        Err(ApprovalRouteError {
+            code: "elicitation_unavailable".into(),
+            retryable: false,
+        })
+    }
+    /// Wait on one card whose id has been synced to the WAL. Dropping this future
+    /// must close the transport route carrying the wait request.
+    async fn r#await(
+        &self,
+        _ctx: &BatchCtx,
+        _elicitation_id: &str,
+        _wait_ms: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        Err(ApprovalRouteError {
+            code: "elicitation_unavailable".into(),
+            retryable: false,
+        })
+    }
+    async fn ack(
+        &self,
+        _ctx: &BatchCtx,
+        _cursor: &ApprovalCursor,
+    ) -> Result<(), ApprovalRouteError> {
+        Err(ApprovalRouteError {
+            code: "elicitation_unavailable".into(),
+            retryable: false,
+        })
+    }
+    async fn report_execution(
+        &self,
+        _ctx: &BatchCtx,
+        _elicitation_id: &str,
+        _execution: ApprovalExecution,
+    ) -> Result<(), ApprovalRouteError> {
+        Err(ApprovalRouteError {
+            code: "elicitation_unavailable".into(),
+            retryable: false,
+        })
+    }
+    /// Release a locally closed call whose card can still be visible; never authorizes it.
+    async fn detach(
         &self,
         _ctx: &BatchCtx,
         _elicitation_id: &str,

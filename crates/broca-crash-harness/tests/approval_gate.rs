@@ -145,6 +145,56 @@ struct Questions {
     root: PathBuf,
     kill: bool,
 }
+impl Questions {
+    fn question(&self, ctx: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        let not_found = || ApprovalRouteError {
+            code: "consent_not_found".into(),
+            retryable: false,
+        };
+        let key = id.strip_prefix("q:").ok_or_else(not_found)?;
+        let seq = key
+            .rsplit_once(':')
+            .and_then(|(_, seq)| seq.parse::<u64>().ok())
+            .ok_or_else(not_found)?;
+        // Each truncated log is copied without daemon storage. Rebuild the card's
+        // argument binding from ToolCallDeferred so a read after restart returns
+        // the original filing even before ApprovalRecorded exists.
+        let frames = FileWalStore::new(&self.root)
+            .read_records(&ctx.bind)
+            .unwrap();
+        let prepared = frames.iter().find(|frame| frame.seq == seq);
+        let Some(WalRecord::ToolCallDeferred {
+            args_hash,
+            module,
+            tool,
+            schema_pin,
+            ..
+        }) = prepared.map(|frame| &frame.record)
+        else {
+            return Err(not_found());
+        };
+        let mut record = json!({
+            "kind":"consent",
+            "state":"pending",
+            "elicitation_id":id,
+            "requester_ref":key,
+            "binding":{"args_hash":args_hash,"module":module,"tool":tool,"schema_pin":schema_pin},
+            "default":"deny",
+            "on_expiry":"deny",
+            "late_execution":"execute",
+            "options":[{"id":"approve","effect":"grant","label":"Allow once"},{"id":"deny","effect":"decline","label":"Not now"}]
+        });
+        if !self.kill {
+            record["state"] = json!("answered");
+            record["answered_choice_id"] = json!("approve");
+            record["approval_digest"] = json!("digest");
+        }
+        Ok(ApprovalQuestion {
+            terminal: !self.kill,
+            record,
+        })
+    }
+}
 #[async_trait]
 impl ElicitationPlane for Questions {
     async fn request(
@@ -168,23 +218,59 @@ impl ElicitationPlane for Questions {
     }
     async fn answers(
         &self,
-        _: &BatchCtx,
-        _: Option<&ApprovalCursor>,
+        ctx: &BatchCtx,
+        since: Option<&ApprovalCursor>,
     ) -> Result<ApprovalPage, ApprovalRouteError> {
         if self.kill && self.root.join("sibling-sent").exists() {
             std::fs::write(self.root.join("kill-ready"), "ready").unwrap();
         }
+        let keys = self.keys.lock().unwrap().clone();
         let records = if self.kill {
             Vec::new()
         } else {
-            self.keys.lock().unwrap().iter().map(|key| json!({"state":"answered","call_key":key,"elicitation_id":format!("q:{key}"),"answered_choice_id":"approve","approval_digest":"digest"})).collect()
+            keys.iter()
+                .skip(since.map_or(0, |cursor| cursor.seq as usize))
+                .map(|key| self.question(ctx, &format!("q:{key}")).map(|q| q.record))
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(ApprovalPage {
             records,
             cursor: ApprovalCursor {
                 provider_incarnation: "inc".into(),
-                seq: 1,
+                seq: keys.len() as u64,
             },
+        })
+    }
+    async fn get(&self, ctx: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.question(ctx, id)
+    }
+    async fn r#await(
+        &self,
+        ctx: &BatchCtx,
+        id: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        if self.kill {
+            // Wait for the other tool call to enter dispatch before publishing
+            // kill-ready. Keep this unanswered card waiting so the process kill
+            // cuts both an open approval wait and an in-flight tool call.
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                poll.tick().await;
+                self.answers(ctx, None).await?;
+                if self.root.join("kill-ready").exists() {
+                    return std::future::pending().await;
+                }
+            }
+        }
+        self.question(ctx, id)
+    }
+    async fn withdraw(&self, _: &BatchCtx, _: &str) -> ApprovalWithdrawal {
+        // Return a retryable refusal so the real-kill test can inspect the
+        // pending withdrawal after the interrupted call is closed.
+        ApprovalWithdrawal::Retry(ApprovalRouteError {
+            code: "transport_busy".into(),
+            retryable: true,
         })
     }
 }
@@ -235,6 +321,7 @@ impl ToolPlane for Tools {
         bytes: &str,
         key: &str,
         _: &str,
+        _: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
         assert_eq!(bytes, r#"{"n":0.000001}"#);
         let frames = FileWalStore::new(&self.root)

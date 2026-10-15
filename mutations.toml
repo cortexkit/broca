@@ -968,18 +968,6 @@ file = "crates/broca-wal/src/record.rs"
 old = "| WalRecord::ToolResult { hooks: Some(_), .. } => &[STEP_TRANSFORMS_FEATURE],"
 new = "| WalRecord::ToolResult { hooks: Some(_), .. } => &[], // NON-VACUITY BREAK"
 
-[[control]]
-id = "elicitation-old-incarnation-not-empty"
-guards = "an old-incarnation answers refusal is named and never treated as an empty page"
-runner = "cargo"
-package = "broca-subc"
-target = "--test it"
-test_file = "crates/broca-subc/tests/it/elicitation_ops.rs"
-expect_red = ["elicitation_ops::old_incarnation_refusal_surfaces_and_fresh_read_keeps_answers"]
-file = "crates/broca-subc/src/elicitation.rs"
-old = "self.call(\"elicitation.answers\", &json!({\"since\": since}))\n            .await"
-new = "self.call(\"elicitation.answers\", &json!({\"since\": since})).await.or_else(|error| if error.code() == Some(CURSOR_INCARNATION_CHANGED) { Ok(AnswersPage { records: vec![], cursor: since.unwrap().clone() }) } else { Err(error) }) // NON-VACUITY BREAK"
-
 # The provider transport is feature-gated. The pinned runner's Cargo selectors do not
 # accept feature flags, so command rows invoke the live libtest target explicitly.
 [[control]]
@@ -1078,9 +1066,12 @@ package = "broca-core"
 target = "--lib"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_skips_expired_until_a_late_record"]
+select = "expected"
 file = "crates/broca-core/src/replay.rs"
-old = "if call.decision == Some(DeferredDecision::Expired) && call.late_approval.is_none() {"
-new = "if false && call.decision == Some(DeferredDecision::Expired) && call.late_approval.is_none() { // NON-VACUITY BREAK"
+old = '''if self.late_allowed(call)
+                && call.decision == Some(DeferredDecision::Expired)'''
+new = '''if false && self.late_allowed(call)
+                && call.decision == Some(DeferredDecision::Expired) // NON-VACUITY BREAK'''
 
 [[control]]
 id = "reader-fold-keeps-late-execution"
@@ -4798,21 +4789,6 @@ new = '''let filing_ctx = held.ctx(ctx);
                         let held = Held { key: format!("retry-{timestamp}:{}", held.key), ..held }; // NON-VACUITY BREAK'''
 
 [[control]]
-id = "core-approval-refile-on-resume"
-guards = "a resumed Deferred call refiles the original key even when a marker already carries its id"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-features = ["test-clock"]
-test_file = "crates/broca-core/src/run/approval_tests.rs"
-expect_red = ["run::approval_tests::restart_pause_refiles_same_key_without_mutate_and_continues_approved_calls"]
-file = "crates/broca-core/src/run.rs"
-old = '''digest,
-                filed: false,'''
-new = '''digest,
-                filed: true, // NON-VACUITY BREAK'''
-
-[[control]]
 id = "core-approval-second-validation-consumes-refusal"
 guards = "a second validation refusal becomes a terminal, never a dispatch authorization"
 runner = "cargo"
@@ -4862,9 +4838,10 @@ target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::restart_pause_refiles_same_key_without_mutate_and_continues_approved_calls"]
+select = "expected"
 file = "crates/broca-core/src/run.rs"
-old = "Slot::Held(call) if call.digest.is_none() => {"
-new = "Slot::Held(call) if false && call.digest.is_none() => { // NON-VACUITY BREAK"
+old = "Slot::Held(call) if !call.approved => Some(broca_wal::AwaitingApprovalEntry {"
+new = "Slot::Held(call) if false && !call.approved => Some(broca_wal::AwaitingApprovalEntry { // NON-VACUITY BREAK"
 
 [[control]]
 id = "core-approval-stop-drains-dispatch"
@@ -4901,9 +4878,10 @@ target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::old_incarnation_is_re_read_and_sibling_keys_are_distinct"]
-file = "crates/broca-core/src/run.rs"
-old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }'''
-new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK */ answer_poll = AnswerPollSchedule::default(); }'''
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''Err(error) if error.code == "cursor_incarnation_changed" && !reset => {'''
+new = '''Err(error) if false && error.code == "cursor_incarnation_changed" && !reset => { // NON-VACUITY BREAK'''
 
 [[control]]
 id = "core-approval-classify-late-before-dedup"
@@ -4931,9 +4909,10 @@ target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::late_none_requires_terminal_get_and_later_approval_is_not_lost_at_stream_head"]
+select = "expected"
 file = "crates/broca-core/src/run.rs"
-old = "} else if question.terminal"
-new = "} else if true /* NON-VACUITY BREAK */"
+old = "crate::consent::answer(&question.record, &key, &held.prepared)"
+new = '''crate::consent::answer(&question.record, &key, &held.prepared).map(|answer| answer.or_else(|| Some(crate::consent::ConsentAnswer { id: id.clone(), decision: crate::consent::ConsentDecision::None, record: question.record.clone() }))) // NON-VACUITY BREAK'''
 
 [[control]]
 id = "core-approval-late-at-most-once"
@@ -5004,9 +4983,10 @@ target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor"]
-file = "crates/broca-core/src/run.rs"
-old = "AnswerResponse::Unreadable => return Err(()),"
-new = "AnswerResponse::Unreadable => continue, // NON-VACUITY BREAK"
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if let Some(candidate) = answer(record, key, prepared)? {"
+new = "if let Some(candidate) = answer(record, key, prepared).unwrap_or(None) { // NON-VACUITY BREAK"
 
 [[control]]
 id = "core-approval-cursor-fixture-requires-sync"
@@ -5017,11 +4997,12 @@ target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor"]
+select = "expected"
 file = "crates/broca-core/src/run/approval_tests/memory_wal.rs"
 old = '''let mut state = self.state.lock().unwrap();
         state.synced = state.pending.clone();'''
 new = '''let mut state = self.state.lock().unwrap();
-        if state.pending.len() == 5 { return Ok(()); } // NON-VACUITY BREAK: skip the approval barrier.
+        if matches!(state.pending.last().map(|frame| &frame.record), Some(WalRecord::ApprovalRecorded { .. })) { return Ok(()); } // NON-VACUITY BREAK: skip the approval's own barrier.
         state.synced = state.pending.clone();'''
 
 [[control]]
@@ -5043,11 +5024,12 @@ guards = "an unreadable successful filing reply refiles the accepted question un
 runner = "cargo"
 package = "broca-subc"
 target = "--lib"
-test_file = "crates/broca-subc/src/elicitation.rs"
-expect_red = ["elicitation::tests::accepted_filing_with_unreadable_ack_refiles_same_key_and_recovers_question"]
-file = "crates/broca-subc/src/elicitation.rs"
-old = "ElicitationError::AcceptedFilingReplyUnreadable(message)"
-new = "ElicitationError::Protocol(message) /* NON-VACUITY BREAK */"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_unreadable_filing_retries_same_key"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = "ConsentError::AcceptedFilingReplyUnreadable(message)"
+new = "ConsentError::Protocol(message) /* NON-VACUITY BREAK */"
 
 [[control]]
 id = "core-approval-cancel-wins-restart-pause"
@@ -5739,7 +5721,7 @@ features = ["test-clock"]
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::retention_expiry_deletes_owed_content_and_withdraws_from_identity_only_record"]
 file = "crates/broca-module/src/retention.rs"
-old = 'provider_id: "prefrontal-core".into(),'
+old = 'provider_id: "cingulate".into(),'
 new = 'provider_id: ask.prompt.clone(), // NON-VACUITY BREAK: retain prompt as identity metadata'
 
 [[control]]
@@ -10773,60 +10755,6 @@ old = "        let configured_https = policy();\n        let state = self.state.
 new = "        let state = self.state.lock().unwrap();\n        let configured_https = policy(); // NON-VACUITY BREAK: read config under session mutex"
 
 [[control]]
-id = "approval-held-answer-backoff-bounded"
-guards = "held approvals back off answer reads while retaining a one-second pickup cap"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-test_file = "crates/broca-core/src/run.rs"
-expect_red = ["run::approval_gate::held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap"]
-select = "expected"
-file = "crates/broca-core/src/run.rs"
-old = "            self.delay = (delay * 2).min(1000);"
-new = "            self.delay = 50; // NON-VACUITY BREAK: poll every 50 ms forever"
-
-[[control]]
-id = "approval-answer-pickup-cap"
-guards = "an answer arriving during a held approval backoff is read within one second"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-test_file = "crates/broca-core/src/run.rs"
-expect_red = ["run::approval_gate::held_approval_poll_count_is_bounded_and_mid_backoff_answer_meets_cap"]
-select = "expected"
-file = "crates/broca-core/src/run.rs"
-old = "            self.delay = (delay * 2).min(1000);"
-new = "            self.delay = (delay * 2).min(10000); // NON-VACUITY BREAK: allow ten-second pickup delay"
-
-[[control]]
-id = "approval-wait-real-rpc-rate"
-guards = "the actual held approval wait uses backoff rather than repeatedly resetting to 50 ms"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-features = ["test-clock"]
-test_file = "crates/broca-core/src/run/approval_tests.rs"
-expect_red = ["run::approval_tests::held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer"]
-select = "expected"
-file = "crates/broca-core/src/run.rs"
-old = "                    answer_poll.completed(now(control));"
-new = "                    answer_poll.completed(now(control)); answer_poll.delay = 50; // NON-VACUITY BREAK: force rapid reads in the real waiter"
-
-[[control]]
-id = "approval-wait-real-answer-pickup"
-guards = "the actual held approval wait picks up an answer within one second of its arrival mid-backoff"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-features = ["test-clock"]
-test_file = "crates/broca-core/src/run/approval_tests.rs"
-expect_red = ["run::approval_tests::held_wait_bounds_real_answer_reads_and_picks_up_mid_backoff_answer"]
-select = "expected"
-file = "crates/broca-core/src/run.rs"
-old = "                    answer_poll.completed(now(control));"
-new = "                    answer_poll.completed(now(control)); answer_poll.next = now(control).saturating_add(10000); // NON-VACUITY BREAK: oversleep answer arrival in the real waiter"
-
-[[control]]
 id = "serve-exit-does-not-join-unrelated-blocking-jobs"
 guards = "process exit explicitly joins durability but does not wait for unrelated blocking tasks"
 runner = "cargo"
@@ -10968,6 +10896,1296 @@ select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                let from = match subscribe_from(&params) {"
 new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"
+[[control]]
+id = "core-consent-recorded-id-get-await"
+guards = "a paused call with a durable card id reads and awaits that same card without refiling"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::pending_restart_pause_gets_then_awaits_the_same_durable_card"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''if let Some(id) = &held.id {
+                                    let pending = scan.lock()'''
+new = '''if let Some(id) = None::<&String> { // NON-VACUITY BREAK
+                                    let pending = scan.lock()'''
+
+[[control]]
+id = "core-consent-answers-before-refile"
+guards = "settled cards are adopted before an id-less call can create another card"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::settled_lookup_precedes_refile_and_recovers_without_request"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, &answer.record, progress)'''
+new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, &answer.record, progress)'''
+
+[[control]]
+id = "core-consent-second-lookup-adopts"
+guards = "settlement during refiling adopts the older answer and withdraws the durable duplicate"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::second_lookup_adopts_settlement_and_withdraws_duplicate_after_id_sync"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
+        let answer = authorize_candidate(
+            plane,
+            ctx,
+            key,
+            prepared,
+            Some(id),
+            &answer.record,
+            progress,
+        )'''
+new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
+        let answer = authorize_candidate(
+            plane,
+            ctx,
+            key,
+            prepared,
+            Some(id),
+            &answer.record,
+            progress,
+        )'''
+
+[[control]]
+id = "core-consent-conflicting-decisions-refuse"
+guards = "two conflicting settled answers never authorize a held or recovered call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::conflicting_settled_decisions_refuse_before_refile"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if found
+                    .as_ref()
+                    .is_some_and(|old| old.decision != candidate.decision)
+                {'''
+new = '''if false && found
+                    .as_ref()
+                    .is_some_and(|old| old.decision != candidate.decision)
+                { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-no-ack-on-owner-feed"
+guards = "a run never acknowledges settlements that another run on the same owner feed needs"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::branch_c_two_sessions_keep_owner_feed_answers_without_ack"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "for record in &page.records {"
+new = '''let _ = plane.ack(ctx, &page.cursor).await; // NON-VACUITY BREAK
+        for record in &page.records {'''
+
+[[control]]
+id = "core-consent-cancel-beats-dispatch"
+guards = "cancellation after second validation and before intent closes Interrupted without a provider send"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::branch_c_cancel_before_intent_closes_approved_interrupted_with_zero_ack_and_send"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''// Stop/cancel wins before the intent. A validation in progress owns no
+                            // dispatch and can be dropped without stranding an in-flight tool.
+                            if is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) { continue }'''
+new = '''// NON-VACUITY BREAK: ignore cancellation after validation'''
+
+[[control]]
+id = "core-consent-unknown-never-success"
+guards = "unknown provider outcomes are reported unknown rather than executed"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::execution_reports_distinguish_provider_error_not_sent_unknown_and_prevalidation"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "Some(DispatchOutcome::Unknown) => ApprovalExecution::OutcomeUnknown,"
+new = "Some(DispatchOutcome::Unknown) => ApprovalExecution::Executed, // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-route-failure-not-executed"
+guards = "synthetic pre-send and validation failures are not executed provider invocations"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::execution_reports_distinguish_provider_error_not_sent_unknown_and_prevalidation"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "_ => ApprovalExecution::ApprovedNotExecuted,"
+new = "_ => ApprovalExecution::Executed, // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-args-binding"
+guards = "the complete canonical returned binding equals the frozen four-field binding"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::binding_mismatch_and_nonapprove_choices_never_authorize"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if returned != serde_jcs::to_vec(&expected).expect("frozen binding is canonicalizable")
+            {'''
+new = '''if false && returned != serde_jcs::to_vec(&expected).expect("frozen binding is canonicalizable")
+            { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-deny-on-expiry"
+guards = "expired cards never authorize execution even when they carry legacy approve metadata"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::late_report_table_includes_expired_metadata_none_and_route_failure"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''Some("expired" | "withdrawn" | "closed") => ConsentDecision::None,'''
+new = '''Some("expired" | "withdrawn" | "closed") => ConsentDecision::Approved, // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-key-bound"
+guards = "the maximum lineage plus sequence key stays within consent's printable ASCII bound"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::maximum_call_key_fits_consent_printable_ascii_bound"]
+select = "expected"
+file = "crates/broca-core/src/context.rs"
+old = '''format!("{lineage_id}:{intent_seq}")'''
+new = '''format!("{}:{lineage_id}:{intent_seq}", "x".repeat(128)) // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-await-cancelled-on-stop"
+guards = "cancel stop and RestartPause drop a held await route within one second"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::await_route_drops_within_one_second_on_cancel_stop_and_restart_pause"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''_ = wait_cancel.cancelled() => Err(crate::consent::refusal("stopped", true)),
+                            _ = cancelled_token(control.cancel.as_ref()) => Err(crate::consent::refusal("cancelled", true)),
+                            _ = cancelled_token(control.stop_requested.as_ref()) => Err(crate::consent::refusal("stopped", true)),'''
+new = '''// NON-VACUITY BREAK: ignore all held-await cancellation sources'''
+
+[[control]]
+id = "core-consent-recovered-answer-never-dispatches"
+guards = "crash close-out adopts terminal information but never records an execution authorization"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::crash_recovered_approval_closes_debt_and_reports_without_approval_record"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if settled.is_some_and(|answer| answer.decision == ConsentDecision::Approved) {
+        report('''
+new = '''if settled.is_some_and(|answer| answer.decision == ConsentDecision::Approved) {
+        let WalRecord::ToolCallDeferred { call_id, .. } = prepared else { unreachable!() };
+        durable(WalRecord::ApprovalRecorded { call_key: key.into(), call_id: call_id.clone(), elicitation_id: Some(recovered.id.clone()), decision: broca_wal::DeferredDecision::Approved, approval_digest: None, closing_result: None }).await?; // NON-VACUITY BREAK
+        report('''
+
+[[control]]
+id = "core-consent-feed-polls-only-expired"
+guards = "ordinary held calls await their card and never activate the late-intake feed poll"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::await_route_drops_within_one_second_on_cancel_stop_and_restart_pause"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''&& !history
+                    .projection
+                    .obligations()
+                    .expired_without_late_record
+                    .is_empty();'''
+new = '''&& (!history.projection.obligations().expired_without_late_record.is_empty() || slots.iter().any(|slot| matches!(slot, Slot::Held(_)))); // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-recovery-marker-terminal-id"
+guards = "crash close-out persists the adopted card id without reopening the terminated call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::close_out_adopted_id_survives_projection_without_reopening_call"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "|| (call.withdrawal_terminal"
+new = "|| (false && call.withdrawal_terminal // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-provisional-resume-reconciles"
+guards = "a recorded pending card id is provisional until ApprovalRecorded and resumes through conflict-checked lookup"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::provisional_id_resume_reconciles_conflicting_settlements_before_get"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''let card = crate::consent::reconcile_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, scan.as_ref(), durable).await?;'''
+new = '''let card = crate::consent::RecoveredCard { id: id.clone(), answer: None }; // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-answered-duplicate-conflict"
+guards = "a duplicate answered during withdrawal is read and opposing decisions refuse before adoption"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_answered_during_withdrawal_refuses_conflicting_decisions"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if duplicate.decision != ConsentDecision::None && duplicate.decision != older {"
+new = "if false && duplicate.decision != ConsentDecision::None && duplicate.decision != older { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-unproven-withdrawal-refuses"
+guards = "a non-terminal withdrawal refusal never proves a duplicate closed or allows adoption"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::unproven_duplicate_withdrawal_does_not_adopt_an_older_answer"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''.ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;'''
+new = '''.or_else(|| Some(ConsentAnswer { id: id.into(), decision: older, record: question.record.clone() })) // NON-VACUITY BREAK
+        .ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;'''
+
+[[control]]
+id = "core-consent-live-feed-conflicting-decisions"
+guards = "live feed intake reduces conflicting answers for one key before any dispatch authorization"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_feed_conflicting_answers_refuse_before_any_dispatch"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = ".is_ok_and(|old| old.decision != answer.decision)"
+new = ".is_ok_and(|old| false && old.decision != answer.decision) // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-complete-before-approval"
+guards = "a live feed prefix never authorizes before later continuation conflicts are checked"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_feed_conflicting_continuations_refuse_before_any_dispatch"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let head = page.records.is_empty();"
+new = "let head = true; // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-late-feed-conflict-refuses"
+guards = "late conflicting settlements close durably as a named not-sent refusal instead of remaining eligible"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_feed_conflicting_answers_close_as_named_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''Ok(Err(error)) if error.code == "consent_conflicting_decisions" => {'''
+new = '''Ok(Err(error)) if false && error.code == "consent_conflicting_decisions" => { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-unavailable-readback-detaches"
+guards = "every invalid known-id answered readback detaches only after its named Unavailable closure is durable"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::every_known_id_unavailable_await_release_detaches_with_original_code"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''// Invalid answered readbacks release the visible card just like transport refusals.
+                                    if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }'''
+new = '''// NON-VACUITY BREAK: discard the known card without detach'''
+
+[[control]]
+id = "core-consent-detach-terminal-before-approval"
+guards = "an approving detach readback durably fences non-execution before any late approval can be recorded"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::approving_detach_readback_stays_not_sent_across_later_admission"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''history.record(
+                    writer,
+                    WalRecord::LateResult {
+                        call_key: held.key.clone(),
+                        outcome: LateOutcome::NotSent,
+                        result: Arc::new(closed(&held.call(), "detached_not_executed")),
+                    },
+                );
+                writer.sync().await?;'''
+new = '''// NON-VACUITY BREAK: record the readback without its terminal fence'''
+
+[[control]]
+id = "core-consent-stopped-episode-blocks-late"
+guards = "durable cancellation and non-resuming stop invalidate late work from expired siblings"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::nonresuming_stopped_episode_expired_sibling_never_late_executes"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "reason: RunFinishReason::Cancelled | RunFinishReason::Interrupted,"
+new = "reason: RunFinishReason::Error, // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-legacy-stop-facts-refresh"
+guards = "unknown legacy stop facts refuse an incomplete prefix and refresh from complete WAL before late admission"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::legacy_stop_facts_seed_requires_full_fold_before_late_dispatch"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "if history.projection.stopped_runs.is_none() {"
+new = "if false && history.projection.stopped_runs.is_none() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-unknown-stop-facts-fail-closed"
+guards = "a legacy suffix without stop facts cannot advertise authorized late execution"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::legacy_projection_suffix_remains_unknown_until_complete_origin_fold"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "self.stopped_runs.as_ref().is_some_and(|stopped| {"
+new = "self.stopped_runs.as_ref().is_none_or(|stopped| { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-stop-facts-prune-closed-runs"
+guards = "stopped-run cache facts are bounded by open calls and disappear after their terminal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::stopped_run_projection_is_bounded_by_open_calls_and_prunes_terminals"]
+select = "expected"
+file = "crates/broca-core/src/replay.rs"
+old = "stopped.retain(|run| open_runs.contains(run));"
+new = "stopped.retain(|run| true || open_runs.contains(run)); // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-late-stop-during-intent-sync"
+guards = "late send rechecks cancel and stop after the durable intent barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
+    }'''
+new = '''fn late_stopped(_control: &RunControl) -> bool {
+        false // NON-VACUITY BREAK
+    }'''
+
+[[control]]
+id = "core-consent-late-stop-during-route-open"
+guards = "late send rechecks cancel and stop after route-open completion immediately before dispatch"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_dispatch_cancel_or_stop_during_route_open_is_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
+    }'''
+new = '''fn late_stopped(_control: &RunControl) -> bool {
+        false // NON-VACUITY BREAK
+    }'''
+
+[[control]]
+id = "core-consent-live-wait-clears-stale-cursor"
+guards = "the live wait actually clears a refused non-zero cursor before rereading the new incarnation"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_wait_clears_stale_nonzero_cursor_before_reread"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }'''
+new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK: retain stale cursor */ answer_poll = AnswerPollSchedule::default(); }'''
+
+[[control]]
+id = "core-consent-live-wait-unreadable-keeps-cursor"
+guards = "the live wait rejects unreadable answered pages before advancing past their corrected feed position"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_wait_unreadable_page_retries_before_cursor_advance"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "Err(_) => return Err(()),"
+new = "Err(_) => continue, // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-reconciliation-budget-keeps-cursor"
+guards = "a healthy known-id traversal longer than the call budget continues from its validated cursor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.cursor = cursor.clone();"
+new = "state.cursor = None; // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-reconciliation-retry-keeps-settlements"
+guards = "retrying a partial reconciliation preserves earlier settled decisions as well as its cursor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::lookup_retry_preserves_prior_settlements_and_cursor"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''state.cursor = cursor.clone();
+        state.found = found.clone();'''
+new = '''state.cursor = cursor.clone();
+        state.found = None; // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-filed-await-approval-rechecks-settlements"
+guards = "an approval after a filed await timeout checks the complete owner feed before intake"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::filed_await_timeout_then_approve_refuses_older_denial"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "lookup_with_progress(plane, ctx, key, prepared, progress).await?;"
+new = "// NON-VACUITY BREAK: accept the approving readback without its settlement snapshot"
+
+[[control]]
+id = "core-consent-first-await-approval-rechecks-settlements"
+guards = "even the first approval readback checks settlements that arrived after the initial pending scan"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::first_filed_await_approval_checks_settlements_after_scan"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "lookup_with_progress(plane, ctx, key, prepared, progress).await?;"
+new = "// NON-VACUITY BREAK: accept the first approving readback without its settlement snapshot"
+
+[[control]]
+id = "core-consent-live-adoption-proves-recorded-duplicate"
+guards = "a different-id live answer cannot replace the recorded card without withdrawal and agreeing terminal readback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "if call.id.as_deref() != Some(answer.id.as_str()) {"
+new = "if false && call.id.as_deref() != Some(answer.id.as_str()) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-total-page-budget"
+guards = "one live feed pass has a total page bound even when every continuation is healthy"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::live_feed_traversal_has_total_budget_and_keeps_progress"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "for _ in 0..32 {"
+new = "for _ in 0..usize::MAX { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-total-time-budget"
+guards = "slow successful continuations share one traversal time budget instead of renewing it per page"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::live_feed_slow_pages_share_one_total_time_budget"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let deadline = tokio::time::Instant::now() + Duration::from_secs(1);"
+new = "let deadline = tokio::time::Instant::now() + Duration::from_secs(120); // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-budget-keeps-progress"
+guards = "live feed budget exhaustion retains validated cursor and reduced decisions for the next pass"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::healthy_live_feed_continues_after_budget_without_restarting"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''tokio::task::yield_now().await;
+        Err(crate::consent::refusal(
+            "consent_feed_budget_exhausted",
+            true,
+        ))'''
+new = '''progress.lock().expect("live consent scan").cursor = None; // NON-VACUITY BREAK
+        tokio::task::yield_now().await;
+        Err(crate::consent::refusal(
+            "consent_feed_budget_exhausted",
+            true,
+        ))'''
+
+[[control]]
+id = "core-consent-ordinary-approved-intent-cancel-keeps-signal"
+guards = "ordinary approved cancellation during intent durability is checked after sync and forwarded to resolution"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::ordinary_approved_cancel_during_intent_sync_is_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let before_send_cancel = control.cancel.as_ref();"
+new = "let before_send_cancel = None::<&CancellationToken>; // NON-VACUITY BREAK"
+
+[[control]]
+id = "subc-approved-pre-send-cancel-after-route-wait"
+guards = "approved adapter rechecks both run signals after ensure_route before any physical call"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_cancel_or_stop_during_ensure_route_sends_nothing"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "if args.signals.interrupted() {"
+new = "if false && args.signals.interrupted() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "subc-approved-pre-send-cancel-after-permit-wait"
+guards = "approved adapter rechecks both run signals after flow-control credit before any physical call"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_cancel_or_stop_during_permit_wait_sends_nothing"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "if args.signals.interrupted() {"
+new = "if false && args.signals.interrupted() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-duplicate-retryable-withdrawal-retains-debt"
+guards = "a retryable answered withdrawal refusal retains debt without treating its code as terminal proof"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "ApprovalWithdrawal::Retry(error) if !error.retryable && terminal_refusal(&error.code) => {"
+new = "ApprovalWithdrawal::Retry(error) if terminal_refusal(&error.code) => { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-duplicate-answered-needs-answer"
+guards = "an answered withdrawal refusal is not proved by an unanswered terminal readback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if reason == "answered" && duplicate.decision == ConsentDecision::None {'''
+new = '''if false && reason == "answered" && duplicate.decision == ConsentDecision::None { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-duplicate-readback-matches-id"
+guards = "terminal withdrawal proof must describe the duplicate card rather than another card"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = ".filter(|answer| answer.id == id && question.terminal)"
+new = ".filter(|_answer| question.terminal) // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-duplicate-readback-must-be-terminal"
+guards = "a nonterminal readback cannot prove that the duplicate card is no longer pending"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = ".filter(|answer| answer.id == id && question.terminal)"
+new = ".filter(|answer| answer.id == id) // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-approved-decision-reaches-crash-harness"
+guards = "the real approval-boundary crash harness exercises core consent authorization rather than an inert fixture"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test approval_gate"
+test_file = "crates/broca-crash-harness/tests/approval_gate.rs"
+expect_red = ["every_approval_record_boundary_resumes_without_second_dispatch_or_model_step"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''Some("approve") => ConsentDecision::Approved,'''
+new = '''Some("approve") => ConsentDecision::Declined, // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-late-feed-backoff-bounded"
+guards = "only the late-intake feed polls, with bounded empty-pass RPC rate"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::late_feed_wait_bounds_real_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = 50; // NON-VACUITY BREAK: continuously poll the late feed at 50 ms"
+
+[[control]]
+id = "core-consent-late-feed-pickup-cap"
+guards = "late settlements arriving during idle backoff are picked up within one second"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::late_feed_wait_bounds_real_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = (delay * 2).min(10000); // NON-VACUITY BREAK: oversleep late answer arrival"
+
+[[control]]
+id = "core-consent-idle-await-deadline-wake"
+guards = "an idle held consent await does not wake the run loop on a fixed polling timer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::idle_held_wait_wakes_only_for_deadlines_or_cancellation"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "_ = tokio::time::sleep(Duration::from_millis(wake_at.saturating_sub(timestamp))), if wake_at != u64::MAX => {}"
+new = "_ = tokio::time::sleep(Duration::from_millis(20)) => {} // NON-VACUITY BREAK: wake every 20 ms even with only idle awaits"
+
+[[control]]
+id = "core-consent-memory-rigs-have-distinct-lineages"
+guards = "separate memory-backed sessions cannot share one consent call key on an owner feed"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::branch_c_two_sessions_keep_owner_feed_answers_without_ack"]
+select = "expected"
+file = "crates/broca-core/src/run/approval_tests/memory_wal.rs"
+old = "frame[53..61].copy_from_slice(&identity.to_le_bytes());"
+new = "frame[53..61].copy_from_slice(&identity.wrapping_mul(0).to_le_bytes()); // NON-VACUITY BREAK: collide independent session keys"
+
+[[control]]
+id = "subc-consent-omits-approval-digest"
+guards = "approved consent execution omits the retired approval_digest wire key"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approval_digest_contract_tests::approved_connection_omits_approval_digest_and_preserves_saved_bytes"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''            Some(&args.key),
+            None,'''
+new = '''            Some(&args.key),
+            Some(""), // NON-VACUITY BREAK: send the retired digest field again'''
+
+[[control]]
+id = "core-consent-filed-await-error-backoff"
+guards = "filed-card await retries back off from 50 ms to a one-second cap"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::filed_await_retryable_errors_have_bounded_rpc_rate"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "call.backoff = (delay * 2).min(1000);"
+new = "call.backoff = 50; // NON-VACUITY BREAK: retry every failed await at the initial delay"
+
+[[control]]
+id = "subc-consent-cancel-during-writer-capacity"
+guards = "approved dispatch cancels its real bounded writer-queue reservation without enqueue or unknown outcome"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = "self.enqueue_approved(&runtime, frame, signals).await?;"
+new = "self.send(&runtime, frame).await?; // NON-VACUITY BREAK: lose run signals at the real writer queue"
+
+[[control]]
+id = "subc-consent-recheck-after-writer-reservation"
+guards = "a signal between capacity reservation and push still prevents enqueue"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::approved_enqueue_tests::approved_push_rechecks_cancel_and_stop_after_capacity_is_reserved"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = "if signals.interrupted() {"
+new = "if false && signals.interrupted() { // NON-VACUITY BREAK: enqueue after a post-reservation signal"
+
+[[control]]
+id = "core-consent-late-admission-keeps-scan-progress"
+guards = "late admission resumes a healthy owner feed beyond its one-second budget"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::late_admission_continues_healthy_feed_beyond_one_budget"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let scan = history.scan(&key);"
+new = "let scan = Arc::new(std::sync::Mutex::new(crate::consent::LookupProgress::default())); // NON-VACUITY BREAK: restart late traversal every admission"
+
+[[control]]
+id = "core-consent-late-get-conflict-authorization"
+guards = "an approving late get is checked against every owner-feed settlement before authorization"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::late_approving_get_rechecks_opposing_settlement_before_authorization"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "let answer = verify_readback(plane, ctx, key, prepared, candidate, progress).await?;"
+new = "let answer = candidate; // NON-VACUITY BREAK: authorize a late get without its settlement snapshot"
+
+[[control]]
+id = "core-consent-expired-adoption-proves-duplicate"
+guards = "expired feed intake cannot replace its recorded card without proven duplicate closure"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::live_expired_older_approval_proves_recorded_duplicate_before_adoption"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if !proven {"
+new = "if false && !proven { // NON-VACUITY BREAK: adopt the late card without closing its recorded duplicate"
+
+[[control]]
+id = "core-consent-late-record-requires-shared-authorization"
+guards = "late approval writers accept only the capability produced by the shared authorize_candidate gate"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::late_approving_get_rechecks_opposing_settlement_before_authorization"]
+select = "expected"
+[[control.edits]]
+file = "crates/broca-core/src/consent.rs"
+old = '''pub(crate) struct AuthorizedAnswer {
+    answer: ConsentAnswer,
+    call_key: String,
+    binding: Value,
+}'''
+new = '''pub(crate) struct AuthorizedAnswer { // NON-VACUITY BREAK: make an unchecked capability constructible
+    pub(crate) answer: ConsentAnswer,
+    pub(crate) call_key: String,
+    pub(crate) binding: Value,
+}'''
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = "let authorized_late = match authorize_answer(&held, answer, ctx, control, history).await {"
+new = "let authorized_late = match Ok::<_, ApprovalRouteError>(crate::consent::AuthorizedAnswer { answer, call_key: held.key.clone(), binding: crate::consent::binding(&held.prepared) }) { // NON-VACUITY BREAK: bypass authorize_candidate on the late path"
+
+[[control]]
+id = "core-consent-retain-candidate-after-settlement-scan"
+guards = "late admission retains a candidate whose settlement scan completed but duplicate closure may still be pending"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::completed_candidate_keeps_authorization_progress_across_admission_retry"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if self.complete && self.expected.is_none() {"
+new = "if self.complete { // NON-VACUITY BREAK: discard an authorization candidate before duplicate closure"
+
+[[control]]
+id = "subc-consent-real-provider-omits-approval-digest"
+guards = "the approved envelope reaching a real provider omits the retired approval_digest field"
+runner = "cargo"
+package = "broca-subc"
+target = "--test it"
+test_file = "crates/broca-subc/tests/it/consent_ops.rs"
+expect_red = ["consent_ops::approved_raw_dispatch_reaches_a_real_provider_without_reserializing_saved_bytes"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''            Some(&args.key),
+            None,'''
+new = '''            Some(&args.key),
+            Some(""), // NON-VACUITY BREAK: reintroduce the retired field on the real provider envelope'''
+
+[[control]]
+id = "subc-approved-closed-writer-is-not-sent"
+guards = "a closed writer queue reservation is typed not-sent before any approved frame is pushed"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_closed_writer_queue_is_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = ".map_err(ApprovedCallError::BeforePush)?"
+new = ".map_err(|error| ApprovedCallError::AfterPush(ConnError::Transport(error.to_string())))? /* NON-VACUITY BREAK: classify the pre-push stage as sent */"
+
+[[control]]
+id = "core-consent-withdraw-ack-requires-record-proof"
+guards = "an opaque withdrawal acknowledgement cannot replace matching terminal identity and binding proof"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::acknowledged_withdrawal_requires_matching_terminal_readback"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''ApprovalWithdrawal::Acknowledged => "withdrawn".to_owned(),'''
+new = "ApprovalWithdrawal::Acknowledged => return Ok(()), // NON-VACUITY BREAK: trust an acknowledgement without card proof"
+
+[[control]]
+id = "subc-withdraw-reply-matches-requested-card"
+guards = "a withdrawn reply for another id is not acknowledgement of the requested card"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_withdrawn_reply_for_another_card_is_not_acknowledged"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = "if record.elicitation_id != id {"
+new = "if false && record.elicitation_id != id { // NON-VACUITY BREAK: accept a different card's withdrawn reply"
+
+[[control]]
+id = "core-consent-authorizer-validates-raw-requester"
+guards = "the shared authorizer validates the raw requester_ref itself instead of trusting a parsed bare answer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::authorization_rejects_foreign_requester_record"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "let candidate = validated_candidate(record, key, prepared)?;"
+new = '''let candidate = ConsentAnswer { id: record["elicitation_id"].as_str().unwrap().into(), decision: ConsentDecision::Approved, record: record.clone() }; // NON-VACUITY BREAK: trust an unchecked raw record'''
+
+[[control]]
+id = "core-consent-authorizer-validates-raw-binding"
+guards = "the shared authorizer validates the raw record against the frozen binding itself"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::authorization_rejects_foreign_binding_record"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "let candidate = validated_candidate(record, key, prepared)?;"
+new = '''let candidate = ConsentAnswer { id: record["elicitation_id"].as_str().unwrap().into(), decision: ConsentDecision::Approved, record: record.clone() }; // NON-VACUITY BREAK: trust an unchecked raw record'''
+
+[[control]]
+id = "core-consent-ordinary-writer-checks-capability-scope"
+guards = "ordinary Approved records require a capability for their own call key and binding"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::ordinary_approval_writer_rejects_capability_for_another_call_or_binding"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "&& proof.matches(&call.key, &call.prepared)"
+new = "&& true /* NON-VACUITY BREAK: transpose an approval capability between calls */"
+
+[[control]]
+id = "core-consent-late-writer-checks-capability-scope"
+guards = "late Approved records require a capability for their own call key and binding"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::late_approval_writer_rejects_capability_for_another_call_or_binding"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "if !authorization.matches(key, prepared) {"
+new = "if false && !authorization.matches(key, prepared) { // NON-VACUITY BREAK: transpose a late capability between calls"
+
+[[control]]
+id = "core-consent-late-authorization-reads-current-tail"
+guards = "late authorization reads new settlements after retryable duplicate proof, never just a completed snapshot"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::late_retry_reads_new_denial_after_duplicate_proof_failure"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.complete = false;"
+new = "/* NON-VACUITY BREAK: trust the completed snapshot instead of reading the current tail */"
+
+[[control]]
+id = "core-consent-held-authorization-reads-current-tail"
+guards = "held authorization reads the retained-cursor tail after a retryable duplicate proof failure"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::held_retry_reads_new_denial_after_duplicate_proof_failure"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.complete = false;"
+new = "/* NON-VACUITY BREAK: trust the completed snapshot instead of reading the current tail */"
+
+[[control]]
+id = "core-consent-tail-keeps-proven-withdrawal-compatible"
+guards = "a binding-checked duplicate proven withdrawn without an answer is not an opposing decision in the fresh tail"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::late_retry_accepts_proven_withdrawn_duplicate_after_fresh_tail"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if closed_without_answer {"
+new = "if false && closed_without_answer { // NON-VACUITY BREAK: treat the proven withdrawn duplicate as an opposing answer"
+
+[[control]]
+id = "subc-approved-setup-stage-is-not-sent"
+guards = "all approved setup errors are classified by the pre-push stage instead of being treated as sent connection errors"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_setup_failures_are_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = ".map_err(ApprovedCallError::BeforePush)?"
+new = ".map_err(|error| ApprovedCallError::AfterPush(ConnError::Transport(error.to_string())))? /* NON-VACUITY BREAK: classify the pre-push stage as sent */"
+
+[[control]]
+id = "subc-approved-after-push-can-be-unknown"
+guards = "a malformed real provider reply after enqueue remains an unknown execution outcome"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_failure_after_real_push_remains_unknown"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = ".map_err(ApprovedCallError::AfterPush)"
+new = ".map_err(|error| ApprovedCallError::BeforePush(error.into())) /* NON-VACUITY BREAK: reclassify a sent failure as not-sent */"
+
+[[control]]
+id = "subc-approved-before-push-stale-route-still-recovers"
+guards = "known stale handles retain proved-pre-send route reopening and one real resend"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_before_push_stale_handle_reopens_and_resends_once"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "error @ ConnError::StaleRouteHandle(_)"
+new = "error @ ConnError::Protocol(_) /* NON-VACUITY BREAK: lose stale-handle recovery */"
+
+[[control]]
+id = "subc-consent-call-key-bound"
+guards = "the full UUID lineage and maximum WAL sequence fit and survive consent correlation unchanged"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_call_key_bound_at_max_wal_seq"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"requester_ref": call_key, "dedup_key": call_key'
+new = '"requester_ref": &call_key[..call_key.len()-1], "dedup_key": call_key /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "subc-consent-no-identity-in-body"
+guards = "the actual consent filing contains no requester-controlled identity or subject"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_request_body_has_no_identity_keys"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"kind": "consent", "title": format!("Run {tool}"), "prompt": ask.prompt,'
+new = '"subject": {"agent_id":"forged"}, "kind": "consent", "title": format!("Run {tool}"), "prompt": ask.prompt, /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "subc-consent-deny-on-expiry"
+guards = "actual held consent filings default to deny on expiry"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_request_body_has_no_identity_keys"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"on_expiry": "deny"'
+new = '"on_expiry": "approve" /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "subc-consent-await-cancel-closes-route"
+guards = "dropping an outstanding consent wait closes its route within one second"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_dropped_await_closes_route_within_one_second"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = 'let _ = conn.route_close(&route).await;'
+new = 'let _ = (conn, route); // NON-VACUITY BREAK: leave the remote waiter alive'
+
+[[control]]
+id = "subc-consent-route-failure-not-executed"
+guards = "a new approved unresolved route is not sent rather than a synthetic execution"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_route_failure_is_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = 'if !matches!(route, Some(ToolRoute::Module(_))) {'
+new = 'if false && !matches!(route, Some(ToolRoute::Module(_))) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "subc-consent-fence-before-route"
+guards = "a completed approved call returns its fence even after its route becomes unavailable"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_fence_precedes_route_and_input_checks"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''let fence_key = (Self::session_key(&ctx.bind), call.tool_call_id.clone());
+        if let Some(prior) = self.fence.lock().unwrap().get(&fence_key) {'''
+new = '''let fence_key = (Self::session_key(&ctx.bind), call.tool_call_id.clone());
+        if let Some(prior) = self.fence.lock().unwrap().get(&fence_key).filter(|_| false) { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "serve-installs-consent-plane"
+platforms = ["linux", "macos"]
+guards = "production installs the scoped consent adapter so an approved held call reaches the provider once with its saved bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/it/approval_gate.rs"
+select = "expected"
+expect_red = ["approval_gate::approved_question_dispatches_saved_bytes_once"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "self.elicitation_plane = Some(elicitation);"
+new = "let _ = elicitation; self.elicitation_plane = None; // NON-VACUITY BREAK: omit the production consent plane"
+
+[[control]]
+id = "serve-required-cingulate-build-cannot-skip"
+platforms = ["linux", "macos"]
+guards = "a required but missing Cingulate build fails instead of returning a passing skip"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/approval_gate.rs"
+select = "expected"
+expect_red = ["approval_gate::missing_cingulate_build_skips_only_when_not_required"]
+file = "crates/broca-module-serve/tests/it/approval_gate.rs"
+old = "None if required => Err("
+new = "None if required && false => Err( // NON-VACUITY BREAK: allow a required build to skip\n"
+
+[[control]]
+id = "wal-consent-writer-admission-is-required"
+guards = "the source fence recognizes the consent authorization helper's AwaitingApproval constructor without exempting its other record variants"
+runner = "cargo"
+package = "broca-wal"
+target = "--test it"
+test_file = "crates/broca-wal/tests/it/compaction_source.rs"
+select = "expected"
+expect_red = ["compaction_source::no_production_path_writes_deferred_call_records"]
+expect_message = "broca-core/src/consent.rs"
+file = "crates/broca-wal/tests/it/compaction_source.rs"
+old = '''found.retain(|variant| variant != "AwaitingApproval");'''
+new = '''found.retain(|variant| variant != "NON-VACUITY BREAK");'''
+
+[[control]]
+id = "retention-consent-provider-identity"
+guards = "retention withdrawal rows name the consent provider rather than the retired core provider"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::retention_expiry_deletes_owed_content_and_withdraws_from_identity_only_record"]
+file = "crates/broca-module/src/retention.rs"
+old = 'provider_id: "cingulate".into(),'
+new = 'provider_id: "prefrontal-core".into(), // NON-VACUITY BREAK: retired consent provider'
+
+[[control]]
+id = "retention-unknown-consent-lapses-at-expiry"
+guards = "unknown consent ids remain pending until exactly expires_at_ms without a consent operation"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::content_free_unknown_id_is_not_refiled_and_is_dropped_at_ask_expiry"]
+file = "crates/broca-module/src/retention_withdrawals.rs"
+old = "if now >= question.expires_at_ms {"
+new = "if now > question.expires_at_ms { // NON-VACUITY BREAK: miss the exact lapse deadline"
+
+[[control]]
+id = "retention-consent-withdraw-body-is-content-free"
+guards = "the production consent withdrawal body contains no expired transcript marker"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/retention_consent_wire.rs"
+expect_red = ["retention_consent_wire::retained_consent_withdrawal_uses_frozen_scope_and_content_free_body"]
+expect_message = "private retention marker in consent.withdraw body"
+file = "crates/broca-subc/src/consent.rs"
+old = '''"consent.withdraw",
+                &json!({"elicitation_id": id}),'''
+new = '''"consent.withdraw",
+                &json!({"elicitation_id": id, "prompt": "RETENTION-MODULE-CONTENT-SENTINEL-59137"}), // NON-VACUITY BREAK: leak expired content'''
+
+
+[[control]]
+id = "subc-consent-no-ack-on-owner-feed"
+guards = "the consent adapter refuses owner-wide acknowledgement even if a caller requests it"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_owner_feed_ack_is_refused_without_a_send"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = 'Err(refusal("consent_owner_feed_ack_forbidden"))'
+new = 'Ok(()) // NON-VACUITY BREAK: accept an owner-feed acknowledgement'
+
+[[control]]
+id = "subc-consent-filing-args-digest"
+guards = "the consent filing transmits the frozen argument hash unchanged alongside its binding"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_request_body_has_no_identity_keys"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"binding": broca_core::consent::binding(prepared), "args_digest": args_hash,'
+new = '"binding": broca_core::consent::binding(prepared), "args_digest": format!("{args_hash}-changed"), /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "subc-consent-default-deny"
+guards = "an unanswered consent filing defaults to deny independently of its expiry policy"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_request_body_has_no_identity_keys"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"default": "deny", "urgency": "normal", "on_expiry": "deny",'
+new = '"default": "approve", "urgency": "normal", "on_expiry": "deny", /* NON-VACUITY BREAK */'
 [[control]]
 id = "attempt-progress-reasoning-classification"
 guards = "Responses reasoning-summary deltas count as real content rather than unknown metadata"

@@ -1,5 +1,9 @@
 use broca_wal::{FramedRecord, Wal, WalError, WalLineageId, WalRecord};
-use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 // Reads see only completed barriers, not buffered appends. This keeps the approval
 // rig's durable-frame assertions meaningful without depending on filesystem fsync.
@@ -19,17 +23,17 @@ struct State {
 impl MemoryWal {
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        // Decode a fixed lineage frame instead of opening a file to mint an identity.
-        // The opaque identity's bytes do not matter to this single-lineage fixture.
+        // Decode a lineage frame without opening a file. Separate rigs must still
+        // have distinct identities when they share an owner-scoped consent feed.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let identity = NEXT.fetch_add(1, Ordering::SeqCst);
         let mut frame = [0x5a; 69];
         frame[..4].copy_from_slice(&16u32.to_le_bytes());
         frame[4] = 2;
         frame[5..21].fill(0);
-        frame[21..53].copy_from_slice(&[
-            0xb8, 0xc1, 0xc2, 0x6f, 0x10, 0xd3, 0xd6, 0x36, 0xff, 0x9d, 0x9d, 0x83, 0x61, 0x97,
-            0x15, 0x8a, 0x04, 0x82, 0xd1, 0x39, 0x75, 0xcc, 0x1b, 0x7c, 0x52, 0xa3, 0xf1, 0x43,
-            0xac, 0x76, 0x45, 0x80,
-        ]);
+        frame[53..61].copy_from_slice(&identity.to_le_bytes());
+        let digest = Sha256::digest([&frame[4..21], &frame[53..69]].concat());
+        frame[21..53].copy_from_slice(&digest);
         let broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } =
             broca_wal::framing::decode_next(&frame)
         else {

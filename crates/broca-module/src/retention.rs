@@ -504,7 +504,7 @@ impl RetentionService {
                     .withdrawal
                     .elicitation_id
                     .map_or(RetentionQuestionId::Unknown, RetentionQuestionId::Known),
-                provider_id: "prefrontal-core".into(),
+                provider_id: "cingulate".into(),
                 provider_incarnation: None,
                 expires_at_ms: ask.expires_at_ms,
             });

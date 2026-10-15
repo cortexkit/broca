@@ -1835,6 +1835,8 @@ async fn retention_expiry_deletes_owed_content_and_withdraws_from_identity_only_
     let rows = rig.store.pending_retention_withdrawals().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].call_key, call_key);
+    assert_eq!(rows[0].provider_id, "cingulate");
+    assert!(!format!("{rows:?}").contains(MARKER));
     assert_eq!(
         rows[0].question,
         RetentionQuestionId::Known("question".into())
@@ -1853,7 +1855,13 @@ async fn retention_expiry_deletes_owed_content_and_withdraws_from_identity_only_
             Some(&rows[0].scope.as_ref().unwrap().to_scope())
         );
         assert_eq!(sent[0].1, "question");
+        assert!(!format!("{sent:?}").contains(MARKER));
     }
+    assert!(rig
+        .store
+        .pending_retention_withdrawals()
+        .unwrap()
+        .is_empty());
     assert_no_marker(&rig.root);
     let mut fresh = request(&rig.key, "r2");
     fresh.retention = None;
@@ -1992,27 +2000,45 @@ impl broca_core::tool_plane::ElicitationPlane for RetainedQuestions {
 async fn content_free_unknown_id_is_not_refiled_and_is_dropped_at_ask_expiry() {
     let rig = Rig::new();
     let now = rig.service.clock.now_ms();
-    seed_owed_question_at(&rig, now, now + 3000, None);
+    let expires_at_ms = now + 3000;
+    seed_owed_question_at(&rig, now, expires_at_ms, None);
     let _lease = rig.service.lease(&rig.key).unwrap();
     rig.service.delete_expired(&rig.key, now + 2000).unwrap();
     let questions = Arc::new(RetainedQuestions::default());
     rig.service.set_withdrawal_adapter(Arc::new(
         crate::retention_withdrawals::ScopedRetentionWithdrawalAdapter(questions.clone()),
     ));
+    fs::write(
+        rig.root.join("test-clock"),
+        serde_json::json!({"now_ms": expires_at_ms - 1}).to_string(),
+    )
+    .unwrap();
+    rig.service.clock.refresh().unwrap();
     assert!(!rig.service.withdraw_retained_questions().await.unwrap());
+    let rows = rig.store.pending_retention_withdrawals().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].provider_id, "cingulate");
+    assert_eq!(rows[0].expires_at_ms, expires_at_ms);
+    assert!(!format!("{rows:?}").contains(MARKER));
     assert!(matches!(
-        rig.store.pending_retention_withdrawals().unwrap()[0].question,
+        rows[0].question,
         broca_store::retention_withdrawals::RetentionQuestionId::Unknown
     ));
     assert!(questions.withdrawals.lock().unwrap().is_empty());
-    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":4000}"#).unwrap();
+    fs::write(
+        rig.root.join("test-clock"),
+        serde_json::json!({"now_ms": expires_at_ms}).to_string(),
+    )
+    .unwrap();
     rig.service.clock.refresh().unwrap();
+    assert_eq!(rig.service.clock.now_ms(), expires_at_ms);
     assert!(rig.service.withdraw_retained_questions().await.unwrap());
     assert!(rig
         .store
         .pending_retention_withdrawals()
         .unwrap()
         .is_empty());
+    assert!(questions.withdrawals.lock().unwrap().is_empty());
     assert_no_marker(&rig.root);
 }
 

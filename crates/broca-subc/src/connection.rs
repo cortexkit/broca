@@ -174,6 +174,31 @@ static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ConnToken(u64);
 
+#[derive(Debug)]
+pub(crate) enum ApprovedCallError {
+    BeforePush(ApprovedSetupError),
+    AfterPush(ConnError),
+}
+
+#[derive(Debug)]
+pub(crate) enum ApprovedSetupError {
+    Interrupted,
+    Connection(ConnError),
+}
+impl From<ConnError> for ApprovedSetupError {
+    fn from(error: ConnError) -> Self {
+        Self::Connection(error)
+    }
+}
+impl std::fmt::Display for ApprovedSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted => f.write_str("approved_dispatch_stopped_before_enqueue"),
+            Self::Connection(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// A route identity that cannot be reused on another connection or route generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RouteHandle {
@@ -734,6 +759,36 @@ impl SubcConnection {
             .send(frame)
             .await
             .map_err(|_| ConnError::Transport("writer task closed".into()))
+    }
+
+    async fn enqueue_approved(
+        &self,
+        runtime: &ConnectionRuntime,
+        frame: Frame,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> Result<(), ApprovedSetupError> {
+        let permit = tokio::select! {
+            biased;
+            _ = signals.cancelled() => return Err(ApprovedSetupError::Interrupted),
+            permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed before enqueue".into()))?,
+        };
+        Self::push_approved(permit, frame, signals)
+    }
+
+    fn push_approved(
+        permit: mpsc::Permit<'_, Frame>,
+        frame: Frame,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> Result<(), ApprovedSetupError> {
+        // A clear final signal observation below is the linearization point: the
+        // call is committed to send. Cancellation after that observation, even
+        // from another thread before permit.send executes, is treated as after
+        // the send. No await separates the observation from the synchronous push.
+        if signals.interrupted() {
+            return Err(ApprovedSetupError::Interrupted);
+        }
+        permit.send(frame);
+        Ok(())
     }
 
     fn spawn_liveness_probe(&self, runtime: &Arc<ConnectionRuntime>) {
@@ -1416,9 +1471,7 @@ impl SubcConnection {
         self.send_tool_call_body(route, deadline, body).await
     }
 
-    /// Keep the exact argument bytes bound by the human approval's hash. Parsing and
-    /// reserializing them could invalidate that approval. Validate a single JSON value
-    /// before sending, then reuse the ordinary path's send, cancellation and reply deadline.
+    /// Preserve the exact argument bytes rather than parsing and reserializing them.
     #[allow(clippy::too_many_arguments)]
     pub async fn tool_call_raw_with_preset(
         &self,
@@ -1431,6 +1484,71 @@ impl SubcConnection {
         call_key: Option<&str>,
         approval_digest: Option<&str>,
     ) -> ConnResult<serde_json::Value> {
+        let body = Self::raw_tool_call_body(
+            name,
+            args_jcs,
+            tool_call_id,
+            preset,
+            call_key,
+            approval_digest,
+        )?;
+        self.send_tool_call_body(route, deadline, body).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn tool_call_raw_guarded(
+        &self,
+        route: &RouteHandle,
+        name: &str,
+        args_jcs: &str,
+        tool_call_id: Option<&str>,
+        deadline: Duration,
+        preset: Option<&str>,
+        call_key: Option<&str>,
+        approval_digest: Option<&str>,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> Result<serde_json::Value, ApprovedCallError> {
+        // All fallible setup belongs to one pre-push stage. There is no fallible
+        // work after enqueue inside this block, so its errors can never mean sent.
+        let before_push = async {
+            let body = Self::raw_tool_call_body(
+                name,
+                args_jcs,
+                tool_call_id,
+                preset,
+                call_key,
+                approval_digest,
+            )?;
+            let corr = self.next_corr();
+            let (runtime, registration, rx) =
+                self.register_route(route, (route.channel, route.epoch, corr))?;
+            let frame = Frame::build(
+                FrameType::Request,
+                data_flags(),
+                route.channel,
+                route.epoch,
+                corr,
+                body,
+            )
+            .map_err(|error| ConnError::Transport(error.to_string()))?;
+            self.enqueue_approved(&runtime, frame, signals).await?;
+            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr))
+        };
+        let (runtime, _registration, mut rx, corr) =
+            before_push.await.map_err(ApprovedCallError::BeforePush)?;
+        self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
+            .await
+            .map_err(ApprovedCallError::AfterPush)
+    }
+
+    fn raw_tool_call_body(
+        name: &str,
+        args_jcs: &str,
+        tool_call_id: Option<&str>,
+        preset: Option<&str>,
+        call_key: Option<&str>,
+        approval_digest: Option<&str>,
+    ) -> ConnResult<Vec<u8>> {
         serde_json::from_str::<&serde_json::value::RawValue>(args_jcs)
             .map_err(|error| ConnError::Protocol(format!("invalid approved arguments: {error}")))?;
         let envelope = ToolCallRequest {
@@ -1459,8 +1577,7 @@ impl SubcConnection {
             );
             body.push('}');
         }
-        self.send_tool_call_body(route, deadline, body.into_bytes())
-            .await
+        Ok(body.into_bytes())
     }
 
     async fn send_tool_call_body(
@@ -1480,32 +1597,36 @@ impl SubcConnection {
             corr,
             body,
         )
-        .map_err(|e| ConnError::Transport(e.to_string()))?;
-        async {
-            self.send(&runtime, frame).await?;
-            // Armed only once the Request is in the writer queue: a call that was never sent has
-            // no provider work to stop. From here until a terminal arrives, giving up on the
-            // call -- the deadline below expiring, or the caller dropping this future -- sends
-            // the provider a Cancel so the tool stops instead of running on with nobody waiting.
-            let mut abandon = CancelOnAbandon::arm(&runtime, route, corr);
-            let terminal = self
-                .await_terminal_deadline(&runtime, &mut rx, deadline)
-                .await;
-            // `Ok` is always a Response or Error terminal: the provider has finished the call.
-            if terminal.is_ok() {
-                abandon.disarm();
-            }
-            let terminal = terminal?;
-            match terminal.header.ty {
-                FrameType::Response => serde_json::from_slice::<serde_json::Value>(&terminal.body)
-                    .map_err(|e| ConnError::Protocol(format!("decode tool result: {e}"))),
-                FrameType::Error => Err(ConnError::Rejected(decode_error_body(&terminal.body))),
-                ty => Err(ConnError::Protocol(format!(
-                    "unexpected tool-call frame {ty:?}"
-                ))),
-            }
+        .map_err(|error| ConnError::Transport(error.to_string()))?;
+        self.send(&runtime, frame).await?;
+        self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
+            .await
+    }
+
+    async fn receive_tool_call(
+        &self,
+        runtime: Arc<ConnectionRuntime>,
+        route: &RouteHandle,
+        corr: u64,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
+        deadline: Duration,
+    ) -> ConnResult<serde_json::Value> {
+        // Arm abandonment only after enqueue. A request canceled while reserving
+        // writer capacity has no provider work to cancel.
+        let mut abandon = CancelOnAbandon::arm(&runtime, route, corr);
+        let terminal = self.await_terminal_deadline(&runtime, rx, deadline).await;
+        if terminal.is_ok() {
+            abandon.disarm();
         }
-        .await
+        let terminal = terminal?;
+        match terminal.header.ty {
+            FrameType::Response => serde_json::from_slice::<serde_json::Value>(&terminal.body)
+                .map_err(|error| ConnError::Protocol(format!("decode tool result: {error}"))),
+            FrameType::Error => Err(ConnError::Rejected(decode_error_body(&terminal.body))),
+            ty => Err(ConnError::Protocol(format!(
+                "unexpected tool-call frame {ty:?}"
+            ))),
+        }
     }
 
     async fn await_terminal(
@@ -2930,7 +3051,30 @@ impl SubcConnection {
         channel: u16,
         epoch: u32,
     ) -> (SubcConnection, RouteHandle, InProcessModuleEnd) {
-        let (write_tx, write_rx) = mpsc::channel(16);
+        Self::in_process_with_capacity_for_test(channel, epoch, 16)
+    }
+
+    pub(crate) fn in_process_full_writer_for_test(
+        channel: u16,
+        epoch: u32,
+    ) -> (SubcConnection, RouteHandle, InProcessModuleEnd) {
+        let (conn, route, module) = Self::in_process_with_capacity_for_test(channel, epoch, 256);
+        let runtime = conn.snapshot_route(&route).unwrap();
+        for _ in 0..256 {
+            runtime
+                .write_tx
+                .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 0, vec![]).unwrap())
+                .unwrap();
+        }
+        (conn, route, module)
+    }
+
+    fn in_process_with_capacity_for_test(
+        channel: u16,
+        epoch: u32,
+        capacity: usize,
+    ) -> (SubcConnection, RouteHandle, InProcessModuleEnd) {
+        let (write_tx, write_rx) = mpsc::channel(capacity);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let conn_token = ConnToken(NEXT_CONNECTION_TOKEN.fetch_add(1, Ordering::Relaxed));
         let runtime = Arc::new(ConnectionRuntime {
@@ -2965,6 +3109,35 @@ impl SubcConnection {
 
 #[cfg(test)]
 impl InProcessModuleEnd {
+    pub(crate) fn fill_pending_for_test(&self) {
+        for corr in 0..MAX_PENDING_REQUESTS as u64 {
+            let (sender, _rx) = mpsc::unbounded_channel();
+            self.pending.lock().unwrap().insert(
+                (9, 1, corr),
+                PendingEntry::Live {
+                    sender: PendingSender::Unary(sender),
+                    route_open: false,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn close_writer_for_test(&mut self) {
+        self.write_rx.close();
+    }
+
+    pub(crate) fn pending_count_for_test(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    pub(crate) fn take_written_for_test(&mut self) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = self.write_rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
     /// The next data-plane Request the connection sent. Other frames (a liveness Ping after a
     /// timeout, a route Goodbye) are skipped.
     pub(crate) async fn next_request(&mut self) -> Frame {
@@ -5593,7 +5766,7 @@ mod approval_raw_tests {
                 Duration::from_secs(1),
                 Some("head"),
                 Some("lineage:7"),
-                Some("digest")
+                None
             ),
             async {
                 let request = module.next_request().await;
@@ -5605,7 +5778,7 @@ mod approval_raw_tests {
                 let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 assert_eq!(value["preset"], "head");
                 assert_eq!(value["call_key"], "lineage:7");
-                assert_eq!(value["approval_digest"], "digest");
+                assert!(value.get("approval_digest").is_none());
                 assert!(module.reply(&request, br#"{"content":[]}"#.to_vec()));
             }
         );
@@ -5636,5 +5809,31 @@ mod approval_raw_tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod approved_enqueue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approved_push_rechecks_cancel_and_stop_after_capacity_is_reserved() {
+        for cancel in [true, false] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let token = CancellationToken::new();
+            let signals = broca_core::tool_plane::DispatchSignals::new(
+                if cancel { Some(&token) } else { None },
+                if cancel { None } else { Some(&token) },
+            );
+            let permit = tx.reserve().await.unwrap();
+            token.cancel();
+            let frame =
+                Frame::build(FrameType::Request, data_flags(), 5, 3, 1, br#"{}"#.to_vec()).unwrap();
+            assert!(matches!(
+                SubcConnection::push_approved(permit, frame, &signals),
+                Err(ApprovedSetupError::Interrupted)
+            ));
+            assert!(rx.try_recv().is_err());
+        }
     }
 }

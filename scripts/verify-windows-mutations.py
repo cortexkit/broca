@@ -143,7 +143,8 @@ class CoverageTests(unittest.TestCase):
         controls = [row for row in catalog["control"]
                     if row.get("test_file") == "crates/broca-module-serve/tests/it/approval_gate.rs"]
         self.assertEqual({row["id"] for row in controls},
-                         {"serve-boot-terminal-withdrawal-debt", "serve-installs-elicitation-plane"})
+                         {"serve-boot-terminal-withdrawal-debt", "serve-installs-elicitation-plane",
+                          "serve-installs-consent-plane", "serve-required-cingulate-build-cannot-skip"})
         for row in controls:
             with self.subTest(control=row["id"]):
                 # Order is not meaningful; scripts/verify-mutation-platforms.py checks the claim itself.

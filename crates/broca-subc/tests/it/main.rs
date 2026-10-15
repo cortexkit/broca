@@ -18,8 +18,8 @@ mod common;
 
 mod aimock_real_aft;
 mod compaction_routes;
+mod consent_ops;
 mod dogfood;
-mod elicitation_ops;
 mod hook_routes;
 mod multi_module_spine;
 mod resume_spine;
