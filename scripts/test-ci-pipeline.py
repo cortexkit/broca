@@ -262,6 +262,25 @@ class WorkflowGraph(unittest.TestCase):
                                  text=True, capture_output=True, timeout=5)
             self.assertEqual(run.returncode == 0, result == 'success', run.stdout + run.stderr)
 
+    def test_ci_uploads_survivor_dumps_even_after_failure(self):
+        for job in ('unit', 'integration'):
+            with self.subTest(job=job):
+                steps = self.workflow('ci.yml')['jobs'][job]['steps']
+                uploads = [step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@')]
+                dump = next((step for step in uploads
+                             if 'broca/target/rig-survivors/*.txt' in step.get('with', {}).get('path', '').splitlines()), None)
+                self.assertIsNotNone(dump, f'{job} must upload survivor dumps')
+                self.assertEqual(dump['if'], 'always()')
+
+    def test_windows_mutations_upload_survivor_dumps_even_after_failure(self):
+        steps = self.workflow('mutations-windows.yml')['jobs']['mutations-windows']['steps']
+        uploads = [step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@')]
+        dump = next((step for step in uploads
+                     if 'broca/target/rig-survivors/*.txt' in step.get('with', {}).get('path', '').splitlines()), None)
+        self.assertIsNotNone(dump, 'Windows mutation shards must upload survivor dumps')
+        self.assertEqual(dump['if'], 'always()')
+        self.assertIn('broca/target/mutations/windows-*.json', dump['with']['path'].splitlines())
+
 
 class MutationReplay(unittest.TestCase):
     def setUp(self):

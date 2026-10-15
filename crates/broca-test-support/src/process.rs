@@ -27,6 +27,47 @@ fn format_survivor_block(root_pid: u32, survivors: &[ProcessInfo]) -> Option<Str
     Some(block)
 }
 
+#[cfg(any(windows, test))]
+fn report_cleanup_diagnostic(message: &str) {
+    // Libtest captures eprintln!, but direct stderr writes split its status lines.
+    // Keep a durable copy too, because successful tests hide captured diagnostics.
+    eprintln!("{message}");
+    if let Err(error) = append_cleanup_diagnostic(message) {
+        eprintln!("test rig: cannot persist process cleanup diagnostic: {error}");
+    }
+}
+
+#[cfg(any(windows, test))]
+fn append_cleanup_diagnostic(message: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    let directory = target.join("rig-survivors");
+    std::fs::create_dir_all(&directory)?;
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("unnamed-test");
+    let filename: String = test
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join(format!("{filename}.txt")))?;
+    writeln!(
+        file,
+        "test={test} test_process={}\n{message}",
+        std::process::id()
+    )
+}
+
 #[cfg(windows)]
 mod windows_processes {
     use super::ProcessInfo;
@@ -85,18 +126,16 @@ mod windows_processes {
             process.in_job = process_job_status(process.pid, &mut errors);
         }
         if let Some(block) = super::format_survivor_block(diagnostic.root_pid, &survivors) {
-            let _ = writeln_stderr(&block);
+            super::report_cleanup_diagnostic(&block);
         }
-        // A clean cleanup prints nothing. This writes past the test harness's output capture,
-        // so an unconditional line lands inside libtest's `test name ... ok` status line and
-        // breaks every tool that parses it (the mutation runner reported such rows as ERROR).
+        // Clean cleanup stays silent, including in the artifact directory.
         if survivors.is_empty() && errors.is_empty() {
             return;
         }
         let first_error = errors
             .first()
             .map(|error| format!(" first_error={error:?}"));
-        let _ = writeln_stderr(&format!(
+        super::report_cleanup_diagnostic(&format!(
             "test rig: process tree cleanup pid={} tracked={} records={} survivors={} errors={}{}",
             root_pid,
             tracked,
@@ -139,11 +178,6 @@ mod windows_processes {
                 None
             }
         }
-    }
-
-    fn writeln_stderr(message: &str) -> std::io::Result<()> {
-        use std::io::Write;
-        writeln!(std::io::stderr().lock(), "{message}")
     }
 }
 
@@ -243,6 +277,65 @@ mod tests {
         if std::env::var_os("BROCA_TEST_SUPPORT_SLEEP").is_some() {
             std::thread::sleep(Duration::from_secs(60));
         }
+    }
+
+    #[test]
+    fn captured_survivor_report_child() {
+        if std::env::var_os("BROCA_TEST_SUPPORT_REPORT").is_some() {
+            let block = format_survivor_block(
+                11,
+                &[ProcessInfo {
+                    image: "detached-child.exe".to_owned(),
+                    pid: 22,
+                    parent_pid: 11,
+                    in_job: Some(false),
+                }],
+            )
+            .unwrap();
+            report_cleanup_diagnostic(&block);
+            report_cleanup_diagnostic("second cleanup diagnostic");
+        }
+    }
+
+    #[test]
+    fn cleanup_diagnostics_preserve_libtest_status_and_append_artifact() {
+        let directory = std::env::temp_dir().join(format!(
+            "broca-captured-survivor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::tests::captured_survivor_report_child"])
+            .env("BROCA_TEST_SUPPORT_REPORT", "1")
+            .env("CARGO_TARGET_DIR", &directory)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("test process::tests::captured_survivor_report_child ... ok"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("surviving processes"), "{stdout}");
+        assert!(!stderr.contains("surviving processes"), "{stderr}");
+        let path =
+            directory.join("rig-survivors/process__tests__captured_survivor_report_child.txt");
+        let report = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_dir_all(&directory);
+        let report = report.expect("successful tests must retain survivor diagnostics");
+        assert!(
+            report.contains("test=process::tests::captured_survivor_report_child"),
+            "{report}"
+        );
+        assert!(
+            report.contains("detached-child.exe") && report.contains("pid=22"),
+            "{report}"
+        );
+        assert!(report.contains("second cleanup diagnostic"), "{report}");
     }
 
     #[cfg(windows)]

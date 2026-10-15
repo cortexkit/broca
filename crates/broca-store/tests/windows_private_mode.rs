@@ -80,14 +80,15 @@ fn windows_private_mode_dry_run_and_idempotent_repair() {
     );
 }
 #[test]
+#[ignore = "requires a Windows token without ACL-read bypass privileges; run explicitly with --ignored"]
 fn windows_private_mode_observes_unreadable_acl() {
     let fixture = BroadParent::new("repair-unreadable");
     let (root, _) = tree(&fixture.path);
     let file = root.join("wal/session.wal");
     deny_acl_read(&file);
-    // A privileged token can read the ACL despite the deny. This test records whether
-    // ACL inspection actually returns PermissionDenied on Windows; the portable
-    // injected test verifies that private-mode refuses when inspection is denied.
+    // Elevated CI tokens can bypass deny_acl_read's ACL-read denial, so this test is
+    // explicitly ignored by default. An explicit run must observe PermissionDenied.
+    // private_mode_refuses_injected_unreadable_acl covers refusal on every CI runner.
     match broca_owner_only::is_private(&file) {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             observation(format_args!(
@@ -101,7 +102,7 @@ fn windows_private_mode_observes_unreadable_acl() {
             observe_acl_environment(&file);
             reset_acl(&file);
             assert_eq!(std::fs::read(&file).unwrap(), b"WAL marker");
-            return;
+            panic!("unreadable-ACL observation requires PermissionDenied, got {inspection:?}");
         }
     }
     for dry_run in [true, false] {
@@ -114,9 +115,7 @@ fn windows_private_mode_observes_unreadable_acl() {
 }
 
 fn observation(message: std::fmt::Arguments<'_>) {
-    // Write directly so a passing observation remains visible under libtest capture.
-    use std::io::Write;
-    writeln!(std::io::stderr().lock(), "{message}").unwrap();
+    eprintln!("{message}");
 }
 
 fn observe_acl_environment(file: &Path) {
