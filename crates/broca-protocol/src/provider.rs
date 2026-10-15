@@ -135,6 +135,9 @@ pub struct ModelAttempt {
     /// JOIN KEY: clocks on the two sides of an HTTP exchange disagree. Match attempts to the
     /// provider's own log by body digest plus order instead.
     pub ts_ms: u64,
+    /// Optional wire measurements; provider and model are joined through the run's `run_started`.
+    #[serde(flatten)]
+    pub content_progress: Box<ContentProgress>,
     /// Wall-clock time the request was handed to the HTTP client, in Unix milliseconds: the
     /// moment a provider's prompt-cache lifetime can start, which `ts_ms` (the end of a
     /// response that may have streamed for minutes) cannot stand in for. Absent when the attempt
@@ -179,6 +182,60 @@ pub struct ModelAttempt {
     /// Boxed because it is empty on most attempts and every provider event carries this type.
     #[serde(skip)]
     pub account_observation: Box<AttemptAccountObservation>,
+}
+
+/// Measured complete wire records, not transport chunks or assembled output. Provider and model
+/// are supplied by the run's `run_started`, not duplicated on each attempt. Absent values were
+/// not observed; in particular a stream with no content has no content timestamps or counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentProgress {
+    /// Unix milliseconds when the first real-content record was decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_content_at_ms: Option<u64>,
+    /// Unix milliseconds when the most recent real-content record was decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_at_ms: Option<u64>,
+    /// UTF-8 data payload bytes of content-bearing records, including their JSON envelopes,
+    /// excluding SSE framing. Provider and model come from the run's `run_started`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bytes: Option<u64>,
+    /// UTF-8 data payload bytes of non-content records, or comment bytes for keepalives,
+    /// excluding SSE framing. Provider and model come from the run's `run_started`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_content_bytes: Option<u64>,
+    /// Top sixteen event types by count (ties ordered by name), then an observed `other` bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_types: Option<Vec<EventTypeTally>>,
+    /// Non-content record bytes following the last content, absent without content; zero when
+    /// content was observed and no following non-content record was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_content_bytes_after_last_content: Option<u64>,
+    /// Complete records following the last content, absent without content; zero for no suffix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_after_last_content: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventTypeTally {
+    pub event_type: String,
+    pub count: u64,
+    /// Absent if the transport did not expose payload lengths, as with WebSocket ping/pong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Present only for event names not recognized by this wire family's explicit mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<bool>,
+}
+
+/// Live advisory status, never reconstructed from attempt records after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightStep {
+    pub step_id: StepId,
+    pub started_at_ms: u64,
+    pub attempt: u32,
+    pub attempt_started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_at_ms: Option<u64>,
 }
 
 /// Exact UTF-8 text payload sent in a Responses WebSocket request, before frame compression.

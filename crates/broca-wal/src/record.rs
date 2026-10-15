@@ -342,6 +342,12 @@ pub enum WalRecord {
         /// Wall-clock attempt end, Unix milliseconds. INFORMATIONAL ONLY, NEVER A JOIN KEY:
         /// match attempts to a provider's log by body digest plus order.
         ts_ms: u64,
+        /// Optional timestamps and byte counts for text, reasoning/summary, function-argument
+        /// and refusal deltas, plus non-content bytes, a bounded event tally and the suffix
+        /// following the last content. Provider and model come from the run's `run_started`;
+        /// no provider/model identity is duplicated on the attempt.
+        #[serde(flatten)]
+        content_progress: Box<broca_protocol::provider::ContentProgress>,
         /// Wall-clock time the request was handed to the HTTP client, Unix milliseconds: when the
         /// provider's prompt-cache lifetime can start. After a restart it is what dates the
         /// session's cache, since `ts_ms` is the end of a response that may have run for minutes.
@@ -936,6 +942,7 @@ impl WalRecord {
             response_body_cap,
             outcome,
             ts_ms,
+            content_progress,
             sent_at_ms,
             transport,
             websocket_request,
@@ -958,6 +965,7 @@ impl WalRecord {
             response_body_cap,
             outcome,
             ts_ms,
+            content_progress,
             sent_at_ms,
             transport,
             websocket_request,

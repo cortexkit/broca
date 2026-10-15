@@ -237,13 +237,17 @@ fn windows_private_mode_never_follows_junctions() {
     assert_eq!(std::fs::read(&target).unwrap(), b"external marker");
     // A supplied junction root is refused too, not just a link discovered during descent.
     let root_link = fixture.path.join("root-link");
-    assert!(Command::new("cmd.exe")
+    let result = Command::new("cmd.exe")
         .args(["/C", "mklink", "/J"])
         .arg(&root_link)
         .arg(&root)
-        .status()
-        .unwrap()
-        .success());
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "root junction fixture: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(!run(&root_link, false).status.success());
     std::fs::remove_dir(root_link).unwrap();
     std::fs::remove_dir(link).unwrap();

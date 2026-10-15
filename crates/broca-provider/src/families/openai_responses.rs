@@ -610,7 +610,7 @@ impl OpenAiResponsesNormalizer {
             step_id,
             private_error_diagnostics: false,
             reasoning_format,
-            sse: SseDecoder::default(),
+            sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Responses),
             response_id: None,
             text_items: BTreeMap::new(),
             refusal: String::new(),
@@ -1104,6 +1104,12 @@ impl OpenAiResponsesNormalizer {
 }
 
 impl StreamNormalizer for OpenAiResponsesNormalizer {
+    fn websocket_telemetry(&mut self) {
+        self.sse.websocket_telemetry();
+    }
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.sse.content_progress()
+    }
     fn private_error_diagnostics(&mut self) {
         self.private_error_diagnostics = true;
     }

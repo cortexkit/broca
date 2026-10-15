@@ -1620,6 +1620,12 @@ async fn late_read_pages_are_atomic_bounded_and_nonrepeating() {
     use crate::serve::{ServeHandler, SessionReadRequest};
     let rig = Rig::new(false);
     seed_late_entries(&rig);
+    let page = rig.registry.route_read(&rig.key, None, None).await.unwrap();
+    // Bound the approval projection itself: the outer response pager also limits bytes and
+    // could hide an unbounded allocation of late results before it trims the response.
+    let (late, next) = crate::approval::late_page(&page.late_approvals, None, 256).unwrap();
+    assert_eq!(late.len(), 1, "late projection ignored max_bytes");
+    assert_eq!(next.as_ref(), Some(&late[0].call_key));
     let mut request = SessionReadRequest::new(rig.key.clone(), None, Some(100));
     request.max_bytes = Some(256);
     let first = rig.registry.read(request.clone()).await.unwrap();

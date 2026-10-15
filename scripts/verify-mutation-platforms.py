@@ -444,6 +444,8 @@ def python_tests(path):
 
 def command_args(row):
     command = row.get("command", [])
+    if command[:3] == ["python3", "-B", "scripts/mutation-bash.py"]:
+        command = ["bash", *command[3:]]
     if command[:2] == ["bash", "-c"]:
         # These wrappers print the diff before one test command; arbitrary shell
         # logic is rejected rather than guessing which test it will execute.
@@ -778,6 +780,13 @@ macro_rules! case { ($name:ident, $path:literal) => { #[test] fn $name() {} }; }
         self.assertEqual(len(self.check()), 1)
         self.assertIn("lib.rs:1: cfg(unix)", self.check()[0])
 
+    def test_native_bash_launcher_checks_underlying_target_gates(self):
+        self.put("crates/probe/src/lib.rs", '#![cfg(unix)]\nmod sample { #[test] fn probe() {} }')
+        self.row.update(runner="command", command=["python3", "-B", "scripts/mutation-bash.py", "-c",
+                        'git diff --stat; cargo test --locked -p probe --lib "$1" -- --exact', "--", "{test}"])
+        self.assertEqual(len(self.check()), 1)
+        self.assertIn("lib.rs:1: cfg(unix)", self.check()[0])
+
     def test_python_tests_are_checked_and_unsupported_commands_refuse(self):
         self.put("proof.py", 'class Proof:\n    def test_probe(self):\n        pass\n')
         self.row.update(runner="command", test_file="proof.py", expect_red=["Proof.test_probe"], command=["python3", "-B", "proof.py", "{test}"])
@@ -794,6 +803,19 @@ class CatalogueTests(unittest.TestCase):
         errors, count = verify_catalogue(self.root, catalogue)
         self.assertEqual(errors, [])
         self.assertGreater(count, 2000)
+
+    def test_live_file_anchor_proof_cannot_claim_windows(self):
+        rows = {"wal-anchored-damaged-length-before-record"}
+        catalogue = tomllib.loads((self.root / "mutations.toml").read_text(encoding="utf-8"))
+        for row in catalogue["control"]:
+            if row["id"] in rows:
+                row.pop("platforms")
+        errors, _ = verify_catalogue(self.root, catalogue)
+        self.assertEqual({error.split(":", 1)[0] for error in errors}, rows)
+        self.assertEqual(len(errors), 1)
+        for error in errors:
+            self.assertIn("does not compile on windows", error)
+            self.assertIn("cfg(unix)", error)
 
     def test_six_retention_platform_reversions_in_fixture_copy_are_rejected(self):
         rows = {

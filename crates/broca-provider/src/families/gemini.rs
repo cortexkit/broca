@@ -627,7 +627,7 @@ impl GeminiNormalizer {
         Self {
             step_id,
             tool_id_policy,
-            sse: SseDecoder::default(),
+            sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Gemini),
             parts: Vec::new(),
             next_call_index: 0,
             usage: Usage::default(),
@@ -922,6 +922,9 @@ fn synthetic_inbound_id(index: u32, policy: ToolIdPolicy) -> String {
 }
 
 impl StreamNormalizer for GeminiNormalizer {
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.sse.content_progress()
+    }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.push(chunk)? {

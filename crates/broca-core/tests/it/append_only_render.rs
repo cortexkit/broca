@@ -279,6 +279,7 @@ impl Provider for TransformingProvider {
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
             let attempt = broca_protocol::ModelAttempt {
+                content_progress: Default::default(),
                 attempt: 0,
                 request_body_len: 1,
                 request_body_sha256: "aa".into(),

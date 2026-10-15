@@ -109,6 +109,8 @@ fn record_data(record: &str) -> Option<String> {
 /// read.
 #[derive(Default)]
 pub struct SseDecoder {
+    content: crate::content_progress::ContentObserver,
+    websocket_telemetry: bool,
     buf: Vec<u8>,
     scan_from: usize,
     /// At most three bytes are held here while deciding whether the stream starts with a BOM.
@@ -125,6 +127,20 @@ pub struct SseDecoder {
 }
 
 impl SseDecoder {
+    pub(crate) fn for_content_family(family: crate::content_progress::ContentFamily) -> Self {
+        Self {
+            content: crate::content_progress::ContentObserver::new(family),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.content.snapshot()
+    }
+
+    pub(crate) fn websocket_telemetry(&mut self) {
+        self.websocket_telemetry = true;
+    }
     /// Append raw response bytes and return the data payloads from every newly
     /// completed record. Invalid UTF-8 in a complete record is a wire error.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, NormalizeError> {
@@ -218,7 +234,39 @@ impl SseDecoder {
             if let Some(name) = event_name {
                 self.last_event_type = Some(name.to_owned());
             }
-            if let Some(payload) = record_data(record) {
+            let data = record_data(record);
+            let telemetry_name = if data.as_deref() == Some("[DONE]") {
+                "[DONE]".to_owned()
+            } else if let Some(payload) = data.as_deref().filter(|s| !s.is_empty()) {
+                event_name
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()?
+                            .get("type")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "message".into())
+            } else if record_has_comment(record) {
+                "keepalive".into()
+            } else {
+                "empty".into()
+            };
+            if self.websocket_telemetry && telemetry_name == "keepalive" {
+                // The socket pump exposes ping/pong as empty records, not their payloads.
+                // Count the observed event but never measure the synthetic SSE comment's bytes.
+                self.content.observe_unmeasured_keepalive();
+            } else {
+                self.content.observe(
+                    &telemetry_name,
+                    data.as_deref(),
+                    data.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map_or(record.len(), str::len),
+                );
+            }
+            if let Some(payload) = data {
                 if event_name.is_none() && !payload.is_empty() {
                     // Deserialize only the envelope discriminator, never retain response content
                     // in diagnostics. Untyped SSE data has the standard event name `message`.

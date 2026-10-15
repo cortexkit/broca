@@ -46,16 +46,17 @@ jobs:
 
   mutations:
     needs: [fixtures, mutation-platforms]
-    name: Mutation catalogue (shard ${{ matrix.shard }}/4)
+    name: Mutation catalogue (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
-        # The whole catalogue replayed in one job took about 39 minutes on this runner
-        # (about 50 s per row, most of it rebuilding). Four shards split the rows so each
-        # job replays about a quarter; every shard still builds the fixtures once.
-        shard: [1, 2, 3, 4]
+        # 26 mutation proofs took 27.7 min, including 13.1 min checking unmodified code.
+        # Split all master proofs 32 ways so these checks and rebuilds fit in 90 min.
+        # Nightly also runs tests in other package targets, so allow it 180 min.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
     env:
       # The breadth audit includes the same real-daemon/vault arms as the test job.
       # Missing fixtures must fail, never subtract those proofs through a green skip.
@@ -124,21 +125,22 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PUSH_BASE: ${{ github.event.before }}
           SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/mutations
           if [[ "$EVENT" == schedule ]]; then
-            ckdev-mutate run --all --broad --shard "$SHARD/4" --report target/mutations/broad.json
+            ckdev-mutate run --all --broad --shard "$SHARD/$SHARDS" --report target/mutations/broad.json
           elif [[ "$EVENT" == workflow_dispatch || ( "$EVENT" == push && "$REF" == refs/heads/master ) ]]; then
-            ckdev-mutate run --all --shard "$SHARD/4" --report target/mutations/all.json
+            ckdev-mutate run --all --shard "$SHARD/$SHARDS" --report target/mutations/all.json
           else
             base="${PR_BASE:-${PUSH_BASE:-}}"
             # A new train branch has an all-zero before SHA; compare against master.
             if [[ -z "$base" || "$base" == 0000000000000000000000000000000000000000 ]]; then
               base=origin/master
             fi
-            ckdev-mutate run --diff "$base" --shard "$SHARD/4" --report target/mutations/diff.json
+            ckdev-mutate run --diff "$base" --shard "$SHARD/$SHARDS" --report target/mutations/diff.json
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
@@ -213,6 +215,22 @@ jobs:
         with:
           path: ~/.cargo/bin/ckdev-mutate.exe
           key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
+      - name: Select Git Bash for native command proofs
+        run: |
+          # Parent PATH cannot outrank System32 in Rust's Windows executable search.
+          # Command rows pass this absolute path through the Python Bash launcher.
+          echo "BROCA_MUTATION_BASH=$(cygpath -w "$BASH")" >> "$GITHUB_ENV"
+      - name: Check native command interpreter
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import sys
+          launcher = [sys.executable, "-B", "scripts/mutation-bash.py"]
+          result = subprocess.run([*launcher, "-c", "printf 'broca-native-bash\\n'"],
+                                  capture_output=True, text=True, check=True)
+          assert result.stdout == "broca-native-bash\n", result
+          subprocess.run([*launcher, "--version"], check=True)
+          PY
       - name: Validate catalogue
         run: ckdev-mutate check
       - name: Test Windows report verifier

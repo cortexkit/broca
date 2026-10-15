@@ -146,7 +146,7 @@ impl WireFamily for GoogleCodeAssist {
     ) -> Box<dyn StreamNormalizer> {
         Box::new(CodeAssistNormalizer {
             inner: GeminiNormalizer::new(step_id, frozen.tool_id),
-            sse: SseDecoder::default(),
+            sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::CodeAssist),
         })
     }
 }
@@ -344,6 +344,9 @@ struct CodeAssistNormalizer {
 }
 
 impl StreamNormalizer for CodeAssistNormalizer {
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.sse.content_progress()
+    }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.push(chunk)? {

@@ -419,7 +419,7 @@ impl OpenAiChatNormalizer {
         Self {
             arguments_guard: Default::default(),
             step_id,
-            sse: SseDecoder::default(),
+            sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Chat),
             message_id: None,
             reasoning: String::new(),
             text: String::new(),
@@ -786,6 +786,9 @@ impl OpenAiChatNormalizer {
 }
 
 impl StreamNormalizer for OpenAiChatNormalizer {
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.sse.content_progress()
+    }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         if self.emitted_final {
             return Ok(Vec::new());

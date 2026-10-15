@@ -14,8 +14,35 @@ use broca_protocol::{CallOptions, GenerationConfig, NormalizedEvent, StepId, Too
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
+
+/// Per-call runtime state, kept out of the frozen request and rendering/cache domain.
+pub struct StepRuntime {
+    pub cancel: CancellationToken,
+    pub deadline: Option<Instant>,
+    pub seal: Option<crate::ShutdownSeal>,
+    pub progress: Option<LiveStepProgress>,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        runtime: StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        match runtime.seal {
+            Some(seal) => {
+                self.step_with_shutdown_seal(step_id, opts, runtime.cancel, runtime.deadline, seal)
+                    .await
+            }
+            None => {
+                self.step_with_shared_cancel(step_id, opts, runtime.cancel, runtime.deadline)
+                    .await
+            }
+        }
+    }
     /// Release run-local network state on completion, cancellation, graceful stop or task abort.
     /// The loop calls this even if a caller retains the provider for a later run.
     fn close_run_transport(&self) {}
@@ -136,6 +163,14 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        runtime: StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        (**self).step_with_runtime(step_id, opts, runtime).await
+    }
     fn close_run_transport(&self) {
         (**self).close_run_transport();
     }

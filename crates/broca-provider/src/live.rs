@@ -119,6 +119,14 @@ impl LiveAnthropicProvider {
 
 #[async_trait]
 impl Provider for LiveAnthropicProvider {
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        runtime: broca_core::provider::StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.inner.step_with_runtime(step_id, opts, runtime).await
+    }
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.inner.step(step_id, opts).await
     }

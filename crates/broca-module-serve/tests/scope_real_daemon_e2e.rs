@@ -1402,6 +1402,7 @@ async fn released_reader_reads_agent_run_writer_session_and_refuses_advancement(
 struct HeldOwnerModel {
     url: String,
     requests: std::sync::Arc<tokio::sync::Semaphore>,
+    content: tokio::sync::mpsc::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1413,24 +1414,36 @@ impl Drop for HeldOwnerModel {
 
 impl HeldOwnerModel {
     async fn start() -> Self {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let requests = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let received = requests.clone();
+        let (content, mut writes) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0; 8192];
-                if stream.read(&mut buf).await.unwrap_or(0) > 0 {
-                    held.push(stream);
-                    received.add_permits(1);
+            let mut held: Vec<tokio::net::TcpStream> = Vec::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { break };
+                        let mut buf = [0; 8192];
+                        if stream.read(&mut buf).await.unwrap_or(0) > 0 {
+                            held.push(stream);
+                            received.add_permits(1);
+                        }
+                    }
+                    Some(()) = writes.recv() => {
+                        for stream in &mut held {
+                            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\ndata: {\"id\":\"held-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n").await.unwrap();
+                        }
+                    }
                 }
             }
         });
         Self {
             url,
             requests,
+            content,
             task,
         }
     }
@@ -1442,6 +1455,107 @@ impl HeldOwnerModel {
             .unwrap()
             .forget();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn active_status_reports_held_model_step_and_content() {
+    let model = HeldOwnerModel::start().await;
+    let Some(rig) = Rig::start_configured(None, None, Some(&model.url)).await else {
+        return;
+    };
+    rig.sync_scope_with(Some("flow-a"), 1).await;
+    let basal = rig.connect_as(CARRIER, &rig.carrier_nonce).await;
+    let session = rig.session("active-progress");
+    let route = open_scoped(&basal, &session).await.unwrap();
+    let started = send(&basal, &route, "first").await.unwrap();
+    let run_id = started["result"]["run_id"].as_str().unwrap();
+    model.wait_request().await;
+    let status = scope_request(
+        &basal,
+        &route,
+        "run.status",
+        serde_json::json!({"run_id":run_id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status["result"]["state"], "active");
+    let step = &status["result"]["step"];
+    assert_eq!(step["step_id"], 1, "{status}");
+    assert_eq!(step["attempt"], 0, "{status}");
+    let started_at = step["started_at_ms"]
+        .as_u64()
+        .expect("step start was observed");
+    let attempt_at = step["attempt_started_at_ms"]
+        .as_u64()
+        .expect("attempt start was observed");
+    assert!(started_at <= attempt_at);
+    assert!(step.get("last_content_at_ms").is_none());
+
+    model.content.send(()).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = scope_request(
+                &basal,
+                &route,
+                "run.status",
+                serde_json::json!({"run_id":run_id}),
+            )
+            .await
+            .unwrap();
+            if status["result"]["step"]["last_content_at_ms"].is_u64() {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live actor sees real content while the HTTP call remains held");
+    let step = &status["result"]["step"];
+    assert_eq!(step["started_at_ms"], started_at);
+    assert_eq!(step["attempt_started_at_ms"], attempt_at);
+    assert!(step["last_content_at_ms"].as_u64().unwrap() >= attempt_at);
+    let mut golden = status["result"].clone();
+    golden["step"]["started_at_ms"] = 1790000000000u64.into();
+    golden["step"]["attempt_started_at_ms"] = 1790000000001u64.into();
+    golden["step"]["last_content_at_ms"] = 1790000000002u64.into();
+    let bytes = serde_json::to_vec(&golden).unwrap();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/run_status.active_with_step.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    assert_eq!(
+        bytes,
+        std::fs::read(path).expect("active-step golden generated through serve")
+    );
+    let cancelled = scope_request(
+        &basal,
+        &route,
+        "run.cancel",
+        serde_json::json!({"run_id":run_id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled["result"], "ack", "{cancelled}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = scope_request(
+                &basal,
+                &route,
+                "run.status",
+                serde_json::json!({"run_id":run_id}),
+            )
+            .await
+            .unwrap();
+            if status["result"]["state"] != "active" {
+                assert!(status["result"].get("step").is_none());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled run leaves active state");
 }
 
 async fn owner_op(

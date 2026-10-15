@@ -224,6 +224,12 @@ struct ChatgptNormalizer {
 }
 
 impl StreamNormalizer for ChatgptNormalizer {
+    fn websocket_telemetry(&mut self) {
+        self.inner.websocket_telemetry();
+    }
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.inner.content_progress()
+    }
     fn private_error_diagnostics(&mut self) {
         self.inner.private_error_diagnostics();
     }

@@ -213,6 +213,7 @@ struct AttemptTrace {
     /// The response-body reader already logged a detailed warning about where this attempt's response was cut off.
     chunk_error_warned: bool,
     response_cap: Option<u64>,
+    content_progress: Box<broca_protocol::provider::ContentProgress>,
     /// Number of complete content records observed by the stream normalizer.
     content_event_count: u64,
     /// Elapsed from `sent_at` when the most recent complete content record was parsed.
@@ -270,6 +271,7 @@ impl AttemptTrace {
             response_body_cap: self.response_cap,
             outcome,
             ts_ms: now_millis(),
+            content_progress: self.content_progress,
             sent_at_ms: self.sent_at_ms,
             transport: self.transport,
             websocket_request: self.websocket_request,
@@ -333,14 +335,33 @@ impl<F: WireFamily + 'static> RenderJob<F> {
 struct ToolNameRestoringNormalizer {
     inner: Box<dyn StreamNormalizer>,
     names: Arc<crate::tool_name_alias::ToolNameMap>,
+    live_progress: Option<broca_core::provider::LiveStepProgress>,
+}
+
+impl ToolNameRestoringNormalizer {
+    fn report_content(&self) {
+        if let Some(progress) = &self.live_progress {
+            if let Some(step) = progress.lock().unwrap().as_mut() {
+                step.last_content_at_ms = self.inner.content_progress().last_content_at_ms;
+            }
+        }
+    }
 }
 
 impl StreamNormalizer for ToolNameRestoringNormalizer {
+    fn websocket_telemetry(&mut self) {
+        self.inner.websocket_telemetry();
+    }
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.inner.content_progress()
+    }
     fn private_error_diagnostics(&mut self) {
         self.inner.private_error_diagnostics();
     }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
-        self.inner.push(chunk).map(|events| {
+        let result = self.inner.push(chunk);
+        self.report_content();
+        result.map(|events| {
             events
                 .into_iter()
                 .map(|event| self.names.restore_event(event))
@@ -377,7 +398,9 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
-        self.inner.finish().map(|events| {
+        let result = self.inner.finish();
+        self.report_content();
+        result.map(|events| {
             events
                 .into_iter()
                 .map(|event| self.names.restore_event(event))
@@ -395,6 +418,7 @@ fn build_retry_normalizer<F: WireFamily>(
     ToolNameRestoringNormalizer {
         inner: family.normalizer(frozen, step_id),
         names: Arc::clone(names),
+        live_progress: None,
     }
 }
 
@@ -509,7 +533,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         cancel: CancellationToken,
         deadline: Option<Instant>,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.start_step_under_seal(step_id, opts, cancel, deadline, None)
+        self.start_step_under_seal(step_id, opts, cancel, deadline, None, None)
     }
 
     fn start_step_under_seal(
@@ -519,6 +543,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         cancel: CancellationToken,
         deadline: Option<Instant>,
         seal: Option<ShutdownSeal>,
+        progress: Option<broca_core::provider::LiveStepProgress>,
     ) -> mpsc::Receiver<NormalizedEvent> {
         let (tx, rx) = mpsc::channel::<NormalizedEvent>(256);
         let served = self.current_auth();
@@ -578,6 +603,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             cancel,
             deadline,
             seal,
+            progress,
             retry_clock,
             Arc::clone(&self.websocket),
             #[cfg(test)]
@@ -589,6 +615,21 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        runtime: broca_core::provider::StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.start_step_under_seal(
+            step_id,
+            opts,
+            runtime.cancel,
+            runtime.deadline,
+            runtime.seal,
+            runtime.progress,
+        )
+    }
     fn close_run_transport(&self) {
         self.websocket.close();
     }
@@ -636,7 +677,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         deadline: Option<Instant>,
         seal: ShutdownSeal,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.start_step_under_seal(step_id, opts, cancel, deadline, Some(seal))
+        self.start_step_under_seal(step_id, opts, cancel, deadline, Some(seal), None)
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
@@ -1441,6 +1482,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
     cancel: CancellationToken,
     deadline: Option<Instant>,
     seal: Option<ShutdownSeal>,
+    progress: Option<broca_core::provider::LiveStepProgress>,
     retry_clock: RetryClock,
     websocket: Arc<responses_websocket::Session>,
     #[cfg(test)] escape_client_builds: std::sync::Arc<AtomicUsize>,
@@ -1533,13 +1575,24 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             }
         };
 
+        let mut attempt = 0;
         let normalizer_factory = || {
-            build_retry_normalizer(
+            if let Some(progress) = &progress {
+                if let Some(step) = progress.lock().unwrap().as_mut() {
+                    step.attempt = attempt;
+                    step.attempt_started_at_ms = now_millis();
+                    step.last_content_at_ms = None;
+                }
+            }
+            attempt += 1;
+            let mut normalizer = build_retry_normalizer(
                 family.as_ref(),
                 frozen.as_ref(),
                 step_id,
                 &rendered.name_map,
-            )
+            );
+            normalizer.live_progress = progress.clone();
+            normalizer
         };
         // Rebuilds only the HTTP shape (url and headers) for a refreshed credential. The body is
         // reused as-is: auth attaches after render, so the bytes sent do not change.
@@ -2661,6 +2714,9 @@ where
 {
     futures::pin_mut!(stream);
     let mut stream_bytes = 0usize;
+    if trace.transport.as_deref() == Some("websocket") {
+        normalizer.websocket_telemetry();
+    }
     let mut progress_marker = normalizer.progress_marker();
     // A grammar with a liveness marker gets two deadlines: `idle` resets on any complete
     // record including keepalive comments, `content` only on content. Without one, `idle` is
@@ -2742,8 +2798,13 @@ where
         } else {
             chunk
         };
-        let events = normalizer
-            .push(normalized)
+        let result = normalizer.push(normalized);
+        let progress = normalizer.content_progress();
+        if progress.content_bytes != trace.content_progress.content_bytes {
+            trace.last_content_elapsed = trace.elapsed_since_send();
+        }
+        *trace.content_progress = progress;
+        let events = result
             .map_err(|error| AttemptFailure::normalize(error, AttemptOutcome::DecodeError))?;
         trace.output_seen |= events.iter().any(|event| {
             matches!(event,
@@ -2758,7 +2819,6 @@ where
         let made_progress = next_marker != progress_marker || !events.is_empty();
         if next_marker != progress_marker {
             trace.content_event_count = next_marker;
-            trace.last_content_elapsed = trace.elapsed_since_send();
         }
         trace.keepalives_after_content = normalizer.keepalives_after_content().unwrap_or_default();
         progress_marker = next_marker;
@@ -2808,8 +2868,13 @@ where
     // where Anthropic reports nothing and the completion check below catches it). Recording
     // both as `eof_before_completion` keeps a body cut at the same point reading the same
     // across wire families.
-    let final_events = normalizer
-        .finish()
+    let result = normalizer.finish();
+    let progress = normalizer.content_progress();
+    if progress.content_bytes != trace.content_progress.content_bytes {
+        trace.last_content_elapsed = trace.elapsed_since_send();
+    }
+    *trace.content_progress = progress;
+    let final_events = result
         .map_err(|error| AttemptFailure::normalize(error, AttemptOutcome::EofBeforeCompletion))?;
     if !record_attempt_events(final_events, &mut completion, tx).await? {
         return Ok(Vec::new());

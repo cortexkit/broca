@@ -357,6 +357,13 @@ pub trait WireFamily: Send + Sync {
 /// returns any newly-complete events; the wire framing is the implementor's
 /// concern, so this stays grammar-generic.
 pub trait StreamNormalizer: Send {
+    /// Socket ping/pong records have no exposed payload lengths; synthetic SSE framing is not
+    /// measured data. Wrappers forward this setting without changing liveness counters.
+    fn websocket_telemetry(&mut self) {}
+    /// Real-content telemetry is observational; it never resets the legacy deadline markers.
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        Default::default()
+    }
     /// Omit untrusted backend error text from diagnostics when the transport requires privacy.
     /// Wrappers forward this; it never changes model-output normalization or request bytes.
     fn private_error_diagnostics(&mut self) {}

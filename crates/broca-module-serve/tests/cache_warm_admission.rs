@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use broca_catalog::live::{AuthMode, ResolveOptions, WireFamilyId};
 use broca_core::{
     AllowAll, BatchCtx, DispatchResult, FileLeaseStore, FileWalStore, OutputEvent, RunError,
-    RunSummary, StartMode, ToolManifest, ToolPlane, ToolPlaneError,
+    RunSummary, StartMode, ToolManifest, ToolPlane, ToolPlaneError, WalStore,
 };
 use broca_module::{
     actor::LineageStatus,
@@ -21,7 +21,8 @@ use broca_module_serve::{
 };
 use broca_protocol::{BindIdentity, RunId, ToolCall, ToolOutput, ToolResult};
 use broca_provider::wire::FrozenRenderConfig;
-use broca_wal::WalRecord;
+use broca_test_support::LogCapture;
+use broca_wal::{FramedRecord, Wal, WalError, WalLineageId, WalRecord};
 use serde_json::{json, Value};
 use std::{
     sync::{Arc, Mutex},
@@ -32,6 +33,61 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, Notify},
 };
+
+// These tests exercise admission and HTTP request bytes, not crash durability. Keep the
+// real WAL encoding/replay, but do not wait for filesystem fsync latency at every barrier.
+// Durability barriers are covered by the core writer and WAL tests.
+struct AdmissionStore(FileWalStore);
+struct AdmissionWal(Box<dyn Wal + Send>);
+
+impl Wal for AdmissionWal {
+    fn append(&mut self, fence: u64, record: &WalRecord, _: bool) -> Result<u64, WalError> {
+        self.0.append(fence, record, false)
+    }
+    fn sync(&self) -> Result<(), WalError> {
+        Ok(())
+    }
+    fn replay(&self) -> Result<Vec<FramedRecord>, WalError> {
+        self.0.replay()
+    }
+    fn tail_after_seq(&self, after_seq: u64) -> Result<Vec<FramedRecord>, WalError> {
+        self.0.tail_after_seq(after_seq)
+    }
+    fn last_seq(&self) -> u64 {
+        self.0.last_seq()
+    }
+    fn lineage_id(&self) -> Option<WalLineageId> {
+        self.0.lineage_id()
+    }
+}
+
+impl WalStore for AdmissionStore {
+    fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+        self.0
+            .open(session)
+            .map(|wal| Box::new(AdmissionWal(wal)) as _)
+    }
+    fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+        self.0.read_records(session)
+    }
+    fn read_records_range(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, WalError> {
+        self.0
+            .read_records_range(session, after_seq, through_seq, anchor)
+    }
+    fn lineage_exists(
+        &self,
+        session: &BindIdentity,
+        meta: Option<&broca_core::AdmissionStoreSnapshot>,
+    ) -> Result<bool, WalError> {
+        self.0.lineage_exists(session, meta)
+    }
+}
 
 #[derive(Default)]
 struct HeldTool {
@@ -84,7 +140,9 @@ struct Executor {
     url: String,
     family: WireFamilyId,
     held: HeldTool,
-    store: Arc<FileWalStore>,
+    store: Arc<AdmissionStore>,
+    logs: LogCapture,
+    warm_finished: Notify,
     provider: Mutex<Option<Arc<Box<dyn broca_core::Provider>>>>,
     warm_connect_gate: Mutex<Option<Arc<WarmConnectGate>>>,
 }
@@ -137,21 +195,22 @@ impl RunExecutor for Executor {
             vault_request: None,
             account_decision: None,
         });
-        broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            job.writer.as_ref(),
-            StartMode::FreshOrResume,
-            provider.as_ref(),
-            &self.held,
-            &AllowAll,
-            self.store.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        )
-        .await
+        self.logs
+            .scope_future(broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
+                job.req,
+                job.writer.as_ref(),
+                StartMode::FreshOrResume,
+                provider.as_ref(),
+                &self.held,
+                &AllowAll,
+                self.store.as_ref(),
+                None,
+                job.control,
+                &out,
+                job.on_admitted,
+                Some(&job.prior_snapshot),
+            ))
+            .await
     }
     fn warm_costs(
         &self,
@@ -169,6 +228,10 @@ impl RunExecutor for Executor {
         config: &broca_wal::RunConfig,
         usage: broca_protocol::Usage,
     ) -> Result<f64, String> {
+        // The automatic driver prices usage after its WAL barrier and then returns the
+        // tick to the scheduler without another await. Wake assertions after that tick,
+        // rather than treating receipt of an HTTP body as a completed automatic warm.
+        self.warm_finished.notify_one();
         broca_module_serve::cache_warm::responses_warm_cost(config, usage)
     }
     async fn warm(&self, job: WarmJob) -> Result<broca_core::WarmSent, broca_module::WarmError> {
@@ -306,12 +369,14 @@ impl Fixture {
                 socket.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        let store = Arc::new(FileWalStore::new(root.join("wal")));
+        let store = Arc::new(AdmissionStore(FileWalStore::new(root.join("wal"))));
         let executor = Arc::new(Executor {
             url,
             family,
             held: HeldTool::default(),
             store: store.clone(),
+            logs: LogCapture::new(),
+            warm_finished: Notify::new(),
             provider: Mutex::new(None),
             warm_connect_gate: Mutex::new(None),
         });
@@ -353,7 +418,6 @@ impl Fixture {
         ServeHandler::send(&self.registry, request).await.unwrap();
     }
     fn records(&self) -> Vec<WalRecord> {
-        use broca_core::WalStore;
         self.executor
             .store
             .read_records(&self.key)
@@ -363,13 +427,45 @@ impl Fixture {
             .collect()
     }
     async fn idle(&self) {
+        // Only a hang guard: progress depends on actor completion, not a timed observation
+        // window. The fixture's WAL barriers do not wait on physical disk durability.
         tokio::time::timeout(Duration::from_secs(4), async {
             while self.registry.route_status(&self.key).await.unwrap() != LineageStatus::Idle {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+    }
+    fn warm_count(&self) -> usize {
+        self.records().iter().filter(|record| matches!(record, WalRecord::CacheWarmed { trigger: Some(trigger), .. } if trigger == "keep_warm")).count()
+    }
+    async fn wait_warms(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while self.warm_count() < count {
+                self.executor.warm_finished.notified().await;
+            }
+        })
+        .await
+        .expect("automatic warm must complete");
+    }
+    async fn wait_warm_miss(&self) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if self.executor.logs.events().iter().any(|event| {
+                    event.target == "cache_warm"
+                        && event
+                            .fields
+                            .get("stop")
+                            .is_some_and(|stop| stop == "warm_missed")
+                }) {
+                    return;
+                }
+                self.executor.warm_finished.notified().await;
+            }
+        })
+        .await
+        .expect("partial prefix miss must stop the automatic scheduler");
     }
     fn assert_unconfigured(&self) {
         let frozen = self
@@ -419,9 +515,7 @@ async fn unconfigured_codex_admission_auto_warms_during_long_tool_wait() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(4), async {
-        while !fixture.records().iter().any(|record| matches!(record, WalRecord::CacheWarmed { trigger: Some(trigger), .. } if trigger == "keep_warm")) { tokio::time::sleep(Duration::from_millis(10)).await; }
-    }).await.unwrap();
+    fixture.wait_warms(1).await;
     fixture.assert_unconfigured();
     assert_ne!(
         fixture.registry.route_status(&fixture.key).await.unwrap(),
@@ -444,7 +538,7 @@ async fn codex_partial_head_miss_stops_auto_warms_but_explicit_warm_remains_avai
             .await;
     fixture.send(None, true).await;
     fixture.executor.held.started.notified().await;
-    tokio::time::sleep(Duration::from_millis(650)).await;
+    fixture.wait_warm_miss().await;
     let warms: Vec<_> = fixture
         .records()
         .into_iter()
@@ -475,8 +569,8 @@ async fn codex_prefix_hit_keeps_auto_warm_cadence() {
             .await;
     fixture.send(None, true).await;
     fixture.executor.held.started.notified().await;
-    tokio::time::sleep(Duration::from_millis(650)).await;
-    assert!(fixture.records().iter().filter(|record| matches!(record, WalRecord::CacheWarmed { trigger: Some(trigger), .. } if trigger == "keep_warm")).count() >= 2);
+    fixture.wait_warms(2).await;
+    assert!(fixture.warm_count() >= 2);
     fixture.executor.held.release.notify_one();
     fixture.idle().await;
     fixture.registry.stop_and_seal().await;
@@ -494,23 +588,14 @@ async fn cancelled_auto_warm_connection_does_not_stop_admission_server() {
     )
     .await
     .unwrap();
-    let warm_count = || {
-        fixture.records().iter().filter(|record| matches!(record, WalRecord::CacheWarmed { trigger: Some(trigger), .. } if trigger == "keep_warm")).count()
-    };
-    tokio::time::timeout(Duration::from_secs(4), async {
-        while warm_count() < 2 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    fixture.wait_warms(2).await;
 
     let gate = Arc::new(WarmConnectGate::default());
     *fixture.executor.warm_connect_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::timeout(Duration::from_secs(4), gate.connected.notified())
         .await
         .unwrap();
-    let completed_warms = warm_count();
+    let completed_warms = fixture.warm_count();
     assert!(completed_warms >= 2, "prefix hits retain automatic cadence");
     fixture.executor.held.release.notify_one();
     tokio::time::timeout(Duration::from_secs(4), gate.dropped.notified())
@@ -518,7 +603,7 @@ async fn cancelled_auto_warm_connection_does_not_stop_admission_server() {
         .expect("tool completion drops the connected automatic warm");
     fixture.idle().await;
     assert_eq!(
-        warm_count(),
+        fixture.warm_count(),
         completed_warms,
         "cancelled warms have no usage"
     );

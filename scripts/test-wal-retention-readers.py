@@ -22,7 +22,7 @@ from unittest import mock
 from lib.archive_read import ArchiveRefusal, logical_wals, read_lineage_id, read_records
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
-EXPECTED_SUITE_ANCHORS = 15
+EXPECTED_SUITE_ANCHORS = 16
 OLD = uuid.UUID("00000000-0000-4000-8000-000000000001")
 PORTABLE = uuid.UUID("00000000-0000-4000-8000-000000000002")
 EPHEMERAL = uuid.UUID("00000000-0000-4000-8000-000000000003")
@@ -166,7 +166,7 @@ class RetentionReaders(unittest.TestCase):
                         self.assertIn(f"  {label}/family steps: 2", out)
                     self.assertNotIn("  expired/family steps:", out)
                 elif script == "find-empty-completions.py":
-                    self.assertIn("scanned 2 WAL(s)", out)
+                    self.assertIn("scanned 2 WAL(s)", out, result.stderr)
                     for label in ("portable", "ephemeral"):
                         self.assertIn(str(self.paths[label]), out)
                     self.assertNotIn(str(self.paths["expired"]), out)
@@ -184,6 +184,32 @@ class RetentionReaders(unittest.TestCase):
 
     def test_all_seven_readers_select_only_live_lineages(self):
         self.assert_live_results()
+
+    def test_empty_completion_wide_window_reports_when_localtime_refuses_cutoff(self):
+        spec = importlib.util.spec_from_file_location("empty_completions", SCRIPTS / "find-empty-completions.py")
+        assert spec is not None and spec.loader is not None
+        reader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reader)
+        localtime = reader.time.localtime
+        for error in (OSError, OverflowError, ValueError):
+            def windows_localtime(value):
+                if value < 0:
+                    raise error("timestamp out of range")
+                return localtime(value)
+
+            with self.subTest(error=error.__name__):
+                out = io.StringIO()
+                with mock.patch.object(sys, "argv", [str(SCRIPTS / "find-empty-completions.py"),
+                                                   "--state-root", str(self.root), "--hours", "1000000"]), \
+                        mock.patch.object(reader.time, "time", return_value=1_800_000_000), \
+                        mock.patch.object(reader.time, "localtime", side_effect=windows_localtime), \
+                        contextlib.redirect_stdout(out):
+                    self.assertEqual(reader.main(), 1)
+                self.assertIn("scanned 2 WAL(s) written since Unix timestamp -1800000000", out.getvalue())
+                self.assertIn("2 SUSPECT(S)", out.getvalue())
+                for label in ("portable", "ephemeral"):
+                    self.assertIn(str(self.paths[label]), out.getvalue())
+                self.assertNotIn(str(self.paths["expired"]), out.getvalue())
 
     def test_all_seven_readers_refuse_unreadable_lineage_frames(self):
         corrupt = bytearray(lineage(EPHEMERAL))

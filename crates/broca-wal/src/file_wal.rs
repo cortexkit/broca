@@ -1810,7 +1810,21 @@ mod tests {
 
     #[test]
     fn damaged_length_before_valid_record_is_not_a_torn_tail() {
-        let path = tmp("bad-length-before-record");
+        check_damaged_length_before_valid_record(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_damaged_length_before_valid_record_is_not_a_torn_tail() {
+        check_damaged_length_before_valid_record(true);
+    }
+
+    fn check_damaged_length_before_valid_record(anchored: bool) {
+        let path = tmp(if anchored {
+            "anchored-bad-length-before-record"
+        } else {
+            "bad-length-before-record"
+        });
         let _ = std::fs::remove_file(&path);
         let mut wal = FileWal::open(&path).unwrap();
         for seq in 1..=3 {
@@ -1819,7 +1833,7 @@ mod tests {
         drop(wal);
         let mut bytes = std::fs::read(&path).unwrap();
         // Layout: lineage frame, record 1, lineage frame, record 2. Record 1 ends where its own
-        // header says; record 2 starts one lineage frame later. Byte anchors exist only on unix,
+        // header says; record 2 starts one lineage frame later. Live-file anchors exist only on Unix,
         // so the anchor is a cross-check where present, never the source of the offset.
         let first = crate::framing::LINEAGE_FRAME_LEN;
         let first_len = u32::from_le_bytes(bytes[first..first + 4].try_into().unwrap()) as usize;
@@ -1840,8 +1854,9 @@ mod tests {
                 ..
             })
         ));
-        // The anchored read skips the prefix and must still see the damage; it exists on unix.
-        if let Some(anchor) = anchor {
+        // Live-file byte anchors require a stable file identity, available only on Unix.
+        if anchored {
+            let anchor = anchor.expect("anchored corruption test requires a stable file identity");
             assert!(
                 read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, Some(&anchor)).is_err()
             );

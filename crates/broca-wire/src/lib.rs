@@ -806,6 +806,7 @@ mod approval_wire_tests {
     #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            step: None,
             title: None,
             awaiting_approval: Some(AwaitingApproval {
                 batch_id: "r-b1".into(),
@@ -1010,6 +1011,9 @@ pub struct PausedRunAuth {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunStatusResponse {
     Active {
+        /// Snapshot of the live actor's in-flight model step; never read from WAL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<broca_protocol::provider::InFlightStep>,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3251,6 +3255,7 @@ mod title_wire_tests {
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                step: None,
                 title: None,
                 awaiting_approval: None
             })
@@ -3264,6 +3269,7 @@ mod title_wire_tests {
             .unwrap(),
             RunStatusResponse::Active {
                 awaiting_approval: None,
+                step: None,
                 title: Some("t".into())
             }
         );
