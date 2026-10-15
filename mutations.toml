@@ -246,6 +246,10 @@ runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/captured_replay_e2e.rs"
+# The two listed captured-replay tests check deadline diagnostics and completed-run
+# WAL kinds. Restricting this proof avoids the >10-minute Windows baseline, at the
+# cost of collateral checks from the rest of the `it` target.
+select = "expected"
 expect_red = ["captured_replay_e2e::client_deadline_dumps_rig_diagnostics_when_capture_server_holds_response", "captured_replay_e2e::real_module_completes_against_captured_openai_chat_bytes"]
 file = "crates/broca-module-serve/tests/it/session_client.rs"
 old = '"seq={} {kind}{}\n",'
@@ -253,6 +257,9 @@ new = '"seq={} {}\n", // NON-VACUITY BREAK: omit decoded record kinds'
 
 [[control]]
 id = "state-root-guard-sees-ckdev-builder"
+# Only the named state-root spawn-site test runs; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "the state-root isolation guard checks broca spawns made through the ckdev command builder, not only Command constructors"
 runner = "cargo"
 package = "broca-module-serve"
@@ -265,6 +272,9 @@ new = '        ["ckdev_", "command(NEVER"].concat(), // NON-VACUITY BREAK: ignor
 
 [[control]]
 id = "state-root-guard-sees-rig-stdio-builders"
+# Only the named rig stdio spawn-site test runs; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "the state-root isolation guard checks daemon spawns made through rig_command and tokio_rig_command, so rigs that moved to the stdio builders stay checked"
 runner = "cargo"
 package = "broca-module-serve"
@@ -445,6 +455,9 @@ new = "        && true // NON-VACUITY BREAK: flow_id ignored\n"
 
 [[control]]
 id = "scope-reopen-active-run-steer"
+# Only the two scope-reopen refusal tests run; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "a steer under a reopened epoch never joins a run of the ended epoch"
 runner = "cargo"
 package = "broca-module-serve"
@@ -755,6 +768,9 @@ new = "OpenError::Classified { reason, class: _ } => ServeError::Open(reason, No
 
 [[control]]
 id = "scoped-tools-require-plan"
+# Only the scoped-tools admission test runs; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "a fresh scoped send cannot supply legacy tools without a fetch plan"
 runner = "cargo"
 package = "broca-module-serve"
@@ -767,6 +783,9 @@ new = "if false && decision.scope().is_some() { // NON-VACUITY BREAK\n          
 
 [[control]]
 id = "plan-model-checked-at-send"
+# Only the two plan-model mismatch tests run; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "every planned send checks persona model compatibility before fetching or writing"
 runner = "cargo"
 package = "broca-module-serve"
@@ -823,6 +842,9 @@ new = "                } else if refreeze_recorded {\n                    writer
 
 [[control]]
 id = "wire-run-paused-refusal"
+# Only the paused-run refusal test runs; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "new sends into a paused session retain the pinned run_paused refusal bytes"
 runner = "cargo"
 package = "broca-module-serve"
@@ -835,6 +857,9 @@ new = "pub const RUN_PAUSED: &str = \"paused\"; // NON-VACUITY BREAK"
 
 [[control]]
 id = "wire-restart-paused-replies"
+# Only the two restart-paused reply tests run; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "restart-paused steer and resend replies keep their pinned paused state tag"
 runner = "cargo"
 package = "broca-module-serve"
@@ -871,6 +896,9 @@ new = "if let Some(_reason) = self.durable_finish_of_active(&run_id) {\n        
 
 [[control]]
 id = "scan-operator-logs-visible"
+# Only the operator-log source scan runs; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "operator diagnostics remain visible at the default INFO root"
 runner = "cargo"
 package = "broca-module-serve"
@@ -1502,6 +1530,9 @@ new = 'vec![("user-agent".to_string(), BROCA_USER_AGENT.to_string()), ("x-app".t
 
 [[control]]
 id = "cache-none-refuses-keep-warm-auto"
+# Only the cache/warm refusal test runs; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "cache.mode none with keep_warm auto is refused before any WAL write or provider call"
 runner = "cargo"
 package = "broca-module-serve"
@@ -1624,6 +1655,9 @@ new = "if true || !held_token_is_expiring(expires_at_ms, epoch_millis()) { // NO
 
 [[control]]
 id = "steer-never-between-call-and-result"
+# Only the mid-tool steer-ordering test runs; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "a steer sent during a tool call reaches the prompt after the call's result"
 runner = "cargo"
 package = "broca-module-serve"
@@ -1653,6 +1687,10 @@ runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
+# The listed late-steer test checks undelivered IDs in run.status before and after
+# restart. Restricting this proof avoids the >10-minute Windows baseline, at the
+# cost of collateral checks from the rest of the `it` target.
+select = "expected"
 expect_red = ["send_delivery::step_limit_with_a_late_steer_reports_undelivered_send_id"]
 file = "crates/broca-module/src/actor.rs"
 old = "                    let undelivered_steers = reconciled\n                        .as_ref()\n                        .and_then(|state| state.undelivered_steers.clone());"
@@ -1672,6 +1710,9 @@ new = "if false && stored_digest != request_digest { // NON-VACUITY BREAK"
 
 [[control]]
 id = "run-paused-refuses-plain-send"
+# Only the plain-send paused-refusal test runs; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "a plain send into an auth-paused session is refused run_paused and writes nothing"
 runner = "cargo"
 package = "broca-module-serve"
@@ -3046,6 +3087,9 @@ new = "    if false && !parsed.step_items.is_empty() && !handler.hook_plane_avai
 
 [[control]]
 id = "hookless-reader-refuses-frozen-plan-without-send-plan"
+# Only the frozen-transform plan-refusal test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "a reader refuses sends to a session with frozen transforms even when the caller omits its plan"
 runner = "cargo"
 package = "broca-module-serve"
@@ -3534,6 +3578,9 @@ new = "            phase_refreshes = 0;\n            attempt_budget = phase_star
 
 [[control]]
 id = "joining-steer-frozen-settings"
+# Only the joining-steer settings-conflict test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "a joining steer cannot silently change named model, variant or generation settings and refuses before any WAL write"
 runner = "cargo"
 package = "broca-module-serve"
@@ -3548,6 +3595,9 @@ new = "                    let _ = field; // NON-VACUITY BREAK: accept incompati
 # Provider-declared reply deadlines are admitted before the session writes anything.
 [[control]]
 id = "catalog-reply-validated"
+# Only the invalid-reply admission test runs; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "invalid reply metadata refuses admission before any WAL write"
 runner = "cargo"
 package = "broca-module-serve"
@@ -5891,6 +5941,9 @@ new = "if bind.scope.flow_id.is_none() { // NON-VACUITY BREAK"
 
 [[control]]
 id = "agent-run-stamp-delegation-fence"
+# Only the scope-stamp source scan runs; other `it` tests are skipped, so
+# failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "agent-run identity conversion must not start reading stamp delegation authority"
 runner = "cargo"
 package = "broca-module-serve"
@@ -8818,6 +8871,9 @@ new = 'kind == "broca-session" && (value == session_ref || true) /* NON-VACUITY 
 
 [[control]]
 id = "move-intent-write-fence"
+# Only the pending-release write-fence test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "pending release and activation intents precede tombstones for writes"
 runner = "cargo"
 package = "broca-module-serve"
@@ -8832,6 +8888,9 @@ new = '''if false && write { // NON-VACUITY BREAK: drop durable-intent fencing
 
 [[control]]
 id = "move-authorization-defers-read-fence"
+# Only the pending-release authorization-order test runs; other `it` tests
+# are skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "ownership authorization cannot let a read-side tombstone outrank the pending-release write fence"
 runner = "cargo"
 package = "broca-module-serve"
@@ -8845,6 +8904,9 @@ new = 'Err(error @ (OpenError::SessionMoving { .. } | OpenError::SessionMoved { 
 
 [[control]]
 id = "move-authorization-before-details"
+# Only the moved-session authorization test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "unauthorized callers learn neither migration details nor parameter errors from moved sessions"
 runner = "cargo"
 package = "broca-module-serve"
@@ -9226,6 +9288,9 @@ new = '''if reply.send((busy, release)).is_ok() {
 
 [[control]]
 id = "move-wire-moving-code"
+# Only the moving-sidecar wire-golden test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "the real serve path pins the session_moving code and cutId detail"
 runner = "cargo"
 package = "broca-module-serve"
@@ -9238,6 +9303,9 @@ new = 'ErrorBody::new("wrong_moving", err.to_string()) /* NON-VACUITY BREAK */'
 
 [[control]]
 id = "move-wire-moved-code"
+# Only the moved-tombstone wire-golden test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "the real serve path pins session_moved and its holder for every read and send"
 runner = "cargo"
 package = "broca-module-serve"
@@ -9250,6 +9318,9 @@ new = 'ErrorBody::new("wrong_moved", err.to_string()) /* NON-VACUITY BREAK */'
 
 [[control]]
 id = "move-early-serve-fence"
+# Only the moved-session early-fence test runs; other `it` tests are skipped,
+# so failures unique to those tests will not fail this mutation proof.
+select = "expected"
 guards = "the early write fence runs before parameter validation, so a mutation on a moved session refuses session_moved, never invalid_params"
 runner = "cargo"
 package = "broca-module-serve"
@@ -11224,6 +11295,20 @@ old = "state.complete = false;"
 new = "state.complete = true; // NON-VACUITY BREAK: trust the live prefix without the authorizer's tail read"
 
 [[control]]
+id = "core-consent-authorizer-live-feed-complete"
+guards = "the authorizer itself reads every settlement continuation before minting authorization, without live intake guards"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::authorization_checks_live_feed_continuations_before_minting"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.complete = false;"
+new = "state.complete = true; // NON-VACUITY BREAK: mint authorization without reading settlement continuations"
+
+[[control]]
 id = "core-consent-late-feed-conflict-refuses"
 guards = "late conflicting settlements close durably as a named not-sent refusal instead of remaining eligible"
 runner = "cargo"
@@ -11355,6 +11440,24 @@ old = '''&crate::tool_plane::DispatchSignals::new(
 new = '''&crate::tool_plane::DispatchSignals::default(), // NON-VACUITY BREAK: drop late-send signals too'''
 
 [[control]]
+id = "core-consent-late-intent-sync-core-stop-fence"
+guards = "the core refuses a late send stopped during intent sync even when the adapter ignores dispatch signals"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_core_fence_stops_noncompliant_adapter_after_intent_sync"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
+    }'''
+new = '''fn late_stopped(_control: &RunControl) -> bool {
+        false // NON-VACUITY BREAK
+    }'''
+
+[[control]]
 id = "core-consent-late-route-open-stop-fences"
 guards = "late send stopped during route open needs either the core check or the adapter's forwarded run signals"
 runner = "cargo"
@@ -11379,6 +11482,24 @@ old = '''&crate::tool_plane::DispatchSignals::new(
                     control.stop_requested.as_ref(),
                 ),'''
 new = '''&crate::tool_plane::DispatchSignals::default(), // NON-VACUITY BREAK: drop late-send signals too'''
+
+[[control]]
+id = "core-consent-late-route-open-core-stop-fence"
+guards = "the core refuses a late send stopped during route open even when the adapter ignores dispatch signals"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_core_fence_stops_noncompliant_adapter_after_route_open"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
+    }'''
+new = '''fn late_stopped(_control: &RunControl) -> bool {
+        false // NON-VACUITY BREAK
+    }'''
 
 [[control]]
 id = "core-consent-live-wait-clears-stale-cursor"
@@ -11483,6 +11604,20 @@ new = "if false && call.id.as_deref() != Some(answer.id.as_str()) { // NON-VACUI
 file = "crates/broca-core/src/consent.rs"
 old = "if let Some(id) = recorded_id.filter(|id| *id != candidate.id) {"
 new = "if let Some(id) = recorded_id.filter(|_| false) { // NON-VACUITY BREAK: skip the authorizer's duplicate proof too"
+
+[[control]]
+id = "core-consent-authorizer-proves-recorded-duplicate"
+guards = "the authorizer itself proves a recorded duplicate closed before adopting another card, without live intake guards"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::authorization_proves_recorded_duplicate_closed_before_adoption"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if let Some(id) = recorded_id.filter(|id| *id != candidate.id) {"
+new = "if let Some(id) = recorded_id.filter(|_| false) { // NON-VACUITY BREAK: skip the authorizer's duplicate proof"
 
 [[control]]
 id = "core-consent-live-feed-total-page-budget"
@@ -12187,6 +12322,9 @@ new = "if now > question.expires_at_ms { // NON-VACUITY BREAK: miss the exact la
 
 [[control]]
 id = "retention-consent-withdraw-body-is-content-free"
+# Only the content-free withdrawal wire test runs; other `it` tests are
+# skipped, so failures unique to them will not fail this mutation proof.
+select = "expected"
 guards = "the production consent withdrawal body contains no expired transcript marker"
 runner = "cargo"
 package = "broca-module-serve"

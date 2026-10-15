@@ -734,6 +734,85 @@ async fn readback_candidate_survives_snapshot_retry_and_cursor_change() {
     assert_eq!(*feed.cursors.lock().unwrap(), [None, None, None]);
 }
 
+#[tokio::test]
+async fn authorization_checks_live_feed_continuations_before_minting() {
+    for choice in ["deny", "approve"] {
+        let feed = ProgressPages {
+            pages: Mutex::new(
+                vec![
+                    progress_page(vec![record("candidate", "approve")], 1),
+                    progress_page(vec![record("older", choice)], 2),
+                    progress_page(Vec::new(), 2),
+                ]
+                .into(),
+            ),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let progress = Mutex::new(LookupProgress::default());
+        let result = authorize_candidate(
+            &feed,
+            &ctx(),
+            "key",
+            &prepared(),
+            None,
+            &record("candidate", "approve"),
+            &progress,
+        )
+        .await;
+        if choice == "deny" {
+            let error = result
+                .err()
+                .expect("a later denial must prevent authorization");
+            assert_eq!(error.code, "consent_conflicting_decisions");
+            assert!(!error.retryable);
+            assert_eq!(feed.cursors.lock().unwrap().len(), 2);
+        } else {
+            let authorized = result.expect("agreeing settlements may authorize");
+            assert_eq!(authorized.value().id, "candidate");
+            assert_eq!(authorized.value().decision, ConsentDecision::Approved);
+            assert_eq!(feed.cursors.lock().unwrap().len(), 3);
+        }
+        let cursors = feed.cursors.lock().unwrap();
+        assert_eq!(cursors[0], None);
+        assert_eq!(cursors[1].as_ref().unwrap().seq, 1);
+    }
+}
+
+#[tokio::test]
+async fn authorization_proves_recorded_duplicate_closed_before_adoption() {
+    for pending in [true, false] {
+        let mut fake = Fake::new(vec![vec![]]);
+        fake.withdrawal_reason = Some("route_busy");
+        fake.pending_readback = pending;
+        let progress = Mutex::new(LookupProgress::default());
+        let result = authorize_candidate(
+            &fake,
+            &ctx(),
+            "key",
+            &prepared(),
+            Some("recorded"),
+            &record("older", "approve"),
+            &progress,
+        )
+        .await;
+        if pending {
+            let error = result.err().expect("a pending duplicate cannot be adopted");
+            assert_eq!(error.code, "consent_withdrawal_unproven");
+            assert!(error.retryable);
+            assert!(progress.lock().unwrap().closed_duplicates.is_empty());
+        } else {
+            let authorized = result.expect("a terminal agreeing duplicate is proven");
+            assert_eq!(authorized.value().id, "older");
+            assert_eq!(authorized.value().decision, ConsentDecision::Approved);
+            assert_eq!(progress.lock().unwrap().closed_duplicates, ["recorded"]);
+        }
+        assert_eq!(
+            &fake.events.lock().unwrap()[..2],
+            ["withdraw:recorded", "get"]
+        );
+    }
+}
+
 #[test]
 fn live_candidate_cannot_erase_an_opposing_buffered_readback() {
     let mut progress = LookupProgress::default();

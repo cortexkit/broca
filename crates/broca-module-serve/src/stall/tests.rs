@@ -153,7 +153,12 @@ async fn repeats_are_limited_and_recovery_is_emitted_once() {
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(witness.records().len(), 1);
     witness.state.egress.operation.store(0, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The watchdog thread notices the cleared operation on its own tick. Wait for that event with
+    // the shared hang guard rather than a fixed 50 ms, which a busy CI runner overran.
+    let deadline = std::time::Instant::now() + broca_test_support::EVENT_HANG_GUARD;
+    while witness.records().len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let records = witness.records();
     assert_eq!(records.len(), 2);
     assert_eq!(records[1]["kind"], "recovery");

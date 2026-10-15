@@ -48,6 +48,15 @@ shared authorizer check. The original end-to-end tests and assertions remain
 unchanged, including the requirement that no approval or provider send occurs
 before conflicting decisions are resolved.
 
+The authorizer also has independent, direct-call proofs:
+`core-consent-authorizer-live-feed-complete` and
+`core-consent-authorizer-proves-recorded-duplicate`. They disable only the
+authorizer's tail read or duplicate proof, respectively. Their tests call
+`consent::authorize_candidate` without entering the run loop, so the redundant
+live-intake guards cannot mask a missing authorizer check. The run-level guards
+remain audited defense in depth; the authorizer is the shared authorization
+choke point.
+
 `core-consent-late-stop-during-intent-sync` and
 `core-consent-late-stop-during-route-open` were retired as single-guard proofs.
 They disabled only `late_stopped`, but approved dispatch now also carries cancel
@@ -77,6 +86,15 @@ production connection's cancellation wait while reserving writer capacity,
 guarded by `approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent`
 in `broca-subc`. That still-later enqueue boundary must remain `NotSent` rather
 than outcome-unknown when interrupted.
+
+`core-consent-late-intent-sync-core-stop-fence` and
+`core-consent-late-route-open-core-stop-fence` separately prove the core fence.
+They disable only `late_stopped` and use a deliberately non-compliant test
+adapter that ignores `DispatchSignals`. The tests reuse every assertion from
+the corresponding compliant-adapter stop tests, including both cancel and stop.
+The production adapter's writer-queue test calls `SubcToolPlane::dispatch_approved`
+directly, without the run loop or `late_stopped`, so its existing
+`subc-approved-writer-queue-stop-fence` row independently proves the adapter layer.
 
 ### Native Windows coverage
 
