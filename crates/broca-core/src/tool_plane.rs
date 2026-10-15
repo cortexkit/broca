@@ -149,6 +149,18 @@ impl DispatchSignals {
                 .as_ref()
                 .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
     }
+    pub async fn cancelled(&self) {
+        async fn wait(token: Option<&tokio_util::sync::CancellationToken>) {
+            match token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            _ = wait(self.cancel.as_ref()) => {}
+            _ = wait(self.stop.as_ref()) => {}
+        }
+    }
 }
 
 /// The tool-dispatch contract. One batch = one assistant turn's tool calls.

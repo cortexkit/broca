@@ -388,8 +388,8 @@ trait ToolPlaneConnection: Send + Sync {
         _deadline: Duration,
         _preset: Option<&str>,
         _args: &ApprovedArgs,
-    ) -> Result<serde_json::Value, ConnError> {
-        Err(ConnError::Protocol("approved_dispatch_unavailable".into()))
+    ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        Err(ConnError::Protocol("approved_dispatch_unavailable".into()).into())
     }
 
     /// The capability names the daemon advertises (`server.describe`).
@@ -423,8 +423,8 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         args: &ApprovedArgs,
-    ) -> Result<serde_json::Value, ConnError> {
-        self.tool_call_raw_with_preset(
+    ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        self.tool_call_raw_guarded(
             route,
             &call.tool_name,
             &args.bytes,
@@ -433,6 +433,7 @@ impl ToolPlaneConnection for SubcConnection {
             preset,
             Some(&args.key),
             None,
+            &args.signals,
         )
         .await
     }
@@ -571,11 +572,19 @@ impl SubcToolPlane {
                     reason: "approved_dispatch_stopped_before_send".into(),
                 };
             }
-            SendAttempt::Reply(
-                self.conn
-                    .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
-                    .await,
-            )
+            match self
+                .conn
+                .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
+                .await
+            {
+                Ok(reply) => SendAttempt::Reply(Ok(reply)),
+                Err(crate::connection::ApprovedCallError::Connection(error)) => {
+                    SendAttempt::Reply(Err(error))
+                }
+                Err(crate::connection::ApprovedCallError::NotSent) => SendAttempt::NotSent {
+                    reason: "approved_dispatch_stopped_before_enqueue".into(),
+                },
+            }
         } else {
             SendAttempt::Reply(
                 self.conn
@@ -2021,8 +2030,8 @@ impl ToolPlane for SubcToolPlane {
             };
         }
 
-        // The route is up; a failure from here on is AFTER the request was handed
-        // to the writer:
+        // A signal before writer enqueue returns typed NotSent below. Once the
+        // guarded push succeeds, reply failures are handled as sent calls:
         //  - an `unknown_channel` rejection is provably pre-send: the daemon's router
         //    freed the channel (the target module was drain-restarted) and refused the
         //    request at routing — it never reached the tool. Evict the stale route and
@@ -2857,7 +2866,7 @@ mod tests {
             deadline: Duration,
             preset: Option<&str>,
             args: &ApprovedArgs,
-        ) -> Result<serde_json::Value, ConnError> {
+        ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
             let arguments = serde_json::from_str(&args.bytes).expect("approved fixture arguments");
             self.tool_call(
                 route,
@@ -2868,6 +2877,7 @@ mod tests {
                 preset,
             )
             .await
+            .map_err(Into::into)
         }
 
         fn route_is_open(&self, route: &RouteHandle) -> bool {
@@ -5891,5 +5901,72 @@ mod approval_digest_contract_tests {
         assert_eq!(value["call_key"], "lineage:7");
         assert_eq!(value["preset"], "head");
         assert!(value.get("approval_digest").is_none(), "consent execution must omit approval_digest rather than sending an empty or legacy digest");
+    }
+}
+
+#[cfg(test)]
+mod approved_queue_contract_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
+        for cancel in [true, false] {
+            let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
+            let plane = SubcToolPlane::new(conn, "aft");
+            let ctx = BatchCtx {
+                batch_id: broca_protocol::BatchId("queue".into()),
+                bind: BindIdentity::new("/project", "test", "queue"),
+                run_id: broca_protocol::RunId("run".into()),
+                scope: None,
+            };
+            plane.routes.lock().unwrap().insert(
+                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
+                RouteState {
+                    handle: route,
+                    sem: Arc::new(Semaphore::new(1)),
+                    stamp: None,
+                },
+            );
+            let call = ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("approved".into()),
+                tool_name: "edit".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            };
+            let token = CancellationToken::new();
+            let signals = broca_core::tool_plane::DispatchSignals::new(
+                if cancel { Some(&token) } else { None },
+                if cancel { None } else { Some(&token) },
+            );
+            let mut dispatch = Box::pin(
+                plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals),
+            );
+            assert!(dispatch.as_mut().now_or_never().is_none());
+            assert_eq!(
+                module.pending_count_for_test(),
+                1,
+                "the real tool request must already be waiting for writer capacity"
+            );
+            token.cancel();
+            let result = tokio::time::timeout(Duration::from_millis(250), dispatch)
+                .await
+                .expect("cancelled approved enqueue must not wait for writer capacity");
+            assert!(
+                matches!(result, DispatchResult::NotSent { .. }),
+                "pre-enqueue interruption is typed not-sent, never unknown: {result:?}"
+            );
+            let frames = module.take_written_for_test();
+            assert_eq!(frames.len(), 256);
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.header.ty == subc_protocol::FrameType::Ping),
+                "no tool request or provider cancel may be enqueued before the send boundary"
+            );
+            assert_eq!(module.pending_count_for_test(), 0);
+            tokio::task::yield_now().await;
+            assert!(module.take_written_for_test().is_empty());
+        }
     }
 }

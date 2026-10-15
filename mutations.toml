@@ -11554,3 +11554,29 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "call.backoff = (delay * 2).min(1000);"
 new = "call.backoff = 50; // NON-VACUITY BREAK: retry every failed await at the initial delay"
+
+[[control]]
+id = "subc-consent-cancel-during-writer-capacity"
+guards = "approved dispatch cancels its real bounded writer-queue reservation without enqueue or unknown outcome"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = "self.enqueue_approved(&runtime, frame, signals).await?;"
+new = "self.send(&runtime, frame).await?; // NON-VACUITY BREAK: lose run signals at the real writer queue"
+
+[[control]]
+id = "subc-consent-recheck-after-writer-reservation"
+guards = "a signal between capacity reservation and push still prevents enqueue"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::approved_enqueue_tests::approved_push_rechecks_cancel_and_stop_after_capacity_is_reserved"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = "if signals.interrupted() {"
+new = "if false && signals.interrupted() { // NON-VACUITY BREAK: enqueue after a post-reservation signal"
