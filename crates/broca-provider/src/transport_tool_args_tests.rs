@@ -89,6 +89,54 @@ const FAMILIES: [Family; 5] = [
     Family::Bedrock,
 ];
 
+#[test]
+fn wire_normalizers_report_real_content_progress() {
+    for family in FAMILIES {
+        let mut normalizer = family.normalizer();
+        for chunk in family.start(false) {
+            normalizer.push(&chunk).unwrap();
+        }
+        assert_eq!(
+            normalizer.content_progress().content_bytes,
+            None,
+            "{family:?}"
+        );
+        normalizer.push(&family.delta("{}", false)).unwrap();
+        let progress = normalizer.content_progress();
+        assert!(progress.content_bytes.is_some_and(|n| n > 0), "{family:?}");
+        assert!(progress.last_content_at_ms.is_some(), "{family:?}");
+    }
+}
+
+#[tokio::test]
+async fn metadata_only_attempt_omits_content_evidence_and_log_time() {
+    use tracing::instrument::WithSubscriber;
+    let normalizer = OpenAiResponses.normalizer(&openai_responses_frozen_config("m"), StepId(1));
+    let raw = b": keepalive\n\ndata: {\"type\":\"response.in_progress\"}\n\n";
+    let stream = futures::stream::iter([
+        Ok(raw.to_vec()),
+        Err(std::io::Error::other("held stream cut")),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+    let logs = super::chunk_error_tests::ProviderWarnings::default();
+    let mut trace = AttemptTrace {
+        sent_at: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    drive_body_stream_traced(stream, normalizer, &tx, MAX_STREAM_BYTES, &mut trace)
+        .with_subscriber(logs.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(logs.0.lock().unwrap()[0]["last_content_ms"], "none");
+    let attempt = trace.into_attempt(0, &RequestDigest::of(b"{}"), AttemptOutcome::ChunkError);
+    let value = serde_json::to_value(attempt).unwrap();
+    assert!(value.get("first_content_at_ms").is_none());
+    assert!(value.get("last_content_at_ms").is_none());
+    assert!(value.get("content_bytes").is_none());
+    assert!(value["non_content_bytes"].as_u64().is_some_and(|n| n > 0));
+    assert_eq!(value["event_types"].as_array().unwrap().len(), 2);
+}
+
 fn cut(events: &[NormalizedEvent]) -> &broca_protocol::provider::ToolArgsTrailingGarbage {
     events
         .iter()

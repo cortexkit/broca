@@ -10842,3 +10842,28 @@ select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                let from = match subscribe_from(&params) {"
 new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"
+[[control]]
+id = "attempt-progress-reasoning-classification"
+guards = "Responses reasoning-summary deltas count as real content rather than unknown metadata"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/content_progress.rs"
+expect_red = ["content_progress::tests::wire_family_content_classification"]
+file = "crates/broca-provider/src/content_progress.rs"
+old = '| "response.reasoning_summary_text.delta"'
+new = '| "response.reasoning_summary_text.never" // NON-VACUITY BREAK'
+
+[[control]]
+id = "run-status-live-step"
+guards = "real-daemon run.status exposes the actor-owned held model step without reading it from WAL"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test scope_real_daemon_e2e"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/scope_real_daemon_e2e.rs"
+expect_red = ["active_status_reports_held_model_step_and_content"]
+file = "crates/broca-module/src/serve.rs"
+old = 'step: state.live_step,'
+new = 'step: None, // NON-VACUITY BREAK'

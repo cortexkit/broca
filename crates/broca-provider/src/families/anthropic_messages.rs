@@ -170,7 +170,7 @@ impl WireFamily for AnthropicMessages {
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
         Box::new(AnthropicStreamNormalizer {
-            sse: SseDecoder::default(),
+            sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Anthropic),
             // The body renders `max_tokens` from this same field, so an output-ceiling error
             // names the cap the provider actually enforced.
             inner: AnthropicNormalizer::new(step_id)
@@ -191,6 +191,9 @@ struct AnthropicStreamNormalizer {
 }
 
 impl StreamNormalizer for AnthropicStreamNormalizer {
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.sse.content_progress()
+    }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.push(chunk)? {

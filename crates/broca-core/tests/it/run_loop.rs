@@ -1834,6 +1834,7 @@ impl broca_core::Provider for AttemptRecordingStub {
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             let attempt = broca_protocol::provider::ModelAttempt {
+                content_progress: Default::default(),
                 attempt: 0,
                 request_body_len: bytes.len() as u64,
                 request_body_sha256: broca_core::request_digest_hex(&bytes),
@@ -1886,6 +1887,7 @@ impl broca_core::Provider for HeldAttemptProvider {
         self.baseline_syncs
             .store(self.wal.sync_calls(), Ordering::SeqCst);
         let attempt = broca_protocol::ModelAttempt {
+            content_progress: Default::default(),
             attempt: 0,
             request_body_len: bytes.len() as u64,
             request_body_sha256: broca_core::request_digest_hex(&bytes),

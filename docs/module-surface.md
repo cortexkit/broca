@@ -698,6 +698,36 @@ keep their existing behavior and omit this diagnostic.
   ends a run with it. It is terminal, not a pause: a pause is only for a failure with a
   caller-side resolver contract (`AuthRequired` → the caller re-authenticates, then resumes the
   SAME run).
+- **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
+  `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?}`. It is a cheap
+  snapshot of the live actor's in-memory model call, never inferred from WAL. Timestamps are
+  Unix milliseconds; `attempt` is zero-based and its content timestamp resets on reissue.
+  No in-flight model step means no object, and no real content yet means no content timestamp.
+  The real-serve fixture is `crates/broca-wire/tests/golden/run_status.active_with_step.json`.
+
+### Attempt content telemetry
+
+`model_attempt_finished` optionally carries `first_content_at_ms`, `last_content_at_ms`,
+`content_bytes`, `non_content_bytes`, `event_types`, `non_content_bytes_after_last_content`,
+and `events_after_last_content`. Provider and model come from the run's `run_started`.
+These fields are informational and need no reader feature. Older readers ignore them.
+
+Content is explicitly classified per wire family: text, reasoning/summary, function-argument,
+and refusal deltas. Lifecycle events, completed item snapshots, signatures, usage, pings and
+keepalive comments are not content. Unknown event types are non-content and carry `unknown:true`
+in the tally. SSE and WebSocket data bytes count UTF-8 payloads (including JSON envelopes), not
+SSE framing; SSE keepalives count comment bytes. Bedrock counts event JSON payload bytes.
+The tally holds the top sixteen event types by count, ties ordered by name, plus an `other`
+bucket for remaining types. Each entry has `event_type`, `count`, measured `bytes`, and optional
+`unknown`. WebSocket ping/pong are exposed by the socket pump without their payload lengths:
+their counts are observed but their byte count, and any aggregate containing it, stay absent.
+Exact counts are retained until the attempt ends so a late frequent event can enter the top sixteen.
+
+No observed content means absent content timestamps, content byte count and suffix counters,
+not synthetic zeroes. Once content is observed, the suffix counters reset to measured zero;
+subsequent non-content records increment them. A byte class never observed stays absent.
+This telemetry and the attempt log's `last_content_ms` do **not** change the existing idle or
+content deadlines, retry policy, or rate-floor policy.
 
 ## 15. session.read consistency + pagination
 

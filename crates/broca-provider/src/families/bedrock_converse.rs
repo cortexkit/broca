@@ -867,6 +867,7 @@ pub struct BedrockStreamNormalizer {
     step_id: StepId,
     message_id: MessageId,
     decoder: BedrockEventStreamDecoder,
+    content_observer: crate::content_progress::ContentObserver,
     blocks: BTreeMap<usize, BlockBuf>,
     usage: Usage,
     finish_reason: FinishReason,
@@ -892,6 +893,9 @@ impl BedrockStreamNormalizer {
             step_id,
             message_id: MessageId(format!("bedrock-step-{}", step_id.0)),
             decoder: BedrockEventStreamDecoder::new(),
+            content_observer: crate::content_progress::ContentObserver::new(
+                crate::content_progress::ContentFamily::Bedrock,
+            ),
             blocks: BTreeMap::new(),
             usage: Usage::default(),
             finish_reason: FinishReason::Other,
@@ -923,6 +927,11 @@ impl BedrockStreamNormalizer {
         let event_type = match frame_kind {
             BedrockFrameKind::Event(event_type) => event_type,
             BedrockFrameKind::Error { code, message } => {
+                self.content_observer.observe(
+                    "error",
+                    Some(&payload.to_string()),
+                    frame.payload.len(),
+                );
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
                     error: bedrock_error(code, &payload, message),
                     retries_used: 0,
@@ -931,6 +940,11 @@ impl BedrockStreamNormalizer {
             }
         };
         let (event_type, event_payload) = event_type_and_payload(event_type, &payload);
+        self.content_observer.observe(
+            event_type.as_deref().unwrap_or("unknown"),
+            Some(&event_payload.to_string()),
+            frame.payload.len(),
+        );
         match event_type.as_deref().unwrap_or("") {
             "messageStart" => self.handle_message_start(out),
             "contentBlockStart" => self.handle_content_block_start(event_payload),
@@ -1213,6 +1227,9 @@ impl BedrockStreamNormalizer {
 }
 
 impl StreamNormalizer for BedrockStreamNormalizer {
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.content_observer.snapshot()
+    }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let frames = self.decoder.push(chunk)?;
         let mut out = Vec::new();

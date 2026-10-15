@@ -642,6 +642,7 @@ fn the_break_glass_defaults_off_and_a_misspelling_is_refused() {
 
 fn attempt(http_status: Option<u16>, observation: AttemptAccountObservation) -> ModelAttempt {
     ModelAttempt {
+        content_progress: Default::default(),
         attempt: 0,
         request_body_len: 10,
         request_body_sha256: "aa".into(),

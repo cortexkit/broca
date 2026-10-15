@@ -458,6 +458,8 @@ pub(crate) struct ApprovalWaitProbe {
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    /// Cheap actor-owned status; never a durability or cancellation input.
+    pub step_progress: Option<crate::provider::LiveStepProgress>,
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) approval_wait_probe: Option<Arc<ApprovalWaitProbe>>,
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
@@ -616,6 +618,7 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            step_progress: None,
             #[cfg(all(test, feature = "test-clock"))]
             approval_wait_probe: None,
             clock: None,
@@ -5608,6 +5611,28 @@ async fn run_step_watched<P: Provider>(
     out: &mpsc::Sender<OutputEvent>,
     on_attempt: &AttemptSink<'_>,
 ) -> Result<Result<StepOutcome, RunFinishReason>, WalWriteError> {
+    struct ProgressGuard(Option<crate::provider::LiveStepProgress>);
+    impl Drop for ProgressGuard {
+        fn drop(&mut self) {
+            if let Some(progress) = &self.0 {
+                *progress.lock().unwrap() = None;
+            }
+        }
+    }
+    let _progress_guard = ProgressGuard(control.step_progress.clone());
+    if let Some(progress) = &control.step_progress {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
+            step_id,
+            started_at_ms: now,
+            attempt: 0,
+            attempt_started_at_ms: now,
+            last_content_at_ms: None,
+        });
+    }
     // The renderer gets a shared handle to the durable snapshot, never a copy of the prompt.
     let render_opts = Arc::clone(opts);
 
@@ -5635,6 +5660,7 @@ async fn run_step_watched<P: Provider>(
             &mut events,
             on_attempt,
             control.shutdown_seal.as_ref(),
+            control.step_progress.clone(),
         );
         tokio::pin!(step);
 
@@ -5736,24 +5762,25 @@ async fn run_step<P: Provider>(
     events: &mut Option<mpsc::Receiver<NormalizedEvent>>,
     on_attempt: &AttemptSink<'_>,
     shutdown_seal: Option<&crate::ShutdownSeal>,
+    progress: Option<crate::provider::LiveStepProgress>,
 ) -> Result<StepOutcome, WalWriteError> {
     let _ = send(
         out,
         OutputEvent::Control(ControlUnit::StepStarted { step_id }),
     )
     .await;
-    let stream = match shutdown_seal {
-        Some(seal) => {
-            provider
-                .step_with_shutdown_seal(step_id, opts, cancel.clone(), deadline, seal.clone())
-                .await
-        }
-        None => {
-            provider
-                .step_with_shared_cancel(step_id, opts, cancel.clone(), deadline)
-                .await
-        }
-    };
+    let stream = provider
+        .step_with_runtime(
+            step_id,
+            opts,
+            crate::provider::StepRuntime {
+                cancel: cancel.clone(),
+                deadline,
+                seal: shutdown_seal.cloned(),
+                progress,
+            },
+        )
+        .await;
     let rx = events.insert(stream);
 
     let mut message: Option<AssistantMessage> = None;
@@ -8957,6 +8984,7 @@ mod tests {
             &out,
             &mut None,
             &|_| Box::pin(async { Ok(()) }),
+            None,
             None,
         )
         .await;

@@ -1908,6 +1908,8 @@ pub fn latest_projection_boundary(
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
+    /// Only the live actor fills this; WAL reconciliation never guesses an in-flight step.
+    pub live_step: Option<broca_protocol::provider::InFlightStep>,
     pub state: crate::RunIndexState,
     /// Durable steer send ids with no later StepStarted to give their input to the model,
     /// in WAL order. Reported only after the run ends: adding the input to the transcript
@@ -1973,6 +1975,7 @@ pub fn reconcile_run_state(records: &[WalRecord], run_id: &str) -> Option<Reconc
                 if rid.0 == run_id {
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
+                        live_step: None,
                         title: None,
                         state: RunIndexState::Active,
                         undelivered_steers: None,
@@ -2042,6 +2045,7 @@ pub fn reconcile_run_state(records: &[WalRecord], run_id: &str) -> Option<Reconc
                         }
                     };
                     found = Some(ReconciledRunState {
+                        live_step: None,
                         title: None,
                         state,
                         undelivered_steers: Some(pending_steer_ids.clone()),
@@ -2063,6 +2067,7 @@ pub fn reconcile_run_state(records: &[WalRecord], run_id: &str) -> Option<Reconc
                 ..
             } if rid.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    live_step: None,
                     title: None,
                     state: RunIndexState::Paused,
                     undelivered_steers: None,
@@ -2087,6 +2092,7 @@ pub fn reconcile_run_state(records: &[WalRecord], run_id: &str) -> Option<Reconc
                 ..
             } if failure.run_id.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    live_step: None,
                     title: None,
                     state: RunIndexState::Error,
                     undelivered_steers: Some(Vec::new()),
@@ -2104,6 +2110,7 @@ pub fn reconcile_run_state(records: &[WalRecord], run_id: &str) -> Option<Reconc
     }
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
+            live_step: None,
             state: RunIndexState::Interrupted,
             undelivered_steers: Some(pending_steer_ids.clone()),
             final_step_finish_reason: None,

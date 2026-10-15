@@ -1022,6 +1022,7 @@ enum RunState {
         /// Current in-progress StepId for advisory session-level status. Relaxed ordering is
         /// sufficient because this monotonic display value does not guard any run state or data.
         progress: Arc<AtomicU64>,
+        step_progress: broca_core::provider::LiveStepProgress,
         /// The run-driving task's join handle — held so the idle-tick liveness backstop
         /// can detect a run task that ended WITHOUT delivering a terminal (the rare
         /// dropped-synthetic-terminal case) via `is_finished()`.
@@ -3684,7 +3685,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             recorded: std::sync::Mutex::new(recorded),
         });
         let steer = broca_core::SteerInbox::new();
+        let step_progress = Arc::new(std::sync::Mutex::new(None));
         let control = RunControl {
+            step_progress: Some(Arc::clone(&step_progress)),
             clock: self
                 .registry
                 .retention_service()
@@ -3792,6 +3795,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             cancel,
             shutdown_seal,
             progress,
+            step_progress,
             handle,
             durable_finish,
         });
@@ -4621,13 +4625,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // already durable and only its completion is still on its way to this actor. That run
         // has ended, so it falls through: its index row still says Active, which sends it to the
         // WAL reconcile below, the same answer `run.result` reads.
-        if let RunState::Active { run_id: active, .. } = &self.state {
+        if let RunState::Active {
+            run_id: active,
+            step_progress,
+            ..
+        } = &self.state
+        {
             if active == run_id
                 && !self.restart_admitting
                 && self.durable_finish_of_active(run_id).is_none()
             {
+                let live_step = step_progress.lock().unwrap().clone();
                 let title = self.live_run_title(run_id).await?;
                 return Ok(Some(ReconciledRunState {
+                    live_step,
                     state: RunIndexState::Active,
                     undelivered_steers: None,
                     final_step_finish_reason: None,
@@ -4669,6 +4680,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         None
                     };
                     return Ok(Some(ReconciledRunState {
+                        live_step: None,
                         state: row.state,
                         undelivered_steers,
                         final_step_finish_reason: row.final_step_finish_reason,
@@ -4685,6 +4697,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 // synthetic rows can lack terminal metadata. Reconcile those rows from the WAL.
                 let reconciled = self.terminal_wal_state(run_id).await?;
                 Ok(Some(ReconciledRunState {
+                    live_step: None,
                     state: row.state,
                     undelivered_steers: reconciled
                         .as_ref()
