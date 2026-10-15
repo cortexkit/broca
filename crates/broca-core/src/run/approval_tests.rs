@@ -1579,12 +1579,23 @@ async fn expire_rig(mut rig: Rig) -> Rig {
     ));
     let expire = async {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
+        let mut marker_deadline = None;
         loop {
             interval.tick().await;
-            // Advance after the question plane is polled, independently of the WAL marker
-            // under test. Missing marker entries must fail assertions, not freeze expiry.
-            if rig.questions.polls.load(Ordering::SeqCst) > 0 {
-                assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some()))), "filed approval missing from pending marker");
+            // Advance once the question plane has been polled and the filed card is in the WAL
+            // marker. Consent recovery reads the answer feed before it files, so the first poll
+            // can come before the card id is recorded; allow a bounded wait for the marker after
+            // polling starts. A missing marker entry then fails this assertion within the bound
+            // instead of freezing expiry until the hang guard.
+            if rig.questions.polls.load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+            let filed = rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some())));
+            let deadline = *marker_deadline.get_or_insert_with(|| {
+                std::time::Instant::now() + std::time::Duration::from_secs(10)
+            });
+            if filed || std::time::Instant::now() >= deadline {
+                assert!(filed, "filed approval missing from pending marker");
                 break;
             }
         }
