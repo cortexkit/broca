@@ -10810,3 +10810,31 @@ old = '''fn late_stopped(control: &RunControl) -> bool {
 new = '''fn late_stopped(_control: &RunControl) -> bool {
         false // NON-VACUITY BREAK
     }'''
+
+[[control]]
+id = "core-consent-live-wait-clears-stale-cursor"
+guards = "the live wait actually clears a refused non-zero cursor before rereading the new incarnation"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_wait_clears_stale_nonzero_cursor_before_reread"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }'''
+new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK: retain stale cursor */ next_poll = 0; }'''
+
+[[control]]
+id = "core-consent-live-wait-unreadable-keeps-cursor"
+guards = "the live wait rejects unreadable answered pages before advancing past their corrected feed position"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::live_wait_unreadable_page_retries_before_cursor_advance"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "Err(_) => return Err(()),"
+new = "Err(_) => continue, // NON-VACUITY BREAK"

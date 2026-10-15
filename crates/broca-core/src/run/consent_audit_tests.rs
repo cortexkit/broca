@@ -170,6 +170,7 @@ async fn provisional_id_resume_reconciles_conflicting_settlements_before_get() {
     rig.finish().await;
 }
 
+#[cfg(feature = "test-clock")]
 struct ConflictingFeed {
     key: String,
     prepared: WalRecord,
@@ -177,11 +178,13 @@ struct ConflictingFeed {
     entered: std::sync::atomic::AtomicBool,
     split: bool,
 }
+#[cfg(feature = "test-clock")]
 impl ConflictingFeed {
     fn record(&self, id: &str, choice: &str) -> Value {
         json!({"state":"answered","requester_ref":self.key,"elicitation_id":id,"answered_choice_id":choice,"binding":crate::consent::binding(&self.prepared)})
     }
 }
+#[cfg(feature = "test-clock")]
 #[async_trait::async_trait]
 impl ElicitationPlane for ConflictingFeed {
     async fn get(&self, _: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
@@ -1119,4 +1122,199 @@ async fn late_dispatch_cancel_or_stop_during_route_open_is_not_sent() {
         );
         rig.finish().await;
     }
+}
+
+#[cfg(feature = "test-clock")]
+struct LiveCursorProbe {
+    key: String,
+    prepared: WalRecord,
+    unreadable: bool,
+    gets: AtomicUsize,
+    entered: std::sync::atomic::AtomicBool,
+    phase: AtomicUsize,
+    stale_refusals: AtomicUsize,
+    skipped: std::sync::atomic::AtomicBool,
+    cursors: Mutex<Vec<Option<ApprovalCursor>>>,
+}
+#[cfg(feature = "test-clock")]
+impl LiveCursorProbe {
+    fn cursor(incarnation: &str, seq: u64) -> ApprovalCursor {
+        ApprovalCursor {
+            provider_incarnation: incarnation.into(),
+            seq,
+        }
+    }
+    fn approved(&self) -> Value {
+        json!({"state":"answered","requester_ref":self.key,"elicitation_id":"held","answered_choice_id":"approve","binding":crate::consent::binding(&self.prepared)})
+    }
+}
+#[cfg(feature = "test-clock")]
+#[async_trait::async_trait]
+impl ElicitationPlane for LiveCursorProbe {
+    async fn get(&self, _: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        Ok(ApprovalQuestion {
+            terminal: false,
+            record: json!({"state":"pending","requester_ref":self.key,"elicitation_id":id}),
+        })
+    }
+    async fn r#await(
+        &self,
+        _: &BatchCtx,
+        _: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.entered.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        cursor: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        if self.gets.load(Ordering::SeqCst) == 0 {
+            return Ok(ApprovalPage {
+                records: Vec::new(),
+                cursor: Self::cursor("setup", 0),
+            });
+        }
+        while !self.entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        // Route I/O must yield even for a refusal, so a broken cursor retry loop
+        // cannot starve this fixture's cancellation monitor and deadline.
+        tokio::task::yield_now().await;
+        self.cursors.lock().unwrap().push(cursor.cloned());
+        if cursor.is_some_and(|c| c.provider_incarnation == "old" && c.seq != 0) {
+            if self.unreadable {
+                self.skipped.store(true, Ordering::SeqCst);
+                return Ok(ApprovalPage {
+                    records: Vec::new(),
+                    cursor: Self::cursor("old", 7),
+                });
+            }
+            self.stale_refusals.fetch_add(1, Ordering::SeqCst);
+            return Err(crate::consent::refusal("cursor_incarnation_changed", false));
+        }
+        if cursor.is_some() {
+            return Ok(ApprovalPage {
+                records: Vec::new(),
+                cursor: Self::cursor("new", 1),
+            });
+        }
+        if self.phase.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut records = Vec::new();
+            if self.unreadable {
+                let mut bad = self.approved();
+                bad.as_object_mut().unwrap().remove("answered_choice_id");
+                records.push(bad);
+            }
+            return Ok(ApprovalPage {
+                records,
+                cursor: Self::cursor("old", 7),
+            });
+        }
+        Ok(ApprovalPage {
+            records: vec![self.approved()],
+            cursor: Self::cursor("new", 1),
+        })
+    }
+}
+
+#[cfg(feature = "test-clock")]
+async fn live_cursor_probe(unreadable: bool) {
+    let mut rig = expired_run("pass").await;
+    // The earlier expiry is durable; polling this new held call uses the normal
+    // advancing clock rather than the frozen clock used to create that expiry.
+    rig.control.clock = None;
+    let mut prepared = rig
+        .frames()
+        .iter()
+        .find(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
+        .unwrap()
+        .record
+        .clone();
+    let WalRecord::ToolCallDeferred { call_id, ask, .. } = &mut prepared else {
+        unreachable!()
+    };
+    *call_id = ToolCallId("held".into());
+    ask.expires_at_ms += 60_000;
+    let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
+    rig.writer.sync().await.unwrap();
+    let probe = Arc::new(LiveCursorProbe {
+        key: crate::context::call_key(rig.writer.lineage_id().unwrap(), seq),
+        prepared: prepared.clone(),
+        unreadable,
+        gets: AtomicUsize::new(0),
+        entered: std::sync::atomic::AtomicBool::new(false),
+        phase: AtomicUsize::new(0),
+        stale_refusals: AtomicUsize::new(0),
+        skipped: std::sync::atomic::AtomicBool::new(false),
+        cursors: Mutex::new(Vec::new()),
+    });
+    rig.control.elicitation_plane = Some(probe.clone());
+    let cancel = CancellationToken::new();
+    rig.control.cancel = Some(cancel.clone());
+    let resume = ResumeCtx {
+        batch_already_started: true,
+        existing: Default::default(),
+        prepared: vec![crate::replay::PreparedCall {
+            record_index: 0,
+            prepared: Arc::new(prepared),
+            approval: None,
+            elicitation_id: Some("held".into()),
+        }],
+    };
+    let batch = rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false);
+    let monitor = async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(2));
+        while rig.tools.provider_requests.load(Ordering::SeqCst) == 0 {
+            if probe.skipped.load(Ordering::SeqCst)
+                || probe.stale_refusals.load(Ordering::SeqCst) > 1
+            {
+                cancel.cancel();
+                break;
+            }
+            tick.tick().await;
+        }
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(batch, monitor)
+    })
+    .await
+    .unwrap();
+    assert!(
+        !result.results[0].is_error,
+        "live feed cursor lost the corrected approval"
+    );
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 1);
+    let cursors = probe.cursors.lock().unwrap().clone();
+    if unreadable {
+        assert_eq!(
+            &cursors[..2],
+            &[None, None],
+            "unreadable live page is retried at the same feed position"
+        );
+        assert!(!probe.skipped.load(Ordering::SeqCst));
+    } else {
+        assert_eq!(probe.stale_refusals.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &cursors[..3],
+            &[None, Some(LiveCursorProbe::cursor("old", 7)), None],
+            "the stale non-zero live cursor must actually be cleared"
+        );
+    }
+    rig.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn live_wait_clears_stale_nonzero_cursor_before_reread() {
+    live_cursor_probe(false).await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn live_wait_unreadable_page_retries_before_cursor_advance() {
+    live_cursor_probe(true).await;
 }
