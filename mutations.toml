@@ -246,6 +246,10 @@ runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/captured_replay_e2e.rs"
+# The two listed captured-replay tests check deadline diagnostics and completed-run
+# WAL kinds. Restricting this proof avoids the >10-minute Windows baseline, at the
+# cost of collateral checks from the rest of the `it` target.
+select = "expected"
 expect_red = ["captured_replay_e2e::client_deadline_dumps_rig_diagnostics_when_capture_server_holds_response", "captured_replay_e2e::real_module_completes_against_captured_openai_chat_bytes"]
 file = "crates/broca-module-serve/tests/it/session_client.rs"
 old = '"seq={} {kind}{}\n",'
@@ -1653,6 +1657,10 @@ runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
+# The listed late-steer test checks undelivered IDs in run.status before and after
+# restart. Restricting this proof avoids the >10-minute Windows baseline, at the
+# cost of collateral checks from the rest of the `it` target.
+select = "expected"
 expect_red = ["send_delivery::step_limit_with_a_late_steer_reports_undelivered_send_id"]
 file = "crates/broca-module/src/actor.rs"
 old = "                    let undelivered_steers = reconciled\n                        .as_ref()\n                        .and_then(|state| state.undelivered_steers.clone());"
