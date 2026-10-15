@@ -151,7 +151,41 @@ Across all four original Windows reports, the 153 ERROR outcomes split into:
   injects each supported conversion error while checking both live WALs are
   still reported. The original wide-window and staging checks remain intact.
 
-Native Windows replay is still required to confirm these fixes. The original
-reports also contain five SURVIVED rows, one timeout and one
-RED_FOR_ANOTHER_REASON; those are separate proof findings, not count/parser
-errors, and are not reclassified or weakened here.
+Replaying the mutation catalogue on native Windows is still required to confirm
+the Bash launcher, cleanup capture, junction-output capture and calendar-rendering
+fixes eliminate the corresponding baseline and parser failures.
+
+### Proof findings from run 38678258208
+
+The five mutations that left their guarding tests green, the approval-marker
+mutation that timed out, and the archived-read mutation caught by an unrelated
+assertion are separate from the output-capture errors above:
+
+| Row | Cause and correction |
+| --- | --- |
+| `registry-read-proof-cache-bound` | The read-proof cache requires an identity that detects WAL replacement. Live Windows WALs expose no persistent OS file ID and never populate the cache, but archived WALs have a content-based identity on every platform. The eviction test now reads a real archive so Windows must exercise the bound, while retaining live-WAL eviction checks on Unix; a separate Windows test checks live reads repeat flush barriers without caching proofs. |
+| `wal-anchored-damaged-length-before-record` | The anchored suffix is never entered without a stable file identity. A Unix-only anchored test now requires an anchor instead of conditionally skipping its assertion; the portable full-replay corruption test remains. |
+| `approval-audit-late-byte-cap` | The outer response pager hid an unbounded intermediate late-result projection. The test now checks the projection's own cap and cursor before checking the final response. |
+| `move-retention-delete` | A second migration check in deletion completion could refuse after a tombstone had already been written. The test now also requires that no tombstone was created. |
+| `windows-vault-open-acl-check` | The fixture contained `{}`, which always failed parsing because `handles` is required. It now contains a valid handle map, succeeds with a private ACL, and requires an inspection error for unsafe ACLs. |
+| `core-approval-marker-from-call-state` | The expiry driver waited for the very marker entry the mutation removed. Repeated 120-second hang guards exhausted the suite's 600-second deadline, independently of WAL storage. The driver now advances after a question-plane poll, so the marker assertions can fail without stalling expiry. No deadlines were raised. |
+| `archived-read-never-restores-live` | Restoring a live Windows WAL removes the archive's synthetic byte anchor. The test unwrapped that missing anchor before checking non-extraction. It now checks non-extraction immediately after each ordinary read, before inspecting anchors. |
+
+The live anchored-suffix row has a cfg-gated Unix test, and the platform verifier's
+regression removes its platform restriction to confirm Windows claims are rejected.
+The remaining corrections retain Windows eligibility; native Windows CI must
+confirm their catches and the uncached-read test.
+
+A nine-row Linux replay with ckdev-mutate 0.12.1 caught all eight eligible rows,
+including the crash-prefix control, and skipped the Windows-only vault ACL row.
+The approval-marker mutant completed its full library target in 7.1 seconds with
+the expected marker failure and eight other marker assertions, not a timeout.
+
+The downloaded Windows shard-1 report and job 116236895570 log from run
+38678258208 record `wire-newer-writer-code` as
+`CAUGHT`, not a parser error. The `step_transform_crash` count disagreement above
+was from the separate Linux breadth measurement. Its crash child inherited the
+parent's stdout and emitted a nested libtest status line before being killed.
+Child stdout and stderr now go to fixture-local files, preserving diagnostics
+without adding an unfinished test to the parent's result stream. The wire golden
+and its mutation remain unchanged.

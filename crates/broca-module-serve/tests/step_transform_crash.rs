@@ -513,6 +513,9 @@ async fn every_record_cut_preserves_prefix_and_exact_hook_call_table() {
         .env("BROCA_HOOK_CHILD_ROOT", &killed)
         .env("BROCA_HOOK_PROJECT", project_root())
         .env("BROCA_HOOK_CHILD_CONNECTION", &daemon.connection_file)
+        // A nested libtest status line would be counted as another parent test by runners.
+        .stdout(std::fs::File::create(killed.join("child.stdout")).unwrap())
+        .stderr(std::fs::File::create(killed.join("child.stderr")).unwrap())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -520,7 +523,9 @@ async fn every_record_cut_preserves_prefix_and_exact_hook_call_table() {
         while !killed.join("reached").exists() {
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "child exited before cut"
+                "child exited before cut: stdout={} stderr={}",
+                std::fs::read_to_string(killed.join("child.stdout")).unwrap(),
+                std::fs::read_to_string(killed.join("child.stderr")).unwrap()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

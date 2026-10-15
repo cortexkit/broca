@@ -948,18 +948,26 @@ mod windows_acl_tests {
             .create_new(true)
             .open(&path)
             .unwrap()
-            .write_all(b"{}")
+            .write_all(br#"{"handles":{}}"#)
             .unwrap();
+        assert!(VaultHandles::load(&path).unwrap().handles.is_empty());
         for unreadable in [false, true] {
             if unreadable {
                 deny_acl_read(&path);
             } else {
                 broaden(&path);
             }
-            assert!(VaultHandles::load(&path).is_err());
+            assert!(
+                matches!(
+                    VaultHandles::load(&path),
+                    Err(VaultHandlesError::Inspect { .. })
+                ),
+                "unsafe ACL must be refused before parsing vault handles"
+            );
             reset_acl(&path);
             broca_owner_only::repair(&path).unwrap();
-            assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+            assert_eq!(std::fs::read(&path).unwrap(), br#"{"handles":{}}"#);
+            assert!(VaultHandles::load(&path).unwrap().handles.is_empty());
         }
     }
 }

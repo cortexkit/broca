@@ -3683,6 +3683,10 @@ fn migration_sidecars_prevent_retention_deletion_and_boot_enrollment() {
         .acquire(&broca_core::lease_key_for(&rig.key))
         .unwrap();
     assert!(rig.service.delete_expired(&rig.key, 1200).is_err());
+    assert!(
+        rig.service.tombstones(&rig.key).unwrap().is_empty(),
+        "migration protection must refuse deletion before writing a tombstone"
+    );
     assert_eq!(std::fs::read(&retained).unwrap(), before);
     assert!(portable.with_extension("moving").exists());
 }

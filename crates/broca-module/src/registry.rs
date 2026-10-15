@@ -3863,10 +3863,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn read_proof_eviction_repeats_the_barrier_and_preserves_the_page() {
-        let root = broca_test_support::scratch_root()
-            .join(format!("broca-read-proof-eviction-{}", std::process::id()));
+    fn read_proof_fixture(
+        archived: bool,
+    ) -> (LineageRegistry, BindIdentity, Arc<RecordingWalStore>) {
+        let root = broca_test_support::scratch_root().join(format!(
+            "broca-read-proof-eviction-{}-{archived}",
+            std::process::id()
+        ));
         let session = BindIdentity::new(root.join("project"), "runner", "session");
         let file_store = Arc::new(FileWalStore::new(root.join("wal")));
         file_store
@@ -3874,6 +3877,23 @@ mod tests {
             .unwrap()
             .append(1, &started_record(&session), true)
             .unwrap();
+        if archived {
+            let path = file_store.wal_path(&session);
+            let archive_dir = root.join("wal-archive");
+            std::fs::create_dir_all(&archive_dir).unwrap();
+            let mut archive =
+                broca_wal::archive::ArchiveWriter::create(archive_dir.join("fold-1.ark"))
+                    .unwrap()
+                    .without_feature_floor();
+            archive
+                .append(
+                    &broca_core::session_addr(&session),
+                    &std::fs::read(&path).unwrap(),
+                )
+                .unwrap();
+            archive.seal().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
         let wal_store = Arc::new(RecordingWalStore {
             inner: file_store,
             through_seq: Mutex::new(Vec::new()),
@@ -3881,22 +3901,46 @@ mod tests {
         });
         let registry =
             LineageRegistry::new_with_reader(Arc::new(NeverOpener), wal_store.clone(), None);
+        (registry, session, wal_store)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reads_without_file_identity_repeat_the_barrier_without_caching_proofs() {
+        let (registry, session, wal_store) = read_proof_fixture(false);
+        assert_eq!(wal_store.file_identity(&session).unwrap(), None);
+        let before = registry.route_read(&session, None, None).await.unwrap();
+        let after = registry.route_read(&session, None, None).await.unwrap();
+        assert_eq!(before.messages.len(), 1);
+        assert_eq!(after.messages, before.messages);
+        assert_eq!(after.head, before.head);
+        assert_eq!(wal_store.flushes.load(Ordering::Relaxed), 2);
+        assert!(registry
+            .inner
+            .read_proofs
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_proof_eviction_repeats_the_barrier_and_preserves_the_page() {
+        // Archives have a content-based identity on every platform, including Windows,
+        // where live WALs do not populate the proof cache.
+        check_read_proof_eviction(true).await;
+        #[cfg(unix)]
+        check_read_proof_eviction(false).await;
+    }
+
+    async fn check_read_proof_eviction(archived: bool) {
+        let (registry, session, wal_store) = read_proof_fixture(archived);
         let before = registry.route_read(&session, None, None).await.unwrap();
         assert_eq!(before.messages.len(), 1);
-        // Read proofs are cached only where the platform exposes a stable WAL file identity
-        // (a unix inode). Without one (Windows) every no-actor read repeats the flush barrier,
-        // so each read below costs one flush there and the cached-proof checks map to `None`.
-        let identity = wal_store.file_identity(&session).unwrap();
-        let flushes_per_cached_read = u64::from(identity.is_none());
-        assert_eq!(
-            identity.and_then(|identity| registry.cached_read_proof(&session, identity)),
-            identity.map(|_| 1)
-        );
+        let identity = wal_store.file_identity(&session).unwrap().unwrap();
+        assert_eq!(registry.cached_read_proof(&session, identity), Some(1));
         registry.route_read(&session, None, None).await.unwrap();
-        assert_eq!(
-            wal_store.flushes.load(Ordering::Relaxed),
-            1 + flushes_per_cached_read
-        );
+        assert_eq!(wal_store.flushes.load(Ordering::Relaxed), 1);
         for i in 0..SESSION_CACHE_SESSIONS {
             registry.cache_read_proof(&test_key(&format!("proof-{i}")), 42, 1);
         }
@@ -3910,18 +3954,10 @@ mod tests {
         let after = registry.route_read(&session, None, None).await.unwrap();
         assert_eq!(after.messages, before.messages);
         assert_eq!(after.head, before.head);
-        // The evicted proof forces the barrier again on every platform.
+        assert_eq!(wal_store.flushes.load(Ordering::Relaxed), 2);
+        assert_eq!(registry.cached_read_proof(&session, identity), Some(1));
         assert_eq!(
-            wal_store.flushes.load(Ordering::Relaxed),
-            2 + flushes_per_cached_read
-        );
-        assert_eq!(
-            identity.and_then(|identity| registry.cached_read_proof(&session, identity)),
-            identity.map(|_| 1)
-        );
-        assert_eq!(
-            identity.and_then(|identity| registry
-                .cached_read_proof(&session, identity.wrapping_add(1))),
+            registry.cached_read_proof(&session, identity.wrapping_add(1)),
             None
         );
     }
