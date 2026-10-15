@@ -153,20 +153,27 @@ impl Fixture {
     }
 
     fn with_finish(resolved: bool, finish: Option<Arc<tokio::sync::Notify>>) -> Self {
-        Self::build(resolved, finish, false, false, None)
+        Self::build(resolved, finish, false, false, None, true)
+    }
+
+    fn for_admission() -> Self {
+        // Admission assertions inspect records, not crash durability. Keep real fsyncs
+        // out of their shutdown budget; the other fixtures still exercise disk barriers.
+        // The admission tests' time limit is only a hang guard, not a disk-latency bound.
+        Self::build(false, None, false, false, None, false)
     }
 
     /// A run stopped inside a batch of two planned calls: the first was dispatched (its intent
     /// is durable, its result is not), the second never left the process.
     fn with_unsent_sibling() -> Self {
-        Self::build(false, None, false, true, None)
+        Self::build(false, None, false, true, None, true)
     }
 
     /// The production shape: a durable run index beside the WAL. The other constructors omit
     /// it because most seal arms are about the WAL, and an index-free registry is a legal
     /// deployment (`broca-run`).
     fn with_run_index(resolved: bool) -> Self {
-        Self::build(resolved, None, true, false, None)
+        Self::build(resolved, None, true, false, None, true)
     }
 
     fn build(
@@ -175,6 +182,7 @@ impl Fixture {
         with_index: bool,
         unsent_sibling: bool,
         poll_gate: Option<Arc<HoldGate>>,
+        fsync: bool,
     ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
@@ -191,6 +199,7 @@ impl Fixture {
             entered: tokio::sync::Notify::new(),
             sync_gate: Arc::new(HoldGate::default()),
             replay_gate: Arc::new(HoldGate::default()),
+            fsync,
         });
         let mut opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(root.join("leases"))),
@@ -483,8 +492,91 @@ async fn shutdown_idle_exits_promptly() {
 }
 
 #[tokio::test]
-async fn shutdown_rejects_new_admission() {
+async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
+    let f = Fixture::for_admission();
+    f.start().await;
+    let handle = f.registry.actor_for(&f.key).await.unwrap();
+    let signal = f.registry.stopping_signal();
+    let registry = f.registry.clone();
+    // Keep the stop task before its first poll of the registry stop future, so both
+    // sends below are admitted before the registry requests stopping.
+    let (release, held) = oneshot::channel();
+    let stopping = tokio::spawn(async move {
+        held.await.unwrap();
+        registry
+            .stop_and_seal_with_budget(Duration::from_millis(200), Duration::from_secs(2))
+            .await
+    });
+    let (reply, rx) = oneshot::channel();
+    handle
+        .send(LineageCmd::Send {
+            retention: None,
+            stop_sequences_named: false,
+            title: None,
+            conversation_key: None,
+            run_id: RunId("late-run".into()),
+            request: Box::new(text_req(&f.key, "late-run").to_submission()),
+            kind: RunKind::FreshOrResume,
+            key: crate::actor::SendKey::Minted,
+            skip_materialization: false,
+            delivery: broca_protocol::Delivery::Queue,
+            plan: None,
+            reply,
+        })
+        .await
+        .ok()
+        .unwrap();
+    let result = rx.await.unwrap();
+    assert!(!signal.is_cancelled());
+    assert!(matches!(result, SendOutcome::Pending { .. }), "{result:?}");
+    let route_result = f
+        .registry
+        .route_send(
+            &f.key,
+            text_req(&f.key, "late-route"),
+            RunKind::FreshOrResume,
+        )
+        .await;
+    assert!(
+        matches!(route_result, Ok(SendOutcome::Pending { .. })),
+        "{route_result:?}"
+    );
+    release.send(()).unwrap();
+    let clean = stopping.await.unwrap();
+    assert!(clean, "{}", f.registry.shutdown_report().unwrap());
+}
+
+#[tokio::test]
+async fn shutdown_slow_seal_sync_expires_admission_test_budget() {
     let f = Fixture::new(false);
+    f.start().await;
+    let release = f.wal.sync_gate.arm();
+    let registry = f.registry.clone();
+    let total = Duration::from_secs(2);
+    let started = tokio::time::Instant::now();
+    let stopping = tokio::spawn(async move {
+        registry
+            .stop_and_seal_with_budget(Duration::from_millis(200), total)
+            .await
+    });
+    f.wal.sync_gate.entered.notified().await;
+    // Hold the seal's sync beyond the registry budget without relying on disk latency.
+    // The actor's own five-second write bound has not expired when the registry returns.
+    tokio::time::pause();
+    tokio::time::advance(total).await;
+    let sealed = stopping.await.unwrap();
+    assert_total_deadline(&f, sealed, started.elapsed(), total);
+    let report = f.registry.shutdown_report().unwrap();
+    assert!(report.current_failures.is_empty(), "{report}");
+    assert!(report.recovery_debt.is_empty(), "{report}");
+    tokio::time::resume();
+    drop(release);
+    wait_for_closed(&f).await;
+}
+
+#[tokio::test]
+async fn shutdown_rejects_new_admission() {
+    let f = Fixture::for_admission();
     f.start().await;
     let handle = f.registry.actor_for(&f.key).await.unwrap();
     let registry = f.registry.clone();
@@ -522,7 +614,11 @@ async fn shutdown_rejects_new_admission() {
             RunKind::FreshOrResume,
         )
         .await;
-    assert!(stopping.await.unwrap());
+    assert!(
+        stopping.await.unwrap(),
+        "{}",
+        f.registry.shutdown_report().unwrap()
+    );
     assert!(
         matches!(result, SendOutcome::Transient(_)),
         "buffered Send admitted while stopping: {result:?}"
@@ -541,6 +637,7 @@ struct GatedReadWalStore {
     entered: tokio::sync::Notify,
     sync_gate: Arc<HoldGate>,
     replay_gate: Arc<HoldGate>,
+    fsync: bool,
 }
 
 impl WalStore for GatedReadWalStore {
@@ -551,6 +648,7 @@ impl WalStore for GatedReadWalStore {
         Ok(Box::new(GatedSyncWal {
             inner: self.inner.open(key)?,
             gate: self.sync_gate.clone(),
+            fsync: self.fsync,
         }))
     }
 
@@ -635,6 +733,7 @@ impl Drop for ReleaseGate {
 struct GatedSyncWal {
     inner: Box<dyn broca_wal::Wal + Send>,
     gate: Arc<HoldGate>,
+    fsync: bool,
 }
 
 impl broca_wal::Wal for GatedSyncWal {
@@ -644,12 +743,16 @@ impl broca_wal::Wal for GatedSyncWal {
         record: &WalRecord,
         sync: bool,
     ) -> Result<u64, broca_wal::WalError> {
-        self.inner.append(fence, record, sync)
+        self.inner.append(fence, record, sync && self.fsync)
     }
 
     fn sync(&self) -> Result<(), broca_wal::WalError> {
         self.gate.wait();
-        self.inner.sync()
+        if self.fsync {
+            self.inner.sync()
+        } else {
+            Ok(())
+        }
     }
 
     fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
@@ -840,7 +943,7 @@ async fn shutdown_aborted_run_join_retains_slot_while_poll_is_blocked() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let gate = Arc::new(HoldGate::default());
         let release = gate.arm();
-        let f = Fixture::build(false, None, false, false, Some(gate.clone()));
+        let f = Fixture::build(false, None, false, false, Some(gate.clone()), true);
         f.start().await;
         gate.poll_requested.notify_one();
         gate.entered.notified().await;
