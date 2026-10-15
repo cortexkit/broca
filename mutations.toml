@@ -11540,3 +11540,17 @@ old = '''            Some(&args.key),
             None,'''
 new = '''            Some(&args.key),
             Some(""), // NON-VACUITY BREAK: send the retired digest field again'''
+
+[[control]]
+id = "core-consent-filed-await-error-backoff"
+guards = "filed-card await retries back off from 50 ms to a one-second cap"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::filed_await_retryable_errors_have_bounded_rpc_rate"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "call.backoff = (delay * 2).min(1000);"
+new = "call.backoff = 50; // NON-VACUITY BREAK: retry every failed await at the initial delay"

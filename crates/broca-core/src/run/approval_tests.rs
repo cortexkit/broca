@@ -185,6 +185,9 @@ impl ElicitationPlane for Questions {
         if answer == "await_refusal" {
             return Err(crate::consent::refusal("route_closed", false));
         }
+        if answer == "await_retryable" {
+            return Err(crate::consent::refusal("route_busy", true));
+        }
         if matches!(answer, "none" | "feed_only") {
             return std::future::pending().await;
         }
@@ -758,6 +761,68 @@ async fn idle_held_wait_wakes_only_for_deadlines_or_cancellation() {
     assert!(observed_idle.get());
     assert_eq!(result.interruption, Some(BatchInterruption::CallerCancel));
     assert_eq!(rig.questions.outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn filed_await_retryable_errors_have_bounded_rpc_rate() {
+    let mut rig = Rig::new("pass", "await_retryable", false, false);
+    let origin = epoch_millis().unwrap();
+    std::fs::write(
+        rig.root.join("test-clock"),
+        json!({"now_ms":origin}).to_string(),
+    )
+    .unwrap();
+    let clock = crate::Clock::for_state_root(&rig.root).unwrap();
+    rig.control.clock = Some(clock.clone());
+    let cancel = CancellationToken::new();
+    rig.control.cancel = Some(cancel.clone());
+    let (entered, mut waiting) = mpsc::unbounded_channel();
+    let (release, resume) = mpsc::unbounded_channel();
+    rig.control.approval_wait_probe = Some(Arc::new(ApprovalWaitProbe {
+        entered,
+        release: tokio::sync::Mutex::new(resume),
+    }));
+    let observed = std::cell::Cell::new(false);
+    let driver = async {
+        let mut elapsed = 0;
+        loop {
+            let (polling, work) = waiting.recv().await.unwrap();
+            if !polling
+                && !work
+                && rig.questions.awaits.load(Ordering::SeqCst) > 0
+                && !cancel.is_cancelled()
+            {
+                if elapsed == 10_000 {
+                    let calls = rig.questions.awaits.load(Ordering::SeqCst);
+                    assert!(
+                        (8..=15).contains(&calls),
+                        "filed await made {calls} RPCs in ten seconds of retryable errors"
+                    );
+                    observed.set(true);
+                    cancel.cancel();
+                } else {
+                    elapsed += 50;
+                    std::fs::write(
+                        rig.root.join("test-clock"),
+                        json!({"now_ms":origin+elapsed}).to_string(),
+                    )
+                    .unwrap();
+                    clock.refresh().unwrap();
+                }
+            }
+            release.send(()).unwrap();
+        }
+    };
+    let result = tokio::select! {
+        result = rig.batch(&crate::AllowAll, vec![call("held")], None, false) => result,
+        () = driver => unreachable!(),
+    };
+    assert!(observed.get());
+    assert_eq!(result.interruption, Some(BatchInterruption::CallerCancel));
+    assert_eq!(rig.questions.keys.lock().unwrap().len(), 1);
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
     rig.finish().await;
 }

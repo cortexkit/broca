@@ -10382,7 +10382,7 @@ mod approval_gate {
                             let Slot::Held(call) = &mut slots[index] else { continue };
                             match result {
                                 Ok(reply) => {
-                                    call.id = Some(reply.id); call.filed = true;
+                                    call.id = Some(reply.id); call.filed = true; call.backoff = 50;
                                     marker(slots, ctx, writer, history).await?;
                                     if let Some(answer) = reply.answer { intake(slots, index, answer, ctx, writer, control, history).await?; }
                                 }
@@ -10399,8 +10399,8 @@ mod approval_gate {
                             if call.approved { continue; }
                             match result {
                                 Ok(Some(answer)) => { intake(slots, index, answer, ctx, writer, control, history).await?; }
-                                Ok(None) => { call.retry_at = now(control).saturating_add(50); }
-                                Err(error) if error.retryable => { call.retry_at = now(control).saturating_add(50); }
+                                Ok(None) => { retry_await(call, now(control)); }
+                                Err(error) if error.retryable => { retry_await(call, now(control)); }
                                 Err(error) => { let held = call.clone(); let result = refusal_decision(call, &error, writer, history).await?; slots[index] = Slot::Done(result); marker(slots, ctx, writer, history).await?;
                                     // Invalid answered readbacks release the visible card just like transport refusals.
                                     if let (Some(elicitation), Some(id)) = (control.elicitation_plane.as_ref(), held.id.clone()) { feedback.push(Box::pin(async move { let answer = release(elicitation.as_ref(), &held.ctx(ctx), &held, &id).await; Feedback::Released(held, answer) })); }
@@ -10496,6 +10496,14 @@ mod approval_gate {
             }
         }
     }
+    fn retry_await(call: &mut Held, timestamp: u64) {
+        // A provider can fail an await immediately. Repeated failures must not
+        // turn the long-held card route into a high-rate RPC polling loop.
+        let delay = call.backoff.clamp(50, 1000);
+        call.retry_at = timestamp.saturating_add(delay);
+        call.backoff = (delay * 2).min(1000);
+    }
+
     #[derive(Default)]
     struct AnswerPollSchedule {
         next: u64,
