@@ -579,13 +579,15 @@ async fn shutdown_rejects_new_admission() {
     let f = Fixture::for_admission();
     f.start().await;
     let handle = f.registry.actor_for(&f.key).await.unwrap();
+    let signal = f.registry.stopping_signal();
     let registry = f.registry.clone();
     let stopping = tokio::spawn(async move {
         registry
             .stop_and_seal_with_budget(Duration::from_millis(200), Duration::from_secs(2))
             .await
     });
-    tokio::task::yield_now().await;
+    // A scheduler yield does not prove the spawned task has requested stopping.
+    signal.cancelled().await;
     let (reply, rx) = oneshot::channel();
     handle
         .send(LineageCmd::Send {
@@ -1007,9 +1009,10 @@ async fn shutdown_allows_natural_completion_without_rewriting_reason() {
     let finish = Arc::new(tokio::sync::Notify::new());
     let f = Fixture::with_finish(true, Some(finish.clone()));
     f.start().await;
+    let signal = f.registry.stopping_signal();
     let registry = f.registry.clone();
     let stopping = tokio::spawn(async move { registry.stop_and_seal().await });
-    tokio::task::yield_now().await;
+    signal.cancelled().await;
     finish.notify_one();
     assert!(tokio::time::timeout(Duration::from_secs(1), stopping)
         .await
