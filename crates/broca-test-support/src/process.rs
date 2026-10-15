@@ -87,6 +87,12 @@ mod windows_processes {
         if let Some(block) = super::format_survivor_block(diagnostic.root_pid, &survivors) {
             let _ = writeln_stderr(&block);
         }
+        // A clean cleanup prints nothing. This writes past the test harness's output capture,
+        // so an unconditional line lands inside libtest's `test name ... ok` status line and
+        // breaks every tool that parses it (the mutation runner reported such rows as ERROR).
+        if survivors.is_empty() && errors.is_empty() {
+            return;
+        }
         let first_error = errors
             .first()
             .map(|error| format!(" first_error={error:?}"));
@@ -101,8 +107,10 @@ mod windows_processes {
         ));
     }
 
+    /// Skipping is routine (the child already exited, or never got a pid), so it stays inside
+    /// the harness's capture and only shows with a failing test's output.
     pub(super) fn report_skipped(reason: &str) {
-        let _ = writeln_stderr(&format!("test rig: process tree cleanup skipped: {reason}"));
+        eprintln!("test rig: process tree cleanup skipped: {reason}");
     }
 
     fn process_snapshot(errors: &mut Vec<String>) -> Vec<ProcessInfo> {
