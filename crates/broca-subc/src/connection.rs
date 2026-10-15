@@ -176,7 +176,7 @@ struct ConnToken(u64);
 
 #[derive(Debug)]
 pub(crate) enum ApprovedCallError {
-    NotSent,
+    NotSent { reason: &'static str },
     Connection(ConnError),
 }
 impl From<ConnError> for ApprovedCallError {
@@ -755,8 +755,8 @@ impl SubcConnection {
     ) -> Result<(), ApprovedCallError> {
         let permit = tokio::select! {
             biased;
-            _ = signals.cancelled() => return Err(ApprovedCallError::NotSent),
-            permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed".into()))?,
+            _ = signals.cancelled() => return Err(ApprovedCallError::NotSent { reason: "approved_dispatch_stopped_before_enqueue" }),
+            permit = runtime.write_tx.reserve() => permit.map_err(|_| ApprovedCallError::NotSent { reason: "writer task closed before enqueue" })?,
         };
         Self::push_approved(permit, frame, signals)
     }
@@ -769,7 +769,9 @@ impl SubcConnection {
         // Reserving capacity can race a signal. No await may separate this final
         // check from the push: entering the writer queue is the send boundary.
         if signals.interrupted() {
-            return Err(ApprovedCallError::NotSent);
+            return Err(ApprovedCallError::NotSent {
+                reason: "approved_dispatch_stopped_before_enqueue",
+            });
         }
         permit.send(frame);
         Ok(())
@@ -3086,6 +3088,10 @@ impl SubcConnection {
 
 #[cfg(test)]
 impl InProcessModuleEnd {
+    pub(crate) fn close_writer_for_test(&mut self) {
+        self.write_rx.close();
+    }
+
     pub(crate) fn pending_count_for_test(&self) -> usize {
         self.pending.lock().unwrap().len()
     }
@@ -5791,7 +5797,9 @@ mod approved_enqueue_tests {
                 Frame::build(FrameType::Request, data_flags(), 5, 3, 1, br#"{}"#.to_vec()).unwrap();
             assert!(matches!(
                 SubcConnection::push_approved(permit, frame, &signals),
-                Err(ApprovedCallError::NotSent)
+                Err(ApprovedCallError::NotSent {
+                    reason: "approved_dispatch_stopped_before_enqueue"
+                })
             ));
             assert!(rx.try_recv().is_err());
         }

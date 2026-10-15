@@ -11669,3 +11669,16 @@ old = '''            Some(&args.key),
             None,'''
 new = '''            Some(&args.key),
             Some(""), // NON-VACUITY BREAK: reintroduce the retired field on the real provider envelope'''
+
+[[control]]
+id = "subc-approved-closed-writer-is-not-sent"
+guards = "a closed writer queue reservation is typed not-sent before any approved frame is pushed"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_closed_writer_queue_is_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = '''permit = runtime.write_tx.reserve() => permit.map_err(|_| ApprovedCallError::NotSent { reason: "writer task closed before enqueue" })?,'''
+new = '''permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed".into()))?, // NON-VACUITY BREAK: misclassify a failed pre-send reservation as unknown'''

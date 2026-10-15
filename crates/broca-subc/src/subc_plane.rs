@@ -581,9 +581,11 @@ impl SubcToolPlane {
                 Err(crate::connection::ApprovedCallError::Connection(error)) => {
                     SendAttempt::Reply(Err(error))
                 }
-                Err(crate::connection::ApprovedCallError::NotSent) => SendAttempt::NotSent {
-                    reason: "approved_dispatch_stopped_before_enqueue".into(),
-                },
+                Err(crate::connection::ApprovedCallError::NotSent { reason }) => {
+                    SendAttempt::NotSent {
+                        reason: reason.into(),
+                    }
+                }
             }
         } else {
             SendAttempt::Reply(
@@ -5908,6 +5910,42 @@ mod approval_digest_contract_tests {
 mod approved_queue_contract_tests {
     use super::*;
     use futures::FutureExt;
+
+    #[tokio::test]
+    async fn approved_closed_writer_queue_is_not_sent() {
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        module.close_writer_for_test();
+        let plane = SubcToolPlane::new(conn, "aft");
+        let ctx = BatchCtx {
+            batch_id: broca_protocol::BatchId("closed-queue".into()),
+            bind: BindIdentity::new("/project", "test", "closed-queue"),
+            run_id: broca_protocol::RunId("run".into()),
+            scope: None,
+        };
+        plane.routes.lock().unwrap().insert(
+            SubcToolPlane::route_key(&ctx.bind, None, "aft"),
+            RouteState {
+                handle: route,
+                sem: Arc::new(Semaphore::new(1)),
+                stamp: None,
+            },
+        );
+        let call = ToolCall {
+            tool_call_id: broca_protocol::ToolCallId("approved".into()),
+            tool_name: "edit".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let result = plane
+            .dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &Default::default())
+            .await;
+        assert!(
+            matches!(result, DispatchResult::NotSent { ref reason } if reason == "writer task closed before enqueue"),
+            "a failed reservation never commits a send: {result:?}"
+        );
+        assert!(module.take_written_for_test().is_empty());
+        assert_eq!(module.pending_count_for_test(), 0);
+    }
 
     #[tokio::test]
     async fn approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
