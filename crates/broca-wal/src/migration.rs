@@ -64,24 +64,24 @@ pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::Wa
 /// directory itself, and a failure must propagate.
 #[cfg(unix)]
 pub fn sync_dir(path: &Path) -> io::Result<()> {
+    let directory = fs::File::open(path)?;
     #[cfg(any(test, feature = "test-io-trace"))]
-    io_trace::observe(io_trace::Event::DirectorySync(path.to_owned()))?;
-    fs::File::open(path)?.sync_all()
+    let directory =
+        io_trace::SyncFile::new(&directory, io_trace::Event::DirectorySync(path.to_owned()));
+    directory.sync_all()
 }
 
-/// NTFS needs no directory handle to make a rename or unlink durable, and `File::open` cannot
-/// open a directory there (it fails with "Access is denied"), so there is nothing to do. This is
-/// the same rule as the WAL fold's directory sync.
+/// Non-Unix builds currently perform no directory sync. `File::open` cannot open
+/// Windows directories this way; this helper makes no Windows directory-durability
+/// guarantee and emits no successful directory-sync observation there.
 #[cfg(not(unix))]
 pub fn sync_dir(_path: &Path) -> io::Result<()> {
-    #[cfg(any(test, feature = "test-io-trace"))]
-    io_trace::observe(io_trace::Event::DirectorySync(_path.to_owned()))?;
     Ok(())
 }
 
 fn sync_file(file: &fs::File) -> io::Result<()> {
     #[cfg(any(test, feature = "test-io-trace"))]
-    io_trace::observe(io_trace::Event::FileSync)?;
+    let file = io_trace::SyncFile::new(file, io_trace::Event::FileSync);
     file.sync_all()
 }
 
@@ -89,6 +89,7 @@ fn sync_file(file: &fs::File) -> io::Result<()> {
 /// state root. Existing directories may be remnants of an interrupted creation;
 /// their existence does not prove that their parent entries were synced.
 /// The state root must already exist. No directory above it is created or synced.
+/// Directory barriers are implemented only on Unix; see `sync_dir`.
 pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
     let root = state_root.canonicalize().map_err(|error| {
         io::Error::new(

@@ -9091,13 +9091,13 @@ old = 'check_installations(installations)?;'
 new = '// NON-VACUITY BREAK: install before validating every ref'
 
 [[control]]
-id = "move-floor-before-publish"
-guards = "foreign runs are excluded from billing before publishing or recovering the WAL"
+id = "move-imported-floor-local-billing"
+guards = "imported-run exclusions survive installation and recovery while pre-existing local runs remain billable"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/move_install/tests.rs"
-expect_red = ["move_install::tests::billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable"]
+expect_red = ["move_install::tests::imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recovery"]
 file = "crates/broca-module/src/move_install.rs"
 old = '.record_imported_runs(session, cut_id, &imported)'
 new = '.record_imported_runs(session, cut_id, &[]) /* NON-VACUITY BREAK: omit imported ids */'
@@ -13390,6 +13390,7 @@ new = '.record_imported_runs(item.session, cut_id, &imported) /* NON-VACUITY BRE
 
 [[control]]
 id = "agent-data-freeze-retry-barriers"
+platforms = ["linux", "macos"]
 guards = "a same-owner freeze retry re-syncs both the file and WAL directory before success"
 runner = "cargo"
 package = "broca-wal"
@@ -13406,6 +13407,7 @@ new = '''// NON-VACUITY BREAK: readable cached JSON is not a durability barrier
 
 [[control]]
 id = "agent-data-freeze-sync-before-publish"
+platforms = ["linux", "macos"]
 guards = "a freeze is not visible before its complete temp inode is synced"
 runner = "cargo"
 package = "broca-wal"
@@ -13436,6 +13438,7 @@ new = '''result.or_else(|error: io::Error| { // NON-VACUITY BREAK: unsupported p
 
 [[control]]
 id = "agent-data-unlink-missing-barrier"
+platforms = ["linux", "macos"]
 guards = "a missing moving or moved marker still owes its directory barrier on retry"
 runner = "cargo"
 package = "broca-wal"
@@ -13449,6 +13452,7 @@ new = 'Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // NON-VA
 
 [[control]]
 id = "agent-data-abort-missing-freeze-barrier"
+platforms = ["linux", "macos"]
 guards = "abort of an already absent owned freeze completes the outstanding WAL-directory barrier"
 runner = "cargo"
 package = "broca-wal"
@@ -13468,6 +13472,7 @@ new = '''} else {
 
 [[control]]
 id = "agent-data-release-missing-freeze-barrier"
+platforms = ["linux", "macos"]
 guards = "release retries finish the freeze removal barrier even after its marker vanished"
 runner = "cargo"
 package = "broca-wal"
@@ -13483,6 +13488,7 @@ new = '''if wal.with_extension("moving").exists() { unlink(&wal.with_extension("
 
 [[control]]
 id = "agent-data-missing-staging-parent-barrier"
+platforms = ["linux", "macos"]
 guards = "cleanup of an absent staging hierarchy syncs its nearest existing ancestor"
 runner = "cargo"
 package = "broca-wal"
@@ -13751,3 +13757,49 @@ expect_red = ["move_install::tests::already_renamed_activation_repays_the_stagin
 file = "crates/broca-module/src/move_install.rs"
 old = 'broca_wal::migration::sync_dir(staging_parent).map_err(unavailable)?;'
 new = 'let _ = staging_parent; // NON-VACUITY BREAK: acknowledge an unsynced rename source removal'
+
+[[control]]
+id = "agent-data-file-sync-helper-call"
+guards = "the file sync helper invokes sync_all rather than returning success without a syscall"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::successful_sync_events_require_the_actual_sync_call_to_succeed"]
+file = "crates/broca-wal/src/migration.rs"
+old = '''    file.sync_all()
+}'''
+new = '''    let _ = file; Ok(()) // NON-VACUITY BREAK: omit only the helper's sync_all invocation
+}'''
+
+[[control]]
+id = "agent-data-real-sync-syscall"
+guards = "sync observations cannot replace the actual filesystem sync syscall"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::successful_sync_events_require_the_actual_sync_call_to_succeed"]
+file = "crates/broca-wal/src/migration/io_trace.rs"
+old = 'self.inner.sync_all()?;'
+new = 'let _ = self.inner; // NON-VACUITY BREAK: keep the observer but remove the real syscall'
+
+[[control]]
+id = "agent-data-sync-trace-after-success"
+guards = "failed filesystem syncs never emit successful FileSync or DirectorySync events"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::successful_sync_events_require_the_actual_sync_call_to_succeed"]
+file = "crates/broca-wal/src/migration/io_trace.rs"
+old = '''        self.inner.sync_all()?;
+        observe(self.event.clone())'''
+new = '''        observe(self.event.clone())?; // NON-VACUITY BREAK: claim success before the syscall
+        self.inner.sync_all()'''

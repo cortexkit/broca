@@ -716,7 +716,7 @@ async fn import_reconciliation_syncs_staging_before_recording_imported() {
             let target = staged.clone();
             let parent = staged.parent().unwrap().to_owned();
             let _trace = io_trace::install(move |event| {
-                if event == Event::DirectorySync(parent.clone()) && target.exists() {
+                if event == Event::BeforeDirectorySync(parent.clone()) && target.exists() {
                     return Err(std::io::Error::other(
                         "injected after staging rename before directory barrier",
                     ));
@@ -741,7 +741,7 @@ async fn import_reconciliation_syncs_staging_before_recording_imported() {
     {
         let target = directory.clone();
         let _trace = io_trace::install(move |event| {
-            if event == Event::DirectorySync(target.clone()) {
+            if event == Event::BeforeDirectorySync(target.clone()) {
                 return Err(std::io::Error::other(
                     "injected import recovery directory barrier",
                 ));

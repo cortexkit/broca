@@ -123,7 +123,7 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
 }
 
 #[test]
-fn billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable() {
+fn imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recovery() {
     let root = root("floor");
     let wal = broca_core::FileWalStore::new(root.join("wal"));
     let session = BindIdentity::new("/p", "runner", "a");
@@ -397,7 +397,7 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
     {
         let target = source.clone();
         let _trace = io_trace::install(move |event| {
-            if event == Event::DirectorySync(target.clone()) {
+            if event == Event::BeforeDirectorySync(target.clone()) {
                 return Err(std::io::Error::other(
                     "injected rename source-directory barrier",
                 ));
@@ -416,7 +416,7 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
     {
         let target = source.clone();
         let _trace = io_trace::install(move |event| {
-            if event == Event::DirectorySync(target.clone()) {
+            if event == Event::BeforeDirectorySync(target.clone()) {
                 return Err(std::io::Error::other(
                     "injected recovery source-directory barrier",
                 ));

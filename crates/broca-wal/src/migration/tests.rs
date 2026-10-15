@@ -33,7 +33,10 @@ fn existing_directory_retry_pays_every_parent_barrier_within_state_root() {
         {
             let mut injected = false;
             let _trace = io_trace::install(move |event| {
-                if event == Event::DirectorySync(parent.clone()) && child.exists() && !injected {
+                if event == Event::BeforeDirectorySync(parent.clone())
+                    && child.exists()
+                    && !injected
+                {
                     injected = true;
                     return Err(io::Error::other(
                         "injected after directory creation before parent barrier",
@@ -92,6 +95,43 @@ fn directory_establishment_requires_an_existing_root_and_rejects_escape() {
         let error = durable_dir(&root, &link.join("escape")).unwrap_err();
         assert!(error.to_string().contains("outside state root"));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_sync_events_require_the_actual_sync_call_to_succeed() {
+    use super::io_trace::{self, Event};
+    use std::{cell::RefCell, rc::Rc};
+    let root = root("successful-sync-observation");
+    let file = fs::File::create(root.join("data")).unwrap();
+    let unsyncable = fs::File::open("/dev/null").unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let _trace = io_trace::install(move |event| {
+        if matches!(event, Event::FileSync | Event::DirectorySync(_)) {
+            observed.borrow_mut().push(event);
+        }
+        Ok(())
+    });
+    assert!(
+        sync_file(&unsyncable).is_err(),
+        "a character device cannot acknowledge a file barrier"
+    );
+    assert!(
+        events.borrow().is_empty(),
+        "a failed syscall must not emit FileSync"
+    );
+    assert!(sync_dir(Path::new("/dev/null")).is_err());
+    assert!(
+        events.borrow().is_empty(),
+        "a failed syscall must not emit DirectorySync"
+    );
+    sync_file(&file).unwrap();
+    sync_dir(&root).unwrap();
+    assert_eq!(
+        *events.borrow(),
+        vec![Event::FileSync, Event::DirectorySync(root)]
+    );
 }
 
 #[test]
@@ -316,6 +356,7 @@ fn real_process_kill_keeps_the_intent_and_tombstone_owned_after_restart() {
 }
 
 #[test]
+#[cfg(unix)]
 fn same_owner_freeze_retry_reestablishes_both_barriers() {
     use super::io_trace::{self, Event};
     use std::{
@@ -336,6 +377,13 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
     let observed = events.clone();
     let mut after_file = false;
     let _trace = io_trace::install(move |event| {
+        if matches!(event, Event::BeforeDirectorySync(_)) && after_file && fail.replace(false) {
+            after_file = false;
+            return Err(io::Error::other("injected freeze directory barrier"));
+        }
+        if matches!(event, Event::BeforeFileSync | Event::BeforeDirectorySync(_)) {
+            return Ok(());
+        }
         if event == Event::FileSync {
             after_file = true;
         } else if matches!(event, Event::DirectorySync(_)) {
@@ -345,9 +393,6 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
             after_file = false;
         }
         observed.borrow_mut().push(event.clone());
-        if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
-            return Err(io::Error::other("injected freeze directory barrier"));
-        }
         Ok(())
     });
     assert!(freeze(&root, &wal, &owner("a"))
@@ -359,7 +404,6 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
         *events.borrow(),
         vec![
             Event::FileSync,
-            Event::DirectorySync(directory.clone()),
             Event::FileSync,
             Event::DirectorySync(directory)
         ]
@@ -367,6 +411,7 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
 }
 
 #[test]
+#[cfg(unix)]
 fn freeze_publishes_only_a_complete_synced_sidecar() {
     use super::io_trace::{self, Event};
     use std::{cell::RefCell, rc::Rc};
@@ -396,6 +441,9 @@ fn freeze_publishes_only_a_complete_synced_sidecar() {
     let observed = events.clone();
     let target = moving.clone();
     let _trace = io_trace::install(move |event| {
+        if matches!(event, Event::BeforeFileSync | Event::BeforeDirectorySync(_)) {
+            return Ok(());
+        }
         if matches!(event, Event::DirectorySync(_)) && observed.borrow().is_empty() {
             return Ok(());
         }
@@ -446,6 +494,7 @@ fn unsupported_freeze_publication_fails_closed_without_a_rename_fallback() {
 }
 
 #[test]
+#[cfg(unix)]
 fn unlink_retry_syncs_directory_after_a_failed_removal_barrier() {
     use super::io_trace::{self, Event};
     use std::{
@@ -461,8 +510,10 @@ fn unlink_retry_syncs_directory_after_a_failed_removal_barrier() {
         let observed = events.clone();
         let fail = Cell::new(true);
         let _trace = io_trace::install(move |event| {
-            observed.borrow_mut().push(event.clone());
-            if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
+            if let Event::DirectorySync(_) = event {
+                observed.borrow_mut().push(event.clone());
+            }
+            if matches!(event, Event::BeforeDirectorySync(_)) && fail.replace(false) {
                 return Err(io::Error::other("injected removal barrier"));
             }
             Ok(())
@@ -473,17 +524,12 @@ fn unlink_retry_syncs_directory_after_a_failed_removal_barrier() {
             .contains("injected removal barrier"));
         assert!(!marker.exists());
         unlink(&marker).unwrap();
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                Event::DirectorySync(directory.clone()),
-                Event::DirectorySync(directory)
-            ]
-        );
+        assert_eq!(*events.borrow(), vec![Event::DirectorySync(directory)]);
     }
 }
 
 #[test]
+#[cfg(unix)]
 fn abort_retry_syncs_directory_when_its_freeze_is_already_absent() {
     use super::io_trace::{self, Event};
     use std::{
@@ -497,8 +543,10 @@ fn abort_retry_syncs_directory_when_its_freeze_is_already_absent() {
     let observed = events.clone();
     let fail = Cell::new(true);
     let _trace = io_trace::install(move |event| {
-        observed.borrow_mut().push(event.clone());
-        if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
+        if let Event::DirectorySync(_) = event {
+            observed.borrow_mut().push(event.clone());
+        }
+        if matches!(event, Event::BeforeDirectorySync(_)) && fail.replace(false) {
             return Err(io::Error::other("injected abort barrier"));
         }
         Ok(())
@@ -508,11 +556,12 @@ fn abort_retry_syncs_directory_when_its_freeze_is_already_absent() {
     abort_freeze(&wal, "a").unwrap();
     assert_eq!(
         *events.borrow(),
-        vec![Event::DirectorySync(wal.parent().unwrap().to_owned()); 2]
+        vec![Event::DirectorySync(wal.parent().unwrap().to_owned())]
     );
 }
 
 #[test]
+#[cfg(unix)]
 fn release_retry_syncs_directory_when_its_freeze_is_already_absent() {
     use super::io_trace::{self, Event};
     use std::{
@@ -527,8 +576,11 @@ fn release_retry_syncs_directory_when_its_freeze_is_already_absent() {
     let fail = Cell::new(true);
     let moving = wal.with_extension("moving");
     let _trace = io_trace::install(move |event| {
-        observed.borrow_mut().push(event.clone());
-        if matches!(event, Event::DirectorySync(_)) && !moving.exists() && fail.replace(false) {
+        if let Event::DirectorySync(_) = event {
+            observed.borrow_mut().push(event.clone());
+        }
+        if matches!(event, Event::BeforeDirectorySync(_)) && !moving.exists() && fail.replace(false)
+        {
             return Err(io::Error::other("injected release removal barrier"));
         }
         Ok(())
@@ -544,6 +596,7 @@ fn release_retry_syncs_directory_when_its_freeze_is_already_absent() {
 }
 
 #[test]
+#[cfg(unix)]
 fn absent_staging_parents_still_sync_the_nearest_existing_directory() {
     use super::io_trace::{self, Event};
     use std::{cell::RefCell, rc::Rc};
