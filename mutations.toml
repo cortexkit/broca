@@ -11525,3 +11525,18 @@ select = "expected"
 file = "crates/broca-core/src/run/approval_tests/memory_wal.rs"
 old = "frame[53..61].copy_from_slice(&identity.to_le_bytes());"
 new = "frame[53..61].copy_from_slice(&identity.wrapping_mul(0).to_le_bytes()); // NON-VACUITY BREAK: collide independent session keys"
+
+[[control]]
+id = "subc-consent-omits-approval-digest"
+guards = "approved consent execution omits the retired approval_digest wire key"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approval_digest_contract_tests::approved_connection_omits_approval_digest_and_preserves_saved_bytes"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''            Some(&args.key),
+            None,'''
+new = '''            Some(&args.key),
+            Some(""), // NON-VACUITY BREAK: send the retired digest field again'''

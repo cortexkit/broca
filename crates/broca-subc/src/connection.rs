@@ -5593,7 +5593,7 @@ mod approval_raw_tests {
                 Duration::from_secs(1),
                 Some("head"),
                 Some("lineage:7"),
-                Some("digest")
+                None
             ),
             async {
                 let request = module.next_request().await;
@@ -5605,7 +5605,7 @@ mod approval_raw_tests {
                 let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 assert_eq!(value["preset"], "head");
                 assert_eq!(value["call_key"], "lineage:7");
-                assert_eq!(value["approval_digest"], "digest");
+                assert!(value.get("approval_digest").is_none());
                 assert!(module.reply(&request, br#"{"content":[]}"#.to_vec()));
             }
         );
