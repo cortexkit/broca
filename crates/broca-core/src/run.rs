@@ -9062,6 +9062,13 @@ mod approval_gate {
         page: ApprovalPage,
         complete: bool,
     }
+    #[derive(Default)]
+    struct FeedProgress {
+        initialized: bool,
+        cursor: Option<crate::tool_plane::ApprovalCursor>,
+        records: Vec<serde_json::Value>,
+        seen: HashSet<(String, u8)>,
+    }
     type FeedDecisions = Vec<(
         String,
         Result<crate::consent::ConsentAnswer, ApprovalRouteError>,
@@ -9074,6 +9081,7 @@ mod approval_gate {
         pub frames: Vec<broca_wal::FramedRecord>,
         pub(super) projection: crate::replay::DeferredCallProjection,
         scans: HashMap<String, Arc<std::sync::Mutex<crate::consent::LookupProgress>>>,
+        live_scan: Arc<std::sync::Mutex<FeedProgress>>,
     }
     impl History {
         pub fn new(
@@ -9089,6 +9097,7 @@ mod approval_gate {
                 frames,
                 projection,
                 scans: HashMap::new(),
+                live_scan: Arc::new(std::sync::Mutex::new(FeedProgress::default())),
             })
         }
         fn scan(&mut self, key: &str) -> Arc<std::sync::Mutex<crate::consent::LookupProgress>> {
@@ -10278,8 +10287,16 @@ mod approval_gate {
                 if let Some(elicitation) = control.elicitation_plane.as_ref() {
                     let since = cursor.clone();
                     let snapshot = history.projection.clone();
+                    let progress = history.live_scan.clone();
                     polling = Some(Box::pin(async move {
-                        read_feed(elicitation.as_ref(), ctx, since, &snapshot).await
+                        read_feed(
+                            elicitation.as_ref(),
+                            ctx,
+                            since,
+                            &snapshot,
+                            progress.as_ref(),
+                        )
+                        .await
                     }));
                 }
             }
@@ -10364,6 +10381,7 @@ mod approval_gate {
                     polling = None; next_poll = now(control).saturating_add(50);
                     match page {
                         Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }
+                        Err(error) if error.code == "consent_feed_budget_exhausted" => { next_poll = 0; }
                         Err(_) => {}
                         Ok(polled) => {
                             let page = polled.page;
@@ -11217,35 +11235,122 @@ mod approval_gate {
     // Do not authorize an answer from a prefix: a later continuation can contain
     // a contradictory answer for the same key. The caller advances its cursor only
     // after this complete, binding-checked snapshot has been durably reduced.
+    #[cfg(test)]
+    pub(super) async fn scan_live_for_test(
+        plane: &dyn crate::tool_plane::ElicitationPlane,
+        ctx: &BatchCtx,
+        history: &mut History,
+    ) -> Result<bool, ApprovalRouteError> {
+        read_feed(
+            plane,
+            ctx,
+            None,
+            &history.projection,
+            history.live_scan.as_ref(),
+        )
+        .await
+        .map(|page| page.complete)
+    }
+    // Read owner-feed pages for at most one second or 32 pages per invocation.
+    // A prefix cannot authorize: only an empty page proves the snapshot complete.
+    // Keep its checked decisions and next cursor across budget retries, rather
+    // than discarding earlier answers or restarting a healthy long feed at zero.
     async fn read_feed(
         plane: &dyn crate::tool_plane::ElicitationPlane,
         ctx: &BatchCtx,
-        mut cursor: Option<crate::tool_plane::ApprovalCursor>,
+        cursor: Option<crate::tool_plane::ApprovalCursor>,
         projection: &crate::replay::DeferredCallProjection,
+        progress: &std::sync::Mutex<FeedProgress>,
     ) -> Result<PolledPage, ApprovalRouteError> {
-        let mut records = Vec::new();
-        loop {
-            let page =
-                tokio::time::timeout(Duration::from_secs(1), plane.answers(ctx, cursor.as_ref()))
-                    .await
-                    .map_err(|_| crate::consent::refusal("timeout", true))??;
+        {
+            let mut state = progress.lock().expect("live consent scan");
+            if !state.initialized {
+                state.cursor = cursor;
+                state.initialized = true;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        for _ in 0..32 {
+            let cursor = progress.lock().expect("live consent scan").cursor.clone();
+            let page = match tokio::time::timeout_at(deadline, plane.answers(ctx, cursor.as_ref()))
+                .await
+            {
+                Err(_) => {
+                    return Err(crate::consent::refusal(
+                        "consent_feed_budget_exhausted",
+                        true,
+                    ))
+                }
+                Ok(Err(error)) => {
+                    if error.code == "cursor_incarnation_changed" {
+                        *progress.lock().expect("live consent scan") = FeedProgress::default();
+                    }
+                    return Err(error);
+                }
+                Ok(Ok(page)) => page,
+            };
             let readable = read_answers(&page.records, projection).is_ok();
             let head = page.records.is_empty();
-            records.extend(page.records);
-            if !readable || head {
+            if !readable {
+                let mut records = progress.lock().expect("live consent scan").records.clone();
+                records.extend(page.records);
                 return Ok(PolledPage {
                     page: ApprovalPage {
                         records,
                         cursor: page.cursor,
                     },
-                    complete: readable && head,
+                    complete: false,
+                });
+            }
+            let mut state = progress.lock().expect("live consent scan");
+            for record in page.records {
+                let Some(key) = record
+                    .get("requester_ref")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(call) = projection.calls.get(key) else {
+                    continue;
+                };
+                if call.late_result.is_some()
+                    || call
+                        .decision
+                        .is_some_and(|kind| kind != DeferredDecision::Expired)
+                {
+                    continue;
+                }
+                if let Ok(Some(answer)) = crate::consent::answer(&record, key, &call.prepared) {
+                    let decision = match answer.decision {
+                        crate::consent::ConsentDecision::Approved => 0,
+                        crate::consent::ConsentDecision::Declined => 1,
+                        crate::consent::ConsentDecision::None => 2,
+                    };
+                    if state.seen.insert((key.into(), decision)) {
+                        state.records.push(record);
+                    }
+                }
+            }
+            if head {
+                let finished = std::mem::take(&mut *state);
+                return Ok(PolledPage {
+                    page: ApprovalPage {
+                        records: finished.records,
+                        cursor: page.cursor,
+                    },
+                    complete: true,
                 });
             }
             if cursor.as_ref() == Some(&page.cursor) {
                 return Err(crate::consent::refusal("consent_cursor_stalled", true));
             }
-            cursor = Some(page.cursor);
+            state.cursor = Some(page.cursor);
         }
+        tokio::task::yield_now().await;
+        Err(crate::consent::refusal(
+            "consent_feed_budget_exhausted",
+            true,
+        ))
     }
 }
 

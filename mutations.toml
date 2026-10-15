@@ -10909,3 +10909,54 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "if call.id.as_deref() != Some(answer.id.as_str()) {"
 new = "if false && call.id.as_deref() != Some(answer.id.as_str()) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-total-page-budget"
+guards = "one live feed pass has a total page bound even when every continuation is healthy"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::live_feed_traversal_has_total_budget_and_keeps_progress"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "for _ in 0..32 {"
+new = "for _ in 0..usize::MAX { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-total-time-budget"
+guards = "slow successful continuations share one traversal time budget instead of renewing it per page"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::live_feed_slow_pages_share_one_total_time_budget"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let deadline = tokio::time::Instant::now() + Duration::from_secs(1);"
+new = "let deadline = tokio::time::Instant::now() + Duration::from_secs(120); // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-live-feed-budget-keeps-progress"
+guards = "live feed budget exhaustion retains validated cursor and reduced decisions for the next pass"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::healthy_live_feed_continues_after_budget_without_restarting"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''tokio::task::yield_now().await;
+        Err(crate::consent::refusal(
+            "consent_feed_budget_exhausted",
+            true,
+        ))'''
+new = '''progress.lock().expect("live consent scan").cursor = None; // NON-VACUITY BREAK
+        tokio::task::yield_now().await;
+        Err(crate::consent::refusal(
+            "consent_feed_budget_exhausted",
+            true,
+        ))'''
