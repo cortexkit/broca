@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const EXCEPTIONS: &[(&str, &str, &str)] = &[
     ("crates/broca-core/src/compaction/tests.rs", "concurrent_clock_refresh_cannot_move_wait_cap_into_real_time", "Memory WAL and injected compaction clock; no disk barrier"),
     ("crates/broca-core/src/compaction/tests.rs", "clock_reaching_the_cap_mid_poll_takes_the_cap_exit_not_the_bound", "Memory WAL and injected compaction clock; no disk barrier"),
+    ("crates/broca-core/src/run/consent_runtime_tests.rs", "await_route_drops_within_one_second_on_cancel_stop_and_restart_pause", "Memory WAL rig (Rig::new); closing the await route within one second is the asserted property"),
     ("crates/broca-core/tests/it/cancel_watchdog.rs", "wait_finished", "Provider-task cleanup after cancellation, not a WAL transition"),
     ("crates/broca-core/tests/it/run_loop.rs", "check_held_attempt_durability", "CountingWalStore is in memory"),
     ("crates/broca-core/tests/it/run_loop.rs", "wait_sends", "CountingWalStore is in memory"),
@@ -219,8 +220,9 @@ fn short_polls(source: &str) -> Vec<(String, usize, u64)> {
             let Some(close) = closing_brace(&ts, body) else {
                 continue;
             };
+            // `tick` covers `tokio::time::interval` polling, which waits without calling sleep.
             let Some(sleep) =
-                (body + 1..close).find(|i| matches!(ts[*i].text, "sleep" | "yield_now"))
+                (body + 1..close).find(|i| matches!(ts[*i].text, "sleep" | "yield_now" | "tick"))
             else {
                 continue;
             };
@@ -242,7 +244,9 @@ fn short_polls(source: &str) -> Vec<(String, usize, u64)> {
                     && i > 0
                     && ts[i - 1].text == "let"
                     && ts[l..close].iter().any(|t| t.text == "deadline"))
-                    || (matches!(ts[i].text, "timeout" | "timeout_at") && l - i < 24)
+                    // 48 tokens leaves room for a short setup line, such as an interval, between
+                    // the timeout and its loop.
+                    || (matches!(ts[i].text, "timeout" | "timeout_at") && l - i < 48)
                 {
                     let stop = (i..l).find(|j| ts[*j].text == ";").unwrap_or(l);
                     duration(&ts[i..stop.min((i + 32).min(l))])
@@ -321,6 +325,9 @@ fn scanner_recognises_literal_counts_and_deadlines() {
     assert_eq!(short_polls("async fn poll() { for _ in 0..100 { probe(); sleep(Duration::from_millis(20)).await; } }")[0].2, 2000);
     assert_eq!(short_polls("async fn poll() { let deadline = Instant::now() + Duration::from_secs(4); loop { assert!(Instant::now() < deadline); probe(); sleep(Duration::from_millis(20)).await; } }")[0].2, 4000);
     assert_eq!(short_polls("async fn poll() { timeout(Duration::from_secs(3), async { loop { probe(); sleep(Duration::from_millis(5)).await; } }).await; }")[0].2, 3000);
+    // Interval polling waits through `tick`, not sleep (the shape of a consent crash test that
+    // escaped this guard and then failed on a busy runner).
+    assert_eq!(short_polls("async fn poll() { timeout(Duration::from_secs(2), async { let mut tick = interval(Duration::from_millis(5)); while !done() { tick.tick().await; } }).await; }")[0].2, 2000);
     assert!(short_polls(
         "async fn poll() { for _ in 0..3000 { sleep(Duration::from_millis(20)).await; } }"
     )

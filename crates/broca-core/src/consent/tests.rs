@@ -511,12 +511,20 @@ async fn process_kill_between_request_return_and_id_sync_recovers_without_second
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let reached = tokio::time::timeout(Duration::from_secs(2), async {
-        let mut tick = tokio::time::interval(Duration::from_millis(5));
-        while !root.join("request-returned").exists() {
-            tick.tick().await;
-        }
-    })
+    // An event wait, not a latency check: the child is a fresh copy of this test binary that
+    // must start, file a card with a real fsync and write its marker, which can take seconds on
+    // a busy runner. The shared guard is a hang bound; the result is asserted after the kill so
+    // the child is always reaped.
+    let reached = broca_test_support::event_timeout(
+        "the consent child to reach the request-return/id-sync gap",
+        async {
+            let mut tick = tokio::time::interval(Duration::from_millis(5));
+            while !root.join("request-returned").exists() {
+                tick.tick().await;
+            }
+        },
+        || format!("marker present: {}", root.join("request-returned").exists()),
+    )
     .await;
     child.kill().unwrap();
     let status = child.wait().unwrap();
