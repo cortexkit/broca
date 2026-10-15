@@ -13738,3 +13738,16 @@ expect_red = ["move_files::tests::import_reconciliation_syncs_staging_before_rec
 file = "crates/broca-module/src/move_files.rs"
 old = 'migration::durable_dir(&self.state_root, staged.parent().unwrap())'
 new = 'Ok::<(), std::io::Error>(()) /* NON-VACUITY BREAK: trust unsynced staging publication */'
+
+[[control]]
+id = "agent-data-activation-recovery-source-barrier"
+guards = "already-renamed activation recovery syncs the staging source directory before completion"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/move_install/tests.rs"
+expect_red = ["move_install::tests::already_renamed_activation_repays_the_staging_source_barrier"]
+file = "crates/broca-module/src/move_install.rs"
+old = 'broca_wal::migration::sync_dir(staging_parent).map_err(unavailable)?;'
+new = 'let _ = staging_parent; // NON-VACUITY BREAK: acknowledge an unsynced rename source removal'

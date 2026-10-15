@@ -362,3 +362,98 @@ fn mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_
         "a fresh receiver run must still bill"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn already_renamed_activation_repays_the_staging_source_barrier() {
+    use broca_wal::migration::{
+        self,
+        io_trace::{self, Event},
+    };
+    use std::{cell::Cell, rc::Rc};
+    let root = root("activation-source-barrier");
+    let session = BindIdentity::new("/p", "runner", "incoming");
+    let incoming = root.join("incoming.wal");
+    {
+        let mut writer = broca_wal::FileWal::open(&incoming).unwrap();
+        episode(&mut writer, &session, "foreign");
+    }
+    let bytes = std::fs::read(&incoming).unwrap();
+    let staged = root.join("wal-staging/cut/incoming.wal");
+    let live = root.join("wal/incoming.wal");
+    let digest = migration::digest(&bytes);
+    migration::stage(&root, &staged, &bytes, &digest).unwrap();
+    let specs = [Installation {
+        session: &session,
+        staged: &staged,
+        live: &live,
+        local_archive: None,
+        end_offset: bytes.len() as u64,
+        digest: &digest,
+    }];
+    let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+    let source = staged.parent().unwrap().to_owned();
+    let drops = Cell::new(0);
+    {
+        let target = source.clone();
+        let _trace = io_trace::install(move |event| {
+            if event == Event::DirectorySync(target.clone()) {
+                return Err(std::io::Error::other(
+                    "injected rename source-directory barrier",
+                ));
+            }
+            Ok(())
+        });
+        assert!(install_verified(&root, "cut", &specs, &export, |_| {
+            drops.set(drops.get() + 1);
+            Ok(())
+        })
+        .is_err());
+    }
+    assert!(!staged.exists());
+    assert_eq!(std::fs::read(&live).unwrap(), bytes);
+    assert_eq!(drops.get(), 0);
+    {
+        let target = source.clone();
+        let _trace = io_trace::install(move |event| {
+            if event == Event::DirectorySync(target.clone()) {
+                return Err(std::io::Error::other(
+                    "injected recovery source-directory barrier",
+                ));
+            }
+            Ok(())
+        });
+        let error = install_verified(&root, "cut", &specs, &export, |_| {
+            drops.set(drops.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("injected recovery source-directory barrier"));
+    }
+    assert_eq!(
+        drops.get(),
+        0,
+        "projection cleanup must follow the source-directory barrier"
+    );
+    let synced = Rc::new(Cell::new(false));
+    let observed = synced.clone();
+    let _trace = io_trace::install(move |event| {
+        if event == Event::DirectorySync(source.clone()) {
+            observed.set(true);
+        }
+        Ok(())
+    });
+    install_verified(&root, "cut", &specs, &export, |_| {
+        assert!(
+            synced.get(),
+            "recovery must finish staging removal before projection cleanup"
+        );
+        drops.set(drops.get() + 1);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(std::fs::read(&live).unwrap(), bytes);
+}

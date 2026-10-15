@@ -154,6 +154,13 @@ pub fn install_verified(
             export
                 .record_imported_runs(item.session, cut_id, &[])
                 .map_err(unavailable)?;
+            // The rename can be visible while its source-directory sync is
+            // still owed. Missing staging is not evidence of durable removal.
+            let staging_parent = item
+                .staged
+                .parent()
+                .ok_or_else(|| unavailable("staged WAL has no directory"))?;
+            broca_wal::migration::sync_dir(staging_parent).map_err(unavailable)?;
         }
         broca_wal::migration::unlink(&item.live.with_extension("moved")).map_err(unavailable)?;
         drop_projection(item.session).map_err(unavailable)?;
