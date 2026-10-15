@@ -9135,6 +9135,26 @@ mod approval_gate {
         fn scan(&mut self, key: &str) -> Arc<std::sync::Mutex<crate::consent::LookupProgress>> {
             self.scans.entry(key.into()).or_default().clone()
         }
+        fn completed_feed_candidate(
+            &mut self,
+            key: &str,
+            answer: crate::consent::ConsentAnswer,
+        ) -> Result<crate::consent::ConsentAnswer, ApprovalRouteError> {
+            let prepared = self
+                .projection
+                .calls
+                .get(key)
+                .expect("feed candidate has a prepared call")
+                .prepared
+                .clone();
+            // read_feed has checked every continuation and binding. Share that
+            // completed snapshot with the common authorization gate, not another RPC scan.
+            self.scan(key)
+                .lock()
+                .expect("consent authorization progress")
+                .confirm_snapshot(key, &prepared, &answer)?;
+            Ok(answer)
+        }
         pub(super) fn require_installed_plane(&self, control: &RunControl) -> Result<(), RunError> {
             let held = self.projection.calls.values().any(|call| {
                 matches!(
@@ -9291,7 +9311,24 @@ mod approval_gate {
         writer: &WalHandle,
         history: &mut History,
     ) -> Result<Option<CallResolution>, RunError> {
-        decision_reason(call, decision, digest, None, writer, history).await
+        decision_reason(call, decision, digest, None, None, writer, history).await
+    }
+    async fn approved_decision(
+        call: &Held,
+        authorization: &crate::consent::AuthorizedAnswer,
+        writer: &WalHandle,
+        history: &mut History,
+    ) -> Result<Option<CallResolution>, RunError> {
+        decision_reason(
+            call,
+            DeferredDecision::Approved,
+            None,
+            None,
+            Some(authorization),
+            writer,
+            history,
+        )
+        .await
     }
     async fn refusal_decision(
         call: &Held,
@@ -9304,6 +9341,7 @@ mod approval_gate {
             DeferredDecision::Unavailable,
             None,
             Some(&error.code),
+            None,
             writer,
             history,
         )
@@ -9315,9 +9353,20 @@ mod approval_gate {
         decision: DeferredDecision,
         digest: Option<String>,
         code: Option<&str>,
+        authorization: Option<&crate::consent::AuthorizedAnswer>,
         writer: &WalHandle,
         history: &mut History,
     ) -> Result<Option<CallResolution>, RunError> {
+        if decision == DeferredDecision::Approved
+            && !authorization.is_some_and(|proof| {
+                proof.value().decision == crate::consent::ConsentDecision::Approved
+                    && call.id.as_deref() == Some(proof.value().id.as_str())
+            })
+        {
+            return Err(RunError::Wal(
+                "approval_record_requires_authorization: candidate was not reconciled".into(),
+            ));
+        }
         let reason = match decision {
             DeferredDecision::Approved => None,
             DeferredDecision::Declined => Some("pre_tool_declined"),
@@ -10457,7 +10506,7 @@ mod approval_gate {
                             let Ok(answers)=read_answers(&page.records, &history.projection) else {continue};
                             if !polled.complete { continue; }
                             for (key,answer) in answers {
-                                let answer = match answer {
+                                let answer = match answer.and_then(|answer| history.completed_feed_candidate(&key, answer)) {
                                     Ok(answer) => answer,
                                     Err(error) => {
                                         if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && !call.approved)) {
@@ -10480,7 +10529,7 @@ mod approval_gate {
                                         call.filed = false; call.retry_at = 0;
                                         adoptions.insert(index, answer);
                                     } else { intake(slots, index, answer, ctx, writer, control, history).await?; }
-                                } else { late_answer(history, writer, &key, answer).await?; }
+                                } else { late_answer(history, writer, ctx, control, &key, answer).await?; }
                             }
                             // Intake, including the marker updates, is durable before advancing.
                             writer.sync().await?;
@@ -10653,9 +10702,8 @@ mod approval_gate {
         }
         if answer.decision == crate::consent::ConsentDecision::Approved {
             if expired {
-                // LateResult prevents any later tool send. Sync it before the
-                // approving readback so a crash between the records never leaves
-                // that approval eligible for late dispatch.
+                // Fence non-execution before checking an approving detach readback.
+                // A failed or interrupted authorization must not leave late work runnable.
                 history.record(
                     writer,
                     WalRecord::LateResult {
@@ -10665,22 +10713,25 @@ mod approval_gate {
                     },
                 );
                 writer.sync().await?;
-                if history.projection.calls[&held.key].late_approval.is_none() {
-                    let WalRecord::ToolCallDeferred { ask, .. } = &*held.prepared else {
-                        unreachable!()
-                    };
-                    history.record(
-                        writer,
-                        WalRecord::LateApprovalRecorded {
-                            call_key: held.key.clone(),
-                            elicitation_id: answer.id.clone(),
-                            decision: LateDecision::Approved,
-                            approval_digest: None,
-                            late_execution: Some(ask.late_execution),
-                        },
-                    );
-                    writer.sync().await?;
-                }
+            }
+            let authorization =
+                match authorize_answer(&held, answer.clone(), ctx, control, history).await {
+                    Ok(authorization) => authorization,
+                    Err(error) if error.retryable => return Ok(()),
+                    Err(error) => return late_refusal(history, writer, &held.key, &error).await,
+                };
+            if expired && history.projection.calls[&held.key].late_approval.is_none() {
+                let WalRecord::ToolCallDeferred { ask, .. } = &*held.prepared else {
+                    unreachable!()
+                };
+                record_late_answer(
+                    history,
+                    writer,
+                    &held.key,
+                    authorization,
+                    ask.late_execution,
+                )
+                .await?;
             }
             if let Some(plane) = &control.elicitation_plane {
                 crate::consent::report(
@@ -10693,7 +10744,7 @@ mod approval_gate {
                 .await;
             }
         } else if expired {
-            late_answer(history, writer, &held.key, answer).await?;
+            late_answer(history, writer, ctx, control, &held.key, answer).await?;
         }
         Ok(())
     }
@@ -10707,6 +10758,27 @@ mod approval_gate {
             crate::consent::report(plane.as_ref(), ctx, id, value, None).await;
         }
     }
+    async fn authorize_answer(
+        held: &Held,
+        candidate: crate::consent::ConsentAnswer,
+        ctx: &BatchCtx,
+        control: &RunControl,
+        history: &mut History,
+    ) -> Result<crate::consent::AuthorizedAnswer, ApprovalRouteError> {
+        let plane = control
+            .elicitation_plane
+            .as_ref()
+            .ok_or_else(|| crate::consent::refusal("elicitation_unavailable", false))?;
+        let scan = history.scan(&held.key);
+        let ctx = held.ctx(ctx);
+        tokio::select! {
+            biased;
+            _ = cancelled_token(control.cancel.as_ref()) => Err(crate::consent::refusal("cancelled", true)),
+            _ = cancelled_token(control.stop_requested.as_ref()) => Err(crate::consent::refusal("stopped", true)),
+            result = tokio::time::timeout(Duration::from_secs(1), crate::consent::authorize_candidate(plane.as_ref(), &ctx, &held.key, &held.prepared, held.id.as_deref(), candidate, scan.as_ref())) => result.unwrap_or_else(|_| Err(crate::consent::refusal("consent_authorization_timeout", true))),
+        }
+    }
+
     async fn intake(
         slots: &mut [Slot],
         index: usize,
@@ -10716,12 +10788,37 @@ mod approval_gate {
         control: &RunControl,
         history: &mut History,
     ) -> Result<(), RunError> {
-        let Slot::Held(call) = &mut slots[index] else {
+        let Slot::Held(held) = &slots[index] else {
             return Ok(());
         };
-        if call.approved {
+        if held.approved {
             return Ok(());
         }
+        let held = held.clone();
+        let authorization = match authorize_answer(&held, answer, ctx, control, history).await {
+            Ok(authorization) => authorization,
+            Err(error) if error.retryable => {
+                if let Slot::Held(call) = &mut slots[index] {
+                    retry_await(call, now(control));
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let result = refusal_decision(&held, &error, writer, history).await?;
+                slots[index] = Slot::Done(result);
+                marker(slots, ctx, writer, history).await?;
+                if let (Some(plane), Some(id)) =
+                    (control.elicitation_plane.as_ref(), held.id.as_deref())
+                {
+                    release(plane.as_ref(), &held.ctx(ctx), &held, id).await;
+                }
+                return Ok(());
+            }
+        };
+        let answer = authorization.value().clone();
+        let Slot::Held(call) = &mut slots[index] else {
+            unreachable!()
+        };
         call.id = Some(answer.id.clone());
         if now(control) >= call.expires()
             || answer.decision == crate::consent::ConsentDecision::None
@@ -10731,15 +10828,15 @@ mod approval_gate {
                 .await?
                 .expect("expiry closes");
             slots[index] = Slot::Done(result);
-            late_answer(history, writer, &key, answer).await?;
+            late_answer(history, writer, ctx, control, &key, answer).await?;
         } else {
             let approved = answer.decision == crate::consent::ConsentDecision::Approved;
-            let kind = if approved {
-                DeferredDecision::Approved
+            let result = if approved {
+                approved_decision(call, &authorization, writer, history).await?
             } else {
-                DeferredDecision::Declined
+                decision(call, DeferredDecision::Declined, None, writer, history).await?
             };
-            if let Some(result) = decision(call, kind, None, writer, history).await? {
+            if let Some(result) = result {
                 slots[index] = Slot::Done(result);
             } else {
                 call.approved = true;
@@ -10787,6 +10884,8 @@ mod approval_gate {
     async fn late_answer(
         history: &mut History,
         writer: &WalHandle,
+        ctx: &BatchCtx,
+        control: &RunControl,
         key: &str,
         answer: crate::consent::ConsentAnswer,
     ) -> Result<(), RunError> {
@@ -10804,11 +10903,36 @@ mod approval_gate {
             unreachable!()
         };
         let late_execution = ask.late_execution;
+        let held = Held {
+            key: key.into(),
+            prepared: call.prepared.clone(),
+            id: call.elicitation_id.clone(),
+            approved: false,
+            filed: false,
+            retry_at: 0,
+            backoff: 50,
+        };
+        let authorized_late = match authorize_answer(&held, answer, ctx, control, history).await {
+            Ok(authorization) => authorization,
+            Err(error) if error.retryable => return Ok(()),
+            Err(error) => return late_refusal(history, writer, key, &error).await,
+        };
+        record_late_answer(history, writer, key, authorized_late, late_execution).await
+    }
+
+    async fn record_late_answer(
+        history: &mut History,
+        writer: &WalHandle,
+        key: &str,
+        authorization: crate::consent::AuthorizedAnswer,
+        late_execution: LateExecution,
+    ) -> Result<(), RunError> {
+        let answer = authorization.value();
         history.record(
             writer,
             WalRecord::LateApprovalRecorded {
                 call_key: key.into(),
-                elicitation_id: answer.id,
+                elicitation_id: answer.id.clone(),
                 decision: match answer.decision {
                     crate::consent::ConsentDecision::Approved => LateDecision::Approved,
                     crate::consent::ConsentDecision::Declined => LateDecision::Declined,
@@ -11059,7 +11183,7 @@ mod approval_gate {
             }
             match page {
                 Ok(Ok(Some(answer))) => {
-                    late_answer(history, writer, &key, answer).await?;
+                    late_answer(history, writer, &ctx, control, &key, answer).await?;
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) if error.code == "consent_conflicting_decisions" => {
@@ -11079,7 +11203,7 @@ mod approval_gate {
                     crate::consent::answer(&question.record, &key, &held.prepared)
                 {
                     if answer.id == id {
-                        late_answer(history, writer, &key, answer).await?;
+                        late_answer(history, writer, &ctx, control, &key, answer).await?;
                     }
                 }
             }

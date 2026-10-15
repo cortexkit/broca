@@ -952,3 +952,31 @@ async fn duplicate_withdrawal_retry_and_terminal_readback_table() {
         assert_eq!(plane.gets.load(Ordering::SeqCst), gets, "{name}");
     }
 }
+
+#[test]
+fn completed_candidate_keeps_authorization_progress_across_admission_retry() {
+    let candidate = ConsentAnswer {
+        id: "new".into(),
+        decision: ConsentDecision::Approved,
+    };
+    let mut progress = LookupProgress::default();
+    progress
+        .seed_candidate("key", &prepared(), &candidate)
+        .unwrap();
+    progress.complete = true;
+    progress.refresh_completed();
+    assert_eq!(
+        progress.expected(),
+        Some(candidate),
+        "a completed settlement scan can still owe duplicate-closure proof"
+    );
+    let mut empty_head = LookupProgress {
+        complete: true,
+        ..Default::default()
+    };
+    empty_head.refresh_completed();
+    assert!(
+        !empty_head.complete,
+        "an empty head must refresh to discover later answers"
+    );
+}

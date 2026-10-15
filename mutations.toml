@@ -10808,9 +10808,9 @@ expect_red = ["consent::tests::settled_lookup_precedes_refile_and_recovers_witho
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
-        durable(id_record(ctx, key, prepared, &answer.id)).await?;'''
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, answer, progress)'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
-        durable(id_record(ctx, key, prepared, &answer.id)).await?;'''
+        let answer = authorize_candidate(plane, ctx, key, prepared, None, answer, progress)'''
 
 [[control]]
 id = "core-consent-second-lookup-adopts"
@@ -10823,9 +10823,9 @@ expect_red = ["consent::tests::second_lookup_adopts_settlement_and_withdraws_dup
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
-        if answer.id != id {'''
+        let answer = authorize_candidate(plane, ctx, key, prepared, Some(id), answer, progress)'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
-        if answer.id != id {'''
+        let answer = authorize_candidate(plane, ctx, key, prepared, Some(id), answer, progress)'''
 
 [[control]]
 id = "core-consent-conflicting-decisions-refuse"
@@ -11594,3 +11594,63 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "let scan = history.scan(&key);"
 new = "let scan = Arc::new(std::sync::Mutex::new(crate::consent::LookupProgress::default())); // NON-VACUITY BREAK: restart late traversal every admission"
+
+[[control]]
+id = "core-consent-late-get-conflict-authorization"
+guards = "an approving late get is checked against every owner-feed settlement before authorization"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::late_approving_get_rechecks_opposing_settlement_before_authorization"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "let answer = verify_readback(plane, ctx, key, prepared, candidate, progress).await?;"
+new = "let answer = candidate; // NON-VACUITY BREAK: authorize a late get without its settlement snapshot"
+
+[[control]]
+id = "core-consent-expired-adoption-proves-duplicate"
+guards = "expired feed intake cannot replace its recorded card without proven duplicate closure"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::live_expired_older_approval_proves_recorded_duplicate_before_adoption"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if !proven {"
+new = "if false && !proven { // NON-VACUITY BREAK: adopt the late card without closing its recorded duplicate"
+
+[[control]]
+id = "core-consent-late-record-requires-shared-authorization"
+guards = "late approval writers accept only the capability produced by the shared authorize_candidate gate"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::late_approving_get_rechecks_opposing_settlement_before_authorization"]
+select = "expected"
+[[control.edits]]
+file = "crates/broca-core/src/consent.rs"
+old = "pub(crate) struct AuthorizedAnswer(ConsentAnswer);"
+new = "pub(crate) struct AuthorizedAnswer(pub(crate) ConsentAnswer); // NON-VACUITY BREAK: make an unchecked capability constructible"
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = "let authorized_late = match authorize_answer(&held, answer, ctx, control, history).await {"
+new = "let authorized_late = match Ok::<_, ApprovalRouteError>(crate::consent::AuthorizedAnswer(answer)) { // NON-VACUITY BREAK: bypass authorize_candidate on the late path"
+
+[[control]]
+id = "core-consent-retain-candidate-after-settlement-scan"
+guards = "late admission retains a candidate whose settlement scan completed but duplicate closure may still be pending"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::completed_candidate_keeps_authorization_progress_across_admission_retry"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if self.complete && self.expected.is_none() {"
+new = "if self.complete { // NON-VACUITY BREAK: discard an authorization candidate before duplicate closure"
