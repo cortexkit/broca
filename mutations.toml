@@ -8764,7 +8764,7 @@ test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::freeze_is_exclusive_and_abort_never_removes_another_cuts_owner"]
 file = "crates/broca-wal/src/migration.rs"
 old = 'fs::hard_link(temp, destination)'
-new = 'fs::rename(temp, destination) // NON-VACUITY BREAK: replace a late freeze owner'
+new = 'fs::rename(temp, destination) /* NON-VACUITY BREAK: replace a late freeze owner */'
 
 [[control]]
 id = "move-abort-owner"
