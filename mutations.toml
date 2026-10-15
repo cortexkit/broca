@@ -10960,3 +10960,17 @@ new = '''progress.lock().expect("live consent scan").cursor = None; // NON-VACUI
             "consent_feed_budget_exhausted",
             true,
         ))'''
+
+[[control]]
+id = "core-consent-ordinary-approved-intent-cancel-keeps-signal"
+guards = "ordinary approved cancellation during intent durability is checked after sync and forwarded to resolution"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::ordinary_approved_cancel_during_intent_sync_is_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let before_send_cancel = control.cancel.as_ref();"
+new = "let before_send_cancel = None::<&CancellationToken>; // NON-VACUITY BREAK"

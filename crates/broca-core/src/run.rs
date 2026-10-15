@@ -6470,7 +6470,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 
         let mut resolutions: Vec<CallResolution> = Vec::with_capacity(plan.len());
         for p in plan {
-            resolutions.push(resolve(p, &ctx, tool_plane, stop).await);
+            resolutions.push(resolve(p, &ctx, tool_plane, None, stop).await);
         }
         debug_assert!(
             !resolutions.iter().any(|r| r.ambiguous),
@@ -6540,8 +6540,17 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             continue;
                         }
                     }
-                    let r = resolve_hooked(p, source_index, step_id, &ctx, tool_plane, stop, hooks)
-                        .await;
+                    let r = resolve_hooked(
+                        p,
+                        source_index,
+                        step_id,
+                        &ctx,
+                        tool_plane,
+                        None,
+                        stop,
+                        hooks,
+                    )
+                    .await;
                     if r.ambiguous {
                         tripped = true;
                     }
@@ -6554,7 +6563,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 // but the concurrently-launched calls all finish — that's the source-order
                 // result set.
                 join_all(plan.into_iter().enumerate().map(|(index, p)| {
-                    resolve_hooked(p, index, step_id, &ctx, tool_plane, stop, hooks)
+                    resolve_hooked(p, index, step_id, &ctx, tool_plane, None, stop, hooks)
                 }))
                 .await
             };
@@ -6747,6 +6756,7 @@ async fn resolve<T: ToolPlane>(
     plan: CallPlan,
     ctx: &BatchCtx,
     tool_plane: &T,
+    cancel: Option<&CancellationToken>,
     stop: Option<&CancellationToken>,
 ) -> CallResolution {
     match plan {
@@ -6754,6 +6764,11 @@ async fn resolve<T: ToolPlane>(
         // A stop requested after this call's intent was written, but before the call was sent:
         // it is not sent. Calls of the batch already sent are left to finish.
         CallPlan::Dispatch(call) if stop_is_requested(stop) => {
+            stopped_resolution(&call.tool_call_id)
+        }
+        CallPlan::Dispatch(call)
+            if call.approved.is_some() && cancel.is_some_and(CancellationToken::is_cancelled) =>
+        {
             stopped_resolution(&call.tool_call_id)
         }
         // RESUME: the call's terminal is already durable — include the
@@ -10116,6 +10131,7 @@ mod approval_gate {
                                     step,
                                     ctx,
                                     plane,
+                                    control.cancel.as_ref(),
                                     control.stop_requested.as_ref(),
                                     hooks,
                                 )
@@ -10364,13 +10380,16 @@ mod approval_gate {
                                     args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;
+                                let before_send_cancel = control.cancel.as_ref();
+                                let stopped_after_intent = before_send_cancel.is_some_and(CancellationToken::is_cancelled) || stop_is_requested(control.stop_requested.as_ref());
                                 let bytes = args_jcs.clone();
                                 slots[index] = Slot::Running; active.insert(index); dispatched.insert(index);
                                 let mut dispatch = PlannedDispatch::from(call);
                                 dispatch.call_key = Some(held.key.clone());
                                 dispatch.approved = Some((bytes, String::new()));
+                                let plan = if stopped_after_intent { CallPlan::Stopped(dispatch.tool_call_id.clone()) } else { CallPlan::Dispatch(dispatch) };
                                 jobs.push(Box::pin(async move {
-                                    let resolution = resolve_hooked(CallPlan::Dispatch(dispatch), index, step, &held.ctx(ctx), plane, control.stop_requested.as_ref(), hooks).await;
+                                    let resolution = resolve_hooked(plan, index, step, &held.ctx(ctx), plane, before_send_cancel, control.stop_requested.as_ref(), hooks).await;
                                     (index, Work::Dispatched(resolution))
                                 }));
                             }

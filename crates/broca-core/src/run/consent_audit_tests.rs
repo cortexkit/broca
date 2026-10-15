@@ -949,6 +949,7 @@ struct IntentSyncWal {
     inner: Box<dyn broca_wal::Wal + Send>,
     armed: std::sync::atomic::AtomicBool,
     gate: Arc<IntentSyncGate>,
+    ordinary: bool,
 }
 #[cfg(feature = "test-clock")]
 impl broca_wal::Wal for IntentSyncWal {
@@ -958,7 +959,15 @@ impl broca_wal::Wal for IntentSyncWal {
         record: &WalRecord,
         sync: bool,
     ) -> Result<u64, broca_wal::WalError> {
-        let intent = matches!(record, WalRecord::LateDispatchIntent { .. });
+        let intent = matches!(record, WalRecord::LateDispatchIntent { .. })
+            || (self.ordinary
+                && matches!(
+                    record,
+                    WalRecord::ToolDispatchIntent {
+                        call_key: Some(_),
+                        ..
+                    }
+                ));
         let seq = self.inner.append(fence, record, sync && !intent)?;
         if intent {
             self.gate.seq.store(seq, Ordering::SeqCst);
@@ -1025,6 +1034,7 @@ async fn late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent() {
                 inner: rig.tools.store.open(&rig.bind).unwrap(),
                 armed: std::sync::atomic::AtomicBool::new(false),
                 gate: gate.clone(),
+                ordinary: false,
             }),
             1,
         )
@@ -1317,4 +1327,72 @@ async fn live_wait_clears_stale_nonzero_cursor_before_reread() {
 #[tokio::test]
 async fn live_wait_unreadable_page_retries_before_cursor_advance() {
     live_cursor_probe(true).await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn ordinary_approved_cancel_during_intent_sync_is_not_sent() {
+    let mut rig = Rig::new("pass", "approve", false, false);
+    rig.writer.shutdown().await.unwrap();
+    let gate = Arc::new(IntentSyncGate {
+        entered: tokio::sync::Notify::new(),
+        released: Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+        seq: std::sync::atomic::AtomicU64::new(0),
+    });
+    rig.writer = WalHandle::spawn(
+        Box::new(IntentSyncWal {
+            inner: rig.tools.store.open(&rig.bind).unwrap(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            gate: gate.clone(),
+            ordinary: true,
+        }),
+        1,
+    )
+    .unwrap();
+    rig.control.elicitation_plane = None;
+    Arc::get_mut(&mut rig.questions).unwrap().head = rig.writer.durable_head();
+    rig.control.elicitation_plane = Some(rig.questions.clone());
+    let cancel = CancellationToken::new();
+    rig.control.cancel = Some(cancel.clone());
+    let batch = rig.batch(&crate::AllowAll, vec![call("c")], None, false);
+    let interrupt = async {
+        gate.entered.notified().await;
+        assert!(rig.writer.durable_head().load(Ordering::SeqCst) < gate.seq.load(Ordering::SeqCst));
+        cancel.cancel();
+        gate.release();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(batch, interrupt)
+    })
+    .await;
+    gate.release();
+    let (_result, ()) = result.expect("ordinary intent gate must release");
+    assert_eq!(
+        rig.tools.provider_requests.load(Ordering::SeqCst),
+        0,
+        "cancel during ordinary approved intent sync cannot send"
+    );
+    assert!(rig.frames().iter().any(|f| matches!(
+        f.record,
+        WalRecord::ToolDispatchIntent {
+            call_key: Some(_),
+            ..
+        }
+    )));
+    assert!(
+        rig.frames().iter().any(|f| matches!(
+            f.record,
+            WalRecord::ToolResult {
+                outcome: DispatchOutcome::Interrupted,
+                ..
+            }
+        )),
+        "the ordinary result must record known non-execution, not Unknown or provider completion"
+    );
+    assert_eq!(
+        rig.questions.reports.lock().unwrap()[0].1,
+        ApprovalExecution::ApprovedNotExecuted
+    );
+    rig.finish().await;
 }

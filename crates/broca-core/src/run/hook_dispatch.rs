@@ -125,6 +125,7 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
     step_id: StepId,
     ctx: &BatchCtx,
     tool_plane: &T,
+    cancel: Option<&CancellationToken>,
     stop: Option<&CancellationToken>,
     hooks: Option<&crate::hooks::HookRuntime<'_>>,
 ) -> CallResolution {
@@ -132,7 +133,7 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
         CallPlan::Dispatch(call) => (call.tool_name.clone(), call.call_key.clone()),
         _ => (String::new(), None),
     };
-    let mut resolution = resolve(plan, ctx, tool_plane, stop).await;
+    let mut resolution = resolve(plan, ctx, tool_plane, cancel, stop).await;
     // Eligibility is decided BEFORE capping, so even an oversized Json remains hookless.
     let subscribed = resolution.plane_subject
         && !matches!(resolution.result.output, ToolOutput::Json { .. })
