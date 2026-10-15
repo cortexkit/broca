@@ -13326,3 +13326,17 @@ only = false
 file = "crates/broca-module/src/cut_state.rs"
 old = 'state.refs = None;'
 new = '// NON-VACUITY BREAK: retain the refused first request as a hidden ref-set latch'
+
+[[control]]
+id = "agent-data-address-reader-function-item"
+guards = "the move-read bypass identifier cannot escape via function items or aliases outside the participant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data_source"
+test_file = "crates/broca-module-serve/tests/agent_data_source.rs"
+expect_red = ["only_agent_data_can_call_the_move_address_reader"]
+only = false
+file = "crates/broca-module-serve/src/lib.rs"
+old = 'pub mod agent_data;'
+new = '''pub mod agent_data;
+pub fn non_vacuity_move_item(wal: &broca_core::FileWalStore) { let reader = broca_core::FileWalStore::read_address_records_for_move; let _ = reader(wal, "0123456789abcdef"); } // NON-VACUITY BREAK'''

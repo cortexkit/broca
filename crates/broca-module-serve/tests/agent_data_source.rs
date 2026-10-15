@@ -19,34 +19,19 @@ fn only_agent_data_can_call_the_move_address_reader() {
     let allowed = root.join("crates/broca-module-serve/src/agent_data.rs");
     let mut files = Vec::new();
     rust_files(&root.join("crates"), &mut files);
-    let call = concat!("read_address_", "records_for_move", "(");
     let mut violations = Vec::new();
     for file in files {
         if file == allowed {
             continue;
         }
         let text = std::fs::read_to_string(&file).unwrap();
-        let mut compact = String::new();
-        let mut lines = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().starts_with("//") {
-                continue;
-            }
-            for character in line.chars().filter(|c| !c.is_whitespace()) {
-                compact.push(character);
-                lines.extend(std::iter::repeat_n(index + 1, character.len_utf8()));
-            }
-        }
-        for (offset, _) in compact.match_indices(call) {
-            if file == root.join("crates/broca-core/src/wal_writer.rs")
-                && compact[..offset].ends_with("fn")
-            {
-                continue;
-            }
+        for line in bypass_identifier_lines(
+            &text,
+            file == root.join("crates/broca-core/src/wal_writer.rs"),
+        ) {
             violations.push(format!(
-                "{}:{}: move-only WAL reader call",
-                file.strip_prefix(&root).unwrap().display(),
-                lines[offset]
+                "{}:{line}: move-only WAL reader identifier",
+                file.strip_prefix(&root).unwrap().display()
             ));
         }
     }
@@ -55,4 +40,42 @@ fn only_agent_data_can_call_the_move_address_reader() {
         "move-only WAL reader called outside agent-data:\n{}",
         violations.join("\n")
     );
+}
+
+fn bypass_identifier_lines(source: &str, definition: bool) -> Vec<usize> {
+    let identifier = concat!("read_address_", "records_for_move");
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut violations = Vec::new();
+    // Do not require call punctuation: imports, aliases and function items can
+    // all grant access. Conservatively reserve this identifier's text too.
+    for (index, line) in source.lines().enumerate() {
+        for (offset, _) in line.match_indices(identifier) {
+            let prefix = &line[..offset];
+            let suffix = &line[offset + identifier.len()..];
+            if prefix.chars().next_back().is_some_and(word)
+                || suffix.chars().next().is_some_and(word)
+            {
+                continue;
+            }
+            if definition && prefix.split_whitespace().last() == Some("fn") {
+                continue;
+            }
+            violations.push(index + 1);
+        }
+    }
+    violations
+}
+
+#[test]
+fn bypass_fence_catches_function_items_imports_and_method_references() {
+    let api = concat!("read_address_", "records_for_move");
+    for source in [
+        format!("let reader = broca_core::FileWalStore::{api};\nlet _ = reader(wal, \"0123456789abcdef\");"),
+        format!("use crate::elsewhere::{api} as reader;"),
+        format!("let reference = FileWalStore::{api};"),
+        format!("wal.{api}(\"0123456789abcdef\");"),
+    ] {
+        assert_eq!(bypass_identifier_lines(&source,false),vec![1],"missed identifier use: {source}");
+    }
+    assert!(bypass_identifier_lines(&format!("let {api}_other = 1;"), false).is_empty());
 }
