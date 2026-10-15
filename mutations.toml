@@ -11682,3 +11682,29 @@ select = "expected"
 file = "crates/broca-subc/src/connection.rs"
 old = '''permit = runtime.write_tx.reserve() => permit.map_err(|_| ApprovedCallError::NotSent { reason: "writer task closed before enqueue" })?,'''
 new = '''permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed".into()))?, // NON-VACUITY BREAK: misclassify a failed pre-send reservation as unknown'''
+
+[[control]]
+id = "core-consent-withdraw-ack-requires-record-proof"
+guards = "an opaque withdrawal acknowledgement cannot replace matching terminal identity and binding proof"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::acknowledged_withdrawal_requires_matching_terminal_readback"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''ApprovalWithdrawal::Acknowledged => "withdrawn".to_owned(),'''
+new = "ApprovalWithdrawal::Acknowledged => return Ok(()), // NON-VACUITY BREAK: trust an acknowledgement without card proof"
+
+[[control]]
+id = "subc-withdraw-reply-matches-requested-card"
+guards = "a withdrawn reply for another id is not acknowledgement of the requested card"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/elicitation.rs"
+expect_red = ["elicitation::withdrawal_identity_tests::withdrawn_reply_for_another_card_is_not_acknowledged"]
+select = "expected"
+file = "crates/broca-subc/src/elicitation.rs"
+old = "record.elicitation_id == elicitation_id"
+new = "true /* NON-VACUITY BREAK: accept a different card's withdrawn reply */"

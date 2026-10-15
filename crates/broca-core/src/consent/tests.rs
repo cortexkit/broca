@@ -257,6 +257,7 @@ async fn second_lookup_adopts_settlement_and_withdraws_duplicate_after_id_sync()
             "answers",
             "answers",
             "withdraw:new",
+            "get",
             "sync:old"
         ]
     );
@@ -782,8 +783,10 @@ async fn duplicate_withdrawal_retry_and_terminal_readback_table() {
     };
     let terminal_none = ApprovalQuestion {
         terminal: true,
-        record: json!({"state":"expired","requester_ref":"key","elicitation_id":"new","answered_choice_id":"approve"}),
+        record: json!({"state":"expired","requester_ref":"key","elicitation_id":"new","answered_choice_id":"approve","binding":binding(&prepared())}),
     };
+    let mut acknowledged = answered("approve");
+    acknowledged.record["state"] = json!("withdrawn");
     let not_sent = |reason: &str| ApprovalWithdrawal::NotSent {
         reason: reason.into(),
     };
@@ -792,9 +795,9 @@ async fn duplicate_withdrawal_retry_and_terminal_readback_table() {
         (
             "acknowledged",
             ApprovalWithdrawal::Acknowledged,
-            Ok(pending.clone()),
+            Ok(acknowledged),
             None,
-            0,
+            1,
         ),
         (
             "answered-agrees",
@@ -979,4 +982,73 @@ fn completed_candidate_keeps_authorization_progress_across_admission_retry() {
         !empty_head.complete,
         "an empty head must refresh to discover later answers"
     );
+}
+
+#[tokio::test]
+async fn acknowledged_withdrawal_requires_matching_terminal_readback() {
+    struct AckPlane {
+        question: ApprovalQuestion,
+        gets: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ElicitationPlane for AckPlane {
+        async fn withdraw(&self, _: &BatchCtx, _: &str) -> ApprovalWithdrawal {
+            ApprovalWithdrawal::Acknowledged
+        }
+        async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(self.question.clone())
+        }
+    }
+    let mut withdrawn = record("new", "approve");
+    withdrawn["state"] = json!("withdrawn");
+    let mut wrong_id = withdrawn.clone();
+    wrong_id["elicitation_id"] = json!("another-card");
+    let mut wrong_key = withdrawn.clone();
+    wrong_key["requester_ref"] = json!("another-call");
+    let mut wrong_binding = withdrawn.clone();
+    wrong_binding["binding"]["args_hash"] = json!("changed");
+    let mut pending = withdrawn.clone();
+    pending["state"] = json!("pending");
+    for (name, value, error) in [
+        ("wrong-id", wrong_id, Some("consent_withdrawal_unproven")),
+        ("wrong-key", wrong_key, Some("consent_withdrawal_unproven")),
+        (
+            "wrong-binding",
+            wrong_binding,
+            Some("consent_binding_mismatch"),
+        ),
+        (
+            "still-pending",
+            pending,
+            Some("consent_withdrawal_unproven"),
+        ),
+        ("matching-withdrawn", withdrawn, None),
+    ] {
+        let plane = AckPlane {
+            question: ApprovalQuestion {
+                terminal: value["state"] != "pending",
+                record: value,
+            },
+            gets: AtomicUsize::new(0),
+        };
+        let result = withdraw_duplicate(
+            &plane,
+            &ctx(),
+            "key",
+            &prepared(),
+            "new",
+            ConsentDecision::Approved,
+        )
+        .await;
+        match error {
+            Some(code) => assert_eq!(result.expect_err(name).code, code, "{name}"),
+            None => result.expect(name),
+        }
+        assert_eq!(
+            plane.gets.load(Ordering::SeqCst),
+            1,
+            "an opaque acknowledgement is not identity/binding proof: {name}"
+        );
+    }
 }

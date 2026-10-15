@@ -300,8 +300,11 @@ impl ElicitationClient {
             )
             .await;
         match result {
-            Ok(record) if record.state == ElicitationState::Withdrawn => {
+            Ok(record) if record.state == ElicitationState::Withdrawn && record.elicitation_id == elicitation_id => {
                 WithdrawalReply::Acknowledged(record)
+            }
+            Ok(record) if record.state == ElicitationState::Withdrawn => {
+                WithdrawalReply::Refused(ElicitationError::Protocol(format!("elicitation.withdraw returned card {} instead of requested card {elicitation_id}", record.elicitation_id)))
             }
             Ok(record) if record.state == ElicitationState::Answered => {
                 WithdrawalReply::NoLongerOpen {
@@ -840,6 +843,28 @@ mod tests {
                 WithdrawalReply::Retryable(ElicitationError::Transport(_))
             ),
             "timeout must retry, not acknowledge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod withdrawal_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn withdrawn_reply_for_another_card_is_not_acknowledged() {
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let client = ElicitationClient::on_route(Arc::new(conn), route, Duration::from_secs(1));
+        let (reply, ()) = tokio::join!(client.withdraw("requested"), async {
+            let request = module.next_request().await;
+            assert!(module.reply(&request, br#"{"state":"withdrawn","elicitation_id":"another-card","requester_ref":"another-call","binding":{}}"#.to_vec()));
+        });
+        assert!(
+            matches!(
+                reply,
+                WithdrawalReply::Refused(ElicitationError::Protocol(_))
+            ),
+            "a different card's withdrawn record is not the requested withdrawal: {reply:?}"
         );
     }
 }

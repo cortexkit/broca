@@ -475,19 +475,22 @@ async fn withdraw_duplicate(
     older: ConsentDecision,
 ) -> Result<(), ApprovalRouteError> {
     let reason = match plane.withdraw(ctx, id).await {
-        ApprovalWithdrawal::Acknowledged => return Ok(()),
+        ApprovalWithdrawal::Acknowledged => "withdrawn".to_owned(),
         ApprovalWithdrawal::NotSent { reason } => reason,
         ApprovalWithdrawal::Retry(error) if !error.retryable && terminal_refusal(&error.code) => {
             error.code
         }
         ApprovalWithdrawal::Retry(error) => return Err(error),
     };
-    // A refused withdrawal is not proof that the duplicate stayed unanswered.
-    // Read its terminal record before adopting the older card's decision.
+    // An acknowledgement carries no identity or binding in this trait. Neither
+    // it nor a refusal proves closure: read the requested card's terminal record.
     let question = plane.get(ctx, id).await?;
     let duplicate = answer(&question.record, key, prepared)?
         .filter(|answer| answer.id == id && question.terminal)
         .ok_or_else(|| refusal("consent_withdrawal_unproven", true))?;
+    if question.record.get("binding") != Some(&binding(prepared)) {
+        return Err(refusal("consent_binding_mismatch", false));
+    }
     if reason == "answered" && duplicate.decision == ConsentDecision::None {
         return Err(refusal("consent_withdrawal_unproven", true));
     }
