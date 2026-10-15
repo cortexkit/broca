@@ -592,3 +592,85 @@ async fn close_out_adopted_id_survives_projection_without_reopening_call() {
     writer.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+struct ProgressPages {
+    pages: Mutex<std::collections::VecDeque<Result<ApprovalPage, ApprovalRouteError>>>,
+    cursors: Mutex<Vec<Option<ApprovalCursor>>>,
+}
+#[async_trait::async_trait]
+impl ElicitationPlane for ProgressPages {
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        cursor: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        self.cursors.lock().unwrap().push(cursor.cloned());
+        self.pages
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted progress page")
+    }
+}
+fn progress_page(records: Vec<Value>, seq: u64) -> Result<ApprovalPage, ApprovalRouteError> {
+    Ok(ApprovalPage {
+        records,
+        cursor: ApprovalCursor {
+            provider_incarnation: "stable".into(),
+            seq,
+        },
+    })
+}
+#[tokio::test]
+async fn lookup_retry_preserves_prior_settlements_and_cursor() {
+    let feed = ProgressPages {
+        pages: Mutex::new(
+            vec![
+                progress_page(vec![record("old", "deny")], 1),
+                Err(refusal("feed_busy", true)),
+                progress_page(vec![record("new", "approve")], 2),
+                progress_page(Vec::new(), 2),
+            ]
+            .into(),
+        ),
+        cursors: Mutex::new(Vec::new()),
+    };
+    let progress = Mutex::new(LookupProgress::default());
+    assert!(
+        lookup_with_progress(&feed, &ctx(), "key", &prepared(), &progress)
+            .await
+            .unwrap_err()
+            .retryable
+    );
+    let error = lookup_with_progress(&feed, &ctx(), "key", &prepared(), &progress)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "consent_conflicting_decisions");
+    let cursors = feed.cursors.lock().unwrap().clone();
+    assert_eq!(cursors[0], None);
+    assert_eq!(cursors[1], cursors[2]);
+    assert_eq!(cursors[2].as_ref().unwrap().seq, 1);
+}
+#[tokio::test]
+async fn lookup_cursor_change_restarts_progress_and_discards_old_settlements() {
+    let feed = ProgressPages {
+        pages: Mutex::new(
+            vec![
+                progress_page(vec![record("old", "deny")], 1),
+                Err(refusal("cursor_incarnation_changed", false)),
+                progress_page(vec![record("new", "approve")], 2),
+                progress_page(Vec::new(), 2),
+            ]
+            .into(),
+        ),
+        cursors: Mutex::new(Vec::new()),
+    };
+    let progress = Mutex::new(LookupProgress::default());
+    let found = lookup_with_progress(&feed, &ctx(), "key", &prepared(), &progress)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "new");
+    assert_eq!(found.decision, ConsentDecision::Approved);
+    assert_eq!(feed.cursors.lock().unwrap()[2], None);
+}

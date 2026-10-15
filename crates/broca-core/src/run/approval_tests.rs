@@ -19,6 +19,9 @@ mod consent_runtime_tests;
 #[path = "consent_audit_tests.rs"]
 mod consent_audit_tests;
 
+#[path = "consent_second_audit_tests.rs"]
+mod consent_second_audit_tests;
+
 struct Hooks {
     validates: AtomicUsize,
     second: &'static str,
@@ -527,6 +530,7 @@ impl ToolPlane for Tools {
     }
 }
 struct Rig {
+    timeout: std::time::Duration,
     unhinted: bool,
     writer: WalHandle,
     root: std::path::PathBuf,
@@ -596,6 +600,7 @@ impl Rig {
             ..Default::default()
         };
         Self {
+            timeout: std::time::Duration::from_secs(3),
             unhinted: false,
             writer,
             root,
@@ -649,7 +654,7 @@ impl Rig {
             other.name = "other".into();
             tools.push(other);
         }
-        tokio::time::timeout(std::time::Duration::from_secs(3), Box::pin(approval_gate::batch(&RunId("r".into()), StepId(1), &self.bind, Some(&serde_json::from_value(json!({"owner":{"kind":"reserved", "module_id":"agent"}, "ref":"s", "scope_epoch":1})).unwrap()),
+        tokio::time::timeout(self.timeout, Box::pin(approval_gate::batch(&RunId("r".into()), StepId(1), &self.bind, Some(&serde_json::from_value(json!({"owner":{"kind":"reserved", "module_id":"agent"}, "ref":"s", "scope_epoch":1})).unwrap()),
             calls, &ToolManifest::from_tools(tools), &self.tools, approval, &self.writer, resume, &[], false, &self.control, Some(&runtime), None, &out, &mut history, restart))).await.expect("scripted approval batch must resolve").unwrap()
     }
     fn frames(&self) -> Vec<broca_wal::FramedRecord> {

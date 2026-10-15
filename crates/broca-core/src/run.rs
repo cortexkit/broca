@@ -9073,6 +9073,7 @@ mod approval_gate {
     pub(super) struct History {
         pub frames: Vec<broca_wal::FramedRecord>,
         pub(super) projection: crate::replay::DeferredCallProjection,
+        scans: HashMap<String, Arc<std::sync::Mutex<crate::consent::LookupProgress>>>,
     }
     impl History {
         pub fn new(
@@ -9084,7 +9085,14 @@ mod approval_gate {
                 .ok_or_else(|| RunError::Wal("approval requires WAL lineage".into()))?;
             let mut projection = crate::replay::DeferredCallProjection::new(lineage);
             projection.fold_frames(&frames);
-            Ok(Self { frames, projection })
+            Ok(Self {
+                frames,
+                projection,
+                scans: HashMap::new(),
+            })
+        }
+        fn scan(&mut self, key: &str) -> Arc<std::sync::Mutex<crate::consent::LookupProgress>> {
+            self.scans.entry(key.into()).or_default().clone()
         }
         pub(super) fn require_installed_plane(&self, control: &RunControl) -> Result<(), RunError> {
             let held = self.projection.calls.values().any(|call| {
@@ -10141,6 +10149,7 @@ mod approval_gate {
                     };
                     let held = call.clone();
                     let timestamp = now(control);
+                    let scan = history.scan(&held.key);
                     active.insert(index);
                     let wait_cancel = CancellationToken::new();
                     waits.insert(index, wait_cancel.clone());
@@ -10166,14 +10175,14 @@ mod approval_gate {
                                     }
                                 };
                                 if let Some(id) = &held.id {
-                                    let card = crate::consent::reconcile(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, durable).await?;
+                                    let card = crate::consent::reconcile_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, scan.as_ref(), durable).await?;
                                     if card.answer.is_some() { return Ok(card); }
                                     let question = elicitation.get(&filing_ctx, &card.id).await?;
                                     let answer = crate::consent::answer(&question.record, &held.key, &held.prepared)?;
                                     if answer.as_ref().is_some_and(|answer| answer.id != card.id) { return Err(crate::consent::refusal("consent_card_mismatch", false)); }
                                     Ok(crate::consent::RecoveredCard { id: card.id, answer })
                                 } else {
-                                    crate::consent::recover(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, timestamp, durable).await
+                                    crate::consent::recover_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, timestamp, scan.as_ref(), durable).await
                                 }
                             }) => result.unwrap_or_else(|_| Err(ApprovalRouteError { code: "timeout".into(), retryable: true })),
                         };

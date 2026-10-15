@@ -10401,7 +10401,7 @@ test_file = "crates/broca-core/src/consent/tests.rs"
 expect_red = ["consent::tests::settled_lookup_precedes_refile_and_recovers_without_request"]
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
-old = '''if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
+old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
         durable(id_record(ctx, key, prepared, &answer.id)).await?;'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
         durable(id_record(ctx, key, prepared, &answer.id)).await?;'''
@@ -10416,7 +10416,7 @@ test_file = "crates/broca-core/src/consent/tests.rs"
 expect_red = ["consent::tests::second_lookup_adopts_settlement_and_withdraws_duplicate_after_id_sync"]
 select = "expected"
 file = "crates/broca-core/src/consent.rs"
-old = '''if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
+old = '''if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
         if answer.id != id {'''
 new = '''if let Some(answer) = None::<ConsentAnswer> { // NON-VACUITY BREAK
         if answer.id != id {'''
@@ -10612,7 +10612,7 @@ test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
 expect_red = ["run::approval_tests::consent_audit_tests::provisional_id_resume_reconciles_conflicting_settlements_before_get"]
 select = "expected"
 file = "crates/broca-core/src/run.rs"
-old = '''let card = crate::consent::reconcile(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, durable).await?;'''
+old = '''let card = crate::consent::reconcile_with_progress(elicitation.as_ref(), &filing_ctx, &held.key, &held.prepared, id, scan.as_ref(), durable).await?;'''
 new = '''let card = crate::consent::RecoveredCard { id: id.clone(), answer: None }; // NON-VACUITY BREAK'''
 
 [[control]]
@@ -10838,3 +10838,32 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "Err(_) => return Err(()),"
 new = "Err(_) => continue, // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-reconciliation-budget-keeps-cursor"
+guards = "a healthy known-id traversal longer than the call budget continues from its validated cursor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_second_audit_tests::healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.cursor = cursor.clone();"
+new = "state.cursor = None; // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-reconciliation-retry-keeps-settlements"
+guards = "retrying a partial reconciliation preserves earlier settled decisions as well as its cursor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::lookup_retry_preserves_prior_settlements_and_cursor"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''state.cursor = cursor.clone();
+        state.found = found.clone();'''
+new = '''state.cursor = cursor.clone();
+        state.found = None; // NON-VACUITY BREAK'''

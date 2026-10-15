@@ -6,7 +6,7 @@ use crate::tool_plane::{
 };
 use broca_wal::{AwaitingApprovalEntry, WalRecord, WithdrawalAnswer};
 use serde_json::{json, Value};
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::Mutex, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentDecision {
@@ -99,14 +99,63 @@ pub async fn lookup(
     key: &str,
     prepared: &WalRecord,
 ) -> Result<Option<ConsentAnswer>, ApprovalRouteError> {
-    let mut cursor: Option<ApprovalCursor> = None;
-    let mut found: Option<ConsentAnswer> = None;
+    lookup_with_progress(
+        plane,
+        ctx,
+        key,
+        prepared,
+        &Mutex::new(LookupProgress::default()),
+    )
+    .await
+}
+
+/// Cursor and binding-checked settlement decisions for one call's owner-feed scan.
+/// Save progress only after an entire page is readable, so a timed-out RPC can
+/// resume without losing earlier decisions. This is not WAL authorization state:
+/// a new process must scan from zero before authorizing a pending recorded id.
+#[derive(Debug, Default)]
+pub struct LookupProgress {
+    key: Option<String>,
+    binding: Option<Value>,
+    cursor: Option<ApprovalCursor>,
+    found: Option<ConsentAnswer>,
+    complete: bool,
+}
+impl LookupProgress {
+    pub fn restart(&mut self) {
+        self.cursor = None;
+        self.found = None;
+        self.complete = false;
+    }
+}
+
+pub async fn lookup_with_progress(
+    plane: &dyn ElicitationPlane,
+    ctx: &BatchCtx,
+    key: &str,
+    prepared: &WalRecord,
+    progress: &Mutex<LookupProgress>,
+) -> Result<Option<ConsentAnswer>, ApprovalRouteError> {
+    let (mut cursor, mut found) = {
+        let mut state = progress.lock().expect("consent scan progress");
+        let expected = binding(prepared);
+        if state.key.as_deref() != Some(key) || state.binding.as_ref() != Some(&expected) {
+            state.restart();
+            state.key = Some(key.into());
+            state.binding = Some(expected);
+        }
+        if state.complete {
+            return Ok(state.found.clone());
+        }
+        (state.cursor.clone(), state.found.clone())
+    };
     let mut reset = false;
     loop {
         let page = match plane.answers(ctx, cursor.as_ref()).await {
             Err(error) if error.code == "cursor_incarnation_changed" && !reset => {
                 cursor = None;
                 found = None;
+                progress.lock().expect("consent scan progress").restart();
                 reset = true;
                 continue;
             }
@@ -126,12 +175,19 @@ pub async fn lookup(
             }
         }
         if page.records.is_empty() {
+            let mut state = progress.lock().expect("consent scan progress");
+            state.complete = true;
+            state.found = found.clone();
+            state.cursor = Some(page.cursor);
             return Ok(found);
         }
         if cursor.as_ref().is_some_and(|old| old == &page.cursor) {
             return Err(refusal("consent_cursor_stalled", true));
         }
         cursor = Some(page.cursor);
+        let mut state = progress.lock().expect("consent scan progress");
+        state.cursor = cursor.clone();
+        state.found = found.clone();
     }
 }
 
@@ -165,25 +221,60 @@ pub async fn recover<F, Fut>(
     key: &str,
     prepared: &WalRecord,
     now_ms: u64,
+    durable: F,
+) -> Result<RecoveredCard, ApprovalRouteError>
+where
+    F: FnMut(WalRecord) -> Fut,
+    Fut: Future<Output = Result<(), ApprovalRouteError>>,
+{
+    recover_with_progress(
+        plane,
+        ctx,
+        key,
+        prepared,
+        now_ms,
+        &Mutex::new(LookupProgress::default()),
+        durable,
+    )
+    .await
+}
+
+pub async fn recover_with_progress<F, Fut>(
+    plane: &dyn ElicitationPlane,
+    ctx: &BatchCtx,
+    key: &str,
+    prepared: &WalRecord,
+    now_ms: u64,
+    progress: &Mutex<LookupProgress>,
     mut durable: F,
 ) -> Result<RecoveredCard, ApprovalRouteError>
 where
     F: FnMut(WalRecord) -> Fut,
     Fut: Future<Output = Result<(), ApprovalRouteError>>,
 {
-    if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
+    if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
         durable(id_record(ctx, key, prepared, &answer.id)).await?;
         return Ok(RecoveredCard {
             id: answer.id.clone(),
             answer: Some(answer),
         });
     }
+    progress.lock().expect("consent scan progress").restart();
     let filing = plane.request(ctx, key, prepared, now_ms).await?;
     if filing.elicitation_id.is_empty() {
         return Err(refusal("consent_record_unreadable", false));
     }
     durable(id_record(ctx, key, prepared, &filing.elicitation_id)).await?;
-    reconcile(plane, ctx, key, prepared, &filing.elicitation_id, durable).await
+    reconcile_with_progress(
+        plane,
+        ctx,
+        key,
+        prepared,
+        &filing.elicitation_id,
+        progress,
+        durable,
+    )
+    .await
 }
 
 /// A recorded id identifies a card but does not prove that the post-filing lookup
@@ -194,13 +285,38 @@ pub async fn reconcile<F, Fut>(
     key: &str,
     prepared: &WalRecord,
     id: &str,
+    durable: F,
+) -> Result<RecoveredCard, ApprovalRouteError>
+where
+    F: FnMut(WalRecord) -> Fut,
+    Fut: Future<Output = Result<(), ApprovalRouteError>>,
+{
+    reconcile_with_progress(
+        plane,
+        ctx,
+        key,
+        prepared,
+        id,
+        &Mutex::new(LookupProgress::default()),
+        durable,
+    )
+    .await
+}
+
+pub async fn reconcile_with_progress<F, Fut>(
+    plane: &dyn ElicitationPlane,
+    ctx: &BatchCtx,
+    key: &str,
+    prepared: &WalRecord,
+    id: &str,
+    progress: &Mutex<LookupProgress>,
     mut durable: F,
 ) -> Result<RecoveredCard, ApprovalRouteError>
 where
     F: FnMut(WalRecord) -> Fut,
     Fut: Future<Output = Result<(), ApprovalRouteError>>,
 {
-    if let Some(answer) = lookup(plane, ctx, key, prepared).await? {
+    if let Some(answer) = lookup_with_progress(plane, ctx, key, prepared, progress).await? {
         if answer.id != id {
             withdraw_duplicate(plane, ctx, key, prepared, id, answer.decision).await?;
         }
