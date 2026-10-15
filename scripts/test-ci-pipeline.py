@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 import unittest
@@ -171,7 +172,8 @@ class WorkflowGraph(unittest.TestCase):
             # Shards wait for the shared fixtures and for the static platform check, so an
             # invalid platform claim never starts a native shard.
             self.assertEqual(job['needs'], ['fixtures', 'mutation-platforms'])
-            self.assertEqual(job['strategy']['matrix']['shard'], ['1', '2', '3', '4'])
+            count = 32 if name == 'mutations' else 4
+            self.assertEqual(job['strategy']['matrix']['shard'], [str(i) for i in range(1, count + 1)])
             script = '\n'.join(s.get('run', '') for s in job['steps'])
             self.assertIn('ckdev-mutate check', script)
             self.assertIn('ckdev-mutate run --all --shard', script)
@@ -187,6 +189,127 @@ class WorkflowGraph(unittest.TestCase):
             run = subprocess.run(['bash', '-c', script], env={**os.environ, 'NEEDS_JSON': json.dumps(lanes)},
                                  text=True, capture_output=True, timeout=5)
             self.assertEqual(run.returncode == 0, result == 'success', run.stdout + run.stderr)
+
+
+class MutationReplay(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-ci-mutations-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.events = self.root / 'events.jsonl'
+        self.tool('ckdev-mutate', '''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['EVENTS'], 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+''')
+        self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
+                    'EVENTS': str(self.events), 'EVENT': 'push', 'REF': 'refs/heads/master',
+                    'PR_BASE': '', 'PUSH_BASE': '', 'SHARD': '1', 'SHARDS': '32'}
+        self.job = WorkflowGraph.workflow('mutations.yml')['jobs']['mutations']
+        self.replay = next(s for s in self.job['steps'] if s.get('name') == 'Replay selected proofs')
+
+    def tool(self, name, source, directory=None):
+        path = (directory or self.bin) / name
+        path.write_text(source)
+        path.chmod(0o755)
+        return path
+
+    def run_replay(self, **env):
+        self.events.unlink(missing_ok=True)
+        run = subprocess.run(['bash', '-c', self.replay['run']], cwd=self.root,
+                             env={**self.env, **env}, text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        return [json.loads(line) for line in self.events.read_text().splitlines()]
+
+    def test_linux_replay_modes_keep_full_master_and_nightly_breadth(self):
+        cases = [
+            ({}, ['--all'], 'all'),
+            ({'EVENT': 'workflow_dispatch'}, ['--all'], 'all'),
+            ({'EVENT': 'schedule'}, ['--all', '--broad'], 'broad'),
+            ({'EVENT': 'pull_request', 'PR_BASE': 'pr-base'}, ['--diff', 'pr-base'], 'diff'),
+            ({'REF': 'refs/heads/train/probe', 'PUSH_BASE': 'push-base'}, ['--diff', 'push-base'], 'diff'),
+            ({'REF': 'refs/heads/train/new', 'PUSH_BASE': '0' * 40}, ['--diff', 'origin/master'], 'diff'),
+        ]
+        for env, selection, report in cases:
+            with self.subTest(env=env):
+                self.assertEqual(self.run_replay(**env), [
+                    ['run', *selection, '--shard', '1/32', '--report', f'target/mutations/{report}.json']])
+
+    def test_linux_matrix_uses_same_shard_denominator(self):
+        shards = self.job['strategy']['matrix']['shard']
+        self.assertEqual(shards, [str(i) for i in range(1, 33)])
+        self.assertEqual(self.job['timeout-minutes'], "${{ github.event_name == 'schedule' && 180 || 90 }}")
+        self.assertEqual(self.replay['env']['SHARDS'], '${{ strategy.job-total }}')
+        for shard in shards:
+            with self.subTest(shard=shard):
+                args, = self.run_replay(SHARD=shard, SHARDS=str(len(shards)))
+                self.assertEqual(args[args.index('--shard') + 1], f'{shard}/{len(shards)}')
+
+    def test_windows_command_proofs_resolve_git_bash_before_wsl(self):
+        steps = WorkflowGraph.workflow('mutations.yml')['jobs']['mutations-windows']['steps']
+        setup = next(i for i, s in enumerate(steps) if s.get('name') == 'Select Git Bash for native command proofs')
+        check = next(i for i, s in enumerate(steps) if s.get('name') == 'Check native command interpreter')
+        validate = next(i for i, s in enumerate(steps) if s.get('name') == 'Validate catalogue')
+        self.assertLess(setup, check)
+        self.assertLess(check, validate)
+        git_bin = self.root / 'Git Bash'
+        git_bin.mkdir()
+        real_bash = shutil.which('bash')
+        assert real_bash is not None, 'the workflow suite requires Bash'
+        self.tool('bash', '#!/bin/sh\necho "WSL has no installed distributions" >&2\nexit 1\n')
+        self.tool('bash', f'#!/bin/sh\nexec "{real_bash}" "$@"\n', git_bin)
+        self.tool('cygpath', f'#!/bin/sh\nprintf "%s\\n" "{git_bin / "bash"}"\n')
+        scripts = self.root / 'scripts'
+        scripts.mkdir()
+        shutil.copyfile(ROOT / 'scripts/mutation-bash.py', scripts / 'mutation-bash.py')
+        env = {**self.env, 'GITHUB_ENV': str(self.root / 'github-env')}
+        env.pop('BROCA_MUTATION_BASH', None)
+        before = subprocess.run([real_bash, '-c', steps[check]['run']], cwd=self.root,
+                                env=env, text=True, capture_output=True, timeout=5)
+        self.assertNotEqual(before.returncode, 0, before.stdout + before.stderr)
+        run = subprocess.run([real_bash, '-c', steps[setup]['run']], cwd=self.root,
+                             env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        for setting in Path(env['GITHUB_ENV']).read_text().splitlines():
+            key, value = setting.split('=', 1)
+            env[key] = value
+        after = subprocess.run([real_bash, '-c', steps[check]['run']], cwd=self.root,
+                               env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        self.assertIn('GNU bash', after.stdout)
+
+    def test_catalogue_shell_rows_use_native_launcher(self):
+        import tomllib
+        rows = tomllib.loads((ROOT / 'mutations.toml').read_text())['control']
+        commands = [row.get('command', []) for row in rows]
+        self.assertTrue(any(command[:3] == ['python3', '-B', 'scripts/mutation-bash.py']
+                            for command in commands))
+        self.assertFalse(any(command[:1] == ['bash'] for command in commands))
+
+    def test_native_launcher_keeps_shell_argv_and_exit_status(self):
+        bash = shutil.which('bash')
+        assert bash is not None
+        run = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/mutation-bash.py'),
+                              '-c', 'printf "%s\\n" "$1"; exit 7', '--', 'a test with spaces'],
+                             env={**self.env, 'BROCA_MUTATION_BASH': bash},
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 7, run.stdout + run.stderr)
+        self.assertEqual(run.stdout, 'a test with spaces\n')
+
+    def test_native_launcher_refuses_windows_without_explicit_path(self):
+        spec = importlib.util.spec_from_file_location('mutation_bash', ROOT / 'scripts/mutation-bash.py')
+        assert spec is not None and spec.loader is not None
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        with patch.dict(os.environ, {}, clear=True), patch.object(launcher.sys, 'platform', 'win32'):
+            with self.assertRaisesRegex(SystemExit, 'BROCA_MUTATION_BASH'):
+                launcher.bash_path()
+        for configured in ('relative/bash', str(self.root / 'missing-bash')):
+            with self.subTest(configured=configured), patch.dict(os.environ, {'BROCA_MUTATION_BASH': configured}):
+                with self.assertRaisesRegex(SystemExit, 'existing absolute Bash'):
+                    launcher.bash_path()
 
 
 class ArtifactWait(unittest.TestCase):

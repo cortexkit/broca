@@ -444,6 +444,8 @@ def python_tests(path):
 
 def command_args(row):
     command = row.get("command", [])
+    if command[:3] == ["python3", "-B", "scripts/mutation-bash.py"]:
+        command = ["bash", *command[3:]]
     if command[:2] == ["bash", "-c"]:
         # These wrappers print the diff before one test command; arbitrary shell
         # logic is rejected rather than guessing which test it will execute.
@@ -775,6 +777,13 @@ macro_rules! case { ($name:ident, $path:literal) => { #[test] fn $name() {} }; }
     def test_python_subprocess_cargo_wrapper_checks_real_rust_target(self):
         self.put("crates/probe/src/lib.rs", '#![cfg(unix)]\nmod sample { #[test] fn probe() {} }')
         self.row.update(runner="command", command=["python3", "-c", "import subprocess, sys; subprocess.run(['cargo', 'test', '--locked', '-p', 'probe', '--lib', sys.argv[1], '--', '--exact'])", "{test}"])
+        self.assertEqual(len(self.check()), 1)
+        self.assertIn("lib.rs:1: cfg(unix)", self.check()[0])
+
+    def test_native_bash_launcher_checks_underlying_target_gates(self):
+        self.put("crates/probe/src/lib.rs", '#![cfg(unix)]\nmod sample { #[test] fn probe() {} }')
+        self.row.update(runner="command", command=["python3", "-B", "scripts/mutation-bash.py", "-c",
+                        'git diff --stat; cargo test --locked -p probe --lib "$1" -- --exact', "--", "{test}"])
         self.assertEqual(len(self.check()), 1)
         self.assertIn("lib.rs:1: cfg(unix)", self.check()[0])
 
