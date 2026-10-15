@@ -2045,7 +2045,10 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
     assert_eq!(value["auth"]["path"], "routed");
 }
 
-// Regenerate only from the daemon's real run.status reply with BROCA_UPDATE_GOLDEN=1.
+// This test needs the test-clock feature: FileWalStore then reads the injected
+// small WAL cap. Regenerate the golden from the spawned daemon's run.status reply
+// with BROCA_UPDATE_GOLDEN=1, so it covers the served error rather than a fixture.
+#[cfg(feature = "test-clock")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_too_large_status_matches_golden_through_real_serve() {
     let rig = Rig::start()

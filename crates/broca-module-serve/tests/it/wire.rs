@@ -2472,9 +2472,44 @@ async fn session_send_refuses_an_unknown_service_tier_before_starting_a_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Health reports lifetime projection failures, including failures from earlier
+// tests in this binary. Re-execute probes of a healthy process with fresh metrics
+// instead of resetting production counters or relaxing their exact assertions.
+async fn isolated_health_probe(test: &str) -> bool {
+    const CHILD_TEST: &str = "BROCA_ISOLATED_HEALTH_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+        return true;
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD_TEST, test)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("isolated health probe must finish within 30s")
+    .expect("spawn isolated health probe");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated health probe {test} failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// A channel-0 health.check returns registry counts and dependency states from memory.
 #[tokio::test]
 async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
+    if !isolated_health_probe(
+        "wire::health_check_reports_slot_counts_and_stale_lkg_without_degrading",
+    )
+    .await
+    {
+        return;
+    }
     let _drop_counter_guard = SERVE_FRAME_DROP_COUNTER_TEST_LOCK.lock().await;
     // The serve binary publishes the table it loaded before serving; this harness has no
     // config, so it publishes the shipped table the same way.
@@ -2940,6 +2975,9 @@ async fn a_vanished_project_root_refuses_execute_ops_but_still_admits_run_ops() 
 /// Vault health distinguishes never-connected, connected, broken, and cached-fallback states.
 #[tokio::test]
 async fn health_check_vault_gauge_flips_on_stamped_outcomes() {
+    if !isolated_health_probe("wire::health_check_vault_gauge_flips_on_stamped_outcomes").await {
+        return;
+    }
     let dir = tmpdir("health-gauge");
     let reg = registry(&dir);
     let gauge = broca_module_serve::serve::VaultGauge::disconnected();

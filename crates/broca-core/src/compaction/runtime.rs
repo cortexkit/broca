@@ -38,6 +38,10 @@ pub(crate) struct CompactionReplies {
     fences: Mutex<std::collections::VecDeque<LateReply>>,
 }
 impl CompactionReplies {
+    pub fn for_plan(planned: bool) -> Option<Self> {
+        planned.then(Self::new)
+    }
+
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         Self {
@@ -802,6 +806,12 @@ fn terminal_exit(exit: CompactionWaitExit) -> StepResult {
 #[cfg(test)]
 mod reply_tests {
     use super::*;
+
+    #[test]
+    fn replies_are_allocated_only_for_a_frozen_compaction_plan() {
+        assert!(CompactionReplies::for_plan(false).is_none());
+        assert!(CompactionReplies::for_plan(true).is_some());
+    }
 
     #[cfg(feature = "test-clock")]
     #[tokio::test(start_paused = true)]

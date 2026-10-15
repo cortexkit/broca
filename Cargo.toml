@@ -103,5 +103,14 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 [profile.dev]
 panic = "unwind"
 
+# Test rigs hash full debug executables before launching their dev-named copies.
+# The mutation runner runs a whole integration target serially under one deadline;
+# optimize hashing so repeated rig startups do not consume that test-run budget.
+[profile.dev.package.broca-test-support]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
