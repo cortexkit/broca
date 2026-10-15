@@ -185,5 +185,7 @@ jobs:
         if: always()
         with:
           name: mutations-windows-${{ github.event_name }}-shard-${{ matrix.shard }}
-          path: broca/target/mutations/windows-*.json
+          path: |
+            broca/target/mutations/windows-*.json
+            broca/target/rig-survivors/*.txt
           if-no-files-found: error

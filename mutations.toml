@@ -3407,6 +3407,8 @@ new = "retention: None, // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-test-clock-staging-fence"
+# Operator fixture invokes POSIX Bash tools and paths, not the native Windows launcher.
+platforms = ["linux", "macos"]
 guards = "release staging refuses an artifact carrying the compiled retention clock override marker"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/tests/test_clock_safety.py \"$1\"", "--", "{test}"]
@@ -3419,6 +3421,8 @@ new = "if false && [[ $(( artifact_s + artifact_n )) -gt 0 ]]; then # NON-VACUIT
 
 [[control]]
 id = "retention-test-clock-execution-sentinel"
+# Operator fixture invokes POSIX Bash tools and paths, not the native Windows launcher.
+platforms = ["linux", "macos"]
 guards = "an otherwise-green workspace gate refuses when the feature-only clock sentinel did not execute"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/tests/test_clock_safety.py \"$1\"", "--", "{test}"]
@@ -8336,6 +8340,8 @@ expect_red = ["synthetic_capture_replay::openai_responses_tool_call"]
 
 [[control]]
 id = "train-push-live-owner-refuses-concurrent-racer"
+# Train fixtures depend on POSIX process/lock semantics and executable shell shims.
+platforms = ["linux", "macos"]
 guards = "train-push rejects a competing invocation while the first process still owns the lock"
 runner = "command"
 command = ["python3", "-B", "scripts/test-train-push.py", "{test}"]
@@ -8624,6 +8630,8 @@ new = '"sessionRef": session_ref, "fromOffset": from_offset, "limit": limit, "cu
 
 [[control]]
 id = "train-push-private-history-public-refuses"
+# Train fixtures depend on POSIX process/lock semantics and executable shell shims.
+platforms = ["linux", "macos"]
 guards = "Commits carrying broca's private history may only be pushed to broca-private"
 runner = "command"
 command = ["python3", "-B", "scripts/test-train-push.py", "{test}", "-v"]
@@ -8633,6 +8641,92 @@ expect_red = ["PrivateHistoryGuardArms.test_private_history_descendant_is_refuse
 file = "scripts/train-push.sh"
 old = '''    if [ "$repo_slug" != "cortexkit/broca-private" ]; then'''
 new = '''    if false; then # NON-VACUITY BREAK: disable the private-history refusal'''
+[[control]]
+id = "test-rig-survivor-libtest-capture"
+guards = "survivor diagnostics from successful tests never split libtest status lines"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-test-support/src/process.rs"
+expect_red = ["process::tests::cleanup_diagnostics_preserve_libtest_status_and_append_artifact"]
+file = "crates/broca-test-support/src/process.rs"
+old = '''    eprintln!("{message}");
+    if let Err(error) = append_cleanup_diagnostic(message) {'''
+new = '''    { // NON-VACUITY BREAK: bypass libtest capture
+        use std::io::Write;
+        writeln!(std::io::stderr().lock(), "{message}").unwrap();
+    }
+    if let Err(error) = append_cleanup_diagnostic(message) {'''
+
+[[control]]
+id = "test-rig-survivor-artifact-append"
+guards = "survivor artifacts retain process identities across multiple cleanup diagnostics"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-test-support/src/process.rs"
+expect_red = ["process::tests::cleanup_diagnostics_preserve_libtest_status_and_append_artifact"]
+file = "crates/broca-test-support/src/process.rs"
+old = '''        .append(true)'''
+new = '''        .write(true).truncate(true) // NON-VACUITY BREAK: overwrite earlier survivors'''
+
+[[control]]
+id = "mutation-platforms-reject-nested-bare-bash"
+guards = "a native outer launcher cannot claim Windows for Python helpers that launch bare Bash"
+runner = "command"
+command = ["python3", "-B", "scripts/verify-mutation-platforms.py", "--self-test", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/verify-mutation-platforms.py"
+expect_red = ["PlatformTests.test_python_bare_bash_helpers_cannot_claim_windows"]
+file = "scripts/verify-mutation-platforms.py"
+old = '''                if "windows" in platforms and bare_bash:'''
+new = '''                if False and "windows" in platforms and bare_bash:  # NON-VACUITY BREAK'''
+
+[[control]]
+id = "ci-unit-retains-survivor-dumps"
+guards = "CI unit jobs upload survivor identities even when tests fail"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_ci_uploads_survivor_dumps_even_after_failure"]
+file = ".github/workflows/ci.yml"
+old = '''          name: rig-survivors-unit-${{ matrix.os }}
+          path: broca/target/rig-survivors/*.txt'''
+new = '''          name: rig-survivors-unit-${{ matrix.os }}
+          path: broca/target/rig-survivors-disabled/*.txt # NON-VACUITY BREAK: omit the survivor dump directory'''
+
+[[control]]
+id = "ci-integration-retains-survivor-dumps"
+guards = "CI integration jobs upload survivor identities even when tests fail"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_ci_uploads_survivor_dumps_even_after_failure"]
+file = ".github/workflows/ci.yml"
+old = '''          name: rig-survivors-integration-${{ matrix.os }}-${{ matrix.shard }}
+          path: broca/target/rig-survivors/*.txt'''
+new = '''          name: rig-survivors-integration-${{ matrix.os }}-${{ matrix.shard }}
+          path: broca/target/rig-survivors-disabled/*.txt # NON-VACUITY BREAK: omit the survivor dump directory'''
+
+[[control]]
+id = "windows-mutations-retains-survivor-dumps"
+guards = "native Windows mutation reports include survivor identities even after replay fails"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}", "-v"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_windows_mutations_upload_survivor_dumps_even_after_failure"]
+file = ".github/workflows/mutations-windows.yml"
+old = '''            broca/target/rig-survivors/*.txt'''
+new = '''            broca/target/rig-survivors-disabled/*.txt # NON-VACUITY BREAK: omit the survivor dump directory'''
+
 # Session-move reader and cut-authority guards.
 [[control]]
 id = "move-freeze-exclusive"
