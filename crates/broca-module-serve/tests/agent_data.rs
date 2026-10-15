@@ -36,6 +36,25 @@ fn root(tag: &str) -> PathBuf {
     ))
 }
 struct NeverOpen;
+struct CountingWalReads {
+    inner: Arc<FileWalStore>,
+    reads: Arc<AtomicUsize>,
+}
+impl WalStore for CountingWalReads {
+    fn open(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+        self.inner.open(session)
+    }
+    fn read_records(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_records(session)
+    }
+}
 #[async_trait]
 impl LineageOpener for NeverOpen {
     async fn open(
@@ -521,18 +540,26 @@ fn assert_code(result: Result<Value, Value>, code: &str) -> Value {
 
 #[tokio::test]
 async fn stamped_principal_admission_precedes_json_and_every_store_read() {
-    let rig = Rig::new("admission", Arc::new(FakeDoor::default()));
+    let mut rig = Rig::new("admission", Arc::new(FakeDoor::default()));
+    let reads = Arc::new(AtomicUsize::new(0));
+    rig.registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+        Arc::new(NeverOpen),
+        Some(Arc::new(CountingWalReads {
+            inner: rig.wal.clone(),
+            reads: reads.clone(),
+        })),
+        Some(rig.index.clone()),
+        None,
+    ));
     std::fs::write(
         rig.root.join("wal/not-a-valid-address.wal"),
         b"must not be read",
     )
     .unwrap();
     let forged = BindIdentity::new("/untrusted", "reserved:entorhinal", "forged");
-    std::fs::write(
-        rig.wal.wal_path(&forged),
-        b"scope authorization must not read this WAL",
-    )
-    .unwrap();
+    // Readable unscoped history would refuse scope adoption. Count the actual
+    // read seam too: unreadable history is deliberately ignored by bind adoption.
+    rig.seed(&forged, "unscoped-history", true);
     for principal in [
         Value::Null,
         json!({"kind":"direct"}),
@@ -563,6 +590,11 @@ async fn stamped_principal_admission_precedes_json_and_every_store_read() {
         }
     }
     assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "an internal bind or forbidden RPC read WAL history"
+    );
     assert!(!rig.root.join("agent-data").exists());
 }
 

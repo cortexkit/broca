@@ -480,6 +480,9 @@ impl MoveDriver for Driver {
                         Ok(bytes) => bytes,
                         Err(error) => match error.verification_cause {
                             Some(cause) => {
+                                // Divergence entries carry only a state, not a
+                                // per-ref message. Keep the cause in ERROR logs
+                                // without adding fields or logging WAL content.
                                 tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
                                 sealed = false;
                                 local
