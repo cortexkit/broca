@@ -766,8 +766,10 @@ impl SubcConnection {
         frame: Frame,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<(), ApprovedCallError> {
-        // Reserving capacity can race a signal. No await may separate this final
-        // check from the push: entering the writer queue is the send boundary.
+        // A clear final signal observation below is the linearization point: the
+        // call is committed to send. Cancellation after that observation, even
+        // from another thread before permit.send executes, is treated as after
+        // the send. No await separates the observation from the synchronous push.
         if signals.interrupted() {
             return Err(ApprovedCallError::NotSent {
                 reason: "approved_dispatch_stopped_before_enqueue",
