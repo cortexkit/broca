@@ -43,7 +43,6 @@ use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::process::Child;
 use tokio::sync::Notify;
 use tokio::time::{sleep, Instant};
 
@@ -566,7 +565,7 @@ fn tool_manifest() -> subc_protocol::manifest::ModuleManifest {
 /// One live rig on one state root: the daemon (supervising `ck-broca` and the stand-in), the
 /// in-process tool provider, and the caller connections opened on it.
 struct Live {
-    daemon: Option<Child>,
+    daemon: Option<broca_test_support::RigChild>,
     connection_file: PathBuf,
     stranger_nonce: PathBuf,
     state_root: PathBuf,
@@ -579,7 +578,7 @@ struct Live {
 impl Live {
     /// Every process the daemon supervises, by pid and command name.
     fn children(&self) -> Vec<(i32, String)> {
-        let Some(pid) = self.daemon.as_ref().and_then(Child::id) else {
+        let Some(pid) = self.daemon.as_ref().and_then(|child| child.id()) else {
             return Vec::new();
         };
         let output = std::process::Command::new("pgrep")
@@ -727,13 +726,14 @@ impl BrocaSubject {
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
         let daemon = broca_test_support::retry_executable_file_busy(|| {
-            tokio::process::Command::new(
-                broca_test_support::ckdev_command(
+            broca_test_support::tokio_rig_command(
+                broca_test_support::ckdev_binary(
                     sibling_bin("ck-subc", "SUBC_CORE_BIN"),
                     broca_test_support::scratch_root(),
-                )
-                .get_program(),
-            )
+                ),
+                root,
+                "daemon",
+            )?
             .env("XDG_CONFIG_HOME", &config_home)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("XDG_DATA_HOME", &data_home)
@@ -747,6 +747,7 @@ impl BrocaSubject {
             .spawn()
         })
         .map_err(|e| fail(format!("spawning ck-subc: {e}")))?;
+        let daemon = broca_test_support::RigChild::new(daemon, root, "daemon");
         let deadline = Instant::now() + Duration::from_secs(20);
         while !connection_file.exists() {
             if Instant::now() >= deadline {

@@ -2472,9 +2472,44 @@ async fn session_send_refuses_an_unknown_service_tier_before_starting_a_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Health reports lifetime projection failures, including failures from earlier
+// tests in this binary. Re-execute probes of a healthy process with fresh metrics
+// instead of resetting production counters or relaxing their exact assertions.
+async fn isolated_health_probe(test: &str) -> bool {
+    const CHILD_TEST: &str = "BROCA_ISOLATED_HEALTH_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+        return true;
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD_TEST, test)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("isolated health probe must finish within 30s")
+    .expect("spawn isolated health probe");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated health probe {test} failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// A channel-0 health.check returns registry counts and dependency states from memory.
 #[tokio::test]
 async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
+    if !isolated_health_probe(
+        "wire::health_check_reports_slot_counts_and_stale_lkg_without_degrading",
+    )
+    .await
+    {
+        return;
+    }
     let _drop_counter_guard = SERVE_FRAME_DROP_COUNTER_TEST_LOCK.lock().await;
     // The serve binary publishes the table it loaded before serving; this harness has no
     // config, so it publishes the shipped table the same way.
@@ -2940,6 +2975,9 @@ async fn a_vanished_project_root_refuses_execute_ops_but_still_admits_run_ops() 
 /// Vault health distinguishes never-connected, connected, broken, and cached-fallback states.
 #[tokio::test]
 async fn health_check_vault_gauge_flips_on_stamped_outcomes() {
+    if !isolated_health_probe("wire::health_check_vault_gauge_flips_on_stamped_outcomes").await {
+        return;
+    }
     let dir = tmpdir("health-gauge");
     let reg = registry(&dir);
     let gauge = broca_module_serve::serve::VaultGauge::disconnected();
@@ -5601,6 +5639,16 @@ impl PreparedWalRoute {
         damage: impl FnOnce(&Path),
         reader: Option<Arc<dyn broca_core::WalStore>>,
     ) -> Self {
+        Self::start_with_authorization(tag, damage, reader, None, None).await
+    }
+
+    async fn start_with_authorization(
+        tag: &str,
+        damage: impl FnOnce(&Path),
+        reader: Option<Arc<dyn broca_core::WalStore>>,
+        first_principal: Option<broca_protocol::BindPrincipal>,
+        principal: Option<subc_protocol::Principal>,
+    ) -> Self {
         let dir = tmpdir(tag);
         let (mut reg, wal) = registry_and_wal(&dir);
         if let Some(reader) = reader {
@@ -5622,6 +5670,57 @@ impl PreparedWalRoute {
         let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
         {
             let mut file = wal.open(&session).expect("create the session WAL");
+            if let Some(principal) = first_principal {
+                let ownership_scope = broca_protocol::SessionScope {
+                    owner: broca_protocol::BindPrincipal::Reserved {
+                        module_id: "prefrontal-core".into(),
+                    },
+                    scope_ref: "flow-1".into(),
+                    scope_epoch: 1,
+                    flow_id: Some("flow-1".into()),
+                    sender: Some(principal.clone()),
+                    agent_id: None,
+                    run_id: None,
+                };
+                file.append(
+                    1,
+                    &WalRecord::RunStarted {
+                        retention: None,
+                        hooks: None,
+                        title: None,
+                        on_restart: None,
+                        keep_warm: None,
+                        marker_order_version: None,
+                        manifest: None,
+                        scope: Some(ownership_scope),
+                        send_id: None,
+                        request_identity_digest: None,
+                        project_id: None,
+                        principal: Some(principal),
+                        run_id: RunId("protected".into()),
+                        session: session.clone(),
+                        ts_ms: None,
+                        config: Box::new(min_config()),
+                        input: vec![].into(),
+                        origin: broca_wal::RunOrigin::Fresh,
+                        submission_id: None,
+                    },
+                    true,
+                )
+                .unwrap();
+                file.append(
+                    1,
+                    &WalRecord::RunFinished {
+                        reason: RunFinishReason::Completed,
+                        ts_ms: None,
+                        usage: Usage::default(),
+                        error: None,
+                        retries_used: 0,
+                    },
+                    true,
+                )
+                .unwrap();
+            }
             for seq in 1..=2 {
                 file.append(
                     1,
@@ -5670,6 +5769,17 @@ impl PreparedWalRoute {
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
 
+        let bind_scope = principal.as_ref().map(|_| {
+            let mut stamp = subc_protocol::scope::ScopeStamp::new(
+                prefrontal_core(),
+                "flow-1",
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true);
+            stamp.attributes.flow_id = Some("flow-1".into());
+            stamp
+        });
         let bind = ModuleControlRequest::RouteBind {
             route_channel: 7,
             epoch: 1,
@@ -5681,10 +5791,10 @@ impl PreparedWalRoute {
                 session.harness.clone(),
                 session.session.clone(),
             ),
-            principal: None,
+            principal,
             consumer_capabilities: None,
             admission_facts: None,
-            scope: None,
+            scope: bind_scope,
             role_versions: None,
             call_mode: None,
         };
@@ -6707,4 +6817,157 @@ async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads(
     );
     assert_eq!(std::fs::read(&route.wal_path).unwrap(), before);
     route.finish().await;
+}
+
+#[tokio::test]
+async fn authorization_precedes_migration_and_validation_for_moved_sessions() {
+    for pending_release in [false, true] {
+        let mut route = protected_moved_route("prefrontal-core", pending_release).await;
+        let before = std::fs::read(&route.wal_path).unwrap();
+        for (i, method) in [
+            "session.send",
+            "session.warm",
+            "session.import",
+            "run.cancel",
+            "session.retract",
+            "session.read",
+            "session.head",
+            "run.result",
+            "run.status",
+            "session.subscribe",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = route
+                .expect_error(
+                    i as u64 + 2,
+                    serde_json::json!({"method":method,"params":{"unknown":true}}),
+                )
+                .await;
+            let error: ErrorBody = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                error.code,
+                if matches!(method, "run.cancel" | "session.retract") {
+                    "scope_owner_mismatch"
+                } else {
+                    "sender_not_owner"
+                },
+                "{method}, pending release: {pending_release}, {error:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&route.wal_path).unwrap(), before);
+        route.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn authorized_moved_sessions_keep_operation_specific_fences() {
+    for pending_release in [false, true] {
+        let mut route = protected_moved_route("basal", pending_release).await;
+        let before = std::fs::read(&route.wal_path).unwrap();
+        for (i, method) in [
+            "session.send",
+            "session.warm",
+            "session.import",
+            "run.cancel",
+            "session.retract",
+            "session.read",
+            "session.head",
+            "run.result",
+            "run.status",
+            "session.subscribe",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = route
+                .expect_error(
+                    i as u64 + 2,
+                    serde_json::json!({"method":method,"params":{"unknown":true}}),
+                )
+                .await;
+            let error: ErrorBody = serde_json::from_slice(&body).unwrap();
+            let write = matches!(
+                method,
+                "session.send"
+                    | "session.warm"
+                    | "session.import"
+                    | "run.cancel"
+                    | "session.retract"
+            );
+            assert_eq!(
+                error.code,
+                if pending_release && write {
+                    "session_moving"
+                } else {
+                    "session_moved"
+                },
+                "{method}, pending release: {pending_release}, {error:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&route.wal_path).unwrap(), before);
+        route.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn unreadable_moved_ownership_fails_closed_without_repair() {
+    let mut route = protected_moved_route("prefrontal-core", true).await;
+    corrupt_first_frame(&route.wal_path);
+    let before = std::fs::read(&route.wal_path).unwrap();
+    for (i, method) in [
+        "session.send",
+        "run.cancel",
+        "session.retract",
+        "session.read",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = route
+            .expect_error(
+                i as u64 + 2,
+                serde_json::json!({"method":method,"params":{"unknown":true}}),
+            )
+            .await;
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "open_failed", "{method}: {error:?}");
+    }
+    assert_eq!(std::fs::read(&route.wal_path).unwrap(), before);
+    route.finish().await;
+}
+
+async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWalRoute {
+    let route = PreparedWalRoute::start_with_authorization(
+        "protected-moved-wire",
+        |_| {},
+        None,
+        Some(broca_protocol::BindPrincipal::Reserved {
+            module_id: first.into(),
+        }),
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "basal".into(),
+        }),
+    )
+    .await;
+    if pending_release {
+        let reference = cortexkit_role_llm_runner::session_ref(
+            "runner",
+            &route.dir.join("proj").to_string_lossy(),
+            "s1",
+        );
+        broca_wal::migration::atomic_json(&route.dir.join("agent-data/cuts/cut-a.json"),
+            &serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
+    }
+    broca_wal::migration::atomic_json(
+        &route.wal_path.with_extension("moved"),
+        &broca_wal::migration::Moved {
+            cut_id: "cut-a".into(),
+            holder: "remote".into(),
+            lineage_id: "lineage".into(),
+        },
+    )
+    .unwrap();
+    route
 }

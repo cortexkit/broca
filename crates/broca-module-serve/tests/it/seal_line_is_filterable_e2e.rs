@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::time::{sleep, Instant};
 
 /// A sibling-checkout subc binary, env-overridable, matching the other rigs here.
@@ -52,6 +52,7 @@ struct Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -114,7 +115,8 @@ impl Rig {
             .expect("write subc config");
 
         let connection_file = runtime_dir.join("subc-connection.json");
-        let child = Command::new(subc_core)
+        let child = broca_test_support::tokio_rig_command(&subc_core, &dir, "daemon")
+            .expect("create daemon log files")
             .env("XDG_CONFIG_HOME", &config_home)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("XDG_DATA_HOME", &data_home)

@@ -662,7 +662,7 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
 // ---- the rig -----------------------------------------------------------------------------------
 
 struct Rig {
-    daemon: tokio::process::Child,
+    daemon: broca_test_support::RigChild,
     connection_file: PathBuf,
     state_root: PathBuf,
     project_root: PathBuf,
@@ -689,7 +689,7 @@ impl Drop for Rig {
                     .status();
             }
         }
-        let _ = self.daemon.start_kill();
+        broca_test_support::kill_and_reap(&mut self.daemon);
     }
 }
 
@@ -850,7 +850,7 @@ impl Rig {
         .unwrap();
         let connection_file = runtime_dir.join("subc-connection.json");
         let daemon = broca_test_support::retry_executable_file_busy(|| {
-            tokio::process::Command::new(&daemon_bin)
+            broca_test_support::tokio_rig_command(&daemon_bin, &root, "daemon")?
                 .env("XDG_CONFIG_HOME", &config_home)
                 .env("XDG_RUNTIME_DIR", &runtime_dir)
                 .env("XDG_DATA_HOME", &data_home)
@@ -863,6 +863,7 @@ impl Rig {
                 .spawn()
         })
         .expect("spawn ck-subc");
+        let daemon = broca_test_support::RigChild::new(daemon, &root, "daemon");
         let deadline = Instant::now() + Duration::from_secs(20);
         while !connection_file.exists() {
             assert!(
@@ -2044,7 +2045,10 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
     assert_eq!(value["auth"]["path"], "routed");
 }
 
-// Regenerate only from the daemon's real run.status reply with BROCA_UPDATE_GOLDEN=1.
+// This test needs the test-clock feature: FileWalStore then reads the injected
+// small WAL cap. Regenerate the golden from the spawned daemon's run.status reply
+// with BROCA_UPDATE_GOLDEN=1, so it covers the served error rather than a fixture.
+#[cfg(feature = "test-clock")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_too_large_status_matches_golden_through_real_serve() {
     let rig = Rig::start()

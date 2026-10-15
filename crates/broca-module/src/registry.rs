@@ -362,6 +362,7 @@ enum Entry {
     /// An open is in flight; waiters await `ready` (a `Result`, so an open FAILURE wakes
     /// them with the error instead of hanging — finding 10).
     Opening {
+        gen: u64,
         ready: broadcast::Sender<Result<ActorHandle, OpenError>>,
     },
     /// An actor is live. `gen` is its identity (a finalizer/close only acts on its OWN
@@ -369,7 +370,10 @@ enum Entry {
     Open { gen: u64, handle: ActorHandle },
     /// The actor is tearing down; ops await `done` then re-open (the close holds the slot
     /// so a new op can't race a half-torn state — finding 6/8).
-    Closing { done: broadcast::Sender<()> },
+    Closing {
+        gen: u64,
+        done: broadcast::Sender<()>,
+    },
     // (a Closed/Failed session is the ABSENT entry — removing the slot.)
 }
 
@@ -446,6 +450,62 @@ pub struct LineageRegistry {
     inner: Arc<Inner>,
 }
 
+/// A failed durability boundary. Historical events survive successful session recovery.
+#[derive(Clone, Debug)]
+pub struct SealFailure {
+    pub session: String,
+    pub generation: u64,
+    pub stage: SealFailureStage,
+    pub timestamp: std::time::SystemTime,
+    pub error: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealFailureStage {
+    Seal,
+    SealDeadline,
+    FinalSync,
+    WriterShutdown,
+}
+
+#[derive(Default)]
+struct SealState {
+    failures: Vec<SealFailure>,
+    recovery_debt: HashMap<LineageKey, SealFailure>,
+}
+
+/// Snapshot at the final stop's return point, not a later sampling of the actor slots.
+#[derive(Clone, Debug)]
+pub struct ShutdownReport {
+    pub complete: bool,
+    pub cause: &'static str,
+    pub elapsed: std::time::Duration,
+    pub budget: std::time::Duration,
+    pub remaining_sessions: Vec<(String, &'static str)>,
+    pub current_failures: Vec<SealFailure>,
+    pub lifetime_failures: usize,
+    pub recovery_debt: Vec<SealFailure>,
+    pub latest_failure: Option<SealFailure>,
+}
+
+impl std::fmt::Display for ShutdownReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; elapsed={:?}; budget={:?}; remaining_sessions={:?}; current_failures={:?}; lifetime_failures={}; recovery_debt_sessions={}; recovery_debt={:?}; latest_failure={:?}",
+            self.cause,
+            self.elapsed,
+            self.budget,
+            self.remaining_sessions,
+            self.current_failures,
+            self.lifetime_failures,
+            self.recovery_debt.len(),
+            self.recovery_debt,
+            self.latest_failure,
+        )
+    }
+}
+
 pub struct MoveSessionGuard {
     gates: Vec<tokio::sync::OwnedMutexGuard<()>>,
     actors: Vec<tokio::sync::oneshot::Sender<()>>,
@@ -489,13 +549,8 @@ struct Inner {
     cap_store: Option<Arc<dyn broca_core::CapStore>>,
     stopping: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
-    seal_failed: AtomicBool,
-    // Preserve the failing return point and its slot snapshot for test assertions. Sampling
-    // later can miss an actor that closes between the failed stop and the assertion.
-    #[cfg(test)]
-    stop_failure: Mutex<String>,
-    #[cfg(test)]
-    seal_errors: Mutex<Vec<(LineageKey, String)>>,
+    seal_state: Mutex<SealState>,
+    shutdown_report: Mutex<Option<ShutdownReport>>,
     #[cfg(test)]
     actor_panics: AtomicU64,
     restart_resume_ready: AtomicBool,
@@ -654,6 +709,12 @@ enum RoutedPage {
 struct ReadSources {
     wal_store: Arc<dyn broca_core::WalStore>,
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadPurpose {
+    Session,
+    Authorization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,11 +896,8 @@ impl LineageRegistry {
                 cap_store,
                 stopping: tokio_util::sync::CancellationToken::new(),
                 seal: tokio_util::sync::CancellationToken::new(),
-                seal_failed: AtomicBool::new(false),
-                #[cfg(test)]
-                stop_failure: Mutex::new(String::new()),
-                #[cfg(test)]
-                seal_errors: Mutex::new(Vec::new()),
+                seal_state: Mutex::new(SealState::default()),
+                shutdown_report: Mutex::new(None),
                 #[cfg(test)]
                 actor_panics: AtomicU64::new(0),
                 restart_resume_ready: AtomicBool::new(false),
@@ -932,7 +990,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
     ) -> Result<Option<Option<broca_protocol::BindPrincipal>>, OpenError> {
-        match self.check_expired(key, None).await {
+        match self.check_authorization_expired(key).await {
             Err(OpenError::Expired { .. }) => return Ok(None),
             Err(error) => return Err(error),
             Ok(()) => {}
@@ -966,7 +1024,9 @@ impl LineageRegistry {
                 }
             }
         }
-        let (records, _) = self.read_durable_wal(key).await?;
+        let (records, _) = self
+            .read_durable_wal_for(key, ReadPurpose::Authorization)
+            .await?;
         let sender = records.iter().find_map(|frame| match &frame.record {
             broca_wal::WalRecord::RunStarted { principal, .. }
             | broca_wal::WalRecord::Queued { principal, .. } => Some(principal.clone()),
@@ -988,7 +1048,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
-        self.check_expired(key, None).await?;
+        self.check_authorization_expired(key).await?;
         let live = {
             let slots = self.inner.slots.lock().unwrap();
             match slots.get(key) {
@@ -1042,7 +1102,7 @@ impl LineageRegistry {
         // so their owner lookup reads the WAL. A failed store read needs the same fallback,
         // not an assumption that no owner was recorded.
         let range = self
-            .read_durable_range(reader, key, 0, None, live_head)
+            .read_durable_range_for(reader, key, 0, None, live_head, ReadPurpose::Authorization)
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
@@ -1080,12 +1140,13 @@ impl LineageRegistry {
             return Ok(None);
         }
         let range = match self
-            .read_durable_range(
+            .read_durable_range_for(
                 reader,
                 key,
                 snapshot.watermark_seq,
                 snapshot.anchor,
                 live_head,
+                ReadPurpose::Authorization,
             )
             .await
         {
@@ -1270,12 +1331,18 @@ impl LineageRegistry {
                         let (tx, rx) = broadcast::channel(1);
                         let _ = rx; // a fresh subscribe below gets the value
                         let gen = self.inner.next_gen.fetch_add(1, Ordering::SeqCst);
-                        slots.insert(key.clone(), Entry::Opening { ready: tx.clone() });
+                        slots.insert(
+                            key.clone(),
+                            Entry::Opening {
+                                gen,
+                                ready: tx.clone(),
+                            },
+                        );
                         Action::Open(tx, gen)
                     }
-                    Some(Entry::Opening { ready }) => Action::Wait(ready.subscribe()),
+                    Some(Entry::Opening { ready, .. }) => Action::Wait(ready.subscribe()),
                     Some(Entry::Open { handle, .. }) => Action::Have(handle.clone()),
-                    Some(Entry::Closing { done }) => Action::WaitClose(done.subscribe()),
+                    Some(Entry::Closing { done, .. }) => Action::WaitClose(done.subscribe()),
                 }
             };
             drop(cut_gate);
@@ -1808,12 +1875,43 @@ impl LineageRegistry {
         anchor: Option<broca_wal::WalByteAnchor>,
         live_head: Option<u64>,
     ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        self.read_durable_range_for(
+            reader,
+            key,
+            after_seq,
+            anchor,
+            live_head,
+            ReadPurpose::Session,
+        )
+        .await
+    }
+
+    async fn read_durable_range_for(
+        &self,
+        reader: &ReadSources,
+        key: &LineageKey,
+        after_seq: u64,
+        anchor: Option<broca_wal::WalByteAnchor>,
+        live_head: Option<u64>,
+        purpose: ReadPurpose,
+    ) -> Result<broca_wal::WalRangeRead, OpenError> {
         let range_read = |through_seq| {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             let read_anchor = anchor;
-            spawn_blocking(JobKind::WalRead, move || {
-                wal_store.read_records_range(&session, after_seq, through_seq, read_anchor.as_ref())
+            spawn_blocking(JobKind::WalRead, move || match purpose {
+                ReadPurpose::Session => wal_store.read_records_range(
+                    &session,
+                    after_seq,
+                    through_seq,
+                    read_anchor.as_ref(),
+                ),
+                ReadPurpose::Authorization => wal_store.read_records_range_for_authorization(
+                    &session,
+                    after_seq,
+                    through_seq,
+                    read_anchor.as_ref(),
+                ),
             })
         };
 
@@ -1833,7 +1931,10 @@ impl LineageRegistry {
         let identity_before = spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
-            move || wal_store.file_identity(&session)
+            move || match purpose {
+                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
+            }
         })
         .await
         .ok()
@@ -1871,7 +1972,10 @@ impl LineageRegistry {
         let flush_identity = match spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
-            move || wal_store.flush_for_read(&session)
+            move || match purpose {
+                ReadPurpose::Session => wal_store.flush_for_read(&session),
+                ReadPurpose::Authorization => wal_store.flush_for_authorization(&session),
+            }
         })
         .await
         {
@@ -1912,7 +2016,10 @@ impl LineageRegistry {
         let identity_after = spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
-            move || wal_store.file_identity(&session)
+            move || match purpose {
+                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
+            }
         })
         .await
         .ok()
@@ -2098,7 +2205,24 @@ impl LineageRegistry {
         ),
         OpenError,
     > {
-        self.check_expired(key, None).await?;
+        self.read_durable_wal_for(key, ReadPurpose::Session).await
+    }
+
+    async fn read_durable_wal_for(
+        &self,
+        key: &LineageKey,
+        purpose: ReadPurpose,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+        ),
+        OpenError,
+    > {
+        match purpose {
+            ReadPurpose::Session => self.check_expired(key, None).await?,
+            ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
+        }
         let Some(reader) = &self.inner.reader else {
             return Err(OpenError::Open(
                 "session.read reader is not configured".into(),
@@ -2114,7 +2238,7 @@ impl LineageRegistry {
             }
         };
         let range = self
-            .read_durable_range(reader, key, 0, None, live_head)
+            .read_durable_range_for(reader, key, 0, None, live_head, purpose)
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
@@ -2691,7 +2815,9 @@ impl LineageRegistry {
     /// The actors' five-second deadline covers the Interrupted write, not child/writer joins.
     /// A blocked join retains its slot and lease until complete; this method still returns at
     /// the total deadline, leaving process exit to end the writer without releasing its lease early.
-    /// False means some actors could not finish: leave their WAL to crash recovery, not cancellation.
+    /// False means actors present during this stop could not finish: leave their WAL to crash
+    /// recovery, not cancellation. Earlier failures do not taint this result; unresolved recovery
+    /// debt and lifetime failure events remain visible in [`Self::shutdown_report`].
     ///
     /// The ceiling is subc's default module drain timeout, 30 seconds. The supervisor drains
     /// routes, sends GOODBYE on channel 0, then waits for child exit before SIGKILL. Changing
@@ -2717,7 +2843,22 @@ impl LineageRegistry {
         grace: std::time::Duration,
         total: std::time::Duration,
     ) -> bool {
-        self.begin_stop();
+        // Include failures already reported by a closing slot that still belongs to this stop,
+        // but never import a previous generation's failure when its session has reopened.
+        let (stopping_generations, first_failure) = {
+            let slots = self.inner.slots.lock().unwrap();
+            let generations: HashSet<_> = slots
+                .values()
+                .map(|entry| match entry {
+                    Entry::Opening { gen, .. }
+                    | Entry::Open { gen, .. }
+                    | Entry::Closing { gen, .. } => *gen,
+                })
+                .collect();
+            let first_failure = self.inner.seal_state.lock().unwrap().failures.len();
+            self.begin_stop();
+            (generations, first_failure)
+        };
         let started = tokio::time::Instant::now();
         let deadline = started + total;
         while started.elapsed() < grace.min(total) {
@@ -2734,20 +2875,22 @@ impl LineageRegistry {
         loop {
             let counts = self.slot_counts();
             if counts.open + counts.opening + counts.closing == 0 {
-                #[cfg(test)]
-                if self.inner.seal_failed.load(Ordering::Acquire) {
-                    self.record_stop_failure("actor bounded shutdown seal failed", started, total);
-                }
-                return !self.inner.seal_failed.load(Ordering::Acquire);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                #[cfg(test)]
-                self.record_stop_failure(
-                    "registry total shutdown deadline expired",
+                return self.record_shutdown_report(
+                    &stopping_generations,
+                    first_failure,
+                    false,
                     started,
                     total,
                 );
-                return false;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return self.record_shutdown_report(
+                    &stopping_generations,
+                    first_failure,
+                    true,
+                    started,
+                    total,
+                );
             }
             tokio::time::sleep_until(
                 (tokio::time::Instant::now() + std::time::Duration::from_millis(10)).min(deadline),
@@ -2756,14 +2899,15 @@ impl LineageRegistry {
         }
     }
 
-    #[cfg(test)]
-    fn record_stop_failure(
+    fn record_shutdown_report(
         &self,
-        cause: &str,
+        stopping_generations: &HashSet<u64>,
+        first_failure: usize,
+        deadline_expired: bool,
         started: tokio::time::Instant,
         total: std::time::Duration,
-    ) {
-        let remaining: Vec<_> = self
+    ) -> bool {
+        let mut remaining_sessions: Vec<_> = self
             .inner
             .slots
             .lock()
@@ -2775,19 +2919,76 @@ impl LineageRegistry {
                     Entry::Opening { .. } => "opening",
                     Entry::Closing { .. } => "closing",
                 };
-                (key.clone(), state)
+                (key.session.clone(), state)
             })
             .collect();
-        let errors = self.inner.seal_errors.lock().unwrap();
-        *self.inner.stop_failure.lock().unwrap() = format!(
-            "{cause}; elapsed={:?}; total={total:?}; remaining_sessions={remaining:?}; seal_errors={errors:?}",
-            started.elapsed()
-        );
+        remaining_sessions.sort_unstable();
+        let state = self.inner.seal_state.lock().unwrap();
+        let current_failures = state
+            .failures
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                *index >= first_failure || stopping_generations.contains(&event.generation)
+            })
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+        let complete =
+            !deadline_expired && remaining_sessions.is_empty() && current_failures.is_empty();
+        let cause = if deadline_expired {
+            "registry total shutdown deadline expired"
+        } else if !remaining_sessions.is_empty() {
+            "shutdown slots remaining"
+        } else if current_failures
+            .iter()
+            .any(|event| event.stage == SealFailureStage::SealDeadline)
+        {
+            "actor shutdown seal deadline expired"
+        } else if current_failures.iter().any(|event| {
+            matches!(
+                event.stage,
+                SealFailureStage::FinalSync | SealFailureStage::WriterShutdown
+            )
+        }) {
+            "fresh final-sync or writer shutdown failure"
+        } else if !current_failures.is_empty() {
+            "actor bounded shutdown seal failed"
+        } else {
+            "current shutdown complete"
+        };
+        let mut recovery_debt: Vec<_> = state.recovery_debt.values().cloned().collect();
+        recovery_debt.sort_by(|a, b| a.session.cmp(&b.session));
+        *self.inner.shutdown_report.lock().unwrap() = Some(ShutdownReport {
+            complete,
+            cause,
+            elapsed: started.elapsed(),
+            budget: total,
+            remaining_sessions,
+            current_failures,
+            lifetime_failures: state.failures.len(),
+            recovery_debt,
+            latest_failure: state.failures.last().cloned(),
+        });
+        complete
     }
 
-    #[cfg(test)]
-    pub(crate) fn stop_failure_diagnostics(&self) -> String {
-        self.inner.stop_failure.lock().unwrap().clone()
+    pub fn shutdown_report(&self) -> Option<ShutdownReport> {
+        self.inner.shutdown_report.lock().unwrap().clone()
+    }
+
+    pub fn seal_failures(&self) -> Vec<SealFailure> {
+        self.inner.seal_state.lock().unwrap().failures.clone()
+    }
+
+    pub fn recovery_debt(&self) -> Vec<SealFailure> {
+        self.inner
+            .seal_state
+            .lock()
+            .unwrap()
+            .recovery_debt
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Cheap inspection: count how many registry slots are opening, open, or closing.
@@ -2836,7 +3037,7 @@ impl LineageRegistry {
             let closed = {
                 let slots = self.inner.slots.lock().unwrap();
                 match slots.get(key) {
-                    Some(Entry::Closing { done }) => Some(done.subscribe()),
+                    Some(Entry::Closing { done, .. }) => Some(done.subscribe()),
                     None => return,
                     Some(Entry::Opening { .. } | Entry::Open { .. }) => None,
                 }
@@ -3168,17 +3369,42 @@ impl RegistryHandle {
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(crate) fn report_seal_failure(&self) {
-        self.inner.seal_failed.store(true, Ordering::Release);
+    pub(crate) fn report_seal_failure(
+        &self,
+        key: &LineageKey,
+        generation: u64,
+        stage: SealFailureStage,
+        error: String,
+    ) {
+        let event = SealFailure {
+            session: key.session.clone(),
+            generation,
+            stage,
+            timestamp: std::time::SystemTime::now(),
+            error,
+        };
+        let mut state = self.inner.seal_state.lock().unwrap();
+        state.failures.push(event.clone());
+        state.recovery_debt.insert(key.clone(), event);
     }
 
-    #[cfg(test)]
-    pub(crate) fn report_seal_error(&self, key: &LineageKey, error: String) {
+    pub(crate) fn has_recovery_debt(&self, key: &LineageKey) -> bool {
         self.inner
-            .seal_errors
+            .seal_state
             .lock()
             .unwrap()
-            .push((key.clone(), error));
+            .recovery_debt
+            .contains_key(key)
+    }
+
+    /// Only the actor's successful replay/recovery followed by a sync may discharge this debt.
+    pub(crate) fn report_recovered(&self, key: &LineageKey) {
+        self.inner
+            .seal_state
+            .lock()
+            .unwrap()
+            .recovery_debt
+            .remove(key);
     }
 
     pub(crate) fn is_stopping(&self) -> bool {
@@ -3205,7 +3431,13 @@ impl RegistryHandle {
         match slots.get(key) {
             Some(Entry::Open { gen: g, .. }) if *g == gen => {
                 let (done, _rx) = broadcast::channel(1);
-                slots.insert(key.clone(), Entry::Closing { done: done.clone() });
+                slots.insert(
+                    key.clone(),
+                    Entry::Closing {
+                        gen,
+                        done: done.clone(),
+                    },
+                );
                 #[cfg(test)]
                 self.inner
                     .close_started
@@ -3788,7 +4020,7 @@ mod tests {
         let (dummy_tx, _rx) = mpsc::channel(1);
 
         let mut slots = reg.inner.slots.lock().unwrap();
-        slots.insert(opening_key, Entry::Opening { ready });
+        slots.insert(opening_key, Entry::Opening { gen: 1, ready });
         slots.insert(
             open_key,
             Entry::Open {
@@ -3803,7 +4035,7 @@ mod tests {
                 },
             },
         );
-        slots.insert(closing_key, Entry::Closing { done });
+        slots.insert(closing_key, Entry::Closing { gen: 3, done });
         drop(slots);
 
         assert_eq!(
@@ -3934,12 +4166,13 @@ mod tests {
         let registry = LineageRegistry::new(Arc::new(GatedOpener { park, release }));
         let session = key();
         let (done, _done_rx) = broadcast::channel(1);
-        registry
-            .inner
-            .slots
-            .lock()
-            .unwrap()
-            .insert(session.clone(), Entry::Closing { done: done.clone() });
+        registry.inner.slots.lock().unwrap().insert(
+            session.clone(),
+            Entry::Closing {
+                gen: 1,
+                done: done.clone(),
+            },
+        );
 
         let registry_for_open = registry.clone();
         let session_for_open = session.clone();
@@ -4496,6 +4729,15 @@ impl LineageRegistry {
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) fn expiry_probe_for_test(&self, probe: Arc<dyn Fn() + Send + Sync>) {
         *self.inner.expiry_read_probe.lock().unwrap() = Some(probe);
+    }
+
+    async fn check_authorization_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.check_expired(key, None).await {
+            // Ownership must be checked against the old copy before disclosing a move or cut.
+            // The request's operation-specific move check runs after authorization succeeds.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => Ok(()),
+            result => result,
+        }
     }
 
     async fn check_expired(&self, key: &LineageKey, run: Option<&str>) -> Result<(), OpenError> {

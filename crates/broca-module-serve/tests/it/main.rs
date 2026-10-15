@@ -20,6 +20,9 @@
 //! - `scope_real_daemon_e2e` replays scope admission mutations against real daemons, independently
 //!   of the unrelated provider and vault fixtures in this target.
 //!
+//! The two wire health probes also need fresh lifetime projection metrics. They
+//! re-execute their exact test names in a child, so this target still runs them.
+//!
 //! Several rigs here remove `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` from this process's own
 //! environment. That is safe to share: the removal only ever moves toward the state every test here
 //! wants, and nothing restores the variables.

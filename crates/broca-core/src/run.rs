@@ -448,10 +448,18 @@ pub struct RunSummary {
     pub final_step_finish_reason: Option<FinishReason>,
 }
 
+#[cfg(all(test, feature = "test-clock"))]
+pub(crate) struct ApprovalWaitProbe {
+    entered: mpsc::UnboundedSender<(bool, bool)>,
+    release: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+}
+
 /// Cooperative run controls. Optional controls default to "off"; ordinary control-payload
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    #[cfg(all(test, feature = "test-clock"))]
+    pub(crate) approval_wait_probe: Option<Arc<ApprovalWaitProbe>>,
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
@@ -608,6 +616,8 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            #[cfg(all(test, feature = "test-clock"))]
+            approval_wait_probe: None,
             clock: None,
             cancel: None,
             compaction_plane: None,
@@ -2861,9 +2871,8 @@ where
         .flatten();
     // The bounded reply channel owns queue storage for the whole run. Allocate it only
     // for a frozen compaction plan, so ordinary tool steps do not retain unused capacity.
-    let compaction_replies = compaction_item
-        .as_ref()
-        .map(|_| crate::compaction::runtime::CompactionReplies::new());
+    let compaction_replies =
+        crate::compaction::runtime::CompactionReplies::for_plan(compaction_item.is_some());
     #[cfg(feature = "test-clock")]
     let compaction_replies = compaction_replies.map(|replies| {
         replies.with_test_root(
@@ -10036,7 +10045,9 @@ mod approval_gate {
         let mut dispatched = HashSet::new();
         let mut cursor = None;
         let mut polling: Option<AnswerRead<'_>> = None;
-        let mut next_poll = 0;
+        let mut answer_poll = AnswerPollSchedule::default();
+        let clock = control.clock.clone().unwrap_or_default();
+        let mut clock_changes = clock.subscribe();
         let mut interruption = None;
         let mut waits = HashMap::<usize, CancellationToken>::new();
         let mut card_ids = HashMap::<usize, Arc<std::sync::Mutex<Option<String>>>>::new();
@@ -10299,15 +10310,14 @@ mod approval_gate {
                 marker(slots, ctx, writer, history).await?;
                 continue;
             }
-            if !stopping
-                && polling.is_none()
-                && now(control) >= next_poll
+            let needs_answers = !stopping
+                && control.elicitation_plane.is_some()
                 && !history
                     .projection
                     .obligations()
                     .expired_without_late_record
-                    .is_empty()
-            {
+                    .is_empty();
+            if polling.is_none() && answer_poll.ready(now(control)) && needs_answers {
                 if let Some(elicitation) = control.elicitation_plane.as_ref() {
                     let since = cursor.clone();
                     let snapshot = history.projection.clone();
@@ -10323,6 +10333,31 @@ mod approval_gate {
                         .await
                     }));
                 }
+            }
+            let timestamp = now(control);
+            let mut wake_at = if needs_answers && polling.is_none() {
+                answer_poll.next
+            } else {
+                u64::MAX
+            };
+            for (index, slot) in slots.iter().enumerate() {
+                if let Slot::Held(call) = slot {
+                    if stopping {
+                        continue;
+                    }
+                    if !call.approved {
+                        wake_at = wake_at.min(call.expires());
+                    }
+                    if !call.approved && !active.contains(&index) {
+                        wake_at = wake_at.min(call.retry_at);
+                    }
+                }
+            }
+            #[cfg(all(test, feature = "test-clock"))]
+            if let Some(probe) = &control.approval_wait_probe {
+                // Acknowledge the durable transition before tests advance the shared clock.
+                let _ = probe.entered.send((polling.is_some(), !jobs.is_empty()));
+                let _ = probe.release.lock().await.recv().await;
             }
             tokio::select! {
                 biased;
@@ -10405,10 +10440,17 @@ mod approval_gate {
                     }
                 }
                 page = async { match polling.as_mut() { Some(poll) => poll.await, None => std::future::pending().await } } => {
-                    polling = None; next_poll = now(control).saturating_add(50);
+                    polling = None;
+                    match &page {
+                        Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }
+                        _ => {}
+                    }
+                    if page.as_ref().is_ok_and(|polled| !polled.page.records.is_empty()) {
+                        answer_poll.reset_backoff();
+                    }
+                    // Even an incomplete or failed feed pass waits before another read.
+                    answer_poll.completed(now(control));
                     match page {
-                        Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }
-                        Err(error) if error.code == "consent_feed_budget_exhausted" => { next_poll = 0; }
                         Err(_) => {}
                         Ok(polled) => {
                             let page = polled.page;
@@ -10447,9 +10489,82 @@ mod approval_gate {
                     }
                 }
                 Some(event) = feedback.next() => { finish_feedback(event, ctx, writer, history, control).await?; }
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                _ = cancelled_token(control.cancel.as_ref()), if !stopping => {}
+                _ = cancelled_token(control.stop_requested.as_ref()), if !stopping => {}
+                _ = clock_changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_millis(wake_at.saturating_sub(timestamp))), if wake_at != u64::MAX => {}
             }
         }
+    }
+    #[derive(Default)]
+    struct AnswerPollSchedule {
+        next: u64,
+        delay: u64,
+    }
+
+    impl AnswerPollSchedule {
+        fn ready(&self, now: u64) -> bool {
+            now >= self.next
+        }
+
+        fn completed(&mut self, now: u64) {
+            // Only expired calls need feed polling; held cards have their own await.
+            // Empty/error reads back off from 50 ms to 1 s. The total feed-pass
+            // budget is separate, and cancellation and clock changes wake independently.
+            let delay = self.delay.max(50);
+            self.next = now.saturating_add(delay);
+            self.delay = (delay * 2).min(1000);
+        }
+
+        fn reset_backoff(&mut self) {
+            self.delay = 50;
+        }
+    }
+
+    #[tokio::test]
+    async fn late_feed_poll_count_is_bounded_and_mid_backoff_answer_meets_cap() {
+        let (ticks, mut clock) = tokio::sync::mpsc::channel(1);
+        let (observed, mut observations) = tokio::sync::mpsc::channel(1);
+        let (answer, mut answer_gate) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let mut schedule = AnswerPollSchedule::default();
+            let mut polls = 0;
+            let mut pickup = None;
+            while let Some(now) = clock.recv().await {
+                if schedule.ready(now) {
+                    polls += 1;
+                    if answer_gate.try_recv().is_ok() {
+                        pickup = Some(now);
+                    }
+                    schedule.completed(now);
+                }
+                observed.send((polls, pickup)).await.unwrap();
+            }
+        });
+        // Each clock advance is acknowledged before the next one; no scheduler or wall-time
+        // assumption decides how many reads the late-answer feed performs.
+        for now in 0..=5_000 {
+            ticks.send(now).await.unwrap();
+            observations.recv().await.unwrap();
+        }
+        answer.send(()).unwrap();
+        let mut last = (0, None);
+        for now in 5_001..=10_000 {
+            ticks.send(now).await.unwrap();
+            last = observations.recv().await.unwrap();
+        }
+        drop(ticks);
+        waiter.await.unwrap();
+        let (polls, pickup) = last;
+        assert!(
+            polls <= 15,
+            "late-answer feed performed {polls} reads in 10 seconds"
+        );
+        let pickup = pickup.expect("answer gate was never read");
+        assert!(
+            (5_001..=6_001).contains(&pickup),
+            "answer missed the 1 s pickup cap: {pickup}"
+        );
     }
     async fn cancelled_token(token: Option<&CancellationToken>) {
         cancelled(token).await

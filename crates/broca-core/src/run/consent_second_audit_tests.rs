@@ -71,7 +71,6 @@ fn seed_known_call(rig: &Rig) -> (String, WalRecord) {
 #[tokio::test]
 async fn healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await() {
     let mut rig = Rig::new("pass", "none", false, false);
-    rig.timeout = std::time::Duration::from_secs(24);
     let (key, prepared) = seed_known_call(&rig);
     rig.writer.sync().await.unwrap();
     let feed = Arc::new(SlowHealthyFeed {
@@ -92,9 +91,12 @@ async fn healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await() {
             elicitation_id: Some("known".into()),
         }],
     };
-    let result = rig
-        .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)
-        .await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(24),
+        rig.batch(&crate::AllowAll, vec![call("c")], Some(resume), false),
+    )
+    .await
+    .expect("healthy owner-feed traversal must finish across retry budgets");
     assert!(!result.results[0].is_error);
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 1);
     assert_eq!(feed.gets.load(Ordering::SeqCst), 1);
@@ -562,6 +564,8 @@ impl ElicitationPlane for BudgetConflictFeed {
 #[tokio::test]
 async fn live_feed_budget_preserves_prefix_until_later_conflict() {
     let mut rig = expired_run("pass").await;
+    // Expiry is already durable; continuation retry deadlines now use real time.
+    rig.control.clock = None;
     let mut prepared = rig
         .frames()
         .iter()

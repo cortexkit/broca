@@ -98,8 +98,11 @@ impl Session {
 
     fn forced_https(&self) -> bool {
         let policy = Arc::clone(&self.policy.read().unwrap());
+        // Evaluate on every attempt so config edits still take effect immediately. The
+        // callback may read disk; it must not hold up socket teardown or failure accounting.
+        let configured_https = policy();
         let state = self.state.lock().unwrap();
-        policy() || state.force_https || state.failures >= FAILURE_LIMIT
+        configured_https || state.force_https || state.failures >= FAILURE_LIMIT
     }
 
     async fn connection(
@@ -917,4 +920,31 @@ mod pump_tests {
         drop(server);
         task.await.unwrap();
     }
+}
+#[test]
+fn policy_read_does_not_hold_session_lock() {
+    let session = Arc::new(Session::default());
+    let (entered, read_started) = std::sync::mpsc::channel();
+    let (release, held_read) = std::sync::mpsc::channel();
+    let held_read = std::sync::Mutex::new(held_read);
+    session.set_policy(Arc::new(move || {
+        entered.send(()).unwrap();
+        held_read.lock().unwrap().recv().unwrap();
+        false
+    }));
+    let reader = session.clone();
+    let task = std::thread::spawn(move || reader.forced_https());
+    read_started.recv().unwrap();
+    let lock_available = session.state.try_lock().is_ok();
+    release.send(()).unwrap();
+    assert!(!task.join().unwrap());
+    assert!(
+        lock_available,
+        "transport config read held the session mutex"
+    );
+    session.set_policy(Arc::new(|| true));
+    assert!(
+        session.forced_https(),
+        "a later attempt must refresh policy"
+    );
 }

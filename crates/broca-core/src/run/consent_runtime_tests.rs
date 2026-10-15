@@ -291,6 +291,11 @@ async fn branch_c_two_sessions_keep_owner_feed_answers_without_ack() {
     let mut a = Rig::new("pass", "none", false, false);
     a.control.elicitation_plane = Some(feed.clone());
     let mut b = Rig::new("pass", "none", false, false);
+    assert_ne!(
+        a.writer.lineage_id(),
+        b.writer.lineage_id(),
+        "separate sessions require distinct consent call-key lineages"
+    );
     b.control.elicitation_plane = Some(feed.clone());
     let held = b.batch(&crate::AllowAll, vec![call("b")], None, false);
     let other = async {
@@ -384,7 +389,8 @@ async fn late_report_table_includes_expired_metadata_none_and_route_failure() {
 
 #[cfg(feature = "test-clock")]
 async fn approved_run() -> Rig {
-    let mut rig = Rig::new("pass", "approve", false, false);
+    let mut rig = Rig::file_backed("pass");
+    *rig.questions.answer.lock().unwrap() = "approve";
     rig.control.manifest = Some(Arc::new(frozen(
         vec![vec![
             sub("pre_tool", Some("approve"), "refuse"),
@@ -538,6 +544,7 @@ async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_r
         let writer = WalHandle::spawn(store.open(&rig.bind).unwrap(), 1).unwrap();
         let questions = Arc::new(Questions {
             store: crate::FileWalStore::new(&cut_root),
+            memory: None,
             completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lineage: writer.lineage_id().unwrap(),
             head: writer.durable_head(),

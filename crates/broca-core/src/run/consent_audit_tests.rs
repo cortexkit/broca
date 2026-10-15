@@ -376,7 +376,9 @@ async fn local_expiry_detaches_the_known_visible_card() {
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn approving_detach_readback_stays_not_sent_across_later_admission() {
-    let rig = expired_run_with_detach("pass", "approve").await;
+    let rig = Rig::file_backed("pass");
+    *rig.questions.detach_answer.lock().unwrap() = "approve";
+    let rig = expire_rig(rig).await;
     assert_eq!(
         rig.questions
             .reports
@@ -469,7 +471,7 @@ async fn approving_detach_readback_stays_not_sent_across_later_admission() {
 
 #[cfg(feature = "test-clock")]
 async fn copied_pending_late_episode(stopped: bool) -> Rig {
-    let mut rig = expired_run("pass").await;
+    let mut rig = expire_rig(Rig::file_backed("pass")).await;
     record_late_consent(&rig).await;
     let bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
     let broca_wal::framing::DecodeStep::Lineage { consumed, .. } =
@@ -501,6 +503,7 @@ async fn copied_pending_late_episode(stopped: bool) -> Rig {
     rig.tools = tools_for_store(crate::FileWalStore::new(&root), rig.bind.clone());
     rig.questions = Arc::new(Questions {
         store: crate::FileWalStore::new(&root),
+        memory: None,
         completed: rig.tools.completed.clone(),
         lineage: rig.writer.lineage_id().unwrap(),
         head: rig.writer.durable_head(),
@@ -660,7 +663,7 @@ async fn stopped_expired_sibling(cancel: bool) -> Rig {
         None,
         &out,
         None,
-        Some(&rig.tools.store),
+        Some(rig.wal_store()),
         None,
     ));
     let interrupt = async {
@@ -1332,7 +1335,8 @@ async fn live_wait_unreadable_page_retries_before_cursor_advance() {
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn ordinary_approved_cancel_during_intent_sync_is_not_sent() {
-    let mut rig = Rig::new("pass", "approve", false, false);
+    let mut rig = Rig::file_backed("pass");
+    *rig.questions.answer.lock().unwrap() = "approve";
     rig.writer.shutdown().await.unwrap();
     let gate = Arc::new(IntentSyncGate {
         entered: tokio::sync::Notify::new(),

@@ -144,6 +144,20 @@ pub trait WalStore: Send + Sync {
         Ok(WalRangeRead::without_anchors(records))
     }
 
+    /// Read ownership history before deciding whether a caller may learn migration details.
+    /// File stores bypass only the move fence here, not WAL validation or durability proofs.
+    /// Callers must use these records solely for authorization and check move admission before
+    /// serving session data or executing an operation.
+    fn read_records_range_for_authorization(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.read_records_range(session, after_seq, through_seq, anchor)
+    }
+
     /// Read a suffix only when `anchor` is valid. Live-file implementations avoid scanning
     /// from byte zero; immutable archive members must first verify their whole digest.
     /// Implementations that cannot prove the byte offset return `None`, which lets callers use
@@ -172,6 +186,20 @@ pub trait WalStore: Send + Sync {
     /// WAL replacement. Stores without a file identity simply cannot reuse cached proofs.
     fn file_identity(&self, _session: &BindIdentity) -> Result<Option<u64>, WalError> {
         Ok(None)
+    }
+
+    /// The durability barrier for ownership reads, with the same fence deferral as
+    /// `read_records_range_for_authorization`.
+    fn flush_for_authorization(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
+        self.flush_for_read(session)
+    }
+
+    /// The file identity for ownership-read proofs, without disclosing migration status.
+    fn file_identity_for_authorization(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<u64>, WalError> {
+        self.file_identity(session)
     }
 }
 
@@ -249,6 +277,13 @@ impl FileWalStore {
             ),
             write,
         )
+    }
+
+    fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
+        match self.check_move(session, false) {
+            Err(WalError::SessionMoving { .. } | WalError::SessionMoved { .. }) => Ok(()),
+            result => result,
+        }
     }
     /// Read a WAL by its filesystem address, with the same live-first archive policy
     /// as session reads. This is read-only, including when the live tail is torn.
@@ -717,6 +752,15 @@ impl FileWalStore {
         read_identity: impl FnOnce(&Path) -> Result<Option<u64>, WalError>,
     ) -> Result<Option<u64>, WalError> {
         self.check_move(session, false)?;
+        self.flush_for_authorization_with_identity(session, read_identity)
+    }
+
+    fn flush_for_authorization_with_identity(
+        &self,
+        session: &BindIdentity,
+        read_identity: impl FnOnce(&Path) -> Result<Option<u64>, WalError>,
+    ) -> Result<Option<u64>, WalError> {
+        self.check_authorization_move(session)?;
         if let Some(member) = self.archived_member(session)?.member {
             // A sealed archive was fsynced before publication and its digest just verified.
             // Reads need no write handle or extraction to prove these immutable bytes.
@@ -793,6 +837,16 @@ impl FileWalStore {
         anchor: Option<&WalByteAnchor>,
     ) -> Result<WalRangeRead, WalError> {
         broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;
+        self.read_address_range_for_authorization(address, after_seq, through_seq, anchor)
+    }
+
+    fn read_address_range_for_authorization(
+        &self,
+        address: &str,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
         let lookup = self.archived_member_at_address(address)?;
         if let Some(member) = lookup.member {
             return member_range(&member, after_seq, through_seq);
@@ -998,6 +1052,22 @@ impl WalStore for FileWalStore {
         self.read_address_range(&session_addr(session), after_seq, through_seq, anchor)
     }
 
+    fn read_records_range_for_authorization(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.check_authorization_move(session)?;
+        self.read_address_range_for_authorization(
+            &session_addr(session),
+            after_seq,
+            through_seq,
+            anchor,
+        )
+    }
+
     fn read_records_range_from_valid_anchor(
         &self,
         session: &BindIdentity,
@@ -1055,6 +1125,18 @@ impl WalStore for FileWalStore {
 
     fn file_identity(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
         self.check_move(session, false)?;
+        self.file_identity_for_authorization(session)
+    }
+
+    fn flush_for_authorization(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
+        self.flush_for_authorization_with_identity(session, |path| broca_wal::file_identity(path))
+    }
+
+    fn file_identity_for_authorization(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<u64>, WalError> {
+        self.check_authorization_move(session)?;
         if let Some(member) = self.archived_member(session)?.member {
             return Ok(Some(member_identity(&member)));
         }

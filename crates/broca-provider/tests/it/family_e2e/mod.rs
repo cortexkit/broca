@@ -16,7 +16,6 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use broca_core::{
@@ -32,15 +31,12 @@ use broca_protocol::{
 use broca_provider::spec::WireFamilyId;
 use broca_provider::wire::{AuthHandle, FrozenRenderConfig, WireFamily};
 use broca_provider::LiveProvider;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-/// A booted aimock instance on an ephemeral port. Killed on drop; its temp dir
-/// (fixtures + the run's lease/WAL) is removed on drop.
+/// A booted aimock on an ephemeral port; failed runs keep its logs for diagnosis.
 pub struct AiMock {
-    child: Child,
+    child: broca_test_support::RigChild,
     pub base_url: String,
     pub dir: PathBuf,
 }
@@ -48,7 +44,9 @@ pub struct AiMock {
 impl Drop for AiMock {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self.child);
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -71,19 +69,18 @@ impl AiMock {
 
         let argv = aimock_argv();
         let (program, base_args) = argv.split_first()?;
-        let mut cmd = Command::new(program);
-        cmd.args(base_args)
+        let child = match broca_test_support::tokio_rig_command(program, &dir, "aimock")
+            .expect("create aimock log files")
+            .args(base_args)
             .arg("--fixtures")
             .arg(&fixture_path)
             .arg("--port")
             .arg("0")
             .arg("--host")
             .arg("127.0.0.1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-
-        let mut child = match cmd.spawn() {
+            .kill_on_drop(true)
+            .spawn()
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
@@ -94,26 +91,31 @@ impl AiMock {
                 return None;
             }
         };
+        let mut child = broca_test_support::RigChild::new(child, &dir, "aimock");
 
         // Read stdout until the "listening on http://HOST:PORT" line appears — that
         // line IS the readiness signal. Tolerant of both shipped bins (one prefixes
         // "[aimock] ", one doesn't), so we match the address anywhere in the line.
-        let stdout = child.stdout.take()?;
-        let mut lines = BufReader::new(stdout).lines();
         let base_url = match timeout(Duration::from_secs(20), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(addr) = parse_listening_addr(&line) {
+            loop {
+                let logs =
+                    std::fs::read_to_string(dir.join("aimock.stdout.log")).unwrap_or_default();
+                if let Some(addr) = logs.lines().find_map(parse_listening_addr) {
                     return Some(addr);
                 }
+                if child.try_wait().ok().flatten().is_some() {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            None
         })
         .await
         {
             Ok(Some(addr)) => format!("http://{addr}"),
             _ => {
                 eprintln!("SKIP family_e2e: aimock never reported a listening port");
-                let _ = child.start_kill();
+                broca_test_support::kill_and_reap(&mut child);
+                eprintln!("{}", broca_test_support::rig_process_logs(&dir, "aimock"));
                 let _ = std::fs::remove_dir_all(&dir);
                 return None;
             }

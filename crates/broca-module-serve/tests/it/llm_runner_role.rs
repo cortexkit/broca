@@ -204,7 +204,8 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
     assert!(describe.majors[0].ops.iter().any(|op| op == "run.status"));
     assert_eq!(
         raw["max_bytes"],
-        serde_json::json!({"default": 4194304, "maximum": 16777216})
+        // Default and maximum are both the shared 3 MiB reply budget (READ_REPLY_MAX_BYTES).
+        serde_json::json!({"default": 3145728, "maximum": 3145728})
     );
     assert_eq!(raw["majors"][0]["stability"], "alpha");
     // It describes the build, never the session, so a second answer is the same.

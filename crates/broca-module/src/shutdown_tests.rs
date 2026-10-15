@@ -683,7 +683,11 @@ async fn wait_for_closed(f: &Fixture) {
 }
 
 fn assert_total_deadline(f: &Fixture, sealed: bool, elapsed: Duration, total: Duration) -> String {
-    let diagnostic = f.registry.stop_failure_diagnostics();
+    let diagnostic = f
+        .registry
+        .shutdown_report()
+        .expect("stop records its outcome")
+        .to_string();
     assert!(!sealed, "{diagnostic}");
     assert!(elapsed >= total, "{elapsed:?}");
     assert!(
@@ -691,10 +695,13 @@ fn assert_total_deadline(f: &Fixture, sealed: bool, elapsed: Duration, total: Du
         "{diagnostic}"
     );
     assert!(
-        diagnostic.contains(&format!("total={total:?}")),
+        diagnostic.contains(&format!("budget={total:?}")),
         "{diagnostic}"
     );
-    assert!(diagnostic.contains(&format!("{:?}", f.key)), "{diagnostic}");
+    assert!(
+        diagnostic.contains(&format!("{:?}", f.key.session)),
+        "{diagnostic}"
+    );
     assert!(diagnostic.contains("\"open\""), "{diagnostic}");
     assert_eq!(f.registry.slot_counts().open, 1);
     // The slot's survival must also preserve the physical single-writer lease.
@@ -822,7 +829,7 @@ async fn shutdown_subscriber_replay_join_retains_slot_past_write_deadline() {
     tokio::time::advance(Duration::from_secs(20)).await;
     let sealed = stopping.await.unwrap();
     let diagnostic = assert_total_deadline(&f, sealed, started.elapsed(), Duration::from_secs(20));
-    assert!(diagnostic.contains("seal_errors=[]"), "{diagnostic}");
+    assert!(diagnostic.contains("current_failures=[]"), "{diagnostic}");
     tokio::time::resume();
     drop(release);
     wait_for_closed(&f).await;
@@ -846,7 +853,7 @@ async fn shutdown_aborted_run_join_retains_slot_while_poll_is_blocked() {
             .await;
         let diagnostic =
             assert_total_deadline(&f, sealed, started.elapsed(), Duration::from_secs(1));
-        assert!(diagnostic.contains("seal_errors=[]"), "{diagnostic}");
+        assert!(diagnostic.contains("current_failures=[]"), "{diagnostic}");
         assert!(!f
             .records()
             .iter()

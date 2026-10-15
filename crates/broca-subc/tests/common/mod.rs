@@ -16,7 +16,7 @@ use std::{
 
 use broca_subc::{SubcConnection, SubcToolPlane};
 use serde_json::json;
-use tokio::{process::Command, time::sleep};
+use tokio::time::sleep;
 
 pub fn checkout_bin(name: &str, env_key: &str) -> PathBuf {
     broca_test_support::subc_bin(name, env_key)
@@ -83,6 +83,7 @@ pub struct Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self._child);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -192,7 +193,7 @@ impl Rig {
 
         let connection_file = runtime_dir.join("subc-connection.json");
         let child = broca_test_support::retry_executable_file_busy(|| {
-            Command::new(&subc_core)
+            broca_test_support::tokio_rig_command(&subc_core, &dir, "daemon")?
                 // The daemon derives its per-module capture directory from the DATA home
                 // (`<data-home>/cortexkit/run/logs/<module_id>.stderr.log`), not from
                 // XDG_RUNTIME_DIR. A rig that leaves it unset appends its own "broca" module's

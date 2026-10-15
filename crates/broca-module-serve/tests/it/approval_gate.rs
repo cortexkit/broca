@@ -261,6 +261,7 @@ impl Drop for Rig {
             task.abort();
         }
         broca_test_support::kill_and_reap(&mut self.daemon);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -323,7 +324,7 @@ impl Rig {
         std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let (subc, cli) = broca_test_support::ckdev_binary_with_companion(subc, cli, &dir);
         let daemon = broca_test_support::retry_executable_file_busy(|| {
-            tokio::process::Command::new(&subc)
+            broca_test_support::tokio_rig_command(&subc, &dir, "daemon")?
                 .env("HOME", &dir)
                 .env("XDG_CONFIG_HOME", dir.join("config"))
                 .env("XDG_RUNTIME_DIR", &runtime)

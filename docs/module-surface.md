@@ -66,6 +66,17 @@ A consumer can be both. The surface is **session-centric**: consumers address
 
 ## 4. The wire surface
 
+Unary responses that exceed subc's 64 MiB frame-body cap fail only their correlated
+call with an `Error` whose code is `response_too_large`. No oversized reply bytes
+are sent, and sibling calls keep using the connection. This also bounds oversized
+error messages. The cap is `subc-protocol` 0.31.0's `MAX_FRAME_BODY_LEN`.
+
+A TCP reset on either half instead ends the connection with the classified
+`reset` serve cause, not a generic serve error. Sibling calls cannot survive an
+RST: [RFC 9293 §3.10.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.10.7.4)
+requires outstanding SEND/RECEIVE operations to receive reset responses and moves
+TCP to CLOSED. An unrelated write error remains a serve error.
+
 ```
 session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
                  include_originals? }
@@ -513,6 +524,27 @@ faithful for step boundaries, finish reasons, tool names, and error detail.
 `session.subscribe` is a **dedicated long-lived stream route**, never multiplexed with
 `cancel`/`status`/`read`. `from:"live"` is future-only and remains quietly attached on an
 idle or terminal lineage until a later run publishes units (§16).
+
+Stamped `route.bind` authorization runs outside frame ingress. Until that check succeeds
+and broca acknowledges the bind, its channel/epoch is not published: a request arriving
+early is dropped as unbound (or stale if another epoch is still published), not queued
+for dispatch after authorization. That never drops a real request, because the daemon
+forwards nothing on a route before the module acknowledges its bind: `route.open` waits
+for the module's `RouteBindAck` before it returns the channel and epoch to the client,
+and while the bind is pending the daemon refuses any request on that channel with
+`unknown_channel` instead of forwarding it. broca records the route as bound before it
+sends `RouteBindAck`, so a client's first request after the acknowledgement finds it.
+
+A route `GOODBYE` closes only the channel/epoch it names. A pending replacement can be
+canceled without closing the published route or its stream, and closing the published
+route does not cancel authorization of a different pending epoch. After the replacement
+is accepted, a `GOODBYE` naming the old epoch is stale.
+
+Route requests authorize the caller before method parameter validation or migration
+checks. In particular, an unauthorized `session.subscribe` reports the authorization
+refusal even when its parameters are invalid. A replacement subscription cancels the
+active stream only after authorization and validation both succeed; a refusal leaves
+deliveries on the original stream correlation.
 
 ## 10. Admission barrier + early failure
 

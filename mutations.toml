@@ -264,6 +264,18 @@ old = '        ["ckdev_", "command("].concat(),'
 new = '        ["ckdev_", "command(NEVER"].concat(), // NON-VACUITY BREAK: ignore the ckdev builder'
 
 [[control]]
+id = "state-root-guard-sees-rig-stdio-builders"
+guards = "the state-root isolation guard checks daemon spawns made through rig_command and tokio_rig_command, so rigs that moved to the stdio builders stay checked"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/state_root_isolation.rs"
+expect_red = ["state_root_isolation::every_broca_spawn_site_pins_its_state_root"]
+file = "crates/broca-module-serve/tests/it/state_root_isolation.rs"
+old = '        ["rig_", "command("].concat(),'
+new = '        ["rig_", "command(NEVER"].concat(), // NON-VACUITY BREAK: ignore the rig stdio builders'
+
+[[control]]
 id = "vault-stand-in-auth-scheduling"
 guards = "the request-recording vault stand-in accepts ClientAuth delayed beyond the production handshake budget"
 runner = "cargo"
@@ -1066,9 +1078,12 @@ package = "broca-core"
 target = "--lib"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_skips_expired_until_a_late_record"]
+select = "expected"
 file = "crates/broca-core/src/replay.rs"
-old = "if self.late_allowed(call)"
-new = "if false && self.late_allowed(call) // NON-VACUITY BREAK"
+old = '''if self.late_allowed(call)
+                && call.decision == Some(DeferredDecision::Expired)'''
+new = '''if false && self.late_allowed(call)
+                && call.decision == Some(DeferredDecision::Expired) // NON-VACUITY BREAK'''
 
 [[control]]
 id = "reader-fold-keeps-late-execution"
@@ -3236,6 +3251,7 @@ old = "let detail = if self.retention {"
 new = "let detail = if false && self.retention { // NON-VACUITY BREAK"
 
 [[control]]
+platforms = ["linux", "macos"]
 id = "retention-reader-boot-enrollment"
 guards = "the real reader daemon enrolls retained WALs before querying its first sweep's deadlines"
 runner = "command"
@@ -3249,6 +3265,7 @@ new = "if false && !matching { // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-writer-admission"
+platforms = ["linux", "macos"]
 guards = "a retained first send reaches real admission instead of the reader-only refusal"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --features test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -3716,6 +3733,7 @@ new = "                .map(|exists| exists) // NON-VACUITY BREAK: invert tombst
 
 [[control]]
 id = "retention-own-tombstone-before-older"
+platforms = ["linux", "macos"]
 guards = "the live lineage's own tombstone answers before an older lineage's lower-sequence tombstone, on the real daemon"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -3732,6 +3750,7 @@ new = "            // NON-VACUITY BREAK: consult the oldest tombstone instead of
 # tombstone answers only for its own lineage.
 [[control]]
 id = "retention-tombstone-never-shadows-fresh-lineage-real-daemon"
+platforms = ["linux", "macos"]
 guards = "an older lineage's tombstone never shadows the fresh forever lineage at its address, live or folded into the archive, on the real daemon"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -3744,6 +3763,7 @@ new = "                // NON-VACUITY BREAK: let the older lineage's tombstone s
 
 [[control]]
 id = "retention-real-daemon-marker-title"
+platforms = ["linux", "macos"]
 guards = "the real-daemon marker scan catches a retention title written to run-index.db"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -4725,13 +4745,13 @@ id = "compaction-inbox-only-for-planned-runs"
 guards = "ordinary tool runs do not retain an unused compaction reply queue at the assistant WAL seam"
 runner = "cargo"
 package = "broca-core"
-target = "--test input_allocation"
+target = "--lib"
 select = "expected"
-test_file = "crates/broca-core/tests/input_allocation.rs"
-expect_red = ["tool_step_does_not_retain_a_second_assistant_message_copy"]
-file = "crates/broca-core/src/run.rs"
-old = "let compaction_replies = compaction_item\n        .as_ref()\n        .map(|_| crate::compaction::runtime::CompactionReplies::new());"
-new = "let compaction_replies = Some(crate::compaction::runtime::CompactionReplies::new()); // NON-VACUITY BREAK"
+test_file = "crates/broca-core/src/compaction/runtime.rs"
+expect_red = ["compaction::runtime::reply_tests::replies_are_allocated_only_for_a_frozen_compaction_plan"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "planned.then(Self::new)"
+new = "{ let _ = planned; Some(Self::new()) } // NON-VACUITY BREAK: allocate an inbox without a frozen plan"
 
 [[control]]
 id = "core-approval-prepared-before-filing"
@@ -4824,12 +4844,12 @@ runner = "cargo"
 package = "broca-core"
 target = "--lib"
 features = ["test-clock"]
-test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
-expect_red = ["run::approval_tests::consent_runtime_tests::awaiting_marker_names_deferred_call_before_lookup_or_filing_finishes"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::restart_pause_refiles_same_key_without_mutate_and_continues_approved_calls"]
 select = "expected"
 file = "crates/broca-core/src/run.rs"
-old = "Slot::Held(call) if !call.approved => Some("
-new = "Slot::Held(call) if false && !call.approved => Some( /* NON-VACUITY BREAK */"
+old = "Slot::Held(call) if !call.approved => Some(broca_wal::AwaitingApprovalEntry {"
+new = "Slot::Held(call) if false && !call.approved => Some(broca_wal::AwaitingApprovalEntry { // NON-VACUITY BREAK"
 
 [[control]]
 id = "core-approval-stop-drains-dispatch"
@@ -4898,13 +4918,9 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::late_none_requires_terminal_get_and_later_approval_is_not_lost_at_stream_head"]
 select = "expected"
-file = "crates/broca-core/src/consent.rs"
-old = '''if state == Some("pending") {
-        return Ok(None);
-    }'''
-new = '''if state == Some("pending") {
-        return Ok(Some(ConsentAnswer { id: record["elicitation_id"].as_str().unwrap().into(), decision: ConsentDecision::None })); // NON-VACUITY BREAK
-    }'''
+file = "crates/broca-core/src/run.rs"
+old = "crate::consent::answer(&question.record, &key, &held.prepared)"
+new = '''crate::consent::answer(&question.record, &key, &held.prepared).map(|answer| answer.or_else(|| Some(crate::consent::ConsentAnswer { id: id.clone(), decision: crate::consent::ConsentDecision::None }))) // NON-VACUITY BREAK'''
 
 [[control]]
 id = "core-approval-late-at-most-once"
@@ -4979,6 +4995,36 @@ select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = "if let Some(candidate) = answer(record, key, prepared)? {"
 new = "if let Some(candidate) = answer(record, key, prepared).unwrap_or(None) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-approval-cursor-fixture-requires-sync"
+guards = "the in-memory cursor fixture requires approval to complete its own sync before the cleared awaiting marker"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor"]
+select = "expected"
+file = "crates/broca-core/src/run/approval_tests/memory_wal.rs"
+old = '''let mut state = self.state.lock().unwrap();
+        state.synced = state.pending.clone();'''
+new = '''let mut state = self.state.lock().unwrap();
+        if matches!(state.pending.last().map(|frame| &frame.record), Some(WalRecord::ApprovalRecorded { .. })) { return Ok(()); } // NON-VACUITY BREAK: skip the approval's own barrier.
+        state.synced = state.pending.clone();'''
+
+[[control]]
+id = "core-approval-logic-defaults-to-memory-wal"
+guards = "approval logic uses the sync-aware memory WAL by default rather than timing filesystem fsync"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor", "run::approval_tests::store_resume_open_batch_pause_preserves_next_request_bytes"]
+file = "crates/broca-core/src/run/approval_tests.rs"
+old = "Self::with_memory(second, answer, transient, stop, Some(MemoryWal::new()))"
+new = "Self::with_memory(second, answer, transient, stop, None) // NON-VACUITY BREAK: restore disk I/O in logic tests."
 
 [[control]]
 id = "subc-accepted-filing-unreadable-ack-retries"
@@ -5891,6 +5937,7 @@ new = "&& false && handler.frozen_plan_requires_approval(&session).await // NON-
 
 [[control]]
 id = "serve-boot-terminal-withdrawal-debt"
+platforms = ["linux", "macos"]
 guards = "boot opens actors with terminal withdrawal debt without a send or restart-resume candidate"
 runner = "cargo"
 package = "broca-module-serve"
@@ -5905,6 +5952,7 @@ new = "for row in candidates.into_iter().take(0) { // NON-VACUITY BREAK: abandon
 
 [[control]]
 id = "serve-installs-elicitation-plane"
+platforms = ["linux", "macos"]
 guards = "the production executor exposes the scoped question plane to both the session actor and run loop"
 runner = "cargo"
 package = "broca-module-serve"
@@ -6201,6 +6249,7 @@ new = 'ErrorBody::new("open_failed", err.to_string()) // NON-VACUITY BREAK'
 
 [[control]]
 id = "retention-shared-clock-advances-daemon"
+platforms = ["linux", "macos"]
 guards = "the shared retention hook advances broca timers and awaits physical deletion rather than proxy timestamps"
 runner = "cargo"
 package = "broca-module-serve"
@@ -6215,6 +6264,7 @@ new = "let _ = milliseconds; self.advance_retention(session, 0).await // NON-VAC
 
 [[control]]
 id = "retention-size-admission-typed-refusal"
+platforms = ["linux", "macos"]
 guards = "a refused first append answers retained_session_too_large through real serve instead of dropping the admission reply"
 runner = "cargo"
 package = "broca-module-serve"
@@ -6569,6 +6619,7 @@ new = '''impl WalStore for ReadCountingWalStore {
 
 [[control]]
 id = "retention-writer-discovery-enabled"
+platforms = ["linux", "macos"]
 guards = "the released writer switch enables production retention discovery and its golden"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --features test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -6629,6 +6680,7 @@ new = "let shortening = false && append_episode // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-shared-tombstone-kill-required"
+platforms = ["linux", "macos"]
 guards = "shared retention crash conformance must run rather than skip its real tombstone kill"
 runner = "command"
 command = ["bash", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --features test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
@@ -6653,6 +6705,7 @@ new = "            // NON-VACUITY BREAK: omit agent-run capability"
 
 [[control]]
 id = "agent-run-fresh-refusal-before-header"
+platforms = ["linux", "macos"]
 guards = "fresh run-scope carrier refusals happen before actor opening creates a WAL header or an index row"
 runner = "cargo"
 package = "broca-module-serve"
@@ -8651,6 +8704,42 @@ new = '''if false && write { // NON-VACUITY BREAK: drop durable-intent fencing
         if let Some(cut_id) = cut_fence'''
 
 [[control]]
+id = "move-authorization-defers-read-fence"
+guards = "ownership authorization cannot let a read-side tombstone outrank the pending-release write fence"
+runner = "cargo"
+package = "broca-module-serve"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads"]
+file = "crates/broca-module/src/registry.rs"
+old = 'Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => Ok(()),'
+new = 'Err(error @ (OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. })) => Err(error), // NON-VACUITY BREAK: restore the read fence before operation admission'
+
+[[control]]
+id = "move-authorization-before-details"
+guards = "unauthorized callers learn neither migration details nor parameter errors from moved sessions"
+runner = "cargo"
+package = "broca-module-serve"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::authorization_precedes_migration_and_validation_for_moved_sessions"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = '''        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);'''
+new = '''        // NON-VACUITY BREAK: disclose the move fence before checking the caller.
+        if let Err(error) = handler.check_migration(&session, true).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);'''
+
+[[control]]
 id = "move-existing-writer-freeze"
 guards = "already-open writers refuse every append after a freeze"
 runner = "cargo"
@@ -9605,7 +9694,7 @@ new = "drop(lease); // NON-VACUITY BREAK: release lease before the writer exits"
 
 [[control]]
 id = "actor-writer-shutdown-error-propagation"
-guards = "an actor's final writer sync failure makes registry shutdown unsuccessful after joining"
+guards = "an idle actor's final writer sync failure is retained as history and unresolved recovery debt after joining"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
@@ -9614,8 +9703,90 @@ select = "expected"
 test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
 expect_red = ["actor::writer_shutdown_tests::actor_reports_final_writer_shutdown_failure"]
 file = "crates/broca-module/src/actor.rs"
-old = "if let Err(error) = result {\n            self.registry.report_seal_failure();"
-new = "if let Err(error) = result {\n            // NON-VACUITY BREAK: report a successful registry shutdown."
+old = '''            self.registry.report_seal_failure(
+                &self.key,
+                self.gen,
+                crate::registry::SealFailureStage::WriterShutdown,
+                format!("writer shutdown failed: {error}"),
+            );'''
+new = '            // NON-VACUITY BREAK: discard the writer shutdown failure and its recovery debt.'
+
+[[control]]
+id = "shutdown-outcome-not-lifetime-failures"
+guards = "a recovered idle writer failure does not taint the current stop, while its history remains visible"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::recovered_idle_writer_failure_does_not_taint_later_stop"]
+file = "crates/broca-module/src/registry.rs"
+old = 'let first_failure = self.inner.seal_state.lock().unwrap().failures.len();'
+new = 'let first_failure = 0; // NON-VACUITY BREAK: lifetime failures taint every subsequent stop.'
+
+[[control]]
+id = "shutdown-fresh-failure-incomplete"
+guards = "a final-sync failure during the current stop still makes that stop incomplete"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::writer_failure_during_stop_is_incomplete"]
+file = "crates/broca-module/src/registry.rs"
+old = '''        let complete =
+            !deadline_expired && remaining_sessions.is_empty() && current_failures.is_empty();'''
+new = '''        let complete = !deadline_expired && remaining_sessions.is_empty(); // NON-VACUITY BREAK: ignore fresh seal failures.'''
+
+[[control]]
+id = "shutdown-recovery-debt-is-session-scoped"
+guards = "successful recovery of one session does not discharge an orphaned session's recovery debt"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::recovery_clears_only_the_recovered_session_debt"]
+file = "crates/broca-module/src/registry.rs"
+old = '''        self.inner
+            .seal_state
+            .lock()
+            .unwrap()
+            .recovery_debt
+            .remove(key);'''
+new = '''        let _ = key;
+        self.inner.seal_state.lock().unwrap().recovery_debt.clear(); // NON-VACUITY BREAK: erase all sessions' debt.'''
+
+[[control]]
+id = "shutdown-recovered-debt-discharged"
+guards = "successful recovery and sync discharge the recovered session's debt but preserve its failure event"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::recovered_idle_writer_failure_does_not_taint_later_stop"]
+file = "crates/broca-module/src/actor.rs"
+old = '            self.registry.report_recovered(&self.key);'
+new = '            // NON-VACUITY BREAK: keep debt even after successful recovery and sync.'
+
+[[control]]
+id = "shutdown-includes-failing-closing-generation"
+guards = "a failed writer still holding its closing slot at stop is part of the current stop's outcome"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module/src/writer_shutdown_tests.rs"
+expect_red = ["actor::writer_shutdown_tests::failing_slot_still_closing_at_stop_is_incomplete"]
+file = "crates/broca-module/src/registry.rs"
+old = '''*index >= first_failure || stopping_generations.contains(&event.generation)'''
+new = '''*index >= first_failure || (false && stopping_generations.contains(&event.generation)) /* NON-VACUITY BREAK: discard a closing slot's already-reported failure. */'''
 
 [[control]]
 id = "subc-local-close-fanout"
@@ -10258,6 +10429,7 @@ new = """
 
 [[control]]
 id = "meta-session-prompt-cache-key"
+platforms = ["linux", "macos"]
 guards = "a Meta send without a caller cache key freezes its session id as prompt_cache_key, so the request reaching Meta's Responses API names a cache scope and resumes render it unchanged"
 runner = "cargo"
 package = "broca-module-serve"
@@ -10401,6 +10573,214 @@ file = "crates/broca-protocol/src/lib.rs"
 old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
 new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"
 
+[[control]]
+id = "serve-reader-authorization-off-ingress"
+guards = "health pings and GOODBYE are read while authorization waits"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_health_ping_during_authorization_and_permit_waits"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if req.method == OP_VAULT_AUDIT {"
+new = "            authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await.unwrap(); // NON-VACUITY BREAK: block ingress on authorization\n            if req.method == OP_VAULT_AUDIT {"
+
+[[control]]
+id = "serve-reader-permit-off-ingress"
+guards = "health pings and GOODBYE are read when route permits are exhausted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_health_ping_during_authorization_and_permit_waits"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if req.method == OP_VAULT_AUDIT {"
+new = "            drop(request_slots.clone().acquire_owned().await.unwrap()); // NON-VACUITY BREAK: wait for a permit on ingress\n            if req.method == OP_VAULT_AUDIT {"
+
+[[control]]
+id = "serve-bind-authorization-off-ingress"
+guards = "health pings and GOODBYE stay readable while stamped-bind ownership reads are held"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reader_answers_ping_and_goodbye_while_bind_ownership_read_is_held"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                routes\n                    .bind_tasks\n                    .spawn(async move { authorize_bind(completed, registry).await });"
+new = "                let completed = authorize_bind(completed, registry).await; // NON-VACUITY BREAK: bind read blocks ingress\n                finish_bind(completed, writer, routes).await?;"
+
+[[control]]
+id = "serve-canceled-bind-cannot-publish"
+guards = "a route GOODBYE fences a late bind read from installing a binding or acknowledging it"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::pending_bind_goodbye_cannot_publish_a_late_ack"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if completed.cancel.is_cancelled() {"
+new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish stale bind completion"
+
+[[control]]
+id = "websocket-policy-read-outside-session-lock"
+guards = "per-attempt transport policy refresh does not hold the session mutex"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::policy_read_does_not_hold_session_lock"]
+select = "expected"
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = "        let configured_https = policy();\n        let state = self.state.lock().unwrap();"
+new = "        let state = self.state.lock().unwrap();\n        let configured_https = policy(); // NON-VACUITY BREAK: read config under session mutex"
+
+[[control]]
+id = "serve-exit-does-not-join-unrelated-blocking-jobs"
+guards = "process exit explicitly joins durability but does not wait for unrelated blocking tasks"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["runtime_shutdown_tests::runtime_exit_joins_durability_but_not_unrelated_blocking_jobs"]
+select = "expected"
+file = "crates/broca-module-serve/src/main.rs"
+old = "    runtime.shutdown_background();"
+new = "    drop(runtime); // NON-VACUITY BREAK: implicitly join every blocking task"
+
+[[control]]
+id = "serve-oversized-response-is-call-local"
+guards = "an oversized success response fails its call while a sibling completes on the same connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {"
+new = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversize tears down connection"
+
+[[control]]
+id = "serve-oversized-error-is-call-local"
+guards = "an oversized error response fails its call while a sibling completes on the same connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {\n        body = serde_json::to_vec(&ErrorBody::new("
+new = "    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversized error tears down connection\n        body = serde_json::to_vec(&ErrorBody::new("
+
+[[control]]
+id = "serve-write-reset-is-classified-close"
+guards = "a write-half reset ends the connection as reset rather than a generic egress failure"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::write_half_reset_is_classified_even_with_a_request_in_flight"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        result = &mut writer => {"
+new = "        result = &mut writer, if false => { // NON-VACUITY BREAK: wait for the reader to notice closed egress"
+
+[[control]]
+id = "serve-goodbye-preserves-other-pending-generation"
+guards = "closing a published route does not cancel authorization of its pending replacement epoch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::published_generation_goodbye_preserves_pending_bind"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            .is_some_and(|(pending_epoch, _)| *pending_epoch == epoch)"
+new = "            .is_some_and(|(_, _)| true) // NON-VACUITY BREAK: cancel every pending epoch"
+
+[[control]]
+id = "serve-goodbye-preserves-other-published-generation"
+guards = "closing a pending or stale generation leaves the published route and original stream correlation intact"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::pending_generation_goodbye_preserves_published_route_and_stream"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if !self\n            .by_channel\n            .get(&channel)\n            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)"
+new = "        if false && !self // NON-VACUITY BREAK: close the published route for every epoch\n            .by_channel\n            .get(&channel)\n            .is_some_and(|(published_epoch, _, _)| *published_epoch == epoch)"
+
+[[control]]
+id = "serve-pending-bind-requests-stay-unbound"
+guards = "a request while stamped-bind authorization is held cannot register a subscription or reach a handler"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::request_during_stamped_bind_authorization_is_unbound"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if frame.header.channel != 0 && bound_epoch != Some(frame.header.epoch) {"
+new = "    if false && frame.header.channel != 0 && bound_epoch != Some(frame.header.epoch) { // NON-VACUITY BREAK: dispatch before bind publication"
+
+[[control]]
+id = "serve-superseded-bind-late-authorization-is-fenced"
+guards = "a superseded bind finishing a real delayed history read cannot overwrite or acknowledge over its replacement"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::superseded_bind_late_authorization_preserves_replacement"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if completed.cancel.is_cancelled() {"
+new = "    if false && completed.cancel.is_cancelled() { // NON-VACUITY BREAK: publish a superseded completion"
+
+[[control]]
+id = "serve-subscribe-authorization-precedes-validation"
+guards = "an unauthorized subscriber receives sender_not_owner before schema or attach-point validation can disclose errors"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::unauthorized_subscribe_reports_authorization_before_invalid_params"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+new = "        if let PreparedRouteRequest::Subscribe { params, .. } = &prepared { // NON-VACUITY BREAK: disclose validation before authorization\n            if let Err((field, message)) = subscribe_from(params) {\n                return send_invalid_params(&writer, ver, channel, epoch, corr, field, &message).await;\n            }\n        }\n        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+
+[[control]]
+id = "serve-unauthorized-subscribe-preserves-active-stream"
+guards = "a well-formed unauthorized replacement leaves the active stream delivering on its original correlation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::unauthorized_replacement_subscribe_preserves_original_stream_correlation"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+new = "        if let PreparedRouteRequest::Subscribe { slot, .. } = &prepared { slot.replace(); } // NON-VACUITY BREAK: replace before authorization\n        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {"
+
+[[control]]
+id = "serve-invalid-subscribe-preserves-active-stream"
+guards = "an authorized malformed subscription cannot replace the active stream before validation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::authorized_invalid_subscribe_preserves_original_stream_correlation"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                let from = match subscribe_from(&params) {"
+new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"
 [[control]]
 id = "core-consent-recorded-id-get-await"
 guards = "a paused call with a durable card id reads and awaits that same card without refiling"
@@ -10609,10 +10989,8 @@ old = '''&& !history
                     .projection
                     .obligations()
                     .expired_without_late_record
-                    .is_empty()
-            {'''
-new = '''&& (!history.projection.obligations().expired_without_late_record.is_empty() || slots.iter().any(|slot| matches!(slot, Slot::Held(_))))
-            { // NON-VACUITY BREAK'''
+                    .is_empty();'''
+new = '''&& (!history.projection.obligations().expired_without_late_record.is_empty() || slots.iter().any(|slot| matches!(slot, Slot::Held(_)))); // NON-VACUITY BREAK'''
 
 [[control]]
 id = "core-consent-recovery-marker-terminal-id"
@@ -10848,8 +11226,8 @@ test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
 expect_red = ["run::approval_tests::consent_audit_tests::live_wait_clears_stale_nonzero_cursor_before_reread"]
 select = "expected"
 file = "crates/broca-core/src/run.rs"
-old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; next_poll = 0; }'''
-new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK: retain stale cursor */ next_poll = 0; }'''
+old = '''Err(error) if error.code == "cursor_incarnation_changed" => { cursor = None; answer_poll = AnswerPollSchedule::default(); }'''
+new = '''Err(error) if error.code == "cursor_incarnation_changed" => { /* NON-VACUITY BREAK: retain stale cursor */ answer_poll = AnswerPollSchedule::default(); }'''
 
 [[control]]
 id = "core-consent-live-wait-unreadable-keeps-cursor"
@@ -11091,3 +11469,59 @@ select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = '''Some("approve") => ConsentDecision::Approved,'''
 new = '''Some("approve") => ConsentDecision::Declined, // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-late-feed-backoff-bounded"
+guards = "only the late-intake feed polls, with bounded empty-pass RPC rate"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::late_feed_wait_bounds_real_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = 50; // NON-VACUITY BREAK: continuously poll the late feed at 50 ms"
+
+[[control]]
+id = "core-consent-late-feed-pickup-cap"
+guards = "late settlements arriving during idle backoff are picked up within one second"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::late_feed_wait_bounds_real_reads_and_picks_up_mid_backoff_answer"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "            self.delay = (delay * 2).min(1000);"
+new = "            self.delay = (delay * 2).min(10000); // NON-VACUITY BREAK: oversleep late answer arrival"
+
+[[control]]
+id = "core-consent-idle-await-deadline-wake"
+guards = "an idle held consent await does not wake the run loop on a fixed polling timer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::idle_held_wait_wakes_only_for_deadlines_or_cancellation"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "_ = tokio::time::sleep(Duration::from_millis(wake_at.saturating_sub(timestamp))), if wake_at != u64::MAX => {}"
+new = "_ = tokio::time::sleep(Duration::from_millis(20)) => {} // NON-VACUITY BREAK: wake every 20 ms even with only idle awaits"
+
+[[control]]
+id = "core-consent-memory-rigs-have-distinct-lineages"
+guards = "separate memory-backed sessions cannot share one consent call key on an owner feed"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_runtime_tests.rs"
+expect_red = ["run::approval_tests::consent_runtime_tests::branch_c_two_sessions_keep_owner_feed_answers_without_ack"]
+select = "expected"
+file = "crates/broca-core/src/run/approval_tests/memory_wal.rs"
+old = "frame[53..61].copy_from_slice(&identity.to_le_bytes());"
+new = "frame[53..61].copy_from_slice(&identity.wrapping_mul(0).to_le_bytes()); // NON-VACUITY BREAK: collide independent session keys"

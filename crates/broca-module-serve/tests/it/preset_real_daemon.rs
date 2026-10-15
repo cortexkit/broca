@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subc_control::ConsumerIdentity;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 const OWNER: &str = "preset-owner";
 // AFT permits shell execution for the daemon's trusted broca runner identity.
@@ -34,6 +34,7 @@ pub(super) struct Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -104,9 +105,8 @@ impl Rig {
             .unwrap(),
         )
         .unwrap();
-        let log = std::fs::File::create(dir.join("daemon-output.log")).unwrap();
         let child = broca_test_support::retry_executable_file_busy(|| {
-            Command::new(&daemon)
+            broca_test_support::tokio_rig_command(&daemon, &dir, "daemon")?
                 .env("HOME", &home)
                 .env("XDG_CONFIG_HOME", &config)
                 .env("XDG_DATA_HOME", &data)
@@ -117,8 +117,6 @@ impl Rig {
                 .env_remove("SUBC_LAUNCH_NONCE")
                 .env_remove("SUBC_LAUNCH_NONCE_FD")
                 .current_dir(&project)
-                .stdout(log.try_clone().unwrap())
-                .stderr(log.try_clone().unwrap())
                 .kill_on_drop(true)
                 .spawn()
         })
@@ -159,7 +157,7 @@ impl Rig {
     }
 
     pub fn logs(&self) -> String {
-        std::fs::read_to_string(self.dir.join("daemon-output.log")).unwrap_or_default()
+        broca_test_support::rig_process_logs(&self.dir, "daemon")
     }
 
     pub async fn connect(&self) -> Arc<SubcConnection> {
