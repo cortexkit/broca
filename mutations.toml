@@ -11654,3 +11654,18 @@ select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = "if self.complete && self.expected.is_none() {"
 new = "if self.complete { // NON-VACUITY BREAK: discard an authorization candidate before duplicate closure"
+
+[[control]]
+id = "subc-consent-real-provider-omits-approval-digest"
+guards = "the approved envelope reaching a real provider omits the retired approval_digest field"
+runner = "cargo"
+package = "broca-subc"
+target = "--test it"
+test_file = "crates/broca-subc/tests/it/elicitation_ops.rs"
+expect_red = ["elicitation_ops::approved_raw_dispatch_reaches_a_real_provider_without_reserializing_saved_bytes"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''            Some(&args.key),
+            None,'''
+new = '''            Some(&args.key),
+            Some(""), // NON-VACUITY BREAK: reintroduce the retired field on the real provider envelope'''

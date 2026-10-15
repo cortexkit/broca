@@ -362,7 +362,7 @@ async fn approved_raw_dispatch_reaches_a_real_provider_without_reserializing_sav
     assert!(raw.contains(&format!("\"arguments\":{bytes}")));
     let envelope: Value = serde_json::from_slice(&bodies[0]).unwrap();
     assert_eq!(envelope["call_key"], "lineage:7");
-    assert_eq!(envelope["approval_digest"], "digest");
+    assert!(envelope.get("approval_digest").is_none());
     plane.batch_finished(&ctx).await.unwrap();
     serve.abort();
 }
