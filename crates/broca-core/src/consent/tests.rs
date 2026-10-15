@@ -237,7 +237,7 @@ async fn settled_lookup_precedes_refile_and_recovers_without_request() {
     assert_eq!(card.answer.unwrap().decision, ConsentDecision::Approved);
     assert_eq!(
         *fake.events.lock().unwrap(),
-        ["answers", "answers", "sync:old"]
+        ["answers", "answers", "answers", "sync:old"]
     );
     assert_eq!(fake.ack_calls.load(Ordering::SeqCst), 0);
 }
@@ -258,6 +258,7 @@ async fn second_lookup_adopts_settlement_and_withdraws_duplicate_after_id_sync()
             "answers",
             "withdraw:new",
             "get",
+            "answers",
             "sync:old"
         ]
     );

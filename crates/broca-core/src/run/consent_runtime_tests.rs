@@ -735,8 +735,9 @@ async fn one_held_and_one_expired_call_use_one_await_one_page_and_drop_settled_w
     rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;
     // One empty reconciliation read precedes get. The live wait then reads one
-    // nonempty page plus its empty continuation head before accepting either answer.
-    assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 3);
+    // nonempty page plus its empty continuation head. Each authorization then
+    // reads that retained head once more before minting its capability.
+    assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 5);
     assert_eq!(
         rig.questions.settlement_pages.load(Ordering::SeqCst),
         pages + 1

@@ -2270,8 +2270,16 @@ async fn unreadable_await_retries_same_card_without_refile() {
         assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
         assert_eq!(
             *rig.questions.cursors.lock().unwrap(),
-            vec![None, None, None],
-            "filing and the corrected approval's fresh conflict check all start at zero"
+            vec![
+                None,
+                None,
+                None,
+                Some(ApprovalCursor {
+                    provider_incarnation: "stable".into(),
+                    seq: 1
+                })
+            ],
+            "filing and readback start fresh; final authorization reads the retained head"
         );
         assert_eq!(rig.questions.awaits.load(Ordering::SeqCst), 2);
         let frames = rig.frames();

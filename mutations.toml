@@ -11786,3 +11786,45 @@ select = "expected"
 file = "crates/broca-core/src/run.rs"
 old = "if !authorization.matches(key, prepared) {"
 new = "if false && !authorization.matches(key, prepared) { // NON-VACUITY BREAK: transpose a late capability between calls"
+
+[[control]]
+id = "core-consent-late-authorization-reads-current-tail"
+guards = "late authorization reads new settlements after retryable duplicate proof, never just a completed snapshot"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::late_retry_reads_new_denial_after_duplicate_proof_failure"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.complete = false;"
+new = "/* NON-VACUITY BREAK: trust the completed snapshot instead of reading the current tail */"
+
+[[control]]
+id = "core-consent-held-authorization-reads-current-tail"
+guards = "held authorization reads the retained-cursor tail after a retryable duplicate proof failure"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::held_retry_reads_new_denial_after_duplicate_proof_failure"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "state.complete = false;"
+new = "/* NON-VACUITY BREAK: trust the completed snapshot instead of reading the current tail */"
+
+[[control]]
+id = "core-consent-tail-keeps-proven-withdrawal-compatible"
+guards = "a binding-checked duplicate proven withdrawn without an answer is not an opposing decision in the fresh tail"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_fourth_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_fourth_audit_tests::late_retry_accepts_proven_withdrawn_duplicate_after_fresh_tail"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "if closed_without_answer {"
+new = "if false && closed_without_answer { // NON-VACUITY BREAK: treat the proven withdrawn duplicate as an opposing answer"

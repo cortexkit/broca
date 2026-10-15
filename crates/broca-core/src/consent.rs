@@ -142,6 +142,7 @@ impl LookupProgress {
         key: &str,
         prepared: &WalRecord,
         candidate: &ConsentAnswer,
+        cursor: &ApprovalCursor,
     ) -> Result<(), ApprovalRouteError> {
         if self.key.as_deref() == Some(key)
             && self
@@ -154,6 +155,7 @@ impl LookupProgress {
         self.seed_candidate(key, prepared, candidate)?;
         self.found = Some(candidate.clone());
         self.complete = true;
+        self.cursor = Some(cursor.clone());
         Ok(())
     }
     pub fn refresh_completed(&mut self) {
@@ -216,6 +218,8 @@ pub async fn lookup_with_progress(
             state.binding = Some(expected);
         }
         if state.complete {
+            // This is retained lookup evidence, not permission to execute. The
+            // authorizer always makes it incomplete and reads the tail before minting.
             return Ok(state.found.clone());
         }
         (state.cursor.clone(), state.found.clone())
@@ -238,6 +242,19 @@ pub async fn lookup_with_progress(
         };
         for record in &page.records {
             if let Some(candidate) = answer(record, key, prepared)? {
+                let closed_without_answer = candidate.decision == ConsentDecision::None
+                    && progress
+                        .lock()
+                        .expect("consent scan progress")
+                        .closed_duplicates
+                        .iter()
+                        .any(|id| id == &candidate.id);
+                if closed_without_answer {
+                    if record.get("binding") != Some(&binding(prepared)) {
+                        return Err(refusal("consent_binding_mismatch", false));
+                    }
+                    continue;
+                }
                 if found
                     .as_ref()
                     .is_some_and(|old| old.decision != candidate.decision)
@@ -266,9 +283,9 @@ pub async fn lookup_with_progress(
     }
 }
 
-/// An approving get/await readback is a candidate, not authorization. Start a
-/// fresh settlement snapshot including that candidate, retaining this snapshot's
-/// progress if its budget expires before every continuation has been checked.
+/// A completed snapshot is only a starting point, never authorization. Preserve
+/// its checked prefix, but read the retained cursor through the current head on
+/// every attempt. Budget expiry retains that cursor and the expected candidate.
 pub async fn verify_readback(
     plane: &dyn ElicitationPlane,
     ctx: &BatchCtx,
@@ -280,6 +297,7 @@ pub async fn verify_readback(
     {
         let mut state = progress.lock().expect("consent scan progress");
         state.seed_candidate(key, prepared, &candidate)?;
+        state.complete = false;
     }
     lookup_with_progress(plane, ctx, key, prepared, progress).await?;
     Ok(candidate)
@@ -335,9 +353,9 @@ pub(crate) async fn authorize_candidate(
         if state.complete && state.found.as_ref() == Some(&candidate) && state.expected.is_none() {
             state.expected = Some(candidate.clone());
         }
+        state.seed_candidate(key, prepared, &candidate)?;
     }
-    let answer = verify_readback(plane, ctx, key, prepared, candidate, progress).await?;
-    if let Some(id) = recorded_id.filter(|id| *id != answer.id) {
+    if let Some(id) = recorded_id.filter(|id| *id != candidate.id) {
         let proven = progress
             .lock()
             .expect("consent authorization progress")
@@ -345,7 +363,7 @@ pub(crate) async fn authorize_candidate(
             .iter()
             .any(|closed| closed == id);
         if !proven {
-            withdraw_duplicate(plane, ctx, key, prepared, id, answer.decision).await?;
+            withdraw_duplicate(plane, ctx, key, prepared, id, candidate.decision).await?;
             progress
                 .lock()
                 .expect("consent authorization progress")
@@ -353,6 +371,9 @@ pub(crate) async fn authorize_candidate(
                 .push(id.into());
         }
     }
+    // Duplicate proof can wait or fail retryably. Check all settlements arriving
+    // since the retained snapshot after that work, immediately before minting.
+    let answer = verify_readback(plane, ctx, key, prepared, candidate, progress).await?;
     Ok(AuthorizedAnswer {
         answer,
         call_key: key.into(),

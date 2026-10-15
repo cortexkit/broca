@@ -9139,6 +9139,7 @@ mod approval_gate {
             &mut self,
             key: &str,
             answer: crate::consent::ConsentAnswer,
+            cursor: &crate::tool_plane::ApprovalCursor,
         ) -> Result<crate::consent::ConsentAnswer, ApprovalRouteError> {
             let prepared = self
                 .projection
@@ -9147,12 +9148,12 @@ mod approval_gate {
                 .expect("feed candidate has a prepared call")
                 .prepared
                 .clone();
-            // read_feed has checked every continuation and binding. Share that
-            // completed snapshot with the common authorization gate, not another RPC scan.
+            // Retain the checked snapshot and its head cursor. The authorization
+            // gate still reads any tail appended before it mints a capability.
             self.scan(key)
                 .lock()
                 .expect("consent authorization progress")
-                .confirm_snapshot(key, &prepared, &answer)?;
+                .confirm_snapshot(key, &prepared, &answer, cursor)?;
             Ok(answer)
         }
         pub(super) fn require_installed_plane(&self, control: &RunControl) -> Result<(), RunError> {
@@ -10507,7 +10508,7 @@ mod approval_gate {
                             let Ok(answers)=read_answers(&page.records, &history.projection) else {continue};
                             if !polled.complete { continue; }
                             for (key,answer) in answers {
-                                let answer = match answer.and_then(|answer| history.completed_feed_candidate(&key, answer)) {
+                                let answer = match answer.and_then(|answer| history.completed_feed_candidate(&key, answer, &page.cursor)) {
                                     Ok(answer) => answer,
                                     Err(error) => {
                                         if let Some(index) = slots.iter().position(|slot| matches!(slot, Slot::Held(call) if call.key == key && !call.approved)) {
