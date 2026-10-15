@@ -8691,6 +8691,19 @@ old = '''        .append(true)'''
 new = '''        .write(true).truncate(true) // NON-VACUITY BREAK: overwrite earlier survivors'''
 
 [[control]]
+id = "test-rig-survivor-gone-pid-exited"
+guards = "PIDs that vanished after cleanup are not reported as surviving processes"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-test-support/src/process.rs"
+expect_red = ["process::tests::process_wait_classifies_open_failed_gone_process_as_exited"]
+file = "crates/broca-test-support/src/process.rs"
+old = '''        ProcessWaitOutcome::OpenFailedInvalidParameter => ProcessWaitClassification::Exited,'''
+new = '''        ProcessWaitOutcome::OpenFailedInvalidParameter => ProcessWaitClassification::StillAlive, // NON-VACUITY BREAK: report a vanished PID as a survivor'''
+
+[[control]]
 id = "mutation-platforms-reject-nested-bare-bash"
 guards = "a native outer launcher cannot claim Windows for Python helpers that launch bare Bash"
 runner = "command"

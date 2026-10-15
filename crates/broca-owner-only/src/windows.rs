@@ -52,25 +52,29 @@ impl Drop for Handle {
 // Process inspection exists only for the test-support survivor dump, whose result type lives in
 // that module, so it is compiled under the same condition; a plain build has neither.
 #[cfg(any(test, feature = "test-support"))]
-pub(super) use processes::{process_is_in_job, process_snapshot};
+pub(super) use processes::{process_is_in_job, process_snapshot, process_wait_for_exit};
 
 #[cfg(any(test, feature = "test-support"))]
 mod processes {
     use super::Handle;
+    use crate::test_support::ProcessWaitError;
     use std::{
         io,
         mem::{size_of, zeroed},
         ptr::null_mut,
     };
     use windows_sys::Win32::{
-        Foundation::{GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        Foundation::{
+            GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
             JobObjects::IsProcessInJob,
-            Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+            Threading::{OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION},
         },
     };
 
@@ -143,6 +147,43 @@ mod processes {
             ));
         }
         Ok(in_job != 0)
+    }
+
+    pub(crate) fn process_wait_for_exit(
+        pid: u32,
+        timeout_ms: u32,
+    ) -> Result<bool, ProcessWaitError> {
+        // windows-sys does not expose the generic Win32 SYNCHRONIZE access right here.
+        const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+        // SAFETY: OpenProcess receives a PID and requests only wait and read-only query access.
+        let process = unsafe {
+            OpenProcess(
+                SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        if process.is_null() {
+            // SAFETY: GetLastError reads the calling thread's last Win32 error.
+            return Err(ProcessWaitError::Open(io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32,
+            )));
+        }
+        let process = Handle(process);
+        // SAFETY: process is a live handle with SYNCHRONIZE access.
+        match unsafe { WaitForSingleObject(process.0, timeout_ms) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => {
+                // SAFETY: GetLastError reads the calling thread's last Win32 error.
+                Err(ProcessWaitError::Wait(io::Error::from_raw_os_error(
+                    unsafe { GetLastError() } as i32,
+                )))
+            }
+            result => Err(ProcessWaitError::Wait(io::Error::other(format!(
+                "WaitForSingleObject returned unexpected result {result}"
+            )))),
+        }
     }
 }
 
