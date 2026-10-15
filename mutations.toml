@@ -11580,3 +11580,17 @@ select = "expected"
 file = "crates/broca-subc/src/connection.rs"
 old = "if signals.interrupted() {"
 new = "if false && signals.interrupted() { // NON-VACUITY BREAK: enqueue after a post-reservation signal"
+
+[[control]]
+id = "core-consent-late-admission-keeps-scan-progress"
+guards = "late admission resumes a healthy owner feed beyond its one-second budget"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_third_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_third_audit_tests::late_admission_continues_healthy_feed_beyond_one_budget"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = "let scan = history.scan(&key);"
+new = "let scan = Arc::new(std::sync::Mutex::new(crate::consent::LookupProgress::default())); // NON-VACUITY BREAK: restart late traversal every admission"

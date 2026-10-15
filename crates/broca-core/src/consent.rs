@@ -123,6 +123,12 @@ pub struct LookupProgress {
     expected: Option<ConsentAnswer>,
 }
 impl LookupProgress {
+    pub fn refresh_completed(&mut self) {
+        if self.complete {
+            self.restart();
+        }
+    }
+
     pub fn restart(&mut self) {
         self.cursor = None;
         self.found = None;

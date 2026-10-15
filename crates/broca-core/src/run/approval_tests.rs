@@ -22,6 +22,10 @@ mod consent_audit_tests;
 #[path = "consent_second_audit_tests.rs"]
 mod consent_second_audit_tests;
 
+#[cfg(feature = "test-clock")]
+#[path = "consent_third_audit_tests.rs"]
+mod consent_third_audit_tests;
+
 #[cfg(test)]
 #[path = "approval_tests/memory_wal.rs"]
 mod memory_wal;

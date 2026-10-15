@@ -11012,32 +11012,45 @@ mod approval_gate {
                 scope: None,
             };
             let ctx = held.ctx(&ctx);
-            let read = || async {
-                if let Some(id) = &held.id {
-                    crate::consent::reconcile(
-                        elicitation.as_ref(),
-                        &ctx,
-                        &key,
-                        &held.prepared,
-                        id,
-                        |record| async move {
-                            writer
-                                .record(record)
-                                .into_result()
-                                .map_err(|_| crate::consent::refusal("wal_write_failed", true))?;
-                            writer
-                                .sync()
-                                .await
-                                .map_err(|_| crate::consent::refusal("wal_sync_failed", true))?;
-                            Ok(())
-                        },
-                    )
-                    .await
-                    .map(|card| card.answer)
-                } else {
-                    crate::consent::lookup(elicitation.as_ref(), &ctx, &key, &held.prepared).await
-                }
-            };
+            let scan = history.scan(&key);
+            // Completed heads can gain new settlements. An interrupted traversal,
+            // however, must keep its checked prefix across admission budgets.
+            scan.lock()
+                .expect("late consent scan progress")
+                .refresh_completed();
+            let read =
+                || async {
+                    if let Some(id) = &held.id {
+                        crate::consent::reconcile_with_progress(
+                            elicitation.as_ref(),
+                            &ctx,
+                            &key,
+                            &held.prepared,
+                            id,
+                            scan.as_ref(),
+                            |record| async move {
+                                writer.record(record).into_result().map_err(|_| {
+                                    crate::consent::refusal("wal_write_failed", true)
+                                })?;
+                                writer.sync().await.map_err(|_| {
+                                    crate::consent::refusal("wal_sync_failed", true)
+                                })?;
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .map(|card| card.answer)
+                    } else {
+                        crate::consent::lookup_with_progress(
+                            elicitation.as_ref(),
+                            &ctx,
+                            &key,
+                            &held.prepared,
+                            scan.as_ref(),
+                        )
+                        .await
+                    }
+                };
             let mut page = tokio::time::timeout(Duration::from_millis(1000), read()).await;
             // A fresh cursor can also be refused during a provider restart. Never interpret
             // that refusal as a stream head; leave the call eligible for the next admission.
