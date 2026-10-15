@@ -839,8 +839,8 @@ async fn sibling_result_is_synced_while_approval_waits_and_expiry_uses_brocas_cl
             interval.tick().await;
             let frames = rig.frames();
             let sibling_done = frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "sibling"));
-            let filed = frames.iter().any(|frame| matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some())));
-            if sibling_done && filed {
+            if sibling_done && rig.questions.polls.load(Ordering::SeqCst) > 0 {
+                assert!(frames.iter().any(|frame| matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some()))), "filed approval missing from pending marker");
                 assert!(!frames
                     .iter()
                     .any(|frame| matches!(frame.record, WalRecord::ToolBatchFinished { .. })));
@@ -1155,7 +1155,12 @@ async fn expire_rig(mut rig: Rig) -> Rig {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
         loop {
             interval.tick().await;
-            if rig.frames().iter().any(|frame| matches!(&frame.record,WalRecord::AwaitingApproval{pending,..} if pending.iter().any(|entry|entry.elicitation_id.is_some()))) { break }
+            // Advance after the question plane is polled, independently of the WAL marker
+            // under test. Missing marker entries must fail assertions, not freeze expiry.
+            if rig.questions.polls.load(Ordering::SeqCst) > 0 {
+                assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some()))), "filed approval missing from pending marker");
+                break;
+            }
         }
         std::fs::write(
             rig.root.join("test-clock"),

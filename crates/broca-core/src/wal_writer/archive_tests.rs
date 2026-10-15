@@ -283,10 +283,12 @@ fn archived_member_serves_all_read_methods_in_place() {
     f.archive(9, &std::fs::read(&path).unwrap());
     std::fs::remove_file(&path).unwrap();
     assert_eq!(f.store.read_records(&f.session).unwrap(), records);
+    assert!(!path.exists(), "reads must not extract");
     let range = f
         .store
         .read_records_range(&f.session, 0, None, None)
         .unwrap();
+    assert!(!path.exists(), "reads must not extract");
     assert_eq!(range.lineage_id, live_range.lineage_id);
     let anchor = range.anchor_at(1).unwrap();
     assert_eq!(complete(range), records);
@@ -298,6 +300,7 @@ fn archived_member_serves_all_read_methods_in_place() {
         ),
         records[1..2]
     );
+    assert!(!path.exists(), "reads must not extract");
     assert_eq!(
         complete(
             f.store

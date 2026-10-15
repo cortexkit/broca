@@ -804,6 +804,19 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertGreater(count, 2000)
 
+    def test_live_file_anchor_proof_cannot_claim_windows(self):
+        rows = {"wal-anchored-damaged-length-before-record"}
+        catalogue = tomllib.loads((self.root / "mutations.toml").read_text(encoding="utf-8"))
+        for row in catalogue["control"]:
+            if row["id"] in rows:
+                row.pop("platforms")
+        errors, _ = verify_catalogue(self.root, catalogue)
+        self.assertEqual({error.split(":", 1)[0] for error in errors}, rows)
+        self.assertEqual(len(errors), 1)
+        for error in errors:
+            self.assertIn("does not compile on windows", error)
+            self.assertIn("cfg(unix)", error)
+
     def test_six_retention_platform_reversions_in_fixture_copy_are_rejected(self):
         rows = {
             "retention-reader-boot-enrollment", "retention-writer-admission",
