@@ -238,7 +238,12 @@ def main() -> int:
     # The failure this hunts is silent by nature, so an unstated scope is the one thing
     # that would make a clean report worthless.
     def stamp(value: float) -> str:
-        return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+        except (OSError, OverflowError, ValueError):
+            # Windows localtime refuses pre-epoch cutoffs from wide scan windows.
+            # Formatting the scope must not prevent reporting the files examined.
+            return f"Unix timestamp {value:.0f}"
 
     print(
         f"scanned {scanned} WAL(s) written since {stamp(cutoff)}"
