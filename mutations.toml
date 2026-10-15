@@ -11205,8 +11205,8 @@ old = ".is_ok_and(|old| old.decision != answer.decision)"
 new = ".is_ok_and(|old| false && old.decision != answer.decision) // NON-VACUITY BREAK"
 
 [[control]]
-id = "core-consent-live-feed-complete-before-approval"
-guards = "a live feed prefix never authorizes before later continuation conflicts are checked"
+id = "core-consent-live-feed-and-authorizer-complete-before-approval"
+guards = "live intake and shared authorization cannot both truncate a feed before later continuation conflicts"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -11214,9 +11214,14 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
 expect_red = ["run::approval_tests::consent_audit_tests::live_feed_conflicting_continuations_refuse_before_any_dispatch"]
 select = "expected"
+[[control.edits]]
 file = "crates/broca-core/src/run.rs"
 old = "let head = page.records.is_empty();"
 new = "let head = true; // NON-VACUITY BREAK"
+[[control.edits]]
+file = "crates/broca-core/src/consent.rs"
+old = "state.complete = false;"
+new = "state.complete = true; // NON-VACUITY BREAK: trust the live prefix without the authorizer's tail read"
 
 [[control]]
 id = "core-consent-late-feed-conflict-refuses"
@@ -11324,8 +11329,8 @@ old = "stopped.retain(|run| open_runs.contains(run));"
 new = "stopped.retain(|run| true || open_runs.contains(run)); // NON-VACUITY BREAK"
 
 [[control]]
-id = "core-consent-late-stop-during-intent-sync"
-guards = "late send rechecks cancel and stop after the durable intent barrier"
+id = "core-consent-late-intent-sync-stop-fences"
+guards = "late send stopped during intent sync needs either the core check or the adapter's forwarded run signals"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -11333,6 +11338,7 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
 expect_red = ["run::approval_tests::consent_audit_tests::late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent"]
 select = "expected"
+[[control.edits]]
 file = "crates/broca-core/src/run.rs"
 old = '''fn late_stopped(control: &RunControl) -> bool {
         is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
@@ -11340,10 +11346,17 @@ old = '''fn late_stopped(control: &RunControl) -> bool {
 new = '''fn late_stopped(_control: &RunControl) -> bool {
         false // NON-VACUITY BREAK
     }'''
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = '''&crate::tool_plane::DispatchSignals::new(
+                    control.cancel.as_ref(),
+                    control.stop_requested.as_ref(),
+                ),'''
+new = '''&crate::tool_plane::DispatchSignals::default(), // NON-VACUITY BREAK: drop late-send signals too'''
 
 [[control]]
-id = "core-consent-late-stop-during-route-open"
-guards = "late send rechecks cancel and stop after route-open completion immediately before dispatch"
+id = "core-consent-late-route-open-stop-fences"
+guards = "late send stopped during route open needs either the core check or the adapter's forwarded run signals"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -11351,6 +11364,7 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
 expect_red = ["run::approval_tests::consent_audit_tests::late_dispatch_cancel_or_stop_during_route_open_is_not_sent"]
 select = "expected"
+[[control.edits]]
 file = "crates/broca-core/src/run.rs"
 old = '''fn late_stopped(control: &RunControl) -> bool {
         is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
@@ -11358,6 +11372,13 @@ old = '''fn late_stopped(control: &RunControl) -> bool {
 new = '''fn late_stopped(_control: &RunControl) -> bool {
         false // NON-VACUITY BREAK
     }'''
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = '''&crate::tool_plane::DispatchSignals::new(
+                    control.cancel.as_ref(),
+                    control.stop_requested.as_ref(),
+                ),'''
+new = '''&crate::tool_plane::DispatchSignals::default(), // NON-VACUITY BREAK: drop late-send signals too'''
 
 [[control]]
 id = "core-consent-live-wait-clears-stale-cursor"
@@ -11445,8 +11466,8 @@ old = "lookup_with_progress(plane, ctx, key, prepared, progress).await?;"
 new = "// NON-VACUITY BREAK: accept the first approving readback without its settlement snapshot"
 
 [[control]]
-id = "core-consent-live-adoption-proves-recorded-duplicate"
-guards = "a different-id live answer cannot replace the recorded card without withdrawal and agreeing terminal readback"
+id = "core-consent-live-adoption-duplicate-proof-fences"
+guards = "live adoption cannot bypass both shared authorization and live intake proof of the recorded duplicate"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -11454,9 +11475,14 @@ features = ["test-clock"]
 test_file = "crates/broca-core/src/run/consent_second_audit_tests.rs"
 expect_red = ["run::approval_tests::consent_second_audit_tests::live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption"]
 select = "expected"
+[[control.edits]]
 file = "crates/broca-core/src/run.rs"
 old = "if call.id.as_deref() != Some(answer.id.as_str()) {"
 new = "if false && call.id.as_deref() != Some(answer.id.as_str()) { // NON-VACUITY BREAK"
+[[control.edits]]
+file = "crates/broca-core/src/consent.rs"
+old = "if let Some(id) = recorded_id.filter(|id| *id != candidate.id) {"
+new = "if let Some(id) = recorded_id.filter(|_| false) { // NON-VACUITY BREAK: skip the authorizer's duplicate proof too"
 
 [[control]]
 id = "core-consent-live-feed-total-page-budget"
@@ -11834,6 +11860,20 @@ select = "expected"
 file = "crates/broca-subc/src/connection.rs"
 old = ".map_err(ApprovedCallError::BeforePush)?"
 new = ".map_err(|error| ApprovedCallError::AfterPush(ConnError::Transport(error.to_string())))? /* NON-VACUITY BREAK: classify the pre-push stage as sent */"
+
+[[control]]
+id = "subc-approved-writer-queue-stop-fence"
+guards = "approved cancel and stop interrupt a full writer queue before any tool request is pushed"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent"]
+expect_message = "cancelled approved enqueue must not wait for writer capacity"
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = "_ = signals.cancelled() => return Err(ApprovedSetupError::Interrupted),"
+new = "_ = std::future::pending::<()>() => return Err(ApprovedSetupError::Interrupted), // NON-VACUITY BREAK: ignore interruption while the writer queue is full"
 
 [[control]]
 id = "core-consent-withdraw-ack-requires-record-proof"
