@@ -534,9 +534,15 @@ mod move_reader_tests {
                 .unwrap();
         }
         let bytes = std::fs::read(&live).unwrap();
-        broca_wal::migration::stage(&staged, &bytes, &broca_wal::migration::digest(&bytes))
-            .unwrap();
+        broca_wal::migration::stage(
+            &root,
+            &staged,
+            &bytes,
+            &broca_wal::migration::digest(&bytes),
+        )
+        .unwrap();
         broca_wal::migration::freeze(
+            &root,
             &live,
             &broca_wal::migration::Freeze {
                 cut_id: "cut".into(),
@@ -547,6 +553,7 @@ mod move_reader_tests {
         .unwrap()
         .unwrap();
         broca_wal::migration::atomic_json(
+            &root,
             &moved.with_extension("moved"),
             &broca_wal::migration::Moved {
                 cut_id: "cut".into(),

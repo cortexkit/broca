@@ -77,6 +77,7 @@ pub fn check_installations(installations: &[Installation<'_>]) -> Result<(), Err
 /// them. Without that intent, do not invoke the missing-staging recovery path.
 /// `drop_projection` removes derived session data, never billing facts or floors.
 pub fn install_verified(
+    state_root: &Path,
     cut_id: &str,
     installations: &[Installation<'_>],
     export: &dyn broca_core::ExportIndex,
@@ -142,7 +143,7 @@ pub fn install_verified(
                 .live
                 .parent()
                 .ok_or_else(|| unavailable("live WAL has no directory"))?;
-            broca_wal::migration::durable_dir(parent).map_err(unavailable)?;
+            broca_wal::migration::durable_dir(state_root, parent).map_err(unavailable)?;
             fs::rename(item.staged, item.live).map_err(unavailable)?;
             broca_wal::migration::sync_dir(parent).map_err(unavailable)?;
             broca_wal::migration::sync_dir(item.staged.parent().unwrap()).map_err(unavailable)?;

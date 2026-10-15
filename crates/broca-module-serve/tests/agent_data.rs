@@ -285,7 +285,8 @@ impl Rig {
     }
     fn new(tag: &str, door: Arc<FakeDoor>) -> Self {
         let root = root(tag);
-        broca_wal::migration::durable_dir(&root.join("wal")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        broca_wal::migration::durable_dir(&root, &root.join("wal")).unwrap();
         let wal = Arc::new(FileWalStore::new(root.join("wal")));
         let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
         let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
@@ -1047,7 +1048,7 @@ async fn status_keeps_a_partial_prepare_intent_byte_identical_until_repeat() {
         replies: Default::default(),
     };
     let path = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&path, &state).unwrap();
+    broca_wal::migration::atomic_json(&rig.root, &path, &state).unwrap();
     let range = broca_wal::read_records_range(
         rig.wal.wal_path(&sessions[0]),
         broca_wal::DEFAULT_MAX_READ_BYTES,
@@ -1057,6 +1058,7 @@ async fn status_keeps_a_partial_prepare_intent_byte_identical_until_repeat() {
     )
     .unwrap();
     broca_wal::migration::freeze(
+        &rig.root,
         &rig.wal.wal_path(&sessions[0]),
         &broca_wal::migration::Freeze {
             cut_id: CUT.into(),
@@ -1151,7 +1153,8 @@ async fn contract_step_vectors_pass_through_internal_serve() {
             sessions: Default::default(),
             replies: Default::default(),
         };
-        broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(CUT), &state).unwrap();
+        broca_wal::migration::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
+            .unwrap();
         let before = std::fs::read(CutStore::new(&rig.root).path(CUT)).unwrap();
         let mut params = json!({"refs":[],"cutId":CUT});
         if case["op"] == "describe" {
@@ -1203,7 +1206,12 @@ async fn contract_idempotency_vectors_replay_before_resolving_sessions() {
             },
         );
         if let Some(cut) = first["params"]["cutId"].as_str() {
-            broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(cut), &state).unwrap();
+            broca_wal::migration::atomic_json(
+                &rig.root,
+                &CutStore::new(&rig.root).path(cut),
+                &state,
+            )
+            .unwrap();
         }
         let mut wire = Wire::new(&rig, entorhinal(), true).await;
         let result = wire.raw(serde_json::to_vec(&case["again"]).unwrap()).await;
@@ -1234,7 +1242,8 @@ async fn contract_ref_set_vectors_are_checked_before_artifacts() {
             sessions: Default::default(),
             replies: Default::default(),
         };
-        broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(CUT), &state).unwrap();
+        broca_wal::migration::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
+            .unwrap();
         let mut params = json!({"refs":case["refs"],"cutId":CUT});
         if case["op"] == "release" {
             params["holder"] = json!("receiver");
@@ -1322,8 +1331,10 @@ async fn source_tombstone_case(op: contract::Op) {
         sessions: recorded_sessions(std::slice::from_ref(&session)),
         replies: Default::default(),
     };
-    broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(CUT), &state).unwrap();
+    broca_wal::migration::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
+        .unwrap();
     broca_wal::migration::atomic_json(
+        &rig.root,
         &rig.wal.wal_path(&session).with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: BACK.into(),
@@ -1384,9 +1395,10 @@ async fn contradictory_owner_case(op: contract::Op) {
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&authority, &state).unwrap();
+    broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
     let sidecar = rig.wal.wal_path(&session).with_extension("moving");
     broca_wal::migration::atomic_json(
+        &rig.root,
         &sidecar,
         &broca_wal::migration::Freeze {
             cut_id: BACK.into(),
@@ -1514,6 +1526,7 @@ fn ordinary_address_reader_keeps_the_moved_fence() {
     assert!(!rig.wal.read_address_records(&address).unwrap().is_empty());
     let before = rig.bytes(&session);
     broca_wal::migration::atomic_json(
+        &rig.root,
         &rig.wal.wal_path(&session).with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: CUT.into(),
@@ -1863,6 +1876,7 @@ async fn activation_busy_freeze_has_typed_refs_and_preserves_staging() {
     )
     .unwrap();
     broca_wal::migration::freeze(
+        &rig.root,
         &rig.wal.wal_path(&session),
         &broca_wal::migration::Freeze {
             cut_id: BACK.into(),
@@ -1908,6 +1922,7 @@ async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
         .unwrap();
         let staged_bytes = if truncated { &[][..] } else { &bytes };
         broca_wal::migration::stage(
+            &rig.root,
             &staged,
             staged_bytes,
             &broca_wal::migration::digest(staged_bytes),
@@ -1922,8 +1937,13 @@ async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
                 &broca_core::session_addr(&other_session),
             )
             .unwrap();
-            broca_wal::migration::stage(&other_staged, &[], &broca_wal::migration::digest(&[]))
-                .unwrap();
+            broca_wal::migration::stage(
+                &rig.root,
+                &other_staged,
+                &[],
+                &broca_wal::migration::digest(&[]),
+            )
+            .unwrap();
         }
         let other = rig
             .root
@@ -1943,7 +1963,7 @@ async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
             replies: Default::default(),
         };
         let authority = CutStore::new(&rig.root).path(CUT);
-        broca_wal::migration::atomic_json(&authority, &state).unwrap();
+        broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
         *rig.door.refusal.lock().unwrap() = Some("unavailable".into());
         let mut wire = Wire::new(&rig, entorhinal(), true).await;
         wire.call("abort", params.clone()).await.unwrap();
@@ -1976,7 +1996,7 @@ async fn boot_keeps_an_unreadable_cut_pending_and_status_read_only() {
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&authority, &state).unwrap();
+    broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
     let before = std::fs::read(&authority).unwrap();
     *rig.door.refusal.lock().unwrap() = Some("unavailable".into());
     rig.service.reconcile_boot().await.unwrap();
@@ -2150,7 +2170,7 @@ async fn diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&authority, &state).unwrap();
+    broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
     let before = std::fs::read(&authority).unwrap();
     assert_eq!(
         wire.call("diverged", params).await.unwrap(),
@@ -2354,7 +2374,7 @@ async fn cut_without_required_addresses_is_named_unreadable_before_lookup() {
     let params = rig.params(CUT, std::slice::from_ref(&a));
     let path = CutStore::new(&rig.root).path(CUT);
     let state = json!({"step":"prepared","refs":params["refs"],"intent":null,"replies":{}});
-    broca_wal::migration::atomic_json(&path, &state).unwrap();
+    broca_wal::migration::atomic_json(&rig.root, &path, &state).unwrap();
     let before = std::fs::read(&path).unwrap();
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     let error = assert_code(wire.call("status", params).await, "unavailable");

@@ -13677,3 +13677,51 @@ expect_red = ["session_door::record_too_large_is_never_retried_for_any_door_meth
 file = "crates/broca-subc/src/session_door.rs"
 old = 'if error.code == "lease_unavailable" || error.code == "lease_acquiring" =>'
 new = 'if error.code == "lease_unavailable" || error.code == "lease_acquiring" || error.code == "record_too_large" => // NON-VACUITY BREAK: retry a client bug'
+
+[[control]]
+id = "agent-data-existing-directory-ancestor-barriers"
+platforms = ["linux", "macos"]
+guards = "an existing directory retry repays every publication barrier through the explicit state root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::existing_directory_retry_pays_every_parent_barrier_within_state_root"]
+file = "crates/broca-wal/src/migration.rs"
+old = 'let mut target = std::path::absolute(path)?;'
+new = '''if path.is_dir() { return Ok(()); } // NON-VACUITY BREAK: trust a cached directory
+    let mut target = std::path::absolute(path)?;'''
+
+[[control]]
+id = "agent-data-directory-state-root-boundary"
+guards = "directory establishment refuses targets outside its explicit pre-existing state root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::directory_establishment_requires_an_existing_root_and_rejects_escape"]
+file = "crates/broca-wal/src/migration.rs"
+old = '''let relative = target.strip_prefix(&root).map_err(|_| {
+        invalid(format!(
+            "move directory {} is outside state root {}",
+            path.display(),
+            state_root.display()
+        ))
+    })?;'''
+new = '''let relative = match target.strip_prefix(&root) {
+        Ok(relative) => relative,
+        Err(_) => return Ok(()), // NON-VACUITY BREAK: acknowledge an outside target
+    };'''
+
+[[control]]
+id = "agent-data-directory-root-precondition"
+guards = "directory helpers never create a missing state root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::directory_establishment_requires_an_existing_root_and_rejects_escape"]
+file = "crates/broca-wal/src/migration.rs"
+old = 'let root = state_root.canonicalize().map_err(|error| {'
+new = '''fs::create_dir_all(state_root)?; // NON-VACUITY BREAK: silently establish the root
+    let root = state_root.canonicalize().map_err(|error| {'''

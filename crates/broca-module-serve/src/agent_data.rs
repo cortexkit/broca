@@ -87,8 +87,8 @@ impl AgentDataService {
             door,
         });
         Self {
-            cuts: CutStore::new(root),
-            artifacts: FileCutArtifacts::new(registry, wal, index, driver),
+            cuts: CutStore::new(&root),
+            artifacts: FileCutArtifacts::new(root.clone(), registry, wal, index, driver),
         }
     }
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {

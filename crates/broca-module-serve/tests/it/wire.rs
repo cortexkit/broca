@@ -6820,6 +6820,7 @@ async fn moving_sidecar_serves_reads_and_refuses_sends_with_the_real_wire_golden
     let mut route = PreparedWalRoute::start("moving-wire", |_| {}).await;
     let before = std::fs::read(&route.wal_path).unwrap();
     broca_wal::migration::freeze(
+        &route.dir,
         &route.wal_path,
         &broca_wal::migration::Freeze {
             cut_id: "cut-a".into(),
@@ -6848,6 +6849,7 @@ async fn moved_tombstone_refuses_every_read_and_send_with_the_real_wire_golden()
     let mut route = PreparedWalRoute::start("moved-wire", |_| {}).await;
     let before = std::fs::read(&route.wal_path).unwrap();
     broca_wal::migration::atomic_json(
+        &route.dir,
         &route.wal_path.with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: "cut-a".into(),
@@ -6888,7 +6890,7 @@ async fn reader_release_refuses_first_time_activation_fence_without_any_sidecar(
         "s1",
     );
     let authority = route.dir.join("agent-data/cuts/cut-a.json");
-    broca_wal::migration::atomic_json(&authority, &serde_json::json!({"step":"imported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
+    broca_wal::migration::atomic_json(&route.dir, &authority, &serde_json::json!({"step":"imported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
     let before = std::fs::read(&route.wal_path).unwrap();
     let state_before = std::fs::read(&authority).unwrap();
     let body = route.expect_error(2, send_request()).await;
@@ -6909,8 +6911,9 @@ async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads(
         &route.dir.join("proj").to_string_lossy(),
         "s1",
     );
-    broca_wal::migration::atomic_json(&route.dir.join("agent-data/cuts/cut-a.json"),&serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
+    broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),&serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     broca_wal::migration::atomic_json(
+        &route.dir,
         &route.wal_path.with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: "cut-a".into(),
@@ -7082,10 +7085,11 @@ async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWa
             &route.dir.join("proj").to_string_lossy(),
             "s1",
         );
-        broca_wal::migration::atomic_json(&route.dir.join("agent-data/cuts/cut-a.json"),
+        broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),
             &serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     }
     broca_wal::migration::atomic_json(
+        &route.dir,
         &route.wal_path.with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: "cut-a".into(),

@@ -85,24 +85,83 @@ fn sync_file(file: &fs::File) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Every newly created parent is synced too: a synced file in an uncommitted
-/// directory would disappear together with the directory after a crash.
-pub fn durable_dir(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
-        return Ok(());
+/// Establish a directory and repeat every publication barrier up to the supplied
+/// state root. Existing directories may be remnants of an interrupted creation;
+/// their existence does not prove that their parent entries were synced.
+/// The state root must already exist. No directory above it is created or synced.
+pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
+    let root = state_root.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "move state root {} must already exist: {error}",
+                state_root.display()
+            ),
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(invalid(format!(
+            "move state root {} is not a directory",
+            state_root.display()
+        )));
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    durable_dir(parent)?;
-    match broca_owner_only::create_dir(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
+    let mut target = std::path::absolute(path)?;
+    if target
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(invalid(format!(
+            "move directory {} contains parent traversal outside its state root",
+            path.display()
+        )));
     }
-    sync_dir(path)?;
-    sync_dir(parent)
+    let mut missing = Vec::new();
+    loop {
+        match target.canonicalize() {
+            Ok(existing) => {
+                target = existing;
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(
+                    target
+                        .file_name()
+                        .ok_or_else(|| invalid("move directory has no existing ancestor"))?
+                        .to_owned(),
+                );
+                if !target.pop() {
+                    return Err(invalid("move directory has no existing ancestor"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    for name in missing.into_iter().rev() {
+        target.push(name);
+    }
+    let relative = target.strip_prefix(&root).map_err(|_| {
+        invalid(format!(
+            "move directory {} is outside state root {}",
+            path.display(),
+            state_root.display()
+        ))
+    })?;
+    let mut directory = root.clone();
+    for part in relative.components() {
+        directory.push(part);
+        match broca_owner_only::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for directory in target.ancestors() {
+        sync_dir(directory)?;
+        if directory == root {
+            break;
+        }
+    }
+    Ok(())
 }
 
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -118,11 +177,11 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 
 /// The caller serializes writes to this destination. The cut-fence scan checks
 /// only completed `.json` files, never a temporary with a partially written intent.
-pub fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+pub fn atomic_json(state_root: &Path, path: &Path, value: &impl Serialize) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("cut path has no parent"))?;
-    durable_dir(parent)?;
+    durable_dir(state_root, parent)?;
     let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(value).map_err(invalid)?;
     let mut file = broca_owner_only::OpenOptions::new()
@@ -227,7 +286,11 @@ fn exclusive_link(temp: &Path, destination: &Path) -> io::Result<()> {
     })
 }
 
-pub fn freeze(wal: &Path, wanted: &Freeze) -> io::Result<Result<Freeze, MoveRefusal>> {
+pub fn freeze(
+    state_root: &Path,
+    wal: &Path,
+    wanted: &Freeze,
+) -> io::Result<Result<Freeze, MoveRefusal>> {
     if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {
         return Ok(Err(MoveRefusal::Moved {
             holder: moved.holder,
@@ -235,7 +298,7 @@ pub fn freeze(wal: &Path, wanted: &Freeze) -> io::Result<Result<Freeze, MoveRefu
     }
     let path = wal.with_extension("moving");
     let parent = path.parent().unwrap_or(Path::new("."));
-    durable_dir(parent)?;
+    durable_dir(state_root, parent)?;
     let bytes = serde_json::to_vec(wanted).map_err(invalid)?;
     loop {
         if let Some(owner) = existing_freeze(&path, wanted)? {
@@ -276,7 +339,12 @@ pub fn abort_freeze(wal: &Path, cut_id: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub fn release(wal: &Path, cut_id: &str, holder: &str) -> io::Result<Result<(), MoveRefusal>> {
+pub fn release(
+    state_root: &Path,
+    wal: &Path,
+    cut_id: &str,
+    holder: &str,
+) -> io::Result<Result<(), MoveRefusal>> {
     let moved_path = wal.with_extension("moved");
     if let Some(moved) = read_json::<Moved>(&moved_path)? {
         if moved.cut_id == cut_id && moved.holder == holder {
@@ -304,6 +372,7 @@ pub fn release(wal: &Path, cut_id: &str, holder: &str) -> io::Result<Result<(), 
     // Publish the tombstone first. A crash before unlink still refuses both reads
     // and writes; tombstone precedence prevents the old WAL being exposed.
     atomic_json(
+        state_root,
         &moved_path,
         &Moved {
             cut_id: cut_id.to_owned(),
@@ -419,13 +488,13 @@ pub fn staging_path(wal_root: &Path, cut_id: &str, address: &str) -> io::Result<
 }
 
 /// Verify before publishing staging; a mismatch leaves no file for activation.
-pub fn stage(path: &Path, bytes: &[u8], digest: &str) -> io::Result<()> {
+pub fn stage(state_root: &Path, path: &Path, bytes: &[u8], digest: &str) -> io::Result<()> {
     use sha2::{Digest, Sha256};
     if format!("{:x}", Sha256::digest(bytes)) != digest {
         return Err(invalid("digest_mismatch"));
     }
     let parent = path.parent().ok_or_else(|| invalid("staging path"))?;
-    durable_dir(parent)?;
+    durable_dir(state_root, parent)?;
     let temp = path.with_extension("wal.tmp");
     let mut file = broca_owner_only::OpenOptions::new()
         .write(true)

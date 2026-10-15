@@ -1,7 +1,10 @@
 use super::*;
 use crate::{FileWal, Wal, WalRecord};
 fn root(tag: &str) -> PathBuf {
-    broca_test_support::scratch_root().join(format!("move-sidecars-{}-{tag}", std::process::id()))
+    let root = broca_test_support::scratch_root()
+        .join(format!("move-sidecars-{}-{tag}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    root
 }
 fn owner(cut: &str) -> Freeze {
     Freeze {
@@ -12,18 +15,98 @@ fn owner(cut: &str) -> Freeze {
 }
 
 #[test]
+#[cfg(unix)]
+fn existing_directory_retry_pays_every_parent_barrier_within_state_root() {
+    use super::io_trace::{self, Event};
+    use std::{cell::RefCell, rc::Rc};
+    for suffix in ["agent-data/cuts", "wal-staging/cut", "wal"] {
+        let root = root(&format!("directory-retry-{}", suffix.replace('/', "-")))
+            .canonicalize()
+            .unwrap();
+        let target = root.join(suffix);
+        if target.exists() {
+            fs::remove_dir_all(&target).unwrap();
+        }
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let child = target.clone();
+        let parent = target.parent().unwrap().to_owned();
+        {
+            let mut injected = false;
+            let _trace = io_trace::install(move |event| {
+                if event == Event::DirectorySync(parent.clone()) && child.exists() && !injected {
+                    injected = true;
+                    return Err(io::Error::other(
+                        "injected after directory creation before parent barrier",
+                    ));
+                }
+                Ok(())
+            });
+            assert!(durable_dir(&root, &target)
+                .unwrap_err()
+                .to_string()
+                .contains("injected after directory creation"));
+        }
+        assert!(target.is_dir());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _trace = io_trace::install(move |event| {
+            if let Event::DirectorySync(path) = event {
+                observed.borrow_mut().push(path);
+            }
+            Ok(())
+        });
+        durable_dir(&root, &target).unwrap();
+        let expected: Vec<_> = target
+            .ancestors()
+            .take_while(|path| path.starts_with(&root))
+            .map(Path::to_owned)
+            .collect();
+        assert_eq!(
+            *events.borrow(),
+            expected,
+            "a cached child must not hide an unpaid ancestor barrier"
+        );
+    }
+}
+
+#[test]
+fn directory_establishment_requires_an_existing_root_and_rejects_escape() {
+    let root = root("directory-boundary").canonicalize().unwrap();
+    let missing = root.join("missing-state-root");
+    let error = durable_dir(&missing, &missing.join("wal")).unwrap_err();
+    assert!(error.to_string().contains("move state root"));
+    assert!(!missing.exists());
+    let outside = root.with_file_name("outside-move-state-root");
+    let error = durable_dir(&root, &outside.join("wal")).unwrap_err();
+    assert!(error.to_string().contains("outside state root"));
+    assert!(!outside.exists());
+    let error = durable_dir(&root, &root.join("../escape")).unwrap_err();
+    assert!(error.to_string().contains("parent traversal"));
+    #[cfg(unix)]
+    {
+        let link = root.join("escape-link");
+        if link.exists() {
+            fs::remove_file(&link).unwrap();
+        }
+        std::os::unix::fs::symlink(root.parent().unwrap(), &link).unwrap();
+        let error = durable_dir(&root, &link.join("escape")).unwrap_err();
+        assert!(error.to_string().contains("outside state root"));
+    }
+}
+
+#[test]
 fn freeze_is_exclusive_and_abort_never_removes_another_cuts_owner() {
     let root = root("owner");
     let wal = root.join("wal/a.wal");
-    assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
+    assert_eq!(freeze(&root, &wal, &owner("a")).unwrap(), Ok(owner("a")));
     let before = fs::read(wal.with_extension("moving")).unwrap();
     assert_eq!(
-        freeze(&wal, &owner("b")).unwrap(),
+        freeze(&root, &wal, &owner("b")).unwrap(),
         Err(MoveRefusal::Moving { cut_id: "a".into() })
     );
     abort_freeze(&wal, "b").unwrap();
     assert_eq!(fs::read(wal.with_extension("moving")).unwrap(), before);
-    assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
+    assert_eq!(freeze(&root, &wal, &owner("a")).unwrap(), Ok(owner("a")));
     abort_freeze(&wal, "a").unwrap();
     assert!(!wal.with_extension("moving").exists());
     let late = root.join("wal/late.wal");
@@ -40,7 +123,7 @@ fn freeze_is_exclusive_and_abort_never_removes_another_cuts_owner() {
         Ok(())
     });
     assert_eq!(
-        freeze(&late, &owner("a")).unwrap(),
+        freeze(&root, &late, &owner("a")).unwrap(),
         Err(MoveRefusal::Moving {
             cut_id: "late-owner".into()
         })
@@ -52,12 +135,13 @@ fn freeze_is_exclusive_and_abort_never_removes_another_cuts_owner() {
 fn release_publishes_tombstone_before_unlink_and_repeats_clean_its_own_freeze() {
     let root = root("release");
     let wal = root.join("wal/a.wal");
-    freeze(&wal, &owner("a")).unwrap().unwrap();
+    freeze(&root, &wal, &owner("a")).unwrap().unwrap();
     assert_eq!(
-        release(&wal, "b", "target").unwrap(),
+        release(&root, &wal, "b", "target").unwrap(),
         Err(MoveRefusal::Moving { cut_id: "a".into() })
     );
     atomic_json(
+        &root,
         &wal.with_extension("moved"),
         &Moved {
             cut_id: "a".into(),
@@ -66,7 +150,7 @@ fn release_publishes_tombstone_before_unlink_and_repeats_clean_its_own_freeze() 
         },
     )
     .unwrap();
-    release(&wal, "a", "target").unwrap().unwrap();
+    release(&root, &wal, "a", "target").unwrap().unwrap();
     assert!(!wal.with_extension("moving").exists());
     assert_eq!(
         check(&wal, "ref", false).unwrap(),
@@ -78,7 +162,7 @@ fn release_publishes_tombstone_before_unlink_and_repeats_clean_its_own_freeze() 
     abort_freeze(&wal, "a").unwrap();
     assert_eq!(fs::read(wal.with_extension("moved")).unwrap(), before);
     assert_eq!(
-        freeze(&wal, &owner("b")).unwrap(),
+        freeze(&root, &wal, &owner("b")).unwrap(),
         Err(MoveRefusal::Moved {
             holder: "target".into()
         })
@@ -89,11 +173,11 @@ fn release_publishes_tombstone_before_unlink_and_repeats_clean_its_own_freeze() 
 fn intent_fence_is_ref_scoped_read_only_and_survives_reader_downgrade() {
     let root = root("fence");
     let wal = root.join("wal/a.wal");
-    durable_dir(wal.parent().unwrap()).unwrap();
+    durable_dir(&root, wal.parent().unwrap()).unwrap();
     fs::write(&wal, b"installed WAL").unwrap();
     let path = root.join("agent-data/cuts/abc.json");
     for op in ["release", "activate"] {
-        atomic_json(&path, &serde_json::json!({"step":"imported","refs":[{"ref_kind":"broca-session","ref":"wanted"}],"intent":{"op":op,"request":{}}})).unwrap();
+        atomic_json(&root, &path, &serde_json::json!({"step":"imported","refs":[{"ref_kind":"broca-session","ref":"wanted"}],"intent":{"op":op,"request":{}}})).unwrap();
         let before = fs::read(&path).unwrap();
         assert_eq!(
             check(&wal, "wanted", true).unwrap(),
@@ -106,7 +190,7 @@ fn intent_fence_is_ref_scoped_read_only_and_survives_reader_downgrade() {
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(fs::read(&wal).unwrap(), b"installed WAL");
     }
-    atomic_json(&path, &serde_json::json!({"refs":[],"intent":null})).unwrap();
+    atomic_json(&root, &path, &serde_json::json!({"refs":[],"intent":null})).unwrap();
     assert_eq!(check(&wal, "wanted", true).unwrap(), Ok(()));
 }
 
@@ -115,7 +199,7 @@ fn corrupt_cut_authority_fails_closed_without_repairing_it() {
     let root = root("corrupt");
     let wal = root.join("wal/a.wal");
     let path = root.join("agent-data/cuts/abc.json");
-    durable_dir(path.parent().unwrap()).unwrap();
+    durable_dir(&root, path.parent().unwrap()).unwrap();
     fs::write(&path, b"not JSON").unwrap();
     assert!(check(&wal, "ref", true).is_err());
     assert_eq!(fs::read(&path).unwrap(), b"not JSON");
@@ -125,13 +209,13 @@ fn corrupt_cut_authority_fails_closed_without_repairing_it() {
 fn staging_digest_and_population_are_not_live_session_inputs() {
     let root = root("staging");
     let path = staging_path(&root.join("wal"), "cut", "addr").unwrap();
-    assert!(stage(&path, b"secret", &digest(b"different")).is_err());
+    assert!(stage(&root, &path, b"secret", &digest(b"different")).is_err());
     assert!(!path.exists());
     let live = root.join("live.wal");
     let writer = FileWal::open(&live).unwrap();
     writer.sync().unwrap();
     let bytes = fs::read(live).unwrap();
-    stage(&path, &bytes, &digest(&bytes)).unwrap();
+    stage(&root, &path, &bytes, &digest(&bytes)).unwrap();
     assert!(FileWal::open(&path).is_err());
     assert!(staging_path(&root.join("wal"), "../other", "addr").is_err());
 }
@@ -143,7 +227,7 @@ fn existing_writer_rechecks_freeze_before_every_append() {
     let mut wal = FileWal::open(&path).unwrap();
     wal.sync().unwrap();
     let before = fs::read(&path).unwrap();
-    freeze(&path, &owner("a")).unwrap().unwrap();
+    freeze(&root, &path, &owner("a")).unwrap().unwrap();
     assert!(matches!(
         wal.append(
             1,
@@ -175,9 +259,9 @@ fn crash_child() {
     };
     let root = PathBuf::from(root);
     let wal = root.join("wal/a.wal");
-    atomic_json(&root.join("agent-data/cuts/kill.json"), &serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":"ref"}],"intent":{"op":"release","request":{}}})).unwrap();
-    freeze(&wal, &owner("kill")).unwrap().unwrap();
-    release(&wal, "kill", "remote").unwrap().unwrap();
+    atomic_json(&root, &root.join("agent-data/cuts/kill.json"), &serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":"ref"}],"intent":{"op":"release","request":{}}})).unwrap();
+    freeze(&root, &wal, &owner("kill")).unwrap().unwrap();
+    release(&root, &wal, "kill", "remote").unwrap().unwrap();
     println!("ARTIFACTS_DURABLE");
     std::io::stdout().flush().unwrap();
     loop {
@@ -238,7 +322,8 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
         cell::{Cell, RefCell},
         rc::Rc,
     };
-    let wal = root("retry-barriers").join("wal/a.wal");
+    let root = root("retry-barriers");
+    let wal = root.join("wal/a.wal");
     let directory = wal.parent().unwrap().to_owned();
     fs::create_dir_all(&directory).unwrap();
     fs::write(
@@ -249,18 +334,27 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
     let events = Rc::new(RefCell::new(Vec::new()));
     let fail = Rc::new(Cell::new(true));
     let observed = events.clone();
+    let mut after_file = false;
     let _trace = io_trace::install(move |event| {
+        if event == Event::FileSync {
+            after_file = true;
+        } else if matches!(event, Event::DirectorySync(_)) {
+            if !after_file {
+                return Ok(());
+            }
+            after_file = false;
+        }
         observed.borrow_mut().push(event.clone());
         if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
             return Err(io::Error::other("injected freeze directory barrier"));
         }
         Ok(())
     });
-    assert!(freeze(&wal, &owner("a"))
+    assert!(freeze(&root, &wal, &owner("a"))
         .unwrap_err()
         .to_string()
         .contains("injected freeze directory barrier"));
-    assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
+    assert_eq!(freeze(&root, &wal, &owner("a")).unwrap(), Ok(owner("a")));
     assert_eq!(
         *events.borrow(),
         vec![
@@ -276,7 +370,8 @@ fn same_owner_freeze_retry_reestablishes_both_barriers() {
 fn freeze_publishes_only_a_complete_synced_sidecar() {
     use super::io_trace::{self, Event};
     use std::{cell::RefCell, rc::Rc};
-    let wal = root("atomic-freeze").join("wal/a.wal");
+    let root = root("atomic-freeze");
+    let wal = root.join("wal/a.wal");
     let moving = wal.with_extension("moving");
     fs::create_dir_all(wal.parent().unwrap()).unwrap();
     {
@@ -291,7 +386,7 @@ fn freeze_publishes_only_a_complete_synced_sidecar() {
             }
             Ok(())
         });
-        assert!(freeze(&wal, &owner("a"))
+        assert!(freeze(&root, &wal, &owner("a"))
             .unwrap_err()
             .to_string()
             .contains("injected before freeze publication"));
@@ -301,6 +396,9 @@ fn freeze_publishes_only_a_complete_synced_sidecar() {
     let observed = events.clone();
     let target = moving.clone();
     let _trace = io_trace::install(move |event| {
+        if matches!(event, Event::DirectorySync(_)) && observed.borrow().is_empty() {
+            return Ok(());
+        }
         if event == Event::FileSync {
             assert!(!target.exists());
         }
@@ -310,7 +408,7 @@ fn freeze_publishes_only_a_complete_synced_sidecar() {
         observed.borrow_mut().push(event);
         Ok(())
     });
-    assert_eq!(freeze(&wal, &owner("a")).unwrap(), Ok(owner("a")));
+    assert_eq!(freeze(&root, &wal, &owner("a")).unwrap(), Ok(owner("a")));
     assert_eq!(
         *events.borrow(),
         vec![
@@ -324,7 +422,8 @@ fn freeze_publishes_only_a_complete_synced_sidecar() {
 
 #[test]
 fn unsupported_freeze_publication_fails_closed_without_a_rename_fallback() {
-    let wal = root("no-hard-links").join("wal/a.wal");
+    let root = root("no-hard-links");
+    let wal = root.join("wal/a.wal");
     let marker = wal.with_extension("moving");
     fs::create_dir_all(wal.parent().unwrap()).unwrap();
     let _trace = super::io_trace::install(|event| {
@@ -336,7 +435,7 @@ fn unsupported_freeze_publication_fails_closed_without_a_rename_fallback() {
         }
         Ok(())
     });
-    let error = freeze(&wal, &owner("a")).unwrap_err();
+    let error = freeze(&root, &wal, &owner("a")).unwrap_err();
     assert!(
         !marker.exists(),
         "unsupported publication exposed a freeze marker"
@@ -391,8 +490,9 @@ fn abort_retry_syncs_directory_when_its_freeze_is_already_absent() {
         cell::{Cell, RefCell},
         rc::Rc,
     };
-    let wal = root("abort-barrier-retry").join("wal/a.wal");
-    freeze(&wal, &owner("a")).unwrap().unwrap();
+    let root = root("abort-barrier-retry");
+    let wal = root.join("wal/a.wal");
+    freeze(&root, &wal, &owner("a")).unwrap().unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let observed = events.clone();
     let fail = Cell::new(true);
@@ -419,8 +519,9 @@ fn release_retry_syncs_directory_when_its_freeze_is_already_absent() {
         cell::{Cell, RefCell},
         rc::Rc,
     };
-    let wal = root("release-barrier-retry").join("wal/a.wal");
-    freeze(&wal, &owner("a")).unwrap().unwrap();
+    let root = root("release-barrier-retry");
+    let wal = root.join("wal/a.wal");
+    freeze(&root, &wal, &owner("a")).unwrap().unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let observed = events.clone();
     let fail = Cell::new(true);
@@ -432,10 +533,10 @@ fn release_retry_syncs_directory_when_its_freeze_is_already_absent() {
         }
         Ok(())
     });
-    assert!(release(&wal, "a", "holder").is_err());
+    assert!(release(&root, &wal, "a", "holder").is_err());
     assert!(!wal.with_extension("moving").exists());
     events.borrow_mut().clear();
-    assert_eq!(release(&wal, "a", "holder").unwrap(), Ok(()));
+    assert_eq!(release(&root, &wal, "a", "holder").unwrap(), Ok(()));
     assert_eq!(
         *events.borrow(),
         vec![Event::DirectorySync(wal.parent().unwrap().to_owned())]

@@ -355,6 +355,7 @@ mod retention_tests {
         let path = wal.wal_path(&key);
         let before = std::fs::read(&path).unwrap();
         broca_wal::migration::freeze(
+            &root,
             &path,
             &broca_wal::migration::Freeze {
                 cut_id: "cut".into(),
@@ -368,7 +369,7 @@ mod retention_tests {
             panic!("frozen warm must stop")
         };
         assert_eq!(reason, "session_moving");
-        broca_wal::migration::release(&path, "cut", "remote")
+        broca_wal::migration::release(&root, &path, "cut", "remote")
             .unwrap()
             .unwrap();
         let WarmTick::Stop { reason, .. } = warmer.warm(&config, &RunId("r".into())).await else {

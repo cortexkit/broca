@@ -80,7 +80,8 @@ impl Rig {
     fn new(tag: &str, source: bool) -> Self {
         let root = broca_test_support::scratch_root()
             .join(format!("file-cut-{}-{tag}", std::process::id()));
-        migration::durable_dir(&root.join("wal")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        migration::durable_dir(&root, &root.join("wal")).unwrap();
         let wal = Arc::new(FileWalStore::new(root.join("wal")));
         let fixture = FileWalStore::new(root.join("incoming"));
         let mut plans = Vec::new();
@@ -143,7 +144,8 @@ impl Rig {
         });
         let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpen), wal.clone(), None);
         let export = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
-        let artifacts = FileCutArtifacts::new(registry, wal.clone(), export, driver.clone());
+        let artifacts =
+            FileCutArtifacts::new(root.clone(), registry, wal.clone(), export, driver.clone());
         let store = CutStore::new(&root);
         Self {
             root,
@@ -317,6 +319,7 @@ async fn actor_critical_section_holds_dispatch_until_completion_and_then_refuses
     let path = wal.wal_path(&session);
     let before = std::fs::read(&path).unwrap();
     migration::freeze(
+        &root,
         &path,
         &Freeze {
             cut_id: CUT.into(),
@@ -497,6 +500,7 @@ async fn abort_recovery_of_identical_hidden_wal_never_becomes_activation() {
         let live = rig.wal.wal_path(&plan.session);
         std::fs::write(&live, &plan.bytes).unwrap();
         migration::atomic_json(
+            &rig.root,
             &live.with_extension("moved"),
             &Moved {
                 cut_id: "old-cut".into(),
@@ -510,7 +514,7 @@ async fn abort_recovery_of_identical_hidden_wal_never_becomes_activation() {
     let path = rig.store.path(CUT);
     let mut state: Value = migration::read_json(&path).unwrap().unwrap();
     state["intent"] = json!({"op":"abort","request":rig.params});
-    migration::atomic_json(&path, &state).unwrap();
+    migration::atomic_json(&rig.root, &path, &state).unwrap();
     migration::unlink(&rig.artifacts.staged(CUT, &rig.driver.plans[0]).unwrap()).unwrap();
     rig.store.reconcile_boot(&rig.artifacts).await.unwrap();
     let state: Value = migration::read_json(&path).unwrap().unwrap();

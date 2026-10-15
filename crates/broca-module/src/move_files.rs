@@ -96,6 +96,7 @@ impl Drop for ArtifactGuard {
 }
 
 pub struct FileCutArtifacts {
+    state_root: PathBuf,
     registry: LineageRegistry,
     wal: Arc<FileWalStore>,
     leases: FileLeaseStore,
@@ -295,6 +296,7 @@ impl FileCutArtifacts {
         activation_refusal(cut_id, state.step, &names, error)
     }
     pub fn new(
+        state_root: PathBuf,
         registry: LineageRegistry,
         wal: Arc<FileWalStore>,
         export: Arc<dyn ExportIndex>,
@@ -302,6 +304,7 @@ impl FileCutArtifacts {
     ) -> Self {
         let root = wal.root().parent().unwrap_or(std::path::Path::new("."));
         Self {
+            state_root,
             registry,
             leases: FileLeaseStore::new(root.join("leases")),
             wal,
@@ -778,6 +781,7 @@ impl CutArtifacts for FileCutArtifacts {
             Op::Prepare => {
                 for plan in &locked.plans {
                     migration::freeze(
+                        &self.state_root,
                         &self.wal.wal_path(&plan.session),
                         &Freeze {
                             cut_id: cut_id.clone(),
@@ -801,20 +805,31 @@ impl CutArtifacts for FileCutArtifacts {
                     .as_str()
                     .ok_or_else(|| unavailable("release holder missing"))?;
                 for plan in &locked.plans {
-                    migration::release(&self.wal.wal_path(&plan.session), &cut_id, holder)
-                        .map_err(unavailable)?
-                        .map_err(unavailable)?;
+                    migration::release(
+                        &self.state_root,
+                        &self.wal.wal_path(&plan.session),
+                        &cut_id,
+                        holder,
+                    )
+                    .map_err(unavailable)?
+                    .map_err(unavailable)?;
                 }
             }
             Op::Import => {
                 for plan in &locked.plans {
-                    migration::stage(&self.staged(&cut_id, plan)?, &plan.bytes, &plan.digest)
-                        .map_err(unavailable)?;
+                    migration::stage(
+                        &self.state_root,
+                        &self.staged(&cut_id, plan)?,
+                        &plan.bytes,
+                        &plan.digest,
+                    )
+                    .map_err(unavailable)?;
                 }
             }
             Op::Activate => {
                 let paths = self.paths(&cut_id, &locked.plans)?;
                 move_install::install_verified(
+                    &self.state_root,
                     &cut_id,
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),

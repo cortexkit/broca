@@ -2270,6 +2270,7 @@ fn move_sidecars_survive_fold_and_never_enter_archives() {
         let sidecar = path.with_extension(extension);
         if extension == "moving" {
             broca_wal::migration::freeze(
+                &f.root,
                 &path,
                 &broca_wal::migration::Freeze {
                     cut_id: "cut".into(),
@@ -2281,6 +2282,7 @@ fn move_sidecars_survive_fold_and_never_enter_archives() {
             .unwrap();
         } else {
             broca_wal::migration::atomic_json(
+                &f.root,
                 &sidecar,
                 &broca_wal::migration::Moved {
                     cut_id: "cut".into(),
@@ -2308,7 +2310,7 @@ fn fold_fences_only_refs_named_by_pending_activation() {
         &protected.session,
     );
     let authority = f.root.join("agent-data/cuts/cut.json");
-    broca_wal::migration::atomic_json(&authority, &serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
+    broca_wal::migration::atomic_json(&f.root, &authority, &serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
     let before = fs::read(&authority).unwrap();
     assert_eq!(f.fold().removed, 1);
     assert_eq!(fs::read(f.store.wal_path(&protected)).unwrap(), bytes);
@@ -2323,6 +2325,7 @@ fn moved_sidecar_hides_archived_session_without_restoring_it() {
     assert_eq!(f.fold().removed, 1);
     let path = f.store.wal_path(&session);
     broca_wal::migration::atomic_json(
+        &f.root,
         &path.with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: "cut".into(),

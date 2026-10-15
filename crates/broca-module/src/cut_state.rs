@@ -135,7 +135,8 @@ impl CutStore {
             .map_err(|error| unavailable(format!("cannot read cut {}: {error}", path.display())))
     }
     fn save(&self, cut_id: &str, state: &CutState) -> Result<(), ErrorBody> {
-        broca_wal::migration::atomic_json(&self.path(cut_id), state).map_err(unavailable)
+        broca_wal::migration::atomic_json(&self.root, &self.path(cut_id), state)
+            .map_err(unavailable)
     }
     async fn lock(
         &self,

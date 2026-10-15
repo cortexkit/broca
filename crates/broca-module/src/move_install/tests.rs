@@ -3,7 +3,10 @@ use broca_core::{ExportIndex, WalStore};
 use broca_protocol::{RunFinishReason, RunId, Usage};
 use broca_wal::{RunConfig, RunOrigin, WalRecord};
 fn root(tag: &str) -> std::path::PathBuf {
-    broca_test_support::scratch_root().join(format!("move-install-{}-{tag}", std::process::id()))
+    let root = broca_test_support::scratch_root()
+        .join(format!("move-install-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    root
 }
 pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
     WalRecord::RunStarted {
@@ -68,7 +71,7 @@ pub(crate) fn episode(wal: &mut dyn broca_wal::Wal, session: &BindIdentity, id: 
 fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     let root = root("preflight");
     let wal_root = root.join("wal");
-    broca_wal::migration::durable_dir(&wal_root).unwrap();
+    broca_wal::migration::durable_dir(&root, &wal_root).unwrap();
     let a = BindIdentity::new("/p", "runner", "a");
     let b = BindIdentity::new("/p", "runner", "b");
     let staged_a = root.join("a.stage");
@@ -104,7 +107,7 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     ];
     let export = broca_store::SqliteStore::open_in_memory().unwrap();
     let drops = std::sync::atomic::AtomicUsize::new(0);
-    let result = install_verified("cut", &specs, &export, |_| {
+    let result = install_verified(&root, "cut", &specs, &export, |_| {
         drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     });
@@ -138,9 +141,10 @@ fn billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable
     let incoming = std::fs::read(incoming_path).unwrap();
     let digest = broca_wal::migration::digest(&incoming);
     let staged = broca_wal::migration::staging_path(wal.root(), "cut", "a").unwrap();
-    broca_wal::migration::stage(&staged, &incoming, &digest).unwrap();
+    broca_wal::migration::stage(&root, &staged, &incoming, &digest).unwrap();
     let live = wal.wal_path(&session);
     broca_wal::migration::atomic_json(
+        &root,
         &live.with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: "old".into(),
@@ -158,13 +162,15 @@ fn billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable
         digest: &digest,
     }];
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    let result = install_verified("cut", &specs, &export, |_| Err("crash after rename".into()));
+    let result = install_verified(&root, "cut", &specs, &export, |_| {
+        Err("crash after rename".into())
+    });
     assert_eq!(result.unwrap_err().code.as_str(), "unavailable");
     assert_eq!(std::fs::read(&live).unwrap(), incoming);
     assert!(!staged.exists());
     drop(export);
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    install_verified("cut", &specs, &export, |_| Ok(())).unwrap();
+    install_verified(&root, "cut", &specs, &export, |_| Ok(())).unwrap();
     assert!(!live.with_extension("moved").exists());
     let records = broca_wal::replay_file(&live, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
     let resolver = |_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1);
@@ -277,7 +283,7 @@ fn rekey_without_a_run_for_the_new_triple_is_refused_without_cross_module_lookup
 #[test]
 fn mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_run() {
     let root = root("mixed-billing");
-    broca_wal::migration::durable_dir(&root).unwrap();
+    broca_wal::migration::durable_dir(&root, &root).unwrap();
     let historical = BindIdentity::new("/p", "runner", "s");
     let current = BindIdentity::new("/p", "broca", "s");
     let incoming_path = root.join("incoming.wal");
@@ -309,11 +315,12 @@ fn mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_
         &broca_core::session_addr(&current),
     )
     .unwrap();
-    broca_wal::migration::stage(&staged, &bytes, &digest).unwrap();
+    broca_wal::migration::stage(&root, &staged, &bytes, &digest).unwrap();
     let live = wal.wal_path(&current);
     let receiver_path = root.join("receiver.db");
     let receiver = broca_store::SqliteStore::open(&receiver_path).unwrap();
     install_verified(
+        &root,
         "mixed-cut",
         &[Installation {
             session: &current,
