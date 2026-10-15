@@ -80,7 +80,7 @@ async fn ordinary_approval_writer_rejects_capability_for_another_call_or_binding
         let proof = capability_for(key, &other, &id).await;
         let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
         let result =
-            approval_gate::approved_decision(&held, &proof, &rig.writer, &mut history).await;
+            approval_gate::approved_decision(&held, proof, &rig.writer, &mut history).await;
         assert!(
             result.is_err(),
             "ordinary approval must check its capability key and binding"

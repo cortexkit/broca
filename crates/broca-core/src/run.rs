@@ -9314,9 +9314,11 @@ mod approval_gate {
     ) -> Result<Option<CallResolution>, RunError> {
         decision_reason(call, decision, digest, None, None, writer, history).await
     }
+    // Move the authorization through approved_decision and decision_reason so it
+    // cannot be reused. A second approval must check the latest consent feed again.
     pub(super) async fn approved_decision(
         call: &Held,
-        authorization: &crate::consent::AuthorizedAnswer,
+        authorization: crate::consent::AuthorizedAnswer,
         writer: &WalHandle,
         history: &mut History,
     ) -> Result<Option<CallResolution>, RunError> {
@@ -9354,7 +9356,7 @@ mod approval_gate {
         decision: DeferredDecision,
         digest: Option<String>,
         code: Option<&str>,
-        authorization: Option<&crate::consent::AuthorizedAnswer>,
+        authorization: Option<crate::consent::AuthorizedAnswer>,
         writer: &WalHandle,
         history: &mut History,
     ) -> Result<Option<CallResolution>, RunError> {
@@ -10834,7 +10836,7 @@ mod approval_gate {
         } else {
             let approved = answer.decision == crate::consent::ConsentDecision::Approved;
             let result = if approved {
-                approved_decision(call, &authorization, writer, history).await?
+                approved_decision(call, authorization, writer, history).await?
             } else {
                 decision(call, DeferredDecision::Declined, None, writer, history).await?
             };
