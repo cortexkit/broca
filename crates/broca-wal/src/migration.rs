@@ -138,9 +138,24 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 pub fn unlink(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => sync_dir(path.parent().unwrap_or(Path::new("."))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // A prior removal may have reached cache but failed its directory barrier.
+    // If the parent itself is absent, make that absence durable at its nearest
+    // existing ancestor instead of treating missing staging directories as errors.
+    let mut parent = path.parent().unwrap_or(Path::new("."));
+    loop {
+        match sync_dir(parent) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    Some(ancestor) => parent = ancestor,
+                    None => return Err(error),
+                }
+            }
+            result => return result,
+        }
     }
 }
 
@@ -255,6 +270,8 @@ pub fn abort_freeze(wal: &Path, cut_id: &str) -> io::Result<()> {
         if owner.cut_id == cut_id {
             unlink(&wal.with_extension("moving"))?;
         }
+    } else {
+        unlink(&wal.with_extension("moving"))?;
     }
     Ok(())
 }
@@ -269,8 +286,8 @@ pub fn release(wal: &Path, cut_id: &str, holder: &str) -> io::Result<Result<(), 
                         cut_id: owner.cut_id,
                     }));
                 }
-                unlink(&wal.with_extension("moving"))?;
             }
+            unlink(&wal.with_extension("moving"))?;
             return Ok(Ok(()));
         }
         return Ok(Err(MoveRefusal::Moved {

@@ -345,3 +345,119 @@ fn unsupported_freeze_publication_fails_closed_without_a_rename_fallback() {
     assert!(error.to_string().contains("cannot publish freeze"));
     assert!(error.to_string().contains(marker.to_str().unwrap()));
 }
+
+#[test]
+fn unlink_retry_syncs_directory_after_a_failed_removal_barrier() {
+    use super::io_trace::{self, Event};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    for extension in ["moving", "moved"] {
+        let directory = root(&format!("unlink-retry-{extension}"));
+        fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join(format!("a.{extension}"));
+        fs::write(&marker, b"marker").unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let fail = Cell::new(true);
+        let _trace = io_trace::install(move |event| {
+            observed.borrow_mut().push(event.clone());
+            if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
+                return Err(io::Error::other("injected removal barrier"));
+            }
+            Ok(())
+        });
+        assert!(unlink(&marker)
+            .unwrap_err()
+            .to_string()
+            .contains("injected removal barrier"));
+        assert!(!marker.exists());
+        unlink(&marker).unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                Event::DirectorySync(directory.clone()),
+                Event::DirectorySync(directory)
+            ]
+        );
+    }
+}
+
+#[test]
+fn abort_retry_syncs_directory_when_its_freeze_is_already_absent() {
+    use super::io_trace::{self, Event};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let wal = root("abort-barrier-retry").join("wal/a.wal");
+    freeze(&wal, &owner("a")).unwrap().unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let fail = Cell::new(true);
+    let _trace = io_trace::install(move |event| {
+        observed.borrow_mut().push(event.clone());
+        if matches!(event, Event::DirectorySync(_)) && fail.replace(false) {
+            return Err(io::Error::other("injected abort barrier"));
+        }
+        Ok(())
+    });
+    assert!(abort_freeze(&wal, "a").is_err());
+    assert!(!wal.with_extension("moving").exists());
+    abort_freeze(&wal, "a").unwrap();
+    assert_eq!(
+        *events.borrow(),
+        vec![Event::DirectorySync(wal.parent().unwrap().to_owned()); 2]
+    );
+}
+
+#[test]
+fn release_retry_syncs_directory_when_its_freeze_is_already_absent() {
+    use super::io_trace::{self, Event};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let wal = root("release-barrier-retry").join("wal/a.wal");
+    freeze(&wal, &owner("a")).unwrap().unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let fail = Cell::new(true);
+    let moving = wal.with_extension("moving");
+    let _trace = io_trace::install(move |event| {
+        observed.borrow_mut().push(event.clone());
+        if matches!(event, Event::DirectorySync(_)) && !moving.exists() && fail.replace(false) {
+            return Err(io::Error::other("injected release removal barrier"));
+        }
+        Ok(())
+    });
+    assert!(release(&wal, "a", "holder").is_err());
+    assert!(!wal.with_extension("moving").exists());
+    events.borrow_mut().clear();
+    assert_eq!(release(&wal, "a", "holder").unwrap(), Ok(()));
+    assert_eq!(
+        *events.borrow(),
+        vec![Event::DirectorySync(wal.parent().unwrap().to_owned())]
+    );
+}
+
+#[test]
+fn absent_staging_parents_still_sync_the_nearest_existing_directory() {
+    use super::io_trace::{self, Event};
+    use std::{cell::RefCell, rc::Rc};
+    let directory = root("missing-staging-parent");
+    fs::create_dir_all(&directory).unwrap();
+    let marker = directory.join("staging/cut/a.wal");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let _trace = io_trace::install(move |event| {
+        observed.borrow_mut().push(event);
+        Ok(())
+    });
+    unlink(&marker).unwrap();
+    assert_eq!(
+        events.borrow().last(),
+        Some(&Event::DirectorySync(directory))
+    );
+}
