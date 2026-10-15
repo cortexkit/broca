@@ -12020,3 +12020,43 @@ old = '''"consent.withdraw",
                 &json!({"elicitation_id": id}),'''
 new = '''"consent.withdraw",
                 &json!({"elicitation_id": id, "prompt": "RETENTION-MODULE-CONTENT-SENTINEL-59137"}), // NON-VACUITY BREAK: leak expired content'''
+
+
+[[control]]
+id = "subc-consent-no-ack-on-owner-feed"
+guards = "the consent adapter refuses owner-wide acknowledgement even if a caller requests it"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_owner_feed_ack_is_refused_without_a_send"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = 'Err(refusal("consent_owner_feed_ack_forbidden"))'
+new = 'Ok(()) // NON-VACUITY BREAK: accept an owner-feed acknowledgement'
+
+[[control]]
+id = "subc-consent-filing-args-digest"
+guards = "the consent filing transmits the frozen argument hash unchanged alongside its binding"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_request_body_has_no_identity_keys"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"binding": broca_core::consent::binding(prepared), "args_digest": args_hash,'
+new = '"binding": broca_core::consent::binding(prepared), "args_digest": format!("{args_hash}-changed"), /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "subc-consent-default-deny"
+guards = "an unanswered consent filing defaults to deny independently of its expiry policy"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_request_body_has_no_identity_keys"]
+select = "expected"
+file = "crates/broca-subc/src/consent.rs"
+old = '"default": "deny", "urgency": "normal", "on_expiry": "deny",'
+new = '"default": "approve", "urgency": "normal", "on_expiry": "deny", /* NON-VACUITY BREAK */'
