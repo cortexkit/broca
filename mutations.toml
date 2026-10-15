@@ -5717,7 +5717,7 @@ features = ["test-clock"]
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::retention_expiry_deletes_owed_content_and_withdraws_from_identity_only_record"]
 file = "crates/broca-module/src/retention.rs"
-old = 'provider_id: "prefrontal-core".into(),'
+old = 'provider_id: "cingulate".into(),'
 new = 'provider_id: ask.prompt.clone(), // NON-VACUITY BREAK: retain prompt as identity metadata'
 
 [[control]]
@@ -11979,3 +11979,44 @@ expect_message = "broca-core/src/consent.rs"
 file = "crates/broca-wal/tests/it/compaction_source.rs"
 old = '''found.retain(|variant| variant != "AwaitingApproval");'''
 new = '''found.retain(|variant| variant != "NON-VACUITY BREAK");'''
+
+[[control]]
+id = "retention-consent-provider-identity"
+guards = "retention withdrawal rows name the consent provider rather than the retired core provider"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::retention_expiry_deletes_owed_content_and_withdraws_from_identity_only_record"]
+file = "crates/broca-module/src/retention.rs"
+old = 'provider_id: "cingulate".into(),'
+new = 'provider_id: "prefrontal-core".into(), // NON-VACUITY BREAK: retired consent provider'
+
+[[control]]
+id = "retention-unknown-consent-lapses-at-expiry"
+guards = "unknown consent ids remain pending until exactly expires_at_ms without a consent operation"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::content_free_unknown_id_is_not_refiled_and_is_dropped_at_ask_expiry"]
+file = "crates/broca-module/src/retention_withdrawals.rs"
+old = "if now >= question.expires_at_ms {"
+new = "if now > question.expires_at_ms { // NON-VACUITY BREAK: miss the exact lapse deadline"
+
+[[control]]
+id = "retention-consent-withdraw-body-is-content-free"
+guards = "the production consent withdrawal body contains no expired transcript marker"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/retention_consent_wire.rs"
+expect_red = ["retention_consent_wire::retained_consent_withdrawal_uses_frozen_scope_and_content_free_body"]
+expect_message = "private retention marker in consent.withdraw body"
+file = "crates/broca-subc/src/consent.rs"
+old = '''"consent.withdraw",
+                &json!({"elicitation_id": id}),'''
+new = '''"consent.withdraw",
+                &json!({"elicitation_id": id, "prompt": "RETENTION-MODULE-CONTENT-SENTINEL-59137"}), // NON-VACUITY BREAK: leak expired content'''

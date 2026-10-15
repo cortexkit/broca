@@ -58,6 +58,7 @@ mod preset_real_daemon;
 mod prompt_blocks_render;
 mod provider_override_boot;
 mod reply_deadline_real_daemon;
+mod retention_consent_wire;
 mod scope_carrier;
 mod scope_stamp_source;
 mod seal_line_is_filterable_e2e;
