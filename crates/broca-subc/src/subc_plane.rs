@@ -389,7 +389,9 @@ trait ToolPlaneConnection: Send + Sync {
         _preset: Option<&str>,
         _args: &ApprovedArgs,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
-        Err(ConnError::Protocol("approved_dispatch_unavailable".into()).into())
+        Err(crate::connection::ApprovedCallError::BeforePush(
+            ConnError::Protocol("approved_dispatch_unavailable".into()).into(),
+        ))
     }
 
     /// The capability names the daemon advertises (`server.describe`).
@@ -483,6 +485,27 @@ enum SendAttempt {
     NotSent { reason: String },
     Reply(Result<serde_json::Value, ConnError>),
 }
+impl SendAttempt {
+    fn approved_reply(
+        reply: Result<serde_json::Value, crate::connection::ApprovedCallError>,
+    ) -> Self {
+        match reply {
+            Ok(reply) => Self::Reply(Ok(reply)),
+            Err(crate::connection::ApprovedCallError::AfterPush(error)) => Self::Reply(Err(error)),
+            // Closed or replaced route handles keep the reopen-and-retry path:
+            // their request never entered a queue. Every other BeforePush error
+            // is not-sent by construction, regardless of its cause.
+            Err(crate::connection::ApprovedCallError::BeforePush(
+                crate::connection::ApprovedSetupError::Connection(
+                    error @ ConnError::StaleRouteHandle(_),
+                ),
+            )) => Self::Reply(Err(error)),
+            Err(crate::connection::ApprovedCallError::BeforePush(error)) => Self::NotSent {
+                reason: error.to_string(),
+            },
+        }
+    }
+}
 
 /// The real subc tool plane. A caller can hint a tool's target module, otherwise the
 /// plane resolves a catalog-unique provider and finally falls back to the configured
@@ -572,21 +595,11 @@ impl SubcToolPlane {
                     reason: "approved_dispatch_stopped_before_send".into(),
                 };
             }
-            match self
-                .conn
-                .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
-                .await
-            {
-                Ok(reply) => SendAttempt::Reply(Ok(reply)),
-                Err(crate::connection::ApprovedCallError::Connection(error)) => {
-                    SendAttempt::Reply(Err(error))
-                }
-                Err(crate::connection::ApprovedCallError::NotSent { reason }) => {
-                    SendAttempt::NotSent {
-                        reason: reason.into(),
-                    }
-                }
-            }
+            SendAttempt::approved_reply(
+                self.conn
+                    .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
+                    .await,
+            )
         } else {
             SendAttempt::Reply(
                 self.conn
@@ -2657,6 +2670,7 @@ mod tests {
         max_concurrent_route_opens: AtomicUsize,
         route_open_completions: Mutex<Vec<String>>,
         tool_replies: Mutex<VecDeque<Result<serde_json::Value, ConnError>>>,
+        approved_setup_error: Mutex<Option<ConnError>>,
         tool_calls: AtomicUsize,
         /// Every id the plane put on the wire, in dispatch order. RECORDED rather than
         /// ignored so a test can assert the retry reuses the SAME id: broca re-sends only
@@ -2702,6 +2716,7 @@ mod tests {
                 max_concurrent_route_opens: AtomicUsize::new(0),
                 route_open_completions: Mutex::new(Vec::new()),
                 tool_replies: Mutex::new(tool_replies.into()),
+                approved_setup_error: Mutex::new(None),
                 tool_calls: AtomicUsize::new(0),
                 dispatched_ids: Mutex::new(Vec::new()),
                 closed_routes: Mutex::new(Vec::new()),
@@ -2869,6 +2884,11 @@ mod tests {
             preset: Option<&str>,
             args: &ApprovedArgs,
         ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+            if let Some(error) = self.approved_setup_error.lock().unwrap().take() {
+                return Err(crate::connection::ApprovedCallError::BeforePush(
+                    error.into(),
+                ));
+            }
             let arguments = serde_json::from_str(&args.bytes).expect("approved fixture arguments");
             self.tool_call(
                 route,
@@ -2879,12 +2899,37 @@ mod tests {
                 preset,
             )
             .await
-            .map_err(Into::into)
+            .map_err(crate::connection::ApprovedCallError::AfterPush)
         }
 
         fn route_is_open(&self, route: &RouteHandle) -> bool {
             !self.closed.lock().unwrap().contains(&route.channel)
         }
+    }
+
+    #[tokio::test]
+    async fn approved_before_push_stale_handle_reopens_and_resends_once() {
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![vec![catalog_entry("aft", &["edit"])]],
+            vec![successful_tool_reply("done")],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("approved-stale-before-push");
+        let (route, _) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
+        *conn.approved_setup_error.lock().unwrap() = Some(ConnError::StaleRouteHandle(route));
+        let result = plane
+            .dispatch_approved(
+                &ctx,
+                &call("edit"),
+                "{}",
+                "call-key",
+                "digest",
+                &Default::default(),
+            )
+            .await;
+        assert!(matches!(result, DispatchResult::Completed(_)));
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5912,6 +5957,91 @@ mod approved_queue_contract_tests {
     use futures::FutureExt;
 
     #[tokio::test]
+    async fn approved_setup_failures_are_not_sent() {
+        for setup in ["raw-body", "registration", "frame-build"] {
+            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+            if setup == "registration" {
+                module.fill_pending_for_test();
+            }
+            const {
+                assert!(
+                    subc_protocol::MAX_FRAME_BODY_LEN <= 64 * 1024 * 1024,
+                    "oversized-frame probe must stay bounded"
+                );
+            }
+            let oversized = if setup == "frame-build" {
+                "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize + 1)
+            } else {
+                "edit".into()
+            };
+            let args = if setup == "raw-body" { "{" } else { "{}" };
+            let result = conn
+                .tool_call_raw_guarded(
+                    &route,
+                    &oversized,
+                    args,
+                    Some("approved"),
+                    Duration::from_millis(20),
+                    None,
+                    Some("call-key"),
+                    None,
+                    &Default::default(),
+                )
+                .await;
+            assert!(
+                matches!(
+                    SendAttempt::approved_reply(result),
+                    SendAttempt::NotSent { .. }
+                ),
+                "{setup} failed before enqueue and must be recorded not-sent"
+            );
+            assert!(
+                module.take_written_for_test().is_empty(),
+                "{setup} must not enqueue a request or cancel"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_failure_after_real_push_remains_unknown() {
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let plane = SubcToolPlane::new(conn, "aft");
+        let ctx = BatchCtx {
+            batch_id: broca_protocol::BatchId("after-push".into()),
+            bind: BindIdentity::new("/project", "test", "after-push"),
+            run_id: broca_protocol::RunId("run".into()),
+            scope: None,
+        };
+        plane.routes.lock().unwrap().insert(
+            SubcToolPlane::route_key(&ctx.bind, None, "aft"),
+            RouteState {
+                handle: route,
+                sem: Arc::new(Semaphore::new(1)),
+                stamp: None,
+            },
+        );
+        let call = ToolCall {
+            tool_call_id: broca_protocol::ToolCallId("approved".into()),
+            tool_name: "edit".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let signals = Default::default();
+        let (result, ()) = tokio::join!(
+            plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals),
+            async {
+                let request = module.next_request().await;
+                assert!(module.reply(&request, b"invalid-json".to_vec()));
+            }
+        );
+        assert!(
+            matches!(result, DispatchResult::SentButOutcomeUnknown { .. }),
+            "a malformed provider reply is after the real push: {result:?}"
+        );
+        assert!(module.take_written_for_test().is_empty());
+    }
+
+    #[tokio::test]
     async fn approved_closed_writer_queue_is_not_sent() {
         let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
         module.close_writer_for_test();
@@ -5940,7 +6070,7 @@ mod approved_queue_contract_tests {
             .dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &Default::default())
             .await;
         assert!(
-            matches!(result, DispatchResult::NotSent { ref reason } if reason == "writer task closed before enqueue"),
+            matches!(result, DispatchResult::NotSent { ref reason } if reason == "subc transport: writer task closed before enqueue"),
             "a failed reservation never commits a send: {result:?}"
         );
         assert!(module.take_written_for_test().is_empty());

@@ -176,12 +176,26 @@ struct ConnToken(u64);
 
 #[derive(Debug)]
 pub(crate) enum ApprovedCallError {
-    NotSent { reason: &'static str },
+    BeforePush(ApprovedSetupError),
+    AfterPush(ConnError),
+}
+
+#[derive(Debug)]
+pub(crate) enum ApprovedSetupError {
+    Interrupted,
     Connection(ConnError),
 }
-impl From<ConnError> for ApprovedCallError {
+impl From<ConnError> for ApprovedSetupError {
     fn from(error: ConnError) -> Self {
         Self::Connection(error)
+    }
+}
+impl std::fmt::Display for ApprovedSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted => f.write_str("approved_dispatch_stopped_before_enqueue"),
+            Self::Connection(error) => write!(f, "{error}"),
+        }
     }
 }
 
@@ -752,11 +766,11 @@ impl SubcConnection {
         runtime: &ConnectionRuntime,
         frame: Frame,
         signals: &broca_core::tool_plane::DispatchSignals,
-    ) -> Result<(), ApprovedCallError> {
+    ) -> Result<(), ApprovedSetupError> {
         let permit = tokio::select! {
             biased;
-            _ = signals.cancelled() => return Err(ApprovedCallError::NotSent { reason: "approved_dispatch_stopped_before_enqueue" }),
-            permit = runtime.write_tx.reserve() => permit.map_err(|_| ApprovedCallError::NotSent { reason: "writer task closed before enqueue" })?,
+            _ = signals.cancelled() => return Err(ApprovedSetupError::Interrupted),
+            permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed before enqueue".into()))?,
         };
         Self::push_approved(permit, frame, signals)
     }
@@ -765,15 +779,13 @@ impl SubcConnection {
         permit: mpsc::Permit<'_, Frame>,
         frame: Frame,
         signals: &broca_core::tool_plane::DispatchSignals,
-    ) -> Result<(), ApprovedCallError> {
+    ) -> Result<(), ApprovedSetupError> {
         // A clear final signal observation below is the linearization point: the
         // call is committed to send. Cancellation after that observation, even
         // from another thread before permit.send executes, is treated as after
         // the send. No await separates the observation from the synchronous push.
         if signals.interrupted() {
-            return Err(ApprovedCallError::NotSent {
-                reason: "approved_dispatch_stopped_before_enqueue",
-            });
+            return Err(ApprovedSetupError::Interrupted);
         }
         permit.send(frame);
         Ok(())
@@ -1496,30 +1508,37 @@ impl SubcConnection {
         approval_digest: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, ApprovedCallError> {
-        let body = Self::raw_tool_call_body(
-            name,
-            args_jcs,
-            tool_call_id,
-            preset,
-            call_key,
-            approval_digest,
-        )?;
-        let corr = self.next_corr();
-        let (runtime, _registration, mut rx) =
-            self.register_route(route, (route.channel, route.epoch, corr))?;
-        let frame = Frame::build(
-            FrameType::Request,
-            data_flags(),
-            route.channel,
-            route.epoch,
-            corr,
-            body,
-        )
-        .map_err(|error| ConnError::Transport(error.to_string()))?;
-        self.enqueue_approved(&runtime, frame, signals).await?;
+        // All fallible setup belongs to one pre-push stage. There is no fallible
+        // work after enqueue inside this block, so its errors can never mean sent.
+        let before_push = async {
+            let body = Self::raw_tool_call_body(
+                name,
+                args_jcs,
+                tool_call_id,
+                preset,
+                call_key,
+                approval_digest,
+            )?;
+            let corr = self.next_corr();
+            let (runtime, registration, rx) =
+                self.register_route(route, (route.channel, route.epoch, corr))?;
+            let frame = Frame::build(
+                FrameType::Request,
+                data_flags(),
+                route.channel,
+                route.epoch,
+                corr,
+                body,
+            )
+            .map_err(|error| ConnError::Transport(error.to_string()))?;
+            self.enqueue_approved(&runtime, frame, signals).await?;
+            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr))
+        };
+        let (runtime, _registration, mut rx, corr) =
+            before_push.await.map_err(ApprovedCallError::BeforePush)?;
         self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
             .await
-            .map_err(Into::into)
+            .map_err(ApprovedCallError::AfterPush)
     }
 
     fn raw_tool_call_body(
@@ -3090,6 +3109,19 @@ impl SubcConnection {
 
 #[cfg(test)]
 impl InProcessModuleEnd {
+    pub(crate) fn fill_pending_for_test(&self) {
+        for corr in 0..MAX_PENDING_REQUESTS as u64 {
+            let (sender, _rx) = mpsc::unbounded_channel();
+            self.pending.lock().unwrap().insert(
+                (9, 1, corr),
+                PendingEntry::Live {
+                    sender: PendingSender::Unary(sender),
+                    route_open: false,
+                },
+            );
+        }
+    }
+
     pub(crate) fn close_writer_for_test(&mut self) {
         self.write_rx.close();
     }
@@ -5799,9 +5831,7 @@ mod approved_enqueue_tests {
                 Frame::build(FrameType::Request, data_flags(), 5, 3, 1, br#"{}"#.to_vec()).unwrap();
             assert!(matches!(
                 SubcConnection::push_approved(permit, frame, &signals),
-                Err(ApprovedCallError::NotSent {
-                    reason: "approved_dispatch_stopped_before_enqueue"
-                })
+                Err(ApprovedSetupError::Interrupted)
             ));
             assert!(rx.try_recv().is_err());
         }

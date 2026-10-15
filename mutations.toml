@@ -11704,8 +11704,8 @@ test_file = "crates/broca-subc/src/subc_plane.rs"
 expect_red = ["subc_plane::approved_queue_contract_tests::approved_closed_writer_queue_is_not_sent"]
 select = "expected"
 file = "crates/broca-subc/src/connection.rs"
-old = '''permit = runtime.write_tx.reserve() => permit.map_err(|_| ApprovedCallError::NotSent { reason: "writer task closed before enqueue" })?,'''
-new = '''permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed".into()))?, // NON-VACUITY BREAK: misclassify a failed pre-send reservation as unknown'''
+old = ".map_err(ApprovedCallError::BeforePush)?"
+new = ".map_err(|error| ApprovedCallError::AfterPush(ConnError::Transport(error.to_string())))? /* NON-VACUITY BREAK: classify the pre-push stage as sent */"
 
 [[control]]
 id = "core-consent-withdraw-ack-requires-record-proof"
@@ -11828,3 +11828,42 @@ select = "expected"
 file = "crates/broca-core/src/consent.rs"
 old = "if closed_without_answer {"
 new = "if false && closed_without_answer { // NON-VACUITY BREAK: treat the proven withdrawn duplicate as an opposing answer"
+
+[[control]]
+id = "subc-approved-setup-stage-is-not-sent"
+guards = "all approved setup errors are classified by the pre-push stage instead of being treated as sent connection errors"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_setup_failures_are_not_sent"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = ".map_err(ApprovedCallError::BeforePush)?"
+new = ".map_err(|error| ApprovedCallError::AfterPush(ConnError::Transport(error.to_string())))? /* NON-VACUITY BREAK: classify the pre-push stage as sent */"
+
+[[control]]
+id = "subc-approved-after-push-can-be-unknown"
+guards = "a malformed real provider reply after enqueue remains an unknown execution outcome"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::approved_failure_after_real_push_remains_unknown"]
+select = "expected"
+file = "crates/broca-subc/src/connection.rs"
+old = ".map_err(ApprovedCallError::AfterPush)"
+new = ".map_err(|error| ApprovedCallError::BeforePush(error.into())) /* NON-VACUITY BREAK: reclassify a sent failure as not-sent */"
+
+[[control]]
+id = "subc-approved-before-push-stale-route-still-recovers"
+guards = "known stale handles retain proved-pre-send route reopening and one real resend"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::approved_before_push_stale_handle_reopens_and_resends_once"]
+select = "expected"
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "error @ ConnError::StaleRouteHandle(_)"
+new = "error @ ConnError::Protocol(_) /* NON-VACUITY BREAK: lose stale-handle recovery */"
