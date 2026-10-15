@@ -31,6 +31,36 @@ Either of these satisfies it:
 A build-from-source deployment must provide a reachable catalog or seed the LKG
 file before serving models.
 
+The poller always requests `catalog.get` with `paged: true`, the catalog fact
+prefixes, and `include_retired: true`. It echoes opaque `next_page_token` strings
+as `page_token`, omitting the token on page one. A response without a continuation
+token is complete, including an older fusiform's unpaged response. Pages are
+assembled before the existing catalog parser, monotonicity checks, and atomic
+LKG write run; no partial catalog is installed.
+
+All pages must agree on `catalog_version` and `resolved_at_ms`. A mismatch or a
+response with code `catalog_changed` discards the assembly and restarts from page
+one, at most twice. Every other refusal, including `refused`, remains terminal on
+both first-page and continuation requests. Message wording is diagnostic only;
+no message text controls restarts. A poll is bounded to 256
+page requests and 64 MiB of serialized response JSON, including tool envelopes
+and abandoned attempts. Exhaustion is a named refusal; malformed pages, duplicate
+model identities or qualification rows, and repeated continuation tokens are
+protocol errors. A failed poll retains the previous memory snapshot and LKG and
+counts once toward catalog health, just as an unpaged failure does.
+
+The fusiform catalog service's reference pagination request/response fixtures
+have not yet been published. Until those fixtures confirm interoperability,
+Broca makes these compatibility assumptions:
+pages retain the existing flat `models` map keyed by `provider/model`, with whole
+providers grouped into pages in provider-id order; `source` is unchanged;
+`withheld` and `uncertain` are per-page arrays concatenated in page order, with
+duplicate rows refused; every page carries the version and page one's resolved
+instant; the final continuation token is absent, not null. Error codes arrive as
+a routed error or a direct/tool-result JSON error document. A stale continuation
+uses the distinct `catalog_changed` code; `refused` and other codes do not signal
+a snapshot restart.
+
 ## 2. Two consumer roles
 
 - **Drivers** start or steer work and inject prompts.
