@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 
@@ -23,6 +24,15 @@ def bash_path():
     return bash
 
 
-if __name__ == "__main__":
+def main(args):
     bash = bash_path()
-    os.execv(bash, [bash, *sys.argv[1:]])
+    if sys.platform == "win32":
+        # Windows has no exec: os.execv spawns a child and exits this process at once, so the
+        # caller loses the child's output and exit status. It also joins argv unquoted, so a
+        # Bash path under "Program Files" splits at the space. Wait for the child instead.
+        return subprocess.run([bash, *args]).returncode
+    os.execv(bash, [bash, *args])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

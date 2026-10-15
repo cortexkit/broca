@@ -298,6 +298,24 @@ with open(os.environ['EVENTS'], 'a') as f:
         self.assertEqual(run.returncode, 7, run.stdout + run.stderr)
         self.assertEqual(run.stdout, 'a test with spaces\n')
 
+    def test_windows_launcher_waits_and_survives_a_path_with_spaces(self):
+        # Windows has no exec, so the launcher must wait for Bash itself and return its status.
+        # Git Bash lives under "Program Files"; a link in a spaced folder stands in for it.
+        bash = shutil.which('bash')
+        assert bash is not None
+        spaced = self.root / 'Program Files' / 'Git'
+        spaced.mkdir(parents=True)
+        (spaced / 'bash').symlink_to(bash)
+        spec = importlib.util.spec_from_file_location('mutation_bash', ROOT / 'scripts/mutation-bash.py')
+        assert spec is not None and spec.loader is not None
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        with patch.dict(os.environ, {'BROCA_MUTATION_BASH': str(spaced / 'bash')}), \
+                patch.object(launcher.sys, 'platform', 'win32'), \
+                patch.object(launcher.os, 'execv', side_effect=AssertionError('execv on Windows')):
+            status = launcher.main(['-c', 'exit 7'])
+        self.assertEqual(status, 7)
+
     def test_native_launcher_refuses_windows_without_explicit_path(self):
         spec = importlib.util.spec_from_file_location('mutation_bash', ROOT / 'scripts/mutation-bash.py')
         assert spec is not None and spec.loader is not None
