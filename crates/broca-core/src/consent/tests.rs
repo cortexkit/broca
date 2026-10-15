@@ -749,46 +749,206 @@ fn live_candidate_cannot_erase_an_opposing_buffered_readback() {
 
 #[tokio::test]
 async fn duplicate_withdrawal_retry_and_terminal_readback_table() {
-    struct ProofPlane { withdrawal: ApprovalWithdrawal, question: Result<ApprovalQuestion, ApprovalRouteError>, gets: std::sync::atomic::AtomicUsize }
+    struct ProofPlane {
+        withdrawal: ApprovalWithdrawal,
+        question: Result<ApprovalQuestion, ApprovalRouteError>,
+        gets: std::sync::atomic::AtomicUsize,
+    }
     #[async_trait::async_trait]
     impl ElicitationPlane for ProofPlane {
-        async fn withdraw(&self, _: &BatchCtx, _: &str) -> ApprovalWithdrawal { self.withdrawal.clone() }
-        async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> { self.gets.fetch_add(1, Ordering::SeqCst); self.question.clone() }
+        async fn withdraw(&self, _: &BatchCtx, _: &str) -> ApprovalWithdrawal {
+            self.withdrawal.clone()
+        }
+        async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.question.clone()
+        }
     }
-    let answered = |choice| ApprovalQuestion { terminal: true, record: record("new", choice) };
-    let mut wrong_id = answered("approve"); wrong_id.record["elicitation_id"] = json!("other");
-    let mut wrong_ref = answered("approve"); wrong_ref.record["requester_ref"] = json!("other");
-    let mut bad_binding = answered("approve"); bad_binding.record["binding"]["args_hash"] = json!("changed");
-    let mut not_terminal = answered("approve"); not_terminal.terminal = false;
-    let pending = ApprovalQuestion { terminal: false, record: json!({"state":"pending","requester_ref":"key","elicitation_id":"new"}) };
-    let terminal_none = ApprovalQuestion { terminal: true, record: json!({"state":"expired","requester_ref":"key","elicitation_id":"new","answered_choice_id":"approve"}) };
-    let not_sent = |reason: &str| ApprovalWithdrawal::NotSent { reason: reason.into() };
+    let answered = |choice| ApprovalQuestion {
+        terminal: true,
+        record: record("new", choice),
+    };
+    let mut wrong_id = answered("approve");
+    wrong_id.record["elicitation_id"] = json!("other");
+    let mut wrong_ref = answered("approve");
+    wrong_ref.record["requester_ref"] = json!("other");
+    let mut bad_binding = answered("approve");
+    bad_binding.record["binding"]["args_hash"] = json!("changed");
+    let mut not_terminal = answered("approve");
+    not_terminal.terminal = false;
+    let pending = ApprovalQuestion {
+        terminal: false,
+        record: json!({"state":"pending","requester_ref":"key","elicitation_id":"new"}),
+    };
+    let terminal_none = ApprovalQuestion {
+        terminal: true,
+        record: json!({"state":"expired","requester_ref":"key","elicitation_id":"new","answered_choice_id":"approve"}),
+    };
+    let not_sent = |reason: &str| ApprovalWithdrawal::NotSent {
+        reason: reason.into(),
+    };
     let retry = |code: &str, retryable| ApprovalWithdrawal::Retry(refusal(code, retryable));
     let cases = vec![
-        ("acknowledged", ApprovalWithdrawal::Acknowledged, Ok(pending.clone()), None, 0),
-        ("answered-agrees", not_sent("answered"), Ok(answered("approve")), None, 1),
-        ("answered-conflicts", not_sent("answered"), Ok(answered("deny")), Some(("consent_conflicting_decisions", false)), 1),
-        ("retry-terminal-agrees", retry("answered", false), Ok(answered("approve")), None, 1),
-        ("retry-terminal-conflicts", retry("answered", false), Ok(answered("deny")), Some(("consent_conflicting_decisions", false)), 1),
-        ("retryable-answered", retry("answered", true), Ok(answered("approve")), Some(("answered", true)), 0),
-        ("retryable-transport", retry("transport_busy", true), Ok(answered("approve")), Some(("transport_busy", true)), 0),
-        ("nonretry-unknown", retry("permanent_refusal", false), Ok(answered("approve")), Some(("permanent_refusal", false)), 0),
-        ("unknown-refusal-proved", not_sent("route_busy"), Ok(answered("approve")), None, 1),
-        ("unknown-refusal-conflicts", not_sent("route_busy"), Ok(answered("deny")), Some(("consent_conflicting_decisions", false)), 1),
-        ("pending-unproved", not_sent("route_busy"), Ok(pending), Some(("consent_withdrawal_unproven", true)), 1),
-        ("wrong-id", not_sent("answered"), Ok(wrong_id), Some(("consent_withdrawal_unproven", true)), 1),
-        ("wrong-ref", not_sent("answered"), Ok(wrong_ref), Some(("consent_withdrawal_unproven", true)), 1),
-        ("wrong-binding", not_sent("answered"), Ok(bad_binding), Some(("consent_binding_mismatch", false)), 1),
-        ("unsupported-choice", not_sent("answered"), Ok(answered("maybe")), Some(("consent_choice_unsupported", false)), 1),
-        ("unproved-terminal-flag", not_sent("answered"), Ok(not_terminal), Some(("consent_withdrawal_unproven", true)), 1),
-        ("answered-without-answer", not_sent("answered"), Ok(terminal_none.clone()), Some(("consent_withdrawal_unproven", true)), 1),
-        ("expired-with-metadata", not_sent("expired"), Ok(terminal_none), None, 1),
-        ("readback-failed", not_sent("answered"), Err(refusal("readback_busy", true)), Some(("readback_busy", true)), 1),
+        (
+            "acknowledged",
+            ApprovalWithdrawal::Acknowledged,
+            Ok(pending.clone()),
+            None,
+            0,
+        ),
+        (
+            "answered-agrees",
+            not_sent("answered"),
+            Ok(answered("approve")),
+            None,
+            1,
+        ),
+        (
+            "answered-conflicts",
+            not_sent("answered"),
+            Ok(answered("deny")),
+            Some(("consent_conflicting_decisions", false)),
+            1,
+        ),
+        (
+            "retry-terminal-agrees",
+            retry("answered", false),
+            Ok(answered("approve")),
+            None,
+            1,
+        ),
+        (
+            "retry-terminal-conflicts",
+            retry("answered", false),
+            Ok(answered("deny")),
+            Some(("consent_conflicting_decisions", false)),
+            1,
+        ),
+        (
+            "retryable-answered",
+            retry("answered", true),
+            Ok(answered("approve")),
+            Some(("answered", true)),
+            0,
+        ),
+        (
+            "retryable-transport",
+            retry("transport_busy", true),
+            Ok(answered("approve")),
+            Some(("transport_busy", true)),
+            0,
+        ),
+        (
+            "nonretry-unknown",
+            retry("permanent_refusal", false),
+            Ok(answered("approve")),
+            Some(("permanent_refusal", false)),
+            0,
+        ),
+        (
+            "unknown-refusal-proved",
+            not_sent("route_busy"),
+            Ok(answered("approve")),
+            None,
+            1,
+        ),
+        (
+            "unknown-refusal-conflicts",
+            not_sent("route_busy"),
+            Ok(answered("deny")),
+            Some(("consent_conflicting_decisions", false)),
+            1,
+        ),
+        (
+            "pending-unproved",
+            not_sent("route_busy"),
+            Ok(pending),
+            Some(("consent_withdrawal_unproven", true)),
+            1,
+        ),
+        (
+            "wrong-id",
+            not_sent("answered"),
+            Ok(wrong_id),
+            Some(("consent_withdrawal_unproven", true)),
+            1,
+        ),
+        (
+            "wrong-ref",
+            not_sent("answered"),
+            Ok(wrong_ref),
+            Some(("consent_withdrawal_unproven", true)),
+            1,
+        ),
+        (
+            "wrong-binding",
+            not_sent("answered"),
+            Ok(bad_binding),
+            Some(("consent_binding_mismatch", false)),
+            1,
+        ),
+        (
+            "unsupported-choice",
+            not_sent("answered"),
+            Ok(answered("maybe")),
+            Some(("consent_choice_unsupported", false)),
+            1,
+        ),
+        (
+            "unproved-terminal-flag",
+            not_sent("answered"),
+            Ok(not_terminal),
+            Some(("consent_withdrawal_unproven", true)),
+            1,
+        ),
+        (
+            "answered-without-answer",
+            not_sent("answered"),
+            Ok(terminal_none.clone()),
+            Some(("consent_withdrawal_unproven", true)),
+            1,
+        ),
+        (
+            "expired-with-metadata",
+            not_sent("expired"),
+            Ok(terminal_none),
+            None,
+            1,
+        ),
+        (
+            "readback-failed",
+            not_sent("answered"),
+            Err(refusal("readback_busy", true)),
+            Some(("readback_busy", true)),
+            1,
+        ),
     ];
     for (name, withdrawal, question, error, gets) in cases {
-        let plane = ProofPlane { withdrawal, question, gets: AtomicUsize::new(0) };
-        let actual = withdraw_duplicate(&plane, &ctx(), "key", &prepared(), "new", ConsentDecision::Approved).await;
-        match error { None => assert!(actual.is_ok(), "{name}: {actual:?}"), Some((code, retryable)) => { let error = actual.expect_err(name); assert_eq!((error.code.as_str(), error.retryable), (code, retryable), "{name}"); } }
+        let plane = ProofPlane {
+            withdrawal,
+            question,
+            gets: AtomicUsize::new(0),
+        };
+        let actual = withdraw_duplicate(
+            &plane,
+            &ctx(),
+            "key",
+            &prepared(),
+            "new",
+            ConsentDecision::Approved,
+        )
+        .await;
+        match error {
+            None => assert!(actual.is_ok(), "{name}: {actual:?}"),
+            Some((code, retryable)) => {
+                let error = actual.expect_err(name);
+                assert_eq!(
+                    (error.code.as_str(), error.retryable),
+                    (code, retryable),
+                    "{name}"
+                );
+            }
+        }
         assert_eq!(plane.gets.load(Ordering::SeqCst), gets, "{name}");
     }
 }

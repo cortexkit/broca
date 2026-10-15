@@ -11000,3 +11000,55 @@ select = "expected"
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "if args.signals.interrupted() {"
 new = "if false && args.signals.interrupted() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-duplicate-retryable-withdrawal-retains-debt"
+guards = "a retryable answered withdrawal refusal retains debt without treating its code as terminal proof"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = "ApprovalWithdrawal::Retry(error) if !error.retryable && terminal_refusal(&error.code) => {"
+new = "ApprovalWithdrawal::Retry(error) if terminal_refusal(&error.code) => { // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-duplicate-answered-needs-answer"
+guards = "an answered withdrawal refusal is not proved by an unanswered terminal readback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = '''if reason == "answered" && duplicate.decision == ConsentDecision::None {'''
+new = '''if false && reason == "answered" && duplicate.decision == ConsentDecision::None { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "core-consent-duplicate-readback-matches-id"
+guards = "terminal withdrawal proof must describe the duplicate card rather than another card"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = ".filter(|answer| answer.id == id && question.terminal)"
+new = ".filter(|_answer| question.terminal) // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-duplicate-readback-must-be-terminal"
+guards = "a nonterminal readback cannot prove that the duplicate card is no longer pending"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/consent/tests.rs"
+expect_red = ["consent::tests::duplicate_withdrawal_retry_and_terminal_readback_table"]
+select = "expected"
+file = "crates/broca-core/src/consent.rs"
+old = ".filter(|answer| answer.id == id && question.terminal)"
+new = ".filter(|answer| answer.id == id) // NON-VACUITY BREAK"
