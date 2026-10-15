@@ -940,7 +940,14 @@ impl CutArtifacts for FileCutArtifacts {
                 match std::fs::read(&staged) {
                     Ok(bytes)
                         if bytes.len() as u64 == plan.end_offset
-                            && migration::digest(&bytes) == plan.digest => {}
+                            && migration::digest(&bytes) == plan.digest =>
+                    {
+                        // Cached bytes can survive a process death before the
+                        // staging rename's directory barrier. Finish publication
+                        // before returning a reply that records imported.
+                        migration::durable_dir(&self.state_root, staged.parent().unwrap())
+                            .map_err(unavailable)?;
+                    }
                     Ok(_) => {
                         migration::unlink(&staged).map_err(unavailable)?;
                         complete = false;

@@ -677,3 +677,101 @@ async fn source_export_and_release_lease_contention_use_retryable_unavailable() 
         .await
         .unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn import_reconciliation_syncs_staging_before_recording_imported() {
+    use crate::cut_state::{CutState, Intent};
+    use broca_wal::migration::io_trace::{self, Event};
+    use std::{cell::RefCell, rc::Rc};
+
+    let rig = Rig::new("import-publication-recovery", false);
+    let state = CutState {
+        refs: Some(serde_json::from_value(rig.params["refs"].clone()).unwrap()),
+        sessions: rig
+            .driver
+            .plans
+            .iter()
+            .map(|plan| (plan.reference.clone(), plan.session.clone()))
+            .collect(),
+        intent: Some(Intent {
+            op: "import".into(),
+            request: rig.params.clone(),
+        }),
+        ..CutState::default()
+    };
+    let authority = rig.store.path(CUT);
+    migration::atomic_json(&rig.root, &authority, &state).unwrap();
+    let before = std::fs::read(&authority).unwrap();
+    for (index, plan) in rig.driver.plans.iter().enumerate() {
+        let staged = migration::staging_path(
+            rig.wal.root(),
+            CUT,
+            &broca_core::session_addr(&plan.session),
+        )
+        .unwrap();
+        if index == 0 {
+            migration::stage(&rig.root, &staged, &plan.bytes, &plan.digest).unwrap();
+        } else {
+            let target = staged.clone();
+            let parent = staged.parent().unwrap().to_owned();
+            let _trace = io_trace::install(move |event| {
+                if event == Event::DirectorySync(parent.clone()) && target.exists() {
+                    return Err(std::io::Error::other(
+                        "injected after staging rename before directory barrier",
+                    ));
+                }
+                Ok(())
+            });
+            assert!(migration::stage(&rig.root, &staged, &plan.bytes, &plan.digest).is_err());
+            assert_eq!(std::fs::read(&staged).unwrap(), plan.bytes);
+        }
+    }
+    let directory = rig.root.join("wal-staging").join(CUT);
+    let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpen), rig.wal.clone(), None);
+    let export = Arc::new(broca_store::SqliteStore::open(rig.root.join("run-index.db")).unwrap());
+    let artifacts = FileCutArtifacts::new(
+        rig.root.clone(),
+        registry,
+        rig.wal.clone(),
+        export,
+        rig.driver.clone(),
+    );
+    let reopened = CutStore::new(&rig.root);
+    {
+        let target = directory.clone();
+        let _trace = io_trace::install(move |event| {
+            if event == Event::DirectorySync(target.clone()) {
+                return Err(std::io::Error::other(
+                    "injected import recovery directory barrier",
+                ));
+            }
+            Ok(())
+        });
+        reopened.reconcile_boot(&artifacts).await.unwrap();
+        assert_eq!(std::fs::read(&authority).unwrap(), before);
+    }
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let target = directory.clone();
+    let cut = authority.clone();
+    let _trace = io_trace::install(move |event| {
+        if event == Event::DirectorySync(target.clone()) {
+            let state: CutState = migration::read_json(&cut)?.unwrap();
+            assert_eq!(state.step, broca_wire::agent_data::step::Step::None);
+            assert_eq!(state.intent.as_ref().unwrap().op, "import");
+            observed.borrow_mut().push(event);
+        }
+        Ok(())
+    });
+    reopened.reconcile_boot(&artifacts).await.unwrap();
+    assert_eq!(
+        events.borrow().len(),
+        2,
+        "each verified ref must pay its staging publication barrier"
+    );
+    let state: CutState = migration::read_json(&authority).unwrap().unwrap();
+    assert_eq!(state.step, broca_wire::agent_data::step::Step::Imported);
+    assert!(state.intent.is_none());
+    assert!(state.replies.contains_key(Op::Import.method()));
+}

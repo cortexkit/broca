@@ -12,6 +12,9 @@ description = "broca WAL: the intent-log source of truth — framed records (len
 # crates can build a gated frame this build reads. Enabled only from dev-dependencies; a
 # release build with it fails to compile. See `framing::TEST_KNOWN_FEATURE`.
 test-known-feature = []
+# Test-only hooks for dependent crates to observe file/directory syncs during
+# session moves and inject I/O failures at those filesystem boundaries.
+test-io-trace = []
 
 [dependencies]
 broca-owner-only.workspace = true

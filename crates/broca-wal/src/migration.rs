@@ -64,7 +64,7 @@ pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::Wa
 /// directory itself, and a failure must propagate.
 #[cfg(unix)]
 pub fn sync_dir(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-io-trace"))]
     io_trace::observe(io_trace::Event::DirectorySync(path.to_owned()))?;
     fs::File::open(path)?.sync_all()
 }
@@ -74,13 +74,13 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
 /// the same rule as the WAL fold's directory sync.
 #[cfg(not(unix))]
 pub fn sync_dir(_path: &Path) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-io-trace"))]
     io_trace::observe(io_trace::Event::DirectorySync(_path.to_owned()))?;
     Ok(())
 }
 
 fn sync_file(file: &fs::File) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-io-trace"))]
     io_trace::observe(io_trace::Event::FileSync)?;
     file.sync_all()
 }
@@ -512,7 +512,10 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-#[cfg(test)]
-mod io_trace;
+#[cfg(all(feature = "test-io-trace", not(debug_assertions)))]
+compile_error!("test-io-trace is a test-only migration feature and must not ship");
+#[cfg(any(test, feature = "test-io-trace"))]
+#[doc(hidden)]
+pub mod io_trace;
 #[cfg(test)]
 mod tests;
