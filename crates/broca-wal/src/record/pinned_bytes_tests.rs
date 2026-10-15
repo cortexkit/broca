@@ -12,6 +12,15 @@
 
 use super::*;
 
+#[test]
+fn attempt_bytes_before_content_progress_stay_identical() {
+    let pinned = include_str!("../../tests/fixtures/model_attempt_before_progress.json").trim_end();
+    let record: WalRecord = serde_json::from_str(pinned).unwrap();
+    assert!(matches!(record, WalRecord::ModelAttemptFinished { .. }));
+    assert!(record.required_features().is_empty());
+    assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+}
+
 /// The wire tag of each record kind. Exhaustive on purpose: see the module comment.
 fn tag_of(record: &WalRecord) -> &'static str {
     match record {
