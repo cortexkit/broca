@@ -27,6 +27,57 @@ The Ubuntu job replays touched rows on changes, the full catalogue on pushes to 
 
 Ubuntu uses 32 independent checkouts, with the shard denominator derived from the matrix size. Focused jobs retain a 90-minute budget; the nightly breadth audit has 180 minutes. The pinned runner already reuses the unmodified build and test results between compatible Cargo rows within each shard. Skipping those checks for individual rows would not add the reuse: it is already enabled.
 
+### Layered consent authorization and stop fences
+
+Consent checks at different boundaries can deliberately overlap. A mutation of
+only the earlier check can survive while the same safety property still holds at
+the later boundary. Joint-fence rows disable both checks in production code;
+they do not claim that either check alone is the sole protection.
+
+`core-consent-live-feed-complete-before-approval` and
+`core-consent-live-adoption-proves-recorded-duplicate` were retired as
+single-guard proofs after `18d4510` centralized held and late authorization in
+`consent::authorize_candidate` and `4c73dff` required a current-head tail read
+before minting authorization. That authorizer reads settlement continuations
+and proves a recorded duplicate closed before adopting a different card. Thus
+truncating the live intake scan or bypassing its duplicate check alone no longer
+authorizes an unsafe call. The replacement rows
+`core-consent-live-feed-and-authorizer-complete-before-approval` and
+`core-consent-live-adoption-duplicate-proof-fences` also disable the corresponding
+shared authorizer check. The original end-to-end tests and assertions remain
+unchanged, including the requirement that no approval or provider send occurs
+before conflicting decisions are resolved.
+
+`core-consent-late-stop-during-intent-sync` and
+`core-consent-late-stop-during-route-open` were retired as single-guard proofs.
+They disabled only `late_stopped`, but approved dispatch now also carries cancel
+and stop tokens to the adapter's physical-send boundary. This signal propagation
+was added by `f14bc889` (approved run signals), not by the later test-wait or
+approval-expiry driver changes. Both original mutations survive because the
+adapter still refuses the send, not because the tests miss their stop windows.
+The intent-sync test holds the real WAL sync, verifies that the intent is not
+durable yet, and cancels before releasing it; the route-open test cancels inside
+`batch_started` before that call returns.
+
+The replacement rows `core-consent-late-intent-sync-stop-fences` and
+`core-consent-late-route-open-stop-fences` preserve those tests and assertions.
+Each disables the core check **and** drops `send_late`'s forwarded signals, so
+neither fence can mask the other. The breaks affect production code, not the
+test adapter's required signal check. These are joint-fence proofs: they do not
+claim that losing either fence alone permits a physical send.
+
+For an adapter honoring `ToolPlane::dispatch_approved`'s signal contract, there is
+no no-send interleaving protected only by `late_stopped`: the adapter checks
+later, including after its own waits. The core checks remain as defense in depth
+and avoid entering route setup or dispatch after an observed stop. The separate
+`subc-approved-pre-send-cancel-after-route-wait` and
+`subc-approved-pre-send-cancel-after-permit-wait` rows target the production
+adapter's post-wait check. `subc-approved-writer-queue-stop-fence` targets the
+production connection's cancellation wait while reserving writer capacity,
+guarded by `approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent`
+in `broca-subc`. That still-later enqueue boundary must remain `NotSent` rather
+than outcome-unknown when interrupted.
+
 ### Native Windows coverage
 
 The Windows workflow replays the full root catalogue across twelve native shards nightly and on manual dispatch. Each shard targets about 60-75 minutes; the 360-minute job ceiling remains to accommodate cold builds and uneven proof costs. Pull requests and pushes to master or `train/**` start it only when the catalogue, mutation workflows/tooling, or fixture setup changes, and use `--diff` with the same committed-base selection as Ubuntu. The workflow's `paths` filters list these inputs; catalogue changes conservatively trigger it even when only a non-Windows row changed, in which case Windows-eligible diff coverage can be empty. Source-only changes receive Windows proofs in the next nightly run, or by manual dispatch.
