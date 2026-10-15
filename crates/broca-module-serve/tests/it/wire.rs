@@ -4176,25 +4176,40 @@ async fn queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned() {
     assert!(matches!(queued, SendResponse::Pending { .. }));
     first_run_release.notify_one();
 
-    for _ in 0..100 {
-        let records = wal.read_records(&session).unwrap();
-        if records.iter().any(|frame| {
+    // This waits for an event, not a speed: the queued run starts only after the first run's
+    // records are fsynced on a real file WAL, and one fsync on a busy CI disk has taken over a
+    // second. The bound is a hang guard, so a run that never pauses still fails by name.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let paused = |records: &[FramedRecord]| {
+        records.iter().any(|frame| {
             matches!(
                 &frame.record,
                 WalRecord::RunPaused { run_id, .. } if run_id.0 == "run-queued-reauth"
             )
-        }) {
-            break;
+        })
+    };
+    let records = loop {
+        let records = wal.read_records(&session).unwrap();
+        if paused(&records) || std::time::Instant::now() >= deadline {
+            break records;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let records = wal.read_records(&session).unwrap();
-    assert!(records.iter().any(|frame| {
-        matches!(
-            &frame.record,
-            WalRecord::RunPaused { run_id, .. } if run_id.0 == "run-queued-reauth"
-        )
-    }));
+    };
+    assert!(
+        paused(&records),
+        "queued run never paused for reauth; records: {:?}",
+        records
+            .iter()
+            .map(|frame| {
+                let debug = format!("{:?}", frame.record);
+                debug
+                    .split([' ', '(', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    );
     assert!(!records.iter().any(|frame| {
         matches!(
             &frame.record,
