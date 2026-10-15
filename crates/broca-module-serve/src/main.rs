@@ -15,8 +15,7 @@ use std::time::Duration;
 use broca_core::{FileLeaseStore, FileWalStore, RunIndex};
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{
-    serve_connection_configured, spawn_catalog_poll, CatalogPoller, ChargeBasisTable,
-    ConsumerRoutes, ServeEnd, ServeIoError,
+    spawn_catalog_poll, CatalogPoller, ChargeBasisTable, ConsumerRoutes, ServeEnd, ServeIoError,
 };
 use broca_subc::{SubcConnection, SubcToolPlane};
 use subc_protocol::SUBC_MODULE_ID_ENV;
@@ -540,6 +539,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
     );
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
+    let move_wal = wal_store.clone();
     let mut opener_builder = DefaultOpener::new(lease_store, wal_store, executor)
         .with_run_index(run_index.clone())
         .with_materialized_store(run_index.clone())
@@ -556,6 +556,20 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cap_store),
     ));
     registry.set_retention_service(retention);
+    let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
+        state_root.clone(),
+        registry.as_ref().clone(),
+        move_wal,
+        run_index.clone(),
+        Arc::new(broca_subc::session_door::SessionDoorClient::new(
+            plan_conn.clone(),
+            broca_protocol::BindIdentity::new(state_root.clone(), "broca", "agent-data"),
+        )),
+    ));
+    agent_data
+        .reconcile_boot()
+        .await
+        .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
     registry
         .boot_retention()
         .await
@@ -674,7 +688,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let stream = connect(&conn_path).await?;
     let (read_half, write_half) = tokio::io::split(stream);
-    let serving = serve_connection_configured(
+    let serving = broca_module_serve::serve::serve_connection_with_agent_data(
         read_half,
         write_half,
         &module_id,
@@ -687,6 +701,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         vault_auditor,
         daemon_capabilities,
         Some(scope_describer),
+        Some(agent_data),
     );
     tokio::pin!(serving);
     tokio::select! {

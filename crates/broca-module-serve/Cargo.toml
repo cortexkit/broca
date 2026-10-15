@@ -70,6 +70,7 @@ clap = { version = "4", features = ["derive"] }
 signal-hook = "0.4"
 
 [dev-dependencies]
+cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }

@@ -9,7 +9,7 @@ use broca_core::{ExportIndex, FileLeaseStore, FileWalStore, LeaseHandle, LeaseSt
 use broca_protocol::BindIdentity;
 use broca_wal::migration::{self, Freeze, Moved};
 use broca_wire::agent_data::{errors::ErrorBody, refs::Refs, request::Request, Op};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -23,8 +23,9 @@ pub struct PlannedSession {
     pub bytes: Vec<u8>,
     pub end_offset: u64,
     pub digest: String,
-    /// The door's sealed digest is mandatory on receiver plans; a claimed item
-    /// digest alone cannot authorize importing bytes read from the door.
+    /// Mandatory for import and activation. A read-only divergence plan may use
+    /// a held local copy without a verified incoming cut, but cannot report that
+    /// the local bytes are a verified prefix of the incoming cut (at_cut).
     pub sealed_digest: Option<String>,
     pub format: String,
     pub lineage_id: String,
@@ -41,9 +42,11 @@ pub struct MoveObservation {
     pub open_actor: bool,
 }
 
-/// The service bridge resolves refs over the store's live and archived sessions.
-/// For receiver operations, it checks format before reading the door, requires
-/// the door's sealed digest, and derives identities from verified RunStarted.
+/// The service bridge resolves requested session references across live and
+/// archived sessions. Import plans derive format and identities from authenticated
+/// WAL bytes and require the door's sealed digest before publishing staging.
+/// Divergence plans omit absent local sessions; the adapter marks them at_cut
+/// because they have no local bytes that the incoming cut could overwrite.
 #[async_trait::async_trait]
 pub trait MoveDriver: Send + Sync {
     async fn plan(
@@ -93,13 +96,194 @@ pub struct FileCutArtifacts {
 fn unavailable(e: impl std::fmt::Display) -> ErrorBody {
     refusal("unavailable", e.to_string(), Value::Null)
 }
+fn busy_ref(reference: &str, code: &str, reason: &str) -> broca_wire::agent_data::errors::BusyRef {
+    broca_wire::agent_data::errors::BusyRef::new("broca-session", reference, reason)
+        .with_reason_code(code)
+}
+fn busy(refs: Vec<broca_wire::agent_data::errors::BusyRef>, message: &str) -> ErrorBody {
+    use broca_wire::agent_data::errors::{BusyDetail, Detail};
+    ErrorBody::with_typed_detail(Detail::Busy(BusyDetail::new(refs)), message)
+}
 fn cut_id(request: &Request) -> Result<String, ErrorBody> {
     request.params()["cutId"]
         .as_str()
         .map(String::from)
         .ok_or_else(|| unavailable("cut request has no cutId"))
 }
+
+/// WAL-derived busy state for closed actors, shared by the read probe and the
+/// prepare preflight. Persisted records cover work that survives actor closure;
+/// LineageRegistry supplies open actors' volatile cache-warm jobs, scheduled
+/// keep-warms and transitions under each session's critical section.
+pub fn source_busy_reason(
+    range: &broca_wal::WalRangeRead,
+) -> Result<Option<&'static str>, ErrorBody> {
+    let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+        return Err(unavailable("session WAL cannot be inspected"));
+    };
+    let raw = records.iter().map(|f| f.record.clone()).collect::<Vec<_>>();
+    if !broca_core::pending_submissions(&raw).is_empty() {
+        return Ok(Some("send_queued"));
+    }
+    if let Some(lineage) = range.lineage_id {
+        if !broca_core::deferred_call_obligations(lineage, records).is_empty() {
+            return Ok(Some("approval_open"));
+        }
+    }
+    if records.iter().any(|f| match &f.record {
+        broca_wal::WalRecord::RunStarted { run_id, .. } => {
+            broca_core::reconcile_run_state(&raw, &run_id.0).is_none_or(|s| !s.state.is_terminal())
+        }
+        _ => false,
+    }) {
+        return Ok(Some("run_active"));
+    }
+    Ok(None)
+}
+
+/// Retention is a property of the current copy, including legacy WALs outside
+/// wal-ephemeral. Never let an older, expired ledger row classify a fresh WAL.
+pub fn retained_move_copy(wal: &FileWalStore, session: &BindIdentity) -> Result<bool, ErrorBody> {
+    if wal.resolve_live_path(session).map_err(unavailable)? == Some(wal.ephemeral_wal_path(session))
+    {
+        return Ok(true);
+    }
+    let Some(bytes) = wal.bytes_for_move(session).map_err(unavailable)? else {
+        return Ok(false);
+    };
+    let range =
+        broca_wal::file_wal::read_verified_member_range(&bytes, 0, 0, None).map_err(unavailable)?;
+    match range.records() {
+        broca_wal::WalRangeRecords::Complete(records) => {
+            Ok(broca_core::is_retention_lineage(records))
+        }
+        _ => Err(unavailable("local WAL cannot be inspected for retention")),
+    }
+}
+
+/// Import already verified these bytes. A later digest change is corrupt local
+/// staging. agent-data/v1 stops automatic activation for operator resolution
+/// rather than retrying or returning the claim while another participant may
+/// already be active.
+pub fn staging_digest_failure(
+    cut_id: &str,
+    step: broca_wire::agent_data::step::Step,
+    session: &str,
+) -> ErrorBody {
+    use broca_wire::agent_data::errors::{
+        digest_mismatch_reason, driver_action_for, DigestMismatchDetail, RefusalCode,
+    };
+    let action = driver_action_for(Op::Activate, &RefusalCode::DigestMismatch);
+    tracing::error!(
+        session,
+        cut_id,
+        ?step,
+        ?action,
+        "agent-data verified activation staging is corrupt"
+    );
+    ErrorBody::with_digest_mismatch_detail(DigestMismatchDetail::new(digest_mismatch_reason::STAGING_DIGEST_MISMATCH),
+        format!("session {session}, cut {cut_id} at {step:?}: verified activation staging no longer matches its sealed digest"))
+}
+
+pub fn activation_refusal(
+    cut_id: &str,
+    step: broca_wire::agent_data::step::Step,
+    session: &str,
+    error: ErrorBody,
+) -> ErrorBody {
+    if error.code.as_str() == "digest_mismatch" {
+        staging_digest_failure(cut_id, step, session)
+    } else {
+        error
+    }
+}
+
+fn moved_source(plan: &PlannedSession, moved: &Moved, op: Op) -> ErrorBody {
+    use broca_wire::agent_data::errors::{Detail, RefusalCode, UnknownRefDetail};
+    let code = match op {
+        Op::Prepare => RefusalCode::UnknownRef,
+        Op::Export => RefusalCode::UnknownRef,
+        Op::Release => RefusalCode::UnknownRef,
+        _ => unreachable!("only source operations inspect moved ownership"),
+    };
+    let mut error = ErrorBody::with_typed_detail(
+        Detail::UnknownRef(UnknownRefDetail::new("broca-session", &plan.reference)),
+        format!(
+            "session {} is held by {} after cut {}",
+            plan.session.session, moved.holder, moved.cut_id
+        ),
+    );
+    error.code = code;
+    error
+}
+
+fn foreign_owner(
+    plan: &PlannedSession,
+    cut_id: &str,
+    owner_cut: &str,
+    op: Op,
+    step: broca_wire::agent_data::step::Step,
+) -> ErrorBody {
+    use broca_wire::agent_data::errors::{Detail, InvalidStateDetail};
+    if matches!(op, Op::Export | Op::Release) {
+        // A prepared or exported cut retains its exclusive freeze until release
+        // or abort. Conflicting ownership is corrupt authority state, not
+        // retryable work. The agent-data/v1 refusal table disallows busy for
+        // export/release; this inconsistency is terminal invalid_state instead.
+        tracing::error!(session = %plan.session.session, session_ref = %plan.reference,
+            cut_id, owner_cut, ?step, "agent-data cut authority contradicts session ownership");
+        return ErrorBody::with_typed_detail(
+            Detail::InvalidState(InvalidStateDetail::new(step)),
+            format!(
+                "cut {cut_id} at {step:?} cannot {} session {} owned by cut {owner_cut}",
+                op.method(),
+                plan.session.session
+            ),
+        );
+    }
+    busy(
+        vec![busy_ref(
+            &plan.reference,
+            "moving",
+            &format!("session is frozen by cut {owner_cut}"),
+        )],
+        "session is frozen by another cut",
+    )
+}
 impl FileCutArtifacts {
+    fn install_error(
+        &self,
+        cut_id: &str,
+        state: &CutState,
+        locked: &LockedPlans,
+        error: ErrorBody,
+    ) -> ErrorBody {
+        if error.code.as_str() == "busy" {
+            return busy(
+                locked
+                    .observations
+                    .iter()
+                    .filter_map(|o| {
+                        o.moving_cut.as_ref().map(|cut| {
+                            busy_ref(
+                                &o.reference,
+                                "moving",
+                                &format!("local session is frozen by cut {cut}"),
+                            )
+                        })
+                    })
+                    .collect(),
+                "receiver session is frozen",
+            );
+        }
+        let names = locked
+            .plans
+            .iter()
+            .map(|p| p.reference.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        activation_refusal(cut_id, state.step, &names, error)
+    }
     pub fn new(
         registry: LineageRegistry,
         wal: Arc<FileWalStore>,
@@ -165,23 +349,19 @@ impl FileCutArtifacts {
         cut_id: &str,
         plan: &PlannedSession,
         required: bool,
+        op: Op,
+        step: broca_wire::agent_data::step::Step,
     ) -> Result<(), ErrorBody> {
         let live = self.wal.wal_path(&plan.session);
         if let Some(moved) =
             migration::read_json::<Moved>(&live.with_extension("moved")).map_err(unavailable)?
         {
-            return Err(refusal(
-                "session_moved",
-                "session moved to another holder",
-                json!({"holder":moved.holder}),
-            ));
+            return Err(moved_source(plan, &moved, op));
         }
         match migration::read_json::<Freeze>(&live.with_extension("moving")).map_err(unavailable)? {
-            Some(freeze) if freeze.cut_id != cut_id => Err(refusal(
-                "busy",
-                "session is frozen by another cut",
-                json!({"reason":"moving","cutId":freeze.cut_id}),
-            )),
+            Some(freeze) if freeze.cut_id != cut_id => {
+                Err(foreign_owner(plan, cut_id, &freeze.cut_id, op, step))
+            }
             Some(freeze)
                 if freeze.end_offset != plan.end_offset || freeze.lineage_id != plan.lineage_id =>
             {
@@ -207,11 +387,17 @@ impl CutArtifacts for FileCutArtifacts {
         let wanted = references
             .as_array()
             .ok_or_else(|| unavailable("invalid ref set"))?;
-        if wanted.len() != plans.len()
-            || wanted.iter().any(|r| {
-                !plans
+        if (!matches!(op, Op::Abort | Op::Diverged) && wanted.len() != plans.len())
+            || (!matches!(op, Op::Abort | Op::Diverged)
+                && wanted.iter().any(|r| {
+                    !plans
+                        .iter()
+                        .any(|p| r["ref_kind"] == "broca-session" && r["ref"] == p.reference)
+                }))
+            || plans.iter().any(|p| {
+                !wanted
                     .iter()
-                    .any(|p| r["ref_kind"] == "broca-session" && r["ref"] == p.reference)
+                    .any(|r| r["ref_kind"] == "broca-session" && r["ref"] == p.reference)
             })
         {
             return Err(unavailable(
@@ -234,13 +420,7 @@ impl CutArtifacts for FileCutArtifacts {
         }
         plans = wanted
             .iter()
-            .map(|r| {
-                plans
-                    .iter()
-                    .find(|p| r["ref"] == p.reference)
-                    .unwrap()
-                    .clone()
-            })
+            .filter_map(|r| plans.iter().find(|p| r["ref"] == p.reference).cloned())
             .collect();
         let sessions = self
             .registry
@@ -312,15 +492,17 @@ impl CutArtifacts for FileCutArtifacts {
         let op = request.op();
         if matches!(op, Op::Prepare | Op::Import | Op::Activate) {
             for plan in &locked.plans {
-                if self
-                    .wal
-                    .resolve_live_path(&plan.session)
-                    .map_err(unavailable)?
-                    == Some(self.wal.ephemeral_wal_path(&plan.session))
-                {
+                if retained_move_copy(self.wal.as_ref(), &plan.session)? {
+                    if op == Op::Prepare {
+                        return Err(refusal(
+                            "not_exportable",
+                            "retention session cannot be moved",
+                            Value::Null,
+                        ));
+                    }
                     return Err(refusal(
-                        "not_exportable",
-                        "retention session cannot be moved",
+                        "local_advanced",
+                        "retained copy with a deletion deadline cannot be replaced by a cut",
                         Value::Null,
                     ));
                 }
@@ -328,18 +510,43 @@ impl CutArtifacts for FileCutArtifacts {
         }
         if op != Op::Abort {
             if let Some(reason) = locked.busy {
-                return Err(refusal(
-                    "busy",
+                if matches!(op, Op::Export | Op::Release) {
+                    return Err(unavailable(format!(
+                        "source session is temporarily busy: {reason}"
+                    )));
+                }
+                return Err(busy(
+                    locked
+                        .observations
+                        .iter()
+                        .filter(|o| o.busy_reason.is_some())
+                        .map(|o| {
+                            busy_ref(
+                                &o.reference,
+                                o.busy_reason.as_deref().unwrap_or(&reason),
+                                "session has pending work",
+                            )
+                        })
+                        .collect(),
                     "session cannot move while work is pending",
-                    json!({"reason":reason}),
                 ));
             }
         }
         if matches!(op, Op::Import | Op::Activate) && locked.open_actor {
-            return Err(refusal(
-                "busy",
+            return Err(busy(
+                locked
+                    .observations
+                    .iter()
+                    .filter(|o| o.open_actor)
+                    .map(|o| {
+                        busy_ref(
+                            &o.reference,
+                            "actor_open",
+                            "receiver session has an open actor",
+                        )
+                    })
+                    .collect(),
                 "receiver session has an open actor",
-                json!({"reason":"actor_open"}),
             ));
         }
         for plan in &locked.plans {
@@ -347,16 +554,12 @@ impl CutArtifacts for FileCutArtifacts {
             if let Some(other) =
                 migration::cut_fence(self.wal.root(), &plan.reference).map_err(unavailable)?
             {
-                if other != cut_id {
-                    return Err(refusal(
-                        "busy",
-                        "another cut holds the session fence",
-                        json!({"reason":"moving","cutId":other}),
-                    ));
+                if other != cut_id && op != Op::Abort {
+                    return Err(foreign_owner(plan, &cut_id, &other, op, state.step));
                 }
             }
             if matches!(op, Op::Prepare | Op::Export) {
-                self.owned_freeze(&cut_id, plan, op == Op::Export)?;
+                self.owned_freeze(&cut_id, plan, op == Op::Export, op, state.step)?;
                 if migration::digest(&plan.bytes) != plan.digest
                     || plan.bytes.len() as u64 != plan.end_offset
                 {
@@ -384,18 +587,6 @@ impl CutArtifacts for FileCutArtifacts {
                 }
             }
             if op == Op::Prepare {
-                if self
-                    .wal
-                    .resolve_live_path(&plan.session)
-                    .map_err(unavailable)?
-                    == Some(self.wal.ephemeral_wal_path(&plan.session))
-                {
-                    return Err(refusal(
-                        "not_exportable",
-                        "retention session cannot be moved",
-                        Value::Null,
-                    ));
-                }
                 if !live.try_exists().map_err(unavailable)? && plan.local_archive.is_none() {
                     return Err(refusal(
                         "unknown_ref",
@@ -417,47 +608,27 @@ impl CutArtifacts for FileCutArtifacts {
                 if live.try_exists().map_err(unavailable)?
                     && std::fs::read(&live).map_err(unavailable)? != plan.bytes
                 {
-                    return Err(refusal(
-                        "busy",
+                    return Err(busy(
+                        vec![busy_ref(
+                            &plan.reference,
+                            "wal_changed",
+                            "source WAL changed before freeze",
+                        )],
                         "source WAL changed before freeze",
-                        Value::Null,
                     ));
                 }
                 let records =
                     broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
                         .map_err(unavailable)?;
-                if let broca_wal::WalRangeRecords::Complete(records) = records.records() {
-                    let raw = records.iter().map(|r| r.record.clone()).collect::<Vec<_>>();
-                    if !broca_core::pending_submissions(&raw).is_empty() {
-                        return Err(refusal(
-                            "busy",
-                            "source has queued submissions",
-                            json!({"reason":"send_queued"}),
-                        ));
-                    }
-                    if records.iter().any(|r| match &r.record {
-                        broca_wal::WalRecord::RunStarted { run_id, .. } => {
-                            broca_core::reconcile_run_state(&raw, &run_id.0)
-                                .is_none_or(|s| !s.state.is_terminal())
-                        }
-                        _ => false,
-                    }) {
-                        return Err(refusal(
-                            "busy",
-                            "source has an unfinished run",
-                            json!({"reason":"run_active"}),
-                        ));
-                    }
-                    if records.iter().any(|r| match &r.record {
-                        broca_wal::WalRecord::RunStarted { retention, .. } => retention.is_some(),
-                        _ => false,
-                    }) {
-                        return Err(refusal(
-                            "not_exportable",
-                            "retention session cannot be moved",
-                            Value::Null,
-                        ));
-                    }
+                if let Some(reason) = source_busy_reason(&records)? {
+                    return Err(busy(
+                        vec![busy_ref(
+                            &plan.reference,
+                            reason,
+                            &format!("source has pending {reason}"),
+                        )],
+                        "source has pending work",
+                    ));
                 }
             }
             if op == Op::Release {
@@ -465,14 +636,10 @@ impl CutArtifacts for FileCutArtifacts {
                     .map_err(unavailable)?;
                 if let Some(moved) = moved {
                     if moved.cut_id != cut_id || request.params()["holder"] != moved.holder {
-                        return Err(refusal(
-                            "session_moved",
-                            "session moved to another holder",
-                            json!({"holder":moved.holder}),
-                        ));
+                        return Err(moved_source(plan, &moved, Op::Release));
                     }
                 } else {
-                    self.owned_freeze(&cut_id, plan, true)?;
+                    self.owned_freeze(&cut_id, plan, true, Op::Release, state.step)?;
                 }
             }
             if op == Op::Import {
@@ -498,7 +665,14 @@ impl CutArtifacts for FileCutArtifacts {
                     .map_err(unavailable)?
                     .is_some()
                 {
-                    return Err(refusal("busy", "receiver is frozen by a cut", Value::Null));
+                    return Err(busy(
+                        vec![busy_ref(
+                            &plan.reference,
+                            "moving",
+                            "receiver is frozen by a cut",
+                        )],
+                        "receiver is frozen by a cut",
+                    ));
                 }
                 let local = if live.try_exists().map_err(unavailable)? {
                     std::fs::read(&live).map_err(unavailable)?
@@ -523,11 +697,26 @@ impl CutArtifacts for FileCutArtifacts {
                     "activation staging is missing without a pending activate intent",
                 ));
             }
-            move_install::check_installations(&self.installations(&locked.plans, &paths))?;
+            move_install::check_installations(&self.installations(&locked.plans, &paths))
+                .map_err(|e| self.install_error(&cut_id, state, &locked, e))?;
         }
         Ok(())
     }
     async fn apply(&self, request: &Request, _state: &CutState) -> Result<Value, ErrorBody> {
+        if let Request::Busy(request) = request {
+            // Busy has no cut identity or durable state. Reuse the session snapshot
+            // locks without acquiring a cut lock or writing any move artifacts.
+            static NEXT_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let key = format!(
+                "busy-{}",
+                NEXT_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let _guard = self.lock_refs(&key, &request.refs, Op::Busy).await?;
+            let locked = self.locked(&key)?;
+            return self
+                .driver
+                .reply(Op::Busy, &locked.plans, &[], &locked.observations);
+        }
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         let op = request.op();
@@ -577,15 +766,44 @@ impl CutArtifacts for FileCutArtifacts {
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),
                     |session| self.driver.drop_projection(session),
-                )?;
+                )
+                .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;
             }
             Op::Abort => {
                 self.rollback(request, _state).await?;
             }
             Op::Describe | Op::Busy | Op::Diverged | Op::Status => {}
         }
-        self.driver
-            .reply(op, &locked.plans, &offsets, &locked.observations)
+        let reply = self
+            .driver
+            .reply(op, &locked.plans, &offsets, &locked.observations)?;
+        if let Request::Diverged(request) = request {
+            use broca_wire::agent_data::diverged::{DivergedEntry, DivergedReply, DivergedState};
+            let held: DivergedReply = serde_json::from_value(reply).map_err(unavailable)?;
+            if held.refs.len() != locked.plans.len() {
+                return Err(unavailable("divergence reply does not cover held refs"));
+            }
+            // An absent copy needs neither a fabricated bind triple nor a door
+            // read. Preserve the request's order when merging those at_cut entries.
+            return serde_json::to_value(DivergedReply::new(
+                request
+                    .refs
+                    .iter()
+                    .map(|reference| {
+                        locked
+                            .plans
+                            .iter()
+                            .position(|plan| plan.reference == reference.r#ref)
+                            .map_or_else(
+                                || DivergedEntry::new(DivergedState::AtCut),
+                                |i| held.refs[i],
+                            )
+                    })
+                    .collect(),
+            ))
+            .map_err(unavailable);
+        }
+        Ok(reply)
     }
     async fn rollback(&self, request: &Request, _state: &CutState) -> Result<(), ErrorBody> {
         let cut_id = cut_id(request)?;
@@ -594,6 +812,25 @@ impl CutArtifacts for FileCutArtifacts {
             migration::abort_freeze(&self.wal.wal_path(&plan.session), &cut_id)
                 .map_err(unavailable)?;
             migration::unlink(&self.staged(&cut_id, plan)?).map_err(unavailable)?;
+        }
+        // A damaged staged WAL may no longer reveal a bind triple. Staging is
+        // private to this cut, so discard its remaining files without inventing
+        // a session identity or touching another cut's directory.
+        let directory = self
+            .wal
+            .root()
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("wal-staging")
+            .join(&cut_id);
+        match std::fs::read_dir(directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    migration::unlink(&entry.map_err(unavailable)?.path()).map_err(unavailable)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(unavailable(error)),
         }
         Ok(())
     }

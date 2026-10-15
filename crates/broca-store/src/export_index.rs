@@ -803,6 +803,108 @@ mod tests {
         }
     }
 
+    fn projection_bytes(store: &SqliteStore) -> Vec<Vec<String>> {
+        projection_bytes_for(store, None)
+    }
+
+    fn projection_bytes_for(
+        store: &SqliteStore,
+        session: Option<&BindIdentity>,
+    ) -> Vec<Vec<String>> {
+        let conn = store.conn.lock().unwrap();
+        let key = session.map(SqliteStore::key);
+        ["message", "meta"]
+            .iter()
+            .flat_map(|table| {
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT * FROM {table} WHERE (?1 IS NULL OR session=?1) ORDER BY session"
+                    ))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([key.as_deref()], |row| {
+                        (0..columns)
+                            .map(|i| row.get_ref(i).map(|value| format!("{value:?}")))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drop_projection_preserves_facts_floors_and_rebuild_bytes() {
+        use broca_core::ExportIndex;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = BindIdentity::new("/tmp/export", "runner", "metered");
+        let frames = records("local", 1);
+        store.project(&session, &frames).unwrap();
+        store
+            .emit_export_run(&frames, &RunId("local".into()), &resolver)
+            .unwrap();
+        store
+            .record_imported_runs(&session, "cut", &[RunId("foreign".into())])
+            .unwrap();
+        let projection = projection_bytes(&store);
+        assert!(!projection.is_empty());
+        let facts = export_fact_rows(&store.conn.lock().unwrap());
+        assert!(!facts.is_empty());
+        store.drop_session_projection(&session).unwrap();
+        assert!(projection_bytes(&store).is_empty());
+        assert_eq!(export_fact_rows(&store.conn.lock().unwrap()), facts);
+        store
+            .emit_export_run(&records("foreign", 1), &RunId("foreign".into()), &resolver)
+            .unwrap();
+        assert_eq!(
+            export_fact_rows(&store.conn.lock().unwrap()),
+            facts,
+            "imported floor survives projection deletion"
+        );
+        store.project(&session, &frames).unwrap();
+        assert_eq!(projection_bytes(&store), projection);
+    }
+
+    #[test]
+    fn drop_projection_failure_rolls_back_messages_and_meta() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = BindIdentity::new("/tmp/export", "runner", "metered");
+        store.project(&session, &records("local", 1)).unwrap();
+        let before = projection_bytes(&store);
+        store.conn.lock().unwrap().execute_batch("CREATE TEMP TRIGGER fail_meta_drop BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'injected metadata delete failure'); END;").unwrap();
+        assert!(store
+            .drop_session_projection(&session)
+            .unwrap_err()
+            .contains("injected metadata delete failure"));
+        assert_eq!(projection_bytes(&store), before);
+    }
+
+    #[test]
+    fn drop_projection_changes_only_the_named_session() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let target = BindIdentity::new("/tmp/export", "runner", "metered");
+        let other = BindIdentity::new("/other", "runner", "unrelated");
+        store.project(&target, &records("local", 1)).unwrap();
+        store
+            .project(
+                &other,
+                &records_with_usage_policy(
+                    "other",
+                    1,
+                    "open_ai_usage_reasoning_separate",
+                    other.clone(),
+                ),
+            )
+            .unwrap();
+        let before = projection_bytes_for(&store, Some(&other));
+        assert!(!before.is_empty());
+        store.drop_session_projection(&target).unwrap();
+        assert!(projection_bytes_for(&store, Some(&target)).is_empty());
+        assert_eq!(projection_bytes_for(&store, Some(&other)), before);
+    }
+
     #[test]
     fn export_persists_distinct_routing_key_and_vault_witness() {
         let root = broca_test_support::scratch_root().join(format!(

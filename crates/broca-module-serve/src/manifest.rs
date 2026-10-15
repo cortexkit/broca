@@ -258,6 +258,7 @@ pub fn manifest_configured(
         // Agent-run scopes likewise admit only Basal's attested sender, without tools.
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
+            broca_wire::agent_data::PROVIDES.to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
         ],
@@ -427,6 +428,11 @@ pub fn manifest_configured(
             // A session is identified by {project_root, harness, session}: the surface is
             // scoped per project + per session.
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        }, ProviderRole::InternalService {
+            service_id: broca_wire::agent_data::SERVICE_ID.to_string(),
+            transport: subc_protocol::manifest::InternalTransport::Bulk,
+            agent_facing: false,
+            operations: broca_wire::agent_data::REQUIRED_OPS.iter().map(|op| op.to_string()).collect(),
         }])
     // WHAT BROCA OPENS ROUTES TO, built from the same resolved values the serve binary dials,
     // so the declaration follows the configuration rather than a second list of names.
@@ -488,11 +494,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares the runner role, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner and agent-data roles, flow and agent-run scope handling, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so

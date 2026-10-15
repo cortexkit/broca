@@ -2,6 +2,7 @@ use super::*;
 use crate::cut_state::CutStore;
 use crate::registry::{ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle};
 use broca_core::WalStore;
+use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 const CUT: &str = "0123456789abcdef0123456789abcdef";
 struct NeverOpen;
@@ -27,11 +28,19 @@ impl MoveDriver for Driver {
     async fn plan(
         &self,
         _cut_id: &str,
-        _refs: &Refs,
-        _op: Op,
+        refs: &Refs,
+        op: Op,
     ) -> Result<Vec<PlannedSession>, ErrorBody> {
         tokio::task::yield_now().await;
-        Ok(self.plans.clone())
+        let mut plans = Vec::new();
+        for reference in refs.iter() {
+            match self.plans.iter().find(|p| p.reference == reference.r#ref) {
+                Some(plan) => plans.push(plan.clone()),
+                None if op == Op::Abort => {}
+                None => return Err(refusal("unknown_ref", "unknown session", json!(reference))),
+            }
+        }
+        Ok(plans)
     }
     async fn cover(&self, _ref: &str) -> Result<u64, ErrorBody> {
         Ok(0)
@@ -41,11 +50,16 @@ impl MoveDriver for Driver {
     }
     fn reply(
         &self,
-        _op: Op,
+        op: Op,
         _plans: &[PlannedSession],
         _offsets: &[u64],
-        _observations: &[MoveObservation],
+        observations: &[MoveObservation],
     ) -> Result<Value, ErrorBody> {
+        if op == Op::Busy {
+            return Ok(
+                json!({"refs": observations.iter().map(|o| json!({"state":if o.busy_reason.is_some() {"busy"} else {"idle"}})).collect::<Vec<_>>()}),
+            );
+        }
         if self.fail_reply.load(Ordering::SeqCst) {
             Err(unavailable("reply checkpoint failure"))
         } else {
@@ -516,4 +530,149 @@ async fn abort_recovery_of_identical_hidden_wal_never_becomes_activation() {
             .exists());
         assert!(!rig.artifacts.staged(CUT, plan).unwrap().exists());
     }
+}
+
+#[tokio::test]
+async fn busy_without_cut_id_reads_held_refs_and_refuses_first_unknown() {
+    let rig = Rig::new("busy-no-cut-id", true);
+    let params = json!({"refs":rig.params["refs"]});
+    let reply = rig
+        .store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.busy",
+            &params,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, json!({"refs":[{"state":"idle"},{"state":"idle"}]}));
+    assert!(!rig.store.path(CUT).exists());
+    let unknown = json!({"ref_kind":"broca-session","ref":"ffffffffffffffffffffffffffffffff"});
+    let mixed = json!({"refs":[rig.params["refs"][0],unknown]});
+    let error = rig
+        .store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.busy",
+            &mixed,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "unknown_ref");
+    assert_eq!(serde_json::to_value(error).unwrap()["detail"], unknown);
+}
+
+#[tokio::test]
+async fn abort_unseen_cut_with_unknown_refs_is_durable_and_replayed() {
+    let rig = Rig::new("abort-unknown", false);
+    let params = json!({"cutId":CUT,"refs":[{"ref_kind":"broca-session","ref":"ffffffffffffffffffffffffffffffff"}]});
+    let first = rig
+        .store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.abort",
+            &params,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap();
+    let reopened = CutStore::new(&rig.root);
+    assert_eq!(
+        reopened
+            .execute(
+                "reserved:entorhinal",
+                "agent_data.status",
+                &params,
+                &rig.artifacts
+            )
+            .await
+            .unwrap()["step"],
+        "aborted"
+    );
+    assert_eq!(
+        reopened
+            .execute(
+                "reserved:entorhinal",
+                "agent_data.abort",
+                &params,
+                &rig.artifacts
+            )
+            .await
+            .unwrap(),
+        first
+    );
+}
+
+#[tokio::test]
+async fn abort_mixed_refs_leaves_another_cuts_freeze_untouched() {
+    let rig = Rig::new("abort-mixed", true);
+    rig.store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.prepare",
+            &rig.params,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap();
+    let moving = rig
+        .wal
+        .wal_path(&rig.driver.plans[0].session)
+        .with_extension("moving");
+    let before = std::fs::read(&moving).unwrap();
+    let params = json!({"cutId":"ffffffffffffffffffffffffffffffff","refs":[rig.params["refs"][0],{"ref_kind":"broca-session","ref":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}]});
+    rig.store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.abort",
+            &params,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(moving).unwrap(), before);
+}
+
+#[tokio::test]
+async fn source_export_and_release_lease_contention_use_retryable_unavailable() {
+    let rig = Rig::new("source-lease", true);
+    rig.op(Op::Prepare).await.unwrap();
+    let leases = FileLeaseStore::new(rig.root.join("leases"));
+    let held = leases
+        .acquire(&broca_core::lease_key_for(&rig.driver.plans[1].session))
+        .unwrap();
+    let error = rig.op(Op::Export).await.unwrap_err();
+    assert_eq!(error.code.as_str(), "unavailable");
+    assert!(error.code.retryable());
+    drop(held);
+    rig.op(Op::Export).await.unwrap();
+    let held = leases
+        .acquire(&broca_core::lease_key_for(&rig.driver.plans[1].session))
+        .unwrap();
+    let mut params = rig.params.clone();
+    params["holder"] = json!("receiver");
+    let error = rig
+        .store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.release",
+            &params,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "unavailable");
+    assert!(error.code.retryable());
+    drop(held);
+    rig.store
+        .execute(
+            "reserved:entorhinal",
+            "agent_data.release",
+            &params,
+            &rig.artifacts,
+        )
+        .await
+        .unwrap();
 }

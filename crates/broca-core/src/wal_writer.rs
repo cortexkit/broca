@@ -291,14 +291,38 @@ impl FileWalStore {
         &self,
         address: &str,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        self.read_address_records_inner(address, false)
+    }
+
+    /// Bypass the moving/moved reader fence solely to discover the address of a
+    /// move-back destination. Only the agent-data participant in broca-module-serve
+    /// may call this: ordinary readers must keep refusing tombstoned sessions.
+    /// Size limits and archive verification are unchanged; no writer is opened and
+    /// no archive member is restored into the live WAL directory.
+    pub fn read_address_records_for_move(
+        &self,
+        address: &str,
+    ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        self.read_address_records_inner(address, true)
+    }
+
+    fn read_address_records_inner(
+        &self,
+        address: &str,
+        for_move: bool,
+    ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
         if address.len() != 16 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(WalError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid WAL address",
             )));
         }
+        if !for_move {
+            let path = self.root.join(format!("{address}.wal"));
+            broca_wal::migration::guard(&path, "", false)?;
+        }
         match self
-            .read_address_range(address, 0, None, None)?
+            .read_address_range_for_authorization(address, 0, None, None)?
             .into_records()
         {
             broca_wal::WalRangeRecords::Complete(records) => Ok(records),
