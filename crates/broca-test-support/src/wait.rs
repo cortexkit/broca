@@ -129,7 +129,7 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(diagnosed.get(), "the guard must report state on timeout");
-        assert_eq!(start.elapsed(), EVENT_HANG_GUARD);
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
     }
 
     #[tokio::test]
