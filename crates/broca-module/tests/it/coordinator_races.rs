@@ -1393,21 +1393,21 @@ async fn queued_burst_drains_fifo_with_identical_durable_payloads() {
         assert!(matches!(outcome, SendOutcome::Pending { .. }));
     }
 
+    // These wait for events, not for speed: each queued run starts only after the previous
+    // run's terminal is fsynced on a real file WAL, and one fsync on a busy CI disk has taken
+    // over a second. The 60 s bound is a hang guard; the exact counts are still asserted.
+    let hang_guard = || std::time::Instant::now() + Duration::from_secs(60);
     for expected_starts in 2..=4 {
         gate.release().await;
-        for _ in 0..80 {
-            if exec.started_count() >= expected_starts {
-                break;
-            }
+        let deadline = hang_guard();
+        while exec.started_count() < expected_starts && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(exec.started_count(), expected_starts);
     }
     gate.release().await;
-    for _ in 0..80 {
-        if exec.finished_count() >= 4 {
-            break;
-        }
+    let deadline = hang_guard();
+    while exec.finished_count() < 4 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(exec.finished_count(), 4);
