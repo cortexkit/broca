@@ -238,8 +238,9 @@ impl Driver {
             .iter()
             .find(|item| item.session_ref == reference)
             .ok_or_else(|| unavailable("imported reply does not cover the activation ref"))?;
-        let session = session
-            .ok_or_else(|| unavailable("activation has neither a staged nor installed WAL"))?;
+        let session = session.ok_or_else(|| {
+            broca_module::move_files::staging_digest_failure(cut_id, state.step, reference)
+        })?;
         let path = broca_wal::migration::staging_path(
             self.wal.root(),
             cut_id,
@@ -350,18 +351,6 @@ impl Driver {
         // An abort can arrive before activation, when the only local identity is
         // in this cut's staged WAL. It must not need a working door to clean up.
         if !cut_id.is_empty() {
-            let activation_step = if op == Op::Activate {
-                let state: Option<broca_module::cut_state::CutState> =
-                    broca_wal::migration::read_json(&CutStore::new(&self.root).path(cut_id))
-                        .map_err(unavailable)?;
-                Some(
-                    state
-                        .ok_or_else(|| unavailable("activation has no cut state"))?
-                        .step,
-                )
-            } else {
-                None
-            };
             let dir = self.root.join("wal-staging").join(cut_id);
             match std::fs::read_dir(dir) {
                 Ok(entries) => {
@@ -376,17 +365,11 @@ impl Driver {
                         ) {
                             Ok(range) => range,
                             Err(error) => {
-                                if op == Op::Abort {
+                                // Activation checks the stored import digest even
+                                // when staging no longer reveals an identity;
+                                // abort can discard its cut-private files directly.
+                                if matches!(op, Op::Abort | Op::Activate) {
                                     continue;
-                                }
-                                if let Some(step) = activation_step {
-                                    return Err(broca_module::move_files::staging_digest_failure(
-                                        cut_id,
-                                        step,
-                                        path.file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("staged-session"),
-                                    ));
                                 }
                                 return Err(unavailable(error));
                             }

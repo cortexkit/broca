@@ -1716,15 +1716,15 @@ async fn activate_reports_local_advanced_when_retention_appears_after_import() {
 }
 #[tokio::test]
 async fn activation_corruption_is_a_staging_digest_fork_and_abort_discards_it() {
-    for torn in [true, false] {
+    for damage in ["checksum", "append", "truncate"] {
         let (rig, params, mut bytes) = incoming_rig("corrupt-activation");
         let session = rig.session("incoming");
         let mut wire = Wire::new(&rig, entorhinal(), true).await;
         wire.call("import", params.clone()).await.unwrap();
-        if torn {
+        if damage == "checksum" {
             let last = bytes.len() - 1;
             bytes[last] ^= 1;
-        } else {
+        } else if damage == "append" {
             bytes.extend_from_slice(
                 &broca_wal::framing::encode(
                     4,
@@ -1739,6 +1739,8 @@ async fn activation_corruption_is_a_staging_digest_fork_and_abort_discards_it() 
                 )
                 .unwrap(),
             );
+        } else {
+            bytes = b"not a WAL".to_vec();
         }
         let staged = broca_wal::migration::staging_path(
             rig.wal.root(),
@@ -2090,4 +2092,16 @@ async fn diverged_held_ref_with_a_bad_cut_is_unknown_and_logs_the_cause() {
         );
         assert!(!logs.contains("tool transcript result"));
     }
+}
+
+#[tokio::test]
+async fn import_refuses_an_unknown_wal_frame_version_before_staging() {
+    let (rig, params, mut bytes) = incoming_rig("unknown-frame-version");
+    bytes[4] = 99;
+    rig.door
+        .plant(CUT, params["refs"][0]["ref"].as_str().unwrap(), bytes);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let error = assert_code(wire.call("import", params).await, "incompatible_version");
+    assert_eq!(error["detail"]["found"], "broca-wal/v99");
+    assert_nothing_staged(&rig);
 }

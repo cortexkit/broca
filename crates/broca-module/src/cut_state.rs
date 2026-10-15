@@ -320,8 +320,7 @@ impl CutStore {
         if op == Op::Diverged {
             // A divergence probe is read-only. In particular, an absent local
             // copy must not fetch the cut merely to inspect a pending import.
-            self.reconcile_locked(cut_id, &mut state, artifacts, true)
-                .await?;
+            Self::reconcile_locked(self, cut_id, &mut state, artifacts, true).await?;
             let refs = request.refs().expect("diverged carries refs");
             let _sessions = artifacts.lock_refs(cut_id, refs, Op::Diverged).await?;
             return artifacts.apply(&request, &state).await;

@@ -354,3 +354,38 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
     .await
     .expect("agent-data real-daemon lane exceeded its own deadline");
 }
+
+#[tokio::test]
+async fn required_daemon_lane_refuses_to_skip_missing_binaries() {
+    let missing = root("required-missing-rigs");
+    let output = timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "real_daemon::two_real_daemons_move_and_move_back_through_the_attested_door",
+                "--nocapture",
+            ])
+            .env("BROCA_REQUIRE_SUBC", "1")
+            .env("SUBC_CORE_BIN", missing.join("no-daemon"))
+            .env("FAKE_AFT_STUB_BIN", missing.join("no-fake"))
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("required-lane self-test deadline")
+    .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "missing required rigs silently passed: {text}"
+    );
+    assert!(
+        text.contains("real agent-data lane requires ck-subc and fake-aft-stub"),
+        "{text}"
+    );
+}

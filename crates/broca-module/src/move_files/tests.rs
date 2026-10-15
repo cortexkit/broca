@@ -645,7 +645,7 @@ async fn source_export_and_release_lease_contention_use_retryable_unavailable() 
         .unwrap();
     let error = rig.op(Op::Export).await.unwrap_err();
     assert_eq!(error.code.as_str(), "unavailable");
-    assert!(error.code.retryable());
+    assert!(broca_wire::agent_data::errors::driver_action_for(Op::Export, &error.code).retryable());
     drop(held);
     rig.op(Op::Export).await.unwrap();
     let held = leases
@@ -664,7 +664,9 @@ async fn source_export_and_release_lease_contention_use_retryable_unavailable() 
         .await
         .unwrap_err();
     assert_eq!(error.code.as_str(), "unavailable");
-    assert!(error.code.retryable());
+    assert!(
+        broca_wire::agent_data::errors::driver_action_for(Op::Release, &error.code).retryable()
+    );
     drop(held);
     rig.store
         .execute(
