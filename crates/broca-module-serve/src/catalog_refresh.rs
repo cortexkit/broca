@@ -290,12 +290,12 @@ impl CatalogPoller {
                 Ok(response) => break response,
                 Err(error) => {
                     if let ConnError::Rejected(message) = &error {
-                        if let Some(("refused", reason)) = message.split_once(" — ") {
-                            if catalog_changed(reason) {
-                                *self.handle.lock().unwrap() = Some(handle.clone());
-                                return Err(ReadError::Changed(reason.into()));
-                            }
+                        *self.handle.lock().unwrap() = Some(handle.clone());
+                        let (code, reason) = message.split_once(" — ").unwrap_or(("", message));
+                        if code == "catalog_changed" {
+                            return Err(ReadError::Changed(reason.into()));
                         }
+                        return Err(PollError::Refused(format!("catalog.get: {message}")).into());
                     }
                     self.handle.lock().unwrap().take();
                     if *transport_retried {
@@ -398,11 +398,6 @@ struct CatalogPage {
     next_page_token: Option<String>,
 }
 
-fn catalog_changed(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("catalog changed") && message.contains("first page")
-}
-
 fn decode_tool_response(mut value: serde_json::Value) -> Result<CatalogPage, ReadError> {
     // Decode both routed tool envelopes and direct replies through the same catalog parser.
     let mut is_error = false;
@@ -420,15 +415,16 @@ fn decode_tool_response(mut value: serde_json::Value) -> Result<CatalogPage, Rea
         value = serde_json::from_str(text)
             .map_err(|error| PollError::Protocol(format!("decode catalog.get text: {error}")))?;
     }
-    if value.get("code").and_then(|code| code.as_str()) == Some("refused") {
+    if let Some(code) = value.get("code").and_then(|code| code.as_str()) {
         let message = value
             .get("message")
             .and_then(|message| message.as_str())
             .unwrap_or("");
-        if catalog_changed(message) {
+        // Only the dedicated code identifies a stale pinned snapshot. Message text is diagnostic.
+        if code == "catalog_changed" {
             return Err(ReadError::Changed(message.into()));
         }
-        return Err(PollError::Refused(format!("catalog.get: {message}")).into());
+        return Err(PollError::Refused(format!("catalog.get {code}: {message}")).into());
     }
     if is_error {
         return Err(PollError::Protocol("catalog.get returned an application error".into()).into());
@@ -795,11 +791,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_catalog_refusal_restarts_without_mixing_pages() {
+    async fn catalog_changed_code_restarts_without_mixing_pages() {
         assert_restarts_without_mixing(Ok(tool_reply(
             serde_json::json!({
-                "code": "refused",
-                "message": "catalog changed since the first page; restart from page one",
+                "code": "catalog_changed",
+                "message": "snapshot lease is no longer valid",
             }),
             true,
         )))
@@ -807,9 +803,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routed_changed_catalog_refusal_restarts_without_mixing_pages() {
+    async fn routed_catalog_changed_code_restarts_without_mixing_pages() {
         assert_restarts_without_mixing(Err(ConnError::Rejected(
-            "refused — catalog changed since the first page; restart from page one".into(),
+            "catalog_changed — snapshot lease is no longer valid".into(),
         )))
         .await;
     }
@@ -1004,6 +1000,77 @@ mod tests {
             CatalogPoller::with_route(route.clone(), identity(), Arc::new(CatalogCache::empty()));
         assert!(matches!(poller.poll().await, Err(PollError::Refused(_))));
         assert_eq!(route.arguments.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_continuation_refusals_are_terminal_even_with_catalog_changed_text() {
+        for code in ["refused", "permission_denied"] {
+            let message = "catalog changed since the first page; restart from page one";
+            let refusal = serde_json::json!({"code": code, "message": message});
+            for result in [
+                Ok(tool_reply(refusal.clone(), true)),
+                Ok(refusal),
+                Err(ConnError::Rejected(format!("{code} — {message}"))),
+            ] {
+                let [first, _] = split_pages(&full_response(7, 10));
+                let route = scripted_route(vec![Ok(first), result]);
+                let cache = Arc::new(CatalogCache::empty());
+                cache
+                    .install_for_test(full_response(7, 1), CatalogSource::Fusiform)
+                    .unwrap();
+                let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
+                let error = poller.poll().await.unwrap_err();
+                assert!(
+                    matches!(error, PollError::Refused(ref reason) if reason.contains(code)),
+                    "{error}"
+                );
+                let arguments = route.arguments.lock().unwrap();
+                assert_eq!(
+                    arguments.len(),
+                    2,
+                    "ordinary refusals must not restart the read"
+                );
+                assert!(arguments[1].get("page_token").is_some());
+                assert_eq!(route.opens.load(Ordering::Relaxed), 1);
+                assert_eq!(cache.snapshot().unwrap().resolved_at_ms(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn first_page_refusal_is_terminal() {
+        for message in [
+            "snapshot lease is no longer valid",
+            "catalog changed since the first page; restart from page one",
+        ] {
+            let refusal = serde_json::json!({"code": "refused", "message": message});
+            for result in [
+                Ok(tool_reply(refusal.clone(), true)),
+                Ok(refusal),
+                Err(ConnError::Rejected(format!("refused — {message}"))),
+            ] {
+                let route = scripted_route(vec![result]);
+                let cache = Arc::new(CatalogCache::empty());
+                cache
+                    .install_for_test(response(1), CatalogSource::Fusiform)
+                    .unwrap();
+                let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
+                let error = poller.poll().await.unwrap_err();
+                assert!(
+                    matches!(error, PollError::Refused(ref reason) if reason.contains(message)),
+                    "{error}"
+                );
+                let arguments = route.arguments.lock().unwrap();
+                assert_eq!(
+                    arguments.len(),
+                    1,
+                    "first-page refusals must not be retried"
+                );
+                assert!(arguments[0].get("page_token").is_none());
+                assert_eq!(route.opens.load(Ordering::Relaxed), 1);
+                assert_eq!(cache.snapshot().unwrap().resolved_at_ms(), 1);
+            }
+        }
     }
 
     #[tokio::test]

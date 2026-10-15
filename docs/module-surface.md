@@ -39,8 +39,10 @@ assembled before the existing catalog parser, monotonicity checks, and atomic
 LKG write run; no partial catalog is installed.
 
 All pages must agree on `catalog_version` and `resolved_at_ms`. A mismatch or a
-`refused` response saying the catalog changed since the first page discards the
-assembly and restarts from page one, at most twice. A poll is bounded to 256
+response with code `catalog_changed` discards the assembly and restarts from page
+one, at most twice. Every other refusal, including `refused`, remains terminal on
+both first-page and continuation requests. Message wording is diagnostic only;
+no message text controls restarts. A poll is bounded to 256
 page requests and 64 MiB of serialized response JSON, including tool envelopes
 and abandoned attempts. Exhaustion is a named refusal; malformed pages, duplicate
 model identities or qualification rows, and repeated continuation tokens are
@@ -54,9 +56,10 @@ pages retain the existing flat `models` map keyed by `provider/model`, with whol
 providers grouped into pages in provider-id order; `source` is unchanged;
 `withheld` and `uncertain` are per-page arrays concatenated in page order, with
 duplicate rows refused; every page carries the version and page one's resolved
-instant; the final continuation token is absent, not null. Changed-snapshot
-refusals carry code `refused` and a message naming the catalog change since the
-first page, either as a routed error or a tool-result JSON error document.
+instant; the final continuation token is absent, not null. Error codes arrive as
+a routed error or a direct/tool-result JSON error document. A stale continuation
+uses the distinct `catalog_changed` code; `refused` and other codes do not signal
+a snapshot restart.
 
 ## 2. Two consumer roles
 

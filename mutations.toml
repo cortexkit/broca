@@ -10869,27 +10869,31 @@ new = "false /* NON-VACUITY BREAK: ignore page instant drift */"
 
 [[control]]
 id = "catalog-page-refusal-restarts"
-guards = "a changed-catalog tool refusal restarts the whole read without mixing pages"
+guards = "a catalog_changed tool code restarts the whole read regardless of message wording"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--lib"
 test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
-expect_red = ["catalog_refresh::tests::changed_catalog_refusal_restarts_without_mixing_pages"]
+expect_red = ["catalog_refresh::tests::catalog_changed_code_restarts_without_mixing_pages"]
 file = "crates/broca-module-serve/src/catalog_refresh.rs"
-old = "return Err(ReadError::Changed(message.into()));"
-new = 'return Err(PollError::Refused(message.into()).into()); // NON-VACUITY BREAK: do not restart'
+old = '''if code == "catalog_changed" {
+            return Err(ReadError::Changed(message.into()));'''
+new = '''if false && code == "catalog_changed" { // NON-VACUITY BREAK: ignore snapshot-change code
+            return Err(ReadError::Changed(message.into()));'''
 
 [[control]]
 id = "catalog-page-routed-refusal-restarts"
-guards = "a changed-catalog routed refusal restarts the whole read without mixing pages"
+guards = "a routed catalog_changed code restarts the whole read regardless of message wording"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--lib"
 test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
-expect_red = ["catalog_refresh::tests::routed_changed_catalog_refusal_restarts_without_mixing_pages"]
+expect_red = ["catalog_refresh::tests::routed_catalog_changed_code_restarts_without_mixing_pages"]
 file = "crates/broca-module-serve/src/catalog_refresh.rs"
-old = "return Err(ReadError::Changed(reason.into()));"
-new = 'return Err(PollError::Refused(reason.into()).into()); // NON-VACUITY BREAK: do not restart'
+old = '''if code == "catalog_changed" {
+                            return Err(ReadError::Changed(reason.into()));'''
+new = '''if false && code == "catalog_changed" { // NON-VACUITY BREAK: ignore snapshot-change code
+                            return Err(ReadError::Changed(reason.into()));'''
 
 [[control]]
 id = "catalog-page-repeated-token-refused"
