@@ -926,3 +926,197 @@ fn legacy_projection_suffix_remains_unknown_until_complete_origin_fold() {
             .is_some());
     }
 }
+
+#[cfg(feature = "test-clock")]
+struct IntentSyncGate {
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    cv: std::sync::Condvar,
+    seq: std::sync::atomic::AtomicU64,
+}
+#[cfg(feature = "test-clock")]
+impl IntentSyncGate {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+#[cfg(feature = "test-clock")]
+struct IntentSyncWal {
+    inner: Box<dyn broca_wal::Wal + Send>,
+    armed: std::sync::atomic::AtomicBool,
+    gate: Arc<IntentSyncGate>,
+}
+#[cfg(feature = "test-clock")]
+impl broca_wal::Wal for IntentSyncWal {
+    fn append(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+    ) -> Result<u64, broca_wal::WalError> {
+        let intent = matches!(record, WalRecord::LateDispatchIntent { .. });
+        let seq = self.inner.append(fence, record, sync && !intent)?;
+        if intent {
+            self.gate.seq.store(seq, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+            if sync {
+                self.sync()?;
+            }
+        }
+        Ok(seq)
+    }
+    fn sync(&self) -> Result<(), broca_wal::WalError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            // Hold the real durability barrier after intent append, before its ack.
+            self.gate.entered.notify_one();
+            let (released, timeout) = self
+                .gate
+                .cv
+                .wait_timeout_while(
+                    self.gate.released.lock().unwrap(),
+                    std::time::Duration::from_secs(10),
+                    |released| !*released,
+                )
+                .unwrap();
+            if timeout.timed_out() && !*released {
+                return Err(broca_wal::WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "intent sync gate was not released",
+                )));
+            }
+        }
+        self.inner.sync()
+    }
+    fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.inner.replay()
+    }
+    fn tail_after_seq(
+        &self,
+        seq: u64,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.inner.tail_after_seq(seq)
+    }
+    fn last_seq(&self) -> u64 {
+        self.inner.last_seq()
+    }
+    fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+        self.inner.lineage_id()
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent() {
+    for cancel in [true, false] {
+        let mut rig = copied_pending_late_episode(false).await;
+        rig.writer.shutdown().await.unwrap();
+        let gate = Arc::new(IntentSyncGate {
+            entered: tokio::sync::Notify::new(),
+            released: Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+            seq: std::sync::atomic::AtomicU64::new(0),
+        });
+        rig.writer = WalHandle::spawn(
+            Box::new(IntentSyncWal {
+                inner: rig.tools.store.open(&rig.bind).unwrap(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                gate: gate.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        rig.control.elicitation_plane = None;
+        Arc::get_mut(&mut rig.questions).unwrap().head = rig.writer.durable_head();
+        rig.control.elicitation_plane = Some(rig.questions.clone());
+        let token = CancellationToken::new();
+        if cancel {
+            rig.control.cancel = Some(token.clone());
+        } else {
+            rig.control.stop_requested = Some(token.clone());
+        }
+        let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+        let admission = approval_gate::admission(
+            &mut history,
+            &rig.writer,
+            &rig.bind,
+            &rig.control,
+            &rig.tools,
+        );
+        let interrupt = async {
+            gate.entered.notified().await;
+            assert!(
+                rig.writer.durable_head().load(Ordering::SeqCst) < gate.seq.load(Ordering::SeqCst),
+                "intent must still be unsynced when stop arrives"
+            );
+            token.cancel();
+            gate.release();
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(admission, interrupt)
+        })
+        .await;
+        gate.release();
+        let (result, ()) = result.expect("the intent barrier must be released");
+        result.unwrap();
+        assert_eq!(
+            rig.tools.provider_requests.load(Ordering::SeqCst),
+            0,
+            "late cancellation during intent sync must win before send"
+        );
+        assert!(rig.frames().iter().any(|frame| matches!(
+            frame.record,
+            WalRecord::LateResult {
+                outcome: broca_wal::LateOutcome::NotSent,
+                ..
+            }
+        )));
+        assert_eq!(
+            rig.questions.reports.lock().unwrap()[0].1,
+            ApprovalExecution::ApprovedNotExecuted
+        );
+        rig.finish().await;
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn late_dispatch_cancel_or_stop_during_route_open_is_not_sent() {
+    for cancel in [true, false] {
+        let mut rig = copied_pending_late_episode(false).await;
+        let token = CancellationToken::new();
+        if cancel {
+            rig.control.cancel = Some(token.clone());
+        } else {
+            rig.control.stop_requested = Some(token.clone());
+        }
+        *rig.tools.interrupt_on_open.lock().unwrap() = Some(token);
+        let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+        approval_gate::admission(
+            &mut history,
+            &rig.writer,
+            &rig.bind,
+            &rig.control,
+            &rig.tools,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rig.tools.provider_requests.load(Ordering::SeqCst),
+            0,
+            "late cancellation during route open must win before send"
+        );
+        assert!(rig.frames().iter().any(|frame| matches!(
+            frame.record,
+            WalRecord::LateResult {
+                outcome: broca_wal::LateOutcome::NotSent,
+                ..
+            }
+        )));
+        assert_eq!(
+            rig.questions.reports.lock().unwrap()[0].1,
+            ApprovalExecution::ApprovedNotExecuted
+        );
+        rig.finish().await;
+    }
+}

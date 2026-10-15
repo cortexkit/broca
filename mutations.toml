@@ -10774,3 +10774,39 @@ select = "expected"
 file = "crates/broca-core/src/replay.rs"
 old = "stopped.retain(|run| open_runs.contains(run));"
 new = "stopped.retain(|run| true || open_runs.contains(run)); // NON-VACUITY BREAK"
+
+[[control]]
+id = "core-consent-late-stop-during-intent-sync"
+guards = "late send rechecks cancel and stop after the durable intent barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_dispatch_cancel_or_stop_during_intent_sync_is_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
+    }'''
+new = '''fn late_stopped(_control: &RunControl) -> bool {
+        false // NON-VACUITY BREAK
+    }'''
+
+[[control]]
+id = "core-consent-late-stop-during-route-open"
+guards = "late send rechecks cancel and stop after route-open completion immediately before dispatch"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-core/src/run/consent_audit_tests.rs"
+expect_red = ["run::approval_tests::consent_audit_tests::late_dispatch_cancel_or_stop_during_route_open_is_not_sent"]
+select = "expected"
+file = "crates/broca-core/src/run.rs"
+old = '''fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
+    }'''
+new = '''fn late_stopped(_control: &RunControl) -> bool {
+        false // NON-VACUITY BREAK
+    }'''

@@ -11044,19 +11044,8 @@ mod approval_gate {
             );
             writer.sync().await?;
             let tool_call = call.call();
-            let result = match plane
-                .batch_started(&ctx, std::slice::from_ref(&tool_call), &manifest)
-                .await
-            {
-                Ok(()) => {
-                    plane
-                        .dispatch_approved(&ctx, &tool_call, args_jcs, &key, "")
-                        .await
-                }
-                Err(error) => DispatchResult::NotSent {
-                    reason: error.to_string(),
-                },
-            };
+            let result =
+                send_late(plane, &ctx, &tool_call, &manifest, args_jcs, &key, control).await;
             let outcome = match &result {
                 DispatchResult::Completed(_) => LateOutcome::Completed,
                 DispatchResult::NotSent { .. }
@@ -11077,6 +11066,41 @@ mod approval_gate {
             let _ = plane.batch_finished(&ctx).await;
         }
         Ok(())
+    }
+
+    async fn send_late<T: ToolPlane>(
+        plane: &T,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        manifest: &ToolManifest,
+        args_jcs: &str,
+        key: &str,
+        control: &RunControl,
+    ) -> DispatchResult {
+        // Stop may arrive while the intent sync or route open is pending. Neither
+        // completed await is permission to send without checking both tokens again.
+        if late_stopped(control) {
+            return DispatchResult::NotSent {
+                reason: "late_execution_stopped".into(),
+            };
+        }
+        if let Err(error) = plane
+            .batch_started(ctx, std::slice::from_ref(call), manifest)
+            .await
+        {
+            return DispatchResult::NotSent {
+                reason: error.to_string(),
+            };
+        }
+        if late_stopped(control) {
+            return DispatchResult::NotSent {
+                reason: "late_execution_stopped".into(),
+            };
+        }
+        plane.dispatch_approved(ctx, call, args_jcs, key, "").await
+    }
+    fn late_stopped(control: &RunControl) -> bool {
+        is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
     }
 
     // Validate every relevant answer before accepting the page, so an unreadable

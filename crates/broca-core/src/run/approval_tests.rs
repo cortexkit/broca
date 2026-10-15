@@ -387,6 +387,7 @@ impl ElicitationPlane for Questions {
 }
 struct Tools {
     interrupt_on_recheck: Mutex<Option<CancellationToken>>,
+    interrupt_on_open: Mutex<Option<CancellationToken>>,
     default_module: Mutex<String>,
     routes: Mutex<std::collections::HashMap<(BatchId, ToolCallId), String>>,
     hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -416,6 +417,9 @@ impl ToolPlane for Tools {
                 .lock()
                 .unwrap()
                 .insert((ctx.batch_id.clone(), call.tool_call_id.clone()), module);
+        }
+        if let Some(token) = self.interrupt_on_open.lock().unwrap().as_ref() {
+            token.cancel();
         }
         Ok(())
     }
@@ -598,6 +602,7 @@ impl Rig {
             bind: bind.clone(),
             tools: Tools {
                 interrupt_on_recheck: Mutex::new(None),
+                interrupt_on_open: Mutex::new(None),
                 default_module: Mutex::new("aft".into()),
                 routes: Mutex::new(Default::default()),
                 hold: Mutex::new(None),
@@ -1351,6 +1356,7 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
     let cut_writer = WalHandle::spawn(cut_store.open(&rig.bind).unwrap(), 2).unwrap();
     let cut_tools = Tools {
         interrupt_on_recheck: Mutex::new(None),
+        interrupt_on_open: Mutex::new(None),
         default_module: Mutex::new("aft".into()),
         routes: Mutex::new(Default::default()),
         hold: Mutex::new(None),
@@ -1949,6 +1955,7 @@ async fn unreadable_await_retries_same_card_without_refile() {
 fn tools_for_store(store: crate::FileWalStore, bind: BindIdentity) -> Tools {
     Tools {
         interrupt_on_recheck: Mutex::new(None),
+        interrupt_on_open: Mutex::new(None),
         default_module: Mutex::new("aft".into()),
         routes: Mutex::new(Default::default()),
         hold: Mutex::new(None),
