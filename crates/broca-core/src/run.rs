@@ -10536,6 +10536,8 @@ mod approval_gate {
                         Ok(polled) => {
                             let page = polled.page;
                             let Ok(answers)=read_answers(&page.records, &history.projection) else {continue};
+                            // Redundant defense: consent::authorize_candidate also reads every
+                            // continuation before minting authorization, independently of live intake.
                             if !polled.complete { continue; }
                             for (key,answer) in answers {
                                 let answer = match answer.and_then(|answer| history.completed_feed_candidate(&key, answer, &page.cursor)) {
@@ -10558,6 +10560,8 @@ mod approval_gate {
                                         // Before adopting this older answer, withdraw the card
                                         // already recorded for the call. If it was answered first,
                                         // read that answer and require agreement before changing ids.
+                                        // This is redundant defense: consent::authorize_candidate
+                                        // independently proves the recorded duplicate closed.
                                         call.filed = false; call.retry_at = 0;
                                         adoptions.insert(index, answer);
                                     } else { intake(slots, index, answer, ctx, writer, control, history).await?; }
