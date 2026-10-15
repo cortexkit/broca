@@ -539,6 +539,21 @@ impl Wire {
 fn entorhinal() -> Value {
     json!({"kind":"reserved","module_id":"entorhinal"})
 }
+fn recorded_sessions(sessions: &[BindIdentity]) -> BTreeMap<String, BindIdentity> {
+    sessions
+        .iter()
+        .map(|session| {
+            (
+                contract::session_ref(
+                    &session.harness,
+                    &session.project_root.to_string_lossy(),
+                    &session.session,
+                ),
+                session.clone(),
+            )
+        })
+        .collect()
+}
 fn assert_code(result: Result<Value, Value>, code: &str) -> Value {
     let error = result.unwrap_err();
     assert_eq!(error["code"], code, "{error}");
@@ -1028,6 +1043,7 @@ async fn status_keeps_a_partial_prepare_intent_byte_identical_until_repeat() {
             op: "prepare".into(),
             request: params.clone(),
         }),
+        sessions: recorded_sessions(&sessions),
         replies: Default::default(),
     };
     let path = CutStore::new(&rig.root).path(CUT);
@@ -1132,6 +1148,7 @@ async fn contract_step_vectors_pass_through_internal_serve() {
             step: serde_json::from_value(case["from"].clone()).unwrap(),
             refs: Some(contract::refs::Refs::new(vec![]).unwrap()),
             intent: None,
+            sessions: Default::default(),
             replies: Default::default(),
         };
         broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(CUT), &state).unwrap();
@@ -1214,6 +1231,7 @@ async fn contract_ref_set_vectors_are_checked_before_artifacts() {
                 .as_array()
                 .map(|_| serde_json::from_value(case["started_with"].clone()).unwrap()),
             intent: None,
+            sessions: Default::default(),
             replies: Default::default(),
         };
         broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(CUT), &state).unwrap();
@@ -1301,6 +1319,7 @@ async fn source_tombstone_case(op: contract::Op) {
         },
         refs: Some(serde_json::from_value(params["refs"].clone()).unwrap()),
         intent: None,
+        sessions: recorded_sessions(std::slice::from_ref(&session)),
         replies: Default::default(),
     };
     broca_wal::migration::atomic_json(&CutStore::new(&rig.root).path(CUT), &state).unwrap();
@@ -1361,6 +1380,7 @@ async fn contradictory_owner_case(op: contract::Op) {
         },
         refs: Some(serde_json::from_value(params["refs"].clone()).unwrap()),
         intent: None,
+        sessions: recorded_sessions(std::slice::from_ref(&session)),
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
@@ -1816,8 +1836,11 @@ async fn activation_corruption_is_a_staging_digest_fork_and_abort_discards_it() 
             wire.call("status", params.clone()).await.unwrap(),
             json!({"step":"imported"})
         );
+        let orphan = staged.with_extension("wal.tmp");
+        std::fs::write(&orphan, b"interrupted private staging write").unwrap();
         wire.call("abort", params.clone()).await.unwrap();
         assert!(!staged.exists());
+        assert!(!orphan.exists());
         assert_eq!(
             wire.call("status", params).await.unwrap(),
             json!({"step":"aborted"})
@@ -1867,10 +1890,15 @@ async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
     use broca_module::cut_state::{CutState, CutStore, Intent};
     let (rig, mut params, bytes) = incoming_rig("abort-partial-import");
     let session = rig.session("incoming");
-    params["refs"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"ref_kind":"broca-session","ref":"ffffffffffffffffffffffffffffffff"}));
+    let other_session = rig.session("other-unheld");
+    params["refs"].as_array_mut().unwrap().push(
+        serde_json::to_value(contract::session_reference(
+            &other_session.harness,
+            &other_session.project_root.to_string_lossy(),
+            &other_session.session,
+        ))
+        .unwrap(),
+    );
     let staged = broca_wal::migration::staging_path(
         rig.wal.root(),
         CUT,
@@ -1892,6 +1920,7 @@ async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
             op: "import".into(),
             request: params.clone(),
         }),
+        sessions: recorded_sessions(&[session.clone(), other_session]),
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
@@ -1923,6 +1952,7 @@ async fn boot_keeps_an_unreadable_cut_pending_and_status_read_only() {
             op: "import".into(),
             request: params.clone(),
         }),
+        sessions: recorded_sessions(&[rig.session("incoming")]),
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
@@ -2090,6 +2120,7 @@ async fn diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import
             op: "import".into(),
             request: params.clone(),
         }),
+        sessions: recorded_sessions(&[rig.session("incoming")]),
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
@@ -2181,4 +2212,156 @@ async fn refused_first_prepare_does_not_capture_refs_for_the_next_request() {
         wire.call("status", params).await.unwrap(),
         json!({"step":"aborted"})
     );
+}
+
+fn unreadable_wal(rig: &Rig, session: &BindIdentity) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(rig.wal.wal_path(session))
+        .unwrap()
+        .set_len(rig.wal.max_read_bytes() + 1)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn healthy_cut_abort_uses_recorded_addresses_beside_an_unreadable_wal() {
+    let mut rig = Rig::new("abort-bad-neighbor", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a", true);
+    rig.seed(&b, "b", true);
+    let params = rig.params(CUT, std::slice::from_ref(&a));
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    wire.call("prepare", params.clone()).await.unwrap();
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(broca_module::cut_state::CutStore::new(&rig.root).path(CUT)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["sessions"][params["refs"][0]["ref"].as_str().unwrap()],
+        serde_json::to_value(&a).unwrap()
+    );
+    unreadable_wal(&rig, &b);
+    let events = ErrorEvents(Arc::default());
+    let dispatch = tracing::Dispatch::new(events.clone());
+    let _log = tracing::dispatcher::set_default(&dispatch);
+    drop(wire);
+    rig.service = Arc::new(AgentDataService::new(
+        rig.root.clone(),
+        rig.registry.as_ref().clone(),
+        rig.wal.clone(),
+        rig.index.clone(),
+        rig.door.clone(),
+    ));
+    rig.service.reconcile_boot().await.unwrap();
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    wire.call("abort", params.clone()).await.unwrap();
+    assert!(!rig.wal.wal_path(&a).with_extension("moving").exists());
+    assert_eq!(
+        wire.call("status", params).await.unwrap(),
+        json!({"step":"aborted"})
+    );
+    assert!(
+        !events
+            .0
+            .lock()
+            .unwrap()
+            .join("\n")
+            .contains(&broca_core::session_addr(&b)),
+        "cut recovery scanned its unreadable neighbor"
+    );
+}
+
+#[tokio::test]
+async fn divergence_is_per_ref_when_one_held_wal_is_unreadable() {
+    let rig = Rig::new("diverged-bad-neighbor", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a", true);
+    rig.seed(&b, "b", true);
+    let params = rig.params(CUT, &[a.clone(), b.clone()]);
+    rig.door.plant(
+        CUT,
+        params["refs"][0]["ref"].as_str().unwrap(),
+        rig.bytes(&a),
+    );
+    unreadable_wal(&rig, &b);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    assert_eq!(
+        wire.call("diverged", params).await.unwrap(),
+        json!({"refs":[{"state":"at_cut"},{"state":"unknown"}]})
+    );
+    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unresolved_ref_with_unreadable_inventory_is_unknown_not_absent() {
+    let (rig, params, _) = incoming_rig("ambiguous-local-copy");
+    let b = rig.session("unreadable");
+    rig.seed(&b, "b", true);
+    unreadable_wal(&rig, &b);
+    let address = broca_core::session_addr(&b);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    assert_eq!(
+        wire.call("diverged", params.clone()).await.unwrap(),
+        json!({"refs":[{"state":"unknown"}]})
+    );
+    for op in ["prepare", "import"] {
+        let error = assert_code(wire.call(op, params.clone()).await, "unavailable");
+        assert!(
+            error["message"].as_str().unwrap().contains(&address),
+            "{error}"
+        );
+    }
+    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
+    assert!(!rig.root.join("wal-staging").exists());
+}
+
+#[tokio::test]
+async fn cut_without_required_addresses_is_named_unreadable_before_lookup() {
+    use broca_module::cut_state::CutStore;
+    let rig = Rig::new("mapless-cut", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a", true);
+    rig.seed(&b, "b", true);
+    unreadable_wal(&rig, &b);
+    let params = rig.params(CUT, std::slice::from_ref(&a));
+    let path = CutStore::new(&rig.root).path(CUT);
+    let state = json!({"step":"prepared","refs":params["refs"],"intent":null,"replies":{}});
+    broca_wal::migration::atomic_json(&path, &state).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let error = assert_code(wire.call("status", params).await, "unavailable");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains(path.to_str().unwrap()),
+        "{error}"
+    );
+    assert!(
+        error["message"].as_str().unwrap().contains("sessions"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed() {
+    let rig = Rig::new("ambiguous-inventory", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a", true);
+    rig.seed(&b, "b", true);
+    let ephemeral = rig.wal.ephemeral_wal_path(&b);
+    std::fs::create_dir_all(ephemeral.parent().unwrap()).unwrap();
+    std::fs::copy(rig.wal.wal_path(&b), ephemeral).unwrap();
+    assert!(rig.wal.addresses().is_err());
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let params = rig.params(CUT, std::slice::from_ref(&a));
+    wire.call("prepare", params.clone()).await.unwrap();
+    wire.call("abort", params).await.unwrap();
+    assert!(!rig.wal.wal_path(&a).with_extension("moving").exists());
 }

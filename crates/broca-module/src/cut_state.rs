@@ -44,6 +44,7 @@ pub struct Reply {
 pub struct CutState {
     pub step: Step,
     pub refs: Option<Refs>,
+    pub sessions: BTreeMap<String, broca_protocol::BindIdentity>,
     pub intent: Option<Intent>,
     #[serde(default)]
     pub replies: BTreeMap<String, Reply>,
@@ -53,6 +54,7 @@ impl Default for CutState {
         Self {
             step: Step::None,
             refs: None,
+            sessions: BTreeMap::new(),
             intent: None,
             replies: BTreeMap::new(),
         }
@@ -85,6 +87,12 @@ impl<T: Send> CutGuard for T {}
 /// checking every session named by the batch, not just its first artifact.
 #[async_trait::async_trait]
 pub trait CutArtifacts: Send + Sync {
+    fn resolved_sessions(
+        &self,
+        _cut_id: &str,
+    ) -> Result<BTreeMap<String, broca_protocol::BindIdentity>, ErrorBody> {
+        Ok(BTreeMap::new())
+    }
     async fn lock_refs(
         &self,
         cut_id: &str,
@@ -121,9 +129,10 @@ impl CutStore {
             .join(format!("{cut_id}.json"))
     }
     fn load(&self, cut_id: &str) -> Result<CutState, ErrorBody> {
-        broca_wal::migration::read_json(&self.path(cut_id))
+        let path = self.path(cut_id);
+        broca_wal::migration::read_json(&path)
             .map(|s| s.unwrap_or_default())
-            .map_err(unavailable)
+            .map_err(|error| unavailable(format!("cannot read cut {}: {error}", path.display())))
     }
     fn save(&self, cut_id: &str, state: &CutState) -> Result<(), ErrorBody> {
         broca_wal::migration::atomic_json(&self.path(cut_id), state).map_err(unavailable)
@@ -399,6 +408,7 @@ impl CutStore {
         artifacts.check(&request, &state).await?;
         if state.refs.is_none() {
             state.refs = requested_refs;
+            state.sessions = artifacts.resolved_sessions(cut_id)?;
         }
         state.intent = Some(Intent {
             op: method.rsplit('.').next().unwrap().to_owned(),
@@ -419,6 +429,7 @@ impl CutStore {
                         // set for this cutId. Forget the failed request's refs
                         // before admitting the next first request.
                         state.refs = None;
+                        state.sessions.clear();
                         self.save(cut_id, &state)?;
                     }
                     Op::Export => {

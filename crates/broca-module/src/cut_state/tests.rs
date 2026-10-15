@@ -14,6 +14,7 @@ struct Artifacts {
     applied: AtomicUsize,
     calls: AtomicUsize,
     fail_b: AtomicBool,
+    locks: AtomicUsize,
 }
 impl Artifacts {
     fn new(root: PathBuf) -> Self {
@@ -23,6 +24,7 @@ impl Artifacts {
             applied: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             fail_b: AtomicBool::new(false),
+            locks: AtomicUsize::new(0),
         }
     }
     fn staged(&self, reference: &str) -> PathBuf {
@@ -49,6 +51,7 @@ impl CutArtifacts for Artifacts {
         _refs: &Refs,
         _op: Op,
     ) -> Result<Box<dyn CutGuard>, ErrorBody> {
+        self.locks.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(()))
     }
     async fn check(&self, _request: &Request, _state: &CutState) -> Result<(), ErrorBody> {
@@ -648,4 +651,26 @@ async fn rolled_back_first_prepare_and_import_clear_the_uncommitted_ref_set() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn mapless_cut_is_unreadable_before_any_artifact_resolution() {
+    let root = root("mapless-cut");
+    let store = CutStore::new(&root);
+    let artifacts = Artifacts::new(root);
+    let state = json!({"step":"prepared","refs":params()["refs"],"intent":null,"replies":{}});
+    broca_wal::migration::atomic_json(&store.path(CUT), &state).unwrap();
+    let error = store
+        .execute(
+            "reserved:entorhinal",
+            Op::Status.method(),
+            &params(),
+            &artifacts,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "unavailable");
+    assert!(error.message.contains(store.path(CUT).to_str().unwrap()));
+    assert!(error.message.contains("sessions"));
+    assert_eq!(artifacts.locks.load(Ordering::SeqCst), 0);
 }

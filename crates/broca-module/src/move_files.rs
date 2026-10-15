@@ -11,7 +11,7 @@ use broca_wal::migration::{self, Freeze, Moved};
 use broca_wire::agent_data::{errors::ErrorBody, refs::Refs, request::Request, Op};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -33,6 +33,20 @@ pub struct PlannedSession {
     pub local_archive: Option<Vec<u8>>,
 }
 
+#[derive(Default)]
+pub struct MovePlans {
+    pub sessions: Vec<PlannedSession>,
+    pub unknown_refs: BTreeSet<String>,
+}
+impl From<Vec<PlannedSession>> for MovePlans {
+    fn from(sessions: Vec<PlannedSession>) -> Self {
+        Self {
+            sessions,
+            unknown_refs: BTreeSet::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MoveObservation {
     pub reference: String,
@@ -49,12 +63,7 @@ pub struct MoveObservation {
 /// because they have no local bytes that the incoming cut could overwrite.
 #[async_trait::async_trait]
 pub trait MoveDriver: Send + Sync {
-    async fn plan(
-        &self,
-        cut_id: &str,
-        refs: &Refs,
-        op: Op,
-    ) -> Result<Vec<PlannedSession>, ErrorBody>;
+    async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody>;
     async fn cover(&self, reference: &str) -> Result<u64, ErrorBody>;
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody>;
     fn reply(
@@ -69,6 +78,7 @@ pub trait MoveDriver: Send + Sync {
 #[derive(Clone)]
 struct LockedPlans {
     plans: Vec<PlannedSession>,
+    unknown_refs: BTreeSet<String>,
     busy: Option<String>,
     open_actor: bool,
     observations: Vec<MoveObservation>,
@@ -376,24 +386,38 @@ impl FileCutArtifacts {
 
 #[async_trait::async_trait]
 impl CutArtifacts for FileCutArtifacts {
+    fn resolved_sessions(&self, cut_id: &str) -> Result<BTreeMap<String, BindIdentity>, ErrorBody> {
+        let locked = self.plans.lock().unwrap();
+        let locked = locked
+            .get(cut_id)
+            .ok_or_else(|| unavailable("session critical sections are not held"))?;
+        Ok(locked
+            .plans
+            .iter()
+            .map(|plan| (plan.reference.clone(), plan.session.clone()))
+            .collect())
+    }
     async fn lock_refs(
         &self,
         cut_id: &str,
         refs: &Refs,
         op: Op,
     ) -> Result<Box<dyn CutGuard>, ErrorBody> {
-        let mut plans = self.driver.plan(cut_id, refs, op).await?;
+        let resolved = self.driver.plan(cut_id, refs, op).await?;
+        let mut plans = resolved.sessions;
         let references = serde_json::to_value(refs).map_err(unavailable)?;
         let wanted = references
             .as_array()
             .ok_or_else(|| unavailable("invalid ref set"))?;
         if (!matches!(op, Op::Abort | Op::Diverged) && wanted.len() != plans.len())
+            && op != Op::Busy
             || (!matches!(op, Op::Abort | Op::Diverged)
                 && wanted.iter().any(|r| {
                     !plans
                         .iter()
                         .any(|p| r["ref_kind"] == "broca-session" && r["ref"] == p.reference)
                 }))
+                && op != Op::Busy
             || plans.iter().any(|p| {
                 !wanted
                     .iter()
@@ -474,6 +498,7 @@ impl CutArtifacts for FileCutArtifacts {
             cut_id.to_owned(),
             LockedPlans {
                 plans,
+                unknown_refs: resolved.unknown_refs,
                 busy,
                 open_actor,
                 observations,
@@ -713,9 +738,37 @@ impl CutArtifacts for FileCutArtifacts {
             );
             let _guard = self.lock_refs(&key, &request.refs, Op::Busy).await?;
             let locked = self.locked(&key)?;
-            return self
-                .driver
-                .reply(Op::Busy, &locked.plans, &[], &locked.observations);
+            use broca_wire::agent_data::busy::{BusyEntry, BusyReply, BusyState};
+            let held: BusyReply = serde_json::from_value(self.driver.reply(
+                Op::Busy,
+                &locked.plans,
+                &[],
+                &locked.observations,
+            )?)
+            .map_err(unavailable)?;
+            if held.refs.len() != locked.plans.len() {
+                return Err(unavailable("busy reply does not cover held refs"));
+            }
+            return serde_json::to_value(BusyReply::new(
+                request
+                    .refs
+                    .iter()
+                    .map(|reference| {
+                        locked
+                            .plans
+                            .iter()
+                            .position(|plan| plan.reference == reference.r#ref)
+                            .map_or_else(
+                                || {
+                                    BusyEntry::new(BusyState::Unknown)
+                                        .with_reason("local session could not be inspected")
+                                },
+                                |i| held.refs[i].clone(),
+                            )
+                    })
+                    .collect(),
+            ))
+            .map_err(unavailable);
         }
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
@@ -790,6 +843,9 @@ impl CutArtifacts for FileCutArtifacts {
                     .refs
                     .iter()
                     .map(|reference| {
+                        if locked.unknown_refs.contains(&reference.r#ref) {
+                            return DivergedEntry::new(DivergedState::Unknown);
+                        }
                         locked
                             .plans
                             .iter()

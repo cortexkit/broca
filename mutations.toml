@@ -12761,24 +12761,11 @@ old = '''"local_advanced",
 new = '''if op == Op::Activate { "invalid_state" } else { "local_advanced" }, // NON-VACUITY BREAK
                         "retained copy with a deletion deadline cannot be replaced by a cut",'''
 
-[[control]]
-id = "agent-data-activation-missing-identity"
-guards = "damaged imported staging that no longer reveals a bind identity is a digest fork"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--test agent_data"
-features = ["test-clock"]
-test_file = "crates/broca-module-serve/tests/agent_data.rs"
-expect_red = ["activation_corruption_is_a_staging_digest_fork_and_abort_discards_it"]
-only = false
-file = "crates/broca-module-serve/src/agent_data.rs"
-old = '''let session = session.ok_or_else(|| {
-            broca_module::move_files::staging_digest_failure(cut_id, state.step, reference)
-        })?;'''
-new = '''let session = session.ok_or_else(|| {
-            let _ = (cut_id, state.step, reference);
-            unavailable("NON-VACUITY BREAK: hide staging corruption as an outage")
-        })?;'''
+# Retired control: agent-data-activation-missing-identity.
+# Each cut now records its session-ref-to-bind-triple map before staging, so
+# activation no longer recovers identity from staged bytes. Identity now comes
+# from the required address map; a missing identity is unreachable.
+# Removal commit: "mason: persist cut addresses and isolate unreadable WAL discovery".
 
 [[control]]
 id = "agent-data-activation-digest-reason"
@@ -13340,3 +13327,121 @@ file = "crates/broca-module-serve/src/lib.rs"
 old = 'pub mod agent_data;'
 new = '''pub mod agent_data;
 pub fn non_vacuity_move_item(wal: &broca_core::FileWalStore) { let reader = broca_core::FileWalStore::read_address_records_for_move; let _ = reader(wal, "0123456789abcdef"); } // NON-VACUITY BREAK'''
+
+[[control]]
+id = "agent-data-cut-records-session-addresses"
+guards = "intent durably records every resolved session address before cut artifacts can change"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["healthy_cut_abort_uses_recorded_addresses_beside_an_unreadable_wal"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'state.sessions = artifacts.resolved_sessions(cut_id)?;'
+new = 'state.sessions = BTreeMap::new(); // NON-VACUITY BREAK: lose durable address authority'
+
+[[control]]
+id = "agent-data-existing-cut-no-global-scan"
+guards = "recovery of a recorded cut never inspects unrelated local WALs"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["healthy_cut_abort_uses_recorded_addresses_beside_an_unreadable_wal"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''SessionInventory {
+                sessions: state.expect("bound cut exists").sessions,
+                unreadable: Vec::new(),
+            }'''
+new = 'self.local_sessions()? /* NON-VACUITY BREAK: scan unrelated WALs during recovery */'
+
+[[control]]
+id = "agent-data-unreadable-is-not-absence"
+guards = "an unresolved ref with unreadable inventory cannot be treated as absent or at_cut"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["unresolved_ref_with_unreadable_inventory_is_unknown_not_absent"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '(bound || !unreadable.is_empty())'
+new = 'bound /* NON-VACUITY BREAK: assume no readable match means absence */'
+
+[[control]]
+id = "agent-data-divergence-unreadable-ref-only"
+guards = "an unreadable held ref is unknown without blocking readable refs in the same probe"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["divergence_is_per_ref_when_one_held_wal_is_unreadable"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if locked.unknown_refs.contains(&reference.r#ref) {'
+new = 'if false && locked.unknown_refs.contains(&reference.r#ref) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-required-cut-address-map"
+guards = "map-less cut authority is refused by name before any ref resolution or action"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["cut_without_required_addresses_is_named_unreadable_before_lookup"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'pub sessions: BTreeMap<String, broca_protocol::BindIdentity>,'
+new = '''#[serde(default)] // NON-VACUITY BREAK: accept unrecoverable old authority
+    pub sessions: BTreeMap<String, broca_protocol::BindIdentity>,'''
+
+[[control]]
+id = "agent-data-partial-address-inventory"
+guards = "participant discovery isolates unreadable inventory locations while ordinary inventory remains strict"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed"]
+only = false
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'self.address_inventory(true)'
+new = 'self.address_inventory(false) /* NON-VACUITY BREAK: one bad location blocks all discovery */'
+
+[[control]]
+id = "agent-data-discovery-skips-unreadable-wals"
+guards = "an unreadable WAL is logged and isolated instead of failing every requested ref"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["divergence_is_per_ref_when_one_held_wal_is_unreadable"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''inventory.unreadable.push(address);
+                    continue;'''
+new = '''inventory.unreadable.push(address);
+                    return Err(unavailable("NON-VACUITY BREAK: fail the whole scan"));'''
+
+[[control]]
+id = "agent-data-activation-digest-never-outage"
+guards = "changed verified activation bytes remain a digest_mismatch fork, never retryable unavailable"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["activation_corruption_is_a_staging_digest_fork_and_abort_discards_it"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'staging_digest_failure(cut_id, step, session)'
+new = '{ let _ = (cut_id, step, session); unavailable("NON-VACUITY BREAK: hide activation corruption as a transient outage") }'

@@ -25,12 +25,7 @@ struct Driver {
 }
 #[async_trait::async_trait]
 impl MoveDriver for Driver {
-    async fn plan(
-        &self,
-        _cut_id: &str,
-        refs: &Refs,
-        op: Op,
-    ) -> Result<Vec<PlannedSession>, ErrorBody> {
+    async fn plan(&self, _cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
         tokio::task::yield_now().await;
         let mut plans = Vec::new();
         for reference in refs.iter() {
@@ -40,7 +35,7 @@ impl MoveDriver for Driver {
                 None => return Err(refusal("unknown_ref", "unknown session", json!(reference))),
             }
         }
-        Ok(plans)
+        Ok(plans.into())
     }
     async fn cover(&self, _ref: &str) -> Result<u64, ErrorBody> {
         Ok(0)

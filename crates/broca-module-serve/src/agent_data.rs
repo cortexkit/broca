@@ -11,7 +11,7 @@ use std::{
 use broca_core::FileWalStore;
 use broca_module::{
     cut_state::{refusal, CutStore},
-    move_files::{FileCutArtifacts, MoveDriver, MoveObservation, PlannedSession},
+    move_files::{FileCutArtifacts, MoveDriver, MoveObservation, MovePlans, PlannedSession},
     move_install, LineageRegistry,
 };
 use broca_protocol::BindIdentity;
@@ -131,6 +131,12 @@ struct Driver {
     door: Arc<dyn SessionDoor>,
 }
 
+#[derive(Default)]
+struct SessionInventory {
+    sessions: BTreeMap<String, BindIdentity>,
+    unreadable: Vec<String>,
+}
+
 fn door_refusal(error: SessionDoorError) -> ErrorBody {
     let code = match error.door_code.as_deref() {
         Some("not_found") => "cut_not_ready",
@@ -221,7 +227,7 @@ impl Driver {
         &self,
         reference: &str,
         cut_id: &str,
-        session: Option<&BindIdentity>,
+        session: &BindIdentity,
     ) -> Result<Vec<u8>, ErrorBody> {
         let state: broca_module::cut_state::CutState =
             broca_wal::migration::read_json(&CutStore::new(&self.root).path(cut_id))
@@ -238,9 +244,6 @@ impl Driver {
             .iter()
             .find(|item| item.session_ref == reference)
             .ok_or_else(|| unavailable("imported reply does not cover the activation ref"))?;
-        let session = session.ok_or_else(|| {
-            broca_module::move_files::staging_digest_failure(cut_id, state.step, reference)
-        })?;
         let path = broca_wal::migration::staging_path(
             self.wal.root(),
             cut_id,
@@ -314,117 +317,121 @@ impl Driver {
             }
         }
     }
-    fn local_sessions(
-        &self,
-        cut_id: &str,
-        op: Op,
-    ) -> Result<BTreeMap<String, BindIdentity>, ErrorBody> {
-        let mut sessions = BTreeMap::new();
-        for session in self.index.retained_sessions().map_err(unavailable)? {
-            sessions.insert(
-                contract::session_ref(
-                    &session.harness,
-                    &session.project_root.to_string_lossy(),
-                    &session.session,
-                ),
-                session,
+    fn local_sessions(&self) -> Result<SessionInventory, ErrorBody> {
+        let mut inventory = SessionInventory::default();
+        let (addresses, unreadable) = self.wal.move_addresses().map_err(unavailable)?;
+        for address in &unreadable {
+            tracing::error!(
+                address,
+                "agent-data skipped an unreadable inventory location"
             );
         }
-        for address in self.wal.addresses().map_err(unavailable)? {
-            let records = self
-                .wal
-                .read_address_records_for_move(&address)
-                .map_err(unavailable)?;
+        inventory.unreadable = unreadable;
+        for address in addresses {
+            let records = match self.wal.read_address_records_for_move(&address) {
+                Ok(records) => records,
+                Err(_) => {
+                    tracing::error!(
+                        address,
+                        "agent-data skipped an unreadable WAL during reference discovery"
+                    );
+                    inventory.unreadable.push(address);
+                    continue;
+                }
+            };
             for record in records {
                 if let broca_wal::WalRecord::RunStarted { session, .. } = record.record {
-                    sessions.insert(
-                        contract::session_ref(
-                            &session.harness,
-                            &session.project_root.to_string_lossy(),
-                            &session.session,
-                        ),
-                        session,
-                    );
-                }
-            }
-        }
-        // An abort can arrive before activation, when the only local identity is
-        // in this cut's staged WAL. It must not need a working door to clean up.
-        if !cut_id.is_empty() {
-            let dir = self.root.join("wal-staging").join(cut_id);
-            match std::fs::read_dir(dir) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let path = entry.map_err(unavailable)?.path();
-                        if path.extension().is_none_or(|e| e != "wal") {
-                            continue;
-                        }
-                        let bytes = std::fs::read(&path).map_err(unavailable)?;
-                        let range = match broca_wal::file_wal::read_verified_member_range(
-                            &bytes, 0, 0, None,
-                        ) {
-                            Ok(range) => range,
-                            Err(error) => {
-                                // Activation checks the stored import digest even
-                                // when staging no longer reveals an identity;
-                                // abort can discard its cut-private files directly.
-                                if matches!(op, Op::Abort | Op::Activate) {
-                                    continue;
-                                }
-                                return Err(unavailable(error));
-                            }
-                        };
-                        if let broca_wal::WalRangeRecords::Complete(records) = range.records() {
-                            for record in records {
-                                if let broca_wal::WalRecord::RunStarted { session, .. } =
-                                    &record.record
-                                {
-                                    sessions.insert(
-                                        contract::session_ref(
-                                            &session.harness,
-                                            &session.project_root.to_string_lossy(),
-                                            &session.session,
-                                        ),
-                                        session.clone(),
-                                    );
-                                }
-                            }
-                        }
+                    if broca_core::session_addr(&session) == address {
+                        inventory.sessions.insert(
+                            contract::session_ref(
+                                &session.harness,
+                                &session.project_root.to_string_lossy(),
+                                &session.session,
+                            ),
+                            session,
+                        );
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(unavailable(e)),
             }
         }
-        Ok(sessions)
+        Ok(inventory)
     }
 }
 
 #[async_trait::async_trait]
 impl MoveDriver for Driver {
-    async fn plan(
-        &self,
-        cut_id: &str,
-        refs: &Refs,
-        op: Op,
-    ) -> Result<Vec<PlannedSession>, ErrorBody> {
+    async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
         let receiver = matches!(op, Op::Diverged | Op::Import | Op::Activate);
-        let sessions = if op == Op::Import {
-            BTreeMap::new()
+        let state: Option<broca_module::cut_state::CutState> = if op == Op::Busy {
+            None
         } else {
-            self.local_sessions(
-                if matches!(op, Op::Busy | Op::Diverged) {
-                    ""
-                } else {
-                    cut_id
-                },
-                op,
-            )?
+            let path = CutStore::new(&self.root).path(cut_id);
+            broca_wal::migration::read_json(&path).map_err(|error| {
+                unavailable(format!("cannot read cut {}: {error}", path.display()))
+            })?
         };
-        let retained = self.index.retained_sessions().map_err(unavailable)?;
+        let bound = state.as_ref().is_some_and(|state| {
+            state.refs.is_some()
+                || state.intent.is_some()
+                || state.step != contract::step::Step::None
+        });
+        // Once intent is durable, use only its recorded addresses. Discovering
+        // unrelated sessions must never become a prerequisite for cut recovery.
+        let mut inventory = if bound {
+            SessionInventory {
+                sessions: state.expect("bound cut exists").sessions,
+                unreadable: Vec::new(),
+            }
+        } else if matches!(op, Op::Busy | Op::Diverged | Op::Prepare | Op::Import) {
+            self.local_sessions()?
+        } else {
+            SessionInventory::default()
+        };
+        let retained = if op == Op::Prepare && !bound {
+            self.index.retained_sessions().map_err(unavailable)?
+        } else {
+            Vec::new()
+        };
+        if inventory.unreadable.is_empty() {
+            for session in &retained {
+                inventory
+                    .sessions
+                    .entry(contract::session_ref(
+                        &session.harness,
+                        &session.project_root.to_string_lossy(),
+                        &session.session,
+                    ))
+                    .or_insert_with(|| session.clone());
+            }
+        }
+        let sessions = inventory.sessions;
+        let unreadable = inventory.unreadable;
+        let mut unknown_refs = BTreeSet::new();
         let mut plans = Vec::new();
         for reference in refs.iter() {
             let session = sessions.get(&reference.r#ref);
+            if reference.ref_kind == contract::BROCA_SESSION_REF_KIND
+                && session.is_none()
+                && (bound || !unreadable.is_empty())
+            {
+                if matches!(op, Op::Diverged | Op::Busy) {
+                    unknown_refs.insert(reference.r#ref.clone());
+                    continue;
+                }
+                let cause = if bound {
+                    format!(
+                        "cut {cut_id} has no recorded address for ref {}",
+                        reference.r#ref
+                    )
+                } else {
+                    format!(
+                        "cannot resolve ref {} while WAL addresses are unreadable: {}",
+                        reference.r#ref,
+                        unreadable.join(", ")
+                    )
+                };
+                return Err(unavailable(cause));
+            }
             if reference.ref_kind != contract::BROCA_SESSION_REF_KIND
                 || (!receiver && session.is_none())
             {
@@ -445,8 +452,14 @@ impl MoveDriver for Driver {
                 let Some(session) = session else {
                     continue;
                 };
-                let Some(bytes) = self.wal.bytes_for_move(session).map_err(unavailable)? else {
-                    continue;
+                let bytes = match self.wal.bytes_for_move(session) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        tracing::error!(session_ref=%reference.r#ref,address=%broca_core::session_addr(session),"agent-data cannot inspect the requested local copy");
+                        unknown_refs.insert(reference.r#ref.clone());
+                        continue;
+                    }
                 };
                 Some(bytes)
             } else {
@@ -469,30 +482,43 @@ impl MoveDriver for Driver {
             let mut sealed = receiver;
             let bytes = if op == Op::Diverged {
                 let local = local_probe.expect("held divergence ref has local bytes");
-                if broca_module::move_files::retained_move_copy(
+                match broca_module::move_files::retained_move_copy(
                     self.wal.as_ref(),
                     session.expect("held ref resolved"),
-                )? {
-                    sealed = false;
-                    local
-                } else {
-                    match self.incoming(&reference.r#ref, cut_id).await {
-                        Ok(bytes) => bytes,
-                        Err(error) => match error.verification_cause {
-                            Some(cause) => {
-                                // Divergence entries carry only a state, not a
-                                // per-ref message. Keep the cause in ERROR logs
-                                // without adding fields or logging WAL content.
-                                tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
-                                sealed = false;
-                                local
-                            }
-                            None => return Err(error.refusal),
-                        },
+                ) {
+                    Ok(true) => {
+                        sealed = false;
+                        local
+                    }
+                    Err(_) => {
+                        unknown_refs.insert(reference.r#ref.clone());
+                        continue;
+                    }
+                    Ok(false) => {
+                        match self.incoming(&reference.r#ref, cut_id).await {
+                            Ok(bytes) => bytes,
+                            Err(error) => match error.verification_cause {
+                                Some(cause) => {
+                                    // Divergence entries carry only a state, not a
+                                    // per-ref message. Keep the cause in ERROR logs
+                                    // without adding fields or logging WAL content.
+                                    tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
+                                    sealed = false;
+                                    local
+                                }
+                                None => return Err(error.refusal),
+                            },
+                        }
                     }
                 }
             } else if op == Op::Activate {
-                self.activation_bytes(&reference.r#ref, cut_id, session)?
+                self.activation_bytes(
+                    &reference.r#ref,
+                    cut_id,
+                    session.expect("recorded activation address checked"),
+                )?
+            } else if op == Op::Abort {
+                Vec::new()
             } else if receiver {
                 self.incoming(&reference.r#ref, cut_id)
                     .await
@@ -501,19 +527,6 @@ impl MoveDriver for Driver {
                 let session = session.expect("source ref resolved");
                 match self.wal.bytes_for_move(session).map_err(unavailable)? {
                     Some(bytes) => bytes,
-                    None if op == Op::Abort => {
-                        let path = broca_wal::migration::staging_path(
-                            self.wal.root(),
-                            cut_id,
-                            &broca_core::session_addr(session),
-                        )
-                        .map_err(unavailable)?;
-                        match std::fs::read(path) {
-                            Ok(bytes) => bytes,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                            Err(e) => return Err(unavailable(e)),
-                        }
-                    }
                     None => {
                         return Err(refusal(
                             "unknown_ref",
@@ -539,7 +552,9 @@ impl MoveDriver for Driver {
             } else {
                 session.expect("local ref resolved").clone()
             };
-            let local_archive = if self
+            let local_archive = if op == Op::Abort {
+                None
+            } else if self
                 .wal
                 .resolve_live_path(&session)
                 .map_err(unavailable)?
@@ -561,7 +576,10 @@ impl MoveDriver for Driver {
                 local_archive,
             });
         }
-        Ok(plans)
+        Ok(MovePlans {
+            sessions: plans,
+            unknown_refs,
+        })
     }
     async fn cover(&self, reference: &str) -> Result<u64, ErrorBody> {
         self.door.cover(reference).await.map_err(unavailable)
