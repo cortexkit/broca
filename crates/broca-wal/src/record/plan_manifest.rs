@@ -87,9 +87,9 @@ pub enum FetchOutcome {
         /// Absent keeps manifests from providers without deadlines byte-compatible.
         reply: Option<BTreeMap<String, FrozenReply>>,
     },
-    /// An optional system-text-only item whose provider did not answer, so the session was
+    /// An optional tool or system-text provider that gave no usable answer, so the session was
     /// admitted without it. Written as `"absent": "<reason>"`. The reason is an open string
-    /// (for example `timeout`, `unknown_module` or `refused:<code>`) that a reader keeps and
+    /// (for example `timeout`, `unknown_module`, `plan_stale` or `refused:<code>`) that a reader keeps and
     /// never interprets.
     Absent {
         /// Why the provider did not answer.
@@ -101,8 +101,7 @@ pub enum FetchOutcome {
     Unknown,
 }
 
-/// One provider's fetch at admission. A provider is fetched once however many of the plan's
-/// items name it.
+/// One provider's final fetch outcome at admission, combining its tool and system-text items.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderFetch {
     /// The provider module that was fetched.

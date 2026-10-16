@@ -1,4 +1,4 @@
-//! Admission: fetch every provider a checked plan names, once and in parallel under one
+//! Admission: fetch every provider a checked plan names in parallel under one
 //! deadline, check what came back against the plan, and build the manifest the session's
 //! `RunStarted` freezes.
 //!
@@ -189,6 +189,9 @@ enum DeclarationOutcome {
 /// How long admission waits, in all, for every provider's answer.
 pub const ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Optional tools must leave time within admission for text to be recomposed without them.
+pub const OPTIONAL_TOOL_BUDGET: Duration = Duration::from_secs(5);
+
 /// The joining rule this build uses to make a session's system text from its fetched texts:
 /// the texts in plan order, each non-empty one separated from the next by [`JOIN_SEPARATOR`].
 /// It is recorded with every session so a later build that joins differently never changes the
@@ -207,8 +210,10 @@ pub const DECLARE_OP: &str = cortexkit_role_step_transform_provider::ops::TRANSF
 /// `compaction-provider/v1`.
 pub const DESCRIBE_OP: &str = cortexkit_role_compaction_provider::ops::ROLE_DESCRIBE;
 
-/// The kind of every absent item: only a system-text item may be optional.
+/// The kind of an absent system-text item.
 pub const ABSENT_KIND_SYSTEM_TEXT: &str = "system_text";
+/// The kind of an absent tool item.
+pub const ABSENT_KIND_TOOL: &str = "tool";
 
 /// The provider code recorded when a provider's answer cannot be decoded.
 pub const INVALID_ANSWER: &str = "invalid_answer";
@@ -629,9 +634,12 @@ struct CatalogFetch<'a> {
 }
 
 impl CatalogFetch<'_> {
-    /// Only a provider whose one item is an optional system-text item may go unanswered.
+    /// An optional tool's absence also removes any text from that provider.
     fn optional(&self) -> bool {
-        self.tool_item.is_none() && self.text_item.is_some_and(|item| item.optional)
+        self.tool_item.map_or_else(
+            || self.text_item.is_some_and(|item| item.optional),
+            |item| item.optional,
+        )
     }
 }
 
@@ -702,7 +710,8 @@ pub async fn admit(
     session: &broca_protocol::BindIdentity,
     deadline: Duration,
 ) -> Result<Admitted, Refusal> {
-    let deadline = Instant::now() + deadline;
+    let started = Instant::now();
+    let deadline = started + deadline;
     let mut catalog_fetches: Vec<CatalogFetch<'_>> = Vec::new();
     for item in plan.tool_items.iter().chain(&plan.system_text_items) {
         if catalog_fetches.iter().all(|f| f.provider != item.provider) {
@@ -718,11 +727,15 @@ pub async fn admit(
     }
     let catalogs = futures::future::join_all(catalog_fetches.iter().map(|fetch| {
         let request = catalog_request(plan, fetch.tool_item, fetch.text_item);
+        let fetch_deadline = if fetch.tool_item.is_some_and(|item| item.optional) {
+            deadline.min(started + OPTIONAL_TOOL_BUDGET)
+        } else {
+            deadline
+        };
         async move {
-            within_deadline(deadline, || fetcher.catalog(fetch.provider, &request))
+            within_deadline(fetch_deadline, || fetcher.catalog(fetch.provider, &request))
                 .await
                 .map_err(FetchMiss::from_error)
-                .and_then(|answer| decode_answer(answer, fetch.text_item.is_some()))
         }
     }));
     let declarations = futures::future::join_all(plan.step_items.iter().map(|step| {
@@ -774,9 +787,145 @@ pub async fn admit(
         )
     };
     let (catalogs, declarations, compaction) = futures::join!(catalogs, declarations, compaction);
+    let mut raw_answers = BTreeMap::new();
+    let mut outcomes: BTreeMap<&str, Result<Fetched, FetchMiss>> = BTreeMap::new();
+    let mut absent_tools = BTreeSet::new();
+    for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
+        let mut decoded = match outcome {
+            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some()),
+            Err(_) => continue,
+        };
+        if let Ok(answer) = outcome {
+            raw_answers.insert(fetch.provider, answer.clone());
+        }
+        if fetch.tool_item.is_some_and(|item| item.optional)
+            && decoded
+                .as_ref()
+                .is_ok_and(|fetched| !differences_of(plan, fetch.provider, fetched).is_empty())
+        {
+            decoded = Err(FetchMiss {
+                unanswered: Unanswered::PlanStale,
+                retryable: None,
+                detail: None,
+            });
+        }
+        outcomes.insert(fetch.provider, decoded);
+    }
+    for (fetch, outcome) in catalog_fetches.iter().zip(catalogs) {
+        if let Err(missed) = outcome {
+            outcomes.insert(fetch.provider, Err(missed));
+        }
+        if fetch.tool_item.is_some_and(|item| item.optional) && outcomes[fetch.provider].is_err() {
+            absent_tools.insert(fetch.provider);
+        }
+    }
+
+    // Keep the planned round unchanged on healthy launches. Only an absent optional tool
+    // changes the composition and requires discarding every first-round text.
+    let mut admitted_plan = plan.clone();
+    let mut differences = Vec::new();
+    while !absent_tools.is_empty() {
+        let absent_count = absent_tools.len();
+        admitted_plan = plan.clone();
+        differences.clear();
+        for fetch in &catalog_fetches {
+            if absent_tools.contains(fetch.provider) || fetch.tool_item.is_none() {
+                continue;
+            }
+            if let Some(answer) = raw_answers.get(fetch.provider) {
+                // Ignore first-round text validation after the tool set changes. Required
+                // tool catalogs still have to match the original planned tool set.
+                let tools = decode_answer(answer.clone(), false);
+                if let Ok(fetched) = &tools {
+                    differences.extend(differences_of(plan, fetch.provider, fetched));
+                }
+                outcomes.insert(fetch.provider, tools);
+            }
+        }
+        admitted_plan.composition["providers"]
+            .as_array_mut()
+            .expect("checked composition providers")
+            .retain(|entry| {
+                !absent_tools.contains(entry["provider"].as_str().expect("checked provider"))
+            });
+        admitted_plan.composition_digest =
+            cortexkit_role_tool_provider::catalog::composition_digest(&Value::Object(
+                admitted_plan.composition.clone(),
+            ))
+            .expect("a filtered checked composition is JSON");
+        for provider in &absent_tools {
+            admitted_plan.composed.remove(*provider);
+        }
+        let texts = futures::future::join_all(catalog_fetches.iter().filter_map(|fetch| {
+            let text_item = fetch.text_item?;
+            if absent_tools.contains(fetch.provider) {
+                return None;
+            }
+            let request = catalog_request(&admitted_plan, None, Some(text_item));
+            Some(async move {
+                let outcome =
+                    within_deadline(deadline, || fetcher.catalog(fetch.provider, &request))
+                        .await
+                        .map_err(FetchMiss::from_error)
+                        .and_then(|answer| decode_answer(answer, true));
+                (fetch.provider, outcome)
+            })
+        }))
+        .await;
+        // Text-only catalog requests must answer no tools, even when this provider also
+        // supplied tools in the first round. Validate them against the admitted digest.
+        let mut text_plan = admitted_plan.clone();
+        text_plan.composed.values_mut().for_each(Vec::clear);
+        for (provider, text) in texts {
+            let optional_tool = plan
+                .tool_items
+                .iter()
+                .any(|item| item.provider == provider && item.optional);
+            match text {
+                Ok(text) => {
+                    let stale = differences_of(&text_plan, provider, &text);
+                    if !stale.is_empty() {
+                        if optional_tool {
+                            absent_tools.insert(provider);
+                            outcomes.insert(
+                                provider,
+                                Err(FetchMiss {
+                                    unanswered: Unanswered::PlanStale,
+                                    retryable: None,
+                                    detail: None,
+                                }),
+                            );
+                        } else {
+                            differences.extend(stale);
+                        }
+                        continue;
+                    }
+                    // A text-only provider's entire first answer is superseded. For a
+                    // mixed provider, a text answer cannot repair a failed tool catalog.
+                    if !plan.tool_items.iter().any(|item| item.provider == provider) {
+                        outcomes.insert(provider, Ok(text));
+                    } else if let Some(Ok(fetched)) = outcomes.get_mut(provider) {
+                        fetched.text = text.text;
+                    }
+                }
+                Err(missed) => {
+                    if optional_tool {
+                        absent_tools.insert(provider);
+                    }
+                    outcomes.insert(provider, Err(missed));
+                }
+            }
+        }
+        if absent_tools.len() == absent_count {
+            break;
+        }
+        // A remaining optional tool provider can fail during its text fetch too. Remove it
+        // and recompose surviving text again; each retry removes at least one provider.
+    }
 
     // Log only terminal outcomes, after retries have either answered or exhausted the deadline.
-    for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
+    for fetch in &catalog_fetches {
+        let outcome = &outcomes[fetch.provider];
         if let Err(missed) = outcome {
             missed.warn(session, fetch.provider, CATALOG_OP);
         }
@@ -816,16 +965,14 @@ pub async fn admit(
 
     // A required item that did not answer refuses admission; an optional one is absent.
     let mut failures: BTreeMap<&str, Unanswered> = BTreeMap::new();
-    let mut outcomes: BTreeMap<&str, Result<Fetched, FetchMiss>> = BTreeMap::new();
-    for (fetch, outcome) in catalog_fetches.iter().zip(catalogs) {
-        if let Err(missed) = &outcome {
+    for fetch in &catalog_fetches {
+        if let Err(missed) = &outcomes[fetch.provider] {
             if !fetch.optional() {
                 failures
                     .entry(fetch.provider)
                     .or_insert_with(|| missed.unanswered.clone());
             }
         }
-        outcomes.insert(fetch.provider, outcome);
     }
     for (step, outcome) in plan.step_items.iter().zip(&declarations) {
         if let DeclarationOutcome::Unanswered(missed) = outcome {
@@ -846,10 +993,11 @@ pub async fn admit(
         });
     }
 
-    let mut differences = Vec::new();
-    for (provider, outcome) in &outcomes {
-        if let Ok(fetched) = outcome {
-            differences.extend(differences_of(plan, provider, fetched));
+    if absent_tools.is_empty() {
+        for (provider, outcome) in &outcomes {
+            if let Ok(fetched) = outcome {
+                differences.extend(differences_of(plan, provider, fetched));
+            }
         }
     }
     // Validate declarations against the same reduction owner that the plan freezes.
@@ -1010,7 +1158,7 @@ pub async fn admit(
             plan: OpaqueJson::from_json_text(plan.text.clone())
                 .expect("a plan serialized from a JSON value is JSON"),
             plan_identity: plan.identity.clone(),
-            composition_digest: plan.composition_digest.clone(),
+            composition_digest: admitted_plan.composition_digest.clone(),
             fetches,
             tools: Arc::new(tools),
             system_digest: sha256_hex(system_text.as_bytes()),
@@ -1028,7 +1176,7 @@ pub struct BaselineFacts {
     /// One per answered provider, its item digest being the provider's catalog digest, which
     /// covers its system text too.
     pub items: Vec<BaselineItem>,
-    /// One per optional system-text item left absent.
+    /// One per absent tool or system-text item, including a removed tool provider's text.
     pub absent_items: Vec<AbsentItem>,
     pub composition_digest: String,
     pub tool_names: Vec<String>,
@@ -1038,6 +1186,7 @@ pub struct BaselineFacts {
 pub fn baseline_facts(manifest: &PlanManifest) -> BaselineFacts {
     let mut items = Vec::new();
     let mut absent_items = Vec::new();
+    let plan: Value = serde_json::from_str(manifest.plan.as_json_text()).expect("frozen JSON plan");
     for fetch in &manifest.fetches {
         match &fetch.outcome {
             FetchOutcome::Answered { catalog_digest, .. } => {
@@ -1051,12 +1200,21 @@ pub fn baseline_facts(manifest: &PlanManifest) -> BaselineFacts {
                     ),
                     crate::refusal::AbsenceReason::Other(reason) => (reason, None),
                 };
-                absent_items.push(AbsentItem {
-                    provider: fetch.provider.clone(),
-                    kind: ABSENT_KIND_SYSTEM_TEXT.to_owned(),
-                    reason,
-                    provider_code,
-                });
+                for (list, kind) in [
+                    ("tool_items", ABSENT_KIND_TOOL),
+                    ("system_text_items", ABSENT_KIND_SYSTEM_TEXT),
+                ] {
+                    if plan[list].as_array().is_some_and(|items| {
+                        items.iter().any(|item| item["provider"] == fetch.provider)
+                    }) {
+                        absent_items.push(AbsentItem {
+                            provider: fetch.provider.clone(),
+                            kind: kind.to_owned(),
+                            reason: reason.clone(),
+                            provider_code: provider_code.clone(),
+                        });
+                    }
+                }
             }
             FetchOutcome::Unknown => {}
         }

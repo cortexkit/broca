@@ -225,8 +225,8 @@ plans: dict[str, tuple[str, dict]] = {}
 
 # A Broca head: core persona text first plus core's forwarding tools with
 # web_search excluded, AFT tools and text, Magic Context tools and text.
-# Broca has no compaction support, so it gets neither a compaction item nor
-# Magic Context's reduction hooks.
+# Broca accepts compaction_item, but does not yet accept composition.compaction,
+# so these plans omit the item and Magic Context's reduction hooks.
 compositions["broca-head"] = composition(
     {
         "aft": ["read", "edit", "bash", "bash_status"],
@@ -449,6 +449,37 @@ two_phase["step_transform_items"][0]["subscriptions"].insert(
 compositions["pre-tool-two-phase"] = composition({"magic-context": [], "prefrontal-core": []})
 plans["pre-tool-two-phase"] = ("pre-tool-two-phase", two_phase)
 
+# Direct search is nonessential. A failed search catalog drops its provider,
+# while repository tools and core role text remain required.
+for name, with_text in [
+    ("broca-worker-optional-tool", False),
+    ("broca-worker-optional-tool-with-text", True),
+]:
+    value = copy.deepcopy(plans["broca-worker"][1])
+    value["tool_items"].append(item("plexus", "worker", optional=True))
+    if with_text:
+        value["system_text_items"].append(item("plexus", "worker"))
+    comp = copy.deepcopy(compositions["broca-worker"])
+    comp["providers"].append(composition({"plexus": ["web_search"]})["providers"][0])
+    comp["providers"].sort(key=lambda entry: entry["provider"])
+    compositions[name] = comp
+    plans[name] = (name, value)
+
+# A synthetic hook-capable runner proves subtraction preserves frozen steps
+# and opaque extensions, not just the surviving provider/tool names.
+value = copy.deepcopy(plans["pre-tool-two-phase"][1])
+value["tool_items"] = [item("aft", "worker", AFT_WORKER_PARAMS),
+                       item("plexus", "worker", optional=True)]
+value["system_text_items"].extend([item("aft", "worker"),
+                                     item("plexus", "worker", optional=True)])
+comp = composition({"aft": ["read", "edit", "bash"], "magic-context": [],
+                    "plexus": ["web_search"], "prefrontal-core": []})
+comp["extension"] = {"ordered": ["z", "a"], "unknown": {"keep": True}}
+comp["providers"][0]["extension"] = {"keep": [3, 1, 2]}
+comp["providers"][0]["tools"][0]["extension"] = "keep tool member"
+compositions["optional-tool-two-phase"] = comp
+plans["optional-tool-two-phase"] = ("optional-tool-two-phase", value)
+
 # Include on_unavailable and budget_ms in the composition hash, not only
 # the plan identity. Core always serializes the step-transform list, as `[]`
 # when the session has none, in the composition as in the plan.
@@ -461,6 +492,26 @@ for comp_name, value in plans.values():
     compositions[comp_name]["step_transform_items"] = copy.deepcopy(value["step_transform_items"])
     value["composition"] = compositions[comp_name]
     value["composition_digest"] = sha256_hex(jcs(value["composition"]))
+
+admitted_compositions = {}
+for name in ["broca-worker-optional-tool", "broca-worker-optional-tool-with-text",
+             "optional-tool-two-phase"]:
+    admitted = copy.deepcopy(compositions[name])
+    admitted["providers"] = [entry for entry in admitted["providers"]
+                              if entry["provider"] != "plexus"]
+    admitted_compositions[name] = admitted
+    compositions[name + "-admitted"] = admitted
+
+# This Broca worker has neither compaction nor hook transforms. If its optional
+# Plexus tool catalog is unavailable, admission drops Plexus and fetches AFT's
+# system text using the reduced composition. A case-specific composition triple
+# pins those bytes for this second request without changing the synthetic case.
+admitted_compositions["broca-worker-optional-tool-two-phase"] = copy.deepcopy(
+    admitted_compositions["broca-worker-optional-tool-with-text"]
+)
+compositions["broca-worker-optional-tool-two-phase-admitted"] = admitted_compositions[
+    "broca-worker-optional-tool-two-phase"
+]
 
 # --------------------------------------------------------------------------
 # write compositions and plans
@@ -737,13 +788,91 @@ outcomes = {
 }
 def refusal(code, detail, **extra):
     return {"admitted": False, "code": code, "detail": detail,
-            "writes": "nothing", **extra}
+             "writes": "nothing", **extra}
+
+
+for reason in ["refused", "timeout", "unknown_module", "plan_stale"]:
+    name = "broca-worker-optional-tool"
+    fetch = {"provider": "plexus", "phase": "tools", "budget_ms": 5000}
+    absent = {"provider": "plexus", "kind": "tool", "reason": reason}
+    if reason == "plan_stale":
+        fetch.update(catalog_reply("plexus", plans[name][1]["composition_digest"], []))
+        fetch["differences"] = [{"kind": "tools", "provider": "plexus",
+                                 "missing": ["web_search"], "unexpected": []}]
+    else:
+        fetch["reason"] = reason
+    if reason == "refused":
+        fetch["provider_code"] = absent["provider_code"] = "catalog_refused"
+    admitted = admitted_compositions[name]
+    outcomes[f"admit-optional-tool-{reason.replace('_', '-')}"] = {
+        **plan_ref(name), "fetches": [fetch],
+        "admitted_composition": f"compositions/{name}-admitted.json",
+        "expected": {"admitted": True, "baseline": {"absent_items": [absent],
+                     "composition_digest": sha256_hex(jcs(admitted))}},
+    }
+
+for case, name, admitted_name in [
+    ("admit-optional-tool-with-text-item", "broca-worker-optional-tool-with-text",
+     "broca-worker-optional-tool-with-text"),
+    ("admit-optional-tool-two-phase", "optional-tool-two-phase",
+     "optional-tool-two-phase"),
+    ("admit-optional-tool-two-phase-broca", "broca-worker-optional-tool-with-text",
+     "broca-worker-optional-tool-two-phase"),
+]:
+    admitted = admitted_compositions[admitted_name]
+    outcomes[case] = {
+        **plan_ref(name),
+        "admitted_composition": f"compositions/{admitted_name}-admitted.json",
+        "fetches": [{"provider": "plexus", "phase": "tools", "budget_ms": 5000,
+                     "reason": "refused", "provider_code": "catalog_refused"}],
+        "expected": {"admitted": True, "baseline": {
+                     "absent_items": [{"provider": "plexus", "kind": kind,
+                                       "reason": "refused", "provider_code": "catalog_refused"}
+                                      for kind in ["tool", "system_text"]],
+                     "composition_digest": sha256_hex(jcs(admitted))}},
+    }
+
+phase_two_request = {"params": {}, "system_text": {"preset": "worker", "params": {}},
+                     "composition": admitted_compositions["optional-tool-two-phase"]}
+write_triple("catalog-requests", "optional-tool-two-phase-text", phase_two_request)
+outcomes["admit-optional-tool-two-phase"]["runner_declaration"] = {"hooks": True, "compaction": True}
+outcomes["admit-optional-tool-two-phase"]["fetches"].append({
+    "provider": "aft", "phase": "text", "request": phase_two_request,
+    "request_file": "catalog-requests/optional-tool-two-phase-text.json",
+    "answer": {"composition_digest": sha256_hex(jcs(phase_two_request["composition"])),
+               "tool_names": [], "system_text": {
+                   "composition_digest": sha256_hex(jcs(phase_two_request["composition"])),
+                }},
+})
+
+phase_two_broca_request = {
+    "params": {},
+    "system_text": {"preset": "worker", "params": {}},
+    "composition": admitted_compositions["broca-worker-optional-tool-two-phase"],
+}
+write_triple(
+    "catalog-requests", "optional-tool-two-phase-broca-text", phase_two_broca_request
+)
+outcomes["admit-optional-tool-two-phase-broca"]["fetches"].append({
+    "provider": "aft",
+    "phase": "text",
+    "request": phase_two_broca_request,
+    "request_file": "catalog-requests/optional-tool-two-phase-broca-text.json",
+    "answer": {
+        "composition_digest": sha256_hex(jcs(phase_two_broca_request["composition"])),
+        "tool_names": [],
+        "system_text": {
+            "composition_digest": sha256_hex(jcs(phase_two_broca_request["composition"])),
+        },
+    },
+})
 
 
 # Invalid plans keep the valid composition reference so the defect is isolated.
 for name, field, change in [
     ("duplicate-provider", "plan.tool_items", "duplicate"),
-    ("optional-non-text", "plan.tool_items[0].optional", "non-text"),
+    ("optional-non-text", "plan.compaction_item.optional", "non-text"),
+    ("optional-false-tool", "plan.tool_items[0].optional", "false-tool"),
     ("optional-false", "plan.system_text_items[1].optional", "false"),
     ("non-canonical-composition", "plan.composition", "order"),
 ]:
@@ -751,14 +880,18 @@ for name, field, change in [
     if change == "duplicate":
         invalid["tool_items"].append(copy.deepcopy(invalid["tool_items"][0]))
     elif change == "non-text":
-        invalid["tool_items"][0]["optional"] = True
+        invalid = copy.deepcopy(plans["pre-tool-declared"][1])
+        invalid["compaction_item"]["optional"] = True
+    elif change == "false-tool":
+        invalid["tool_items"][0]["optional"] = False
     elif change == "false":
         invalid["system_text_items"][1]["optional"] = False
     else:
         invalid["composition"]["providers"].reverse()
         invalid["composition_digest"] = sha256_hex(jcs(invalid["composition"]))
     outcomes[f"refuse-{name}"] = {
-        "plan_inline": invalid, "composition": "compositions/broca-head.json",
+        "plan_inline": invalid, "composition": ("compositions/pre-tool-declared.json"
+            if change == "non-text" else "compositions/broca-head.json"),
         "expected": refusal("invalid_params", {"field": field}),
     }
 
@@ -978,6 +1111,8 @@ for name, value in outcomes.items():
             "hooks": has_hooks,
             "compaction": has_compaction,
         }
+    if name.startswith("admit-optional-tool-"):
+        value["runner_declaration"]["capabilities"] = ["fetch-plan-optional-tools/v1"]
     write_text(HERE / "admission" / f"{name}.json", pretty(value))
 
 print(f"{'computed' if CHECK else 'wrote'} {len(compositions)} compositions, {len(plans)} plans, "
@@ -996,6 +1131,13 @@ for name, (_, value) in plans.items():
     digest = value["composition_digest"]
     table.append(f"| `{name}` | `{identity}` | `{digest}` |")
     print(f"{name}: plan={identity} composition={digest}")
+table.extend(["", "Admitted compositions remove whole provider entries only. The two-phase text",
+              "requests are also pinned as JSON, JCS and SHA-256.", "",
+              "| Admitted composition / request | SHA-256 |", "|---|---|"])
+for name, value in admitted_compositions.items():
+    table.append(f"| `compositions/{name}-admitted` | `{sha256_hex(jcs(value))}` |")
+table.append(f"| `catalog-requests/optional-tool-two-phase-text` | `{sha256_hex(jcs(phase_two_request))}` |")
+table.append(f"| `catalog-requests/optional-tool-two-phase-broca-text` | `{sha256_hex(jcs(phase_two_broca_request))}` |")
 readme = HERE / "README.md"
 prefix = readme.read_text(encoding="utf-8").split(DIGEST_HEADING)[0].rstrip()
 write_text(readme, prefix + "\n\n" + "\n".join(table) + "\n")

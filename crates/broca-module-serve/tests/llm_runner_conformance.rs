@@ -66,6 +66,8 @@ fn require_compaction_test_clock() {
 mod attribution;
 #[path = "llm_runner_conformance/evidence.rs"]
 mod evidence;
+#[path = "llm_runner_conformance/optional_tools.rs"]
+mod optional_tools;
 /// Retention deletion scenarios on the same real-daemon rig. They move the daemon's clock
 /// through its `test-clock` control file, which only a `test-clock` build reads.
 #[cfg(feature = "test-clock")]
