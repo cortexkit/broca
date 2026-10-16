@@ -492,6 +492,53 @@ fn only_cfg_test_module_files_are_excluded_from_source_scans() {
     std::fs::remove_dir_all(&scratch).unwrap();
 }
 
+// Directory enumeration may resolve `..` while the manifest-derived root still contains it.
+// Normalize separators lexically so the same allowances also work with Windows paths.
+fn repo_relative_path(root: &Path, path: &Path) -> String {
+    let normalize = |path: &Path| {
+        let path = path.to_string_lossy().replace('\\', "/");
+        let mut parts = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop().expect("source path must not escape its root");
+                }
+                _ => parts.push(part),
+            }
+        }
+        parts.join("/")
+    };
+    let root = format!("{}/", normalize(root));
+    normalize(path)
+        .strip_prefix(&root)
+        .expect("source path must be inside the repository")
+        .to_owned()
+}
+
+#[test]
+fn deferred_writer_paths_are_normalized_relative_to_repo() {
+    for (root, path) in [
+        (
+            r"D:\a\broca\broca\broca\crates\broca-wal\../..",
+            r"D:\a\broca\broca\broca\crates\broca-core\src\consent.rs",
+        ),
+        (
+            r"D:\a\broca\broca\broca",
+            r"D:\a\broca\broca\broca\crates\broca-wal\..\..\crates\broca-core\src\consent.rs",
+        ),
+        (
+            "/work/broca/crates/broca-wal/../..",
+            "/work/broca/crates/broca-core/./src/consent.rs",
+        ),
+    ] {
+        assert_eq!(
+            repo_relative_path(Path::new(root), Path::new(path)),
+            "crates/broca-core/src/consent.rs"
+        );
+    }
+}
+
 #[test]
 fn no_production_path_writes_deferred_call_records() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -503,7 +550,6 @@ fn no_production_path_writes_deferred_call_records() {
         }
     }
     assert!(paths.len() > 100, "scan must reach real production sources");
-    let conformance = root.join("crates/broca-store/src/conformance");
     // This fixture library is reachable only from cfg(test) or the explicit test-conformance
     // feature, never from a shipped reader. Verify that boundary before omitting its helpers.
     let store_lib = std::fs::read_to_string(root.join("crates/broca-store/src/lib.rs")).unwrap();
@@ -511,28 +557,31 @@ fn no_production_path_writes_deferred_call_records() {
         .contains("#[cfg(any(test, feature = \"test-conformance\"))]\npub mod conformance;"));
     // Core's run loop writes the deferred-call records. Other production files may
     // construct only the specific helper records admitted below.
-    let writer = root.join("crates/broca-core/src/run.rs");
+    let writer = "crates/broca-core/src/run.rs";
     // Consent's authorization helper builds the approval ID records the run loop writes.
-    let consent = root.join("crates/broca-core/src/consent.rs");
+    let consent = "crates/broca-core/src/consent.rs";
     // The session actor's restart seal decides how core closes an open Deferred call that still
     // owes a withdrawal: it returns `DeferredCloseKind::WithdrawElicitation(..)` to core, and
     // core writes the record through the session's single writer. Choosing that close kind is
     // the only deferred-call construction the actor may make.
-    let actor = root.join("crates/broca-module/src/actor.rs");
+    let actor = "crates/broca-module/src/actor.rs";
     let writes: Vec<_> = paths
         .iter()
-        .filter(|path| !path.starts_with(&conformance) && !is_cfg_test_module_file(path))
-        .filter(|path| **path != writer)
-        .filter_map(|path| {
+        .filter(|path| !is_cfg_test_module_file(path))
+        .map(|path| (path, repo_relative_path(&root, path)))
+        .filter(|(_, relative)| {
+            !relative.starts_with("crates/broca-store/src/conformance/") && relative != writer
+        })
+        .filter_map(|(path, relative)| {
             let source = std::fs::read_to_string(path).unwrap();
             let mut found = scan_constructors(&source, DEFERRED_VARIANTS, true);
-            if *path == consent {
+            if relative == consent {
                 found.retain(|variant| variant != "AwaitingApproval");
             }
-            if *path == actor {
+            if relative == actor {
                 found.retain(|variant| *variant != "WithdrawElicitation");
             }
-            (!found.is_empty()).then(|| format!("{}: {found:?}", path.display()))
+            (!found.is_empty()).then(|| format!("{relative}: {found:?}"))
         })
         .collect();
     assert!(
