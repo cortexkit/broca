@@ -24,6 +24,8 @@
 //!   and `google/antigravity-claude-sonnet-4-6-thinking` are the other alias rows fusiform serves
 //!   at that commit (`data/model-aliases.json`), built the same way from its embedded models.dev
 //!   seed rows for `google/gemini-3.6-flash` and `anthropic/claude-sonnet-4-6`.
+//! - The Argon row projects antigravity-auth's grouped registry definition into catalog facts:
+//!   low/medium/high effort, a 1,048,576 context window and a 65,536 output limit.
 #[cfg(not(feature = "live"))]
 #[test]
 fn this_suite_needs_its_feature_enabled() {
@@ -384,19 +386,16 @@ mod gated {
         );
     }
 
-    /// Code Assist (Antigravity) ids with NO catalog row are exempt from refusal: a variant sent
-    /// to one is admitted, NOT applied (the request is byte-identical to the same send without
-    /// one), and warned once per model and variant. These are ids fusiform does not alias
-    /// (model-aliases.json at fusiform cf99add), so the catalog cannot say which levels they
-    /// accept. Every other family still refuses.
+    /// Without a catalog row the resolver cannot know a model's variants, even if the renderer
+    /// knows some tiers. Sending no variant is still allowed through the explicit family route.
     #[test]
-    fn code_assist_variant_on_an_id_with_no_catalog_row_is_admitted_unapplied_and_warned_once() {
+    fn code_assist_variant_without_a_catalog_row_is_refused_but_no_variant_is_admitted() {
         for (model, variant) in [
             ("google/antigravity-gemini-3.5-flash", "high"),
             ("google/antigravity-gemini-3.1-pro", "low"),
             ("google/antigravity-gpt-oss-120b-medium", "high"),
             ("google/antigravity-claude-opus-4-6-thinking", "max"),
-            // Without a row even an invented name cannot be judged, so it is tolerated too.
+            ("google/antigravity-gemini-4-argon-high", "low"),
             ("google/antigravity-gemini-3.5-flash", "invented-level"),
         ] {
             install();
@@ -407,15 +406,25 @@ mod gated {
                 "{model} must have no catalog row for this case"
             );
             let plain = resolved(model, AuthMethod::Antigravity, None);
-            let with = resolved(model, AuthMethod::Antigravity, Some(variant));
-            assert!(with.variant.is_none(), "{model}: nothing frozen");
-            assert_eq!(with, plain, "{model}: frozen config unchanged");
-            assert_eq!(body(&with), body(&plain), "{model}: identical request");
-            // Admission already reported this pair, so reporting it again logs nothing.
-            let _ = resolved(model, AuthMethod::Antigravity, Some(variant));
-            assert!(
-                !broca_provider::variant::note_variant_not_applied(model, variant, "test"),
-                "{model} {variant}: the not-applied warning was logged by admission, once"
+            assert!(plain.variant.is_none());
+            assert_eq!(body(&plain)["model"], json!(plain.wire_model_id));
+            let error =
+                resolve_with_typed(model, AuthMethod::Antigravity, Some(variant), None, None)
+                    .unwrap_err();
+            let broca_core::RunError::VariantUnsupported(refusal) =
+                broca_core::RunError::from(error)
+            else {
+                panic!("missing catalog row must be variant_unsupported");
+            };
+            assert_eq!(refusal.model, model);
+            assert_eq!(refusal.variant, variant);
+            assert!(refusal.defined.is_empty());
+            assert_eq!(
+                refusal.reason,
+                format!(
+                    "model '{model}' cannot use variant '{variant}': the catalog has no \
+                         row for this model, so its variants cannot be known"
+                )
             );
         }
         // The same kind of undefined variant on another family is still refused.
@@ -513,6 +522,50 @@ mod gated {
     }
 
     #[test]
+    fn code_assist_argon_resolves_default_and_variants_to_native_tiers() {
+        let model = "google/antigravity-gemini-4-argon";
+        let plain = resolved(model, AuthMethod::Antigravity, None);
+        assert_eq!(plain.wire_model_id, "gemini-4-argon-medium");
+        assert!(plain.variant.is_none());
+        for (name, wire_id, level) in [
+            ("low", "gemini-4-argon-low", "LOW"),
+            ("medium", "gemini-4-argon-medium", "MEDIUM"),
+            ("high", "gemini-4-argon-high", "HIGH"),
+        ] {
+            let frozen = resolved(model, AuthMethod::Antigravity, Some(name));
+            assert_eq!(frozen.wire_model_id, wire_id);
+            assert_eq!(frozen.variant.as_ref().unwrap().name, name);
+            let rendered = body(&frozen);
+            assert_eq!(rendered["model"], json!(wire_id));
+            assert_eq!(
+                rendered["request"]["generationConfig"]["thinkingConfig"],
+                json!({"includeThoughts": true, "thinkingLevel": level})
+            );
+            let resumed = resolve_with(
+                model,
+                AuthMethod::Antigravity,
+                None,
+                None,
+                frozen.variant.as_ref(),
+            )
+            .expect("Argon resumes its frozen tier");
+            assert_eq!(resumed, frozen);
+        }
+        let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("xhigh"), None, None)
+            .unwrap_err();
+        let broca_core::RunError::VariantUnsupported(refusal) = broca_core::RunError::from(error)
+        else {
+            panic!("unknown Argon variant must be variant_unsupported");
+        };
+        assert_eq!(refusal.model, model);
+        assert_eq!(refusal.variant, "xhigh");
+        assert_eq!(refusal.defined, ["low", "medium", "high"]);
+        assert!(refusal
+            .reason
+            .ends_with("its variants are [low, medium, high]"));
+    }
+
+    #[test]
     fn unsupported_variants_retain_structured_details_including_code_assist_tiers() {
         for (model, method, variant, defined) in [
             (
@@ -601,23 +654,31 @@ mod gated {
         );
     }
 
-    /// `antigravity-claude-sonnet-4-6-thinking` has an alias row (claude-sonnet-4-6's levels) but
-    /// Code Assist has no tiers for it: the wire id passes through unchanged. A level the row
-    /// defines is recorded, not applied, and not refused; a level it does not define is refused.
+    /// A catalog-defined effort must still be refused if Code Assist cannot render it as a tier.
     #[test]
-    fn code_assist_variant_on_a_model_without_tiers_is_recorded_not_applied() {
+    fn code_assist_variant_on_a_model_without_tiers_is_refused() {
         let model = "google/antigravity-claude-sonnet-4-6-thinking";
         let plain = resolved(model, AuthMethod::Antigravity, None);
         assert_eq!(plain.wire_model_id, "claude-sonnet-4-6-thinking");
-        let with = resolved(model, AuthMethod::Antigravity, Some("high"));
-        assert!(with.variant.is_none());
-        assert_eq!(with, plain);
-        assert_eq!(body(&with), body(&plain));
-        assert!(
-            !broca_provider::variant::note_variant_not_applied(model, "high", "test"),
-            "admission already warned that the variant was not applied"
+        assert!(plain.variant.is_none());
+        let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("high"), None, None)
+            .unwrap_err();
+        let broca_core::RunError::VariantUnsupported(refusal) = broca_core::RunError::from(error)
+        else {
+            panic!("a route without tiers must be variant_unsupported");
+        };
+        assert_eq!(refusal.model, model);
+        assert_eq!(refusal.variant, "high");
+        assert_eq!(refusal.defined, ["low", "medium", "high", "max"]);
+        assert_eq!(
+            refusal.reason,
+            format!(
+                "model '{model}' cannot use variant 'high': the Google Code Assist route \
+                     sends a reasoning level as a backend tier id and has no tiers for \
+                     'claude-sonnet-4-6-thinking'"
+            )
         );
-        let error = refusal(model, AuthMethod::Antigravity, "xhigh");
+        let error = self::refusal(model, AuthMethod::Antigravity, "xhigh");
         assert!(error.contains("does not define variant 'xhigh'"), "{error}");
     }
 

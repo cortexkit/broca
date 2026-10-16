@@ -18,7 +18,7 @@ mod gated {
 
     use broca_catalog::live::{
         AuthMethod, AuthMode, EpisodeRenderConfig, FrozenRenderConfig, FrozenVariant,
-        ResolveOptions, WireFamilyId,
+        ResolutionError, ResolveOptions, WireFamilyId,
     };
     use broca_catalog::{CatalogCache, CatalogSource, FusiformCatalogResponse};
     use broca_protocol::{
@@ -47,7 +47,10 @@ mod gated {
         broca_catalog::install_global_catalog_cache(cache);
     }
 
-    fn resolve(variant: Option<&str>, restored: Option<&FrozenVariant>) -> FrozenRenderConfig {
+    fn resolve(
+        variant: Option<&str>,
+        restored: Option<&FrozenVariant>,
+    ) -> Result<FrozenRenderConfig, ResolutionError> {
         let options = ResolveOptions {
             auth_method: Some(AuthMethod::Antigravity),
             family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -72,10 +75,11 @@ mod gated {
             &options,
             broca_provider::build_provider_http_client(),
             render,
+        )?;
+        Ok(
+            serde_json::from_value(resolved.provider.render_config_blob())
+                .expect("resolved provider exposes its frozen config"),
         )
-        .expect("resolves");
-        serde_json::from_value(resolved.provider.render_config_blob())
-            .expect("resolved provider exposes its frozen config")
     }
 
     fn body(frozen: &FrozenRenderConfig) -> Value {
@@ -98,17 +102,20 @@ mod gated {
     #[test]
     fn a_resume_keeps_the_frozen_tier_after_the_alias_row_is_withdrawn() {
         install(true);
-        let admitted = resolve(Some("high"), None);
+        let admitted = resolve(Some("high"), None).expect("variant admitted with a catalog row");
         assert_eq!(admitted.wire_model_id, "gemini-3.8-flash-high");
         let frozen_variant = admitted.variant.clone().expect("the variant is frozen");
 
         install(false);
-        // The row is really gone: a fresh send now takes the no-row path and is not applied.
-        let fresh = resolve(Some("high"), None);
-        assert!(fresh.variant.is_none());
-        assert_eq!(fresh.wire_model_id, "gemini-3.8-flash-medium");
+        // Fresh variants require a catalog row, but resume uses the variant frozen at admission.
+        let error = resolve(Some("high"), None).unwrap_err();
+        let ResolutionError::VariantUnsupported(refusal) = error else {
+            panic!("missing catalog row must refuse the fresh variant");
+        };
+        assert!(refusal.reason.contains("the catalog has no row"));
+        assert!(refusal.defined.is_empty());
 
-        let resumed = resolve(None, Some(&frozen_variant));
+        let resumed = resolve(None, Some(&frozen_variant)).expect("frozen variant resumes");
         assert_eq!(resumed.wire_model_id, "gemini-3.8-flash-high");
         assert_eq!(resumed.variant, admitted.variant);
         assert_eq!(

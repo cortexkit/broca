@@ -23,7 +23,9 @@
 //! admitted, so a resume renders from the frozen value and a later catalog change cannot move
 //! an admitted run's request bytes.
 
+#[cfg(feature = "live")]
 use std::collections::HashSet;
+#[cfg(feature = "live")]
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -449,30 +451,6 @@ fn warn_unknown_entry_type_once(catalog_model: &str, entry_type: &str) {
     }
 }
 
-/// Say, once per model and variant per process, that a requested variant was recorded on the
-/// run but not applied to the request. Returns whether this call logged (the first time).
-///
-/// Used only by broca-catalog's resolver for the Code Assist family, in the two cases where a
-/// variant is tolerated rather than refused: the model id has no catalog row at all, or the
-/// family has no thinking tiers for the model and so cannot render any variant.
-pub fn note_variant_not_applied(catalog_model: &str, variant: &str, reason: &str) -> bool {
-    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
-    let first = SEEN
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .insert((catalog_model.to_string(), variant.to_string()));
-    if first {
-        tracing::warn!(
-            target: "wire",
-            "session.send for model '{catalog_model}' requested variant '{variant}': recorded on \
-             the run but NOT applied ({reason}); the request is sent exactly as without a \
-             variant (reported once per model and variant per process)"
-        );
-    }
-    first
-}
-
 /// Freeze a resolved variant into a render config, adjusting the reasoning policy the family
 /// renderer reads so request fields and history echo agree with the variant:
 ///
@@ -580,21 +558,6 @@ mod tests {
         ] {
             assert_eq!(anthropic_manual_thinking(id), manual, "{id}");
         }
-    }
-
-    #[test]
-    fn variant_not_applied_is_reported_once_per_model_and_variant() {
-        assert!(note_variant_not_applied(
-            "test/once-model",
-            "high",
-            "reason"
-        ));
-        assert!(!note_variant_not_applied(
-            "test/once-model",
-            "high",
-            "reason"
-        ));
-        assert!(note_variant_not_applied("test/once-model", "low", "reason"));
     }
 
     #[test]

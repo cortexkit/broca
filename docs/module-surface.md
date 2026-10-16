@@ -456,11 +456,15 @@ code and detail, naming the tiers the route has in the message. `defined` still 
 model's variants, not the route's tiers. A
 level the row does not define is refused as above.
 
-Two cases are NOT refused and NOT applied: the id has no catalog row at all (e.g.
-`antigravity-gemini-3.5-flash`, `antigravity-gemini-3.1-pro`), or the family has no tiers for
-the model (`antigravity-claude-sonnet-4-6-thinking`). The variant is recorded on `RunStarted`,
-the request is exactly the one sent without a variant, and the module warns once per (model,
-variant) (`broca.wire`: "recorded on the run but NOT applied").
+A variant is also refused with `variant_unsupported` if the id has no catalog row (its variants
+cannot be known), or the Code Assist route has no tiers for the model (it cannot apply the
+variant). The message identifies the missing catalog row or route tiers; `defined` is empty
+without a catalog row and otherwise lists the catalog-defined variants. Neither refusal prevents
+sending the model with no variant through an explicit Code Assist route.
+
+`antigravity-gemini-4-argon` defaults to `gemini-4-argon-medium`; its `low`, `medium`, and `high`
+variants select the corresponding native tier ids. Argon tiers use uppercase `thinkingLevel`
+(`LOW`, `MEDIUM`, `HIGH`) with `includeThoughts: true`, no `thinkingBudget`, and no `toolConfig`.
 
 ## 5. Reliability model (the egress reality)
 

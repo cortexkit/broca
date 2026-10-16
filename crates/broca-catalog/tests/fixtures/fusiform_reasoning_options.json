@@ -216,6 +216,20 @@
       "limit.context": 128000,
       "limit.output": 8192
     },
+    "google/antigravity-gemini-4-argon": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": ["low", "medium", "high"]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536
+    },
     "google/antigravity-gemini-3.8-flash": {
       "capability.attachment": true,
       "capability.input_modalities": [
