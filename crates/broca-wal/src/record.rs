@@ -343,9 +343,10 @@ pub enum WalRecord {
         /// match attempts to a provider's log by body digest plus order.
         ts_ms: u64,
         /// Optional timestamps and byte counts for text, reasoning/summary, function-argument
-        /// and refusal deltas, plus non-content bytes, a bounded event tally and the suffix
-        /// following the last content. Provider and model come from the run's `run_started`;
-        /// no provider/model identity is duplicated on the attempt.
+        /// and refusal deltas, plus the longest gap between consecutive real-content records and
+        /// when that gap ended, non-content bytes, a bounded event tally and the suffix following
+        /// the last content. Provider and model come from the run's `run_started`; no identity is
+        /// duplicated on the attempt.
         #[serde(flatten)]
         content_progress: Box<broca_protocol::provider::ContentProgress>,
         /// Wall-clock time the request was handed to the HTTP client, Unix milliseconds: when the
@@ -3611,6 +3612,23 @@ mod schema_tests {
         assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
     }
 
+    #[test]
+    fn contentful_attempt_progress_bytes_are_pinned_before_gap_metrics() {
+        // Keep the full content-bearing shape stable when optional measurements are added.
+        let bytes = br#"{"type":"model_attempt_finished","step_id":2,"attempt":1,"request_body_len":12,"request_body_sha256":"aa","http_status":200,"response_body_len":3,"response_body_sha256":"bb","outcome":"complete","ts_ms":50,"first_content_at_ms":10,"last_content_at_ms":20,"content_bytes":3,"non_content_bytes":4,"non_content_bytes_after_last_content":0,"events_after_last_content":0}"#;
+        let record: WalRecord = serde_json::from_slice(bytes).unwrap();
+        match &record {
+            WalRecord::ModelAttemptFinished {
+                content_progress, ..
+            } => {
+                assert_eq!(content_progress.max_content_gap_ms, None);
+                assert_eq!(content_progress.max_content_gap_ended_at_ms, None);
+            }
+            other => panic!("expected model attempt record, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_vec(&record).unwrap(), bytes.to_vec());
+    }
+
     /// The attempt record's bytes are pinned, and every outcome this build writes round-trips.
     #[test]
     fn model_attempt_finished_bytes_are_pinned_and_every_outcome_round_trips() {
@@ -3618,6 +3636,19 @@ mod schema_tests {
         let record: WalRecord = serde_json::from_slice(stored).unwrap();
         assert!(record.is_informational());
         assert_eq!(serde_json::to_vec(&record).unwrap(), stored.to_vec());
+
+        let interior_gap = br#"{"type":"model_attempt_finished","step_id":2,"attempt":1,"request_body_len":12,"request_body_sha256":"aa","http_status":200,"response_body_len":3,"response_body_sha256":"bb","outcome":"complete","ts_ms":50,"first_content_at_ms":10,"last_content_at_ms":50,"max_content_gap_ms":30,"max_content_gap_ended_at_ms":40}"#;
+        let record: WalRecord = serde_json::from_slice(interior_gap).unwrap();
+        match &record {
+            WalRecord::ModelAttemptFinished {
+                content_progress, ..
+            } => {
+                assert_eq!(content_progress.max_content_gap_ms, Some(30));
+                assert_eq!(content_progress.max_content_gap_ended_at_ms, Some(40));
+            }
+            other => panic!("expected model attempt record, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_vec(&record).unwrap(), interior_gap.to_vec());
 
         // Absent optionals write no bytes: an attempt that never received a status line.
         let no_status = br#"{"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":12,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"e3b0","outcome":"connect_failed","ts_ms":5}"#;

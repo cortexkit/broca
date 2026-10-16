@@ -342,7 +342,10 @@ impl ToolNameRestoringNormalizer {
     fn report_content(&self) {
         if let Some(progress) = &self.live_progress {
             if let Some(step) = progress.lock().unwrap().as_mut() {
-                step.last_content_at_ms = self.inner.content_progress().last_content_at_ms;
+                let content = self.inner.content_progress();
+                step.last_content_at_ms = content.last_content_at_ms;
+                step.max_content_gap_ms = content.max_content_gap_ms;
+                step.max_content_gap_ended_at_ms = content.max_content_gap_ended_at_ms;
             }
         }
     }
@@ -1582,6 +1585,8 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                     step.attempt = attempt;
                     step.attempt_started_at_ms = now_millis();
                     step.last_content_at_ms = None;
+                    step.max_content_gap_ms = None;
+                    step.max_content_gap_ended_at_ms = None;
                 }
             }
             attempt += 1;

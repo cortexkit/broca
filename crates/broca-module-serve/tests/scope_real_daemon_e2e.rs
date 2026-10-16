@@ -1485,6 +1485,8 @@ async fn active_status_reports_held_model_step_and_content() {
         .expect("attempt start was observed");
     assert!(started_at <= attempt_at);
     assert!(step.get("last_content_at_ms").is_none());
+    assert!(step.get("max_content_gap_ms").is_none());
+    assert!(step.get("max_content_gap_ended_at_ms").is_none());
 
     model.content.send(()).await.unwrap();
     let status =
@@ -1507,11 +1509,44 @@ async fn active_status_reports_held_model_step_and_content() {
     let step = &status["result"]["step"];
     assert_eq!(step["started_at_ms"], started_at);
     assert_eq!(step["attempt_started_at_ms"], attempt_at);
-    assert!(step["last_content_at_ms"].as_u64().unwrap() >= attempt_at);
+    let first_content_at = step["last_content_at_ms"].as_u64().unwrap();
+    assert!(first_content_at >= attempt_at);
+    assert!(step.get("max_content_gap_ms").is_none());
+
+    model.content.send(()).await.unwrap();
+    let status =
+        broca_test_support::wait_until("live actor sees the interior content gap", || async {
+            let status = scope_request(
+                &basal,
+                &route,
+                "run.status",
+                serde_json::json!({"run_id":run_id}),
+            )
+            .await
+            .unwrap();
+            let step = &status["result"]["step"];
+            if step["max_content_gap_ms"].is_u64() && step["max_content_gap_ended_at_ms"].is_u64() {
+                Ok(status)
+            } else {
+                Err(status.to_string())
+            }
+        })
+        .await;
+    let step = &status["result"]["step"];
+    assert!(step["max_content_gap_ms"].as_u64().is_some());
+    assert_eq!(
+        step["max_content_gap_ended_at_ms"], step["last_content_at_ms"],
+        "the longest gap ends at the latest content event in this two-event stream"
+    );
+    assert!(step["max_content_gap_ended_at_ms"].as_u64().unwrap() >= first_content_at);
+    assert_eq!(step["started_at_ms"], started_at);
+    assert_eq!(step["attempt_started_at_ms"], attempt_at);
     let mut golden = status["result"].clone();
     golden["step"]["started_at_ms"] = 1790000000000u64.into();
     golden["step"]["attempt_started_at_ms"] = 1790000000001u64.into();
     golden["step"]["last_content_at_ms"] = 1790000000002u64.into();
+    golden["step"]["max_content_gap_ms"] = 1u64.into();
+    golden["step"]["max_content_gap_ended_at_ms"] = 1790000000002u64.into();
     let bytes = serde_json::to_vec(&golden).unwrap();
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../broca-wire/tests/golden/run_status.active_with_step.json");

@@ -5644,6 +5644,8 @@ async fn run_step_watched<P: Provider>(
             attempt: 0,
             attempt_started_at_ms: now,
             last_content_at_ms: None,
+            max_content_gap_ms: None,
+            max_content_gap_ended_at_ms: None,
         });
     }
     // The renderer gets a shared handle to the durable snapshot, never a copy of the prompt.
