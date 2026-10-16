@@ -8,6 +8,7 @@ const EXCEPTIONS: &[(&str, &str, &str)] = &[
     ("crates/broca-core/src/compaction/tests.rs", "concurrent_clock_refresh_cannot_move_wait_cap_into_real_time", "Memory WAL and injected compaction clock; no disk barrier"),
     ("crates/broca-core/src/compaction/tests.rs", "clock_reaching_the_cap_mid_poll_takes_the_cap_exit_not_the_bound", "Memory WAL and injected compaction clock; no disk barrier"),
     ("crates/broca-core/src/run/consent_runtime_tests.rs", "await_route_drops_within_one_second_on_cancel_stop_and_restart_pause", "Memory WAL rig (Rig::new); closing the await route within one second is the asserted property"),
+    ("crates/broca-module-serve/tests/it/approval_gate.rs", "setup_failure_without_wal_preserves_panic_and_reaps_daemon", "Cleanup grace only: survival is recorded before the wait, and expiry escalates SIGTERM to SIGKILL instead of failing"),
     ("crates/broca-core/tests/it/cancel_watchdog.rs", "wait_finished", "Provider-task cleanup after cancellation, not a WAL transition"),
     ("crates/broca-core/tests/it/run_loop.rs", "check_held_attempt_durability", "CountingWalStore is in memory"),
     ("crates/broca-core/tests/it/run_loop.rs", "wait_sends", "CountingWalStore is in memory"),
