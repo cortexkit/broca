@@ -979,6 +979,14 @@ impl SqliteStore {
                 )?;
             }
         }
+        // Index only runs with unsettled withdrawal work, so each live retained
+        // lineage can look up its runs without scanning unrelated session rows.
+        // Adding an ordinary SQLite index changes neither columns nor row bytes;
+        // older binaries can keep opening and writing this database on rollback.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS run_index_discovery_lineage_idx ON run_index(lineage_id, session) WHERE withdrawals_owed=1",
+            [],
+        )?;
         export_index::init_schema(conn).map_err(StoreError::from)
     }
 

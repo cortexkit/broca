@@ -435,6 +435,10 @@ impl Wire {
         Self::new_with_scope(rig, principal, internal, Value::Null).await
     }
     async fn new_with_scope(rig: &Rig, principal: Value, internal: bool, scope: Value) -> Self {
+        rig.service.wait_inventory().await;
+        Self::without_inventory(rig, principal, internal, scope).await
+    }
+    async fn without_inventory(rig: &Rig, principal: Value, internal: bool, scope: Value) -> Self {
         let (stream, module) = tokio::io::duplex(64 * 1024);
         let (read, write) = tokio::io::split(module);
         let registry = rig.registry.clone();
@@ -1294,6 +1298,12 @@ async fn session_ref_vectors_are_resolved_by_the_serve_participant() {
 #[cfg(unix)]
 #[path = "agent_data/real_daemon.rs"]
 mod real_daemon;
+
+#[path = "agent_data/inventory.rs"]
+mod inventory;
+
+#[path = "agent_data/persistent_inventory.rs"]
+mod persistent_inventory;
 
 #[tokio::test]
 async fn closed_session_with_question_withdrawal_debt_is_busy_before_prepare() {

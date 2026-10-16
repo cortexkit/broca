@@ -13687,33 +13687,21 @@ new = '''#[serde(default)] // NON-VACUITY BREAK: accept unrecoverable old author
 
 [[control]]
 id = "agent-data-partial-address-inventory"
-guards = "participant discovery isolates unreadable inventory locations while ordinary inventory remains strict"
+guards = "participant lookup preserves known refs beside unreadable WALs and ambiguous addresses while ordinary inventory remains strict"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test agent_data"
 features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
-expect_red = ["discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed"]
-only = false
-file = "crates/broca-core/src/wal_writer.rs"
-old = 'self.address_inventory(true)'
-new = 'self.address_inventory(false) /* NON-VACUITY BREAK: one bad location blocks all discovery */'
-
-[[control]]
-id = "agent-data-discovery-skips-unreadable-wals"
-guards = "an unreadable WAL is logged and isolated instead of failing every requested ref"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--test agent_data"
-features = ["test-clock"]
-test_file = "crates/broca-module-serve/tests/agent_data.rs"
-expect_red = ["divergence_is_per_ref_when_one_held_wal_is_unreadable"]
+expect_red = ["discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed", "divergence_is_per_ref_when_one_held_wal_is_unreadable"]
 only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
-old = '''inventory.unreadable.push(address);
-                    continue;'''
-new = '''inventory.unreadable.push(address);
-                    return Err(unavailable("NON-VACUITY BREAK: fail the whole scan"));'''
+old = '''            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));'''
+new = '''            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));
+        // NON-VACUITY BREAK: one unreadable location blocks even known refs.
+        if !inventory.unreadable.is_empty() {
+            return SessionInventory { sessions: BTreeMap::new(), unreadable: inventory.unreadable };
+        }'''
 
 [[control]]
 id = "agent-data-activation-digest-never-outage"
@@ -13963,3 +13951,81 @@ expect_red = ["optional_tool_has_own_budget"]
 file = "crates/broca-fetch-plan/src/admit.rs"
 old = "deadline.min(started + OPTIONAL_TOOL_BUDGET)"
 new = "deadline /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "agent-data-named-ref-no-full-scan"
+guards = "a busy probe reads only its named WAL after boot inventory publication"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::busy_one_ref_reads_only_its_wal_after_inventory_build"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
+'''
+new = '''    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
+        // NON-VACUITY BREAK: restore request-time full WAL discovery.
+        for address in self.wal.move_addresses().unwrap().0 {
+            let _ = self.wal.read_address_records_for_move(&address);
+        }
+'''
+
+[[control]]
+id = "agent-data-incomplete-inventory-is-unknown"
+guards = "an inventory that has not completed cannot prove an unresolved ref is absent"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::incomplete_inventory_is_unknown_until_boot_build_finishes"]
+only = false
+file = "crates/broca-core/src/wal_writer/move_inventory.rs"
+old = '''        if !state.finished {
+'''
+new = '''        if false { // NON-VACUITY BREAK: claim a still-building inventory is complete.
+'''
+
+[[control]]
+id = "retention-discovery-live-lineages-before-runs"
+guards = "empty or expired-only retention inventory cannot scan the ordinary run index"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention_withdrawals.rs"
+expect_red = ["retention_withdrawals::tests::discovery_without_live_retention_does_not_scan_runs"]
+only = false
+file = "crates/broca-store/src/retention_withdrawals.rs"
+old = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1";'
+new = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id WHERE r.withdrawals_owed=1 AND l.expired_at_ms IS NULL"; // NON-VACUITY BREAK: restore the run-driven sweep query.'
+
+[[control]]
+id = "agent-data-persistent-cache-validates-lineage-and-length"
+guards = "cached triples cannot survive a replaced lineage or a stale committed length"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::replaced_wal_lineage_is_rescanned_instead_of_reusing_identities", "persistent_inventory::stale_cached_length_is_detected_and_rescanned"]
+only = false
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = 'if let Some(old) = old.filter(|old| reusable(old, &source)) {'
+new = 'if let Some(old) = old { // NON-VACUITY BREAK: reuse without checking lineage or committed length.'
+
+[[control]]
+id = "agent-data-persistent-cache-is-not-authority"
+guards = "each boot discovers current addresses instead of declaring the previous cache complete"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::cache_does_not_define_the_complete_address_inventory"]
+only = false
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = 'match locations(store, cancel, &mut inventory.unreadable, &mut stats) {'
+new = '''// NON-VACUITY BREAK: cached addresses are the entire inventory authority.
+    match Ok::<_, WalError>(cached.iter().map(|(address, entry)| (address.clone(), entry.source.clone())).collect::<BTreeMap<_, _>>()) {'''

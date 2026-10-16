@@ -427,6 +427,7 @@ struct Routes {
     pending_binds: std::collections::HashMap<u16, (u32, CancellationToken)>,
     bind_tasks: JoinSet<BindCompletion>,
     subscribe_cancel: std::collections::HashMap<u16, Arc<SubscriptionSlot>>,
+    agent_data_cancel: std::collections::HashMap<u16, CancellationToken>,
     dispatch_lanes: std::collections::HashMap<BrocaBindIdentity, Arc<DispatchLane>>,
     next_dispatch_lane_sweep: usize,
     /// Whether the daemon advertises `scopes/v1` (from `server.describe`, or from this
@@ -443,6 +444,7 @@ impl Routes {
             pending_binds: std::collections::HashMap::new(),
             bind_tasks: JoinSet::new(),
             subscribe_cancel: std::collections::HashMap::new(),
+            agent_data_cancel: std::collections::HashMap::new(),
             dispatch_lanes: std::collections::HashMap::new(),
             next_dispatch_lane_sweep: DISPATCH_LANE_SWEEP_MIN,
             daemon_scopes,
@@ -482,6 +484,9 @@ impl Routes {
             .map(|(_, session, _)| session);
         if let Some(cancel) = self.subscribe_cancel.remove(&channel) {
             cancel.route.cancel();
+        }
+        if let Some(cancel) = self.agent_data_cancel.remove(&channel) {
+            cancel.cancel();
         }
         if let Some(session) = departed_session {
             self.evict_dispatch_lane_if_idle(&session);
@@ -1112,7 +1117,16 @@ where
                 let service = routes.agent_data.clone();
                 let writer = writer.clone();
                 let slots = request_slots.clone();
+                let cancel = routes
+                    .agent_data_cancel
+                    .entry(channel)
+                    .or_insert_with(|| conn_cancel.child_token())
+                    .clone();
                 request_tasks.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => Ok(()),
+                        result = async move {
                     let _permit = slots
                         .acquire_owned()
                         .await
@@ -1135,6 +1149,8 @@ where
                             )
                             .await
                         }
+                    }
+                        } => result,
                     }
                 });
                 return Ok(true);
@@ -1480,6 +1496,7 @@ async fn handle_control_request(
             // reader that did not write them -- scripts/live-runs.py and
             // scripts/audit-export-lane.py are that shape deliberately.
             let mut metrics = serde_json::json!({
+                    "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
                     "retention_unreadable_sessions": retention_unreadable,
                     "retention_repairs_pending": health_registry.retention_repairs_pending(),
                     "stall_watchdog": crate::stall::health_gauges(),
@@ -1660,6 +1677,9 @@ async fn finish_bind(
     }
     tracing::debug!(target: "wire.ingress", stage = "bound", channel = completed.channel,
         epoch = completed.epoch, session = %completed.identity.session, "module route bound");
+    if let Some(cancel) = routes.agent_data_cancel.remove(&completed.channel) {
+        cancel.cancel();
+    }
     routes.by_channel.insert(
         completed.channel,
         (completed.epoch, completed.identity, completed.bind),

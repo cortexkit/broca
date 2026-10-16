@@ -2753,6 +2753,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // and the index is not provably current, so deletion keeps them. Present at zero.
         "retention_unreadable_sessions",
         "retention_repairs_pending",
+        "agent_data_ops",
     ]
     .into_iter()
     .collect();
@@ -2802,6 +2803,13 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     );
     // This registry has no failed retention writes, so no repair obligation is outstanding.
     assert_eq!(metrics["retention_repairs_pending"], serde_json::json!(0));
+    assert_eq!(
+        metrics["agent_data_ops"],
+        serde_json::json!({
+            "describe":0,"busy":0,"diverged":0,"prepare":0,"export":0,
+            "import":0,"release":0,"activate":0,"abort":0,"status":0
+        })
+    );
     // The counter lock keeps the stale-frame sibling out during this interval. Equal readings
     // show that this rig's health probe and valid route request did not drop a frame, while the
     // unsigned values above ensure each metric remains present when its process count is zero.

@@ -30,6 +30,8 @@ use tokio::sync::{broadcast, oneshot};
 use crate::lease::LeaseHandle;
 
 mod extraction;
+mod move_inventory;
+pub use move_inventory::{MoveInventory, MoveInventoryBuildStats};
 
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
@@ -209,6 +211,8 @@ pub trait WalStore: Send + Sync {
 pub struct FileWalStore {
     root: PathBuf,
     max_read_bytes: u64,
+    move_inventory: Arc<move_inventory::InventoryState>,
+    move_reads: AtomicU64,
 }
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
@@ -242,6 +246,7 @@ impl FileWalStore {
     /// it before creating artifacts. Ordinary session readers must not use this
     /// bypass: `read_records_range` enforces moved-session refusal for them.
     pub fn bytes_for_move(&self, session: &BindIdentity) -> Result<Option<Vec<u8>>, WalError> {
+        self.move_reads.fetch_add(1, Ordering::Relaxed);
         use std::io::Read;
         if let Some(member) = self.archived_member(session)?.member {
             return Ok(Some(member.payload));
@@ -311,6 +316,9 @@ impl FileWalStore {
         address: &str,
         for_move: bool,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        if for_move {
+            self.move_reads.fetch_add(1, Ordering::Relaxed);
+        }
         if address.len() != 16 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(WalError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -332,7 +340,7 @@ impl FileWalStore {
     }
 
     pub fn addresses(&self) -> Result<std::collections::BTreeSet<String>, WalError> {
-        self.address_inventory(false)
+        self.address_inventory(false, &|| false)
             .map(|(addresses, _)| addresses)
     }
 
@@ -342,12 +350,13 @@ impl FileWalStore {
     pub fn move_addresses(
         &self,
     ) -> Result<(std::collections::BTreeSet<String>, Vec<String>), WalError> {
-        self.address_inventory(true)
+        self.address_inventory(true, &|| false)
     }
 
     fn address_inventory(
         &self,
         partial: bool,
+        cancelled: &impl Fn() -> bool,
     ) -> Result<(std::collections::BTreeSet<String>, Vec<String>), WalError> {
         let mut addresses = std::collections::BTreeSet::new();
         let mut unreadable = Vec::new();
@@ -363,6 +372,12 @@ impl FileWalStore {
             match std::fs::read_dir(root) {
                 Ok(entries) => {
                     for entry in entries {
+                        if cancelled() {
+                            return Err(WalError::Io(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "move inventory cancelled",
+                            )));
+                        }
                         let path = match entry {
                             Ok(entry) => entry.path(),
                             Err(error) => {
@@ -382,6 +397,12 @@ impl FileWalStore {
             }
         }
         for address in addresses.clone() {
+            if cancelled() {
+                return Err(WalError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "move inventory cancelled",
+                )));
+            }
             if let Err(error) = self.resolve_live_address(&address) {
                 failure(address.clone(), error)?;
                 addresses.remove(&address);
@@ -395,6 +416,12 @@ impl FileWalStore {
             }
         };
         for path in paths {
+            if cancelled() {
+                return Err(WalError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "move inventory cancelled",
+                )));
+            }
             let members = broca_wal::archive::ArchiveReader::open(&path, self.max_read_bytes)
                 .map_err(WalError::Io)
                 .and_then(|mut reader| {
@@ -422,6 +449,8 @@ impl FileWalStore {
         Self {
             root: root.into(),
             max_read_bytes: DEFAULT_MAX_READ_BYTES,
+            move_inventory: Arc::default(),
+            move_reads: AtomicU64::new(0),
         }
     }
 
@@ -588,6 +617,8 @@ impl FileWalStore {
         let lookup = self.archived_member(session)?;
         let path = if let Some(member) = lookup.member {
             let path = self.wal_path(session);
+            // Extraction preserves the logical address and payload, so the move
+            // identity inventory remains valid without decoding the member again.
             extraction::restore(&path, &member.payload).map_err(WalError::Io)?;
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
@@ -629,11 +660,16 @@ impl FileWalStore {
         } else {
             false
         };
-        Ok(Box::new(if retained_policy {
+        let wal = if retained_policy {
             wal.with_append_budget(self.append_cap(retained_size::SizeScope::RetainedSession)?)
         } else {
             wal.with_recovery_cap(self.append_cap(retained_size::SizeScope::Session)?)
-        }))
+        };
+        Ok(Box::new(move_inventory::IndexedWal::new(
+            wal,
+            session_addr(session),
+            self.move_inventory.clone(),
+        )))
     }
 
     /// Resolve only after live absence: a live WAL is authoritative even when an archive

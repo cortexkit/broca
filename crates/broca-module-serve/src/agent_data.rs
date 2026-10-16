@@ -4,7 +4,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -71,6 +74,9 @@ impl SessionDoor for SessionDoorClient {
 pub struct AgentDataService {
     cuts: CutStore,
     artifacts: FileCutArtifacts,
+    wal: Arc<FileWalStore>,
+    inventory_cancel: tokio_util::sync::CancellationToken,
+    op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
     pub fn new(
@@ -88,11 +94,60 @@ impl AgentDataService {
         });
         Self {
             cuts: CutStore::new(&root),
-            artifacts: FileCutArtifacts::new(root.clone(), registry, wal, index, driver),
+            artifacts: FileCutArtifacts::new(root.clone(), registry, wal.clone(), index, driver),
+            wal,
+            inventory_cancel: tokio_util::sync::CancellationToken::new(),
+            op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
+    pub fn start_inventory(&self) {
+        self.wal.start_move_inventory(self.inventory_cancel.clone());
+    }
+    pub async fn wait_inventory(&self) {
+        self.start_inventory();
+        self.wal.wait_move_inventory().await;
+    }
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
+        self.start_inventory();
         self.cuts.reconcile_boot(&self.artifacts).await
+    }
+}
+
+const OPS: [&str; 10] = [
+    "describe", "busy", "diverged", "prepare", "export", "import", "release", "activate", "abort",
+    "status",
+];
+
+pub(crate) fn health_counts(service: Option<&AgentDataService>) -> Value {
+    Value::Object(
+        OPS.iter()
+            .enumerate()
+            .map(|(i, op)| {
+                (
+                    (*op).to_owned(),
+                    json!(service.map_or(0, |s| s.op_counts[i].load(Ordering::Relaxed))),
+                )
+            })
+            .collect(),
+    )
+}
+
+struct OpObservation {
+    op: String,
+    cut_id: String,
+    ref_count: usize,
+    start: Instant,
+}
+impl Drop for OpObservation {
+    fn drop(&mut self) {
+        tracing::info!(op = %self.op, cut_id = %self.cut_id, ref_count = self.ref_count,
+            elapsed_ms = self.start.elapsed().as_millis() as u64, "agent-data op finished");
+    }
+}
+
+impl Drop for AgentDataService {
+    fn drop(&mut self) {
+        self.inventory_cancel.cancel();
     }
 }
 
@@ -118,6 +173,29 @@ pub(crate) async fn dispatch(
     }
     let rpc: Rpc = serde_json::from_slice(bytes)
         .map_err(|e| refusal("invalid_request", e.to_string(), Value::Null))?;
+    if let Some(i) = OPS
+        .iter()
+        .position(|op| rpc.method == format!("agent_data.{op}"))
+    {
+        service.op_counts[i].fetch_add(1, Ordering::Relaxed);
+    }
+    // Drop also records cancelled calls, so a disconnected caller cannot hide
+    // its operation's rate or elapsed time from the process log.
+    let _observation = OpObservation {
+        op: rpc.method.clone(),
+        cut_id: rpc
+            .params
+            .get("cutId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        ref_count: rpc
+            .params
+            .get("refs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        start: Instant::now(),
+    };
     service
         .cuts
         .execute(caller, &rpc.method, &rpc.params, &service.artifacts)
@@ -317,50 +395,28 @@ impl Driver {
             }
         }
     }
-    fn local_sessions(&self) -> Result<SessionInventory, ErrorBody> {
-        let mut inventory = SessionInventory::default();
-        let (addresses, unreadable) = self.wal.move_addresses().map_err(unavailable)?;
-        for address in &unreadable {
-            tracing::error!(
-                address,
-                "agent-data skipped an unreadable inventory location"
-            );
+    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
+        let inventory = self
+            .wal
+            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));
+        SessionInventory {
+            sessions: inventory
+                .sessions
+                .into_iter()
+                .map(|(reference, (_, session))| (reference, session))
+                .collect(),
+            unreadable: inventory.unreadable,
         }
-        inventory.unreadable = unreadable;
-        for address in addresses {
-            let records = match self.wal.read_address_records_for_move(&address) {
-                Ok(records) => records,
-                Err(_) => {
-                    tracing::error!(
-                        address,
-                        "agent-data skipped an unreadable WAL during reference discovery"
-                    );
-                    inventory.unreadable.push(address);
-                    continue;
-                }
-            };
-            for record in records {
-                if let broca_wal::WalRecord::RunStarted { session, .. } = record.record {
-                    if broca_core::session_addr(&session) == address {
-                        inventory.sessions.insert(
-                            contract::session_ref(
-                                &session.harness,
-                                &session.project_root.to_string_lossy(),
-                                &session.session,
-                            ),
-                            session,
-                        );
-                    }
-                }
-            }
-        }
-        Ok(inventory)
     }
 }
 
 #[async_trait::async_trait]
 impl MoveDriver for Driver {
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
+        // Empty move probes must not depend on inventory readiness or touch WALs.
+        if refs.iter().next().is_none() {
+            return Ok(MovePlans::default());
+        }
         let receiver = matches!(op, Op::Diverged | Op::Import | Op::Activate);
         let state: Option<broca_module::cut_state::CutState> = if op == Op::Busy {
             None
@@ -383,7 +439,7 @@ impl MoveDriver for Driver {
                 unreadable: Vec::new(),
             }
         } else if matches!(op, Op::Busy | Op::Diverged | Op::Prepare | Op::Import) {
-            self.local_sessions()?
+            self.local_sessions(refs)
         } else {
             SessionInventory::default()
         };
@@ -536,12 +592,16 @@ impl MoveDriver for Driver {
                     }
                 }
             };
-            let (format, lineage_id) = if op == Op::Abort {
+            let (format, lineage_id) = if matches!(op, Op::Abort | Op::Busy) {
                 ("broca-wal/v1;features=".into(), String::new())
             } else {
                 wal_format(&bytes)?
             };
-            let digest = broca_wal::migration::digest(&bytes);
+            let digest = if op == Op::Busy {
+                String::new()
+            } else {
+                broca_wal::migration::digest(&bytes)
+            };
             let session = if receiver && sealed {
                 move_install::verify_received(
                     &reference.r#ref,
@@ -552,7 +612,7 @@ impl MoveDriver for Driver {
             } else {
                 session.expect("local ref resolved").clone()
             };
-            let local_archive = if op == Op::Abort {
+            let local_archive = if matches!(op, Op::Abort | Op::Busy) {
                 None
             } else if self
                 .wal
