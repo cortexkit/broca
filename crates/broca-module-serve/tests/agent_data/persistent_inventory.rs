@@ -316,6 +316,68 @@ fn rewrite_cache(path: &std::path::Path, mut cache: Value) {
 }
 
 #[tokio::test]
+async fn reader_feature_changes_invalidate_only_dependent_entries() {
+    let mut rig = Rig::new("persistent-reader-features", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a-run", true);
+    rig.seed(&b, "b-run", true);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let path = rig.root.join("move-inventory.json");
+    let mut cache: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cache["reader_features"] = json!(["future-reader/v99"]);
+    rewrite_cache(&path, cache);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(
+        rig.wal.move_inventory_build_stats().payload_reads,
+        0,
+        "capability-table changes alone must not cause a cold boot"
+    );
+    let mut cache: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entry = &mut cache["addresses"][broca_core::session_addr(&a)];
+    entry["used_features"] = json!(["future-frame/v99"]);
+    entry["triples"] = json!([]);
+    rewrite_cache(&path, cache);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(rig.wal.move_inventory_build_stats().payload_reads, 1);
+    assert_eq!(rig.wal.move_inventory_build_stats().reused, 1);
+    assert_eq!(cached_refs(&rig, &a), 1);
+    assert_eq!(cached_refs(&rig, &b), 1);
+}
+
+#[tokio::test]
+async fn cache_records_explicit_frame_requirements_not_just_record_features() {
+    let mut rig = Rig::new("persistent-used-features", Arc::new(FakeDoor::default()));
+    let session = rig.session("gated");
+    let record = started(&session, "run");
+    let frame =
+        broca_wal::framing::encode_with_requires(1, 1, &["compaction/v1"], &record).unwrap();
+    let mut wal = rig.wal.open(&session).unwrap();
+    wal.append_preencoded(1, &record, true, frame).unwrap();
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let path = rig.root.join("move-inventory.json");
+    let cache: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        cache["addresses"][broca_core::session_addr(&session)]["used_features"],
+        json!(["compaction/v1"])
+    );
+    wal.append(1, &record, true).unwrap();
+    drop(wal);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let cache: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        cache["addresses"][broca_core::session_addr(&session)]["used_features"],
+        json!(["compaction/v1"]),
+        "suffix reads must retain the prefix's declared requirements"
+    );
+}
+
+#[tokio::test]
 #[cfg(unix)]
 async fn legacy_wal_without_lineage_reuses_unchanged_identity() {
     let mut rig = Rig::new("persistent-legacy", Arc::new(FakeDoor::default()));

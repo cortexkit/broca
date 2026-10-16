@@ -8,8 +8,10 @@ mod pacing;
 #[cfg(test)]
 mod tests;
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const CACHE_LIMIT: u64 = 128 * 1024 * 1024;
+const CHECKPOINT_ADDRESSES: usize = 1024;
+const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MoveInventoryBuildStats {
@@ -87,6 +89,7 @@ struct CachedAddress {
     committed_end: u64,
     last_seq: u64,
     triples: Vec<BindIdentity>,
+    used_features: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -140,10 +143,7 @@ fn load(
         stats.cache_bytes += bytes.len() as u64;
         let cache: Cache = serde_json::from_slice(&bytes)
             .map_err(|error| invalid(&format!("invalid move inventory cache: {error}")))?;
-        if cache.version != CACHE_VERSION
-            || cache.reader_features != reader_features()
-            || cache.checksum != checksum(&cache.addresses)?
-        {
+        if cache.version != CACHE_VERSION || cache.checksum != checksum(&cache.addresses)? {
             return Err(invalid(
                 "move inventory cache version or checksum does not match",
             ));
@@ -164,7 +164,19 @@ fn load(
         Ok(cache)
     })();
     match result {
-        Ok(cache) => cache.addresses,
+        Ok(cache) => {
+            let known = reader_features();
+            cache
+                .addresses
+                .into_iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .used_features
+                        .iter()
+                        .all(|feature| known.contains(feature))
+                })
+                .collect()
+        }
         Err(error) => {
             tracing::warn!(%error, "move inventory cache unavailable; rebuilding from WALs");
             BTreeMap::new()
@@ -179,8 +191,8 @@ fn checksum(addresses: &BTreeMap<String, CachedAddress>) -> Result<String, WalEr
 }
 
 fn reader_features() -> Vec<String> {
-    // A downgraded reader must not reuse a newer reader's success over frames it
-    // cannot decode. Inventory-format changes additionally bump CACHE_VERSION.
+    // Only entries using an unknown feature need decoding after a downgrade.
+    // New reader capabilities do not invalidate unrelated restart hints.
     let mut features = broca_wal::KNOWN_FEATURES
         .iter()
         .map(|name| (*name).to_owned())
@@ -615,6 +627,7 @@ fn scan_after_stamp(
     }
     after_stamp();
     let mut triples = Vec::new();
+    let mut used_features;
     let (committed_end, last_seq) = match &source {
         Source::Live {
             path,
@@ -652,6 +665,7 @@ fn scan_after_stamp(
                     }
                 }
             }
+            let reused_prefix = range.is_some();
             let range = match range {
                 Some(range) => range,
                 None => {
@@ -661,6 +675,15 @@ fn scan_after_stamp(
                     file_wal::read_records_range(path, store.max_read_bytes, 0, None, None)?
                 }
             };
+            used_features = range.used_features().to_vec();
+            if reused_prefix {
+                used_features.extend(
+                    old.expect("validated cached suffix")
+                        .used_features
+                        .iter()
+                        .cloned(),
+                );
+            }
             if range.lineage_id.is_some_and(|id| {
                 lineage_id
                     .as_ref()
@@ -718,6 +741,7 @@ fn scan_after_stamp(
                 .map_err(WalError::Io)?
                 .ok_or_else(|| invalid("archive inventory member disappeared"))?;
             let range = file_wal::read_verified_member_range(&member.payload, 0, 0, None)?;
+            used_features = range.used_features().to_vec();
             add_records(&mut triples, address, &range)?;
             if FileStamp::at(path)? != *stamp {
                 return Err(changed("archive changed during inventory read"));
@@ -728,28 +752,33 @@ fn scan_after_stamp(
             )
         }
     };
+    used_features.sort();
+    used_features.dedup();
     Ok(CachedAddress {
         source,
         committed_end,
         last_seq,
         triples,
+        used_features,
     })
 }
 
 pub(super) fn build(store: &FileWalStore, cancel: &CancellationToken) {
-    build_after_pass(store, cancel, |_| {})
+    build_with_hooks(store, cancel, |_| {}, |_| {})
 }
 
-fn build_after_pass(
+fn build_with_hooks(
     store: &FileWalStore,
     cancel: &CancellationToken,
     mut after_pass: impl FnMut(usize),
+    mut after_address: impl FnMut(usize),
 ) {
     let start = std::time::Instant::now();
     let mut stats = MoveInventoryBuildStats::default();
     let cached = load(store, &mut stats);
     let mut inventory = MoveInventory::default();
     let mut next_cache = BTreeMap::new();
+    let mut checkpoint = (0, std::time::Instant::now());
     // The cache never defines which addresses exist. Every boot enumerates the
     // current roots/indexes, including locations absent from the previous cache.
     for pass in 0..2 {
@@ -787,6 +816,20 @@ fn build_after_pass(
                     if stats.payload_reads != reads_before {
                         pacing::after_payload(work.elapsed(), cancel);
                     }
+                    // Partial hints are safe: every boot still takes a fresh census
+                    // and validates each entry. Bound lost work across restarts,
+                    // without rewriting an already reusable warm cache in chunks.
+                    if stats.payload_reads > 0
+                        && next_cache.len() > checkpoint.0
+                        && (next_cache.len() - checkpoint.0 >= CHECKPOINT_ADDRESSES
+                            || checkpoint.1.elapsed() >= CHECKPOINT_INTERVAL)
+                    {
+                        if let Err(error) = save(store, next_cache.clone()) {
+                            tracing::warn!(%error, "move inventory checkpoint could not be saved");
+                        }
+                        checkpoint = (next_cache.len(), std::time::Instant::now());
+                    }
+                    after_address(next_cache.len());
                     std::thread::yield_now();
                 }
             }

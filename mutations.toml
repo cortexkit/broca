@@ -14175,3 +14175,55 @@ expect_red = ["wal_writer::move_inventory::persistent::tests::final_pass_recover
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "if inventory.unreadable.is_empty() || pass == 1 {"
 new = "if true { // NON-VACUITY BREAK: omit the end-of-build failure pass."
+
+[[control]]
+id = "agent-data-cache-checkpoints-interrupted-builds"
+guards = "an interrupted cold build leaves bounded completed work reusable by the next boot"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::interrupted_build_checkpoints_and_reuses_completed_addresses"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "if stats.payload_reads > 0"
+new = "if false && stats.payload_reads > 0 // NON-VACUITY BREAK\n"
+
+[[control]]
+id = "agent-data-cache-ignores-unused-reader-capabilities"
+guards = "changes to the reader capability table do not invalidate unrelated cache entries"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::reader_feature_changes_invalidate_only_dependent_entries"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "if cache.version != CACHE_VERSION"
+new = "if cache.reader_features != reader_features() || cache.version != CACHE_VERSION // NON-VACUITY BREAK\n"
+
+[[control]]
+id = "agent-data-cache-checks-entry-frame-features"
+guards = "a cache entry using an unknown frame feature is decoded instead of reused"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::reader_feature_changes_invalidate_only_dependent_entries"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = ".all(|feature| known.contains(feature))"
+new = ".all(|feature| true) /* NON-VACUITY BREAK: ignore unknown frame requirements. */"
+
+[[control]]
+id = "agent-data-cache-records-original-frame-features"
+guards = "explicit frame requirements survive decoding into persisted inventory hints"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::cache_records_explicit_frame_requirements_not_just_record_features"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "range.used_features = used_features;"
+new = "range.used_features = Vec::new(); // NON-VACUITY BREAK: discard original envelope gates."

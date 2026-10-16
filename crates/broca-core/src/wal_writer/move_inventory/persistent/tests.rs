@@ -146,15 +146,55 @@ fn final_pass_recovers_a_transiently_unreadable_address() {
     let rig = Rig::new();
     let path = rig.root.join("wal/0123456789abcdef.wal");
     std::fs::create_dir(&path).unwrap();
-    build_after_pass(&rig.store, &CancellationToken::new(), |pass| {
-        if pass == 0 {
-            std::fs::remove_dir(&path).unwrap();
-            let mut wal = FileWal::open(&path).unwrap();
-            wal.append(1, &terminal(), true).unwrap();
-        }
-    });
+    build_with_hooks(
+        &rig.store,
+        &CancellationToken::new(),
+        |pass| {
+            if pass == 0 {
+                std::fs::remove_dir(&path).unwrap();
+                let mut wal = FileWal::open(&path).unwrap();
+                wal.append(1, &terminal(), true).unwrap();
+            }
+        },
+        |_| {},
+    );
     assert_eq!(rig.store.move_inventory_health(), (true, 0));
     assert_eq!(rig.store.move_inventory_build_stats().payload_reads, 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn interrupted_build_checkpoints_and_reuses_completed_addresses() {
+    let rig = Rig::new();
+    for i in 0..CHECKPOINT_ADDRESSES + 1 {
+        std::fs::write(rig.root.join("wal").join(format!("{i:016x}.wal")), []).unwrap();
+    }
+    let cancel = CancellationToken::new();
+    build_with_hooks(
+        &rig.store,
+        &cancel,
+        |_| {},
+        |completed| {
+            if completed == CHECKPOINT_ADDRESSES {
+                cancel.cancel();
+            }
+        },
+    );
+    assert!(cancel.is_cancelled());
+    let saved = load(&rig.store, &mut MoveInventoryBuildStats::default());
+    assert_eq!(
+        saved.len(),
+        CHECKPOINT_ADDRESSES,
+        "cancelled boot must leave reusable completed hints"
+    );
+    let restarted = FileWalStore::new(rig.root.join("wal"));
+    build(&restarted, &CancellationToken::new());
+    assert_eq!(restarted.move_inventory_health(), (true, 0));
+    assert_eq!(
+        restarted.move_inventory_build_stats().reused,
+        CHECKPOINT_ADDRESSES as u64
+    );
+    assert_eq!(restarted.move_inventory_build_stats().payload_reads, 1);
 }
 
 #[test]
