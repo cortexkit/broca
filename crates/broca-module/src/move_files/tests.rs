@@ -727,7 +727,15 @@ async fn import_reconciliation_syncs_staging_before_recording_imported() {
             assert_eq!(std::fs::read(&staged).unwrap(), plan.bytes);
         }
     }
-    let directory = rig.root.join("wal-staging").join(CUT);
+    // Import recovery repays this barrier through the rooted directory helper, which reports
+    // the resolved path. On macOS the scratch root sits under /var, a symlink to /private/var,
+    // so match the resolved spelling. (`stage` above syncs the path as given.)
+    let directory = rig
+        .root
+        .join("wal-staging")
+        .join(CUT)
+        .canonicalize()
+        .unwrap();
     let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpen), rig.wal.clone(), None);
     let export = Arc::new(broca_store::SqliteStore::open(rig.root.join("run-index.db")).unwrap());
     let artifacts = FileCutArtifacts::new(
