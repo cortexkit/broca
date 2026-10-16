@@ -13621,10 +13621,11 @@ new = '''{
                     sessions: state.expect("bound cut exists").sessions,
                     unreadable: Vec::new(),
                 };
+                // NON-VACUITY BREAK: read every local WAL again during bound-cut recovery.
                 if let Ok((addresses, _)) = self.wal.move_addresses() {
                     for address in addresses {
                         if let Err(error) = self.wal.read_address_records(&address) {
-                            tracing::error!(%address, %error, "NON-VACUITY BREAK: scan an unrelated WAL during cut recovery");
+                            tracing::error!(%address, %error, "scan during cut recovery");
                         }
                     }
                 }
