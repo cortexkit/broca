@@ -2325,3 +2325,79 @@ async fn late_receipt_during_model_wait_is_durable_without_resending_and_crash_r
     );
     let _ = writer.shutdown().await;
 }
+
+#[tokio::test]
+async fn boundary_cancel_during_compaction_wait_exits_cancelled_without_recall() {
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let bind = bind();
+    let inbox = Arc::new(CompactionInbox::default());
+    let boundary = crate::SteerInbox::new();
+    let control = crate::RunControl {
+        steer: Some(boundary.clone()),
+        ..Default::default()
+    };
+    let scripted = Scripted::new(
+        &shared,
+        ready(),
+        vec![json!({"answer":"wait","reason":"work","bound_ms":60000})],
+    );
+    let plane: Arc<dyn CompactionPlane> = scripted.clone();
+    let replies = runtime::CompactionReplies::new();
+    let runtime = runtime::Runtime {
+        provider: "provider",
+        bind: &bind,
+        plane: Some(&plane),
+        inbox: Some(&inbox),
+        writer: &writer,
+        control: &control,
+        replies: &replies,
+    };
+    let mut state = runtime.setup(setup(), &raw()).await.unwrap();
+    let driver = async {
+        loop {
+            if shared.frames().iter().any(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::CompactionAnswer {
+                        disposition: CompactionDisposition::Wait,
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        boundary
+            .request_boundary_cancel(&writer, &broca_protocol::RunId("r".into()))
+            .await
+            .unwrap();
+    };
+    let raw = raw();
+    let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            runtime.step(&mut state, status(), &raw, Some(10), None),
+            driver
+        )
+    })
+    .await
+    .expect("boundary cancellation must not wait out compaction's bound");
+    assert!(matches!(
+        result.unwrap(),
+        runtime::StepResult::Terminal(RunFinishReason::Cancelled, None)
+    ));
+    assert_eq!(
+        scripted.statuses.lock().unwrap().len(),
+        1,
+        "no compaction recall after cancellation"
+    );
+    assert!(shared.frames().iter().any(|frame| matches!(
+        frame.record,
+        WalRecord::CompactionWait {
+            exited: CompactionWaitExit::Cancel,
+            ..
+        }
+    )));
+    writer.shutdown().await.unwrap();
+}

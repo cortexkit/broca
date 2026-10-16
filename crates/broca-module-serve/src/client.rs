@@ -316,6 +316,7 @@ impl SessionClient {
     /// `run.cancel`: cooperatively stop a run by id.
     pub async fn cancel(&self, run_id: &str) -> Result<CancelResponse, ConnError> {
         let params = CancelParams {
+            at: None,
             run_id: run_id.to_string(),
         };
         self.request("run.cancel", &params, "decode cancel").await

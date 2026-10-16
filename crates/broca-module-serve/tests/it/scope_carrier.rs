@@ -1403,3 +1403,36 @@ async fn unknown_run_status_and_paused_cancel_match_the_role_contract() {
     );
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn unlisted_cancel_points_refuse_at_without_changing_the_run() {
+    let mut rig = Rig::start("cancel-unlisted", true, true).await;
+    rig.bind_ok(7, Some(core()), Some(stamp(core(), 1))).await;
+    let before = rig.wal_bytes();
+    for at in [
+        serde_json::json!("later"),
+        serde_json::json!(0),
+        serde_json::Value::Null,
+    ] {
+        let reply = rig
+            .request(
+                7,
+                serde_json::json!({"method":"run.cancel","params":{"run_id":"absent","at":at}}),
+            )
+            .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "invalid_params");
+        assert_eq!(error.detail.unwrap()["field"], "at");
+        assert_eq!(
+            rig.wal_bytes(),
+            before,
+            "refused cancellation must write nothing"
+        );
+    }
+    let head = rig
+        .request(7, serde_json::json!({"method":"session.head","params":{}}))
+        .await;
+    assert_eq!(head.header.ty, FrameType::Response);
+    rig.finish().await;
+}

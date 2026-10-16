@@ -26,10 +26,12 @@ struct State {
 }
 
 /// Steered messages waiting for the running turn's next step. Shared by the lineage actor and
-/// the one run it was created for.
+/// the one run it was created for. The same lock orders boundary cancellation before step
+/// admission, so the WAL can never place a new StepStarted after an accepted cancellation.
 #[derive(Default)]
 pub struct SteerInbox {
     state: Mutex<State>,
+    boundary_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl SteerInbox {
@@ -63,6 +65,60 @@ impl SteerInbox {
         let taken = std::mem::take(&mut state.pending);
         record();
         taken
+    }
+
+    /// Serialize cancellation and step admission with WAL order. The marker is queued before
+    /// waking the loop; its caller must sync before acknowledging the cancellation.
+    pub fn cancel_at_boundary<E>(&self, record: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+        let _state = self.lock();
+        if !self.boundary_cancel.is_cancelled() {
+            record()?;
+            self.boundary_cancel.cancel();
+        }
+        Ok(())
+    }
+
+    /// The acknowledgement barrier is shared by the actor and crash probes. A duplicate still
+    /// waits for the writer, so retrying after a failed barrier never acknowledges volatile data.
+    pub async fn request_boundary_cancel(
+        &self,
+        writer: &crate::WalHandle,
+        run_id: &broca_protocol::RunId,
+    ) -> Result<(), crate::WalWriteError> {
+        self.cancel_at_boundary(|| {
+            writer
+                .record(broca_wal::WalRecord::RunCancelRequested {
+                    run_id: run_id.clone(),
+                    at: broca_wal::record::RunCancelAt::StepBoundary,
+                })
+                .into_result()
+                .map(|_| ())
+        })?;
+        writer.sync().await?;
+        Ok(())
+    }
+
+    pub fn boundary_cancel(&self) -> &tokio_util::sync::CancellationToken {
+        &self.boundary_cancel
+    }
+
+    /// Replay has already proved the cancellation durable. Keep the actor's shared signal in
+    /// sync with that intent so a later immediate cancel records an escalation after a restart.
+    pub fn restore_boundary_cancel(&self) {
+        let _state = self.lock();
+        self.boundary_cancel.cancel();
+    }
+
+    /// A pending cancel and a new step cannot cross: whichever holds the lock first records
+    /// first. Returning None means no StepStarted was written and no steer was consumed.
+    pub fn try_take_at_step(&self, record: impl FnOnce()) -> Option<Vec<Message>> {
+        let mut state = self.lock();
+        if self.boundary_cancel.is_cancelled() {
+            return None;
+        }
+        let taken = std::mem::take(&mut state.pending);
+        record();
+        Some(taken)
     }
 
     /// At a final answer the turn could extend: close the inbox if nothing is queued and return

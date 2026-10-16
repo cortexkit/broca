@@ -763,6 +763,7 @@ impl Runtime<'_> {
             let exit = self.with_replies(state, async { tokio::select! {
                 biased;
                 _ = cancelled(self.control.cancel.as_ref()) => CompactionWaitExit::Cancel,
+                _ = cancelled(self.control.steer.as_ref().map(|inbox| inbox.boundary_cancel())) => CompactionWaitExit::Cancel,
                 _ = cancelled(self.control.stop_requested.as_ref()) => CompactionWaitExit::Stopped,
                 _ = async { match &self.control.shutdown_seal { Some(seal) => seal.tripped().await, None => std::future::pending().await } } => CompactionWaitExit::Stopped,
                 _ = clock_deadline(self.control.clock.as_ref(), wake) => if bound < cap && self.now() < cap { CompactionWaitExit::Bound } else if self.estimate_fits(estimate, status.context_window) { CompactionWaitExit::Cap } else { CompactionWaitExit::Exceeded },

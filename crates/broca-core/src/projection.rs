@@ -500,6 +500,8 @@ fn project_control_record<S: ControlProjectionSink>(
         // (a `RunStarted` unit does not carry its prompt either). It reaches readers through
         // `session.read`, placed where the model saw it.
         WalRecord::Steered { .. } => {}
+        // The request changes recovery, not lifecycle: only RunFinished publishes a terminal.
+        WalRecord::RunCancelRequested { .. } => {}
         // A record type written by a newer build: informational by the contract on
         // `WalRecord`, so it emits no control unit and leaves the projection state untouched.
         WalRecord::Unknown => {}

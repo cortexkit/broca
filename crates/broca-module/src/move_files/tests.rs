@@ -379,6 +379,7 @@ async fn actor_critical_section_holds_dispatch_until_completion_and_then_refuses
     let (reply, wait) = tokio::sync::oneshot::channel();
     handle
         .send(crate::actor::LineageCmd::Cancel {
+            at: broca_wal::record::RunCancelAt::Now,
             run_id: broca_protocol::RunId("new".into()),
             reply,
         })

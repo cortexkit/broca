@@ -2745,3 +2745,39 @@ async fn unreadable_answer_does_not_advance_cursor() {
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 1);
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn boundary_cancel_preserves_active_approval_wait_until_immediate_escalation() {
+    let mut rig = Rig::new("pass", "none", false, false);
+    let inbox = crate::SteerInbox::new();
+    let immediate = CancellationToken::new();
+    rig.control.steer = Some(inbox.clone());
+    rig.control.cancel = Some(immediate.clone());
+    let mut batch = Box::pin(rig.batch(&crate::AllowAll, vec![call("held")], None, false));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut batch => panic!("approval wait ended early: {:?}", result.interruption),
+            () = async {
+                while rig.questions.outstanding.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+            } => {},
+        }
+    }).await.unwrap();
+    inbox
+        .request_boundary_cancel(&rig.writer, &RunId("r".into()))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut batch)
+            .await
+            .is_err(),
+        "the current tool batch must retain its pending human decision"
+    );
+    assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
+    immediate.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut batch)
+        .await
+        .unwrap();
+    assert_eq!(result.interruption, Some(BatchInterruption::CallerCancel));
+    drop(batch);
+    rig.finish().await;
+}

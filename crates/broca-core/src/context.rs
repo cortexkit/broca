@@ -1301,6 +1301,7 @@ pub fn resume_state_from_store(
         )
     };
     Ok(crate::ReplayState {
+        cancel_at: tail_state.cancel_at,
         // This prefix supplies model input rather than transcript reads, so it carries no run metadata.
         message_runs: vec![None; prompt.len()],
         run_finals: tail_state.run_finals,

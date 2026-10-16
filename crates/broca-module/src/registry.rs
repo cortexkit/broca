@@ -1694,6 +1694,16 @@ impl LineageRegistry {
         key: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_at(key, run_id, broca_wal::record::RunCancelAt::Now)
+            .await
+    }
+
+    pub async fn route_cancel_at(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
         use crate::actor::{CancelOutcome, LineageCmd};
         loop {
             self.check_move(key, true)?;
@@ -1702,6 +1712,7 @@ impl LineageRegistry {
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Cancel {
                 run_id: run_id.clone(),
+                at,
                 reply,
             };
             if handle.send(cmd).await.is_err() {

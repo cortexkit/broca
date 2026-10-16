@@ -179,9 +179,10 @@ pub enum LineageCmd {
         request: Box<broca_core::ImportRequest>,
         reply: oneshot::Sender<ImportOutcome>,
     },
-    /// Cancel a run by id (cooperative → Interrupted). Replies an ack.
+    /// Cancel a run by id. A boundary request preserves the in-flight step and tool batch.
     Cancel {
         run_id: RunId,
+        at: broca_wal::record::RunCancelAt,
         reply: oneshot::Sender<CancelOutcome>,
     },
     /// Retract a still-pending queued submission (durable tombstone). Replies the outcome.
@@ -1755,8 +1756,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = reply.send(outcome);
                 false
             }
-            LineageCmd::Cancel { run_id, reply } => {
-                let _ = reply.send(self.on_cancel(&run_id).await);
+            LineageCmd::Cancel { run_id, at, reply } => {
+                let _ = reply.send(self.on_cancel_at(&run_id, at).await);
                 false
             }
             LineageCmd::Retract {
@@ -2137,6 +2138,29 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             self.approvals.finished(&episode_run_id);
             return self.drain_queue_one().await;
+        }
+
+        if episode.cancel_at.is_some() {
+            let mut request = submission_from_config(episode_config, episode_input);
+            request.keep_warm = episode_keep_warm;
+            request.on_restart = episode_on_restart;
+            return self
+                .start_run(
+                    episode_run_id,
+                    request,
+                    RunKind::FreshOrResume,
+                    None,
+                    SendIdentity {
+                        title: None,
+                        conversation_key: None,
+                        send_id: None,
+                        request_identity_digest: episode_request_identity_digest,
+                    },
+                    false,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
         }
 
         if episode_disposition == EpisodeDisposition::Paused
@@ -4460,7 +4484,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
     }
 
-    async fn on_cancel(&mut self, run_id: &RunId) -> CancelOutcome {
+    async fn on_cancel_at(
+        &mut self,
+        run_id: &RunId,
+        at: broca_wal::record::RunCancelAt,
+    ) -> CancelOutcome {
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
             return match error.into_move_refusal() {
                 Ok(broca_wal::migration::MoveRefusal::Moving { cut_id }) => {
@@ -4475,10 +4503,50 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let RunState::Active {
             run_id: active,
             cancel,
+            steer,
+            durable_finish,
             ..
         } = &self.state
         {
             if active == run_id {
+                if durable_finish.get().is_some() {
+                    return CancelOutcome::NotActive;
+                }
+                if cancel.is_cancelled() {
+                    return CancelOutcome::Ack;
+                }
+                if at == broca_wal::record::RunCancelAt::StepBoundary {
+                    let writer = self
+                        .writer
+                        .as_ref()
+                        .expect("an active actor owns its writer");
+                    if let Err(error) = steer.request_boundary_cancel(writer, run_id).await {
+                        return CancelOutcome::Error(error.to_string());
+                    }
+                    self.pending_cancels.insert(
+                        run_id.clone(),
+                        self.skip_materialization_runs.contains(run_id),
+                    );
+                    return CancelOutcome::Ack;
+                }
+                if steer.boundary_cancel().is_cancelled() {
+                    let writer = self
+                        .writer
+                        .as_ref()
+                        .expect("an active actor owns its writer");
+                    if let Err(error) = writer
+                        .record(WalRecord::RunCancelRequested {
+                            run_id: run_id.clone(),
+                            at,
+                        })
+                        .into_result()
+                    {
+                        return CancelOutcome::Error(error.to_string());
+                    }
+                    if let Err(error) = writer.sync().await {
+                        return CancelOutcome::Error(error.to_string());
+                    }
+                }
                 cancel.cancel();
                 self.pending_cancels.insert(
                     run_id.clone(),
@@ -4500,6 +4568,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let skip_materialization = self.skip_materialization_runs.contains(run_id);
+        if at == broca_wal::record::RunCancelAt::StepBoundary {
+            let writer = self.writer.as_ref().expect("an open actor owns its writer");
+            if let Err(error) = writer
+                .record(WalRecord::RunCancelRequested {
+                    run_id: run_id.clone(),
+                    at,
+                })
+                .into_result()
+            {
+                return CancelOutcome::Error(error.to_string());
+            }
+            if let Err(error) = writer.sync().await {
+                return CancelOutcome::Error(error.to_string());
+            }
+        }
         self.pending_cancels
             .insert(run_id.clone(), skip_materialization);
         match self
@@ -4836,11 +4919,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 attempt_id: active_attempt,
                 run_id: durable,
                 cancel,
+                steer,
                 skip_materialization,
                 ..
             } if *task_run_id == run_id && *active_attempt == attempt_id => (
                 durable.clone(),
-                cancel.is_cancelled(),
+                cancel.is_cancelled() || steer.boundary_cancel().is_cancelled(),
                 *skip_materialization,
             ),
             // Stale terminal (backstop already fired, or a different/older run) — ignore.
@@ -5388,7 +5472,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let sealable = match snapshot.checkpoint_at_head.last_episode.as_ref() {
             // The index may still list an older episode's run; only the LAST episode can be
             // unfinished, so a mark for any other run is left alone.
-            Some(episode) if candidates.contains(&episode.run_id) => {
+            Some(episode)
+                if candidates.contains(&episode.run_id) && episode.cancel_at.is_none() =>
+            {
                 let tail: Vec<WalRecord> = snapshot
                     .tail
                     .iter()

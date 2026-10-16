@@ -9276,9 +9276,9 @@ target = "--lib"
 test_file = "crates/broca-module/src/move_files/tests.rs"
 expect_red = ["move_files::tests::actor_critical_section_holds_dispatch_until_completion_and_then_refuses_warm"]
 file = "crates/broca-module/src/actor.rs"
-old = '''async fn on_cancel(&mut self, run_id: &RunId) -> CancelOutcome {
+old = ''') -> CancelOutcome {
         if let Err(error) = self.wal_store.check_move(&self.key, true) {'''
-new = '''async fn on_cancel(&mut self, run_id: &RunId) -> CancelOutcome {
+new = ''') -> CancelOutcome {
         if let Err(error) = Ok::<(), broca_wal::WalError>(()) { // NON-VACUITY BREAK'''
 
 [[control]]
@@ -14380,3 +14380,64 @@ expect_red = ["inventory::route_goodbye_does_not_drop_prepare_between_freeze_and
 file = "crates/broca-module-serve/src/agent_data.rs"
 old = '| "agent_data.status"'
 new = '| "agent_data.status" | "agent_data.prepare" /* NON-VACUITY BREAK: cancel prepare after its freeze. */'
+
+[[control]]
+id = "core-boundary-cancel-durable-before-ack"
+guards = "a step-boundary cancellation is synced before its acknowledgement can complete"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/boundary_cancel_tests.rs"
+expect_red = ["run::boundary_cancel_tests::boundary_cancel_ack_waits_for_durable_marker"]
+file = "crates/broca-core/src/steer.rs"
+old = '''        writer.sync().await?;
+        Ok(())'''
+new = '''        // NON-VACUITY BREAK: acknowledge without the cancellation barrier.
+        Ok(())'''
+
+[[control]]
+id = "core-boundary-cancel-no-next-step"
+guards = "neither the boundary check nor atomic step admission permits a StepStarted after cancellation"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/run/boundary_cancel_tests.rs"
+expect_red = ["run::boundary_cancel_tests::boundary_cancel_finishes_model_and_entire_tool_batch"]
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = "if is_cancelled(control) || boundary_cancelled(control) || recovered_cancel {"
+new = "if is_cancelled(control) { // NON-VACUITY BREAK: ignore boundary cancellation."
+[[control.edits]]
+file = "crates/broca-core/src/steer.rs"
+old = '''        if self.boundary_cancel.is_cancelled() {
+            return None;
+        }'''
+new = '''        if false { // NON-VACUITY BREAK: let atomic step admission ignore cancellation.
+            return None;
+        }'''
+
+[[control]]
+id = "module-boundary-cancel-immediate-escalation"
+guards = "immediate cancellation still aborts a held model while a boundary cancellation is pending"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test steer_interrupt"
+test_file = "crates/broca-crash-harness/tests/it/boundary_cancel.rs"
+expect_red = ["boundary_cancel::boundary_cancel_then_immediate_is_durable_and_cannot_be_downgraded"]
+file = "crates/broca-module/src/actor.rs"
+old = '''                cancel.cancel();
+                self.pending_cancels.insert('''
+new = '''                if !steer.boundary_cancel().is_cancelled() { cancel.cancel(); } // NON-VACUITY BREAK: ignore escalation during a boundary cancel.
+                self.pending_cancels.insert('''
+
+[[control]]
+id = "core-boundary-cancel-restores-shared-signal"
+guards = "a resumed pending boundary cancellation is idempotent and later immediate escalation is durable"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test steer_interrupt"
+test_file = "crates/broca-crash-harness/tests/it/boundary_cancel.rs"
+expect_red = ["boundary_cancel::recovered_boundary_cancel_remains_idempotent_and_immediate_escalation_is_durable"]
+file = "crates/broca-core/src/run.rs"
+old = "inbox.restore_boundary_cancel();"
+new = "// NON-VACUITY BREAK: leave the actor unaware of replayed cancellation."

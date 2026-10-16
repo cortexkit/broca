@@ -171,6 +171,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     PLAN_MANIFEST_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
+    RUN_CANCEL_AT_FEATURE,
     SCOPE_FEATURE,
     STEER_QUEUE_FEATURE,
     STEP_TRANSFORMS_FEATURE,
@@ -207,6 +208,9 @@ pub const RESTART_PAUSE_FEATURE: &str = "restart-pause/v1";
 /// must not ignore them and keep content indefinitely. Reader builds enforce retention across
 /// admission, projection, reads and deletion; production sends stay off until capability rollout.
 pub const RETENTION_FEATURE: &str = "retention/v1";
+
+/// Pending cancellation changes recovery's next action, so a reader may not skip it.
+pub const RUN_CANCEL_AT_FEATURE: &str = "run-cancel-at/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -834,6 +838,7 @@ mod tests {
                 PLAN_MANIFEST_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
+                RUN_CANCEL_AT_FEATURE,
                 SCOPE_FEATURE,
                 STEER_QUEUE_FEATURE,
                 STEP_TRANSFORMS_FEATURE,

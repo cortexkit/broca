@@ -909,6 +909,24 @@ pub trait ServeHandler: Send + Sync {
         run_id: broca_protocol::RunId,
     ) -> Result<CancelResponse, ServeError>;
 
+    /// Boundary-aware adapter. Implementations without the runtime must refuse, not silently
+    /// convert a boundary cancellation into an immediate one.
+    async fn cancel_at(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<CancelResponse, ServeError> {
+        if at == broca_wal::record::RunCancelAt::Now {
+            self.cancel(session, run_id).await
+        } else {
+            Err(ServeError::Open(
+                "step-boundary cancellation is not installed".into(),
+                None,
+            ))
+        }
+    }
+
     /// `run.status` / `session.status` — the lineage's current state.
     async fn status(&self, session: &LineageKey) -> Result<StatusResponse, ServeError>;
 
@@ -1831,8 +1849,18 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<CancelResponse, ServeError> {
+        self.cancel_at(session, run_id, broca_wal::record::RunCancelAt::Now)
+            .await
+    }
+
+    async fn cancel_at(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
-        match self.route_cancel(session, run_id).await? {
+        match self.route_cancel_at(session, run_id, at).await? {
             CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
             CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),

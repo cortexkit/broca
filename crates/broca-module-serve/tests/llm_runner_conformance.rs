@@ -49,7 +49,7 @@ use tokio::time::{sleep, Instant};
 /// The scripted tool provider's module id: what broca records as each call's `dispatched_to`.
 const TOOL_MODULE: &str = "conformance-tools";
 /// The stand-in module whose launch nonce gives the suite a second caller identity.
-const STRANGER: &str = "conformance-stranger";
+const OWNER_MODULE: &str = "conformance-owner";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
 /// The harness every session the suite opens is bound under.
@@ -64,6 +64,8 @@ fn require_compaction_test_clock() {
 
 #[path = "llm_runner_conformance/attribution.rs"]
 mod attribution;
+#[path = "llm_runner_conformance/boundary_cancel.rs"]
+mod boundary_cancel;
 #[path = "llm_runner_conformance/evidence.rs"]
 mod evidence;
 #[path = "llm_runner_conformance/optional_tools.rs"]
@@ -145,6 +147,8 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
+    raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
     compaction_clocks: Mutex<HashMap<PathBuf, u64>>,
@@ -350,6 +354,15 @@ async fn serve_model_request(
             .get(session)
             .and_then(|script| script.turns.get(turn_index).cloned())
     });
+    if let Some(session) = &session {
+        shared
+            .raw_bodies
+            .lock()
+            .unwrap()
+            .entry(session.clone())
+            .or_default()
+            .push(buffer[body_start..body_start + length].to_vec());
+    }
     let Some(turn) = turn else {
         eprintln!(
             "unmatched conformance model request: model={} session={session:?}",
@@ -380,6 +393,14 @@ async fn serve_model_request(
         .entry(session.clone())
         .or_default()
         .push(request.clone());
+    let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
+    if let Some(gate) = model_gate {
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::select! {
+            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
+            () = shared.released.notified() => return Ok(()),
+        }
+    }
     // The first model request of a run comes right after its start record is durable, and the
     // one after a tool call right after that call's result is.
     let point = if turn_index == 0 {
@@ -569,7 +590,7 @@ fn tool_manifest() -> subc_protocol::manifest::ModuleManifest {
 struct Live {
     daemon: Option<broca_test_support::RigChild>,
     connection_file: PathBuf,
-    stranger_nonce: PathBuf,
+    owner_nonce: PathBuf,
     state_root: PathBuf,
     logs_dir: PathBuf,
     tools: tokio::task::JoinHandle<()>,
@@ -687,8 +708,8 @@ impl BrocaSubject {
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
-        let stranger_nonce = root.join("stranger.nonce");
-        let _ = std::fs::remove_file(&stranger_nonce);
+        let owner_nonce = root.join("owner.nonce");
+        let _ = std::fs::remove_file(&owner_nonce);
         let connection_file = runtime_dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
         let config = json!({
@@ -709,12 +730,12 @@ impl BrocaSubject {
                     },
                     "enabled": true
                 },
-                STRANGER: {
+                OWNER_MODULE: {
                     "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
                     "args": [],
                     "env": {
-                        "FAKE_AFT_MODULE_ID": STRANGER,
-                        "FAKE_AFT_LAUNCH_NONCE_PATH": stranger_nonce,
+                        "FAKE_AFT_MODULE_ID": OWNER_MODULE,
+                        "FAKE_AFT_LAUNCH_NONCE_PATH": owner_nonce,
                     },
                     "enabled": true,
                     "reserved": true,
@@ -787,7 +808,7 @@ impl BrocaSubject {
         Ok(Live {
             daemon: Some(daemon),
             connection_file,
-            stranger_nonce,
+            owner_nonce,
             state_root,
             logs_dir: data_home.join("cortexkit/broca/logs"),
             tools,
@@ -811,7 +832,7 @@ impl BrocaSubject {
         } else {
             let deadline = Instant::now() + Duration::from_secs(20);
             let nonce = loop {
-                if let Ok(text) = std::fs::read_to_string(&live.stranger_nonce) {
+                if let Ok(text) = std::fs::read_to_string(&live.owner_nonce) {
                     if !text.trim().is_empty() {
                         break text.trim().to_owned();
                     }
@@ -824,7 +845,7 @@ impl BrocaSubject {
                 sleep(Duration::from_millis(25)).await;
             };
             Some(ConsumerIdentity {
-                module_id: STRANGER.into(),
+                module_id: OWNER_MODULE.into(),
                 launch_nonce: nonce,
             })
         };
@@ -1306,6 +1327,53 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn hold_next_model_step(&self, session: &str) -> Result<(), HarnessError> {
+        self.shared
+            .model_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), Arc::default());
+        Ok(())
+    }
+
+    async fn await_model_step(&self, session: &str) -> Result<(), HarnessError> {
+        let gate = self
+            .shared
+            .model_holds
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .ok_or_else(|| HarnessError::new("no model hold installed"))?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            HoldGate::wait(&gate.arrived, &gate.arrived_wake),
+        )
+        .await
+        .map_err(|_| HarnessError::new("model did not reach its hold"))
+    }
+
+    async fn release_model_step(&self, session: &str) -> Result<(), HarnessError> {
+        let gate = self
+            .shared
+            .model_holds
+            .lock()
+            .unwrap()
+            .remove(session)
+            .ok_or_else(|| HarnessError::new("no model hold installed"))?;
+        HoldGate::set(&gate.released, &gate.released_wake);
+        Ok(())
+    }
+
+    async fn model_invocations(&self, session: &str) -> Result<usize, HarnessError> {
+        Ok(self
+            .shared
+            .raw_bodies
+            .lock()
+            .unwrap()
+            .get(session)
+            .map_or(0, Vec::len))
+    }
     fn capabilities(&self) -> BTreeSet<Capability> {
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
@@ -1334,15 +1402,17 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn owner_stamp(&self) -> RouteStamp {
+        // A direct caller does not freeze an attested owner, so using one here would make
+        // stranger cancellation legitimately admissible on an otherwise unowned session.
         RouteStamp {
-            principal: "direct".into(),
+            principal: format!("reserved:{OWNER_MODULE}"),
             scope: None,
         }
     }
 
     fn stranger_stamp(&self) -> RouteStamp {
         RouteStamp {
-            principal: format!("reserved:{STRANGER}"),
+            principal: "direct".into(),
             scope: None,
         }
     }
@@ -1827,6 +1897,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     // a case that drifts to skipped or inapplicable would otherwise pass this test without
     // checking anything.
     for name in [
+        "run_cancel_step_boundary_finishes_tool_batch",
+        "run_cancel_unlisted_at_refused",
+        "run_cancel_step_boundary_escalates_to_now",
         "send_id_retry_same_answer",
         "run_attribution_per_message",
         "send_id_reuse_refused_naming_field",
