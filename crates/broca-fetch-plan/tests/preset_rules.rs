@@ -54,7 +54,7 @@ fn daemon_preset_syntax_boundaries_are_checked_for_every_item_role() {
 }
 
 #[test]
-fn composition_compaction_is_refused_even_when_null() {
+fn composition_compaction_without_an_item_is_refused_even_when_null() {
     for compaction in [Value::Null, json!({"provider": "aft"})] {
         let mut value = plan();
         value["composition"]["compaction"] = compaction;
@@ -124,6 +124,7 @@ fn compaction_refusal_is_preserved_for_approve_subscriptions() {
     });
     value["step_transform_items"] = json!([item.clone()]);
     value["composition"]["step_transform_items"] = json!([item]);
+    value["composition"]["compaction"] = json!({"provider": "aft"});
     value["composition_digest"] = json!(cortexkit_role_tool_provider::catalog::composition_digest(
         &value["composition"]
     )

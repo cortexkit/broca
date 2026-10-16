@@ -189,27 +189,20 @@ fn load(relative: &str) -> Value {
         .unwrap()
 }
 
-/// `plan` without its `compaction_item`. broca does not take a compaction provider, so it is
-/// sent the same plan without one; a vector plan naming one stands for a runner that does.
-fn without_compaction(mut plan: Value) -> Value {
-    plan.as_object_mut().unwrap().remove("compaction_item");
-    plan
-}
-
 fn carries_compaction(plan: &Value) -> bool {
     plan.get("compaction_item").is_some()
 }
 
-/// The vector plan at `relative`, as broca is sent it: without a compaction item.
+/// The vector plan at `relative`, unchanged, for a compaction-capable runner.
 fn broca_plan(relative: &str) -> Plan {
     parse_plan(
-        &without_compaction(load(relative)),
-        broca_fetch_plan::CompactionSupport::Unsupported,
+        &load(relative),
+        broca_fetch_plan::CompactionSupport::Supported,
     )
     .unwrap()
 }
 
-/// The refusal broca answers a well-formed plan that names a compaction provider with.
+/// A reader without the compaction writer surface refuses a well-formed compaction plan.
 fn compaction_refusal() -> Value {
     json!({"field": "plan.compaction_item"})
 }
@@ -246,17 +239,6 @@ fn every_digested_vector_matches_broca_canonicalisation() {
             assert_eq!(sha256_hex(&jcs), digest, "{folder}/{stem}");
             assert_eq!(plan_identity(&value).unwrap(), digest, "{folder}/{stem}");
             if folder == "plans" {
-                if value["composition"].get("compaction").is_some() {
-                    assert_eq!(
-                        parse_plan(&value, broca_fetch_plan::CompactionSupport::Unsupported)
-                            .unwrap_err()
-                            .detail(),
-                        json!({"field": "plan.composition.compaction"}),
-                        "{stem}"
-                    );
-                    checked += 1;
-                    continue;
-                }
                 if carries_compaction(&value) {
                     assert_eq!(
                         parse_plan(&value, broca_fetch_plan::CompactionSupport::Unsupported)
@@ -266,11 +248,8 @@ fn every_digested_vector_matches_broca_canonicalisation() {
                         "{stem}"
                     );
                 }
-                let plan = parse_plan(
-                    &without_compaction(value.clone()),
-                    broca_fetch_plan::CompactionSupport::Unsupported,
-                )
-                .unwrap_or_else(|r| panic!("{stem}: {r:?}"));
+                let plan = parse_plan(&value, broca_fetch_plan::CompactionSupport::Supported)
+                    .unwrap_or_else(|r| panic!("{stem}: {r:?}"));
                 // A plan that only reorders another's texts shares that plan's composition and
                 // has no composition file of its own.
                 if root()
@@ -336,31 +315,13 @@ fn catalog_requests_are_built_as_recorded() {
         .filter_map(|e| {
             let relative = format!("plans/{}", e.file_name().to_string_lossy());
             parse_plan(
-                &without_compaction(load(&relative)),
-                broca_fetch_plan::CompactionSupport::Unsupported,
+                &load(&relative),
+                broca_fetch_plan::CompactionSupport::Supported,
             )
             .ok()
         })
         .collect();
     for (name, case) in cases.as_object().unwrap() {
-        if case["request"]["composition"]["step_transform_items"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty())
-        {
-            let plan = load("plans/pre-tool-declared.json");
-            let refusal = parse_plan(
-                &without_compaction(plan),
-                broca_fetch_plan::CompactionSupport::Unsupported,
-            )
-            .unwrap_err();
-            assert_eq!(refusal.code(), "invalid_params", "{name}");
-            assert_eq!(
-                refusal.detail(),
-                json!({"field": "plan.composition.compaction"}),
-                "{name}"
-            );
-            continue;
-        }
         let provider = case["provider"].as_str().unwrap();
         let found = plans.iter().any(|plan| {
             let tool = plan.tool_items.iter().find(|i| i.provider == provider);
@@ -392,10 +353,7 @@ fn tool_item_params_reach_the_catalog_request_unchanged() {
     entries.sort();
     for name in entries {
         let raw = load(&format!("plans/{name}"));
-        let Ok(plan) = parse_plan(
-            &without_compaction(raw.clone()),
-            broca_fetch_plan::CompactionSupport::Unsupported,
-        ) else {
+        let Ok(plan) = parse_plan(&raw, broca_fetch_plan::CompactionSupport::Supported) else {
             continue;
         };
         for (index, item) in raw["tool_items"]
@@ -429,8 +387,8 @@ fn send_vectors_carry_admissible_plans() {
         let send = load(send);
         check_send_members(send.as_object().unwrap()).unwrap();
         parse_plan(
-            &without_compaction(send["plan"].clone()),
-            broca_fetch_plan::CompactionSupport::Unsupported,
+            &send["plan"],
+            broca_fetch_plan::CompactionSupport::Supported,
         )
         .unwrap();
     }
@@ -635,8 +593,17 @@ impl Fetcher for Simulated {
         }
     }
 
-    async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
-        panic!("broca's vector plans are admitted without their compaction item")
+    async fn describe_compaction(&self, provider: &str) -> Result<DescribeAnswer, FetchError> {
+        assert_eq!(
+            self.plan.compaction_item.as_ref().unwrap().provider,
+            provider
+        );
+        Ok(DescribeAnswer::Answered(json!({
+            "majors": [{"version": "compaction-provider/v1",
+                "ops": ["role.describe", "compaction.setup", "compaction.step"],
+                "stability": "alpha"}],
+            "implementation_version": "test", "capabilities": []
+        })))
     }
 
     async fn declare(&self, provider: &str, request: &DeclareRequest) -> Result<Value, FetchError> {
@@ -683,7 +650,7 @@ async fn run_first_send_of(
     case: &Value,
     plan: Value,
 ) -> Result<broca_fetch_plan::Admitted, Refusal> {
-    let plan = parse_plan(&plan, broca_fetch_plan::CompactionSupport::Unsupported)?;
+    let plan = parse_plan(&plan, broca_fetch_plan::CompactionSupport::Supported)?;
     if let Some(composition) = case.get("composition").and_then(Value::as_str) {
         if case.get("plan_inline").is_none() {
             assert_eq!(Value::Object(plan.composition.clone()), load(composition));
@@ -761,9 +728,8 @@ fn check_refusal(name: &str, refusal: &Refusal, expected: &Value) {
     assert_eq!(expected["writes"], "nothing", "{name}");
 }
 
-/// The commons hook vectors include compaction composition data for runners that support
-/// it. Remove only that unsupported member; the subscriptions and expected differences stay
-/// exactly as recorded.
+/// Subscription-refusal vectors retain their compaction data and assert the recorded
+/// differences between planned subscriptions and the provider's declaration.
 #[tokio::test]
 async fn loosened_subscriptions_match_the_exact_commons_differences() {
     for name in [
@@ -777,15 +743,8 @@ async fn loosened_subscriptions_match_the_exact_commons_differences() {
         "refuse-declared-preset-gone-two-subscriptions.json",
     ] {
         let case = load(&format!("admission/{name}"));
-        let mut raw = without_compaction(case_plan(&case).unwrap());
-        raw["composition"]
-            .as_object_mut()
-            .unwrap()
-            .remove("compaction");
-        raw["composition_digest"] = json!(
-            cortexkit_role_tool_provider::catalog::composition_digest(&raw["composition"]).unwrap()
-        );
-        let plan = parse_plan(&raw, broca_fetch_plan::CompactionSupport::Unsupported).unwrap();
+        let raw = case_plan(&case).unwrap();
+        let plan = parse_plan(&raw, broca_fetch_plan::CompactionSupport::Supported).unwrap();
         let fetcher = Simulated::new(plan.clone(), &case);
         let refusal = admit(&plan, &fetcher, ADMISSION_DEADLINE)
             .await
@@ -794,7 +753,7 @@ async fn loosened_subscriptions_match_the_exact_commons_differences() {
     }
 }
 
-/// Each JSON admission case for a runner that supports neither hooks nor compaction matches its expected result.
+/// Admission cases run unchanged with compaction support and simulated hook declarations.
 #[tokio::test(start_paused = true)]
 async fn every_admission_vector_holds() {
     let mut names: Vec<String> = std::fs::read_dir(root().join("admission"))
@@ -809,31 +768,21 @@ async fn every_admission_vector_holds() {
     let mut skipped = Vec::new();
     for name in names {
         let case = load(&format!("admission/{name}"));
-        // Cases requiring hooks or compaction belong to runners with those contracts.
-        // The optional-tool two-phase case also carries composition.compaction, which
-        // broca still rejects, so it is kept as an identity fixture rather than executed.
-        if case["runner_declaration"]["hooks"] != false
-            || case["runner_declaration"]["compaction"] != false
+        // A hookless runner refuses hook items before calling this crate's admission API.
+        // These twins test that runner gate, which the simulated fetcher does not implement.
+        if case["runner_declaration"]["hooks"] == false
+            && case.get("later_plan").is_none()
+            && case_plan(&case).is_ok_and(|plan| {
+                plan["step_transform_items"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+            })
         {
             skipped.push(name);
             continue;
         }
         let expected = &case["expected"];
         if case.get("later_plan").is_some() {
-            // A first send whose plan names a compaction provider is refused by broca before
-            // anything is frozen; the identity comparison the case records is checked as is.
-            if let Some(send) = case.get("first_send") {
-                let first = &load(send.as_str().unwrap())["plan"];
-                if carries_compaction(first) {
-                    assert_eq!(
-                        parse_plan(first, broca_fetch_plan::CompactionSupport::Unsupported)
-                            .unwrap_err()
-                            .detail(),
-                        compaction_refusal(),
-                        "{name}"
-                    );
-                }
-            }
             match run_later_send(&case) {
                 Ok(()) => {
                     assert_eq!(expected["admitted"], true, "{name}");
@@ -843,27 +792,8 @@ async fn every_admission_vector_holds() {
             }
             continue;
         }
-        // The vectors record what a runner that takes a compaction provider answers. broca does
-        // not take one, so a well-formed plan naming one is refused `plan.compaction_item`
-        // (a plan malformed in itself, or a send carrying a member the plan replaces, is refused
-        // for that first, as recorded). Everything else the case pins is checked on the same
-        // plan without its compaction item.
-        let plan = case_plan(&case);
-        let refused_first_as_recorded = expected["code"] == "invalid_params";
-        if let Ok(plan) = &plan {
-            if carries_compaction(plan) && !refused_first_as_recorded {
-                let refusal = run_first_send(&case).await.unwrap_err();
-                assert_eq!(refusal.code(), "invalid_params", "{name}");
-                assert_eq!(refusal.detail(), compaction_refusal(), "{name}");
-            }
-        }
         let started = tokio::time::Instant::now();
-        let outcome = match plan {
-            Ok(plan) if !refused_first_as_recorded => {
-                run_first_send_of(&case, without_compaction(plan)).await
-            }
-            _ => run_first_send(&case).await,
-        };
+        let outcome = run_first_send(&case).await;
         assert!(
             started.elapsed() <= ADMISSION_DEADLINE,
             "{name}: admission ran past its deadline"
@@ -901,15 +831,12 @@ async fn every_admission_vector_holds() {
             "missing skipped twin {twin}; skipped: {skipped:?}"
         );
     }
-    assert!(
-        !skipped.is_empty(),
-        "runner-declaration filter selected every vector; skipped: {skipped:?}"
-    );
-    assert!(skipped
+    assert_eq!(skipped.len(), 4, "unexpected filtered vectors: {skipped:?}");
+    assert!(!skipped
         .iter()
         .any(|name| name == "admit-optional-tool-two-phase.json"));
     eprintln!(
-        "admission vectors: {} executed, {} generic runner cases filtered",
+        "admission vectors: {} executed, {} hookless runner cases filtered",
         total - skipped.len(),
         skipped.len()
     );
@@ -921,9 +848,7 @@ async fn a_timeout_waits_out_exactly_the_deadline() {
     let case = load("admission/refuse-required-timeout.json");
     let plan = case_plan(&case).unwrap();
     let started = tokio::time::Instant::now();
-    let refusal = run_first_send_of(&case, without_compaction(plan))
-        .await
-        .unwrap_err();
+    let refusal = run_first_send_of(&case, plan).await.unwrap_err();
     assert_eq!(refusal.code(), "fetch_unavailable");
     assert_eq!(started.elapsed(), ADMISSION_DEADLINE);
 }
@@ -1210,10 +1135,7 @@ async fn hook_only_manifest_vector_refuses_before_fetch() {
     let value = load("plans/text-only-and-hook-only.json");
     let refusal = parse_plan(&value, broca_fetch_plan::CompactionSupport::Unsupported).unwrap_err();
     assert_eq!(refusal.code(), "invalid_params");
-    assert_eq!(
-        refusal.detail(),
-        json!({"field": "plan.composition.compaction"})
-    );
+    assert_eq!(refusal.detail(), compaction_refusal());
 }
 
 /// Texts are joined in plan order with the fixed separator. An empty text adds neither bytes nor

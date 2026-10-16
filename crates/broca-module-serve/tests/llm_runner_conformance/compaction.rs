@@ -409,7 +409,8 @@ impl BrocaSubject {
         }
         let composition = json!({"providers":[
             {"provider":MODULE,"tools":[]},
-            {"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],"step_transform_items":[]});
+            {"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],
+            "compaction":{"provider":MODULE},"step_transform_items":[]});
         // A distinct model id carries test identity without adding a message to the
         // transcript. The HTTP capture rejects unknown ids rather than guessing a session.
         let mut fields =

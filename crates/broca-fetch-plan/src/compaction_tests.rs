@@ -18,11 +18,14 @@ fn raw_plan(provider: &str, owner: Option<&str>, op: &str) -> Value {
     }
     providers.sort();
     providers.dedup();
-    let composition = json!({
+    let mut composition = json!({
         "providers": providers.iter().map(|provider| json!({"provider": provider, "tools": []})).collect::<Vec<_>>(),
         "step_transform_items": steps,
         "extra": {"opaque": [null, false, 7]}
     });
+    if let Some(owner) = owner {
+        composition["compaction"] = json!({"provider": owner});
+    }
     let mut plan = json!({
         "tool_items": [], "system_text_items": [], "step_transform_items": steps,
         "composition_digest": composition_digest(&composition).unwrap(), "composition": composition
@@ -51,6 +54,94 @@ fn compaction_support_is_explicit_and_unsupported_keeps_the_refusal() {
             .detail(),
         json!({"field": "plan.compaction_item"})
     );
+}
+
+#[test]
+fn parser_preserves_the_matching_compaction_composition_in_catalog_requests() {
+    let mut raw = raw_plan("magic-context", Some("magic-context"), "replace");
+    raw["composition"]["compaction"]["opaque"] = json!({"nested": [null, false, 7]});
+    raw["composition_digest"] = json!(composition_digest(&raw["composition"]).unwrap());
+    let plan = parse_plan(&raw, CompactionSupport::Supported).unwrap();
+    let request = crate::admit::catalog_request(&plan, None, None);
+    assert_eq!(json!(plan.composition), raw["composition"]);
+    assert_eq!(plan.composition_digest, raw["composition_digest"]);
+    assert_eq!(
+        serde_json::to_vec(&request.composition).unwrap(),
+        serde_json::to_vec(&raw["composition"]).unwrap()
+    );
+    assert_eq!(
+        composition_digest(&json!(request.composition)).unwrap(),
+        plan.composition_digest
+    );
+}
+
+#[test]
+fn parser_accepts_a_plan_without_either_compaction_member() {
+    let raw = raw_plan("other-context", None, "append");
+    for support in [CompactionSupport::Supported, CompactionSupport::Unsupported] {
+        let plan = parse_plan(&raw, support).unwrap();
+        assert!(plan.compaction_item.is_none());
+        assert!(!plan.composition.contains_key("compaction"));
+    }
+}
+
+#[test]
+fn parser_refuses_a_compaction_item_without_composition_compaction() {
+    let mut raw = raw_plan("magic-context", Some("magic-context"), "replace");
+    raw["composition"]
+        .as_object_mut()
+        .unwrap()
+        .remove("compaction");
+    raw["composition_digest"] = json!(composition_digest(&raw["composition"]).unwrap());
+    let refusal = parse_plan(&raw, CompactionSupport::Supported).unwrap_err();
+    assert_eq!(refusal.code(), "invalid_params");
+    assert_eq!(
+        refusal.detail(),
+        json!({"field": "plan.composition.compaction"})
+    );
+}
+
+#[test]
+fn parser_refuses_composition_compaction_without_an_item() {
+    let mut raw = raw_plan("other-context", None, "append");
+    raw["composition"]["compaction"] = json!({"provider": "other-context"});
+    raw["composition_digest"] = json!(composition_digest(&raw["composition"]).unwrap());
+    for support in [CompactionSupport::Supported, CompactionSupport::Unsupported] {
+        let refusal = parse_plan(&raw, support).unwrap_err();
+        assert_eq!(refusal.code(), "invalid_params");
+        assert_eq!(
+            refusal.detail(),
+            json!({"field": "plan.composition.compaction"})
+        );
+    }
+}
+
+#[test]
+fn parser_refuses_a_mismatched_compaction_provider() {
+    let mut raw = raw_plan("other-context", Some("magic-context"), "append");
+    raw["composition"]["compaction"]["provider"] = json!("other-context");
+    raw["composition_digest"] = json!(composition_digest(&raw["composition"]).unwrap());
+    let refusal = parse_plan(&raw, CompactionSupport::Supported).unwrap_err();
+    assert_eq!(refusal.code(), "invalid_params");
+    assert_eq!(
+        refusal.detail(),
+        json!({"field": "plan.composition.compaction"})
+    );
+}
+
+#[test]
+fn parser_refuses_a_malformed_compaction_composition() {
+    for compaction in [Value::Null, json!([]), json!({}), json!({"provider": 7})] {
+        let mut raw = raw_plan("magic-context", Some("magic-context"), "replace");
+        raw["composition"]["compaction"] = compaction;
+        raw["composition_digest"] = json!(composition_digest(&raw["composition"]).unwrap());
+        let refusal = parse_plan(&raw, CompactionSupport::Supported).unwrap_err();
+        assert_eq!(refusal.code(), "invalid_params");
+        assert_eq!(
+            refusal.detail(),
+            json!({"field": "plan.composition.compaction"})
+        );
+    }
 }
 
 #[test]

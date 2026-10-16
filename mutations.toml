@@ -5193,6 +5193,18 @@ old = "Ok(CompactionDiscovery::NotServed(named))"
 new = "{ let _ = named; Ok(CompactionDiscovery::Served) } // NON-VACUITY BREAK"
 
 [[control]]
+id = "fetch-plan-compaction-composition-provider-matches"
+guards = "composition.compaction names the same provider as the top-level compaction_item"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--lib"
+test_file = "crates/broca-fetch-plan/src/compaction_tests.rs"
+expect_red = ["compaction_tests::parser_refuses_a_mismatched_compaction_provider"]
+file = "crates/broca-fetch-plan/src/plan.rs"
+old = 'value.get("provider").and_then(Value::as_str) == Some(item.provider.as_str())'
+new = '{ let _ = item; value.get("provider").and_then(Value::as_str).is_some() } /* NON-VACUITY BREAK */'
+
+[[control]]
 id = "fetch-plan-compaction-could-not-tell-is-not-a-role-refusal"
 guards = "a compaction provider that could not be asked is the retryable fetch_unavailable, never the permanent role refusal"
 runner = "cargo"

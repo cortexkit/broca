@@ -258,7 +258,7 @@ pub enum CompactionSupport {
 /// a provider named twice in one role list, a malformed or forbidden step subscription, a
 /// composition whose digest is not the one stated, or a composition that is not in canonical
 /// order, does not list exactly the plan's providers, or does not repeat the plan's
-/// step-transform items.
+/// step-transform items and compaction provider.
 pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, Refusal> {
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
@@ -334,7 +334,14 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
         .and_then(Value::as_object)
         .cloned()
         .ok_or_else(|| Refusal::invalid("plan.composition"))?;
-    if composition.contains_key("compaction") {
+    let compaction_matches = match (composition.get("compaction"), compaction_item.as_ref()) {
+        (None, None) => true,
+        (Some(value), Some(item)) => {
+            value.get("provider").and_then(Value::as_str) == Some(item.provider.as_str())
+        }
+        _ => false,
+    };
+    if !compaction_matches {
         return Err(Refusal::invalid("plan.composition.compaction"));
     }
     let stated = object
