@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -38,13 +39,14 @@ async fn cancelled_agent_data_request(connection_close: bool) {
         rig.index.clone(),
         door.clone(),
     ));
+    rig.seed(&rig.session("held"), "run", true);
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     wire.send(
         7,
         1,
         10,
         FrameType::Request,
-        json!({"method":"agent_data.import","params":rig.params(CUT, &[rig.session("incoming")])}),
+        json!({"method":"agent_data.diverged","params":rig.params(CUT, &[rig.session("held")])}),
     )
     .await;
     tokio::time::timeout(Duration::from_secs(5), door.entered.notified())
@@ -62,17 +64,109 @@ async fn cancelled_agent_data_request(connection_close: bool) {
     tokio::time::timeout(Duration::from_secs(5), door.dropped.notified())
         .await
         .expect("closed route must drop the in-flight agent-data handler");
-    assert_nothing_staged(&rig);
+    assert!(!rig.root.join("wal-staging").exists());
+    assert!(rig.wal.wal_path(&rig.session("held")).exists());
 }
 
 #[tokio::test]
-async fn route_goodbye_cancels_inflight_agent_data_handler() {
+async fn route_goodbye_cancels_inflight_read_only_agent_data_handler() {
     cancelled_agent_data_request(false).await;
 }
 
 #[tokio::test]
-async fn connection_eof_cancels_inflight_agent_data_handler() {
+async fn connection_eof_cancels_inflight_read_only_agent_data_handler() {
     cancelled_agent_data_request(true).await;
+}
+
+#[derive(Default)]
+struct ParkExportDoor {
+    covered: AtomicU64,
+    exporting: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    exported: tokio::sync::Notify,
+    exported_bytes: Mutex<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl SessionDoor for ParkExportDoor {
+    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+        self.covered.fetch_add(1, Ordering::SeqCst);
+        Ok(0)
+    }
+    async fn export(&self, _: &str, bytes: &[u8]) -> Result<(), SessionDoorError> {
+        self.exporting.notify_one();
+        self.resume.notified().await;
+        *self.exported_bytes.lock().unwrap() = bytes.to_vec();
+        self.exported.notify_one();
+        Ok(())
+    }
+    async fn read(&self, _: &str, _: u64, _: &str) -> Result<DoorRead, SessionDoorError> {
+        unreachable!()
+    }
+}
+
+async fn export_survives_closed_route(connection_close: bool) {
+    let door = Arc::new(ParkExportDoor::default());
+    let mut rig = Rig::new("inventory-export-goodbye", Arc::new(FakeDoor::default()));
+    rig.service = Arc::new(AgentDataService::new(
+        rig.root.clone(),
+        rig.registry.as_ref().clone(),
+        rig.wal.clone(),
+        rig.index.clone(),
+        door.clone(),
+    ));
+    let session = rig.session("held");
+    rig.seed(&session, "run", true);
+    let expected = rig.bytes(&session);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let params = rig.params(CUT, &[session]);
+    wire.call("prepare", params.clone()).await.unwrap();
+    assert_eq!(door.covered.load(Ordering::SeqCst), 1);
+    wire.send(
+        7,
+        1,
+        10,
+        FrameType::Request,
+        json!({"method":"agent_data.export","params":params}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), door.exporting.notified())
+        .await
+        .unwrap();
+    if connection_close {
+        use tokio::io::AsyncWriteExt;
+        wire.stream.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut wire.serving)
+            .await
+            .expect("connection teardown must not wait on the parked mutation")
+            .unwrap()
+            .unwrap();
+    } else {
+        let goodbye =
+            Frame::build_with_version(2, FrameType::Goodbye, flags(), 7, 1, 11, Vec::new())
+                .unwrap();
+        write_frame(&mut wire.stream, &goodbye).await.unwrap();
+        // A subsequent control response proves the server processed GOODBYE before
+        // the parked export is released, rather than merely writing it to a socket.
+        wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+            .await;
+        assert_eq!(wire.next().await.header.ty, FrameType::Response);
+    }
+    door.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), door.exported.notified())
+        .await
+        .expect("export must finish after its route closes");
+    assert_eq!(*door.exported_bytes.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn route_goodbye_does_not_drop_export_between_cover_and_export() {
+    export_survives_closed_route(false).await;
+}
+
+#[tokio::test]
+async fn connection_eof_does_not_drop_export_between_cover_and_export() {
+    export_survives_closed_route(true).await;
 }
 
 #[tokio::test]

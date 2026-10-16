@@ -119,6 +119,22 @@ const OPS: [&str; 10] = [
     "status",
 ];
 
+pub(crate) fn request_is_read_only(bytes: &[u8]) -> bool {
+    let Ok(rpc) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    matches!(
+        rpc.get("method").and_then(Value::as_str),
+        Some(
+            "agent_data.describe"
+                | "agent_data.busy"
+                | "agent_data.diverged"
+                | "agent_data.prepare"
+                | "agent_data.status"
+        )
+    )
+}
+
 pub(crate) fn health_counts(service: Option<&AgentDataService>) -> Value {
     Value::Object(
         OPS.iter()

@@ -14227,3 +14227,34 @@ expect_red = ["persistent_inventory::cache_records_explicit_frame_requirements_n
 file = "crates/broca-wal/src/file_wal.rs"
 old = "range.used_features = used_features;"
 new = "range.used_features = Vec::new(); // NON-VACUITY BREAK: discard original envelope gates."
+
+[[control]]
+id = "agent-data-mutating-ops-outlive-connection"
+guards = "EOF aborts a connection waiter but not its in-progress export"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::connection_eof_does_not_drop_export_between_cover_and_export"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "tokio::spawn(operation).await.map_err(|e| ServeIoError(e.to_string()))??"
+new = "operation.await? // NON-VACUITY BREAK: connection owns the mutating future."
+
+[[control]]
+id = "agent-data-route-close-keeps-mutating-ops"
+guards = "route GOODBYE cannot drop an export after cover, even when its result has no waiter"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::route_goodbye_does_not_drop_export_between_cover_and_export", "inventory::connection_eof_does_not_drop_export_between_cover_and_export"]
+[[control.edits]]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "_ = cancel.cancelled(), if read_only => Ok(()),"
+new = "_ = cancel.cancelled() => Ok(()), // NON-VACUITY BREAK: cancel mutations as well as reads."
+[[control.edits]]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "tokio::spawn(operation).await.map_err(|e| ServeIoError(e.to_string()))??"
+new = "operation.await? // NON-VACUITY BREAK: remove the independent operation owner."
