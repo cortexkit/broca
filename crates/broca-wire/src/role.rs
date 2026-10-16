@@ -216,6 +216,7 @@ pub fn broca_role_describe_with_writers(
         "queue",
         "interrupt",
         "plans",
+        "fetch-plan-optional-tools/v1",
     ]
     .map(String::from)
     .to_vec();
@@ -267,7 +268,8 @@ pub struct BaselineParams {}
 /// empty and `composition_digest` absent, never a value computed some other way. One admitted
 /// with a plan reports, from its frozen manifest, one item per provider that answered
 /// (`{provider, item_digest}`, the provider's catalog digest), the optional items that did not
-/// answer, and the plan's composition digest. `tool_names` are the model-facing names of the
+/// answer, and the admitted composition digest (excluding absent optional tool providers).
+/// `tool_names` are the model-facing names of the
 /// tools the session runs with. No mid-session change exists yet, so both generations are 0.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineWire {
@@ -666,7 +668,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "e6ca7fdbf53ad8417bcae2b392640640f3605dbd95a361a047259e81c1f7d60a",
+            "174f2b7bef5dafb296dda13202fe970dbeef26d36596daffd08eeb1b1cb50c65",
         );
     }
 
@@ -823,7 +825,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "e240b84adcb82e2326480b7cc9cc52e84f1933fd9f8cae58398b2a8ea750025c";
+        "8b8bf812761e5d7aa43c16e34d93b79f08a262b326e45a54cb548f9b432f7464";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

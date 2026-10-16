@@ -1,8 +1,9 @@
 //! Fetch-plan admission for broca.
 //!
 //! A session's first `session.send` may carry a fetch plan instead of a tool list and system
-//! prompt. Broca then fetches each provider's catalog and system text itself, once, in parallel
-//! and under one deadline, checks the answers against the plan, and freezes exactly what it got
+//! prompt. Broca then fetches each provider's catalog and system text itself in parallel
+//! under one deadline. If an optional tool provider is absent, it recomposes system text
+//! against the surviving tools. It checks the answers and freezes exactly what it got
 //! in the session's `RunStarted` (`broca_wal::PlanManifest`). Every later episode and every
 //! resume renders from that manifest and never fetches again.
 //!

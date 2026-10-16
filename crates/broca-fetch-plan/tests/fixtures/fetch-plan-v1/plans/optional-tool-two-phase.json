@@ -1,0 +1,166 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {
+        "behavior": "autonomous",
+        "scope": "readwrite",
+        "tool_descs": "concise",
+        "host": "broca",
+        "remote_exec": {
+          "enabled": true,
+          "default_demand": "linux"
+        },
+        "siblings": [
+          "/Users/worker/projects/commons",
+          "/Users/worker/projects/claustrum"
+        ]
+      }
+    },
+    {
+      "provider": "plexus",
+      "preset": "worker",
+      "params": {},
+      "optional": true
+    }
+  ],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "worker",
+      "params": {
+        "role": "mason"
+      }
+    },
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {}
+    },
+    {
+      "provider": "plexus",
+      "preset": "worker",
+      "params": {},
+      "optional": true
+    }
+  ],
+  "compaction_item": {
+    "provider": "magic-context",
+    "preset": "worker",
+    "params": {}
+  },
+  "step_transform_items": [
+    {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "subscriptions": [
+        {
+          "hook": "pre_tool",
+          "phase": "mutate",
+          "ops": [],
+          "on_unavailable": "pass",
+          "budget_ms": 1000
+        },
+        {
+          "hook": "pre_tool",
+          "phase": "validate",
+          "ops": [],
+          "on_unavailable": "pass",
+          "budget_ms": 1000
+        }
+      ]
+    }
+  ],
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ],
+            "extension": "keep tool member"
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ],
+        "extension": {
+          "keep": [
+            3,
+            1,
+            2
+          ]
+        }
+      },
+      {
+        "provider": "magic-context",
+        "tools": []
+      },
+      {
+        "provider": "plexus",
+        "tools": [
+          {
+            "name": "web_search",
+            "capabilities": [
+              "plexus:web.search/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": []
+      }
+    ],
+    "extension": {
+      "ordered": [
+        "z",
+        "a"
+      ],
+      "unknown": {
+        "keep": true
+      }
+    },
+    "compaction": {
+      "provider": "magic-context"
+    },
+    "step_transform_items": [
+      {
+        "provider": "magic-context",
+        "preset": "worker",
+        "params": {},
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "mutate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          },
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    ]
+  },
+  "composition_digest": "600786dfbeacf1e5587437d75b38ab6c82a18674f9faf72e6827688c3649b8fe"
+}

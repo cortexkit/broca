@@ -1,0 +1,126 @@
+{
+  "plan": "plans/broca-worker-optional-tool-with-text.json",
+  "composition": "compositions/broca-worker-optional-tool-with-text.json",
+  "admitted_composition": "compositions/broca-worker-optional-tool-two-phase-admitted.json",
+  "fetches": [
+    {
+      "provider": "plexus",
+      "phase": "tools",
+      "budget_ms": 5000,
+      "reason": "refused",
+      "provider_code": "catalog_refused"
+    },
+    {
+      "provider": "aft",
+      "phase": "text",
+      "request": {
+        "params": {},
+        "system_text": {
+          "preset": "worker",
+          "params": {}
+        },
+        "composition": {
+          "providers": [
+            {
+              "provider": "aft",
+              "tools": [
+                {
+                  "name": "bash",
+                  "capabilities": [
+                    "shell.exec/v1"
+                  ]
+                },
+                {
+                  "name": "edit",
+                  "capabilities": [
+                    "code.edit/v1"
+                  ]
+                },
+                {
+                  "name": "read",
+                  "capabilities": [
+                    "code.read/v1"
+                  ]
+                }
+              ]
+            },
+            {
+              "provider": "prefrontal-core",
+              "tools": [
+                {
+                  "name": "ask",
+                  "capabilities": [
+                    "prefrontal-core:parent.ask/v1"
+                  ]
+                },
+                {
+                  "name": "browser_use",
+                  "capabilities": [
+                    "browser.use/v1",
+                    "cerebellum:browser.use/v1"
+                  ]
+                },
+                {
+                  "name": "computer_use",
+                  "capabilities": [
+                    "cerebellum:computer.use/v1",
+                    "computer.use/v1"
+                  ]
+                },
+                {
+                  "name": "knowhow",
+                  "capabilities": [
+                    "prefrontal-core:knowhow.read/v1"
+                  ]
+                },
+                {
+                  "name": "sidekick",
+                  "capabilities": [
+                    "prefrontal-core:sidekick.research/v1"
+                  ]
+                }
+              ]
+            }
+          ],
+          "step_transform_items": []
+        }
+      },
+      "request_file": "catalog-requests/optional-tool-two-phase-broca-text.json",
+      "answer": {
+        "composition_digest": "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4",
+        "tool_names": [],
+        "system_text": {
+          "composition_digest": "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4"
+        }
+      }
+    }
+  ],
+  "expected": {
+    "admitted": true,
+    "baseline": {
+      "absent_items": [
+        {
+          "provider": "plexus",
+          "kind": "tool",
+          "reason": "refused",
+          "provider_code": "catalog_refused"
+        },
+        {
+          "provider": "plexus",
+          "kind": "system_text",
+          "reason": "refused",
+          "provider_code": "catalog_refused"
+        }
+      ],
+      "composition_digest": "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4"
+    }
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false,
+    "capabilities": [
+      "fetch-plan-optional-tools/v1"
+    ]
+  }
+}

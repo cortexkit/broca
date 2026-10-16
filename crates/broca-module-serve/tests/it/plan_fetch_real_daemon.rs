@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use broca_fetch_plan::PlanAdmitter;
@@ -57,6 +56,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 struct Seen {
     binds: Vec<Option<std::collections::BTreeMap<String, String>>>,
     ops: Vec<String>,
+    catalogs: Vec<Value>,
 }
 
 /// A provider serving the v1 catalog for module `id`, answering from the request's composition.
@@ -70,7 +70,7 @@ impl StandIn {
         let composition = &arguments["composition"];
         let digest =
             cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap();
-        let tools: Vec<Value> = composition["providers"]
+        let mut tools: Vec<Value> = composition["providers"]
             .as_array()
             .unwrap()
             .iter()
@@ -90,6 +90,9 @@ impl StandIn {
                 })
             })
             .collect();
+        if arguments.get("preset").is_none() {
+            tools.clear();
+        }
         let mut answer = json!({
             "generation": "1",
             "catalog_digest": sha256_hex(self.id.as_bytes()),
@@ -97,7 +100,7 @@ impl StandIn {
             "tools": tools,
         });
         if arguments.get("system_text").is_some() {
-            let text = format!("{} over subc", self.id);
+            let text = format!("{} over subc {digest}", self.id);
             answer["system_text"] = json!({
                 "text": text,
                 "item_digest": sha256_hex(text.as_bytes()),
@@ -131,7 +134,20 @@ impl subc_client_rs::ModuleHandler for StandIn {
         let op = request["name"].as_str().unwrap_or_default().to_owned();
         self.seen.lock().unwrap().ops.push(op.clone());
         let answer = match op.as_str() {
-            "tool.catalog" => self.catalog(&request["arguments"]),
+            "tool.catalog" => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .catalogs
+                    .push(request["arguments"].clone());
+                if self.id == "plexus" {
+                    return subc_client_rs::HandlerOutcome::Error {
+                        code: "catalog_refused".into(),
+                        message: "optional catalog unavailable".into(),
+                    };
+                }
+                self.catalog(&request["arguments"])
+            }
             "transform.declare" => self.declare(&request["arguments"]),
             other => {
                 return subc_client_rs::HandlerOutcome::Error {
@@ -221,18 +237,18 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     })
     .expect("spawn ck-subc");
     let mut daemon = broca_test_support::RigChild::new(daemon, &root, "daemon");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !connection_file.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never published its connection file"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    broca_test_support::wait_until("the daemon publishes its connection file", || async {
+        if connection_file.exists() {
+            Ok(())
+        } else {
+            Err("connection file absent".into())
+        }
+    })
+    .await;
 
     let mut seen: HashMap<&str, Arc<Mutex<Seen>>> = HashMap::new();
     let mut serving = Vec::new();
-    for id in ["aft", "magic-context", "prefrontal-core"] {
+    for id in ["aft", "magic-context", "prefrontal-core", "plexus"] {
         let record = Arc::new(Mutex::new(Seen::default()));
         seen.insert(id, record.clone());
         let (_, serve) = subc_client_rs::serve_with_handle(
@@ -250,7 +266,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     let conn = SubcConnection::connect(&connection_file)
         .await
         .expect("connect to the daemon");
-    let admitter = SubcPlanAdmitter::new(Arc::new(conn));
+    let admitter = Arc::new(SubcPlanAdmitter::new(Arc::new(conn)));
     let session = broca_protocol::BindIdentity::new(
         project_root.canonicalize().unwrap(),
         "runner",
@@ -284,7 +300,9 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     );
     assert_eq!(
         manifest.system_text,
-        "prefrontal-core over subc\n\naft over subc\n\nmagic-context over subc"
+        ["prefrontal-core", "aft", "magic-context"]
+            .map(|id| format!("{id} over subc {}", plan.composition_digest))
+            .join("\n\n")
     );
     let v1 = Some(
         [("tool-provider".to_owned(), "v1".to_owned())]
@@ -292,6 +310,9 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
             .collect(),
     );
     for (id, record) in &seen {
+        if *id == "plexus" {
+            continue;
+        }
         let record = record.lock().unwrap();
         assert!(!record.binds.is_empty(), "{id} was fetched");
         assert!(
@@ -321,6 +342,88 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
         refusal.detail(),
         json!({"provider": "no-such-module", "reason": "unknown_module"})
     );
+
+    // The real daemon fetcher is installed on the session registry, so admission, WAL
+    // freezing, model rendering and restart all exercise the same manifest.
+    use crate::delivery_rig::{result, Rig, Step};
+    let mut rig = Rig::start("optional-tool-real-daemon").await;
+    rig.registry().set_plan_admitter(admitter);
+    rig.script.push(&[Step::Text("admitted")]);
+    rig.bind(7).await;
+    let optional = raw_vector("plans/broca-worker-optional-tool-with-text.json");
+    let reply = result(&rig.request(7, json!({"method":"session.send", "params":{
+        "send_id":"optional-first", "prompt":"hi", "model":{"provider":"fake","model":"fake"},
+        "plan":optional
+    }})).await);
+    rig.wait_for_finished(1).await;
+    let baseline = reply["baseline"].clone();
+    assert_eq!(
+        baseline["composition_digest"],
+        "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4"
+    );
+    assert!(!baseline["tool_names"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("web_search")));
+    assert_eq!(
+        baseline["absent_items"],
+        json!([
+            {"provider":"plexus","kind":"tool","reason":"refused","provider_code":"catalog_refused"},
+            {"provider":"plexus","kind":"system_text","reason":"refused","provider_code":"catalog_refused"}
+        ])
+    );
+    let frozen = rig
+        .records()
+        .iter()
+        .find_map(|r| match r {
+            broca_wal::WalRecord::RunStarted { manifest, .. } => manifest.clone(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(frozen
+        .system_text
+        .contains(baseline["composition_digest"].as_str().unwrap()));
+    assert!(!frozen
+        .system_text
+        .contains(optional["composition_digest"].as_str().unwrap()));
+    let expected_composition =
+        raw_vector("compositions/broca-worker-optional-tool-with-text-admitted.json");
+    for id in ["aft", "prefrontal-core"] {
+        let record = seen[id].lock().unwrap();
+        let request = record.catalogs.last().unwrap();
+        assert_eq!(request["composition"], expected_composition);
+        assert!(request.get("preset").is_none());
+    }
+    let counts: HashMap<_, _> = seen
+        .iter()
+        .map(|(id, s)| (*id, s.lock().unwrap().ops.len()))
+        .collect();
+    assert_eq!(counts["plexus"], 1);
+    rig.wait_closed().await;
+    let mut rig = rig.restart().await;
+    rig.bind(7).await;
+    let resumed = result(
+        &rig.request(7, json!({"method":"session.baseline","params":{}}))
+            .await,
+    );
+    assert_eq!(resumed["baseline"], baseline);
+    rig.script.push(&[Step::Text("resumed")]);
+    let continued = rig.request(7, json!({"method":"session.send","params":{
+        "send_id":"optional-resumed", "prompt":"continue", "model":{"provider":"fake","model":"fake"}
+    }})).await;
+    assert!(
+        result(&continued)["run_id"].is_string(),
+        "resume admitted a new run"
+    );
+    rig.wait_for_finished(2).await;
+    for (id, record) in &seen {
+        assert_eq!(
+            record.lock().unwrap().ops.len(),
+            counts[id],
+            "resume never refetches {id}"
+        );
+    }
+    rig.finish().await;
 
     for task in serving {
         task.abort();

@@ -1,146 +1,82 @@
 {
   "plan_inline": {
-    "tool_items": [
-      {
-        "provider": "aft",
-        "preset": "head",
-        "params": {
-          "behavior": "interactive",
-          "scope": "all",
-          "tool_descs": "full",
-          "host": "broca"
-        },
-        "optional": true
-      },
-      {
-        "provider": "magic-context",
-        "preset": "head",
-        "params": {}
-      },
-      {
-        "provider": "prefrontal-core",
-        "preset": "head",
-        "params": {
-          "exclude": [
-            "web_search"
-          ]
-        }
-      }
-    ],
+    "tool_items": [],
     "system_text_items": [
       {
         "provider": "prefrontal-core",
-        "preset": "head",
+        "preset": "worker",
         "params": {
-          "model": {
-            "provider": "anthropic",
-            "id": "claude-opus-5",
-            "variant": "max"
-          }
+          "role": "mason"
         }
-      },
-      {
-        "provider": "aft",
-        "preset": "head",
-        "params": {}
-      },
-      {
-        "provider": "magic-context",
-        "preset": "head",
-        "params": {}
       }
     ],
-    "step_transform_items": [],
+    "compaction_item": {
+      "provider": "magic-context",
+      "preset": "worker",
+      "params": {},
+      "optional": true
+    },
+    "step_transform_items": [
+      {
+        "provider": "magic-context",
+        "preset": "worker",
+        "params": {},
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    ],
     "composition": {
       "providers": [
         {
-          "provider": "aft",
-          "tools": [
-            {
-              "name": "bash",
-              "capabilities": [
-                "shell.exec/v1"
-              ]
-            },
-            {
-              "name": "bash_status",
-              "capabilities": [
-                "shell.exec/v1"
-              ]
-            },
-            {
-              "name": "edit",
-              "capabilities": [
-                "code.edit/v1"
-              ]
-            },
-            {
-              "name": "read",
-              "capabilities": [
-                "code.read/v1"
-              ]
-            }
-          ]
-        },
-        {
           "provider": "magic-context",
-          "tools": [
-            {
-              "name": "ctx_memory",
-              "capabilities": [
-                "magic-context:memory.write/v1"
-              ]
-            },
-            {
-              "name": "ctx_note",
-              "capabilities": [
-                "magic-context:notes/v1"
-              ]
-            },
-            {
-              "name": "ctx_search",
-              "capabilities": [
-                "magic-context:archive.search/v1"
-              ]
-            }
-          ]
+          "tools": []
         },
         {
           "provider": "prefrontal-core",
-          "tools": [
+          "tools": []
+        }
+      ],
+      "compaction": {
+        "provider": "magic-context"
+      },
+      "step_transform_items": [
+        {
+          "provider": "magic-context",
+          "preset": "worker",
+          "params": {},
+          "subscriptions": [
             {
-              "name": "browser_use",
-              "capabilities": [
-                "browser.use/v1",
-                "cerebellum:browser.use/v1"
-              ]
-            },
-            {
-              "name": "computer_use",
-              "capabilities": [
-                "cerebellum:computer.use/v1",
-                "computer.use/v1"
-              ]
+              "hook": "pre_tool",
+              "phase": "validate",
+              "ops": [],
+              "on_unavailable": "pass",
+              "budget_ms": 1000
             }
           ]
         }
-      ],
-      "step_transform_items": []
+      ]
     },
-    "composition_digest": "e5d6c646c78f48fe16b1e3f3d1ee8a656f7bbd5447ba6b8b02a4837d44c4d3a7"
+    "composition_digest": "0482cc96fe3b2a69a8a81a10d43a23a18151ed81450d39c3d3d24fa82cb2189c"
   },
-  "composition": "compositions/broca-head.json",
+  "composition": "compositions/pre-tool-declared.json",
   "expected": {
     "admitted": false,
     "code": "invalid_params",
     "detail": {
-      "field": "plan.tool_items[0].optional"
+      "field": "plan.compaction_item.optional"
     },
     "writes": "nothing"
   },
   "settled": "BROCA, room #881",
   "runner_declaration": {
-    "hooks": false,
-    "compaction": false
+    "hooks": true,
+    "compaction": true
   }
 }

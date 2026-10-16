@@ -269,6 +269,18 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
+`role.describe.capabilities` includes `fetch-plan-optional-tools/v1`. A caller may mark
+a plan's tool item `optional: true`; literal `false`, optional compaction/transform items,
+and optional persona text remain invalid. Optional tool fetches have a five-second budget
+inside the shared admission deadline. An unavailable, invalid or stale optional provider
+is absent, not a launch refusal; its paired text is absent too. Broca removes that provider's
+whole composition entry and fetches surviving system text again against the admitted
+composition. When no optional tool provider is absent, tools and text are fetched in the
+original single parallel round. The frozen baseline uses
+the admitted digest and one absence entry per removed item (`kind: "tool"` or
+`"system_text"`, a flat `reason`, and `provider_code` for provider refusals). Later sends
+and resumes use the manifest without refetching.
+
 `session.send.conversation_key` optionally selects routing's provider-account affinity across
 sessions. When present it must be a string of 1–256 bytes, all printable ASCII `0x21`–`0x7E`
 (no spaces). Invalid values, including null or non-strings, are refused before any WAL write
