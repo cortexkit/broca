@@ -2954,8 +2954,14 @@ file = "crates/broca-test-support/src/ckdev.rs"
 old = '''    let temporary = unique_temp(directory)?;
     fill_copy(source, &temporary, &destination)?;'''
 new = '''    let temporary = unique_temp(directory)?;
-    let _premature = File::create(&destination)?; // NON-VACUITY BREAK: expose an incomplete executable.
-    fill_copy(source, &temporary, &destination)?;'''
+    let premature = File::create(&destination)?; // NON-VACUITY BREAK: expose an incomplete executable.
+    let copied = fill_copy(source, &temporary, &destination);
+    drop(premature);
+    if let Err(error) = copied {
+        // Keep failed-copy cleanup intact; the break is premature visibility on a successful copy.
+        let _ = fs::remove_file(&destination);
+        return Err(error);
+    }'''
 
 [[control]]
 id = "test-rig-ckdev-no-inherited-writer"
@@ -3013,7 +3019,11 @@ runner = "cargo"
 package = "broca-test-support"
 target = "--lib"
 test_file = "crates/broca-test-support/src/ckdev.rs"
-expect_red = ["ckdev::tests::pruning_removes_old_unused_copies"]
+expect_red = [
+    "ckdev::tests::pruning_removes_old_unused_copies",
+    "ckdev::tests::pruning_retries_old_tombstones",
+    "ckdev::tests::pruning_runs_at_most_once",
+]
 expect_message = "unused copy older than 24 hours survived"
 file = "crates/broca-test-support/src/ckdev.rs"
 old = "        prune_copies(&cache, &directory, SystemTime::now());"
@@ -3858,6 +3868,7 @@ guards = "the real daemon installs the same hook adapter for actor sends and the
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test llm_runner_conformance"
+features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 expect_red = ["production_executor_installs_hooks_and_describes_ordered_phases"]
 platforms = ["macos", "linux"]
@@ -6105,7 +6116,8 @@ runner = "cargo"
 package = "broca-test-support"
 target = "--test subc_bin_guard"
 test_file = "crates/broca-test-support/tests/subc_bin_guard.rs"
-expect_red = ["subc_bin_guard::real_daemon_binary_environment_reads_use_shared_resolver"]
+# This integration target declares the test at crate root, not in a subc_bin_guard module.
+expect_red = ["real_daemon_binary_environment_reads_use_shared_resolver"]
 file = "crates/broca-module-serve/tests/it/early_args_boot.rs"
 old = 'let scratch = Scratch::new("unknown");'
 new = 'let scratch = Scratch::new("unknown");\n    let _ = std::env::var_os("SUBC_CORE_BIN"); // NON-VACUITY BREAK'
@@ -12572,6 +12584,9 @@ target = "--test agent_data"
 features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["describe_is_internal_and_declares_the_agent_owned_store"]
+select = "expected"
+# This test checks internal describe admission and management refusal. It omits the target's
+# move/import/export, freeze/replay and real-daemon cases; those remain ordinary suite coverage.
 only = false
 file = "crates/broca-module-serve/src/serve.rs"
 old = '''if bind.agent_data {

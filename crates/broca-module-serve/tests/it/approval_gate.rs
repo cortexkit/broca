@@ -347,7 +347,17 @@ struct Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            dump(&self.records());
+            // Startup can fail before the WAL exists. A second panic here aborts libtest,
+            // hiding the original failure and preventing daemon cleanup.
+            match self.script.wal.read_records(&self.script.session) {
+                Ok(frames) => dump(
+                    &frames
+                        .into_iter()
+                        .map(|frame| frame.record)
+                        .collect::<Vec<_>>(),
+                ),
+                Err(error) => eprintln!("APPROVAL DIAGNOSTIC cannot read WAL: {error}"),
+            }
             fn logs(dir: &std::path::Path) {
                 for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                     let path = entry.path();
@@ -880,6 +890,91 @@ fn approved(rig: &Rig, records: &[WalRecord]) {
     assert_eq!(validates.len(), 2);
     assert!(validates[0] < filing && filing < validates[1] && validates[1] < dispatch);
     dump(records);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_failure_without_wal_preserves_panic_and_reaps_daemon() {
+    const CHILD: &str = "BROCA_APPROVAL_SETUP_FAILURE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let Some(rig) = Rig::start("setup-failure", true).await else {
+                return;
+            };
+            assert!(rig.script.wal.read_records(&rig.script.session).is_err());
+            println!("APPROVAL_SETUP_DAEMON_PID={}", rig.daemon.id().unwrap());
+            println!("APPROVAL_SETUP_RIG_DIR={}", rig.dir.display());
+            panic!("intentional approval setup failure before WAL creation");
+        })
+        .await
+        .expect("bounded approval setup-failure scenario");
+        return;
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(150),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "approval_gate::setup_failure_without_wal_preserves_panic_and_reaps_daemon",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "BROCA_STATE_ROOT",
+                broca_test_support::scratch_root().join("approval-setup-child-state"),
+            )
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("bounded approval setup-failure subprocess")
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("running 1 test"), "{stdout}\n{stderr}");
+    if output.status.success() && stdout.contains("SKIP approval_gate") {
+        println!("{stdout}");
+        return;
+    }
+    let pid = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("APPROVAL_SETUP_DAEMON_PID="))
+        .expect("child must report the daemon pid")
+        .parse::<u32>()
+        .unwrap();
+    let process = subc_os::Process::open(pid).unwrap();
+    let survived = process.is_some();
+    // A broken destructor can abort the child. Stop its daemon before reporting the regression.
+    if let Some(process) = process {
+        let _ = process.signal(subc_os::Signal::Terminate);
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            while subc_os::Process::open(pid).unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            let _ = process.signal(subc_os::Signal::Kill);
+        }
+    }
+    assert_eq!(output.status.code(), Some(101), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("intentional approval setup failure"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("APPROVAL DIAGNOSTIC cannot read WAL"),
+        "{stderr}"
+    );
+    assert!(!survived, "daemon {pid} survived unwinding");
+    let dir = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("APPROVAL_SETUP_RIG_DIR="))
+        .expect("child must report its rig directory");
+    assert!(
+        !std::path::Path::new(dir).exists(),
+        "rig directory survived unwinding: {dir}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

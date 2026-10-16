@@ -364,6 +364,11 @@ mod tests {
     #[test]
     fn sleeping_child() {
         if std::env::var_os("BROCA_TEST_SUPPORT_SLEEP").is_some() {
+            if let Some(ready) = std::env::var_os("BROCA_TEST_SUPPORT_SLEEP_READY") {
+                println!("nested cleanup child stdout");
+                eprintln!("nested cleanup child stderr");
+                std::fs::write(ready, b"ready").unwrap();
+            }
             std::thread::sleep(Duration::from_secs(60));
         }
     }
@@ -667,14 +672,27 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_kills_and_reaps_before_returning() {
+        let ready = crate::scratch_root().join("cleanup-child-ready");
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "process::tests::sleeping_child"])
+            .args(["--exact", "process::tests::sleeping_child", "--nocapture"])
             .env("BROCA_TEST_SUPPORT_SLEEP", "1")
+            .env("BROCA_TEST_SUPPORT_SLEEP_READY", &ready)
+            // Nested libtest banners bypass this test's capture and corrupt the parent's results.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         assert!(child.try_wait().unwrap().is_none());
         kill_and_reap(&mut child);
+        let _ = std::fs::remove_file(ready);
+        started.expect("sleeping child must start before cleanup");
         let status = child.try_wait().unwrap().expect("child must be reaped");
         assert!(
             !status.success(),
@@ -683,6 +701,34 @@ mod tests {
         );
         // Cleanup is also safe after the process has already been reaped.
         kill_and_reap(&mut child);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_nested_libtest_output_out_of_parent() {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::cleanup_kills_and_reaps_before_returning",
+                    "--test-threads=1",
+                ])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("bounded nested cleanup subprocess")
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert_eq!(stdout.matches("running 1 test").count(), 1, "{stdout}");
+        assert!(
+            stdout.contains("test process::tests::cleanup_kills_and_reaps_before_returning ... ok"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("nested cleanup child"), "{stdout}");
+        assert!(!stderr.contains("nested cleanup child"), "{stderr}");
     }
 
     #[test]

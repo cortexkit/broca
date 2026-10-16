@@ -652,7 +652,10 @@ mod tests {
         fs::write(old.join("executable"), b"left by a failed deletion").unwrap();
         age_directory(&old);
         publish_pruning_once(&built, &OnceLock::new());
-        assert!(!old.exists(), "failed deletion was never retried");
+        assert!(
+            !old.exists(),
+            "unused copy older than 24 hours survived: failed deletion was never retried"
+        );
     }
 
     #[test]
@@ -697,7 +700,7 @@ mod tests {
         publish_pruning_once(&built, &OnceLock::new());
         assert!(
             !old.exists(),
-            "fresh prune control did not remove the old copy"
+            "unused copy older than 24 hours survived: fresh prune control did not remove the old copy"
         );
     }
 
