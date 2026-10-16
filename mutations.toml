@@ -13803,3 +13803,20 @@ old = '''        self.inner.sync_all()?;
         observe(self.event.clone())'''
 new = '''        observe(self.event.clone())?; // NON-VACUITY BREAK: claim success before the syscall
         self.inner.sync_all()'''
+
+[[control]]
+id = "agent-data-directory-resolved-parent-spelling"
+platforms = ["linux", "macos"]
+guards = "a configured state-root spelling with parent components is accepted when its resolved target stays inside the root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::directory_establishment_accepts_resolved_parent_spelling"]
+file = "crates/broca-wal/src/migration.rs"
+old = 'let mut target = std::path::absolute(path)?;'
+new = '''let mut target = std::path::absolute(path)?;
+    if target.components().any(|part| part == std::path::Component::ParentDir) {
+        return Err(invalid("NON-VACUITY BREAK: blanket parent-component refusal"));
+    }'''

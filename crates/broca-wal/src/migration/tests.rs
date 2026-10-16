@@ -73,6 +73,22 @@ fn existing_directory_retry_pays_every_parent_barrier_within_state_root() {
 }
 
 #[test]
+fn directory_establishment_accepts_resolved_parent_spelling() {
+    let root = root("parent-spelling").canonicalize().unwrap();
+    let configured = root.join("..").join(root.file_name().unwrap());
+    for suffix in ["agent-data/cuts", "wal-staging/cut", "wal"] {
+        let target = configured.join(suffix);
+        durable_dir(&configured, &target).unwrap();
+        assert_eq!(target.canonicalize().unwrap(), root.join(suffix));
+        durable_dir(&configured, &target).unwrap();
+    }
+    let target = configured.join("missing-component/../resolved-child");
+    durable_dir(&configured, &target).unwrap();
+    assert!(root.join("resolved-child").is_dir());
+    assert!(!root.join("missing-component").exists());
+}
+
+#[test]
 fn directory_establishment_requires_an_existing_root_and_rejects_escape() {
     let root = root("directory-boundary").canonicalize().unwrap();
     let missing = root.join("missing-state-root");
@@ -83,8 +99,19 @@ fn directory_establishment_requires_an_existing_root_and_rejects_escape() {
     let error = durable_dir(&root, &outside.join("wal")).unwrap_err();
     assert!(error.to_string().contains("outside state root"));
     assert!(!outside.exists());
-    let error = durable_dir(&root, &root.join("../escape")).unwrap_err();
-    assert!(error.to_string().contains("parent traversal"));
+    let escape = root.join("../escape");
+    let error = durable_dir(&root, &escape).unwrap_err();
+    assert!(error.to_string().contains("outside state root"));
+    assert!(error.to_string().contains(escape.to_str().unwrap()));
+    assert!(!root.parent().unwrap().join("escape").exists());
+    let error = durable_dir(
+        &root,
+        &root.join("missing-component/../../escape-after-missing"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("outside state root"));
+    assert!(!root.join("missing-component").exists());
+    assert!(!root.parent().unwrap().join("escape-after-missing").exists());
     #[cfg(unix)]
     {
         let link = root.join("escape-link");
@@ -93,6 +120,8 @@ fn directory_establishment_requires_an_existing_root_and_rejects_escape() {
         }
         std::os::unix::fs::symlink(root.parent().unwrap(), &link).unwrap();
         let error = durable_dir(&root, &link.join("escape")).unwrap_err();
+        assert!(error.to_string().contains("outside state root"));
+        let error = durable_dir(&root, &link.join("missing-component/../escape")).unwrap_err();
         assert!(error.to_string().contains("outside state root"));
     }
 }

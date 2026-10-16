@@ -107,15 +107,6 @@ pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
         )));
     }
     let mut target = std::path::absolute(path)?;
-    if target
-        .components()
-        .any(|part| part == std::path::Component::ParentDir)
-    {
-        return Err(invalid(format!(
-            "move directory {} contains parent traversal outside its state root",
-            path.display()
-        )));
-    }
     let mut missing = Vec::new();
     loop {
         match target.canonicalize() {
@@ -126,8 +117,10 @@ pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 missing.push(
                     target
-                        .file_name()
+                        .components()
+                        .next_back()
                         .ok_or_else(|| invalid("move directory has no existing ancestor"))?
+                        .as_os_str()
                         .to_owned(),
                 );
                 if !target.pop() {
@@ -137,8 +130,14 @@ pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    // Resolve existing symlinks before normalizing the missing suffix: a parent
+    // component is relative to that physical ancestor, not its original spelling.
     for name in missing.into_iter().rev() {
-        target.push(name);
+        if name == std::ffi::OsStr::new("..") {
+            target.pop();
+        } else {
+            target.push(name);
+        }
     }
     let relative = target.strip_prefix(&root).map_err(|_| {
         invalid(format!(
