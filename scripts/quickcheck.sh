@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Targeted verification for a small fixup — the cheap check to run BEFORE the
 # full gate, so one-line fixes don't pay a full workspace relink to discover a
-# fmt/clippy triviality. Runs, in order: fmt-check (whole workspace, seconds),
+# fmt/clippy triviality. Runs, in order: fmt-check on the named crates,
 # clippy on the named crates, and their lib/bin tests. Integration tests and
 # the cross-workspace suites stay in scripts/gate.sh.
 #
@@ -9,7 +9,7 @@
 #    ex: scripts/quickcheck.sh broca-subc broca-module
 set -u
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
@@ -35,22 +35,10 @@ done
 set -x
 # Keep verification read-only: --locked refuses manifest/lock disagreements rather
 # than updating dependencies and letting gated-commit sweep them into the commit.
-# Scope formatting to workspace members; dependency source files are not ours to
-# reformat, whether Cargo resolved them from a registry, git, or a local checkout.
-#
-# Building the -p list from cargo metadata rather than hardcoding it means a new crate is
-# covered the day it is added, with no second list to drift.
-fmt_pkgs=()
-while IFS= read -r p; do fmt_pkgs+=(-p "$p"); done < <(
-    cargo metadata --no-deps --format-version 1 2>/dev/null |
-        python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"]]'
-)
-if [ ${#fmt_pkgs[@]} -eq 0 ]; then
-    echo "quickcheck: REFUSING -- could not enumerate workspace packages for fmt." >&2
-    echo "  A fmt check over an empty package set passes vacuously." >&2
-    exit 2
-fi
-cargo fmt "${fmt_pkgs[@]}" -- --check || exit $?
+# Formatting every workspace crate was the largest cost of a warm one-crate
+# check. Format only the selected crates here; their clippy, lib/bin tests and
+# doctests remain below. gate.sh and CI still check whole-workspace formatting.
+cargo fmt "${PKGS[@]}" -- --check || exit $?
 cargo clippy --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} --all-targets -- -D warnings || exit $?
 # `--lib` and `--doc` make cargo refuse the whole command when any selected package has no
 # library target (ck-import is binary-only), so add those selectors only when at least one
