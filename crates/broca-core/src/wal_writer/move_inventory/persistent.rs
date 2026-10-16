@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 mod pacing;
+#[cfg(test)]
+mod tests;
 
 const CACHE_VERSION: u32 = 2;
 const CACHE_LIMIT: u64 = 128 * 1024 * 1024;
@@ -297,6 +299,93 @@ fn locations(
     unreadable: &mut Vec<String>,
     stats: &mut MoveInventoryBuildStats,
 ) -> Result<BTreeMap<String, Source>, WalError> {
+    locations_after_live(store, cancel, unreadable, stats, || {})
+}
+
+fn locations_after_live(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    unreadable: &mut Vec<String>,
+    stats: &mut MoveInventoryBuildStats,
+    after_live: impl FnOnce(),
+) -> Result<BTreeMap<String, Source>, WalError> {
+    // Folds copy into a sealed archive before deleting live files. Listing live
+    // first ensures a fold between listings is seen in at least one location.
+    let (live, ambiguous) = live_locations(store, cancel, unreadable)?;
+    after_live();
+    let mut sources = archive_locations(store, cancel, unreadable, stats)?;
+    for (address, path) in live {
+        cancelled(cancel)?;
+        // Live always overrides archived history at the same address.
+        sources.insert(
+            address,
+            Source::Live {
+                path,
+                stamp: FileStamp {
+                    len: 0,
+                    file_id: None,
+                    modified_ns: None,
+                },
+                lineage_id: None,
+                sealed_tail: false,
+            },
+        );
+    }
+    for address in ambiguous {
+        sources.remove(&address);
+        unreadable.push(address);
+    }
+    Ok(sources)
+}
+
+type LiveLocations = (
+    BTreeMap<String, PathBuf>,
+    std::collections::BTreeSet<String>,
+);
+
+fn live_locations(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    unreadable: &mut Vec<String>,
+) -> Result<LiveLocations, WalError> {
+    let mut live = BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for root in [&store.root, &store.ephemeral_root()] {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable.push(root.display().to_string());
+                continue;
+            }
+        };
+        for entry in entries {
+            cancelled(cancel)?;
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(_) => {
+                    unreadable.push(root.display().to_string());
+                    continue;
+                }
+            };
+            if path.extension().is_some_and(|ext| ext == "wal") {
+                if let Some(address) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    if live.insert(address.to_owned(), path.clone()).is_some() {
+                        ambiguous.insert(address.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok((live, ambiguous))
+}
+
+fn archive_locations(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    unreadable: &mut Vec<String>,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<BTreeMap<String, Source>, WalError> {
     let mut sources = BTreeMap::new();
     let mut paths = store.archive_containers()?.unwrap_or_default();
     paths.sort_by_key(|path| broca_wal::archive::fold_timestamp(path).unwrap_or(0));
@@ -317,7 +406,7 @@ fn locations(
             }
             if reader.state().map_err(WalError::Io)? == broca_wal::archive::ContainerState::Unsealed
             {
-                return Ok(Vec::new());
+                return Err(invalid("inventory archive is not sealed yet"));
             }
             // Verified v2 indexes prove member coverage without touching payloads.
             // V1 containers need header walks, which also skip every payload.
@@ -373,58 +462,38 @@ fn locations(
             }
         }
     }
-    let mut live = BTreeMap::new();
-    let mut ambiguous = std::collections::BTreeSet::new();
-    for root in [&store.root, &store.ephemeral_root()] {
-        let entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                unreadable.push(root.display().to_string());
-                continue;
-            }
-        };
-        for entry in entries {
-            cancelled(cancel)?;
-            let path = match entry {
-                Ok(entry) => entry.path(),
-                Err(_) => {
-                    unreadable.push(root.display().to_string());
-                    continue;
-                }
-            };
-            if path.extension().is_some_and(|ext| ext == "wal") {
-                if let Some(address) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    if live.insert(address.to_owned(), path.clone()).is_some() {
-                        ambiguous.insert(address.to_owned());
-                    }
-                }
-            }
-        }
-    }
-    for (address, path) in live {
-        cancelled(cancel)?;
-        // A live file overrides an archived copy of the same address. The scan
-        // opens its headers later, so enumeration holds no live WALs open.
-        sources.insert(
-            address,
-            Source::Live {
-                path,
-                stamp: FileStamp {
-                    len: 0,
-                    file_id: None,
-                    modified_ns: None,
-                },
-                lineage_id: None,
-                sealed_tail: false,
-            },
-        );
-    }
-    for address in ambiguous {
-        sources.remove(&address);
-        unreadable.push(address);
-    }
     Ok(sources)
+}
+
+fn scan_address(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    address: &str,
+    source: Source,
+    old: Option<&CachedAddress>,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<Option<CachedAddress>, WalError> {
+    match scan(store, address, source, old, stats) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            // A fold or activation can remove the enumerated path. Re-resolve
+            // live first, then the newest archive; only a complete census can
+            // prove that an address now has no bytes anywhere.
+            let mut unreadable = Vec::new();
+            let mut current = locations(store, cancel, &mut unreadable, stats)?;
+            if !unreadable.is_empty() {
+                return Err(invalid(&format!(
+                    "cannot re-resolve inventory address: {}",
+                    unreadable.join(", ")
+                )));
+            }
+            current
+                .remove(address)
+                .map(|source| scan(store, address, source, old, stats))
+                .transpose()
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn add_records(
@@ -618,13 +687,21 @@ pub(super) fn build(store: &FileWalStore, cancel: &CancellationToken) {
                 }
                 let work = std::time::Instant::now();
                 let reads_before = stats.payload_reads;
-                match scan(store, &address, source, cached.get(&address), &mut stats) {
-                    Ok(entry) => {
+                match scan_address(
+                    store,
+                    cancel,
+                    &address,
+                    source,
+                    cached.get(&address),
+                    &mut stats,
+                ) {
+                    Ok(Some(entry)) => {
                         for session in &entry.triples {
                             insert(&mut inventory, &address, session);
                         }
                         next_cache.insert(address, entry);
                     }
+                    Ok(None) => {}
                     Err(error) => {
                         tracing::error!(address, %error, "move inventory cannot read WAL");
                         inventory.unreadable.push(address);

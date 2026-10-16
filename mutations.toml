@@ -14084,3 +14084,44 @@ expect_red = ["persistent_inventory::legacy_wal_without_lineage_reuses_unchanged
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "if a == b && (l.is_some() || x.file_id.is_some()) && x.file_id == y.file_id && l == r)"
 new = "if a == b && l.is_some() && x.file_id == y.file_id && l == r) // NON-VACUITY BREAK"
+
+[[control]]
+id = "agent-data-inventory-live-before-archive"
+guards = "a copy-then-delete fold between live and archive listings cannot hide an address"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::fold_between_listings_keeps_the_address"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = '''    let (live, ambiguous) = live_locations(store, cancel, unreadable)?;
+    after_live();
+    let mut sources = archive_locations(store, cancel, unreadable, stats)?;'''
+new = '''    // NON-VACUITY BREAK: enumerate archives before the live listing.
+    let mut sources = archive_locations(store, cancel, unreadable, stats)?;
+    after_live();
+    let (live, ambiguous) = live_locations(store, cancel, unreadable)?;'''
+
+[[control]]
+id = "agent-data-inventory-vanished-live-fallback"
+guards = "a live source moved into an archive is re-resolved at scan time"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::vanished_live_path_falls_back_to_archived_member"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {"
+new = "Err(WalError::Io(error)) if false && error.kind() == io::ErrorKind::NotFound => { // NON-VACUITY BREAK"
+
+[[control]]
+id = "agent-data-inventory-unsealed-is-unknown"
+guards = "an unsealed archive is not silently treated as an empty complete container"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::unsealed_archive_cannot_prove_absence"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = 'return Err(invalid("inventory archive is not sealed yet"));'
+new = 'return Ok(Vec::new()); // NON-VACUITY BREAK: silently skip the only copy.'
