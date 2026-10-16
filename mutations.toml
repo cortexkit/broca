@@ -14380,3 +14380,18 @@ expect_red = ["inventory::route_goodbye_does_not_drop_prepare_between_freeze_and
 file = "crates/broca-module-serve/src/agent_data.rs"
 old = '| "agent_data.status"'
 new = '| "agent_data.status" | "agent_data.prepare" /* NON-VACUITY BREAK: cancel prepare after its freeze. */'
+
+[[control]]
+id = "antigravity-retired-route-is-refused"
+guards = "retired Antigravity bare and tier routes refuse during resolution with a live replacement"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-catalog/src/live.rs"
+expect_red = ["live::tests::retired_antigravity_routes_refuse_with_live_replacements"]
+file = "crates/broca-catalog/src/live.rs"
+old = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
+    ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),'''
+new = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
+    // NON-VACUITY BREAK: forget the retired bare 3.7 route.'''

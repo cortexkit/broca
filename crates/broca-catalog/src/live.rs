@@ -81,29 +81,67 @@ const ANTIGRAVITY_TIER_ALIASES: &[(&str, &str)] = &[
     ("gemini-3.5-flash", "gemini-3.5-flash-low"),
     ("gemini-3.5-flash-high", "gemini-3-flash-agent"),
     ("gemini-3.5-flash-low", "gemini-3.5-flash-extra-low"),
-    // 3.6/3.7/3.8-flash tier wire ids (-low/-medium/-high) are valid backend entities and pass
-    // through unchanged; only each bare slug needs its default-tier alias. All default to `medium`.
-    //
-    // 3.8 added 2026-09-04 AGAINST A MEASURED 404, with the control that makes it conclusive: a
-    // live probe ran `antigravity-gemini-3.8-flash` and `antigravity-gemini-3.7-flash` back to
-    // back on one auth, one endpoint and one client version. 3.7 returned PROBE_OK; 3.8 returned
-    // a backend 404. A daily 404 has two known causes -- an unknown entity and a stale native
-    // client version -- and the passing sibling rules the second one out, because both requests
-    // carried the identical User-Agent.
-    ("gemini-3.6-flash", "gemini-3.6-flash-medium"),
-    ("gemini-3.7-flash", "gemini-3.7-flash-medium"),
+    // Live tier wire ids pass through unchanged; bare slugs select their default tier.
     ("gemini-3.8-flash", "gemini-3.8-flash-medium"),
     ("gemini-4-argon", "gemini-4-argon-medium"),
     ("gemini-3-flash", "gemini-3-flash-medium"),
     ("gemini-3-pro", "gemini-3-pro-low"),
 ];
 
+/// Routes Google withdrew from Antigravity's daily endpoint, paired with a live replacement.
+/// AGAUTH's two `fetchAvailableModels` captures just before 2026-10-14T13:11Z, using clients
+/// 1.3.3 and 1.3.5, returned the same 29 routes. Compared with the 2026-10-12 map, these tier
+/// ids disappeared; their bare aliases must not reach the backend either. Update this list only
+/// from a fresh capture, not guesses from a 404 (which can also mean a stale client version).
+const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
+    ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),
+    (
+        "gemini-3.7-flash-low",
+        "google/antigravity-gemini-3.8-flash",
+    ),
+    (
+        "gemini-3.7-flash-medium",
+        "google/antigravity-gemini-3.8-flash",
+    ),
+    (
+        "gemini-3.7-flash-high",
+        "google/antigravity-gemini-3.8-flash",
+    ),
+    ("gemini-3.6-flash", "google/antigravity-gemini-3.8-flash"),
+    (
+        "gemini-3.6-flash-low",
+        "google/antigravity-gemini-3.8-flash",
+    ),
+    (
+        "gemini-3.6-flash-medium",
+        "google/antigravity-gemini-3.8-flash",
+    ),
+    (
+        "gemini-3.6-flash-high",
+        "google/antigravity-gemini-3.8-flash",
+    ),
+    ("gemini-3.1-pro", "google/antigravity-gemini-4-argon"),
+    ("gemini-3.1-pro-low", "google/antigravity-gemini-4-argon"),
+    ("gemini-3.1-pro-high", "google/antigravity-gemini-4-argon"),
+    ("gemini-pro-agent", "google/antigravity-gemini-4-argon"),
+    // The Fusiform model-catalog repository's retirement commit 24ba360 records that both
+    // Google's served-model list and the native Antigravity plugin dropped this Claude route.
+    // No live Antigravity replacement has been verified.
+    ("claude-sonnet-4-6-thinking", "anthropic/claude-sonnet-5-5"),
+];
+
+fn retired_antigravity_replacement(model_id: &str) -> Option<&'static str> {
+    let stripped = model_id.strip_prefix("antigravity-").unwrap_or(model_id);
+    RETIRED_ANTIGRAVITY_ROUTES
+        .iter()
+        .find_map(|(route, replacement)| (*route == stripped).then_some(*replacement))
+}
+
 /// Strip the harness-only route prefix, then resolve any user-facing Antigravity tier alias.
 ///
 /// THE FALLBACK PASSES THE STRIPPED NAME THROUGH UNCHANGED, which is deliberate but sharp on
-/// both edges. Non-gemini Antigravity models are served under their plain names and need no
-/// tier -- antigravity-claude-sonnet-4-6-thinking runs fine with no entry here -- so the
-/// passthrough is load-bearing rather than a default nobody chose.
+/// both edges. Non-Gemini Antigravity models use plain backend names without tier aliases, so
+/// passthrough remains necessary. Known withdrawals are refused before reaching this conversion.
 ///
 /// A GEMINI model with no entry can still become an opaque provider 404 because bare slugs do not
 /// necessarily name backend entities. This table records measured Antigravity routes rather than
@@ -795,6 +833,21 @@ fn resolve_provider_inner(
              endpoint directly"
         )
     })?;
+
+    if opts.family_override == Some(WireFamilyId::GoogleCodeAssist) {
+        if let Some(replacement) = retired_antigravity_replacement(model_id) {
+            let advice = if replacement.starts_with("google/antigravity-") {
+                " (medium)"
+            } else {
+                " through the Anthropic provider"
+            };
+            return Err(format!(
+                "model '{model}' is unservable: Google withdrew this Antigravity route; \
+                 use '{replacement}'{advice} instead"
+            )
+            .into());
+        }
+    }
 
     // Taking the snapshot is an Arc clone over memory. It never opens fusiform or reads the LKG.
     // Without a catalog snapshot, provider resolution fails as configuration rather than
@@ -2020,42 +2073,171 @@ mod tests {
     const NO_CLAIM: &str = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJ4QHkueiJ9.sig";
 
     #[test]
+    fn retired_antigravity_routes_refuse_with_live_replacements() {
+        seed_catalog_for_resolution();
+        for (route, replacement) in [
+            ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),
+            (
+                "gemini-3.7-flash-low",
+                "google/antigravity-gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.7-flash-medium",
+                "google/antigravity-gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.7-flash-high",
+                "google/antigravity-gemini-3.8-flash",
+            ),
+            ("gemini-3.6-flash", "google/antigravity-gemini-3.8-flash"),
+            (
+                "gemini-3.6-flash-low",
+                "google/antigravity-gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.6-flash-medium",
+                "google/antigravity-gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.6-flash-high",
+                "google/antigravity-gemini-3.8-flash",
+            ),
+            ("gemini-3.1-pro", "google/antigravity-gemini-4-argon"),
+            ("gemini-3.1-pro-low", "google/antigravity-gemini-4-argon"),
+            ("gemini-3.1-pro-high", "google/antigravity-gemini-4-argon"),
+            ("gemini-pro-agent", "google/antigravity-gemini-4-argon"),
+            ("claude-sonnet-4-6-thinking", "anthropic/claude-sonnet-5-5"),
+        ] {
+            for prefix in ["", "antigravity-"] {
+                let model = format!("google/{prefix}{route}");
+                let result = resolve_provider(
+                    &model,
+                    None,
+                    2048,
+                    &AuthMode::Bearer("unused".into()),
+                    &ResolveOptions {
+                        auth_method: Some(AuthMethod::Antigravity),
+                        family_override: Some(WireFamilyId::GoogleCodeAssist),
+                        ..Default::default()
+                    },
+                );
+                let error = result
+                    .err()
+                    .unwrap_or_else(|| panic!("served retired {model}"));
+                assert!(matches!(error, ResolutionError::Config(_)));
+                let advice = if route == "claude-sonnet-4-6-thinking" {
+                    " through the Anthropic provider"
+                } else {
+                    " (medium)"
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "model '{model}' is unservable: Google withdrew this Antigravity route; \
+                         use '{replacement}'{advice} instead"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_antigravity_replacements_and_native_gemini_still_resolve() {
+        seed_catalog_for_resolution();
+        for (model, family, expected_wire_id) in [
+            (
+                "google/antigravity-gemini-3.8-flash",
+                Some(WireFamilyId::GoogleCodeAssist),
+                "gemini-3.8-flash-medium",
+            ),
+            (
+                "google/antigravity-gemini-4-argon",
+                Some(WireFamilyId::GoogleCodeAssist),
+                "gemini-4-argon-medium",
+            ),
+            // Pin the native family independently of catalog membership: these withdrawals
+            // concern Antigravity, not the ordinary Gemini API.
+            (
+                "google/gemini-3.1-pro",
+                Some(WireFamilyId::Gemini),
+                "gemini-3.1-pro",
+            ),
+        ] {
+            let result = resolve_provider(
+                model,
+                None,
+                2048,
+                &AuthMode::Bearer("unused".into()),
+                &ResolveOptions {
+                    family_override: family,
+                    project_id: Some("live-route-project"),
+                    ..Default::default()
+                },
+            );
+            let resolved = result.unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(resolved.wire_model, expected_wire_id);
+        }
+    }
+
+    #[test]
     fn antigravity_wire_model_aliases_map_only_registered_routes() {
+        let assert_wire_bytes = |route: &str, wire_id: &str| {
+            use broca_provider::families::{google_codeassist_frozen_config, GoogleCodeAssist};
+            let mut actual =
+                google_codeassist_frozen_config(google_codeassist_wire_model_id(route));
+            let mut expected = google_codeassist_frozen_config(wire_id);
+            actual.project_id = Some("wire-bytes-project".into());
+            expected.project_id = Some("wire-bytes-project".into());
+            let mut request = anthropic_options();
+            request.step_context = Some(broca_protocol::StepContext {
+                run_id: "live-route-bytes".into(),
+                step_index: 0,
+            });
+            assert_eq!(
+                GoogleCodeAssist.render(&actual, &request),
+                GoogleCodeAssist.render(&expected, &request),
+                "{route} wire bytes"
+            );
+        };
         let mapped = [
             ("gemini-3.5-flash", "gemini-3.5-flash-low"),
             ("gemini-3.5-flash-high", "gemini-3-flash-agent"),
             ("gemini-3.5-flash-low", "gemini-3.5-flash-extra-low"),
-            ("gemini-3.6-flash", "gemini-3.6-flash-medium"),
-            ("gemini-3.7-flash", "gemini-3.7-flash-medium"),
             ("gemini-3.8-flash", "gemini-3.8-flash-medium"),
+            ("gemini-4-argon", "gemini-4-argon-medium"),
             ("gemini-3-flash", "gemini-3-flash-medium"),
             ("gemini-3-pro", "gemini-3-pro-low"),
         ];
         for (route, wire_id) in mapped {
             assert_eq!(google_codeassist_wire_model_id(route), wire_id);
+            assert_wire_bytes(route, wire_id);
+            assert_wire_bytes(&format!("antigravity-{route}"), wire_id);
             assert_eq!(
                 google_codeassist_wire_model_id(&format!("antigravity-{route}")),
                 wire_id
             );
         }
 
-        // 3.6/3.7-flash tier ids are valid backend entities and must pass through unchanged
-        // (identity), NOT get re-aliased — the bare slug is the only one needing the default-tier map.
+        // These live backend ids need no alias, including the literal 3.5-flash wire tiers.
         for tier_id in [
-            "gemini-3.6-flash-low",
-            "gemini-3.6-flash-medium",
-            "gemini-3.6-flash-high",
-            "gemini-3.7-flash-low",
-            "gemini-3.7-flash-medium",
-            "gemini-3.7-flash-high",
-            // 3.8's tier ids were verified as live backend entities before this row was
-            // added: both -medium and -high returned a completed turn against the deployed
-            // daemon while the bare slug 404'd on the same auth and client version.
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.5-flash-lite",
             "gemini-3.8-flash-low",
             "gemini-3.8-flash-medium",
             "gemini-3.8-flash-high",
+            "gemini-3.8-flash-tiered",
+            "gemini-3-flash-low",
+            "gemini-3-flash-medium",
+            "gemini-3-flash-high",
+            "gemini-3-pro-low",
+            "gemini-3-pro-high",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
         ] {
             assert_eq!(google_codeassist_wire_model_id(tier_id), tier_id);
+            assert_wire_bytes(tier_id, tier_id);
+            assert_wire_bytes(&format!("antigravity-{tier_id}"), tier_id);
             assert_eq!(
                 google_codeassist_wire_model_id(&format!("antigravity-{tier_id}")),
                 tier_id
@@ -2096,7 +2278,7 @@ mod tests {
                 "low",
                 Some("gemini-3.8-flash-low"),
             ),
-            ("antigravity-gemini-3.6-flash", "minimal", None),
+            ("antigravity-gemini-3.8-flash", "minimal", None),
             // 3.5-flash's user-facing tiers are aliased to other backend ids.
             (
                 "antigravity-gemini-3.5-flash",
@@ -2117,7 +2299,7 @@ mod tests {
             );
         }
         assert_eq!(
-            google_codeassist_tiers("antigravity-gemini-3.6-flash"),
+            google_codeassist_tiers("antigravity-gemini-3.8-flash"),
             ["low", "medium", "high"]
         );
         assert_eq!(
