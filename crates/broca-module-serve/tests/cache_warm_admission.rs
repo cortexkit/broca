@@ -37,11 +37,12 @@ use tokio::{
 // These tests exercise admission and HTTP request bytes, not crash durability. Keep the
 // real WAL encoding/replay, but do not wait for filesystem fsync latency at every barrier.
 // Durability barriers are covered by the core writer and WAL tests.
-struct AdmissionStore(FileWalStore);
-struct AdmissionWal(Box<dyn Wal + Send>);
+struct AdmissionStore(FileWalStore, Arc<std::sync::atomic::AtomicUsize>);
+struct AdmissionWal(Box<dyn Wal + Send>, Arc<std::sync::atomic::AtomicUsize>);
 
 impl Wal for AdmissionWal {
     fn append(&mut self, fence: u64, record: &WalRecord, _: bool) -> Result<u64, WalError> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.0.append(fence, record, false)
     }
     fn sync(&self) -> Result<(), WalError> {
@@ -65,7 +66,7 @@ impl WalStore for AdmissionStore {
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
         self.0
             .open(session)
-            .map(|wal| Box::new(AdmissionWal(wal)) as _)
+            .map(|wal| Box::new(AdmissionWal(wal, self.1.clone())) as _)
     }
     fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
         self.0.read_records(session)
@@ -163,26 +164,51 @@ impl RunExecutor for Executor {
         )
         .unwrap();
         let key = resolve_caller_cache_key(job.req.cache.as_ref());
-        let resolved = broca_catalog::live::resolve_provider_with_catalog_base_url(
-            &format!(
-                "{}/{}",
-                job.req.model.provider_module_id, job.req.model.model_id
-            ),
-            &self.url,
-            None,
-            None,
-            &AuthMode::Bearer(
-                "eyJhbGciOiJub25lIn0.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjdC10ZXN0In0.sig".into(),
-            ),
-            &ResolveOptions {
-                family_override: Some(family),
-                session_id: Some(job.req.session.session.as_str()),
-                cache_policy: policy,
-                prompt_cache_key: key.as_deref(),
-                ..Default::default()
-            },
-            broca_provider::build_provider_http_client(),
-        )?;
+        let model = format!(
+            "{}/{}",
+            job.req.model.provider_module_id, job.req.model.model_id
+        );
+        let auth = AuthMode::Bearer(
+            "eyJhbGciOiJub25lIn0.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjdC10ZXN0In0.sig".into(),
+        );
+        let options = ResolveOptions {
+            family_override: Some(family),
+            project_id: Some("admission-project"),
+            session_id: Some(job.req.session.session.as_str()),
+            cache_policy: policy,
+            prompt_cache_key: key.as_deref(),
+            ..Default::default()
+        };
+        let client = broca_provider::build_provider_http_client();
+        let resolved = if family == WireFamilyId::GoogleCodeAssist {
+            // Tier aliases need not be catalog rows. Use native resolution rather than the
+            // shared-host helper, which treats unknown ids as opaque OpenAI-compatible models.
+            broca_catalog::live::resolve_catalog_episode_with_client(
+                &model,
+                None,
+                &auth,
+                &options,
+                client,
+                broca_catalog::live::EpisodeRenderConfig {
+                    base_url: Some(&self.url),
+                    ..Default::default()
+                },
+            )
+        } else {
+            broca_catalog::live::resolve_provider_with_catalog_base_url(
+                &model, &self.url, None, None, &auth, &options, client,
+            )
+        };
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let error = RunError::from(error);
+                if let Some(ack) = job.on_admitted {
+                    let _ = ack.send(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        };
         let provider: Arc<Box<dyn broca_core::Provider>> = Arc::new(resolved.provider);
         // The admission/warm fixture serves SSE over HTTP and inspects POST bodies; socket
         // affinity is checked separately by the mixed-pipe catalog test.
@@ -369,7 +395,10 @@ impl Fixture {
                 socket.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        let store = Arc::new(AdmissionStore(FileWalStore::new(root.join("wal"))));
+        let store = Arc::new(AdmissionStore(
+            FileWalStore::new(root.join("wal")),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ));
         let executor = Arc::new(Executor {
             url,
             family,
@@ -708,5 +737,77 @@ async fn unconfigured_chat_and_gemini_admission_remain_unsupported() {
             "unsupported warming sends nothing"
         );
         fixture.registry.stop_and_seal().await;
+    }
+}
+
+#[tokio::test]
+async fn retired_antigravity_sends_refuse_before_wal_writes_or_model_calls() {
+    for (route, replacement) in [
+        ("gemini-3.7-flash", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.7-flash-low", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.7-flash-medium", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.7-flash-high", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.6-flash", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.6-flash-low", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.6-flash-medium", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.6-flash-high", "antigravity-gemini-3.8-flash"),
+        ("gemini-3.1-pro", "antigravity-gemini-4-argon"),
+        ("gemini-3.1-pro-low", "antigravity-gemini-4-argon"),
+        ("gemini-3.1-pro-high", "antigravity-gemini-4-argon"),
+        ("gemini-pro-agent", "antigravity-gemini-4-argon"),
+        ("claude-sonnet-4-6-thinking", "anthropic/claude-sonnet-5-5"),
+    ] {
+        for prefix in ["", "antigravity-"] {
+            let f = Fixture::start_for(false, WireFamilyId::GoogleCodeAssist).await;
+            let model = format!("{prefix}{route}");
+            for attempt in ["fresh", "already-open"] {
+                let params: broca_wire::SendParams = serde_json::from_value(json!({
+                    "prompt": "ping",
+                    "model": {"provider": "google", "model": model},
+                }))
+                .unwrap();
+                let request = params
+                    .into_send_request(f.key.clone(), RunId(format!("retired-{model}-{attempt}")))
+                    .unwrap();
+                let before = f.executor.store.0.bytes_for_move(&f.key).unwrap();
+                let error = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    ServeHandler::send(&f.registry, request),
+                )
+                .await
+                .expect("retired send admission hung")
+                .expect_err(&format!("{model} {attempt} was admitted"));
+                let message = error.to_string();
+                assert!(message.contains(&format!("google/{model}")), "{message}");
+                assert!(message.contains("Google withdrew"), "{message}");
+                assert!(message.contains(replacement), "{message}");
+                if route == "claude-sonnet-4-6-thinking" {
+                    assert!(
+                        message.contains("through the Anthropic provider"),
+                        "{message}"
+                    );
+                } else {
+                    assert!(message.contains("(medium)"), "{message}");
+                }
+                assert_eq!(
+                    f.executor.store.1.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{model} attempted a WAL append"
+                );
+                // Opening a fresh session can initialize the WAL header, but refusal must append
+                // no records. A later send on that open session must leave every byte unchanged.
+                assert!(f.records().is_empty(), "{model} wrote a WAL record");
+                if attempt == "already-open" {
+                    assert!(before.is_some());
+                    assert_eq!(f.executor.store.0.bytes_for_move(&f.key).unwrap(), before);
+                }
+                assert!(
+                    f.bodies.lock().unwrap().is_empty(),
+                    "{model} made a model call"
+                );
+                assert!(f.executor.provider.lock().unwrap().is_none());
+                f.idle().await;
+            }
+        }
     }
 }
