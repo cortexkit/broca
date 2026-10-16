@@ -337,10 +337,10 @@ class SameShaPushArms(unittest.TestCase):
 
 
 class RemotePreflightArms(unittest.TestCase):
-    def test_failed_remote_preflight_refuses_before_even_the_probe_push(self):
+    def test_opted_in_failed_remote_preflight_refuses_before_even_the_probe_push(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = build_fixture(pathlib.Path(tmp))
-            result = run_guard_result(work, 'preflight-red', extra_env={'FAIL_REMOTE_PREFLIGHT': '17'})
+            result = run_guard_result(work, 'preflight-red', extra_env={'FAIL_REMOTE_PREFLIGHT': '17', 'TRAIN_PUSH_LINUX_PREFLIGHT': '1'})
             output = result.stdout + result.stderr
             self.assertIn('fixture-remote-preflight', output)
             self.assertEqual(result.returncode, 2, output)
@@ -348,6 +348,16 @@ class RemotePreflightArms(unittest.TestCase):
             self.assertNotIn('first train in this repo', output)
             refs = git(work, 'ls-remote', '--heads', 'origin', 'train/*')
             self.assertEqual(refs.stdout, '', refs.stdout + refs.stderr)
+
+    def test_default_skips_duplicate_linux_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = build_fixture(pathlib.Path(tmp))
+            result = run_guard_result(work, 'preflight-skipped', extra_env={
+                'FAIL_REMOTE_PREFLIGHT': '17', 'TRAIN_PUSH_LINUX_PREFLIGHT': '0'})
+            output = result.stdout + result.stderr
+            self.assertIn('Linux preflight skipped', output)
+            self.assertNotIn('fixture-remote-preflight', output)
+            self.assertIn('first train in this repo', output)
 
     def test_same_sha_reuses_preflight_but_requeue_requires_another(self):
         source = SCRIPT.read_text()
@@ -360,6 +370,7 @@ class RemotePreflightArms(unittest.TestCase):
             harness = f'''
 set -euo pipefail
 linux_preflight_sha=""
+export TRAIN_PUSH_LINUX_PREFLIGHT=1
 candidate_sha=first
 say() {{ :; }}
 refuse() {{ echo "REFUSED: $*"; exit 2; }}

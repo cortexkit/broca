@@ -67,6 +67,8 @@
 # The optional smoke is the targeted slice the diff touches (the one or two
 # suites you would rerun by hand), NOT the full gate. It exists to catch an
 # obvious break before spending a CI run.
+# Set TRAIN_PUSH_LINUX_PREFLIGHT=1 to repeat the portable CI lane before pushing.
+# It is opt-in because CI runs the same tests and deployment need not wait for either.
 #
 # A red train leaves origin/train/<train-name> in place: fix, commit, and run
 # this script again with the same name to update the branch and re-run CI.
@@ -663,6 +665,9 @@ fi
 linux_preflight_sha=""
 run_linux_preflight() {
   local candidate dirty
+  if [ "${TRAIN_PUSH_LINUX_PREFLIGHT:-0}" != 1 ]; then
+    return 0
+  fi
   candidate="$(git rev-parse HEAD)" || refuse "could not resolve the preflight SHA"
   dirty="$(git status --porcelain)" || refuse "could not read worktree status before Linux preflight"
   [[ -z "$dirty" ]] || refuse "dirty worktree before Linux preflight"
@@ -673,6 +678,9 @@ run_linux_preflight() {
   [[ "$(git rev-parse HEAD)" == "$candidate" && -z "$dirty" ]] || refuse "HEAD/worktree changed during Linux preflight"
   linux_preflight_sha="$candidate"
 }
+if [ "${TRAIN_PUSH_LINUX_PREFLIGHT:-0}" != 1 ]; then
+  say "Linux preflight skipped (CI repeats it); opt in with TRAIN_PUSH_LINUX_PREFLIGHT=1"
+fi
 run_linux_preflight
 
 # ---------------------------------------------------------------------------

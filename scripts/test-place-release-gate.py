@@ -601,6 +601,80 @@ class PlacementGateTests(GateBase):
         self.assertEqual(self.dest.read_bytes(), self.deployed_bytes, "restart-only must not place bytes")
         self.assertFalse(self.rollback.exists(), "restart-only must not create a rollback snapshot")
 
+    def restart_fixture(self, *, new_pid=True, right_inode=True):
+        self.deploy(signed="adhoc,runtime")
+        stub_binary(self.staged, features=[], signed="adhoc,runtime")
+        restarted = self.tmp / "restarted"
+        ck = self.fake_bin / "ck"
+        ck.write_text('#!/bin/sh\n' + (f'touch "{restarted}"\n' if new_pid else 'exit 0\n'))
+        ck.chmod(0o755)
+        (self.fake_bin / "ps").write_text(f'''#!/usr/bin/env python3
+from pathlib import Path
+pid = 4243 if Path({str(restarted)!r}).exists() else 4242
+print("  PID COMMAND")
+print(f"{{pid}} {self.dest} --subc socket")
+''')
+        (self.fake_bin / "lsof").write_text(f'''#!/usr/bin/env python3
+from pathlib import Path
+inode = Path({str(self.dest)!r}).stat().st_ino
+if Path({str(restarted)!r}).exists() and not {right_inode!r}: inode = 1
+print("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME")
+print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
+''')
+        return dict(PLACE_RELEASE_CK=str(ck), BROCA_TEST_BIN=str(self.dest),
+                    PLACE_RELEASE_WAIT_SECONDS="0", PLACE_RELEASE_POLL_SECONDS="0")
+
+    def test_live_approved_logs_approver_keeps_rollback_and_waits_for_new_image(self):
+        env = self.restart_fixture()
+        report = self.tmp / "report.json"
+        wal = self.state / "wal"
+        wal.mkdir()
+        shutil.copy2(ROOT / "scripts/fixtures/resume-close-out-sealed.wal", wal / "session.wal")
+        shutil.copy2(ROOT / "scripts/fixtures/resume-close-out-unsealed.wal", wal / "unsealed.wal")
+        result = self.place("--restart", "--live-approved", "--report", str(report),
+                            PLACE_RELEASE_GATE_CMD='echo "live runs          2"; echo "  live  session.wal  last write 0s ago"; echo "  live  unsealed.wal  last write 0s ago"; exit 1', **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("live restart approved by " + subprocess.check_output(["id", "-un"], text=True).strip(), result.stdout)
+        self.assertIn("live runs accepted immediately before restart", result.stdout)
+        self.assertIn("(pid 4243)", result.stdout)
+        data = json.loads(report.read_text())
+        self.assertEqual(data["pid"], "4243")
+        self.assertEqual(data["sessions_at_restart"], ["session.wal", "unsealed.wal"])
+        self.assertEqual(data["sessions_sealed"], ["session.wal"])
+        self.assertEqual(data["sessions_unconfirmed"], ["unsealed.wal"])
+        self.assertEqual(data["seal_error"], "")
+        self.assertEqual(Path(data["backup"]).read_bytes(), self.deployed_bytes)
+        self.assertTrue(Path(data["backup"] + ".sha256").exists())
+
+    def test_live_approved_accepts_a_run_that_starts_between_placement_and_restart(self):
+        env = self.restart_fixture()
+        counter = self.tmp / "gate-called"
+        gate = f'if [ -f "{counter}" ]; then echo "live runs          1"; exit 1; fi; touch "{counter}"; exit 0'
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD=gate, **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("live runs accepted immediately before restart", result.stdout)
+        self.assertIn("(pid 4243)", result.stdout)
+
+    def test_live_approval_never_overrides_unknown_live_run_state(self):
+        env = self.restart_fixture()
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD="exit 2", **env)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("gate could not determine live runs", result.stderr)
+        self.assertEqual(self.dest.read_bytes(), self.deployed_bytes)
+        self.assertFalse(self.rollback.exists())
+
+    def test_live_approved_still_requires_a_new_pid(self):
+        env = self.restart_fixture(new_pid=False)
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD="exit 1", **env)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("TIMED OUT waiting for placed image", result.stderr)
+
+    def test_live_approved_still_requires_the_placed_inode(self):
+        env = self.restart_fixture(right_inode=False)
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD="exit 1", **env)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("TIMED OUT waiting for placed image", result.stderr)
+
     def test_refuses_a_copy_without_the_runtime_flag(self) -> None:
         self.deploy(signed="adhoc")
         stub_binary(self.staged, features=[])

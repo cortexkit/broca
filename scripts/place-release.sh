@@ -18,7 +18,10 @@
 #
 # Usage:
 #   scripts/place-release.sh --staged /tmp/ck-broca-065 [--dest <path>] [--skip-gate] [--restart]
-#   scripts/place-release.sh --restart-only [--dest <path>]
+#   scripts/place-release.sh --restart-only [--dest <path>] [--live-approved]
+# --live-approved permits a restart with known live runs, logging the invoking OS user.
+# It never bypasses an unreadable gate or the new-pid/placed-inode wait.
+# --report FILE writes the rollback path, restart pid and pre-restart live WAL names as JSON.
 #
 # A plain placement (--staged <path> without --restart) places the staged binary at --dest
 # atomically using rename(2). Because rename preserves the running process's existing inode,
@@ -63,10 +66,12 @@ SKIP_GATE=0
 RESTART=0
 RESTART_ONLY=0
 STAGED_PROVIDED=0
+LIVE_APPROVED=0
+REPORT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --staged|--dest)
+    --staged|--dest|--report)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
         echo "place-release: usage error: $1 requires an argument" >&2
         exit 2
@@ -79,9 +84,20 @@ while [ $# -gt 0 ]; do
     --skip-gate) SKIP_GATE=1; shift ;;
     --restart) RESTART=1; shift ;;
     --restart-only) RESTART_ONLY=1; shift ;;
+    --live-approved) LIVE_APPROVED=1; shift ;;
+    --report) REPORT="$2"; shift 2 ;;
     *) echo "place-release: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ "$LIVE_APPROVED" -eq 1 ]; then
+  if { [ "$RESTART" -eq 0 ] && [ "$RESTART_ONLY" -eq 0 ]; } || [ "$SKIP_GATE" -eq 1 ]; then
+    echo "place-release: --live-approved requires --restart or --restart-only, without --skip-gate" >&2
+    exit 2
+  fi
+  APPROVER="$(id -un)" || exit 2
+  echo "== live restart approved by $APPROVER (uid $(id -u)) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 if [ "$RESTART_ONLY" -eq 1 ]; then
   if [ "$STAGED_PROVIDED" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$SKIP_GATE" -eq 1 ]; then
@@ -98,6 +114,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/signing-posture.sh"
 source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
+GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
+TMP=""
+trap 'rm -f "${TMP:-}" "$GATE_LOG"' EXIT
 
 # The live-run gate answers "is any run live RIGHT NOW". It only refuses when this invocation
 # will restart (--restart, --restart-only), because placement alone is an atomic rename that
@@ -106,12 +125,42 @@ source "$REPO_ROOT/scripts/running-image.sh"
 run_gate() {
   set +e
   if [ -n "${PLACE_RELEASE_GATE_CMD:-}" ]; then
-    bash -c "$PLACE_RELEASE_GATE_CMD" >/tmp/place-gate.txt 2>&1
+    bash -c "$PLACE_RELEASE_GATE_CMD" >"$GATE_LOG" 2>&1
   else
-    python3 "$REPO_ROOT/scripts/live-runs.py" >/tmp/place-gate.txt 2>&1
+    python3 "$REPO_ROOT/scripts/live-runs.py" >"$GATE_LOG" 2>&1
   fi
   gate_rc=$?
   set -e
+}
+
+write_report() {
+  [ -n "$REPORT" ] || return 0
+  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" <<'PY'
+import importlib.util, json, pathlib, sys
+path, backup, pid, gate, scripts = sys.argv[1:]
+snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
+sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith("  live  ")]
+sealed = []
+seal_error = ""
+if pid and sessions:
+    # Read terminal records in the pre-restart session logs. A new process can
+    # start even if the old process left a run without a durable completion record.
+    try:
+        sys.path.insert(0, scripts)
+        spec = importlib.util.spec_from_file_location("live_runs", pathlib.Path(scripts) / "live-runs.py")
+        live = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(live)
+        wals = {wal.name: wal for wal in live.logical_wals(live.state_root.default_state_root() / "wal", include_archives=False)}
+        sealed = [name for name in sessions if name in wals and live.tail_state(wals[name]) == live.SEALED]
+    except Exception as error:
+        seal_error = str(error)
+pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid,
+                                       "sessions_at_restart": sessions,
+                                       "sessions_sealed": sealed,
+                                       "sessions_unconfirmed": [name for name in sessions if name not in sealed],
+                                       "seal_error": seal_error,
+                                       "live_run_snapshot": snapshot}))
+PY
 }
 
 # The live-run gate applies only when this invocation will restart (--restart, --restart-only).
@@ -122,9 +171,14 @@ if [ "$SKIP_GATE" -eq 0 ]; then
   if [ "$RESTART" -eq 1 ] || [ "$RESTART_ONLY" -eq 1 ]; then
     case "$gate_rc" in
       0) echo "== gate: no live runs" ;;
-      1) echo "place-release: REFUSING -- a run is live. Restart cuts it." >&2
-         grep -aE "live runs|session" /tmp/place-gate.txt | head -3 >&2 || true
-         exit 1 ;;
+      1) if [ "$LIVE_APPROVED" -eq 1 ]; then
+           echo "== gate: live runs accepted by $APPROVER"
+           cat "$GATE_LOG"
+         else
+           echo "place-release: REFUSING -- a run is live. Restart cuts it." >&2
+         grep -aE "live runs|session" "$GATE_LOG" | head -3 >&2 || true
+           exit 1
+         fi ;;
       *) echo "place-release: REFUSING -- gate could not determine live runs (exit $gate_rc)." >&2
          echo "  A gate that cannot tell must not be read as a clear gate." >&2
          exit 2 ;;
@@ -132,7 +186,7 @@ if [ "$SKIP_GATE" -eq 0 ]; then
   else
     case "$gate_rc" in
       0) echo "== gate: no live runs" ;;
-      1) live_count=$(grep -aE "live runs" /tmp/place-gate.txt 2>/dev/null | sed -E 's/.*live runs[^0-9]*([0-9]+).*/\1/' | head -1 || true)
+      1) live_count=$(grep -aE "live runs" "$GATE_LOG" 2>/dev/null | sed -E 's/.*live runs[^0-9]*([0-9]+).*/\1/' | head -1 || true)
          # The gate said a run is live but its count did not parse: say so rather than invent one.
          if ! [[ "$live_count" =~ ^[0-9]+$ ]]; then
            runs_str="runs are live (count unreadable)"
@@ -177,10 +231,12 @@ restart_and_wait() {
     sleep "$poll_seconds"
   done
   echo "== restarted at $(date -u +%H:%M:%SZ) (pid $new_pid)"
+  write_report "$new_pid"
   echo "   Verify:  scripts/verify-deploy.sh --sha $expected_sha --marker <new> --control <known>"
 }
 
 if [ "$RESTART_ONLY" -eq 1 ]; then
+  write_report
   disk_inode="$(broca_file_inode "$DEST")"
   disk_sha="$(shasum -a 256 "$DEST" | awk '{print $1}')"
   restart_and_wait "$disk_inode" "$disk_sha"
@@ -223,7 +279,7 @@ fi
 # Same-directory temp is REQUIRED, not tidiness: rename(2) is only atomic within one filesystem,
 # and /tmp is frequently a different one.
 TMP="$(mktemp "${DEST}.place.XXXXXX")"
-trap 'rm -f "$TMP"' EXIT
+# Keep the existing exit trap: it removes both this temp image and the per-invocation gate log.
 
 cat "$STAGED" >"$TMP"
 chmod 755 "$TMP"
@@ -421,10 +477,12 @@ if ! ( cd "$ROLLBACK_DIR" && shasum -c "$(basename "$BACKUP").sha256" >/dev/null
   exit 2
 fi
 
+write_report
+
 BEFORE_INODE="$(broca_file_inode "$DEST")"
 
 mv -f "$TMP" "$DEST"
-trap - EXIT
+TMP=""
 
 AFTER_INODE="$(broca_file_inode "$DEST")"
 AFTER_SHA="$(shasum -a 256 "$DEST" | awk '{print $1}')"
@@ -471,13 +529,17 @@ fi
 # which harms nothing, and say so.
 if [ "$SKIP_GATE" -eq 0 ]; then
   run_gate
-  if [ "$gate_rc" -ne 0 ]; then
+  if [ "$gate_rc" -eq 1 ] && [ "$LIVE_APPROVED" -eq 1 ]; then
+    echo "== gate: live runs accepted immediately before restart by $APPROVER"
+    cat "$GATE_LOG"
+  elif [ "$gate_rc" -ne 0 ]; then
     echo "place-release: PLACED but NOT restarted -- the live-run gate is no longer clear (exit $gate_rc)." >&2
-    grep -aE "live runs|session" /tmp/place-gate.txt | head -3 >&2 || true
+    grep -aE "live runs|session" "$GATE_LOG" | head -3 >&2 || true
     echo "  The new binary is on disk and not loaded. Restart when the gate is clear:" >&2
     echo "    scripts/place-release.sh --restart-only --dest '$DEST'" >&2
     exit 3
   fi
 fi
 
+write_report
 restart_and_wait "$AFTER_INODE" "$AFTER_SHA"

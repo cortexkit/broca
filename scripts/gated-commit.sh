@@ -92,7 +92,8 @@ if [ "$#" -eq 0 ]; then
   }
   derived=$(changed_crates | sort -u | tr '\n' ' ')
   if [ -n "$derived" ]; then
-    # shellcheck disable=SC2086 -- deliberate split: crate names cannot contain spaces.
+    # Deliberate split: crate names cannot contain spaces.
+    # shellcheck disable=SC2086
     set -- $derived
     echo "gated-commit: derived crates from the diff: $*"
   else
@@ -110,7 +111,7 @@ if [ "$#" -eq 0 ]; then
   fi
 fi
 
-echo "gated-commit: running quickcheck on: $*"
+echo "gated-commit: running crate-scoped fmt, all-target clippy, lib/bin tests and doctests on: $*"
 # Capture the status DIRECTLY rather than inside `if ! ...`, where $? would hold the negated
 # test result and report a failing gate as "exit 0". Caught by reading this script's own first
 # refusal, which is the only reason it is right: the wrong version still refuses correctly and
