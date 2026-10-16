@@ -86,6 +86,7 @@ impl FileWalStore {
             state.inventory.unreadable.push(reason.into());
             state.finished = true;
         }
+        self.move_inventory.state.clear_poison();
         drop(state);
         self.move_inventory.ready.notify_waiters();
     }

@@ -13000,8 +13000,8 @@ test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["diverged_marks_a_retained_local_copy_advanced"]
 only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
-old = 'Ok(true) => "advanced",'
-new = 'Ok(true) => "at_cut", // NON-VACUITY BREAK'
+old = 'divergence = Some(broca_module::move_files::LocalDivergence::Advanced);'
+new = 'divergence = Some(broca_module::move_files::LocalDivergence::AtCut); // NON-VACUITY BREAK'
 
 [[control]]
 id = "agent-data-retained-import-fork"
@@ -13116,8 +13116,8 @@ test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["diverged_held_ref_with_a_bad_cut_is_unknown_and_logs_the_cause"]
 only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
-old = 'Ok(false) if p.sealed_digest.is_none() => "unknown",'
-new = 'Ok(false) if false && p.sealed_digest.is_none() => "unknown", // NON-VACUITY BREAK'
+old = 'Some(broca_module::move_files::LocalDivergence::Unknown);'
+new = 'Some(broca_module::move_files::LocalDivergence::AtCut); // NON-VACUITY BREAK'
 
 [[control]]
 id = "agent-data-diverged-verification-log"
@@ -13262,8 +13262,8 @@ test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["move_and_move_back_replays_and_rejoins_only_a_prefix"]
 only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
-old = 'Ok(local) if p.bytes.starts_with(local.as_deref().unwrap_or_default()) => "at_cut",'
-new = 'Ok(local) if p.bytes.starts_with(local.as_deref().unwrap_or_default()) || true => "at_cut", // NON-VACUITY BREAK'
+old = 'Some(if bytes.starts_with(&local) {'
+new = 'Some(if true || bytes.starts_with(&local) { // NON-VACUITY BREAK'
 
 [[control]]
 id = "agent-data-address-reader-normal-fence"
@@ -13980,7 +13980,7 @@ package = "broca-module-serve"
 target = "--test agent_data"
 features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
-expect_red = ["inventory::incomplete_inventory_is_unknown_until_boot_build_finishes"]
+expect_red = ["inventory::incomplete_inventory_is_unknown_until_boot_build_finishes", "persistent_inventory::second_boot_reuses_unchanged_wals_without_payload_reads"]
 only = false
 file = "crates/broca-core/src/wal_writer/move_inventory.rs"
 old = '''        if !state.finished {
@@ -14002,18 +14002,18 @@ old = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lin
 new = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id WHERE r.withdrawals_owed=1 AND l.expired_at_ms IS NULL"; // NON-VACUITY BREAK: restore the run-driven sweep query.'
 
 [[control]]
-id = "agent-data-persistent-cache-validates-lineage-and-length"
-guards = "cached triples cannot survive a replaced lineage or a stale committed length"
+id = "agent-data-persistent-cache-validates-lineage"
+guards = "cached triples cannot survive a replaced lineage even with the same file stamp and length"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test agent_data"
 features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
-expect_red = ["persistent_inventory::replaced_wal_lineage_is_rescanned_instead_of_reusing_identities", "persistent_inventory::stale_cached_length_is_detected_and_rescanned"]
+expect_red = ["persistent_inventory::replaced_wal_lineage_is_rescanned_instead_of_reusing_identities"]
 only = false
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
-old = 'if let Some(old) = old.filter(|old| reusable(old, &source)) {'
-new = 'if let Some(old) = old { // NON-VACUITY BREAK: reuse without checking lineage or committed length.'
+old = "&& l == r)"
+new = "&& true) // NON-VACUITY BREAK: reuse a replaced lineage with an otherwise equal stamp."
 
 [[control]]
 id = "agent-data-persistent-cache-is-not-authority"
@@ -14052,7 +14052,7 @@ runner = "cargo"
 package = "broca-core"
 target = "--lib"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/tests.rs"
-expect_red = ["wal_writer::move_inventory::tests::panic_finishes_inventory_incomplete", "wal_writer::move_inventory::tests::cancellation_finishes_inventory_incomplete"]
+expect_red = ["wal_writer::move_inventory::tests::panic_finishes_inventory_incomplete", "wal_writer::move_inventory::tests::cancellation_finishes_inventory_incomplete", "wal_writer::move_inventory::tests::panic_while_inventory_locked_finishes_incomplete"]
 file = "crates/broca-core/src/wal_writer/move_inventory.rs"
 old = "if result.is_err() || !state.finished {"
 new = "if false { // NON-VACUITY BREAK: leave interrupted builds pending forever."
@@ -14136,8 +14136,8 @@ platforms = ["linux", "macos"]
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::append_during_scan_keeps_only_the_stamped_strict_prefix"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
-old = "if after != source && !grew {"
-new = "if after != source { // NON-VACUITY BREAK: reject ordinary append-only growth."
+old = "if after_stamp != *stamp && !grew {"
+new = "if after_stamp != *stamp { // NON-VACUITY BREAK: reject ordinary append-only growth."
 
 [[control]]
 id = "agent-data-inventory-clips-stamped-prefix"
@@ -14284,3 +14284,28 @@ file = "crates/broca-module-serve/src/agent_data.rs"
 old = '''            Op::Diverged => json!({"refs":plans.iter().map(|p| {'''
 new = '''            Op::Diverged => json!({"refs":plans.iter().map(|p| {
                 let _ = self.wal.bytes_for_move(&p.session); // NON-VACUITY BREAK: reread the local WAL in reply. '''
+
+[[control]]
+id = "agent-data-persistent-cache-validates-length"
+guards = "a stale committed end cannot reuse even an otherwise matching lineage and file stamp"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::stale_cached_length_is_detected_and_rescanned"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "&& old.committed_end == stamp.len"
+new = "&& true // NON-VACUITY BREAK: reuse a stale committed end.\n"
+
+[[control]]
+id = "agent-data-inventory-merges-concurrent-publications"
+guards = "identities published after the boot census survive final inventory publication"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::build_merges_identities_published_after_its_census"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "inventory.sessions.append(&mut state.inventory.sessions);"
+new = "state.inventory.sessions.clear(); // NON-VACUITY BREAK: discard identities published during the build."

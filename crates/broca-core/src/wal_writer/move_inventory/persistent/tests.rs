@@ -46,6 +46,92 @@ fn terminal() -> WalRecord {
     }
 }
 
+fn started(session: &BindIdentity) -> WalRecord {
+    WalRecord::RunStarted {
+        retention: None,
+        hooks: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        marker_order_version: None,
+        manifest: None,
+        scope: None,
+        send_id: None,
+        request_identity_digest: None,
+        project_id: None,
+        principal: None,
+        run_id: broca_protocol::RunId("new-run".into()),
+        session: session.clone(),
+        ts_ms: Some(1),
+        config: Box::new(broca_wal::RunConfig {
+            model: broca_protocol::ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: broca_protocol::ToolChoice::Auto,
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: vec![],
+            context_management: None,
+        }),
+        input: Default::default(),
+        origin: broca_wal::RunOrigin::Fresh,
+        submission_id: None,
+    }
+}
+
+#[test]
+fn build_merges_identities_published_after_its_census() {
+    let rig = Rig::new();
+    let session = BindIdentity {
+        harness: "runner".into(),
+        project_root: "/p".into(),
+        session: "created-during-build".into(),
+    };
+    let reference = cortexkit_role_llm_runner::session_ref(
+        &session.harness,
+        &session.project_root.to_string_lossy(),
+        &session.session,
+    );
+    build_with_hooks(
+        &rig.store,
+        &CancellationToken::new(),
+        |_| {
+            let mut wal = rig.store.open(&session).unwrap();
+            wal.append(1, &started(&session), false).unwrap();
+            assert!(rig
+                .store
+                .move_session_refs(std::iter::once(reference.as_str()))
+                .sessions
+                .contains_key(&reference));
+        },
+        |_| {},
+    );
+    let inventory = rig
+        .store
+        .move_session_refs(std::iter::once(reference.as_str()));
+    assert!(inventory.unreadable.is_empty());
+    assert_eq!(
+        inventory.sessions.get(&reference),
+        Some(&(session_addr(&session), session))
+    );
+    assert_eq!(
+        rig.store.move_inventory_build_stats().payload_reads,
+        0,
+        "the new identity must come from publication, not another census"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn append_during_scan_keeps_only_the_stamped_strict_prefix() {

@@ -617,9 +617,12 @@ fn same_live_lineage(old: &Source, current: &Source) -> bool {
 
 fn reusable(old: &CachedAddress, current: &Source) -> bool {
     match current {
-        Source::Live { stamp, .. } => {
+        Source::Live {
+            stamp, sealed_tail, ..
+        } => {
             same_live_lineage(&old.source, current)
-                && old.source == *current
+                && matches!(&old.source, Source::Live { stamp: previous, sealed_tail: previous_tail, .. }
+                    if previous == stamp && previous_tail == sealed_tail)
                 && old.committed_end == stamp.len
         }
         Source::Archive { payload_len, .. } => {
@@ -733,10 +736,15 @@ fn scan_after_stamp(
             }) {
                 return Err(changed("inventory WAL lineage changed during read"));
             }
-            let after = live_source(path.clone(), stats)?;
-            let grew = matches!(&after, Source::Live { stamp: later, .. }
-                if later.len > stamp.len && same_live_lineage(&source, &after));
-            if after != source && !grew {
+            let after_stamp = FileStamp::at(path)?;
+            let grew = if after_stamp.len > stamp.len {
+                let after = live_source(path.clone(), stats)?;
+                matches!(&after, Source::Live { stamp: later, .. }
+                    if later.len >= after_stamp.len && same_live_lineage(&source, &after))
+            } else {
+                false
+            };
+            if after_stamp != *stamp && !grew {
                 return Err(changed("WAL changed during inventory read"));
             }
             let WalRangeRecords::Complete(records) = range.records() else {
@@ -896,7 +904,7 @@ fn build_with_hooks(
         return;
     }
     let mut state = store.move_inventory.state.lock().unwrap();
-    // Merge identities from RunStarted writes synced while this scan ran. The
+    // Merge candidates from RunStarted writes published while this scan ran. The
     // saved hints can lag those writes: the next boot detects their larger WAL
     // length and reads the appended records before proving inventory complete.
     inventory.sessions.append(&mut state.inventory.sessions);

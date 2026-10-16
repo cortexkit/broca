@@ -15,6 +15,26 @@ async fn panic_finishes_inventory_incomplete() {
 }
 
 #[tokio::test]
+async fn panic_while_inventory_locked_finishes_incomplete() {
+    let store = FileWalStore::new(PathBuf::from("unused-inventory-lock-panic"));
+    store.run_inventory_build(|| {
+        let _state = store.move_inventory.state.lock().unwrap();
+        panic!("injected inventory panic while locked");
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.wait_move_inventory(),
+    )
+    .await
+    .expect("poisoned lock must not strand waiters");
+    assert_eq!(store.move_inventory_health(), (true, 1));
+    assert!(!store
+        .move_session_refs(std::iter::empty())
+        .unreadable
+        .is_empty());
+}
+
+#[tokio::test]
 async fn cancellation_finishes_inventory_incomplete() {
     let store = Arc::new(FileWalStore::new(PathBuf::from("unused-inventory-cancel")));
     let cancel = CancellationToken::new();
