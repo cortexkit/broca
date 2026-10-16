@@ -235,6 +235,62 @@ mod tests {
     }
 
     #[test]
+    fn discovery_with_live_retention_uses_partial_covering_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let live = BindIdentity::new("/p", "h", "live");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO retention_lineage VALUES ('live', 'live-key', 1, 0, 1, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            insert_run(
+                &conn,
+                "live",
+                &serde_json::to_string(&live).unwrap(),
+                Some("live"),
+                true,
+            );
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4000)
+                 INSERT INTO run_index (run_id, session, state, lineage_id, withdrawals_owed)
+                 SELECT 'other-'||x, ?1, 'completed', 'other-lineage-'||x, 1 FROM n",
+                [serde_json::to_string(&BindIdentity::new("/p", "h", "other")).unwrap()],
+            )
+            .unwrap();
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {DISCOVERY_SQL}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("COVERING INDEX run_index_discovery_lineage_idx")),
+                "discovery must avoid reading full run rows: {plan:?}"
+            );
+            let mut stmt = conn.prepare(DISCOVERY_SQL).unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows, vec![serde_json::to_string(&live).unwrap()]);
+            let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(
+                steps < 200,
+                "discovery walked unrelated runs: {steps} VM steps"
+            );
+        }
+        assert_eq!(
+            store.retention_lineages_with_discovery().unwrap(),
+            vec![live]
+        );
+    }
+
+    #[test]
     fn discovery_without_live_retention_does_not_scan_runs() {
         let store = SqliteStore::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();

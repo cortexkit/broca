@@ -13995,7 +13995,7 @@ runner = "cargo"
 package = "broca-store"
 target = "--lib"
 test_file = "crates/broca-store/src/retention_withdrawals.rs"
-expect_red = ["retention_withdrawals::tests::discovery_without_live_retention_does_not_scan_runs"]
+expect_red = ["retention_withdrawals::tests::discovery_without_live_retention_does_not_scan_runs", "retention_withdrawals::tests::discovery_with_live_retention_uses_partial_covering_index"]
 only = false
 file = "crates/broca-store/src/retention_withdrawals.rs"
 old = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1";'
@@ -14029,3 +14029,57 @@ file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = 'match locations(store, cancel, &mut inventory.unreadable, &mut stats) {'
 new = '''// NON-VACUITY BREAK: cached addresses are the entire inventory authority.
     match Ok::<_, WalError>(cached.iter().map(|(address, entry)| (address.clone(), entry.source.clone())).collect::<BTreeMap<_, _>>()) {'''
+
+[[control]]
+id = "retention-all-runs-lineage-index"
+guards = "retained session enumeration uses the non-partial lineage index rather than scanning ordinary runs"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention.rs"
+expect_red = ["retention::tests::retained_sessions_cost_is_bounded_by_retention_inventory"]
+select = "expected"
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = '"CREATE INDEX IF NOT EXISTS run_index_lineage_session_idx ON run_index(lineage_id, session)",'
+new = '"DROP INDEX IF EXISTS run_index_lineage_session_idx", // NON-VACUITY BREAK: remove the general lineage lookup index.'
+
+[[control]]
+id = "retention-run-rows-lineage-index"
+guards = "per-lineage run lookup uses the non-partial lineage index rather than scanning ordinary runs"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention.rs"
+expect_red = ["retention::tests::retention_run_rows_cost_is_bounded_by_lineage_runs"]
+select = "expected"
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = '"CREATE INDEX IF NOT EXISTS run_index_lineage_session_idx ON run_index(lineage_id, session)",'
+new = '"DROP INDEX IF EXISTS run_index_lineage_session_idx", // NON-VACUITY BREAK: remove the general lineage lookup index.'
+
+[[control]]
+id = "retention-discovery-covering-lineage-index"
+guards = "live-lineage withdrawal discovery uses its partial covering index rather than automatic indexes or full run rows"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention_withdrawals.rs"
+expect_red = ["retention_withdrawals::tests::discovery_with_live_retention_uses_partial_covering_index"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = '"CREATE INDEX IF NOT EXISTS run_index_discovery_lineage_idx ON run_index(lineage_id, session) WHERE withdrawals_owed=1",'
+new = '"DROP INDEX IF EXISTS run_index_discovery_lineage_idx", // NON-VACUITY BREAK: remove the covering withdrawal lookup index.'
+
+[[control]]
+id = "retention-sessions-lineages-before-runs"
+guards = "retained session enumeration starts at the small retention inventory while still including expired sessions"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention.rs"
+expect_red = ["retention::tests::retained_sessions_cost_is_bounded_by_retention_inventory"]
+only = false
+file = "crates/broca-store/src/retention.rs"
+old = 'const RETAINED_SESSIONS_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id";'
+new = 'const RETAINED_SESSIONS_SQL: &str = "SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id"; // NON-VACUITY BREAK: restore the run-driven session query.'
