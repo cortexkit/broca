@@ -7,6 +7,13 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::{bind_identity_from_store_key, SqliteStore, StoreError};
 
+const RETENTION_RUN_ROWS_SQL: &str =
+    "SELECT run_id, state_changed_ms FROM run_index WHERE lineage_id=?1 ORDER BY run_id";
+// Start at retention_lineage and look up only its runs, rather than scanning all
+// run_index rows when no sessions have retention enabled. Include expired lineages
+// too: their sessions must remain non-exportable even after deletion.
+const RETAINED_SESSIONS_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id";
+
 /// One WAL lineage's durable retention progress. `session` is stored in meta's U+001F triple
 /// form, not the JSON form used by run_index. A non-terminal lineage has no deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +74,9 @@ impl SqliteStore {
     pub fn retention_run_rows(&self, lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
         let ids: Vec<(String, Option<u64>)> = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT run_id, state_changed_ms FROM run_index WHERE lineage_id=?1 ORDER BY run_id").map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(RETENTION_RUN_ROWS_SQL)
+                .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([lineage], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(|e| e.to_string())?;
@@ -87,7 +96,7 @@ impl SqliteStore {
 
     pub fn retained_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id")?;
+        let mut stmt = conn.prepare(RETAINED_SESSIONS_SQL)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
@@ -302,6 +311,150 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    fn cost_fixture() -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let session = serde_json::to_string(&BindIdentity::new("/p", "h", "live")).unwrap();
+            conn.execute(
+                "INSERT INTO retention_lineage VALUES ('live', 'live-key', 1, 0, 1, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO run_index (run_id, session, state, lineage_id, state_changed_ms) VALUES ('z-live', ?1, 'completed', 'live', 7), ('a-live', ?1, 'completed', 'live', NULL)",
+                [&session],
+            ).unwrap();
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4000)
+                 INSERT INTO run_index (run_id, session, state, lineage_id, withdrawals_owed)
+                 SELECT 'other-'||x, ?1, 'completed', 'other-lineage-'||x, 1 FROM n",
+                [serde_json::to_string(&BindIdentity::new("/p", "h", "other")).unwrap()],
+            )
+            .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn retained_sessions_cost_is_bounded_by_retention_inventory() {
+        let store = cost_fixture();
+        assert_eq!(
+            store.retained_sessions().unwrap(),
+            vec![BindIdentity::new("/p", "h", "live")]
+        );
+        let conn = store.conn.lock().unwrap();
+        for empty in [false, true] {
+            if empty {
+                conn.execute("DELETE FROM retention_lineage", []).unwrap();
+            }
+            let mut stmt = conn.prepare(RETAINED_SESSIONS_SQL).unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), usize::from(!empty));
+            let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(
+                steps < 200,
+                "retained sessions walked unrelated runs: {steps} VM steps"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_run_rows_cost_is_bounded_by_lineage_runs() {
+        let store = cost_fixture();
+        let runs = store.retention_run_rows("live").unwrap();
+        assert_eq!(
+            runs.iter()
+                .map(|row| row.run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-live", "z-live"]
+        );
+        assert_eq!(
+            runs.iter()
+                .map(|row| row.state_changed_ms)
+                .collect::<Vec<_>>(),
+            vec![None, Some(7)]
+        );
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(RETENTION_RUN_ROWS_SQL).unwrap();
+        let rows = stmt
+            .query_map(["live"], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec!["a-live", "z-live"]);
+        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(
+            steps < 200,
+            "lineage lookup walked unrelated runs: {steps} VM steps"
+        );
+    }
+
+    #[test]
+    fn retained_sessions_matches_old_join_including_expired_and_shared_sessions() {
+        use std::collections::BTreeSet;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let expected = ["live", "expired-only", "shared"]
+            .map(|s| serde_json::to_string(&BindIdentity::new("/p", "h", s)).unwrap())
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let old;
+        let new;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO retention_lineage VALUES
+                ('live', 'live-key', 1, 0, 1, 0, NULL),
+                ('expired', 'expired-key', 1, 0, NULL, 0, 2),
+                ('fresh', 'shared-key', 1, 0, 1, 0, NULL),
+                ('old', 'shared-key', 1, 0, NULL, 0, 2),
+                ('no-runs', 'no-runs-key', 1, 0, 1, 0, NULL)",
+            )
+            .unwrap();
+            for (i, (session, lineage)) in [
+                ("live", Some("live")),
+                ("live", Some("live")),
+                ("expired-only", Some("expired")),
+                ("shared", Some("fresh")),
+                ("shared", Some("old")),
+                ("unknown", Some("not-retained")),
+                ("null", None),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                conn.execute("INSERT INTO run_index (run_id, session, state, lineage_id) VALUES (?1, ?2, 'completed', ?3)",
+                    params![format!("run-{i}"), serde_json::to_string(&BindIdentity::new("/p", "h", session)).unwrap(), lineage]).unwrap();
+            }
+            let sessions = |sql| {
+                conn.prepare(sql)
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<BTreeSet<_>, _>>()
+                    .unwrap()
+            };
+            old = sessions("SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id");
+            new = sessions(RETAINED_SESSIONS_SQL);
+        }
+        assert_eq!(old, expected);
+        assert_eq!(new, old);
+        assert_eq!(
+            store
+                .retained_sessions()
+                .unwrap()
+                .iter()
+                .map(|s| serde_json::to_string(s).unwrap())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+
     #[test]
     fn retention_recovery_does_not_resurrect_settled_withdrawal_export() {
         use crate::retention_withdrawals::{RetentionQuestionId, RetentionWithdrawal};

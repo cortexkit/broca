@@ -979,10 +979,16 @@ impl SqliteStore {
                 )?;
             }
         }
-        // Index only runs with unsettled withdrawal work, so each live retained
-        // lineage can look up its runs without scanning unrelated session rows.
+        // All retained sessions (including expired ones) and per-lineage run lookups
+        // need an index even when no withdrawal work is owed.
         // Adding an ordinary SQLite index changes neither columns nor row bytes;
         // older binaries can keep opening and writing this database on rollback.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS run_index_lineage_session_idx ON run_index(lineage_id, session)",
+            [],
+        )?;
+        // Keep the partial discovery index: unlike the general index, it covers the
+        // withdrawals_owed predicate without reading potentially large run rows.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS run_index_discovery_lineage_idx ON run_index(lineage_id, session) WHERE withdrawals_owed=1",
             [],
