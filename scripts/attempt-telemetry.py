@@ -55,6 +55,8 @@ class Attempt:
     end_at_ms: int | None
     first_content_at_ms: int | None
     last_content_at_ms: int | None
+    max_content_gap_ms: int | None
+    max_content_gap_ended_at_ms: int | None
     content_time_fields_present: bool
     content_bytes: int | None
     non_content_bytes: int | None
@@ -108,30 +110,22 @@ class Attempt:
         return True
 
     def idle_cut(self, bound_ms: int) -> bool | None:
-        """Return whether either measurable no-content stretch reaches the bound."""
+        """Return whether any measurable no-content interval reaches the bound."""
         if self.no_content:
             duration = self.duration_ms
             return None if duration is None else duration >= bound_ms
 
-        if not self.content_timestamps_valid:
-            # A known gap can prove a cut even when the other content timestamp is missing.
-            gaps = [
-                gap
-                for gap in (self.time_to_first_content_ms, self.trailing_gap_ms)
-                if gap is not None
-            ]
-            if any(gap >= bound_ms for gap in gaps):
-                return True
-            return None
-
         first_gap = self.time_to_first_content_ms
         trailing_gap = self.trailing_gap_ms
-        if first_gap is None or trailing_gap is None:
-            gaps = [gap for gap in (first_gap, trailing_gap) if gap is not None]
-            if any(gap >= bound_ms for gap in gaps):
-                return True
+        interior_gap = self.max_content_gap_ms
+        gaps = [gap for gap in (first_gap, interior_gap, trailing_gap) if gap is not None]
+        if any(gap >= bound_ms for gap in gaps):
+            return True
+        if not self.content_timestamps_valid:
             return None
-        return first_gap >= bound_ms or trailing_gap >= bound_ms
+        if first_gap is None or trailing_gap is None or interior_gap is None:
+            return None
+        return False
 
 
 @dataclasses.dataclass
@@ -214,6 +208,8 @@ def _attempt(record: dict[str, Any], addr: str, run: RunContext) -> Attempt:
         end_at_ms=_integer(record.get("ts_ms")),
         first_content_at_ms=_integer(progress.get("first_content_at_ms")),
         last_content_at_ms=_integer(progress.get("last_content_at_ms")),
+        max_content_gap_ms=_integer(progress.get("max_content_gap_ms")),
+        max_content_gap_ended_at_ms=_integer(progress.get("max_content_gap_ended_at_ms")),
         content_time_fields_present=(
             "first_content_at_ms" in progress or "last_content_at_ms" in progress
         ),
@@ -322,6 +318,7 @@ def _group_report(attempts: list[Attempt]) -> dict[str, Any]:
         "total_duration": _distribution(attempts, "duration_ms", p99=True),
         "time_to_first_content": _distribution(attempts, "time_to_first_content_ms", p99=False),
         "trailing_gap": _distribution(attempts, "trailing_gap_ms", p99=True),
+        "interior_content_gap": _distribution(attempts, "max_content_gap_ms", p99=True),
         "content_attempts": sum(attempt.content_timestamps_valid for attempt in attempts),
         "no_content_attempts": sum(attempt.no_content for attempt in attempts),
         "non_content_suffix": {
@@ -399,6 +396,29 @@ def _report_data(result: ScanResult, since_ms: int, until_ms: int) -> dict[str, 
         }
         for gap, kind, attempt in ranked[:20]
     ]
+    interior_ranked = [
+        (attempt.max_content_gap_ms, attempt)
+        for attempt in result.attempts
+        if attempt.max_content_gap_ms is not None
+    ]
+    interior_ranked.sort(
+        key=lambda item: (-item[0], item[1].session_addr, item[1].run_id,
+                          item[1].step_id, item[1].ordinal)
+    )
+    longest_interior = [
+        {
+            "session_addr": attempt.session_addr,
+            "run_id": attempt.run_id,
+            "step": attempt.step_id,
+            "attempt": attempt.ordinal,
+            "provider": attempt.provider,
+            "model": attempt.model,
+            "outcome": attempt.outcome,
+            "gap_ms": gap,
+            "ended_at_ms": attempt.max_content_gap_ended_at_ms,
+        }
+        for gap, attempt in interior_ranked[:20]
+    ]
     return {
         "window": {"since_ms": since_ms, "until_ms": until_ms, "inclusive": True,
                    "filter": "attempt ts_ms end time"},
@@ -410,9 +430,19 @@ def _report_data(result: ScanResult, since_ms: int, until_ms: int) -> dict[str, 
         "provider_models": provider_models,
         "idle_bound_sensitivity": _candidate_cut_summary(result.attempts),
         "longest_observed_initial_or_trailing_gaps": longest,
+        "longest_observed_interior_gaps": longest_interior,
         "mid_stream_longest_gap": {
-            "available": False,
-            "reason": "broca doesn't record the longest gap between content events; a mid-stream stall that later resumed can't be seen.",
+            "available": bool(interior_ranked),
+            "attempts_with_measurement": len(interior_ranked),
+            "unavailable_attempts": len(result.attempts) - len(interior_ranked),
+            "reason": (
+                None
+                if interior_ranked
+                else (
+                    "unavailable: no selected attempt has a measured interval between content events; "
+                    "older records or attempts with fewer than two content events have no value."
+                )
+            ),
         },
     }
 
@@ -436,6 +466,16 @@ def _format_distribution(title: str, stats: dict[str, int | None]) -> str:
 
 def render_text(data: dict[str, Any]) -> str:
     window = data["window"]
+    if data["mid_stream_longest_gap"]["available"]:
+        gap_status = (
+            "mid-stream longest gap: measured when at least two content events arrived; "
+            "missing measurements remain unavailable for older records or fewer than two events."
+        )
+    else:
+        gap_status = (
+            "mid-stream longest gap: unavailable — selected attempts have no recorded interval between content events; "
+            "records may predate this field or have fewer than two content events."
+        )
     lines = [
         f"window_utc: {_iso_utc(window['since_ms'])} through {_iso_utc(window['until_ms'])} (inclusive; filtered by attempt end ts_ms)",
         f"WAL files examined: {data['wal_files']}",
@@ -443,7 +483,7 @@ def render_text(data: dict[str, Any]) -> str:
         f"attempts with no run_started join: {data['unjoined_attempts']}",
         f"attempts skipped for fixture/import runs: {data['excluded_fixture_or_import_attempts']}",
         f"attempts missing end timestamp across scanned WALs: {data['attempts_without_end_timestamp']}",
-        "mid-stream longest gap: unavailable — broca doesn't record the longest gap between content events; a mid-stream stall that later resumed can't be seen.",
+        gap_status,
         "",
         "provider/model distributions",
     ]
@@ -456,6 +496,7 @@ def render_text(data: dict[str, Any]) -> str:
             _format_distribution("total_duration", group["total_duration"]),
             _format_distribution("time_to_first_content", group["time_to_first_content"]),
             _format_distribution("trailing_gap", group["trailing_gap"]),
+            _format_distribution("interior_content_gap", group["interior_content_gap"]),
             f"  content attempts={group['content_attempts']} no-content attempts={group['no_content_attempts']}",
             "  non-content traffic after last content: "
             f"attempts={group['non_content_suffix']['attempt_count']} "
@@ -464,7 +505,11 @@ def render_text(data: dict[str, Any]) -> str:
             f"bytes_unknown_attempts={group['non_content_suffix']['bytes_unknown_attempts']} "
             f"events_unknown_attempts={group['non_content_suffix']['events_unknown_attempts']}",
         ])
-    lines.extend(["", "candidate idle-bound sensitivity (time_to_first_content and trailing_gap only)"])
+    lines.extend([
+        "",
+        "candidate idle-bound sensitivity (time_to_first_content, interior_content_gap, "
+        "and trailing_gap)",
+    ])
     for item in data["idle_bound_sensitivity"]:
         mins = item["bound_ms"] // 60_000
         lines.append(
@@ -481,6 +526,16 @@ def render_text(data: dict[str, Any]) -> str:
             f"  session={item['session_addr']} run={item['run_id']} step={item['step']} "
             f"attempt={item['attempt']} provider/model={item['provider']}/{item['model']} "
             f"outcome={item['outcome']} gap={item['gap_kind']}:{item['gap_ms']} ms"
+        )
+    lines.extend(["", "20 longest measured interior content gaps"])
+    if not data["longest_observed_interior_gaps"]:
+        lines.append("  unavailable — no attempt has a measured gap between two content events")
+    for item in data["longest_observed_interior_gaps"]:
+        ended = "unknown" if item["ended_at_ms"] is None else str(item["ended_at_ms"]) + " ms"
+        lines.append(
+            f"  session={item['session_addr']} run={item['run_id']} step={item['step']} "
+            f"attempt={item['attempt']} provider/model={item['provider']}/{item['model']} "
+            f"outcome={item['outcome']} gap={item['gap_ms']} ms ended_at={ended}"
         )
     return "\n".join(lines)
 

@@ -745,18 +745,24 @@ keep their existing behavior and omit this diagnostic.
   caller-side resolver contract (`AuthRequired` → the caller re-authenticates, then resumes the
   SAME run).
 - **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
-  `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?}`. It is a cheap
-  snapshot of the live actor's in-memory model call, never inferred from WAL. Timestamps are
-  Unix milliseconds; `attempt` is zero-based and its content timestamp resets on reissue.
+  `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?,
+  max_content_gap_ms?, max_content_gap_ended_at_ms?}`. It is a cheap snapshot of the live actor's
+  in-memory model call, never inferred from WAL. Timestamps are
+  Unix milliseconds; `attempt` is zero-based and its content progress resets on reissue. The
+  longest gap is measured only between consecutive real-content events, and its end time is the
+  later event's timestamp. With fewer than two content events both gap fields are absent.
   No in-flight model step means no object, and no real content yet means no content timestamp.
   The real-serve fixture is `crates/broca-wire/tests/golden/run_status.active_with_step.json`.
 
 ### Attempt content telemetry
 
 `model_attempt_finished` optionally carries `first_content_at_ms`, `last_content_at_ms`,
-`content_bytes`, `non_content_bytes`, `event_types`, `non_content_bytes_after_last_content`,
-and `events_after_last_content`. Provider and model come from the run's `run_started`.
-These fields are informational and need no reader feature. Older readers ignore them.
+`max_content_gap_ms`, `max_content_gap_ended_at_ms`, `content_bytes`, `non_content_bytes`,
+`event_types`, `non_content_bytes_after_last_content`, and `events_after_last_content`.
+The maximum content gap is the longest interval between consecutive real-content events, and
+its end time is the later event's timestamp. Both fields are absent with fewer than two content
+events. Provider and model come from the run's `run_started`. These fields are informational
+and need no reader feature; older readers ignore them.
 
 Content is explicitly classified per wire family: text, reasoning/summary, function-argument,
 and refusal deltas. Lifecycle events, completed item snapshots, signatures, usage, pings and

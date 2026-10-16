@@ -173,6 +173,21 @@ impl ContentObserver {
     }
 
     fn observe_bytes(&mut self, name: &str, payload: Option<&str>, bytes: Option<u64>) {
+        self.observe_bytes_with_time(name, payload, bytes, None);
+    }
+
+    #[cfg(test)]
+    fn observe_at(&mut self, name: &str, payload: Option<&str>, bytes: Option<u64>, now_ms: u64) {
+        self.observe_bytes_with_time(name, payload, bytes, Some(now_ms));
+    }
+
+    fn observe_bytes_with_time(
+        &mut self,
+        name: &str,
+        payload: Option<&str>,
+        bytes: Option<u64>,
+        now_ms: Option<u64>,
+    ) {
         let (content, known) = match name {
             "keepalive" | "empty" | "[DONE]" => (false, true),
             _ => classify(
@@ -199,10 +214,19 @@ impl ContentObserver {
             tally.unknown = Some(true);
         }
         if content {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now = now_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            });
+            if let Some(previous) = self.progress.last_content_at_ms {
+                let gap = now.saturating_sub(previous);
+                if self.progress.max_content_gap_ms.is_none_or(|max| gap > max) {
+                    self.progress.max_content_gap_ms = Some(gap);
+                    self.progress.max_content_gap_ended_at_ms = Some(now);
+                }
+            }
             self.progress.first_content_at_ms.get_or_insert(now);
             self.progress.last_content_at_ms = Some(now);
             if let Some(bytes) = bytes {
@@ -499,6 +523,89 @@ mod tests {
         assert_eq!(keepalive.bytes, None);
         assert!(progress.content_bytes.is_some());
         assert_eq!(decoder.liveness_records(), 2);
+    }
+
+    #[test]
+    fn zero_content_events_leave_gap_measurements_absent() {
+        let mut observer = ContentObserver::new(ContentFamily::Responses);
+        observer.observe_at("keepalive", None, None, 100);
+        observer.observe_at("response.in_progress", Some("{}"), Some(2), 200);
+        let progress = observer.snapshot();
+        assert_eq!(progress.first_content_at_ms, None);
+        assert_eq!(progress.last_content_at_ms, None);
+        assert_eq!(progress.max_content_gap_ms, None);
+        assert_eq!(progress.max_content_gap_ended_at_ms, None);
+    }
+
+    #[test]
+    fn one_content_event_leaves_gap_measurements_absent() {
+        let mut observer = ContentObserver::new(ContentFamily::Responses);
+        observer.observe_at(
+            "response.output_text.delta",
+            Some(r#"{"delta":"x"}"#),
+            Some(10),
+            100,
+        );
+        let progress = observer.snapshot();
+        assert_eq!(progress.first_content_at_ms, Some(100));
+        assert_eq!(progress.last_content_at_ms, Some(100));
+        assert_eq!(progress.max_content_gap_ms, None);
+        assert_eq!(progress.max_content_gap_ended_at_ms, None);
+    }
+
+    #[test]
+    fn several_content_events_keep_the_longest_gap_and_its_end() {
+        let mut observer = ContentObserver::new(ContentFamily::Responses);
+        for now_ms in [100, 150, 650, 700] {
+            observer.observe_at(
+                "response.output_text.delta",
+                Some(r#"{"delta":"x"}"#),
+                Some(10),
+                now_ms,
+            );
+        }
+        let progress = observer.snapshot();
+        assert_eq!(progress.max_content_gap_ms, Some(500));
+        assert_eq!(progress.max_content_gap_ended_at_ms, Some(650));
+        assert_eq!(progress.last_content_at_ms, Some(700));
+    }
+
+    #[test]
+    fn interleaved_keepalives_do_not_extend_content_gaps() {
+        let mut observer = ContentObserver::new(ContentFamily::Responses);
+        observer.observe_at(
+            "response.output_text.delta",
+            Some(r#"{"delta":"x"}"#),
+            Some(10),
+            100,
+        );
+        observer.observe_at("keepalive", None, None, 10_000);
+        observer.observe_at("response.in_progress", Some("{}"), Some(2), 20_000);
+        observer.observe_at(
+            "response.output_text.delta",
+            Some(r#"{"delta":"y"}"#),
+            Some(10),
+            150,
+        );
+        let progress = observer.snapshot();
+        assert_eq!(progress.max_content_gap_ms, Some(50));
+        assert_eq!(progress.max_content_gap_ended_at_ms, Some(150));
+    }
+
+    #[test]
+    fn a_measured_zero_gap_is_distinct_from_an_unobserved_gap() {
+        let mut observer = ContentObserver::new(ContentFamily::Responses);
+        for _ in 0..2 {
+            observer.observe_at(
+                "response.output_text.delta",
+                Some(r#"{"delta":"x"}"#),
+                Some(10),
+                100,
+            );
+        }
+        let progress = observer.snapshot();
+        assert_eq!(progress.max_content_gap_ms, Some(0));
+        assert_eq!(progress.max_content_gap_ended_at_ms, Some(100));
     }
 
     #[test]

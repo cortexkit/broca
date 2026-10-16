@@ -23,7 +23,7 @@ attempt_telemetry = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = attempt_telemetry
 SPEC.loader.exec_module(attempt_telemetry)
 
-EXPECTED_SUITE_ANCHORS = 4
+EXPECTED_SUITE_ANCHORS = 5
 BASE = 1_000_000_000
 
 
@@ -114,10 +114,15 @@ class AttemptTelemetryTests(unittest.TestCase):
             })
             self.assertEqual(group["trailing_gap"]["count"], 0)
             self.assertEqual(group["trailing_gap"]["unknown"], 1)
+            self.assertEqual(group["interior_content_gap"], {
+                "count": 0, "unknown": 1, "p50_ms": None, "p90_ms": None,
+                "p99_ms": None, "max_ms": None,
+            })
             self.assertEqual(report["idle_bound_sensitivity"][0]["true_cuts"], 1)
             text = attempt_telemetry.render_text(report)
             self.assertIn("no-content attempts=1", text)
-            self.assertIn("broca doesn't record the longest gap between content events", text)
+            self.assertIn("mid-stream longest gap: unavailable", text)
+            self.assertIn("records may predate this field or have fewer than two content events", text)
 
     def test_duration_content_gaps_and_suffix_byte_math(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +148,60 @@ class AttemptTelemetryTests(unittest.TestCase):
                              "trailing_gap")
             self.assertFalse(report["mid_stream_longest_gap"]["available"])
 
+    def test_interior_gap_distribution_and_idle_sensitivity_with_legacy_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            write_wal(root, [
+                started("run", "provider", "model"),
+                attempt(
+                    1, 0, BASE, BASE + 180_000, "complete",
+                    first_content_at_ms=BASE + 10_000,
+                    last_content_at_ms=BASE + 175_000,
+                    max_content_gap_ms=150_000,
+                    max_content_gap_ended_at_ms=BASE + 160_000,
+                ),
+                attempt(
+                    2, 0, BASE, BASE + 320_000, "http_error",
+                    first_content_at_ms=BASE + 10_000,
+                    last_content_at_ms=BASE + 315_000,
+                    max_content_gap_ms=300_000,
+                    max_content_gap_ended_at_ms=BASE + 310_000,
+                ),
+                attempt(
+                    3, 0, BASE, BASE + 100_000, "complete",
+                    first_content_at_ms=BASE + 10_000,
+                    last_content_at_ms=BASE + 90_000,
+                ),
+            ])
+
+            report = attempt_telemetry._report_data(scan(root), 0, 2_000_000_000)
+            group = report["provider_models"][0]
+            self.assertEqual(group["interior_content_gap"], {
+                "count": 2, "unknown": 1, "p50_ms": 150_000,
+                "p90_ms": 300_000, "p99_ms": 300_000, "max_ms": 300_000,
+            })
+            self.assertEqual(report["mid_stream_longest_gap"], {
+                "available": True,
+                "attempts_with_measurement": 2,
+                "unavailable_attempts": 1,
+                "reason": None,
+            })
+            self.assertEqual(
+                report["longest_observed_interior_gaps"][0]["ended_at_ms"],
+                BASE + 310_000,
+            )
+            first_bound = report["idle_bound_sensitivity"][0]
+            self.assertEqual(
+                (first_bound["false_cuts"], first_bound["true_cuts"], first_bound["unknown_gap"]),
+                (1, 1, 1),
+            )
+            text = attempt_telemetry.render_text(report)
+            self.assertIn(
+                "interior_content_gap: p50=150000 ms p90=300000 ms p99=300000 ms max=300000 ms",
+                text,
+            )
+            self.assertIn("ended_at=1000310000 ms", text)
+
     def test_each_idle_bound_counts_false_and_true_cuts_from_measured_edges(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -165,7 +224,12 @@ class AttemptTelemetryTests(unittest.TestCase):
             report = attempt_telemetry._report_data(scan(root), 0, 2_000_000_000)
             counts = [(row["false_cuts"], row["true_cuts"], row["unknown_gap"])
                       for row in report["idle_bound_sensitivity"]]
-            self.assertEqual(counts, [(2, 2, 0), (1, 2, 0), (1, 1, 0), (0, 1, 0)])
+            self.assertEqual(counts, [
+                (2, 2, 0),
+                (1, 2, 1),
+                (1, 1, 2),
+                (0, 1, 3),
+            ])
             self.assertEqual(report["idle_bound_sensitivity"][3]["bound_ms"], 15 * 60_000)
 
 

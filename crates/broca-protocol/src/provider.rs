@@ -195,6 +195,12 @@ pub struct ContentProgress {
     /// Unix milliseconds when the most recent real-content record was decoded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_content_at_ms: Option<u64>,
+    /// Longest interval between consecutive real-content records; absent before the second record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_content_gap_ms: Option<u64>,
+    /// Unix milliseconds when the longest consecutive-content interval ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_content_gap_ended_at_ms: Option<u64>,
     /// UTF-8 data payload bytes of content-bearing records, including their JSON envelopes,
     /// excluding SSE framing. Provider and model come from the run's `run_started`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +242,10 @@ pub struct InFlightStep {
     pub attempt_started_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_content_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_content_gap_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_content_gap_ended_at_ms: Option<u64>,
 }
 
 /// Exact UTF-8 text payload sent in a Responses WebSocket request, before frame compression.
