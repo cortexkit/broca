@@ -49,6 +49,9 @@ async fn expiry_read_failure_joins_nonrestart_admission_before_next_attempt() {
     let dir = broca_test_support::scratch_root().join(format!("admission-expiry-read-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // Seed and open in one fixed clock domain. A one-second real-time retention can
+    // legitimately delete the seeded WAL while setup is still flushing it on disk.
+    std::fs::write(dir.join("test-clock"), br#"{"now_ms":1000000}"#).unwrap();
     let key = BindIdentity::new(dir.join("project"), "runner", "session");
     let wal = Arc::new(FlakyReadWalStore::new(dir.join("wal")));
     let leases = Arc::new(FileLeaseStore::new(dir.join("leases")));
@@ -69,20 +72,59 @@ async fn expiry_read_failure_joins_nonrestart_admission_before_next_attempt() {
         let registry = registry.clone(); let key = key.clone();
         async move { registry.route_send(&key, text_req(&key, "new"), RunKind::AppendEpisode).await }
     });
-    executor.started.acquire().await.unwrap().forget();
+    broca_test_support::wait_for("admission executor starts", executor.started.acquire(),
+        || format!("slots={:?}", registry.slot_counts())).await.unwrap().forget();
     wal.fail_next_read();
-    std::fs::write(dir.join("test-clock"), br#"{"offset_ms":2000}"#).unwrap();
+    std::fs::write(dir.join("test-clock"), br#"{"now_ms":1002000}"#).unwrap();
     retention.clock.refresh().unwrap();
-    assert!(matches!(tokio::time::timeout(Duration::from_secs(15), send).await.unwrap().unwrap().unwrap(), SendOutcome::Error(_)));
+    assert!(matches!(broca_test_support::wait_for("expired admission replies", send,
+        || format!("slots={:?}", registry.slot_counts())).await.unwrap().unwrap(), SendOutcome::Error(_)));
     assert!(!executor.live.load(Ordering::SeqCst), "failed expiry read must join the admission task before replying");
     // A new attempt may only start after the previous executor has dropped its guard.
     let next = tokio::spawn({
         let registry = registry.clone(); let key = key.clone();
         async move { registry.route_send(&key, text_req(&key, "next"), RunKind::FreshOrResume).await }
     });
-    tokio::time::timeout(Duration::from_secs(15), executor.started.acquire()).await.unwrap().unwrap().forget();
+    broca_test_support::wait_for("next admission executor starts", executor.started.acquire(),
+        || format!("slots={:?}", registry.slot_counts())).await.unwrap().forget();
     executor.release.notify_one();
-    let _ = tokio::time::timeout(Duration::from_secs(15), next).await.unwrap().unwrap();
+    let _ = broca_test_support::wait_for("next admission replies", next,
+        || format!("slots={:?}", registry.slot_counts())).await.unwrap();
+    let _ = registry.stop_and_seal().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn status_after_expiry_deletion_reports_expired() {
+    let dir = broca_test_support::scratch_root().join(format!("admission-expiry-status-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("test-clock"), br#"{"now_ms":1000000}"#).unwrap();
+    let key = BindIdentity::new(dir.join("project"), "runner", "session");
+    let wal = Arc::new(FlakyReadWalStore::new(dir.join("wal")));
+    let leases = Arc::new(FileLeaseStore::new(dir.join("leases")));
+    let store = Arc::new(broca_store::SqliteStore::open(dir.join("index.db")).unwrap());
+    let retention = Arc::new(crate::retention::RetentionService::new(
+        Arc::new(FileWalStore::new(dir.join("wal"))), store.clone(), leases.clone(), store,
+        Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+    ).unwrap());
+    seed_admission_episode(&wal, &key, retention.clock.now_ms(), false);
+    // Force the interleaving where expiry has removed the WAL before status opens it.
+    // The tombstone must classify the address; a missing transcript is not an I/O fault.
+    std::fs::write(dir.join("test-clock"), br#"{"now_ms":1002000}"#).unwrap();
+    retention.clock.refresh().unwrap();
+    {
+        use broca_core::LeaseStore;
+        let _lease = leases.acquire(&broca_core::lease_key_for(&key)).unwrap();
+        assert!(retention.delete_expired(&key, retention.clock.now_ms()).unwrap().is_some());
+    }
+    assert_eq!(wal.inner.wal_present(&key), Some(false));
+    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
+        leases, wal, Arc::new(RetentionDone),
+    )));
+    registry.set_retention_service(retention);
+    let status = registry.route_status(&key).await;
+    assert!(matches!(status, Err(crate::registry::OpenError::Expired { .. })), "{status:?}");
     let _ = registry.stop_and_seal().await;
     let _ = std::fs::remove_dir_all(dir);
 }

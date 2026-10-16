@@ -5,6 +5,7 @@
 //! server's own bytes, never from anything broca reports.
 
 use super::tests::text_req;
+use super::wal_test_support::NoFsyncWalStore;
 use super::*;
 use crate::opener::DefaultOpener;
 use crate::registry::LineageRegistry;
@@ -170,7 +171,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// event the step produces.
 struct LoopExecutor {
     provider: Box<dyn Provider>,
-    wal_store: Arc<FileWalStore>,
+    wal_store: Arc<NoFsyncWalStore>,
     displayed: Arc<Notify>,
 }
 
@@ -216,6 +217,7 @@ struct Fixture {
     key: BindIdentity,
     root: std::path::PathBuf,
     displayed: Arc<Notify>,
+    wal_store: Arc<NoFsyncWalStore>,
 }
 
 impl Fixture {
@@ -228,14 +230,15 @@ impl Fixture {
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let key = BindIdentity::new(root.join("project"), "runner", "session");
-        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        // These tests inspect transport handover and record ordering, not crash durability.
+        let wal_store = Arc::new(NoFsyncWalStore::new(FileWalStore::new(root.join("wal"))));
         let displayed = Arc::new(Notify::new());
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(root.join("leases"))),
             wal_store.clone(),
             Arc::new(LoopExecutor {
                 provider: provider(),
-                wal_store,
+                wal_store: wal_store.clone(),
                 displayed: Arc::clone(&displayed),
             }),
         );
@@ -244,6 +247,7 @@ impl Fixture {
             key,
             root,
             displayed,
+            wal_store,
         }
     }
 
@@ -276,10 +280,12 @@ impl Fixture {
 
     /// Seal through the registry, returning how long the whole seal took.
     async fn seal(&self) -> Duration {
+        self.wal_store.refuse_physical_sync();
         let started = tokio::time::Instant::now();
         assert!(
             self.registry.stop_and_seal_with_budget(GRACE, TOTAL).await,
-            "the seal must complete"
+            "the seal must complete: {:?}",
+            self.registry.shutdown_report()
         );
         let elapsed = started.elapsed();
         assert_eq!(self.registry.slot_counts().open, 0);
@@ -335,9 +341,18 @@ async fn the_seal_records_the_attempt_in_flight_before_the_interrupted_terminal(
     let f = Fixture::live(&server);
     f.start().await;
     // The text delta ends the prefix, so its display event means every prefix byte arrived.
-    tokio::time::timeout(Duration::from_secs(30), f.displayed.notified())
-        .await
-        .expect("the stalled stream's prefix never reached the run");
+    broca_test_support::wait_for(
+        "stalled stream prefix reaches the run",
+        f.displayed.notified(),
+        || {
+            format!(
+                "slots={:?}, records={}",
+                f.registry.slot_counts(),
+                broca_test_support::record_kinds(f.records())
+            )
+        },
+    )
+    .await;
 
     let elapsed = f.seal().await;
     eprintln!("seal with a stalled attempt in flight took {elapsed:?}");
@@ -417,16 +432,15 @@ async fn the_seal_between_attempts_adds_no_attempt_record() {
     f.start().await;
     // Wait for the failed attempt's record to reach the WAL, which puts the transport in its
     // 60-second retry delay.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if !attempt_outcomes(&f.records()).is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    broca_test_support::wait_until("first attempt is recorded", || async {
+        let records = f.records();
+        if !attempt_outcomes(&records).is_empty() {
+            Ok(())
+        } else {
+            Err(broca_test_support::record_kinds(records))
         }
     })
-    .await
-    .expect("the first attempt was never recorded");
+    .await;
 
     f.seal().await;
 
@@ -482,19 +496,22 @@ async fn the_seal_stays_bounded_when_the_transport_never_hands_over_its_record()
         })
     });
     f.start().await;
-    tokio::time::timeout(Duration::from_secs(30), started.notified())
-        .await
-        .expect("the step never started");
+    broca_test_support::wait_for("provider step starts", started.notified(), || {
+        format!("slots={:?}", f.registry.slot_counts())
+    })
+    .await;
 
     let elapsed = f.seal().await;
 
     assert!(
         elapsed >= SEALED_ATTEMPT_HANDOVER_BOUND,
-        "the seal gave up on the record before its bound: {elapsed:?}"
+        "the seal gave up on the record before its bound: {elapsed:?}; {:?}",
+        f.registry.shutdown_report()
     );
     assert!(
         elapsed < SHUTDOWN_SEAL_BOUND,
-        "the seal outran its per-actor bound: {elapsed:?}"
+        "the seal outran its per-actor bound: {elapsed:?}; {:?}",
+        f.registry.shutdown_report()
     );
     let records = f.records();
     assert!(attempt_outcomes(&records).is_empty());
