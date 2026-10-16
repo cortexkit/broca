@@ -113,11 +113,15 @@ impl SubcPlanFetcher {
             .await
         {
             Ok(Ok(reply)) => decode_reply(&reply),
-            Ok(Err(refusal)) => Err(FetchError::Refused {
-                retryable: refusal.code == TRANSIENT,
-                code: refusal.code,
-                detail: refusal.detail,
-            }),
+            Ok(Err(refusal)) => {
+                let retryable = refusal.code == TRANSIENT;
+                Err(FetchError::provider_refused(
+                    refusal.code,
+                    refusal.detail,
+                    &refusal.message,
+                    retryable,
+                ))
+            }
             Err(error) => Err(FetchError::Lost(error.to_string())),
         }
     }

@@ -38,6 +38,10 @@ enum FetchMissDetail {
     InvalidAnswer {
         serde_error_kind: Option<&'static str>,
     },
+    ProviderRefusal {
+        message: Option<String>,
+        field: Option<String>,
+    },
     ItemDigestMismatch {
         item_digest: String,
         computed_sha256: String,
@@ -49,13 +53,28 @@ enum FetchMissDetail {
 impl FetchMiss {
     fn from_error(error: FetchError) -> Self {
         let retryable = match &error {
-            FetchError::Refused { retryable, .. } => Some(*retryable),
+            FetchError::Refused { retryable, .. }
+            | FetchError::ProviderRefused { retryable, .. } => Some(*retryable),
+            FetchError::UnknownModule | FetchError::Lost(_) => None,
+        };
+        let detail = match &error {
+            FetchError::ProviderRefused {
+                message, detail, ..
+            } => Some(FetchMissDetail::ProviderRefusal {
+                message: Some(bounded_diagnostic_text(message)),
+                field: detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("field"))
+                    .and_then(Value::as_str)
+                    .map(bounded_diagnostic_text),
+            }),
+            FetchError::Refused { .. } => None,
             FetchError::UnknownModule | FetchError::Lost(_) => None,
         };
         Self {
             unanswered: unanswered(error),
             retryable,
-            detail: None,
+            detail,
         }
     }
 
@@ -100,8 +119,14 @@ impl FetchMiss {
         }
     }
 
-    /// Emit only identifiers and validation metadata; provider payloads can contain prompts.
-    fn warn(&self, session: &broca_protocol::BindIdentity, provider: &str, op: &str) {
+    /// Emit bounded refusal diagnostics and validation metadata; catalog requests can contain prompts.
+    fn warn(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        plan_identity: &str,
+        provider: &str,
+        op: &str,
+    ) {
         match (&self.unanswered, &self.detail) {
             (Unanswered::InvalidReply { tool, member }, _) => tracing::warn!(
                 target: "admission",
@@ -155,6 +180,21 @@ impl FetchMiss {
                 text_present,
                 text_bytes,
             ),
+            (
+                Unanswered::Refused { code },
+                Some(FetchMissDetail::ProviderRefusal { message, field }),
+            ) if op == CATALOG_OP => tracing::warn!(
+                target: "admission",
+                "unanswered provider fetch session={} plan_identity={} provider={} op={} code=refused provider_code={} retryable={} refusal_message={:?} refusal_field={:?}",
+                bounded_diagnostic_text(&session.session),
+                bounded_diagnostic_text(plan_identity),
+                bounded_diagnostic_text(provider),
+                op,
+                bounded_diagnostic_text(code),
+                self.retryable.unwrap_or(false),
+                message,
+                field,
+            ),
             (Unanswered::Refused { code }, _) => tracing::warn!(
                 target: "admission",
                 "unanswered provider fetch session={} provider={} op={} code=refused provider_code={} retryable={}",
@@ -174,6 +214,16 @@ impl FetchMiss {
             ),
         }
     }
+}
+
+const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 512;
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    let mut end = value.len().min(MAX_PROVIDER_DIAGNOSTIC_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 #[derive(Debug)]
@@ -232,8 +282,32 @@ pub enum FetchError {
         detail: Option<Value>,
         retryable: bool,
     },
+    /// A tool provider refusal whose human-readable explanation is retained for diagnostics.
+    ProviderRefused {
+        code: String,
+        detail: Option<Value>,
+        message: String,
+        retryable: bool,
+    },
     /// The call was lost in transport; retried until the deadline.
     Lost(String),
+}
+
+impl FetchError {
+    /// Build a provider refusal with a diagnostic message capped at 512 UTF-8 bytes.
+    pub fn provider_refused(
+        code: String,
+        detail: Option<Value>,
+        message: &str,
+        retryable: bool,
+    ) -> Self {
+        Self::ProviderRefused {
+            code,
+            detail,
+            message: bounded_diagnostic_text(message),
+            retryable,
+        }
+    }
 }
 
 /// Calls to the providers a plan names. Each call is one attempt; admission retries and bounds
@@ -403,6 +477,9 @@ where
                 error @ (FetchError::UnknownModule
                 | FetchError::Refused {
                     retryable: false, ..
+                }
+                | FetchError::ProviderRefused {
+                    retryable: false, ..
                 }),
             )) => return Err(error),
             Ok(Err(error)) => last = error,
@@ -422,7 +499,9 @@ fn unanswered(error: FetchError) -> Unanswered {
     match error {
         FetchError::UnknownModule => Unanswered::UnknownModule,
         // A retryable refusal still refusing at the deadline is reported as that refusal.
-        FetchError::Refused { code, .. } => Unanswered::Refused { code },
+        FetchError::Refused { code, .. } | FetchError::ProviderRefused { code, .. } => {
+            Unanswered::Refused { code }
+        }
         FetchError::Lost(_) => Unanswered::Timeout,
     }
 }
@@ -927,13 +1006,13 @@ pub async fn admit(
     for fetch in &catalog_fetches {
         let outcome = &outcomes[fetch.provider];
         if let Err(missed) = outcome {
-            missed.warn(session, fetch.provider, CATALOG_OP);
+            missed.warn(session, &plan.identity, fetch.provider, CATALOG_OP);
         }
     }
     for (step, outcome) in plan.step_items.iter().zip(&declarations) {
         match outcome {
             DeclarationOutcome::Unanswered(missed) | DeclarationOutcome::RefusedPreset(missed) => {
-                missed.warn(session, &step.item.provider, DECLARE_OP);
+                missed.warn(session, &plan.identity, &step.item.provider, DECLARE_OP);
             }
             DeclarationOutcome::Answered { .. } => {}
         }
@@ -943,7 +1022,7 @@ pub async fn admit(
         .as_ref()
         .map(|item| item.provider.as_str());
     if let (Some(provider), Some(Err(missed))) = (compaction_provider, &compaction) {
-        missed.warn(session, provider, DESCRIBE_OP);
+        missed.warn(session, &plan.identity, provider, DESCRIBE_OP);
     }
 
     // A compaction provider that said it does not serve the role will say so on every retry.
@@ -1481,6 +1560,20 @@ mod tests {
             )
             .await;
 
+            let refused_catalog = plan_for("catalog-refusing");
+            let refused_plan_identity = refused_catalog.identity.clone();
+            run_fetch(
+                &refused_catalog,
+                Err(FetchError::provider_refused(
+                    "invalid_request".into(),
+                    Some(json!({"field": "preset"})),
+                    "The requested preset is unexpected",
+                    false,
+                )),
+                "session-catalog-refused",
+            )
+            .await;
+
             let invalid = plan_for("invalid");
             let invalid_answer = json!({
                 "generation": "1",
@@ -1489,11 +1582,15 @@ mod tests {
                 "tools": [TEXT_MARKER]
             });
             run_fetch(&invalid, Ok(invalid_answer), "session-invalid").await;
-            (computed.to_owned(), TEXT_MARKER.len())
+            (
+                computed.to_owned(),
+                TEXT_MARKER.len(),
+                refused_plan_identity,
+            )
         })
         .await;
 
-        assert_eq!(lines.len(), 4, "one warning per unanswered provider fetch");
+        assert_eq!(lines.len(), 5, "one warning per unanswered provider fetch");
         let present = lines
             .iter()
             .find(|line| line.contains("provider=text-present"))
@@ -1530,6 +1627,18 @@ mod tests {
         assert!(refused.contains("provider_code=provider_busy"));
         assert!(refused.contains("retryable=true"));
 
+        let catalog_refused = lines
+            .iter()
+            .find(|line| line.contains("provider=catalog-refusing"))
+            .unwrap();
+        assert!(catalog_refused.contains("session=session-catalog-refused"));
+        assert!(catalog_refused.contains(&format!("plan_identity={}", results.2)));
+        assert!(catalog_refused.contains("op=tool.catalog"));
+        assert!(catalog_refused.contains("provider_code=invalid_request"));
+        assert!(catalog_refused
+            .contains("refusal_message=Some(\"The requested preset is unexpected\")"));
+        assert!(catalog_refused.contains("refusal_field=Some(\"preset\")"));
+
         let invalid = lines
             .iter()
             .find(|line| line.contains("provider=invalid"))
@@ -1540,5 +1649,41 @@ mod tests {
         assert!(invalid.contains("serde_error_kind=data"));
 
         assert!(lines.iter().all(|line| !line.contains(TEXT_MARKER)));
+    }
+
+    #[tokio::test]
+    async fn provider_refusal_diagnostic_strings_are_truncated_to_512_bytes() {
+        let plan = plan_for("long-refusal");
+        let message = "é".repeat(257);
+        let field = "f".repeat(513);
+        let error = FetchError::provider_refused(
+            "invalid_request".into(),
+            Some(json!({"field": field.clone()})),
+            &message,
+            false,
+        );
+        let (_, lines) = capture_admission_logs(run_fetch(&plan, Err(error), "session-long")).await;
+
+        assert_eq!(lines.len(), 1);
+        let expected_message = "é".repeat(256);
+        let expected_field = "f".repeat(512);
+        assert!(
+            lines[0].contains(&format!("refusal_message=Some(\"{expected_message}\")")),
+            "message was not truncated on a UTF-8 boundary at 512 bytes: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains(&format!("refusal_message=Some(\"{message}\")")),
+            "the full refusal message reached the warning"
+        );
+        assert!(
+            lines[0].contains(&format!("refusal_field=Some(\"{expected_field}\")")),
+            "field was not truncated at 512 bytes: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains(&format!("refusal_field=Some(\"{field}\")")),
+            "the full refusal field reached the warning"
+        );
     }
 }

@@ -135,12 +135,13 @@ impl CatalogPoller {
     }
 
     pub async fn poll(&self) -> Result<(), PollError> {
-        let response = self
+        let poll_started = std::time::Instant::now();
+        let (response, page_count) = self
             .read_catalog(MAX_CATALOG_PAGES, MAX_CATALOG_BYTES)
             .await?;
         // Only a complete, pinned read reaches the existing parser and durable cache path.
         self.cache
-            .refresh(response)
+            .refresh_polled(response, page_count, poll_started)
             .map_err(|error| PollError::Cache(error.to_string()))?;
         Ok(())
     }
@@ -149,7 +150,7 @@ impl CatalogPoller {
         &self,
         max_pages: usize,
         max_bytes: usize,
-    ) -> Result<FusiformCatalogResponse, PollError> {
+    ) -> Result<(FusiformCatalogResponse, usize), PollError> {
         let arguments = serde_json::json!({
             "fact_prefixes": FUSIFORM_FACT_PREFIXES,
             // Preserve the known-negative state. With the default false, an upstream withdrawal
@@ -187,6 +188,7 @@ impl CatalogPoller {
             let mut arguments = arguments.clone();
             let mut tokens = BTreeSet::new();
             let mut assembled: Option<FusiformCatalogResponse> = None;
+            let mut snapshot_pages = 0;
             loop {
                 let result = self
                     .call_page(
@@ -242,6 +244,7 @@ impl CatalogPoller {
                         assembled = Some(page.catalog);
                     }
                 }
+                snapshot_pages += 1;
                 match page.next_page_token {
                     Some(token) => {
                         if !tokens.insert(token.clone()) {
@@ -251,7 +254,9 @@ impl CatalogPoller {
                         }
                         arguments["page_token"] = token.into();
                     }
-                    None => return Ok(assembled.expect("first page was assembled")),
+                    None => {
+                        return Ok((assembled.expect("first page was assembled"), snapshot_pages))
+                    }
                 }
             }
         }
@@ -649,6 +654,16 @@ mod tests {
         })
     }
 
+    async fn capture_catalog_info<F: std::future::Future>(future: F) -> (F::Output, Vec<String>) {
+        let (output, events) = broca_test_support::capture_logs(future).await;
+        let logs = events
+            .into_iter()
+            .filter(|event| event.target == "catalog" && event.level == tracing::Level::INFO)
+            .map(|event| event.message().to_owned())
+            .collect();
+        (output, logs)
+    }
+
     fn scripted_route(responses: Vec<Result<serde_json::Value, ConnError>>) -> Arc<FakeRoute> {
         Arc::new(FakeRoute {
             responses: Mutex::new(responses.into()),
@@ -667,10 +682,24 @@ mod tests {
         let dir = test_dir();
         let paged_path = dir.join("paged.json");
         let cache = Arc::new(CatalogCache::open(&paged_path));
-        CatalogPoller::with_route(route.clone(), identity(), cache.clone())
-            .poll()
-            .await
-            .unwrap();
+        let (poll_result, logs) = capture_catalog_info(
+            CatalogPoller::with_route(route.clone(), identity(), cache.clone()).poll(),
+        )
+        .await;
+        poll_result.unwrap();
+        assert_eq!(logs.len(), 1, "one success record per refresh: {logs:?}");
+        let success = &logs[0];
+        assert!(success.contains("pages=2"), "{success}");
+        assert!(success.contains("catalog_version=7"), "{success}");
+        assert!(success.contains("resolved_at_ms=10"), "{success}");
+        assert!(success.contains("models=3"), "{success}");
+        let elapsed_ms = success
+            .split_once("elapsed_ms=")
+            .expect("success record includes elapsed time")
+            .1
+            .parse::<u64>()
+            .expect("elapsed time is an integer number of milliseconds");
+        assert!(elapsed_ms < 10_000, "unexpected poll duration: {success}");
 
         let unpaged_path = dir.join("unpaged.json");
         let unpaged = Arc::new(CatalogCache::open(&unpaged_path));
@@ -722,10 +751,11 @@ mod tests {
         let route = scripted_route(pages.iter().cloned().map(Ok).collect());
         let cache = Arc::new(CatalogCache::empty());
         let poller = CatalogPoller::with_route(route.clone(), identity(), cache.clone());
-        let assembled = poller
+        let (assembled, page_count) = poller
             .read_catalog(MAX_CATALOG_PAGES, MAX_CATALOG_BYTES)
             .await
             .unwrap();
+        assert_eq!(page_count, 2);
         assert_eq!(
             serde_json::to_vec(&assembled).unwrap(),
             serde_json::to_vec(&full).unwrap()
