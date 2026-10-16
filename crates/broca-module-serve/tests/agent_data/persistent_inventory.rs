@@ -70,6 +70,25 @@ async fn second_boot_reuses_unchanged_wals_without_payload_reads() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn cache_persists_raw_device_and_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let mut rig = Rig::new("persistent-raw-identity", Arc::new(FakeDoor::default()));
+    let session = rig.session("present");
+    rig.seed(&session, "run", true);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let metadata = std::fs::metadata(rig.wal.wal_path(&session)).unwrap();
+    let cache: Value =
+        serde_json::from_slice(&std::fs::read(rig.root.join("move-inventory.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        cache["addresses"][broca_core::session_addr(&session)]["source"]["stamp"]["file_id"],
+        json!([metadata.dev(), metadata.ino()])
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn grown_wal_scans_only_from_its_cached_committed_end() {
     let mut rig = Rig::new("persistent-inventory-growth", Arc::new(FakeDoor::default()));
     let current = rig.session("current");
@@ -233,6 +252,25 @@ fn rewrite_cache(path: &std::path::Path, mut cache: Value) {
     let addresses = serde_json::to_vec(&cache["addresses"]).unwrap();
     cache["checksum"] = json!(broca_wal::migration::digest(&addresses));
     std::fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn legacy_wal_without_lineage_reuses_unchanged_identity() {
+    let mut rig = Rig::new("persistent-legacy", Arc::new(FakeDoor::default()));
+    let session = rig.session("legacy");
+    std::fs::create_dir_all(rig.root.join("wal")).unwrap();
+    let bytes = broca_wal::framing::encode(1, 1, &started(&session, "legacy-run")).unwrap();
+    std::fs::write(rig.wal.wal_path(&session), bytes).unwrap();
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(rig.wal.move_inventory_build_stats().payload_reads, 1);
+    assert_eq!(cached_refs(&rig, &session), 1);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(rig.wal.move_inventory_build_stats().payload_reads, 0);
+    assert_eq!(rig.wal.move_inventory_build_stats().reused, 1);
+    assert_eq!(cached_refs(&rig, &session), 1);
 }
 
 #[tokio::test]

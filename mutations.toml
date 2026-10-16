@@ -14056,3 +14056,31 @@ expect_red = ["wal_writer::move_inventory::tests::panic_finishes_inventory_incom
 file = "crates/broca-core/src/wal_writer/move_inventory.rs"
 old = "if result.is_err() || !state.finished {"
 new = "if false { // NON-VACUITY BREAK: leave interrupted builds pending forever."
+
+[[control]]
+id = "agent-data-cache-stable-file-identity"
+guards = "the restart cache stores raw device and inode rather than an unstable hash"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::cache_persists_raw_device_and_inode"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "Some((metadata.dev(), metadata.ino()))"
+new = "Some((metadata.ino(), metadata.dev())) // NON-VACUITY BREAK: no longer the raw device/inode pair."
+
+[[control]]
+id = "agent-data-cache-reuses-legacy-wals"
+guards = "unchanged lineage-less WALs reuse stamp and raw file identity on the second boot"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/agent_data/persistent_inventory.rs"
+expect_red = ["persistent_inventory::legacy_wal_without_lineage_reuses_unchanged_identity"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "if a == b && (l.is_some() || x.file_id.is_some()) && x.file_id == y.file_id && l == r)"
+new = "if a == b && l.is_some() && x.file_id == y.file_id && l == r) // NON-VACUITY BREAK"

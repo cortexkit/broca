@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 mod pacing;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_LIMIT: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -25,7 +25,7 @@ pub struct MoveInventoryBuildStats {
 #[serde(deny_unknown_fields)]
 struct FileStamp {
     len: u64,
-    file_id: Option<u64>,
+    file_id: Option<(u64, u64)>,
     modified_ns: Option<u64>,
 }
 
@@ -37,7 +37,7 @@ impl FileStamp {
         }
         Ok(Self {
             len: metadata.len(),
-            file_id: file_wal::file_identity(path)?,
+            file_id: persistent_file_identity(&metadata),
             modified_ns: metadata
                 .modified()
                 .ok()
@@ -45,6 +45,19 @@ impl FileStamp {
                 .and_then(|elapsed| elapsed.as_nanos().try_into().ok()),
         })
     }
+}
+
+#[cfg(unix)]
+fn persistent_file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    // Persist raw identifiers, not a standard-library hash whose algorithm can
+    // change between compiler releases and invalidate every restart hint.
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn persistent_file_identity(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,10 +446,13 @@ fn add_records(
 }
 
 fn same_live_lineage(old: &Source, current: &Source) -> bool {
+    // Legacy logs have no lineage. Their stable file identity and unchanged
+    // stamp still prove the same append-only prefix; without either identity
+    // mechanism we must decode again instead of reusing an absence proof.
     matches!((old, current),
-        (Source::Live { path: a, stamp: x, lineage_id: Some(l), .. },
-         Source::Live { path: b, stamp: y, lineage_id: Some(r), .. })
-        if a == b && x.file_id == y.file_id && l == r)
+        (Source::Live { path: a, stamp: x, lineage_id: l, .. },
+         Source::Live { path: b, stamp: y, lineage_id: r, .. })
+        if a == b && (l.is_some() || x.file_id.is_some()) && x.file_id == y.file_id && l == r)
 }
 
 fn reusable(old: &CachedAddress, current: &Source) -> bool {
@@ -497,7 +513,7 @@ fn scan(
             });
             let mut range = None;
             if let Some(old) = suffix {
-                if let Some(file_id) = stamp.file_id {
+                if let Some(file_id) = file_wal::file_identity(path)? {
                     stats.payload_reads += 1;
                     stats.payload_bytes += stamp.len - old.committed_end;
                     store.move_reads.fetch_add(1, Ordering::Relaxed);
