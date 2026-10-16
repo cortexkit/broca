@@ -1,0 +1,42 @@
+{
+  "plan": "plans/broca-worker-optional-tool-with-text.json",
+  "composition": "compositions/broca-worker-optional-tool-with-text.json",
+  "admitted_composition": "compositions/broca-worker-optional-tool-with-text-admitted.json",
+  "fetches": [
+    {
+      "provider": "plexus",
+      "phase": "tools",
+      "budget_ms": 5000,
+      "reason": "refused",
+      "provider_code": "catalog_refused"
+    }
+  ],
+  "expected": {
+    "admitted": true,
+    "baseline": {
+      "absent_items": [
+        {
+          "provider": "plexus",
+          "kind": "tool",
+          "reason": "refused",
+          "provider_code": "catalog_refused"
+        },
+        {
+          "provider": "plexus",
+          "kind": "system_text",
+          "reason": "refused",
+          "provider_code": "catalog_refused"
+        }
+      ],
+      "composition_digest": "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4"
+    }
+  },
+  "settled": "BROCA, room #881",
+  "runner_declaration": {
+    "hooks": false,
+    "compaction": false,
+    "capabilities": [
+      "fetch-plan-optional-tools/v1"
+    ]
+  }
+}

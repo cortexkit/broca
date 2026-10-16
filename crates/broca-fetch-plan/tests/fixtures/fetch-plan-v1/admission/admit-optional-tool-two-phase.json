@@ -1,0 +1,139 @@
+{
+  "plan": "plans/optional-tool-two-phase.json",
+  "composition": "compositions/optional-tool-two-phase.json",
+  "admitted_composition": "compositions/optional-tool-two-phase-admitted.json",
+  "fetches": [
+    {
+      "provider": "plexus",
+      "phase": "tools",
+      "budget_ms": 5000,
+      "reason": "refused",
+      "provider_code": "catalog_refused"
+    },
+    {
+      "provider": "aft",
+      "phase": "text",
+      "request": {
+        "params": {},
+        "system_text": {
+          "preset": "worker",
+          "params": {}
+        },
+        "composition": {
+          "providers": [
+            {
+              "provider": "aft",
+              "tools": [
+                {
+                  "name": "bash",
+                  "capabilities": [
+                    "shell.exec/v1"
+                  ],
+                  "extension": "keep tool member"
+                },
+                {
+                  "name": "edit",
+                  "capabilities": [
+                    "code.edit/v1"
+                  ]
+                },
+                {
+                  "name": "read",
+                  "capabilities": [
+                    "code.read/v1"
+                  ]
+                }
+              ],
+              "extension": {
+                "keep": [
+                  3,
+                  1,
+                  2
+                ]
+              }
+            },
+            {
+              "provider": "magic-context",
+              "tools": []
+            },
+            {
+              "provider": "prefrontal-core",
+              "tools": []
+            }
+          ],
+          "extension": {
+            "ordered": [
+              "z",
+              "a"
+            ],
+            "unknown": {
+              "keep": true
+            }
+          },
+          "compaction": {
+            "provider": "magic-context"
+          },
+          "step_transform_items": [
+            {
+              "provider": "magic-context",
+              "preset": "worker",
+              "params": {},
+              "subscriptions": [
+                {
+                  "hook": "pre_tool",
+                  "phase": "mutate",
+                  "ops": [],
+                  "on_unavailable": "pass",
+                  "budget_ms": 1000
+                },
+                {
+                  "hook": "pre_tool",
+                  "phase": "validate",
+                  "ops": [],
+                  "on_unavailable": "pass",
+                  "budget_ms": 1000
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "request_file": "catalog-requests/optional-tool-two-phase-text.json",
+      "answer": {
+        "composition_digest": "0856d31b85000103ca214234dfedc2a935733d1e5b887b4757f618f88c492ab4",
+        "tool_names": [],
+        "system_text": {
+          "composition_digest": "0856d31b85000103ca214234dfedc2a935733d1e5b887b4757f618f88c492ab4"
+        }
+      }
+    }
+  ],
+  "expected": {
+    "admitted": true,
+    "baseline": {
+      "absent_items": [
+        {
+          "provider": "plexus",
+          "kind": "tool",
+          "reason": "refused",
+          "provider_code": "catalog_refused"
+        },
+        {
+          "provider": "plexus",
+          "kind": "system_text",
+          "reason": "refused",
+          "provider_code": "catalog_refused"
+        }
+      ],
+      "composition_digest": "0856d31b85000103ca214234dfedc2a935733d1e5b887b4757f618f88c492ab4"
+    }
+  },
+  "runner_declaration": {
+    "hooks": true,
+    "compaction": true,
+    "capabilities": [
+      "fetch-plan-optional-tools/v1"
+    ]
+  },
+  "settled": "BROCA, room #881"
+}

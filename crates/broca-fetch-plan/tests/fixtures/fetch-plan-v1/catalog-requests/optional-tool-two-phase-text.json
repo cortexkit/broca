@@ -1,0 +1,85 @@
+{
+  "params": {},
+  "system_text": {
+    "preset": "worker",
+    "params": {}
+  },
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ],
+            "extension": "keep tool member"
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ],
+        "extension": {
+          "keep": [
+            3,
+            1,
+            2
+          ]
+        }
+      },
+      {
+        "provider": "magic-context",
+        "tools": []
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": []
+      }
+    ],
+    "extension": {
+      "ordered": [
+        "z",
+        "a"
+      ],
+      "unknown": {
+        "keep": true
+      }
+    },
+    "compaction": {
+      "provider": "magic-context"
+    },
+    "step_transform_items": [
+      {
+        "provider": "magic-context",
+        "preset": "worker",
+        "params": {},
+        "subscriptions": [
+          {
+            "hook": "pre_tool",
+            "phase": "mutate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          },
+          {
+            "hook": "pre_tool",
+            "phase": "validate",
+            "ops": [],
+            "on_unavailable": "pass",
+            "budget_ms": 1000
+          }
+        ]
+      }
+    ]
+  }
+}

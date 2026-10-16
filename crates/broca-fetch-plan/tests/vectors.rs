@@ -25,6 +25,42 @@ use serde_json::{json, Value};
 /// vector set updates these.
 const PINNED_IDENTITIES: &[(&str, &str)] = &[
     (
+        "compositions/broca-worker-optional-tool",
+        "cdf0ce9ad9c935be2dcc7cf59952388bf8622d94462b5d11826f140ab221c8a3",
+    ),
+    (
+        "compositions/broca-worker-optional-tool-admitted",
+        "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4",
+    ),
+    (
+        "compositions/broca-worker-optional-tool-two-phase-admitted",
+        "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4",
+    ),
+    (
+        "catalog-requests/optional-tool-two-phase-broca-text",
+        "b8a86db83398bcd744fa3b96bc3cc33e210bbc6ccdc92d73c6ac52addca2c795",
+    ),
+    (
+        "plans/broca-worker-optional-tool",
+        "2b450f884acd8844a2e564aa926f576d26321be306acf2c7400762c9ef0ea005",
+    ),
+    (
+        "plans/broca-worker-optional-tool-with-text",
+        "7746b56b1973e0dddba047878465c37f5783043c9197fa51955ec071056afebc",
+    ),
+    (
+        "plans/optional-tool-two-phase",
+        "9b5a011374f6b289dfd81af87a95649de1ab27c5b22a33a8874f42e772c1b4f0",
+    ),
+    (
+        "compositions/optional-tool-two-phase-admitted",
+        "0856d31b85000103ca214234dfedc2a935733d1e5b887b4757f618f88c492ab4",
+    ),
+    (
+        "catalog-requests/optional-tool-two-phase-text",
+        "2d56610d57bed3401dc053dfab6a3ee71d541b83b3c54a5efc4fa4ae3112930d",
+    ),
+    (
         "plans/broca-head",
         "8f3ac238ef62c3ea5018135445beb0db6b568cdeba8674a2edadb5de03490022",
     ),
@@ -191,7 +227,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[test]
 fn every_digested_vector_matches_broca_canonicalisation() {
     let mut checked = 0;
-    for folder in ["plans", "compositions"] {
+    for folder in ["plans", "compositions", "catalog-requests"] {
         let mut stems: Vec<String> = std::fs::read_dir(root().join(folder))
             .unwrap()
             .flatten()
@@ -451,6 +487,7 @@ struct Simulated {
     plan: Plan,
     fetches: BTreeMap<String, Value>,
     declarations: BTreeMap<String, Value>,
+    requests: std::sync::Mutex<Vec<(String, Value)>>,
 }
 
 impl Simulated {
@@ -472,6 +509,7 @@ impl Simulated {
             plan,
             fetches: by_provider("fetches"),
             declarations: by_provider("declarations"),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -481,7 +519,8 @@ impl Simulated {
         let composed = &self.plan.composed[provider];
         let names: Vec<String> = match overrides.get("tool_names") {
             Some(names) => serde_json::from_value(names.clone()).unwrap(),
-            None => composed.iter().map(|t| t.name.clone()).collect(),
+            None if request.preset.is_some() => composed.iter().map(|t| t.name.clone()).collect(),
+            None => Vec::new(),
         };
         let tools: Vec<Value> = names
             .iter()
@@ -512,7 +551,14 @@ impl Simulated {
         let digest = overrides
             .get("composition_digest")
             .cloned()
-            .unwrap_or_else(|| json!(self.plan.composition_digest));
+            .unwrap_or_else(|| {
+                json!(
+                    cortexkit_role_tool_provider::catalog::composition_digest(&json!(
+                        request.composition
+                    ))
+                    .unwrap()
+                )
+            });
         let mut answer = json!({
             "generation": "1",
             "catalog_digest": sha256_hex(provider.as_bytes()),
@@ -520,7 +566,7 @@ impl Simulated {
             "tools": tools,
         });
         if request.system_text.is_some() {
-            let text = format!("{provider} system text");
+            let text = format!("{provider} system text {}", answer["composition_digest"]);
             let text_overrides = overrides.get("system_text").cloned().unwrap_or(json!({}));
             let mut tool_names = names.clone();
             tool_names.sort();
@@ -531,7 +577,7 @@ impl Simulated {
                 "composition_digest": text_overrides
                     .get("composition_digest")
                     .cloned()
-                    .unwrap_or_else(|| json!(self.plan.composition_digest)),
+                    .unwrap_or_else(|| answer["composition_digest"].clone()),
                 "tool_names": text_overrides.get("tool_names").cloned().unwrap_or(json!(tool_names)),
             });
         }
@@ -542,14 +588,43 @@ impl Simulated {
 #[async_trait]
 impl Fetcher for Simulated {
     async fn catalog(&self, provider: &str, request: &CatalogRequest) -> Result<Value, FetchError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((provider.to_owned(), json!(request)));
         let Some(fetch) = self.fetches.get(provider) else {
             return Ok(self.answer(provider, request, &json!({})));
         };
+        if fetch["phase"] == "tools" && request.preset.is_none() {
+            return Ok(self.answer(provider, request, &json!({})));
+        }
+        if fetch["phase"] == "text" && request.preset.is_some() {
+            return Ok(self.answer(provider, request, &json!({})));
+        }
+        if fetch["phase"] == "planned" && json!(request.composition) != json!(self.plan.composition)
+        {
+            return Ok(self.answer(provider, request, &json!({})));
+        }
+        if let Some(file) = fetch["request_file"].as_str() {
+            assert_eq!(
+                json!(request),
+                load(file),
+                "{provider}: second-round request body"
+            );
+            let jcs = root().join(file.replace(".json", ".jcs"));
+            assert_eq!(
+                serde_jcs::to_vec(request).unwrap(),
+                std::fs::read(jcs).unwrap(),
+                "{provider}: second-round request JCS bytes"
+            );
+        }
         if fetch.get("route_open").and_then(Value::as_str) == Some("unknown_module") {
             return Err(FetchError::UnknownModule);
         }
         match fetch.get("reason").and_then(Value::as_str) {
             Some("timeout") => std::future::pending().await,
+            Some("unknown_module") => Err(FetchError::UnknownModule),
+            Some("invalid_answer") => Ok(json!({"tools":"not an array"})),
             Some("refused") => Err(FetchError::Refused {
                 code: fetch["provider_code"].as_str().unwrap().to_owned(),
                 detail: None,
@@ -615,7 +690,34 @@ async fn run_first_send_of(
         }
     }
     let fetcher = Simulated::new(plan.clone(), case);
-    admit(&plan, &fetcher, ADMISSION_DEADLINE).await
+    let admitted = admit(&plan, &fetcher, ADMISSION_DEADLINE).await?;
+    if let Some(file) = case["admitted_composition"].as_str() {
+        let expected = load(file);
+        let requests = fetcher.requests.lock().unwrap();
+        let sent = requests
+            .iter()
+            .find(|(_, request)| request["composition"] == expected)
+            .expect("text fetched with the pinned admitted composition");
+        assert_eq!(
+            serde_jcs::to_vec(&sent.1["composition"]).unwrap(),
+            std::fs::read(root().join(file.replace(".json", ".jcs"))).unwrap()
+        );
+        assert_eq!(
+            admitted.manifest.composition_digest,
+            std::fs::read_to_string(root().join(file.replace(".json", ".sha256"))).unwrap()
+        );
+        for fetch in case["fetches"].as_array().into_iter().flatten() {
+            if let Some(file) = fetch["request_file"].as_str() {
+                assert!(
+                    requests.iter().any(|(provider, sent)| provider
+                        == fetch["provider"].as_str().unwrap()
+                        && *sent == load(file)),
+                    "the recorded second-phase fetch must execute"
+                );
+            }
+        }
+    }
+    Ok(admitted)
 }
 
 fn test_session() -> broca_protocol::BindIdentity {
@@ -703,10 +805,16 @@ async fn every_admission_vector_holds() {
         .collect();
     names.sort();
     assert!(names.len() >= 30, "only {} admission vectors", names.len());
+    let total = names.len();
     let mut skipped = Vec::new();
     for name in names {
         let case = load(&format!("admission/{name}"));
-        if case["runner_declaration"] != json!({"hooks": false, "compaction": false}) {
+        // Cases requiring hooks or compaction belong to runners with those contracts.
+        // The optional-tool two-phase case also carries composition.compaction, which
+        // broca still rejects, so it is kept as an identity fixture rather than executed.
+        if case["runner_declaration"]["hooks"] != false
+            || case["runner_declaration"]["compaction"] != false
+        {
             skipped.push(name);
             continue;
         }
@@ -764,8 +872,12 @@ async fn every_admission_vector_holds() {
             Ok(admitted) => {
                 assert_eq!(expected["admitted"], true, "{name}");
                 let facts = baseline_facts(&admitted.manifest);
-                let absent = expected.get("absent_items").cloned().unwrap_or(json!([]));
+                let baseline = expected.get("baseline").unwrap_or(expected);
+                let absent = baseline.get("absent_items").cloned().unwrap_or(json!([]));
                 assert_eq!(json!(facts.absent_items), absent, "{name}");
+                if let Some(digest) = baseline.get("composition_digest") {
+                    assert_eq!(json!(facts.composition_digest), *digest, "{name}");
+                }
                 if let Some(frozen) = expected.get("frozen_step_transform_items") {
                     let plan: Value =
                         serde_json::from_str(admitted.manifest.plan.as_json_text()).unwrap();
@@ -793,6 +905,14 @@ async fn every_admission_vector_holds() {
         !skipped.is_empty(),
         "runner-declaration filter selected every vector; skipped: {skipped:?}"
     );
+    assert!(skipped
+        .iter()
+        .any(|name| name == "admit-optional-tool-two-phase.json"));
+    eprintln!(
+        "admission vectors: {} executed, {} generic runner cases filtered",
+        total - skipped.len(),
+        skipped.len()
+    );
 }
 
 /// A timed-out fetch takes the whole admission deadline and no longer.
@@ -806,6 +926,222 @@ async fn a_timeout_waits_out_exactly_the_deadline() {
         .unwrap_err();
     assert_eq!(refusal.code(), "fetch_unavailable");
     assert_eq!(started.elapsed(), ADMISSION_DEADLINE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_tool_has_own_budget() {
+    let case = load("admission/admit-optional-tool-timeout.json");
+    let started = tokio::time::Instant::now();
+    let admitted = run_first_send(&case).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    assert_eq!(
+        baseline_facts(&admitted.manifest).absent_items[0].reason,
+        "timeout"
+    );
+    let started = tokio::time::Instant::now();
+    let plan = broca_plan("plans/broca-worker-optional-tool.json");
+    let fetcher = Simulated::new(plan.clone(), &case);
+    admit(&plan, &fetcher, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn optional_tool_plan_stale_is_absent() {
+    let admitted = run_first_send(&load("admission/admit-optional-tool-plan-stale.json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        baseline_facts(&admitted.manifest).absent_items[0].reason,
+        "plan_stale"
+    );
+}
+
+#[tokio::test]
+async fn optional_tool_baseline_uses_admitted_digest() {
+    let case = load("admission/admit-optional-tool-refused.json");
+    let admitted = run_first_send(&case).await.unwrap();
+    assert_eq!(
+        baseline_facts(&admitted.manifest).composition_digest,
+        "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4"
+    );
+}
+
+#[tokio::test]
+async fn optional_tool_baseline_marks_tool_absence() {
+    let admitted = run_first_send(&load("admission/admit-optional-tool-with-text-item.json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        json!(baseline_facts(&admitted.manifest).absent_items),
+        json!([
+            {"provider":"plexus", "kind":"tool", "reason":"refused", "provider_code":"catalog_refused"},
+            {"provider":"plexus", "kind":"system_text", "reason":"refused", "provider_code":"catalog_refused"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn optional_tool_text_is_recomposed() {
+    let case = load("admission/admit-optional-tool-two-phase-broca.json");
+    let plan = broca_plan("plans/broca-worker-optional-tool-with-text.json");
+    let fetcher = Simulated::new(plan.clone(), &case);
+    let admitted = admit(&plan, &fetcher, ADMISSION_DEADLINE).await.unwrap();
+    let composition = load("compositions/broca-worker-optional-tool-two-phase-admitted.json");
+    let digest = "ae5f5d0a9238f443ea4676e31000c9233381a4c07ee962bd941c3d51fe933fb4";
+    let requests = fetcher.requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|(p, _)| p == "plexus").count(), 1);
+    for item in plan
+        .system_text_items
+        .iter()
+        .filter(|i| i.provider != "plexus")
+    {
+        let sent: Vec<_> = requests
+            .iter()
+            .filter(|(p, _)| p == &item.provider)
+            .collect();
+        assert_eq!(sent.len(), 2, "{}", item.provider);
+        let expected = json!({"params":{}, "system_text":{"preset":item.preset,"params":item.params},"composition":composition});
+        assert_eq!(sent[1].1, expected);
+        assert_eq!(
+            serde_jcs::to_vec(&sent[1].1["composition"]).unwrap(),
+            std::fs::read(
+                root().join("compositions/broca-worker-optional-tool-two-phase-admitted.jcs")
+            )
+            .unwrap()
+        );
+        assert!(admitted
+            .manifest
+            .system_text
+            .contains(&format!("{} system text \"{digest}\"", item.provider)));
+    }
+    assert!(!admitted
+        .manifest
+        .system_text
+        .contains(&plan.composition_digest));
+}
+
+#[tokio::test]
+async fn healthy_optional_tools_keep_one_round_and_planned_baseline() {
+    let plan = broca_plan("plans/broca-worker-optional-tool-with-text.json");
+    let fetcher = Simulated::new(plan.clone(), &json!({}));
+    let admitted = admit(&plan, &fetcher, ADMISSION_DEADLINE).await.unwrap();
+    let requests = fetcher.requests.lock().unwrap();
+    assert_eq!(requests.len(), plan.composed.len());
+    for (provider, request) in requests.iter() {
+        assert_eq!(
+            *request,
+            json!(broca_fetch_plan::admit::catalog_request(
+                &plan,
+                plan.tool_items.iter().find(|i| &i.provider == provider),
+                plan.system_text_items
+                    .iter()
+                    .find(|i| &i.provider == provider)
+            ))
+        );
+    }
+    assert_eq!(
+        admitted.manifest.composition_digest,
+        plan.composition_digest
+    );
+    assert!(baseline_facts(&admitted.manifest).absent_items.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_optional_tool_answer_is_absent_with_its_text() {
+    let mut case = load("admission/admit-optional-tool-with-text-item.json");
+    case["fetches"][0]["reason"] = json!("invalid_answer");
+    let admitted = run_first_send(&case).await.unwrap();
+    let facts = baseline_facts(&admitted.manifest);
+    assert_eq!(facts.absent_items.len(), 2);
+    for item in facts.absent_items {
+        assert_eq!(item.reason, "refused");
+        assert_eq!(item.provider_code.as_deref(), Some("invalid_answer"));
+    }
+    assert!(!admitted
+        .manifest
+        .tools
+        .iter()
+        .any(|t| t.module.as_deref() == Some("plexus")));
+}
+
+#[tokio::test]
+async fn successful_recomposed_text_cannot_mask_a_required_tool_failure() {
+    let mut case = load("admission/admit-optional-tool-with-text-item.json");
+    case["fetches"].as_array_mut().unwrap().push(json!({
+        "provider":"aft", "phase":"tools", "reason":"refused", "provider_code":"required_catalog_refused"
+    }));
+    let refusal = run_first_send(&case).await.unwrap_err();
+    assert_eq!(refusal.code(), "fetch_unavailable");
+    assert_eq!(
+        refusal.detail(),
+        json!({"provider":"aft","reason":"refused","provider_code":"required_catalog_refused"})
+    );
+}
+
+#[tokio::test]
+async fn recomposed_text_supersedes_a_text_only_providers_stale_first_answer() {
+    let mut case = load("admission/admit-optional-tool-with-text-item.json");
+    let mut raw = case_plan(&case).unwrap();
+    raw["system_text_items"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "provider":"notes", "preset":"worker", "params":{}
+        }));
+    raw["composition"]["providers"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, json!({"provider":"notes","tools":[]}));
+    raw["composition_digest"] = json!(cortexkit_role_tool_provider::catalog::composition_digest(
+        &raw["composition"]
+    )
+    .unwrap());
+    case["fetches"].as_array_mut().unwrap().push(json!({
+        "provider":"notes", "phase":"planned", "answer":{"composition_digest":"stale-first-answer"}
+    }));
+    let plan = parse_plan(&raw, broca_fetch_plan::CompactionSupport::Unsupported).unwrap();
+    let fetcher = Simulated::new(plan.clone(), &case);
+    let admitted = admit(&plan, &fetcher, ADMISSION_DEADLINE).await.unwrap();
+    assert!(admitted.manifest.system_text.contains(&format!(
+        "notes system text \"{}\"",
+        admitted.manifest.composition_digest
+    )));
+    assert!(!admitted.manifest.system_text.contains("stale-first-answer"));
+}
+
+#[tokio::test]
+async fn optional_tool_filter_preserves_unknown_members_and_empty_steps() {
+    let case = load("admission/admit-optional-tool-with-text-item.json");
+    let mut raw = load("plans/broca-worker-optional-tool-with-text.json");
+    let extension = json!({"ordered":["z","a"],"unknown":{"keep":true}});
+    raw["composition"]["extension"] = extension.clone();
+    raw["composition"]["step_transform_items"] = json!([]);
+    raw["composition"]["providers"][0]["extension"] = json!({"keep":[3,1,2]});
+    raw["composition"]["providers"][0]["tools"][0]["extension"] = json!("keep tool member");
+    raw["composition_digest"] = json!(cortexkit_role_tool_provider::catalog::composition_digest(
+        &raw["composition"]
+    )
+    .unwrap());
+    let plan = parse_plan(&raw, broca_fetch_plan::CompactionSupport::Unsupported).unwrap();
+    let fetcher = Simulated::new(plan.clone(), &case);
+    let admitted = admit(&plan, &fetcher, ADMISSION_DEADLINE).await.unwrap();
+    let mut expected = load("compositions/broca-worker-optional-tool-with-text-admitted.json");
+    expected["extension"] = extension;
+    expected["step_transform_items"] = json!([]);
+    expected["providers"][0]["extension"] = json!({"keep":[3,1,2]});
+    expected["providers"][0]["tools"][0]["extension"] = json!("keep tool member");
+    let requests = fetcher.requests.lock().unwrap();
+    let text = &requests.last().unwrap().1;
+    assert_eq!(
+        serde_jcs::to_vec(&text["composition"]).unwrap(),
+        serde_jcs::to_vec(&expected).unwrap()
+    );
+    assert_eq!(
+        admitted.manifest.composition_digest,
+        cortexkit_role_tool_provider::catalog::composition_digest(&expected).unwrap()
+    );
 }
 
 /// A retryable refusal is retried inside the deadline until the provider answers.

@@ -16,6 +16,8 @@ pub enum Unanswered {
     Refused { code: String },
     /// A catalog reply declaration failed validation, naming its tool and member.
     InvalidReply { tool: String, member: String },
+    /// An optional provider's answer no longer matches its planned tools or composition.
+    PlanStale,
 }
 
 impl Unanswered {
@@ -26,6 +28,7 @@ impl Unanswered {
             Self::UnknownModule => "unknown_module",
             Self::Refused { .. } => "refused",
             Self::InvalidReply { .. } => "refused",
+            Self::PlanStale => "plan_stale",
         }
     }
 
@@ -52,8 +55,8 @@ impl Unanswered {
         detail
     }
 
-    /// How the manifest records an optional item this left absent: `timeout`, `unknown_module`
-    /// or `refused:<provider code>`.
+    /// How the manifest records an absent optional item: `timeout`, `unknown_module`,
+    /// `plan_stale`, or `refused:<provider code>`.
     pub fn absence(&self) -> String {
         match self {
             Self::Refused { code } => format!("refused:{code}"),
@@ -68,6 +71,7 @@ impl Unanswered {
         match absence {
             "timeout" => AbsenceReason::Known(Self::Timeout),
             "unknown_module" => AbsenceReason::Known(Self::UnknownModule),
+            "plan_stale" => AbsenceReason::Known(Self::PlanStale),
             other => match other.strip_prefix("refused:") {
                 Some(code) => AbsenceReason::Known(Self::Refused {
                     code: code.to_owned(),

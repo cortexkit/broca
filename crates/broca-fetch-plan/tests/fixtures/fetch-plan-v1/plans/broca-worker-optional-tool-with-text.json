@@ -1,0 +1,134 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {
+        "behavior": "autonomous",
+        "scope": "readwrite",
+        "tool_descs": "concise",
+        "host": "broca",
+        "remote_exec": {
+          "enabled": true,
+          "default_demand": "linux"
+        },
+        "siblings": [
+          "/Users/worker/projects/commons",
+          "/Users/worker/projects/claustrum"
+        ]
+      }
+    },
+    {
+      "provider": "prefrontal-core",
+      "preset": "worker",
+      "params": {
+        "exclude": [
+          "web_search"
+        ]
+      }
+    },
+    {
+      "provider": "plexus",
+      "preset": "worker",
+      "params": {},
+      "optional": true
+    }
+  ],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "worker",
+      "params": {
+        "role": "mason"
+      }
+    },
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {}
+    },
+    {
+      "provider": "plexus",
+      "preset": "worker",
+      "params": {}
+    }
+  ],
+  "step_transform_items": [],
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "plexus",
+        "tools": [
+          {
+            "name": "web_search",
+            "capabilities": [
+              "plexus:web.search/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": [
+          {
+            "name": "ask",
+            "capabilities": [
+              "prefrontal-core:parent.ask/v1"
+            ]
+          },
+          {
+            "name": "browser_use",
+            "capabilities": [
+              "browser.use/v1",
+              "cerebellum:browser.use/v1"
+            ]
+          },
+          {
+            "name": "computer_use",
+            "capabilities": [
+              "cerebellum:computer.use/v1",
+              "computer.use/v1"
+            ]
+          },
+          {
+            "name": "knowhow",
+            "capabilities": [
+              "prefrontal-core:knowhow.read/v1"
+            ]
+          },
+          {
+            "name": "sidekick",
+            "capabilities": [
+              "prefrontal-core:sidekick.research/v1"
+            ]
+          }
+        ]
+      }
+    ],
+    "step_transform_items": []
+  },
+  "composition_digest": "cdf0ce9ad9c935be2dcc7cf59952388bf8622d94462b5d11826f140ab221c8a3"
+}

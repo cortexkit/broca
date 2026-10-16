@@ -34,7 +34,7 @@ pub struct Item {
     pub provider: String,
     pub preset: String,
     pub params: Map<String, Value>,
-    /// Only a system-text item may be optional.
+    /// Tool and non-persona system-text items may be optional.
     pub optional: bool,
 }
 
@@ -117,7 +117,7 @@ fn string_member(object: &Map<String, Value>, key: &str, at: &str) -> Result<Str
 }
 
 /// Read one item at `at` (for example `plan.tool_items[0]`). `may_be_optional` is true only
-/// for system-text items, which may carry `optional: true`; no item may carry `false`.
+/// for tool and system-text items, which may carry `optional: true`; no item may carry `false`.
 fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal> {
     let object = value.as_object().ok_or_else(|| Refusal::invalid(at))?;
     let provider = string_member(object, "provider", at)?;
@@ -254,14 +254,14 @@ pub enum CompactionSupport {
 /// Refuses `invalid_params` naming the field for a malformed plan, and then
 /// `{field: "plan.compaction_item"}` for a plan naming a compaction provider on a runner
 /// without the writer surface. Malformed means a missing or mistyped
-/// member, `optional` anywhere but on a system-text item (or `false`, or on the persona item),
+/// member, `optional` anywhere but on a tool or system-text item (or `false`, or on the persona item),
 /// a provider named twice in one role list, a malformed or forbidden step subscription, a
 /// composition whose digest is not the one stated, or a composition that is not in canonical
 /// order, does not list exactly the plan's providers, or does not repeat the plan's
 /// step-transform items.
 pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, Refusal> {
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
-    let tool_items = items(object, "tool_items", false)?;
+    let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
     if let Some((index, _)) = system_text_items
         .iter()

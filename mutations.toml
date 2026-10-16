@@ -13820,3 +13820,63 @@ new = '''let mut target = std::path::absolute(path)?;
     if target.components().any(|part| part == std::path::Component::ParentDir) {
         return Err(invalid("NON-VACUITY BREAK: blanket parent-component refusal"));
     }'''
+
+[[control]]
+id = "optional-tool-stale-is-absent"
+guards = "a stale optional tool provider is absent rather than refusing session admission"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-fetch-plan --test vectors \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-fetch-plan/tests/vectors.rs"
+expect_red = ["optional_tool_plan_stale_is_absent"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "&& decoded"
+new = "&& false /* NON-VACUITY BREAK */ && decoded"
+
+[[control]]
+id = "optional-tool-recomposed-text"
+guards = "text frozen after optional tool absence comes only from the admitted composition"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-fetch-plan --test vectors \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-fetch-plan/tests/vectors.rs"
+expect_red = ["optional_tool_text_is_recomposed"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "fetched.text = text.text;"
+new = "fetched.text = decode_answer(raw_answers[provider].clone(), true).unwrap().text; // NON-VACUITY BREAK"
+
+[[control]]
+id = "optional-tool-admitted-digest"
+guards = "the frozen baseline reports the admitted rather than planned composition digest"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-fetch-plan --test vectors \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-fetch-plan/tests/vectors.rs"
+expect_red = ["optional_tool_baseline_uses_admitted_digest"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "composition_digest: admitted_plan.composition_digest.clone(),"
+new = "composition_digest: plan.composition_digest.clone(), // NON-VACUITY BREAK"
+
+[[control]]
+id = "optional-tool-absence-kind"
+guards = "an absent optional provider reports separate tool and system_text absence kinds"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-fetch-plan --test vectors \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-fetch-plan/tests/vectors.rs"
+expect_red = ["optional_tool_baseline_marks_tool_absence"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "kind: kind.to_owned(),"
+new = "kind: ABSENT_KIND_SYSTEM_TEXT.to_owned(), // NON-VACUITY BREAK"
+
+[[control]]
+id = "optional-tool-fetch-budget"
+guards = "optional tool fetches have their own five-second budget within the admission deadline"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-fetch-plan --test vectors \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-fetch-plan/tests/vectors.rs"
+expect_red = ["optional_tool_has_own_budget"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "deadline.min(started + OPTIONAL_TOOL_BUDGET)"
+new = "deadline /* NON-VACUITY BREAK */"
