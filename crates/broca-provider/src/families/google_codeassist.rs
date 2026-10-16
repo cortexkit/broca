@@ -53,8 +53,12 @@ const ENVELOPE_USER_AGENT: &str = "antigravity";
 /// `1.0.4 darwin/arm64` returned 404, `1.1.13 darwin/arm64` returned 200, and restoring `1.0.4`
 /// returned 404 again. Treat a new daily 404 as a stale client-version symptom before concluding
 /// that the model is unavailable, and update both values from a current native capture.
-const ANTIGRAVITY_CLI_VERSION: &str = "1.1.20";
-const ANTIGRAVITY_CLIENT_CL: &str = "970154694";
+///
+/// 1.3.5 / 998863838 comes from the native CLI capture of Gemini 4 Argon Low, which the daily
+/// endpoint accepted; 1.1.20 got a 404 on all three Argon tiers. Header set, header order and
+/// envelope keys are unchanged from the earlier capture.
+const ANTIGRAVITY_CLI_VERSION: &str = "1.3.5";
+const ANTIGRAVITY_CLIENT_CL: &str = "998863838";
 /// The fixed `requestType` envelope field.
 const ENVELOPE_REQUEST_TYPE: &str = "agent";
 
@@ -657,21 +661,21 @@ mod tests {
             .iter()
             .find_map(|(name, value)| (name == "user-agent").then_some(value.as_str()));
         assert_eq!(user_agent, Some(antigravity_user_agent().as_str()));
-        assert!(user_agent.unwrap().starts_with("antigravity/cli/1.1.20 "));
-        assert!(user_agent.unwrap().contains("cl=970154694"));
+        assert!(user_agent.unwrap().starts_with("antigravity/cli/1.3.5 "));
+        assert!(user_agent.unwrap().contains("cl=998863838"));
     }
 
     #[test]
     fn native_content_user_agent_is_exact_and_normalizes_reference_platform_names() {
         assert_eq!(
             build_antigravity_user_agent("darwin", "arm64"),
-            "antigravity/cli/1.1.20 (aidev_client; os_type=darwin; arch=arm64; \
-             cl=970154694; auth_method=consumer)"
+            "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; \
+             cl=998863838; auth_method=consumer)"
         );
         assert_eq!(
             build_antigravity_user_agent("win32", "x64"),
-            "antigravity/cli/1.1.20 (aidev_client; os_type=windows; arch=amd64; \
-             cl=970154694; auth_method=consumer)"
+            "antigravity/cli/1.3.5 (aidev_client; os_type=windows; arch=amd64; \
+             cl=998863838; auth_method=consumer)"
         );
         assert_eq!(normalize_antigravity_arch("ia32"), "386");
         assert_eq!(normalize_antigravity_os("linux"), "linux");
