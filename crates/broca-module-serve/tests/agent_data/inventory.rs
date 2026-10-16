@@ -106,6 +106,10 @@ async fn busy_one_ref_reads_only_its_wal_after_inventory_build() {
     assert_eq!(response.header.ty, FrameType::Response);
     let health: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(health["metrics"]["agent_data_ops"]["busy"], 1);
+    assert_eq!(
+        health["metrics"]["agent_data_inventory"],
+        json!({"ready":true,"unreadable":0})
+    );
 }
 
 #[tokio::test]
@@ -133,6 +137,13 @@ async fn incomplete_inventory_is_unknown_until_boot_build_finishes() {
     let absent = rig.session("not-here");
     let mut wire = Wire::without_inventory(&rig, entorhinal(), true, Value::Null).await;
     let params = rig.params(CUT, &[absent]);
+    wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+        .await;
+    let health: Value = serde_json::from_slice(&wire.next().await.body).unwrap();
+    assert_eq!(
+        health["metrics"]["agent_data_inventory"],
+        json!({"ready":false,"unreadable":0})
+    );
     let reply = wire.call("diverged", params.clone()).await.unwrap();
     assert_eq!(reply["refs"][0]["state"], "unknown");
     assert_eq!(rig.wal.move_read_count(), 0);

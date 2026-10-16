@@ -1497,6 +1497,7 @@ async fn handle_control_request(
             // scripts/audit-export-lane.py are that shape deliberately.
             let mut metrics = serde_json::json!({
                     "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
+                    "agent_data_inventory": crate::agent_data::inventory_health(routes.agent_data.as_deref()),
                     "retention_unreadable_sessions": retention_unreadable,
                     "retention_repairs_pending": health_registry.retention_repairs_pending(),
                     "stall_watchdog": crate::stall::health_gauges(),

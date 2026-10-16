@@ -75,7 +75,6 @@ pub struct AgentDataService {
     cuts: CutStore,
     artifacts: FileCutArtifacts,
     wal: Arc<FileWalStore>,
-    inventory_cancel: tokio_util::sync::CancellationToken,
     op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
@@ -96,12 +95,14 @@ impl AgentDataService {
             cuts: CutStore::new(&root),
             artifacts: FileCutArtifacts::new(root.clone(), registry, wal.clone(), index, driver),
             wal,
-            inventory_cancel: tokio_util::sync::CancellationToken::new(),
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
     pub fn start_inventory(&self) {
-        self.wal.start_move_inventory(self.inventory_cancel.clone());
+        // The store may outlive this service and be shared with another one.
+        // A service drop must not cancel their one-shot boot inventory.
+        self.wal
+            .start_move_inventory(tokio_util::sync::CancellationToken::new());
     }
     pub async fn wait_inventory(&self) {
         self.start_inventory();
@@ -132,6 +133,13 @@ pub(crate) fn health_counts(service: Option<&AgentDataService>) -> Value {
     )
 }
 
+pub(crate) fn inventory_health(service: Option<&AgentDataService>) -> Value {
+    service.map_or(Value::Null, |service| {
+        let (ready, unreadable) = service.wal.move_inventory_health();
+        json!({"ready": ready, "unreadable": unreadable})
+    })
+}
+
 struct OpObservation {
     op: String,
     cut_id: String,
@@ -142,12 +150,6 @@ impl Drop for OpObservation {
     fn drop(&mut self) {
         tracing::info!(op = %self.op, cut_id = %self.cut_id, ref_count = self.ref_count,
             elapsed_ms = self.start.elapsed().as_millis() as u64, "agent-data op finished");
-    }
-}
-
-impl Drop for AgentDataService {
-    fn drop(&mut self) {
-        self.inventory_cancel.cancel();
     }
 }
 

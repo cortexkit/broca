@@ -14044,3 +14044,15 @@ old = '''        self.publishing(record);
         self.wal.append(fence, record, sync)'''
 new = '''        if sync { self.publishing(record); } // NON-VACUITY BREAK
         self.wal.append(fence, record, sync)'''
+
+[[control]]
+id = "agent-data-interrupted-inventory-finishes"
+guards = "panic and cancellation finish the one-shot build incomplete and wake waiters"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/tests.rs"
+expect_red = ["wal_writer::move_inventory::tests::panic_finishes_inventory_incomplete", "wal_writer::move_inventory::tests::cancellation_finishes_inventory_incomplete"]
+file = "crates/broca-core/src/wal_writer/move_inventory.rs"
+old = "if result.is_err() || !state.finished {"
+new = "if false { // NON-VACUITY BREAK: leave interrupted builds pending forever."
