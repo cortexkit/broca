@@ -310,6 +310,21 @@ old = "let scratch = Scratch::new(\"unknown\");"
 new = "let scratch = Scratch::new(\"unknown\");\n    let _ = Command::new(\"ck-broca\").spawn(); // NON-VACUITY BREAK"
 
 [[control]]
+id = "test-rig-ckdev-indirect-build-paths"
+guards = "module scripts publish a ckdev copy instead of executing a test binary from the build directory"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test ckdev_guard"
+test_file = "crates/broca-test-support/tests/ckdev_guard.rs"
+expect_red = ["rig_scripts_and_configs_never_launch_build_directory_executables"]
+file = "crates/broca-module-serve/tests/agent_data/real_daemon.rs"
+old = '''let executable = broca_test_support::ckdev_binary(
+            std::env::current_exe().unwrap(),
+            broca_test_support::scratch_root(),
+        );'''
+new = "let executable = std::env::current_exe().unwrap(); // NON-VACUITY BREAK"
+
+[[control]]
 id = "scope-frozen-owner"
 guards = "a scoped session accepts only its owner under the frozen scope"
 runner = "cargo"
