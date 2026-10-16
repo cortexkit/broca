@@ -12,6 +12,28 @@
 
 use super::*;
 
+/// Cancellation must not change the bytes or reader requirements of existing boundaries.
+#[test]
+fn pre_cancel_at_boundaries_keep_their_bytes_and_frame_requirements() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+
+    for pinned in [
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"tool_batch_finished","batch_id":"r-b1"}"#,
+        r#"{"type":"turn_finished","step_id":1}"#,
+        r#"{"type":"run_paused","run_id":"r","reason":"auth_required"}"#,
+        r#"{"type":"run_finished","reason":"cancelled","usage":{},"retries_used":0}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty());
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
 #[test]
 fn attempt_bytes_before_content_progress_stay_identical() {
     let pinned = include_str!("../../tests/fixtures/model_attempt_before_progress.json").trim_end();
