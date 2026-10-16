@@ -143,7 +143,7 @@ async fn incomplete_inventory_is_unknown_until_boot_build_finishes() {
 }
 
 #[tokio::test]
-async fn durable_run_started_after_build_publishes_new_session() {
+async fn unsynced_run_started_after_build_publishes_new_session() {
     let rig = Rig::new("inventory-admission", Arc::new(FakeDoor::default()));
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     let session = rig.session("new-session");
@@ -153,12 +153,14 @@ async fn durable_run_started_after_build_publishes_new_session() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(rig
-        .wal
-        .move_session_refs(std::iter::once(reference.as_str()))
-        .sessions
-        .is_empty());
-    wal.sync().unwrap();
+    assert_eq!(
+        rig.wal
+            .move_session_refs(std::iter::once(reference.as_str()))
+            .sessions
+            .len(),
+        1
+    );
+    drop(wal);
     let reply = wire
         .call("busy", json!({"refs":rig.params(CUT, &[session])["refs"]}))
         .await

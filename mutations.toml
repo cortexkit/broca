@@ -14029,3 +14029,18 @@ file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = 'match locations(store, cancel, &mut inventory.unreadable, &mut stats) {'
 new = '''// NON-VACUITY BREAK: cached addresses are the entire inventory authority.
     match Ok::<_, WalError>(cached.iter().map(|(address, entry)| (address.clone(), entry.source.clone())).collect::<BTreeMap<_, _>>()) {'''
+
+[[control]]
+id = "agent-data-unsynced-identity-published"
+guards = "an unsynced RunStarted dropped without sync remains a local identity candidate"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::unsynced_run_started_after_build_publishes_new_session"]
+file = "crates/broca-core/src/wal_writer/move_inventory.rs"
+old = '''        self.publishing(record);
+        self.wal.append(fence, record, sync)'''
+new = '''        if sync { self.publishing(record); } // NON-VACUITY BREAK
+        self.wal.append(fence, record, sync)'''

@@ -141,7 +141,6 @@ pub(super) struct IndexedWal {
     wal: FileWal,
     address: String,
     inventory: Arc<InventoryState>,
-    pending: Mutex<Vec<BindIdentity>>,
 }
 
 impl IndexedWal {
@@ -150,56 +149,24 @@ impl IndexedWal {
             wal,
             address,
             inventory,
-            pending: Mutex::default(),
         }
     }
 
-    fn appended(&self, record: &WalRecord, sync: bool) {
+    fn publishing(&self, record: &WalRecord) {
+        // This is a conservative candidate set, not a durability claim: requests
+        // verify the actual bytes. Publish before writing so an unsynced drop or
+        // failed append cannot hide an identity that may have reached disk.
         if let WalRecord::RunStarted { session, .. } = record {
-            self.pending.lock().unwrap().push(session.clone());
-        }
-        if sync {
-            self.publish();
-        }
-    }
-
-    fn publish(&self) {
-        let mut pending = self.pending.lock().unwrap();
-        if pending.is_empty() {
-            return;
-        }
-        let mut state = self.inventory.state.lock().unwrap();
-        for session in pending.drain(..) {
-            insert(&mut state.inventory, &self.address, &session);
-        }
-    }
-
-    fn uncertain_write(&self, record: Option<&WalRecord>) {
-        if matches!(record, Some(WalRecord::RunStarted { .. }))
-            || !self.pending.lock().unwrap().is_empty()
-        {
-            self.inventory
-                .state
-                .lock()
-                .unwrap()
-                .inventory
-                .unreadable
-                .push(format!(
-                    "{}: identity durability could not be confirmed",
-                    self.address
-                ));
+            let mut state = self.inventory.state.lock().unwrap();
+            insert(&mut state.inventory, &self.address, session);
         }
     }
 }
 
 impl Wal for IndexedWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        let seq = self
-            .wal
-            .append(fence, record, sync)
-            .inspect_err(|_| self.uncertain_write(Some(record)))?;
-        self.appended(record, sync);
-        Ok(seq)
+        self.publishing(record);
+        self.wal.append(fence, record, sync)
     }
     fn append_preencoded(
         &mut self,
@@ -208,19 +175,11 @@ impl Wal for IndexedWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        let seq = self
-            .wal
-            .append_preencoded(fence, record, sync, frame)
-            .inspect_err(|_| self.uncertain_write(Some(record)))?;
-        self.appended(record, sync);
-        Ok(seq)
+        self.publishing(record);
+        self.wal.append_preencoded(fence, record, sync, frame)
     }
     fn sync(&self) -> Result<(), WalError> {
-        self.wal
-            .sync()
-            .inspect_err(|_| self.uncertain_write(None))?;
-        self.publish();
-        Ok(())
+        self.wal.sync()
     }
     fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
         self.wal.replay()
