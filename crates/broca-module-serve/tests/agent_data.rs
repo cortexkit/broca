@@ -1302,6 +1302,9 @@ mod real_daemon;
 #[path = "agent_data/inventory.rs"]
 mod inventory;
 
+#[path = "agent_data/persistent_inventory.rs"]
+mod persistent_inventory;
+
 #[tokio::test]
 async fn closed_session_with_question_withdrawal_debt_is_busy_before_prepare() {
     let rig = Rig::new("approval-debt", Arc::new(FakeDoor::default()));

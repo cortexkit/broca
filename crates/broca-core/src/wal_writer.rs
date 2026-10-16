@@ -31,7 +31,7 @@ use crate::lease::LeaseHandle;
 
 mod extraction;
 mod move_inventory;
-pub use move_inventory::MoveInventory;
+pub use move_inventory::{MoveInventory, MoveInventoryBuildStats};
 
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).

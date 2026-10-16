@@ -3,6 +3,9 @@ use super::*;
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
+mod persistent;
+pub use persistent::MoveInventoryBuildStats;
+
 #[derive(Default)]
 pub struct MoveInventory {
     pub sessions: BTreeMap<String, (String, BindIdentity)>,
@@ -14,6 +17,7 @@ struct State {
     started: bool,
     finished: bool,
     inventory: MoveInventory,
+    stats: MoveInventoryBuildStats,
 }
 
 #[derive(Default)]
@@ -48,54 +52,19 @@ impl FileWalStore {
         state.started = true;
         drop(state);
         let store = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let start = std::time::Instant::now();
-            let mut inventory = MoveInventory::default();
-            match store.address_inventory(true, &|| cancel.is_cancelled()) {
-                Ok((addresses, unreadable)) => {
-                    inventory.unreadable = unreadable;
-                    for address in addresses {
-                        if cancel.is_cancelled() {
-                            return;
-                        }
-                        // RunStarted can occur after arbitrary run records, including
-                        // under another triple. A first-record shortcut misses identities.
-                        match store.read_address_records_inner(&address, true) {
-                            Ok(records) => {
-                                for record in records {
-                                    if let WalRecord::RunStarted { session, .. } = record.record {
-                                        insert(&mut inventory, &address, &session);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(address, %error, "move inventory cannot read WAL");
-                                inventory.unreadable.push(address);
-                            }
-                        }
-                    }
-                }
-                Err(error) => inventory.unreadable.push(error.to_string()),
-            }
-            if cancel.is_cancelled() {
-                return;
-            }
-            let mut state = store.move_inventory.state.lock().unwrap();
-            // Durable appends and installations may have published while the scan
-            // ran. Merge them last so no admission can be lost at publication.
-            inventory.sessions.append(&mut state.inventory.sessions);
-            inventory.unreadable.append(&mut state.inventory.unreadable);
-            tracing::info!(
-                refs = inventory.sessions.len(),
-                unreadable = inventory.unreadable.len(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "move identity inventory built"
-            );
-            state.inventory = inventory;
+        if let Err(error) = std::thread::Builder::new()
+            .name("move-inventory".into())
+            .spawn(move || persistent::build(&store, &cancel))
+        {
+            let mut state = self.move_inventory.state.lock().unwrap();
+            state
+                .inventory
+                .unreadable
+                .push(format!("cannot start move inventory thread: {error}"));
             state.finished = true;
             drop(state);
-            store.move_inventory.ready.notify_waiters();
-        });
+            self.move_inventory.ready.notify_waiters();
+        }
     }
 
     /// Wait for the boot scan, including a scan that finished with unreadable
@@ -161,6 +130,10 @@ impl FileWalStore {
     /// Cumulative participant WAL snapshots/identity reads, for cost diagnostics.
     pub fn move_read_count(&self) -> u64 {
         self.move_reads.load(Ordering::Relaxed)
+    }
+
+    pub fn move_inventory_build_stats(&self) -> MoveInventoryBuildStats {
+        self.move_inventory.state.lock().unwrap().stats
     }
 }
 
