@@ -1120,6 +1120,7 @@ fn move_sidecars_and_pending_activation_cannot_leave_a_cache_dump() {
         match kind {
             "moving" => {
                 broca_wal::migration::freeze(
+                    &root,
                     &path,
                     &broca_wal::migration::Freeze {
                         cut_id: "cut".into(),
@@ -1132,6 +1133,7 @@ fn move_sidecars_and_pending_activation_cannot_leave_a_cache_dump() {
             }
             "moved" => {
                 broca_wal::migration::atomic_json(
+                    &root,
                     &path.with_extension("moved"),
                     &broca_wal::migration::Moved {
                         cut_id: "cut".into(),
@@ -1147,7 +1149,7 @@ fn move_sidecars_and_pending_activation_cannot_leave_a_cache_dump() {
                     &key.project_root.to_string_lossy(),
                     "moved",
                 );
-                broca_wal::migration::atomic_json(&root.join("agent-data/cuts/cut.json"),&serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
+                broca_wal::migration::atomic_json(&root, &root.join("agent-data/cuts/cut.json"),&serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
             }
             _ => unreachable!(),
         }

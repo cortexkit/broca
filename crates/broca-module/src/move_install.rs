@@ -77,6 +77,7 @@ pub fn check_installations(installations: &[Installation<'_>]) -> Result<(), Err
 /// them. Without that intent, do not invoke the missing-staging recovery path.
 /// `drop_projection` removes derived session data, never billing facts or floors.
 pub fn install_verified(
+    state_root: &Path,
     cut_id: &str,
     installations: &[Installation<'_>],
     export: &dyn broca_core::ExportIndex,
@@ -104,15 +105,45 @@ pub fn install_verified(
                     None => Vec::new(),
                 }
             };
-            let imported = broca_core::imported_run_ids(&incoming, &local);
+            let imported: std::collections::BTreeSet<_> =
+                broca_core::imported_run_ids(&incoming, &local)
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect();
+            let mut by_session = std::collections::BTreeMap::new();
+            // Re-keying preserves historical RunStarted triples. Billing uses
+            // those triples, not the address at which this cut is installed.
+            for frame in &incoming {
+                if let broca_wal::WalRecord::RunStarted {
+                    session, run_id, ..
+                } = &frame.record
+                {
+                    if imported.contains(&run_id.0) {
+                        by_session
+                            .entry((
+                                session.project_root.clone(),
+                                session.harness.clone(),
+                                session.session.clone(),
+                            ))
+                            .or_insert_with(|| (session, Vec::new()))
+                            .1
+                            .push(run_id.clone());
+                    }
+                }
+            }
             export
-                .record_imported_runs(item.session, cut_id, &imported)
+                .record_imported_runs(item.session, cut_id, &[])
                 .map_err(unavailable)?;
+            for (session, imported) in by_session.into_values() {
+                export
+                    .record_imported_runs(session, cut_id, &imported)
+                    .map_err(unavailable)?;
+            }
             let parent = item
                 .live
                 .parent()
                 .ok_or_else(|| unavailable("live WAL has no directory"))?;
-            broca_wal::migration::durable_dir(parent).map_err(unavailable)?;
+            broca_wal::migration::durable_dir(state_root, parent).map_err(unavailable)?;
             fs::rename(item.staged, item.live).map_err(unavailable)?;
             broca_wal::migration::sync_dir(parent).map_err(unavailable)?;
             broca_wal::migration::sync_dir(item.staged.parent().unwrap()).map_err(unavailable)?;
@@ -123,6 +154,13 @@ pub fn install_verified(
             export
                 .record_imported_runs(item.session, cut_id, &[])
                 .map_err(unavailable)?;
+            // The rename can be visible while its source-directory sync is
+            // still owed. Missing staging is not evidence of durable removal.
+            let staging_parent = item
+                .staged
+                .parent()
+                .ok_or_else(|| unavailable("staged WAL has no directory"))?;
+            broca_wal::migration::sync_dir(staging_parent).map_err(unavailable)?;
         }
         broca_wal::migration::unlink(&item.live.with_extension("moved")).map_err(unavailable)?;
         drop_projection(item.session).map_err(unavailable)?;

@@ -291,14 +291,38 @@ impl FileWalStore {
         &self,
         address: &str,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        self.read_address_records_inner(address, false)
+    }
+
+    /// Bypass the moving/moved reader fence solely to discover the address of a
+    /// move-back destination. Only the agent-data participant in broca-module-serve
+    /// may call this: ordinary readers must keep refusing tombstoned sessions.
+    /// Size limits and archive verification are unchanged; no writer is opened and
+    /// no archive member is restored into the live WAL directory.
+    pub fn read_address_records_for_move(
+        &self,
+        address: &str,
+    ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        self.read_address_records_inner(address, true)
+    }
+
+    fn read_address_records_inner(
+        &self,
+        address: &str,
+        for_move: bool,
+    ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
         if address.len() != 16 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(WalError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid WAL address",
             )));
         }
+        if !for_move {
+            let path = self.root.join(format!("{address}.wal"));
+            broca_wal::migration::guard(&path, "", false)?;
+        }
         match self
-            .read_address_range(address, 0, None, None)?
+            .read_address_range_for_authorization(address, 0, None, None)?
             .into_records()
         {
             broca_wal::WalRangeRecords::Complete(records) => Ok(records),
@@ -307,44 +331,91 @@ impl FileWalStore {
         }
     }
 
-    /// Inventory live and sealed archived addresses without extracting archived WALs.
     pub fn addresses(&self) -> Result<std::collections::BTreeSet<String>, WalError> {
+        self.address_inventory(false)
+            .map(|(addresses, _)| addresses)
+    }
+
+    /// Participant discovery keeps unreadable locations separate from absence.
+    /// Callers must not interpret a missing match as an unheld ref when this
+    /// result contains unreadable addresses or containers.
+    pub fn move_addresses(
+        &self,
+    ) -> Result<(std::collections::BTreeSet<String>, Vec<String>), WalError> {
+        self.address_inventory(true)
+    }
+
+    fn address_inventory(
+        &self,
+        partial: bool,
+    ) -> Result<(std::collections::BTreeSet<String>, Vec<String>), WalError> {
         let mut addresses = std::collections::BTreeSet::new();
+        let mut unreadable = Vec::new();
+        let mut failure = |name: String, error: WalError| {
+            if partial {
+                unreadable.push(name);
+                Ok(())
+            } else {
+                Err(error)
+            }
+        };
         for root in [&self.root, &self.ephemeral_root()] {
             match std::fs::read_dir(root) {
                 Ok(entries) => {
                     for entry in entries {
-                        let path = entry.map_err(WalError::Io)?.path();
-                        if path.extension().is_some_and(|e| e == "wal") {
+                        let path = match entry {
+                            Ok(entry) => entry.path(),
+                            Err(error) => {
+                                failure(root.display().to_string(), WalError::Io(error))?;
+                                continue;
+                            }
+                        };
+                        if path.extension().is_some_and(|extension| extension == "wal") {
                             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                                 addresses.insert(stem.to_owned());
                             }
                         }
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(WalError::Io(e)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => failure(root.display().to_string(), WalError::Io(error))?,
             }
         }
-        for address in &addresses {
-            self.resolve_live_address(address)?;
-        }
-        for path in self.archive_containers()?.unwrap_or_default() {
-            let mut reader = broca_wal::archive::ArchiveReader::open(path, self.max_read_bytes)
-                .map_err(WalError::Io)?;
-            if reader.state().map_err(WalError::Io)? == broca_wal::archive::ContainerState::Unsealed
-            {
-                continue;
+        for address in addresses.clone() {
+            if let Err(error) = self.resolve_live_address(&address) {
+                failure(address.clone(), error)?;
+                addresses.remove(&address);
             }
-            addresses.extend(
-                reader
-                    .rescan()
-                    .map_err(WalError::Io)?
-                    .into_iter()
-                    .map(|info| info.session_addr),
-            );
         }
-        Ok(addresses)
+        let paths = match self.archive_containers() {
+            Ok(paths) => paths.unwrap_or_default(),
+            Err(error) => {
+                failure("wal-archive".into(), error)?;
+                Vec::new()
+            }
+        };
+        for path in paths {
+            let members = broca_wal::archive::ArchiveReader::open(&path, self.max_read_bytes)
+                .map_err(WalError::Io)
+                .and_then(|mut reader| {
+                    if reader.state().map_err(WalError::Io)?
+                        == broca_wal::archive::ContainerState::Unsealed
+                    {
+                        return Ok(Vec::new());
+                    }
+                    reader.rescan().map_err(WalError::Io).map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|info| info.session_addr)
+                            .collect::<Vec<_>>()
+                    })
+                });
+            match members {
+                Ok(members) => addresses.extend(members),
+                Err(error) => failure(path.display().to_string(), error)?,
+            }
+        }
+        Ok((addresses, unreadable))
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {

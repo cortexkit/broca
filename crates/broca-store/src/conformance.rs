@@ -151,14 +151,7 @@ impl PageUsageConformance for crate::SqliteStore {
         tx.commit().map_err(|e| e.to_string())
     }
     fn reset_projection_for_conformance(&self, session: &BindIdentity) -> Result<(), String> {
-        let key = crate::SqliteStore::key(session);
-        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM message WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM meta WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        self.drop_session_projection(session)
     }
     fn replace_admission_checkpoint_for_conformance(
         &self,

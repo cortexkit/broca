@@ -2,7 +2,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const CUT: &str = "0123456789abcdef0123456789abcdef";
 fn root(tag: &str) -> PathBuf {
-    broca_test_support::scratch_root().join(format!("cut-state-{}-{tag}", std::process::id()))
+    let root =
+        broca_test_support::scratch_root().join(format!("cut-state-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    root
 }
 fn params() -> Value {
     json!({"cutId":CUT,"refs":[{"ref_kind":"broca-session","ref":"a"},{"ref_kind":"broca-session","ref":"b"}]})
@@ -14,6 +17,7 @@ struct Artifacts {
     applied: AtomicUsize,
     calls: AtomicUsize,
     fail_b: AtomicBool,
+    locks: AtomicUsize,
 }
 impl Artifacts {
     fn new(root: PathBuf) -> Self {
@@ -23,6 +27,7 @@ impl Artifacts {
             applied: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             fail_b: AtomicBool::new(false),
+            locks: AtomicUsize::new(0),
         }
     }
     fn staged(&self, reference: &str) -> PathBuf {
@@ -49,6 +54,7 @@ impl CutArtifacts for Artifacts {
         _refs: &Refs,
         _op: Op,
     ) -> Result<Box<dyn CutGuard>, ErrorBody> {
+        self.locks.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(()))
     }
     async fn check(&self, _request: &Request, _state: &CutState) -> Result<(), ErrorBody> {
@@ -61,6 +67,7 @@ impl CutArtifacts for Artifacts {
             match op {
                 Op::Prepare => {
                     broca_wal::migration::freeze(
+                        &self.root,
                         &self.path(&name),
                         &broca_wal::migration::Freeze {
                             cut_id: CUT.into(),
@@ -72,7 +79,7 @@ impl CutArtifacts for Artifacts {
                     .map_err(unavailable)?;
                 }
                 Op::Release => {
-                    broca_wal::migration::release(&self.path(&name), CUT, "remote")
+                    broca_wal::migration::release(&self.root, &self.path(&name), CUT, "remote")
                         .map_err(unavailable)?
                         .map_err(unavailable)?;
                 }
@@ -85,6 +92,7 @@ impl CutArtifacts for Artifacts {
                 Op::Import => {
                     let bytes = format!("cut:{name}");
                     broca_wal::migration::stage(
+                        &self.root,
                         &self.staged(&name),
                         bytes.as_bytes(),
                         &broca_wal::migration::digest(bytes.as_bytes()),
@@ -181,6 +189,7 @@ async fn status_keeps_prepare_intent_byte_identical_and_repeat_rolls_forward_all
     };
     store.save(CUT, &state).unwrap();
     broca_wal::migration::freeze(
+        &root,
         &artifacts.path("a"),
         &broca_wal::migration::Freeze {
             cut_id: CUT.into(),
@@ -372,6 +381,7 @@ async fn pending_import_verifies_the_entire_ref_set_before_recording_completion(
     };
     store.save(CUT, &state).unwrap();
     broca_wal::migration::stage(
+        &root,
         &artifacts.staged("a"),
         b"cut:a",
         &broca_wal::migration::digest(b"cut:a"),
@@ -385,6 +395,7 @@ async fn pending_import_verifies_the_entire_ref_set_before_recording_completion(
         .replies
         .contains_key(Op::Import.method()));
     broca_wal::migration::stage(
+        &root,
         &artifacts.staged("b"),
         b"invalid",
         &broca_wal::migration::digest(b"invalid"),
@@ -421,9 +432,10 @@ async fn abort_intent_after_staging_unlink_is_not_mistaken_for_activation() {
         .await
         .unwrap();
     for name in ["a", "b"] {
-        broca_wal::migration::durable_dir(artifacts.path(name).parent().unwrap()).unwrap();
+        broca_wal::migration::durable_dir(&root, artifacts.path(name).parent().unwrap()).unwrap();
         std::fs::write(artifacts.path(name), format!("cut:{name}")).unwrap();
         broca_wal::migration::atomic_json(
+            &root,
             &artifacts.path(name).with_extension("moved"),
             &broca_wal::migration::Moved {
                 cut_id: "old-cut".into(),
@@ -456,7 +468,7 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
     let root = root("activate");
     let store = CutStore::new(&root);
     let artifacts = Artifacts::new(root.clone());
-    broca_wal::migration::durable_dir(&root.join("wal")).unwrap();
+    broca_wal::migration::durable_dir(&root, &root.join("wal")).unwrap();
     store
         .execute(
             contract::ADMITTED_CALLER,
@@ -558,7 +570,7 @@ async fn concurrent_repeats_serialize_across_independent_cut_store_instances() {
 async fn unknown_cut_status_is_contract_typed_admitted_and_creates_no_authority() {
     let root = root("unknown-status");
     let store = CutStore::new(&root);
-    let artifacts = Artifacts::new(root);
+    let artifacts = Artifacts::new(root.clone());
     let value = store
         .execute(
             contract::ADMITTED_CALLER,
@@ -577,7 +589,7 @@ async fn unknown_cut_status_is_contract_typed_admitted_and_creates_no_authority(
 async fn changed_ref_set_is_refused_before_the_intent_or_any_export_changes() {
     let root = root("refs");
     let store = CutStore::new(&root);
-    let artifacts = Artifacts::new(root);
+    let artifacts = Artifacts::new(root.clone());
     store
         .execute(
             contract::ADMITTED_CALLER,
@@ -607,4 +619,67 @@ async fn changed_ref_set_is_refused_before_the_intent_or_any_export_changes() {
     );
     assert_eq!(std::fs::read(store.path(CUT)).unwrap(), before);
     assert_eq!(artifacts.calls.load(Ordering::SeqCst), calls);
+}
+
+#[tokio::test]
+async fn rolled_back_first_prepare_and_import_clear_the_uncommitted_ref_set() {
+    for op in [Op::Prepare, Op::Import] {
+        let root = root(op.method());
+        let store = CutStore::new(&root);
+        let artifacts = Artifacts::new(root.clone());
+        artifacts.fail_after.store(1, Ordering::SeqCst);
+        let a = json!({"cutId":CUT,"refs":[params()["refs"][0]]});
+        assert_eq!(
+            store
+                .execute("reserved:entorhinal", op.method(), &a, &artifacts)
+                .await
+                .unwrap_err()
+                .code
+                .as_str(),
+            "unavailable"
+        );
+        let state = store.load(CUT).unwrap();
+        assert_eq!(state.step, Step::None);
+        assert!(state.intent.is_none());
+        assert!(
+            state.refs.is_none(),
+            "refused {op:?} retained a hidden first-request binding"
+        );
+        artifacts.fail_after.store(usize::MAX, Ordering::SeqCst);
+        let b = json!({"cutId":CUT,"refs":[params()["refs"][1]]});
+        store
+            .execute("reserved:entorhinal", op.method(), &b, &artifacts)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load(CUT).unwrap().refs.unwrap(),
+            serde_json::from_value::<Refs>(b["refs"].clone()).unwrap()
+        );
+        store
+            .execute("reserved:entorhinal", Op::Abort.method(), &b, &artifacts)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn mapless_cut_is_unreadable_before_any_artifact_resolution() {
+    let root = root("mapless-cut");
+    let store = CutStore::new(&root);
+    let artifacts = Artifacts::new(root.clone());
+    let state = json!({"step":"prepared","refs":params()["refs"],"intent":null,"replies":{}});
+    broca_wal::migration::atomic_json(&root, &store.path(CUT), &state).unwrap();
+    let error = store
+        .execute(
+            "reserved:entorhinal",
+            Op::Status.method(),
+            &params(),
+            &artifacts,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "unavailable");
+    assert!(error.message.contains(store.path(CUT).to_str().unwrap()));
+    assert!(error.message.contains("sessions"));
+    assert_eq!(artifacts.locks.load(Ordering::SeqCst), 0);
 }

@@ -3838,6 +3838,7 @@ fn migration_sidecars_prevent_retention_deletion_and_boot_enrollment() {
     let retained = rig.service.wal.ephemeral_wal_path(&rig.key);
     let before = std::fs::read(&retained).unwrap();
     broca_wal::migration::freeze(
+        &rig.root,
         &portable,
         &broca_wal::migration::Freeze {
             cut_id: "cut".into(),

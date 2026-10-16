@@ -14,6 +14,7 @@
 pub const RETENTION_WRITER_ENABLED: bool = true;
 
 pub mod account_routing;
+pub mod agent_data;
 pub mod auth_routing;
 pub mod billing_routing;
 pub mod cache_dump;

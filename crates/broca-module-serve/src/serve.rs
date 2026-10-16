@@ -342,6 +342,7 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 /// anything: the same session bound with different observations is still one lineage.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BindObservation {
+    agent_data: bool,
     /// The producer's registered project id, as the client supplied it (unattested).
     project_id: Option<String>,
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
@@ -418,6 +419,7 @@ fn to_bind_principal(principal: &subc_protocol::Principal) -> broca_protocol::Bi
 /// cancel for a live subscribe stream on that channel (cancelled on the route's GOODBYE so
 /// an explicit unsubscribe tears the forward task down promptly).
 struct Routes {
+    agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     // The bind observations (project id, principal) stay beside the session key rather than
     // inside it: BindIdentity also keys the actor registry, so folding them in would give one
     // session WAL a separate actor per distinct observation, all writing the same file.
@@ -436,6 +438,7 @@ struct Routes {
 impl Routes {
     fn new(daemon_scopes: bool) -> Self {
         Self {
+            agent_data: None,
             by_channel: std::collections::HashMap::new(),
             pending_binds: std::collections::HashMap::new(),
             bind_tasks: JoinSet::new(),
@@ -713,6 +716,45 @@ where
 /// module's registered connection), and detached when the connection ends.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_connection_configured<R, W, H>(
+    read_half: R,
+    write_half: W,
+    module_id: &str,
+    handler: Arc<H>,
+    health_registry: Arc<LineageRegistry>,
+    vault_gauge: Arc<VaultGauge>,
+    catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
+    archive: crate::wal_archive::WalArchiveConfig,
+    consumer_routes: crate::consumer_routes::ConsumerRoutes,
+    vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
+    daemon_capabilities: Option<Vec<String>>,
+    scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
+) -> Result<ServeEnd, ServeIoError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: ServeHandler + 'static,
+{
+    serve_connection_with_agent_data(
+        read_half,
+        write_half,
+        module_id,
+        handler,
+        health_registry,
+        vault_gauge,
+        catalog_cache,
+        archive,
+        consumer_routes,
+        vault_auditor,
+        daemon_capabilities,
+        scope_describer,
+        None,
+    )
+    .await
+}
+
+/// Serve the internal `agent-data` session-WAL move service alongside the management surface.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_connection_with_agent_data<R, W, H>(
     mut read_half: R,
     write_half: W,
     module_id: &str,
@@ -725,6 +767,7 @@ pub async fn serve_connection_configured<R, W, H>(
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
     scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
+    agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -758,6 +801,7 @@ where
             vault_auditor,
             daemon_capabilities,
             scope_describer.as_deref(),
+            agent_data,
         ),
     );
     let mut writer_finished = false;
@@ -811,6 +855,7 @@ async fn run_frame_loop<R, H>(
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
     scope_describer: Option<&broca_subc::ModuleScopeDescriber>,
+    agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -832,6 +877,7 @@ where
         .any(|capability| capability == subc_protocol::scope::CAP_SCOPES_V1);
 
     let mut routes = Routes::new(daemon_scopes);
+    routes.agent_data = agent_data;
     let request_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTE_REQUESTS));
     let mut request_tasks = JoinSet::new();
 
@@ -1057,6 +1103,42 @@ where
             let Some((_, session, bind)) = routes.by_channel.get(&channel).cloned() else {
                 unreachable!("route binding disappeared after the channel/epoch guard")
             };
+            if bind.agent_data {
+                let caller = bind
+                    .principal
+                    .as_ref()
+                    .map(|p| p.as_owner_string())
+                    .unwrap_or_default();
+                let service = routes.agent_data.clone();
+                let writer = writer.clone();
+                let slots = request_slots.clone();
+                request_tasks.spawn(async move {
+                    let _permit = slots
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| ServeIoError(e.to_string()))?;
+                    let result =
+                        crate::agent_data::dispatch(service.as_deref(), &caller, &frame.body).await;
+                    match result {
+                        Ok(reply) => {
+                            send_json_response(&writer, ver, channel, epoch, corr, &reply).await
+                        }
+                        Err(error) => {
+                            send_error_bytes(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                serde_json::to_vec(&error)
+                                    .map_err(|e| ServeIoError(e.to_string()))?,
+                            )
+                            .await
+                        }
+                    }
+                });
+                return Ok(true);
+            }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1197,6 +1279,7 @@ async fn handle_control_request(
             identity,
             principal,
             scope,
+            target,
             ..
         } => {
             stall::method_context(1);
@@ -1205,12 +1288,32 @@ async fn handle_control_request(
             // owner is the principal on every earlier episode, and an episode recorded without
             // one can never satisfy that.
             let bind = BindObservation {
+                agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
+                    if service_id == broca_wire::agent_data::SERVICE_ID),
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
             };
+            if !bind.agent_data
+                && !matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
+            {
+                return send_error(
+                    writer,
+                    frame.header.ver,
+                    0,
+                    0,
+                    frame.header.corr,
+                    "invalid_request",
+                    "broca does not serve this route target",
+                )
+                .await;
+            }
             let identity = to_broca_identity(&identity);
-            if let Err(error) = identity.validate_keyable() {
+            if let Err(error) = if bind.agent_data {
+                Ok(())
+            } else {
+                identity.validate_keyable()
+            } {
                 return send_error(
                     writer,
                     frame.header.ver,
@@ -1240,7 +1343,9 @@ async fn handle_control_request(
             };
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
-            if matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_)) {
+            if !completed.bind.agent_data
+                && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
+            {
                 let registry = health_registry.clone();
                 routes
                     .bind_tasks
@@ -4951,6 +5056,7 @@ mod tests {
                 epoch: 1,
                 identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
                 bind: BindObservation {
+                    agent_data: false,
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
@@ -5199,6 +5305,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5340,6 +5447,7 @@ mod tests {
                 None,
                 None,
                 Some(loop_describer.as_ref()),
+                None,
             )
             .await
         });
@@ -5442,6 +5550,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -5589,6 +5698,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -5872,5 +5982,85 @@ mod agent_run_writer_tests {
             ),
             Ok(broca_core::ScopeDecision::Freeze(bind.scope))
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_data_refusal_vectors {
+    use super::*;
+
+    // broca owns no host-managed transcripts or activation undo images. Their
+    // generic refusal cases must still survive this serve ERROR-frame writer,
+    // without inventing broca operations that would produce them.
+    #[tokio::test]
+    async fn contract_refusal_vectors_use_the_serve_error_frame_writer() {
+        use broca_wire::agent_data::{
+            errors::{driver_action_for, may_refuse, DriverAction, ErrorBody as ContractError},
+            Op,
+        };
+        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
+        for name in ["refusals.json", "digest-mismatch.json"] {
+            let file: serde_json::Value =
+                serde_json::from_str(cortexkit_role_agent_data::vectors::file(name).unwrap())
+                    .unwrap();
+            for (index, case) in file["refusals"].as_array().unwrap().iter().enumerate() {
+                let error: ContractError = serde_json::from_value(case["body"].clone()).unwrap();
+                send_error_bytes(
+                    &tx,
+                    PROTOCOL_VERSION,
+                    7,
+                    3,
+                    index as u64,
+                    serde_json::to_vec(&error).unwrap(),
+                )
+                .await
+                .unwrap();
+                let frame = rx.recv().await.unwrap();
+                assert_eq!(frame.header.ty, FrameType::Error);
+                assert_eq!(frame.header.channel, 7);
+                assert_eq!(frame.header.epoch, 3);
+                assert_eq!(frame.header.corr, index as u64);
+                let decoded: ContractError = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(
+                    decoded.code.as_str(),
+                    case["body"]["code"],
+                    "{}",
+                    case["name"]
+                );
+                assert_eq!(decoded.message, case["body"]["message"], "{}", case["name"]);
+                assert_eq!(
+                    serde_json::to_value(&decoded).unwrap()["detail"],
+                    case["body"]["detail"],
+                    "{}",
+                    case["name"]
+                );
+                let action = match case["op"].as_str() {
+                    Some(op) => {
+                        let op = Op::from_method(&format!("agent_data.{op}")).unwrap();
+                        assert!(may_refuse(op, &decoded.code));
+                        if let Some(detail) = decoded.digest_mismatch_detail().unwrap() {
+                            assert_eq!(
+                                detail.reason.as_deref(),
+                                case["body"]["detail"]["reason"].as_str()
+                            );
+                        }
+                        driver_action_for(op, &decoded.code)
+                    }
+                    None => decoded.code.driver_action(),
+                };
+                let expected = match case["driver"].as_str().unwrap() {
+                    "abort" => DriverAction::Abort,
+                    "retry_within_step" => DriverAction::RetryWithinStep,
+                    "retry_later" => DriverAction::RetryLater,
+                    "retry_after_operator" => DriverAction::RetryAfterOperator,
+                    "retry" => DriverAction::Retry,
+                    "terminal_for_step" => DriverAction::TerminalForStep,
+                    other => panic!("unknown driver-action vector {other}"),
+                };
+                assert_eq!(action, expected, "{}", case["name"]);
+                assert_eq!(action.retryable(), case["retryable"], "{}", case["name"]);
+                assert_eq!(decoded.code.is_known(), case["named"], "{}", case["name"]);
+            }
+        }
     }
 }

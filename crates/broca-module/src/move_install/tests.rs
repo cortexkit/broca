@@ -3,7 +3,10 @@ use broca_core::{ExportIndex, WalStore};
 use broca_protocol::{RunFinishReason, RunId, Usage};
 use broca_wal::{RunConfig, RunOrigin, WalRecord};
 fn root(tag: &str) -> std::path::PathBuf {
-    broca_test_support::scratch_root().join(format!("move-install-{}-{tag}", std::process::id()))
+    let root = broca_test_support::scratch_root()
+        .join(format!("move-install-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    root
 }
 pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
     WalRecord::RunStarted {
@@ -68,7 +71,7 @@ pub(crate) fn episode(wal: &mut dyn broca_wal::Wal, session: &BindIdentity, id: 
 fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     let root = root("preflight");
     let wal_root = root.join("wal");
-    broca_wal::migration::durable_dir(&wal_root).unwrap();
+    broca_wal::migration::durable_dir(&root, &wal_root).unwrap();
     let a = BindIdentity::new("/p", "runner", "a");
     let b = BindIdentity::new("/p", "runner", "b");
     let staged_a = root.join("a.stage");
@@ -104,7 +107,7 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     ];
     let export = broca_store::SqliteStore::open_in_memory().unwrap();
     let drops = std::sync::atomic::AtomicUsize::new(0);
-    let result = install_verified("cut", &specs, &export, |_| {
+    let result = install_verified(&root, "cut", &specs, &export, |_| {
         drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     });
@@ -120,7 +123,7 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
 }
 
 #[test]
-fn billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable() {
+fn imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recovery() {
     let root = root("floor");
     let wal = broca_core::FileWalStore::new(root.join("wal"));
     let session = BindIdentity::new("/p", "runner", "a");
@@ -138,9 +141,10 @@ fn billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable
     let incoming = std::fs::read(incoming_path).unwrap();
     let digest = broca_wal::migration::digest(&incoming);
     let staged = broca_wal::migration::staging_path(wal.root(), "cut", "a").unwrap();
-    broca_wal::migration::stage(&staged, &incoming, &digest).unwrap();
+    broca_wal::migration::stage(&root, &staged, &incoming, &digest).unwrap();
     let live = wal.wal_path(&session);
     broca_wal::migration::atomic_json(
+        &root,
         &live.with_extension("moved"),
         &broca_wal::migration::Moved {
             cut_id: "old".into(),
@@ -158,13 +162,15 @@ fn billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable
         digest: &digest,
     }];
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    let result = install_verified("cut", &specs, &export, |_| Err("crash after rename".into()));
+    let result = install_verified(&root, "cut", &specs, &export, |_| {
+        Err("crash after rename".into())
+    });
     assert_eq!(result.unwrap_err().code.as_str(), "unavailable");
     assert_eq!(std::fs::read(&live).unwrap(), incoming);
     assert!(!staged.exists());
     drop(export);
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    install_verified("cut", &specs, &export, |_| Ok(())).unwrap();
+    install_verified(&root, "cut", &specs, &export, |_| Ok(())).unwrap();
     assert!(!live.with_extension("moved").exists());
     let records = broca_wal::replay_file(&live, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
     let resolver = |_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1);
@@ -272,4 +278,182 @@ fn rekey_without_a_run_for_the_new_triple_is_refused_without_cross_module_lookup
     assert_eq!(error.code.as_str(), "invalid_request");
     assert!(error.message.contains(&reference));
     assert!(!root.join("wal-staging").exists());
+}
+
+#[test]
+fn mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_run() {
+    let root = root("mixed-billing");
+    broca_wal::migration::durable_dir(&root, &root).unwrap();
+    let historical = BindIdentity::new("/p", "runner", "s");
+    let current = BindIdentity::new("/p", "broca", "s");
+    let incoming_path = root.join("incoming.wal");
+    {
+        let mut writer = broca_wal::FileWal::open(&incoming_path).unwrap();
+        episode(&mut writer, &historical, "old");
+        episode(&mut writer, &current, "new");
+    }
+    let records =
+        broca_wal::replay_file(&incoming_path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
+    let resolver = |_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1);
+    let source = broca_store::SqliteStore::open(root.join("source.db")).unwrap();
+    for id in ["old", "new"] {
+        source
+            .emit_run(&records, &RunId(id.into()), &resolver)
+            .unwrap();
+    }
+    assert_eq!(
+        source.high_water(),
+        2,
+        "both historical episodes produce real spend facts"
+    );
+    let bytes = std::fs::read(incoming_path).unwrap();
+    let digest = broca_wal::migration::digest(&bytes);
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    let staged = broca_wal::migration::staging_path(
+        wal.root(),
+        "mixed-cut",
+        &broca_core::session_addr(&current),
+    )
+    .unwrap();
+    broca_wal::migration::stage(&root, &staged, &bytes, &digest).unwrap();
+    let live = wal.wal_path(&current);
+    let receiver_path = root.join("receiver.db");
+    let receiver = broca_store::SqliteStore::open(&receiver_path).unwrap();
+    install_verified(
+        &root,
+        "mixed-cut",
+        &[Installation {
+            session: &current,
+            staged: &staged,
+            live: &live,
+            local_archive: None,
+            end_offset: bytes.len() as u64,
+            digest: &digest,
+        }],
+        &receiver,
+        |_| Ok(()),
+    )
+    .unwrap();
+    drop(receiver);
+    let receiver = broca_store::SqliteStore::open(receiver_path).unwrap();
+    let installed = broca_wal::replay_file(&live, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
+    for id in ["old", "new"] {
+        receiver
+            .emit_run(&installed, &RunId(id.into()), &resolver)
+            .unwrap();
+        assert_eq!(
+            receiver.high_water(),
+            0,
+            "foreign run {id} escaped its historical session's billing floor"
+        );
+    }
+    episode(
+        wal.open(&current).unwrap().as_mut(),
+        &current,
+        "fresh-receiver",
+    );
+    let installed = broca_wal::replay_file(&live, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
+    receiver
+        .emit_run(&installed, &RunId("fresh-receiver".into()), &resolver)
+        .unwrap();
+    assert_eq!(
+        receiver.high_water(),
+        1,
+        "a fresh receiver run must still bill"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn already_renamed_activation_repays_the_staging_source_barrier() {
+    use broca_wal::migration::{
+        self,
+        io_trace::{self, Event},
+    };
+    use std::{cell::Cell, rc::Rc};
+    let root = root("activation-source-barrier");
+    let session = BindIdentity::new("/p", "runner", "incoming");
+    let incoming = root.join("incoming.wal");
+    {
+        let mut writer = broca_wal::FileWal::open(&incoming).unwrap();
+        episode(&mut writer, &session, "foreign");
+    }
+    let bytes = std::fs::read(&incoming).unwrap();
+    let staged = root.join("wal-staging/cut/incoming.wal");
+    let live = root.join("wal/incoming.wal");
+    let digest = migration::digest(&bytes);
+    migration::stage(&root, &staged, &bytes, &digest).unwrap();
+    let specs = [Installation {
+        session: &session,
+        staged: &staged,
+        live: &live,
+        local_archive: None,
+        end_offset: bytes.len() as u64,
+        digest: &digest,
+    }];
+    let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+    let source = staged.parent().unwrap().to_owned();
+    let drops = Cell::new(0);
+    {
+        let target = source.clone();
+        let _trace = io_trace::install(move |event| {
+            if event == Event::BeforeDirectorySync(target.clone()) {
+                return Err(std::io::Error::other(
+                    "injected rename source-directory barrier",
+                ));
+            }
+            Ok(())
+        });
+        assert!(install_verified(&root, "cut", &specs, &export, |_| {
+            drops.set(drops.get() + 1);
+            Ok(())
+        })
+        .is_err());
+    }
+    assert!(!staged.exists());
+    assert_eq!(std::fs::read(&live).unwrap(), bytes);
+    assert_eq!(drops.get(), 0);
+    {
+        let target = source.clone();
+        let _trace = io_trace::install(move |event| {
+            if event == Event::BeforeDirectorySync(target.clone()) {
+                return Err(std::io::Error::other(
+                    "injected recovery source-directory barrier",
+                ));
+            }
+            Ok(())
+        });
+        let error = install_verified(&root, "cut", &specs, &export, |_| {
+            drops.set(drops.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("injected recovery source-directory barrier"));
+    }
+    assert_eq!(
+        drops.get(),
+        0,
+        "projection cleanup must follow the source-directory barrier"
+    );
+    let synced = Rc::new(Cell::new(false));
+    let observed = synced.clone();
+    let _trace = io_trace::install(move |event| {
+        if event == Event::DirectorySync(source.clone()) {
+            observed.set(true);
+        }
+        Ok(())
+    });
+    install_verified(&root, "cut", &specs, &export, |_| {
+        assert!(
+            synced.get(),
+            "recovery must finish staging removal before projection cleanup"
+        );
+        drops.set(drops.get() + 1);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(std::fs::read(&live).unwrap(), bytes);
 }

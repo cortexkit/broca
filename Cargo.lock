@@ -276,6 +276,7 @@ dependencies = [
  "chrono",
  "clap",
  "cortexkit-log",
+ "cortexkit-role-agent-data",
  "cortexkit-role-harness",
  "cortexkit-role-llm-runner",
  "cortexkit-role-llm-runner-conformance",
@@ -617,9 +618,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-agent-data"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f17fa4a4f8512840e3f08eb24bbc38784b859ddb343984f1d4dba3d9c6730d4c"
+checksum = "82fc70e9b76c31dd139951f0d670721239cfe6171023fc85d1298f4940276562"
 dependencies = [
  "serde",
  "serde_json",

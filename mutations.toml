@@ -8598,8 +8598,8 @@ select = "expected"
 test_file = "crates/broca-subc/tests/it/session_door.rs"
 expect_red = ["session_door::admit_chunks_at_the_broca_cap_and_resumes_from_cover"]
 file = "crates/broca-subc/src/session_door.rs"
-old = 'pub const MAX_ADMIT_BYTES: usize = 3_145_697;'
-new = 'pub const MAX_ADMIT_BYTES: usize = 3 * 1024 * 1024; // NON-VACUITY BREAK'
+old = 'pub const MAX_CALL_BYTES: usize = 1_048_576;'
+new = 'pub const MAX_CALL_BYTES: usize = 3 * 1024 * 1024; // NON-VACUITY BREAK'
 
 [[control]]
 id = "subc-door-internal-service"
@@ -8816,8 +8816,8 @@ target = "--lib"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::freeze_is_exclusive_and_abort_never_removes_another_cuts_owner"]
 file = "crates/broca-wal/src/migration.rs"
-old = 'options.write(true).create_new(true);'
-new = 'options.write(true).create(true); // NON-VACUITY BREAK: overwrite the freeze owner'
+old = 'fs::hard_link(temp, destination)'
+new = 'fs::rename(temp, destination) /* NON-VACUITY BREAK: replace a late freeze owner */'
 
 [[control]]
 id = "move-abort-owner"
@@ -9091,16 +9091,16 @@ old = 'check_installations(installations)?;'
 new = '// NON-VACUITY BREAK: install before validating every ref'
 
 [[control]]
-id = "move-floor-before-publish"
-guards = "foreign runs are excluded from billing before publishing or recovering the WAL"
+id = "move-imported-floor-local-billing"
+guards = "imported-run exclusions survive installation and recovery while pre-existing local runs remain billable"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/move_install/tests.rs"
-expect_red = ["move_install::tests::billing_floor_precedes_publish_and_install_recovery_keeps_local_runs_billable"]
+expect_red = ["move_install::tests::imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recovery"]
 file = "crates/broca-module/src/move_install.rs"
-old = '.record_imported_runs(item.session, cut_id, &imported)'
-new = '.record_imported_runs(item.session, cut_id, &[]) /* NON-VACUITY BREAK: omit imported ids */'
+old = '.record_imported_runs(session, cut_id, &imported)'
+new = '.record_imported_runs(session, cut_id, &[]) /* NON-VACUITY BREAK: omit imported ids */'
 
 [[control]]
 id = "move-receiver-digest"
@@ -12468,6 +12468,894 @@ old = "if !tokens.insert(token.clone()) {"
 new = "if false && !tokens.insert(token.clone()) { // NON-VACUITY BREAK: accept cursor cycles"
 
 [[control]]
+id = "agent-data-discovery-capability"
+guards = "the registered manifest advertises agent-data/v1 for discovery"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["describe_is_internal_and_declares_the_agent_owned_store"]
+only = false
+file = "crates/broca-module-serve/src/manifest.rs"
+old = '            broca_wire::agent_data::PROVIDES.to_string(),'
+new = '            // NON-VACUITY BREAK: omit agent-data discovery'
+
+[[control]]
+id = "agent-data-service-role"
+guards = "the manifest declares the bulk non-agent-facing agent-data internal service"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["describe_is_internal_and_declares_the_agent_owned_store"]
+only = false
+file = "crates/broca-module-serve/src/manifest.rs"
+old = 'service_id: broca_wire::agent_data::SERVICE_ID.to_string(),'
+new = 'service_id: "not-agent-data".to_string(), // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-internal-surface-only"
+guards = "agent-data operations cannot be reached on the management surface"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["describe_is_internal_and_declares_the_agent_owned_store"]
+only = false
+file = "crates/broca-module-serve/src/serve.rs"
+old = '''if bind.agent_data {
+                let caller'''
+new = '''if true { // NON-VACUITY BREAK: dispatch management requests as agent-data
+                let caller'''
+
+[[control]]
+id = "agent-data-daemon-principal"
+guards = "admission uses the daemon-stamped bind principal rather than the bind triple or request"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["stamped_principal_admission_precedes_json_and_every_store_read"]
+only = false
+file = "crates/broca-module-serve/src/serve.rs"
+old = '.map(|p| p.as_owner_string())'
+new = '.map(|_| broca_wire::agent_data::ADMITTED_CALLER.to_string()) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-admission-before-json"
+guards = "a forbidden caller learns neither request validation nor participant state"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["stamped_principal_admission_precedes_json_and_every_store_read"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'if !contract::caller_admitted(caller) {'
+new = 'if false && !contract::caller_admitted(caller) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-bind-never-opens-a-session"
+guards = "an internal-service bind with a scope never reads the client-supplied session"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["stamped_principal_admission_precedes_json_and_every_store_read"]
+only = false
+file = "crates/broca-module-serve/src/serve.rs"
+old = '!completed.bind.agent_data'
+new = 'true /* NON-VACUITY BREAK: authorize an internal bind through session history */'
+
+[[control]]
+id = "agent-data-rpc-fields-closed"
+guards = "agent-data rejects unknown outer RPC fields after authenticating the caller"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["contract_request_vectors_pass_through_internal_serve"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '#[serde(deny_unknown_fields)]'
+new = '// NON-VACUITY BREAK: allow unknown outer RPC fields'
+
+[[control]]
+id = "agent-data-import-sealed-digest-required"
+guards = "a receiver stages nothing when the door supplies no sealed digest"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_requires_the_doors_sealed_digest"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'if page.digest.is_empty() {'
+new = 'if false && page.digest.is_empty() { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-import-sealed-sha"
+guards = "all received bytes must hash to the door's authenticated sealed digest"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_verifies_the_doors_sealed_digest"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'if broca_wal::migration::digest(&bytes) != page.digest {'
+new = 'if false && broca_wal::migration::digest(&bytes) != page.digest { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-seal-stable-across-pages"
+guards = "one cut cannot change sealed length or digest between read pages"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_refuses_sealed_metadata_that_changes_between_pages"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'if metadata.as_ref().is_some_and(|previous| previous != &seal) {'
+new = 'if false && metadata.as_ref().is_some_and(|previous| previous != &seal) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-cut-size-bound"
+guards = "the receiver rejects a sealed cut above its local WAL byte limit before staging"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_refuses_a_cut_larger_than_the_local_wal_limit"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'if page.stream_end > self.wal.max_read_bytes() {'
+new = 'if false && page.stream_end > self.wal.max_read_bytes() { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-feature-refusal"
+guards = "an unknown WAL reader feature is incompatible_version rather than a retryable outage"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_checks_all_frame_features_before_staging"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''"incompatible_version",
+                    "WAL cut requires unknown reader features",'''
+new = '''"unavailable", // NON-VACUITY BREAK
+                    "WAL cut requires unknown reader features",'''
+
+[[control]]
+id = "agent-data-frame-version-refusal"
+guards = "an unknown WAL frame version is incompatible_version before visible staging"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_refuses_an_unknown_wal_frame_version_before_staging"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''"incompatible_version",
+                    "WAL cut requires an unknown frame version",'''
+new = '''"unavailable", // NON-VACUITY BREAK
+                    "WAL cut requires an unknown frame version",'''
+
+[[control]]
+id = "agent-data-door-not-ready"
+guards = "an unpublished or unknown door cut is cut_not_ready on import"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_maps_door_refusals_without_staging"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Some("not_found") => "cut_not_ready",'
+new = 'Some("not_found") => "unavailable", // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-door-verification-failure"
+guards = "a door manifest verification failure is digest_mismatch on import"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_maps_door_refusals_without_staging"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Some("verify_failed") => "digest_mismatch",'
+new = 'Some("verify_failed") => "unavailable", // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-expired-retention-ref"
+guards = "a deleted retained lineage remains not_exportable rather than an unknown movable ref"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["expired_retention_ledger_ref_is_not_exportable_even_without_wal_bytes"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''if op == Op::Prepare
+                && session.is_some_and(|s| retained.contains(s))'''
+new = '''if false && op == Op::Prepare // NON-VACUITY BREAK
+                && session.is_some_and(|s| retained.contains(s))'''
+
+[[control]]
+id = "agent-data-retention-marker"
+guards = "caller-retained WAL bytes never become an exportable prepared cut"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["retention_marker_never_reaches_the_door"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if retained_move_copy(self.wal.as_ref(), &plan.session)? {'
+new = 'if false && retained_move_copy(self.wal.as_ref(), &plan.session)? { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-archived-member-plan"
+guards = "an archived source exports verified member bytes without restoring or exporting its container"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["archived_source_exports_only_verified_member_bytes_without_restoring_live_wal"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '                local_archive,'
+new = '                local_archive: local_archive.filter(|_| false), // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-abort-unheld-ref"
+guards = "abort omits unheld refs without a fabricated BindIdentity or unknown_ref refusal"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["busy_without_cut_id_and_unknown_abort_follow_the_contract"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''if op == Op::Abort {
+                    continue;
+                }'''
+new = '''if false && op == Op::Abort { // NON-VACUITY BREAK
+                    continue;
+                }'''
+
+[[control]]
+id = "agent-data-busy-without-cut-id"
+guards = "busy is a read of refs and does not require a cutId"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/move_files/tests.rs"
+expect_red = ["move_files::tests::busy_without_cut_id_reads_held_refs_and_refuses_first_unknown"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if let Request::Busy(request) = request {'
+new = '''if let Request::Busy(request) = request {
+            if request.refs.iter().next().is_some() { return Err(unavailable("NON-VACUITY BREAK: require cutId for busy")); }'''
+
+[[control]]
+id = "agent-data-abort-unresolved-subset"
+guards = "abort locks only resolved sessions while durably acknowledging unknown refs"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/move_files/tests.rs"
+expect_red = ["move_files::tests::abort_unseen_cut_with_unknown_refs_is_durable_and_replayed"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '(!matches!(op, Op::Abort | Op::Diverged) && wanted.len() != plans.len())'
+new = '(wanted.len() != plans.len()) /* NON-VACUITY BREAK: demand invented plans for unknown refs */'
+
+[[control]]
+id = "agent-data-question-debt-busy"
+guards = "a closed actor with an owed question withdrawal is not idle or exportable"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["closed_session_with_question_withdrawal_debt_is_busy_before_prepare"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if !broca_core::deferred_call_obligations(lineage, records).is_empty() {'
+new = 'if false && !broca_core::deferred_call_obligations(lineage, records).is_empty() { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-queued-send-busy"
+guards = "a queued send survives actor closure and prevents prepare"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["closed_session_with_a_queued_send_is_busy_before_prepare"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if !broca_core::pending_submissions(&raw).is_empty() {'
+new = 'if false && !broca_core::pending_submissions(&raw).is_empty() { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-unfinished-run-busy"
+guards = "an unfinished or paused run remains busy even without an open actor"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["busy_without_cut_id_and_unknown_abort_follow_the_contract"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if records.iter().any(|f| match &f.record {'
+new = 'if false && records.iter().any(|f| match &f.record { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-prepare-moved-code"
+guards = "prepare on a tombstoned source is terminal unknown_ref with canonical ref detail"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["prepare_tombstone_is_terminal_unknown_ref"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'Op::Prepare => RefusalCode::UnknownRef,'
+new = 'Op::Prepare => RefusalCode::Unavailable, // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-export-moved-code"
+guards = "export on a tombstoned source is terminal unknown_ref rather than a retry loop"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["export_tombstone_is_terminal_unknown_ref"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'Op::Export => RefusalCode::UnknownRef,'
+new = 'Op::Export => RefusalCode::Unavailable, // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-release-moved-code"
+guards = "release cannot retry or replace a tombstone owned by another cut"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["release_tombstone_is_terminal_unknown_ref"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'Op::Release => RefusalCode::UnknownRef,'
+new = 'Op::Release => RefusalCode::Unavailable, // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-export-foreign-owner-code"
+guards = "contradictory export ownership is terminal invalid_state, not retryable busy"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["export_foreign_owner_is_terminal_invalid_state"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '''if matches!(op, Op::Export | Op::Release) {
+        // A prepared or exported cut'''
+new = '''if op == Op::Release { // NON-VACUITY BREAK: export falls back to busy
+        // A prepared or exported cut'''
+
+[[control]]
+id = "agent-data-release-foreign-owner-code"
+guards = "contradictory release ownership is terminal invalid_state and leaves the owner's freeze intact"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["release_foreign_owner_is_terminal_invalid_state"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '''if matches!(op, Op::Export | Op::Release) {
+        // A prepared or exported cut'''
+new = '''if op == Op::Export { // NON-VACUITY BREAK: release falls back to busy
+        // A prepared or exported cut'''
+
+[[control]]
+id = "agent-data-source-lease-refusal"
+guards = "temporary source lease contention uses an allowed retryable unavailable refusal"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/move_files/tests.rs"
+expect_red = ["move_files::tests::source_export_and_release_lease_contention_use_retryable_unavailable"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '''if matches!(op, Op::Export | Op::Release) {
+                    return Err(unavailable(format!('''
+new = '''if false && matches!(op, Op::Export | Op::Release) { // NON-VACUITY BREAK
+                    return Err(unavailable(format!('''
+
+[[control]]
+id = "agent-data-retained-divergence"
+guards = "a retained receiver copy stops the move as advanced before staging"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_marks_a_retained_local_copy_advanced"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Ok(true) => "advanced",'
+new = 'Ok(true) => "at_cut", // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-retained-import-fork"
+guards = "retention appearing after at_cut is local_advanced on import, preserving the deletion promise"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_reports_local_advanced_when_retention_appears_after_at_cut"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '''"local_advanced",
+                        "retained copy with a deletion deadline cannot be replaced by a cut",'''
+new = '''if op == Op::Import { "invalid_state" } else { "local_advanced" }, // NON-VACUITY BREAK
+                        "retained copy with a deletion deadline cannot be replaced by a cut",'''
+
+[[control]]
+id = "agent-data-retained-activation-fork"
+guards = "retention appearing after import is local_advanced on activate without publishing the staged WAL"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["activate_reports_local_advanced_when_retention_appears_after_import"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '''"local_advanced",
+                        "retained copy with a deletion deadline cannot be replaced by a cut",'''
+new = '''if op == Op::Activate { "invalid_state" } else { "local_advanced" }, // NON-VACUITY BREAK
+                        "retained copy with a deletion deadline cannot be replaced by a cut",'''
+
+# Retired control: agent-data-activation-missing-identity.
+# This control required corrupt staging with no readable bind identity to be
+# refused as a digest mismatch rather than an outage. Each move now records its
+# session addresses before writing private incoming WALs. Activation uses those
+# addresses, not identities decoded from the incoming files; a cut-state file
+# missing the address map is refused before activation. The separate control
+# agent-data-activation-digest-never-outage checks that damaged incoming bytes
+# still produce digest_mismatch, not unavailable.
+
+[[control]]
+id = "agent-data-activation-digest-reason"
+guards = "activation digest refusals identify staging corruption using the shared detail constant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["activation_corruption_is_a_staging_digest_fork_and_abort_discards_it"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'DigestMismatchDetail::new(digest_mismatch_reason::STAGING_DIGEST_MISMATCH)'
+new = 'DigestMismatchDetail::new(digest_mismatch_reason::UNDO_DIGEST_MISMATCH) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-activation-busy-detail"
+guards = "a frozen receiver's busy refusal names its refs with typed moving reasons"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["activation_busy_freeze_has_typed_refs_and_preserves_staging"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if error.code.as_str() == "busy" {'
+new = 'if false && error.code.as_str() == "busy" { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-diverged-unheld-at-cut"
+guards = "a ref with no local copy is at_cut without a fabricated session plan"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_unheld_ref_is_at_cut_even_when_import_will_refuse_its_seal"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = '|| DivergedEntry::new(DivergedState::AtCut),'
+new = '|| DivergedEntry::new(DivergedState::Unknown), // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-diverged-unheld-no-door"
+guards = "diverged does not read a cut for an unheld ref, even with a pending import"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''let Some(session) = session else {
+                    continue;
+                };'''
+new = '''let Some(session) = session else {
+                    let _ = self.incoming(&reference.r#ref, cut_id).await; // NON-VACUITY BREAK
+                    continue;
+                };'''
+
+[[control]]
+id = "agent-data-diverged-held-verification"
+guards = "failed verification of a held ref's cut is unknown, never an unverified at_cut answer"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_held_ref_with_a_bad_cut_is_unknown_and_logs_the_cause"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Ok(false) if p.sealed_digest.is_none() => "unknown",'
+new = 'Ok(false) if false && p.sealed_digest.is_none() => "unknown", // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-diverged-verification-log"
+guards = "unknown cut verification answers log the cause, cut and ref at ERROR without content"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_held_ref_with_a_bad_cut_is_unknown_and_logs_the_cause"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'tracing::error!(session_ref = %reference.r#ref, cut_id, cause,'
+new = 'tracing::warn!(session_ref = %reference.r#ref, cut_id, cause, /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-replay-before-resolution"
+guards = "a completed state-changing request replays without needing its door or old sessions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["move_and_move_back_replays_and_rejoins_only_a_prefix"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = '''if state.intent.is_none() {
+            if let Some(reply) = Self::admission'''
+new = '''if false && state.intent.is_none() { // NON-VACUITY BREAK
+            if let Some(reply) = Self::admission'''
+
+[[control]]
+id = "agent-data-step-before-intent"
+guards = "an out-of-order request leaves cut authority byte-identical before any intent or artifact"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["contract_step_vectors_pass_through_internal_serve"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'contract::step::advance(op, state.step).map_err(|e| {'
+new = 'contract::step::advance(Op::Status, state.step).map_err(|e| { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-abort-pending-local-plan"
+guards = "abort of a pending import resolves only local staging and never needs a working door"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["pending_import_abort_uses_only_owned_staging_and_never_the_door"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'if rolling_back {'
+new = 'if false && rolling_back { // NON-VACUITY BREAK: plan the pending import instead of abort'
+
+[[control]]
+id = "agent-data-abort-never-completes-import"
+guards = "a rollback cannot publish a success reply for the partial import it is aborting"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["pending_import_abort_uses_only_owned_staging_and_never_the_door"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'if !rolling_back {'
+new = 'if true { // NON-VACUITY BREAK: reconcile the import before aborting it'
+
+[[control]]
+id = "agent-data-abort-damaged-staging"
+guards = "abort discards cut-private staging even when damaged bytes reveal no session identity"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["activation_corruption_is_a_staging_digest_fork_and_abort_discards_it"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'match std::fs::read_dir(directory) {'
+new = 'match std::fs::read_dir(directory.join("missing")) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-boot-keeps-status-available"
+guards = "a pending cut with an unavailable door does not prevent read-only status after boot"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["boot_keeps_an_unreadable_cut_pending_and_status_read_only"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = '''"cut boot reconciliation remains pending"
+                        );
+                        continue;'''
+new = '''"cut boot reconciliation remains pending"
+                        );
+                        return Err(error); // NON-VACUITY BREAK'''
+
+[[control]]
+id = "agent-data-activation-uses-durable-import"
+guards = "activation uses verified durable import metadata and staging rather than refetching the door"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["two_ref_activation_uses_each_imported_items_metadata_without_the_door"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '} else if op == Op::Activate {'
+new = '} else if false && op == Op::Activate { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-activation-ref-metadata"
+guards = "every activation ref uses its own imported length and digest, including reordered retries"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["two_ref_activation_uses_each_imported_items_metadata_without_the_door"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '.find(|item| item.session_ref == reference)'
+new = '.find(|item| item.session_ref == reference || true) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-divergence-prefix"
+guards = "a held copy that is not a byte prefix of the cut is advanced rather than at_cut"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["move_and_move_back_replays_and_rejoins_only_a_prefix"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Ok(local) if p.bytes.starts_with(local.as_deref().unwrap_or_default()) => "at_cut",'
+new = 'Ok(local) if p.bytes.starts_with(local.as_deref().unwrap_or_default()) || true => "at_cut", // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-address-reader-normal-fence"
+guards = "adding the participant address lookup never weakens the ordinary moved-session reader fence"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["ordinary_address_reader_keeps_the_moved_fence"]
+only = false
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'if !for_move {'
+new = 'if false && !for_move { // NON-VACUITY BREAK: expose a moved copy to ordinary readers'
+
+[[control]]
+id = "agent-data-address-reader-move-back"
+guards = "the privileged participant lookup can inspect the hidden old copy for a move back"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["move_and_move_back_replays_and_rejoins_only_a_prefix"]
+only = false
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'self.read_address_records_inner(address, true)'
+new = 'self.read_address_records_inner(address, false) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-address-reader-only-participant"
+guards = "no source outside the agent-data participant may call the moved-reader bypass"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data_source"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data_source.rs"
+expect_red = ["only_agent_data_can_call_the_move_address_reader"]
+only = false
+file = "crates/broca-module-serve/src/lib.rs"
+old = 'pub mod agent_data;'
+new = '''pub mod agent_data;
+pub fn non_vacuity_move_reader(wal: &broca_core::FileWalStore) { let _ = wal.read_address_records_for_move("0123456789abcdef"); } // NON-VACUITY BREAK'''
+
+[[control]]
+id = "agent-data-incoming-ref-binding"
+guards = "an incoming WAL cannot be installed under a requested ref whose RunStarted triple does not match"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["import_address_is_proved_by_the_wals_run_started_triple"]
+only = false
+[[control.edits]]
+file = "crates/broca-module/src/move_install.rs"
+old = ') == reference'
+new = ') == reference || true /* NON-VACUITY BREAK: select any triple */'
+[[control.edits]]
+file = "crates/broca-module/src/move_files.rs"
+old = ') != plan.reference'
+new = ') != plan.reference && false /* NON-VACUITY BREAK: bypass the second ref binding check */'
+
+[[control]]
+id = "agent-data-required-daemon-lane"
+guards = "BROCA_REQUIRE_SUBC makes missing real-daemon rigs fail instead of silently passing a skip"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/agent_data/real_daemon.rs"
+expect_red = ["real_daemon::required_daemon_lane_refuses_to_skip_missing_binaries"]
+only = false
+file = "crates/broca-module-serve/tests/agent_data/real_daemon.rs"
+old = 'std::env::var_os("BROCA_REQUIRE_SUBC").is_none()'
+new = 'true /* NON-VACUITY BREAK: allow a required lane to skip */'
+
+[[control]]
+id = "agent-data-projection-keeps-facts"
+guards = "dropping a moved session projection never deletes machine-local billing facts"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
+new = '''tx.execute("DELETE FROM export_facts", []).map_err(|e| e.to_string())?; // NON-VACUITY BREAK
+        tx.execute("DELETE FROM message WHERE session=?1", [&key])'''
+
+[[control]]
+id = "agent-data-projection-keeps-billing-floor"
+guards = "projection deletion preserves imported-run exclusions so foreign runs are never billed again"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
+new = '''tx.execute("DELETE FROM export_imported_runs", []).map_err(|e| e.to_string())?; // NON-VACUITY BREAK
+        tx.execute("DELETE FROM message WHERE session=?1", [&key])'''
+
+[[control]]
+id = "agent-data-projection-drop-atomic"
+guards = "a metadata-delete failure rolls the message deletion back in the same transaction"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_failure_rolls_back_messages_and_meta"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = '''tx.execute("DELETE FROM meta WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())'''
+new = '''tx.commit().map_err(|e| e.to_string())?; // NON-VACUITY BREAK: publish half the drop
+        conn.execute("DELETE FROM meta WHERE session=?1", [&key])
+            .map(|_| ()).map_err(|e| e.to_string())'''
+
+[[control]]
+id = "agent-data-projection-message-scope"
+guards = "dropping one projection leaves every other session's message rows byte-identical"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_changes_only_the_named_session"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
+new = 'tx.execute("DELETE FROM message WHERE ?1 IS NOT NULL", [&key]) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-projection-meta-scope"
+guards = "dropping one projection leaves every other session's metadata and WAL watermark intact"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_changes_only_the_named_session"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = 'tx.execute("DELETE FROM meta WHERE session=?1", [&key])'
+new = 'tx.execute("DELETE FROM meta WHERE ?1 IS NOT NULL", [&key]) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-projection-clears-messages"
+guards = "activation discards stale derived messages so they rebuild from the installed WAL"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
+new = 'tx.execute("DELETE FROM message WHERE session=?1 AND 0=1", [&key]) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "agent-data-projection-clears-meta"
+guards = "activation discards the old projection watermark and checkpoint with its messages"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/export_index.rs"
+expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
+only = false
+file = "crates/broca-store/src/lib.rs"
+old = 'tx.execute("DELETE FROM meta WHERE session=?1", [&key])'
+new = 'tx.execute("DELETE FROM meta WHERE session=?1 AND 0=1", [&key]) /* NON-VACUITY BREAK */'
+[[control]]
 id = "test-event-waits-reject-short-real-time-polls"
 guards = "new short wall-clock polling loops in workspace tests must be classified or use the shared diagnostic hang guard"
 runner = "cargo"
@@ -12486,6 +13374,452 @@ new = '''    pub async fn wait_idle(&mut self) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let wal_path = self.wal_path.clone();'''
+
+[[control]]
+id = "agent-data-historical-run-billing-identity"
+guards = "each imported run's floor uses its RunStarted identity, including historical re-keyed triples"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/move_install/tests.rs"
+expect_red = ["move_install::tests::mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_run"]
+only = false
+file = "crates/broca-module/src/move_install.rs"
+old = '.record_imported_runs(session, cut_id, &imported)'
+new = '.record_imported_runs(item.session, cut_id, &imported) /* NON-VACUITY BREAK: file foreign history under the installation identity */'
+
+[[control]]
+id = "agent-data-freeze-retry-barriers"
+platforms = ["linux", "macos"]
+guards = "a same-owner freeze retry re-syncs both the file and WAL directory before success"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::same_owner_freeze_retry_reestablishes_both_barriers"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = '''sync_file(&file)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+    Ok(Some(Ok(owner)))'''
+new = '''// NON-VACUITY BREAK: readable cached JSON is not a durability barrier
+    Ok(Some(Ok(owner)))'''
+
+[[control]]
+id = "agent-data-freeze-sync-before-publish"
+platforms = ["linux", "macos"]
+guards = "a freeze is not visible before its complete temp inode is synced"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::freeze_publishes_only_a_complete_synced_sidecar"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = '''sync_file(&file)?;
+        // A same-directory hard link'''
+new = '''// NON-VACUITY BREAK: publish an unsynced inode
+        // A same-directory hard link'''
+
+[[control]]
+id = "agent-data-freeze-no-replacing-fallback"
+guards = "unsupported hard links fail closed instead of publishing via replacing rename"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::unsupported_freeze_publication_fails_closed_without_a_rename_fallback"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = 'result.map_err(|error: io::Error| {'
+new = '''result.or_else(|error: io::Error| { // NON-VACUITY BREAK: unsupported publication falls back to rename
+        if error.kind() == io::ErrorKind::Unsupported { fs::rename(temp, destination) } else { Err(error) }
+    }).map_err(|error: io::Error| {'''
+
+[[control]]
+id = "agent-data-unlink-missing-barrier"
+platforms = ["linux", "macos"]
+guards = "a missing moving or moved marker still owes its directory barrier on retry"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::unlink_retry_syncs_directory_after_a_failed_removal_barrier"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = 'Err(e) if e.kind() == io::ErrorKind::NotFound => {}'
+new = 'Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-abort-missing-freeze-barrier"
+platforms = ["linux", "macos"]
+guards = "abort of an already absent owned freeze completes the outstanding WAL-directory barrier"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::abort_retry_syncs_directory_when_its_freeze_is_already_absent"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = '''} else {
+        unlink(&wal.with_extension("moving"))?;
+    }
+    Ok(())'''
+new = '''} else {
+        // NON-VACUITY BREAK: absent does not mean durable removal
+    }
+    Ok(())'''
+
+[[control]]
+id = "agent-data-release-missing-freeze-barrier"
+platforms = ["linux", "macos"]
+guards = "release retries finish the freeze removal barrier even after its marker vanished"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::release_retry_syncs_directory_when_its_freeze_is_already_absent"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = '''unlink(&wal.with_extension("moving"))?;
+            return Ok(Ok(()));'''
+new = '''if wal.with_extension("moving").exists() { unlink(&wal.with_extension("moving"))?; } // NON-VACUITY BREAK
+            return Ok(Ok(()));'''
+
+[[control]]
+id = "agent-data-missing-staging-parent-barrier"
+platforms = ["linux", "macos"]
+guards = "cleanup of an absent staging hierarchy syncs its nearest existing ancestor"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::absent_staging_parents_still_sync_the_nearest_existing_directory"]
+only = false
+file = "crates/broca-wal/src/migration.rs"
+old = 'Some(ancestor) => parent = ancestor,'
+new = 'Some(_) => return Ok(()), // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-refused-first-op-clears-refs"
+guards = "a rolled-back refused first prepare/import cannot capture stale refs for a later first request"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["refused_first_prepare_does_not_capture_refs_for_the_next_request"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'state.refs = None;'
+new = '// NON-VACUITY BREAK: retain the refused first request as a hidden ref-set latch'
+
+[[control]]
+id = "agent-data-address-reader-function-item"
+guards = "the move-read bypass identifier cannot escape via function items or aliases outside the participant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data_source"
+test_file = "crates/broca-module-serve/tests/agent_data_source.rs"
+expect_red = ["only_agent_data_can_call_the_move_address_reader"]
+only = false
+file = "crates/broca-module-serve/src/lib.rs"
+old = 'pub mod agent_data;'
+new = '''pub mod agent_data;
+pub fn non_vacuity_move_item(wal: &broca_core::FileWalStore) { let reader = broca_core::FileWalStore::read_address_records_for_move; let _ = reader(wal, "0123456789abcdef"); } // NON-VACUITY BREAK'''
+
+[[control]]
+id = "agent-data-cut-records-session-addresses"
+guards = "intent durably records every resolved session address before cut artifacts can change"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["healthy_cut_abort_uses_recorded_addresses_beside_an_unreadable_wal"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'state.sessions = artifacts.resolved_sessions(cut_id)?;'
+new = 'state.sessions = BTreeMap::new(); // NON-VACUITY BREAK: lose durable address authority'
+
+[[control]]
+id = "agent-data-existing-cut-no-global-scan"
+guards = "recovery of a recorded cut never inspects unrelated local WALs"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["healthy_cut_abort_uses_recorded_addresses_beside_an_unreadable_wal"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''SessionInventory {
+                sessions: state.expect("bound cut exists").sessions,
+                unreadable: Vec::new(),
+            }'''
+new = 'self.local_sessions()? /* NON-VACUITY BREAK: scan unrelated WALs during recovery */'
+
+[[control]]
+id = "agent-data-unreadable-is-not-absence"
+guards = "an unresolved ref with unreadable inventory cannot be treated as absent or at_cut"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["unresolved_ref_with_unreadable_inventory_is_unknown_not_absent"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '(bound || !unreadable.is_empty())'
+new = 'bound /* NON-VACUITY BREAK: assume no readable match means absence */'
+
+[[control]]
+id = "agent-data-divergence-unreadable-ref-only"
+guards = "an unreadable held ref is unknown without blocking readable refs in the same probe"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["divergence_is_per_ref_when_one_held_wal_is_unreadable"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'if locked.unknown_refs.contains(&reference.r#ref) {'
+new = 'if false && locked.unknown_refs.contains(&reference.r#ref) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-required-cut-address-map"
+guards = "map-less cut authority is refused by name before any ref resolution or action"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["cut_without_required_addresses_is_named_unreadable_before_lookup"]
+only = false
+file = "crates/broca-module/src/cut_state.rs"
+old = 'pub sessions: BTreeMap<String, broca_protocol::BindIdentity>,'
+new = '''#[serde(default)] // NON-VACUITY BREAK: accept unrecoverable old authority
+    pub sessions: BTreeMap<String, broca_protocol::BindIdentity>,'''
+
+[[control]]
+id = "agent-data-partial-address-inventory"
+guards = "participant discovery isolates unreadable inventory locations while ordinary inventory remains strict"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed"]
+only = false
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'self.address_inventory(true)'
+new = 'self.address_inventory(false) /* NON-VACUITY BREAK: one bad location blocks all discovery */'
+
+[[control]]
+id = "agent-data-discovery-skips-unreadable-wals"
+guards = "an unreadable WAL is logged and isolated instead of failing every requested ref"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["divergence_is_per_ref_when_one_held_wal_is_unreadable"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''inventory.unreadable.push(address);
+                    continue;'''
+new = '''inventory.unreadable.push(address);
+                    return Err(unavailable("NON-VACUITY BREAK: fail the whole scan"));'''
+
+[[control]]
+id = "agent-data-activation-digest-never-outage"
+guards = "changed verified activation bytes remain a digest_mismatch fork, never retryable unavailable"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["activation_corruption_is_a_staging_digest_fork_and_abort_discards_it"]
+only = false
+file = "crates/broca-module/src/move_files.rs"
+old = 'staging_digest_failure(cut_id, step, session)'
+new = '{ let _ = (cut_id, step, session); unavailable("NON-VACUITY BREAK: hide activation corruption as a transient outage") }'
+
+[[control]]
+id = "agent-data-diverged-known-address-no-door"
+guards = "a pending import's recorded address without local WAL bytes is absent and needs no door read for divergence"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'Ok(None) => continue,'
+new = 'Ok(None) => { let _ = self.incoming(&reference.r#ref, cut_id).await; continue; }, // NON-VACUITY BREAK: read a cut despite absent local WAL bytes'
+
+[[control]]
+id = "subc-door-read-raw-byte-cap"
+guards = "oversize session-door reads are refused before routing and the exact 1 MiB raw-byte boundary is accepted"
+runner = "cargo"
+package = "broca-subc"
+target = "--test it"
+test_file = "crates/broca-subc/tests/it/session_door.rs"
+expect_red = ["session_door::read_limits_use_the_raw_byte_cap_before_opening_the_door"]
+file = "crates/broca-subc/src/session_door.rs"
+old = 'if limit == 0 || limit > MAX_CALL_BYTES {'
+new = 'if limit == 0 { // NON-VACUITY BREAK: route over-cap reads'
+
+[[control]]
+id = "subc-door-record-too-large-terminal"
+guards = "record_too_large is a client bug and never retried by cover, admit or read"
+runner = "cargo"
+package = "broca-subc"
+target = "--test it"
+test_file = "crates/broca-subc/tests/it/session_door.rs"
+expect_red = ["session_door::record_too_large_is_never_retried_for_any_door_method"]
+file = "crates/broca-subc/src/session_door.rs"
+old = 'if error.code == "lease_unavailable" || error.code == "lease_acquiring" =>'
+new = 'if error.code == "lease_unavailable" || error.code == "lease_acquiring" || error.code == "record_too_large" => // NON-VACUITY BREAK: retry a client bug'
+
+[[control]]
+id = "agent-data-existing-directory-ancestor-barriers"
+platforms = ["linux", "macos"]
+guards = "an existing directory retry repays every publication barrier through the explicit state root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::existing_directory_retry_pays_every_parent_barrier_within_state_root"]
+file = "crates/broca-wal/src/migration.rs"
+old = 'let mut target = std::path::absolute(path)?;'
+new = '''if path.is_dir() { return Ok(()); } // NON-VACUITY BREAK: trust a cached directory
+    let mut target = std::path::absolute(path)?;'''
+
+[[control]]
+id = "agent-data-directory-state-root-boundary"
+guards = "directory establishment refuses targets outside its explicit pre-existing state root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::directory_establishment_requires_an_existing_root_and_rejects_escape"]
+file = "crates/broca-wal/src/migration.rs"
+old = '''let relative = target.strip_prefix(&root).map_err(|_| {
+        invalid(format!(
+            "move directory {} is outside state root {}",
+            path.display(),
+            state_root.display()
+        ))
+    })?;'''
+new = '''let relative = match target.strip_prefix(&root) {
+        Ok(relative) => relative,
+        Err(_) => return Ok(()), // NON-VACUITY BREAK: acknowledge an outside target
+    };'''
+
+[[control]]
+id = "agent-data-directory-root-precondition"
+guards = "directory helpers never create a missing state root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::directory_establishment_requires_an_existing_root_and_rejects_escape"]
+file = "crates/broca-wal/src/migration.rs"
+old = 'let root = state_root.canonicalize().map_err(|error| {'
+new = '''fs::create_dir_all(state_root)?; // NON-VACUITY BREAK: silently establish the root
+    let root = state_root.canonicalize().map_err(|error| {'''
+
+[[control]]
+id = "agent-data-import-recovery-staging-barrier"
+guards = "verified staging is directory-synced before import recovery publishes its reply and imported state"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/move_files/tests.rs"
+expect_red = ["move_files::tests::import_reconciliation_syncs_staging_before_recording_imported"]
+file = "crates/broca-module/src/move_files.rs"
+old = 'migration::durable_dir(&self.state_root, staged.parent().unwrap())'
+new = 'Ok::<(), std::io::Error>(()) /* NON-VACUITY BREAK: trust unsynced staging publication */'
+
+[[control]]
+id = "agent-data-activation-recovery-source-barrier"
+guards = "already-renamed activation recovery syncs the staging source directory before completion"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/move_install/tests.rs"
+expect_red = ["move_install::tests::already_renamed_activation_repays_the_staging_source_barrier"]
+file = "crates/broca-module/src/move_install.rs"
+old = 'broca_wal::migration::sync_dir(staging_parent).map_err(unavailable)?;'
+new = 'let _ = staging_parent; // NON-VACUITY BREAK: acknowledge an unsynced rename source removal'
+
+[[control]]
+id = "agent-data-file-sync-helper-call"
+guards = "the file sync helper invokes sync_all rather than returning success without a syscall"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::successful_sync_events_require_the_actual_sync_call_to_succeed"]
+file = "crates/broca-wal/src/migration.rs"
+old = '''    file.sync_all()
+}'''
+new = '''    let _ = file; Ok(()) // NON-VACUITY BREAK: omit only the helper's sync_all invocation
+}'''
+
+[[control]]
+id = "agent-data-real-sync-syscall"
+guards = "sync observations cannot replace the actual filesystem sync syscall"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::successful_sync_events_require_the_actual_sync_call_to_succeed"]
+file = "crates/broca-wal/src/migration/io_trace.rs"
+old = 'self.inner.sync_all()?;'
+new = 'let _ = self.inner; // NON-VACUITY BREAK: keep the observer but remove the real syscall'
+
+[[control]]
+id = "agent-data-sync-trace-after-success"
+guards = "failed filesystem syncs never emit successful FileSync or DirectorySync events"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::successful_sync_events_require_the_actual_sync_call_to_succeed"]
+file = "crates/broca-wal/src/migration/io_trace.rs"
+old = '''        self.inner.sync_all()?;
+        observe(self.event.clone())'''
+new = '''        observe(self.event.clone())?; // NON-VACUITY BREAK: claim success before the syscall
+        self.inner.sync_all()'''
+
+[[control]]
+id = "agent-data-directory-resolved-parent-spelling"
+platforms = ["linux", "macos"]
+guards = "a configured state-root spelling with parent components is accepted when its resolved target stays inside the root"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/migration/tests.rs"
+expect_red = ["migration::tests::directory_establishment_accepts_resolved_parent_spelling"]
+file = "crates/broca-wal/src/migration.rs"
+old = 'let mut target = std::path::absolute(path)?;'
+new = '''let mut target = std::path::absolute(path)?;
+    if target.components().any(|part| part == std::path::Component::ParentDir) {
+        return Err(invalid("NON-VACUITY BREAK: blanket parent-component refusal"));
+    }'''
 
 [[control]]
 id = "optional-tool-stale-is-absent"

@@ -15,11 +15,9 @@ use tokio::{
 
 use crate::connection::{RouteHandle, RouteOpenRetry, SubcConnection};
 
-/// The door's 3 MiB record cap includes a 17-byte record header and a 14-byte stream label
-/// (`reserved:broca`), leaving 3,145,697 bytes for WAL content before hex encoding.
-pub const MAX_ADMIT_BYTES: usize = 3_145_697;
-/// Read pages must fit the same payload cap as admitted records.
-pub const MAX_READ_BYTES: usize = MAX_ADMIT_BYTES;
+/// The door caps admits and reads at 1 MiB raw bytes: hex encoding in JSON doubles
+/// the payload, which must fit the daemon's 4 MiB frame including its envelope.
+pub const MAX_CALL_BYTES: usize = 1_048_576;
 const FIRST_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -137,7 +135,7 @@ impl SessionDoorClient {
         let mut offset = checked_offset(coverage.durable_offset, wal.len())?;
         let mut mismatch_backoff = FIRST_BACKOFF;
         while offset < wal.len() {
-            let end = offset.saturating_add(MAX_ADMIT_BYTES).min(wal.len());
+            let end = offset.saturating_add(MAX_CALL_BYTES).min(wal.len());
             let answer = self
                 .call(
                     "session.admit",
@@ -193,8 +191,10 @@ impl SessionDoorClient {
         cut_id: &str,
         deadline: Instant,
     ) -> Result<DoorRead, SessionDoorError> {
-        if limit == 0 || limit > MAX_READ_BYTES {
-            return Err(unavailable("session.read limit must be in 1..=3145697"));
+        if limit == 0 || limit > MAX_CALL_BYTES {
+            return Err(unavailable(format!(
+                "session.read limit must be in 1..={MAX_CALL_BYTES}"
+            )));
         }
         let answer = self.call("session.read", json!({
             "sessionRef": session_ref, "fromOffset": from_offset, "limit": limit, "cutId": cut_id,
@@ -249,6 +249,8 @@ impl SessionDoorClient {
         let mut delay = FIRST_BACKOFF;
         loop {
             let answer = self.exchange(body.clone(), deadline).await?;
+            // Oversize calls are a client bug, not a transient lease failure.
+            // In particular, record_too_large must never be retried.
             match &answer {
                 Err(error)
                     if error.code == "lease_unavailable" || error.code == "lease_acquiring" =>

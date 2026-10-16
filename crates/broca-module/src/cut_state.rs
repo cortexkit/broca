@@ -44,6 +44,7 @@ pub struct Reply {
 pub struct CutState {
     pub step: Step,
     pub refs: Option<Refs>,
+    pub sessions: BTreeMap<String, broca_protocol::BindIdentity>,
     pub intent: Option<Intent>,
     #[serde(default)]
     pub replies: BTreeMap<String, Reply>,
@@ -53,6 +54,7 @@ impl Default for CutState {
         Self {
             step: Step::None,
             refs: None,
+            sessions: BTreeMap::new(),
             intent: None,
             replies: BTreeMap::new(),
         }
@@ -85,6 +87,12 @@ impl<T: Send> CutGuard for T {}
 /// checking every session named by the batch, not just its first artifact.
 #[async_trait::async_trait]
 pub trait CutArtifacts: Send + Sync {
+    fn resolved_sessions(
+        &self,
+        _cut_id: &str,
+    ) -> Result<BTreeMap<String, broca_protocol::BindIdentity>, ErrorBody> {
+        Ok(BTreeMap::new())
+    }
     async fn lock_refs(
         &self,
         cut_id: &str,
@@ -121,12 +129,14 @@ impl CutStore {
             .join(format!("{cut_id}.json"))
     }
     fn load(&self, cut_id: &str) -> Result<CutState, ErrorBody> {
-        broca_wal::migration::read_json(&self.path(cut_id))
+        let path = self.path(cut_id);
+        broca_wal::migration::read_json(&path)
             .map(|s| s.unwrap_or_default())
-            .map_err(unavailable)
+            .map_err(|error| unavailable(format!("cannot read cut {}: {error}", path.display())))
     }
     fn save(&self, cut_id: &str, state: &CutState) -> Result<(), ErrorBody> {
-        broca_wal::migration::atomic_json(&self.path(cut_id), state).map_err(unavailable)
+        broca_wal::migration::atomic_json(&self.root, &self.path(cut_id), state)
+            .map_err(unavailable)
     }
     async fn lock(
         &self,
@@ -214,6 +224,44 @@ impl CutStore {
         }
         Ok(())
     }
+    fn admission(state: &CutState, request: &Request) -> Result<Option<Value>, ErrorBody> {
+        let op = request.op();
+        let method = op.method();
+        if matches!(op, Op::Busy | Op::Diverged | Op::Describe | Op::Status) {
+            return Ok(None);
+        }
+        if let Some(first) = state.replies.get(method) {
+            let original = Request::decode(method, &first.request)?;
+            return match contract::idempotency::compare(&original, request) {
+                Repeat::Replay => Ok(Some(first.value.clone())),
+                changed => Err(refusal(
+                    changed.refusal().expect("changed request refusal").as_str(),
+                    "cut operation request changed",
+                    Value::Null,
+                )),
+            };
+        }
+        contract::step::advance(op, state.step).map_err(|e| {
+            refusal(
+                e.code().as_str(),
+                "cut step refused",
+                json!({"step":state.step,"refs":state.refs}),
+            )
+        })?;
+        let requested_refs = request.refs();
+        if let Some(refs) = &requested_refs {
+            contract::step::check_ref_set(op, state.step, state.refs.as_ref(), refs).map_err(
+                |detail| {
+                    refusal(
+                        contract::errors::RefusalCode::InvalidState.as_str(),
+                        "cut ref set changed",
+                        serde_json::to_value(detail).expect("ref-set refusal detail"),
+                    )
+                },
+            )?;
+        }
+        Ok(None)
+    }
     /// The internal-service handler passes the caller identity authenticated by
     /// the daemon, not a request field. Reject every identity but reserved:entorhinal
     /// before reading cut JSON, so forbidden callers cannot probe move state.
@@ -279,6 +327,27 @@ impl CutStore {
                 .await?;
             return status_value(&state);
         }
+        if op == Op::Diverged {
+            // A divergence probe is read-only. In particular, an absent local
+            // copy must not fetch the cut merely to inspect a pending import.
+            Self::reconcile_locked(self, cut_id, &mut state, artifacts, true).await?;
+            let refs = request.refs().expect("diverged carries refs");
+            let _sessions = artifacts.lock_refs(cut_id, refs, Op::Diverged).await?;
+            return artifacts.apply(&request, &state).await;
+        }
+        // A completed reply and step refusal do not depend on Engram's
+        // session-door service or on session availability. A lost-reply retry
+        // must not fetch bytes already covered by its durable completion.
+        if state.intent.is_none() {
+            if let Some(reply) = Self::admission(&state, &request)? {
+                return Ok(reply);
+            }
+        }
+        let rolling_back = op == Op::Abort
+            && state
+                .intent
+                .as_ref()
+                .is_some_and(|intent| matches!(intent.op.as_str(), "prepare" | "import"));
         let refs = state.refs.as_ref().or(requested_refs.as_ref());
         let _sessions = match refs {
             Some(refs) => Some(
@@ -286,19 +355,25 @@ impl CutStore {
                     .lock_refs(
                         cut_id,
                         refs,
-                        state
-                            .intent
-                            .as_ref()
-                            .map(intent_request)
-                            .transpose()?
-                            .map_or(op, |r| r.op()),
+                        if rolling_back {
+                            Op::Abort
+                        } else {
+                            state
+                                .intent
+                                .as_ref()
+                                .map(intent_request)
+                                .transpose()?
+                                .map_or(op, |r| r.op())
+                        },
                     )
                     .await?,
             ),
             None => None,
         };
-        self.reconcile_locked(cut_id, &mut state, artifacts, op == Op::Status)
-            .await?;
+        if !rolling_back {
+            self.reconcile_locked(cut_id, &mut state, artifacts, op == Op::Status)
+                .await?;
+        }
         if matches!(op, Op::Busy | Op::Diverged | Op::Describe) {
             return artifacts.apply(&request, &state).await;
         }
@@ -326,40 +401,15 @@ impl CutStore {
                 ));
             }
         }
-        if let Some(first) = state.replies.get(method) {
-            let original = Request::decode(method, &first.request)?;
-            return match contract::idempotency::compare(&original, &request) {
-                Repeat::Replay => Ok(first.value.clone()),
-                changed => Err(refusal(
-                    changed.refusal().expect("changed request refusal").as_str(),
-                    "cut operation request changed",
-                    Value::Null,
-                )),
-            };
-        }
-        contract::step::advance(op, state.step).map_err(|e| {
-            refusal(
-                e.code().as_str(),
-                "cut step refused",
-                json!({"step":state.step,"refs":state.refs}),
-            )
-        })?;
-        if let Some(refs) = &requested_refs {
-            contract::step::check_ref_set(op, state.step, state.refs.as_ref(), refs).map_err(
-                |detail| {
-                    refusal(
-                        contract::errors::RefusalCode::InvalidState.as_str(),
-                        "cut ref set changed",
-                        serde_json::to_value(detail).expect("ref-set refusal detail"),
-                    )
-                },
-            )?;
+        if let Some(reply) = Self::admission(&state, &request)? {
+            return Ok(reply);
         }
         // Check every refusal under the cut lock and all session critical
         // sections, before publishing an intent or changing a session's artifacts.
         artifacts.check(&request, &state).await?;
         if state.refs.is_none() {
             state.refs = requested_refs;
+            state.sessions = artifacts.resolved_sessions(cut_id)?;
         }
         state.intent = Some(Intent {
             op: method.rsplit('.').next().unwrap().to_owned(),
@@ -376,6 +426,11 @@ impl CutStore {
                     Op::Prepare | Op::Import => {
                         artifacts.rollback(&request, &state).await?;
                         state.intent = None;
+                        // A refused first prepare/import commits no session-ref
+                        // set for this cutId. Forget the failed request's refs
+                        // before admitting the next first request.
+                        state.refs = None;
+                        state.sessions.clear();
                         self.save(cut_id, &state)?;
                     }
                     Op::Export => {
@@ -412,21 +467,36 @@ impl CutStore {
             contract::refs::CutId::new(cut_id).map_err(unavailable)?;
             let _cut_lock = self.lock(cut_id).await?;
             let mut state = self.load(cut_id)?;
+            if state.intent.is_none() {
+                continue;
+            }
             let _sessions = match &state.refs {
-                Some(refs) => Some(
-                    artifacts
-                        .lock_refs(
+                Some(refs) => match artifacts
+                    .lock_refs(
+                        cut_id,
+                        refs,
+                        state
+                            .intent
+                            .as_ref()
+                            .map(intent_request)
+                            .transpose()?
+                            .map_or(Op::Status, |r| r.op()),
+                    )
+                    .await
+                {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        // Pending intents still fence their sessions. A missing
+                        // door or damaged staging must not prevent the service
+                        // from answering status or the driver's repeat.
+                        tracing::warn!(
                             cut_id,
-                            refs,
-                            state
-                                .intent
-                                .as_ref()
-                                .map(intent_request)
-                                .transpose()?
-                                .map_or(Op::Status, |r| r.op()),
-                        )
-                        .await?,
-                ),
+                            code = error.code.as_str(),
+                            "cut boot reconciliation remains pending"
+                        );
+                        continue;
+                    }
+                },
                 None => None,
             };
             self.reconcile_locked(cut_id, &mut state, artifacts, false)

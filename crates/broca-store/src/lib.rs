@@ -451,6 +451,21 @@ impl SqliteStore {
         })
     }
 
+    /// Discard one session's derived transcript and its last projected WAL sequence
+    /// atomically so an installed move is rebuilt from its new WAL. Billing facts and the durable
+    /// imported-run IDs that prevent billing another Mac's work again are
+    /// machine-local authority and are deliberately not deleted.
+    pub fn drop_session_projection(&self, session: &BindIdentity) -> Result<(), String> {
+        let key = Self::key(session);
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM message WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM meta WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Populate page-usage metadata for legacy rows that still have SQL `NULL`.
     ///
     /// This is deliberately an explicit operation rather than part of [`Self::open`]. A row is

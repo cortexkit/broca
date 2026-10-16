@@ -64,35 +64,104 @@ pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::Wa
 /// directory itself, and a failure must propagate.
 #[cfg(unix)]
 pub fn sync_dir(path: &Path) -> io::Result<()> {
-    fs::File::open(path)?.sync_all()
+    let directory = fs::File::open(path)?;
+    #[cfg(any(test, feature = "test-io-trace"))]
+    let directory =
+        io_trace::SyncFile::new(&directory, io_trace::Event::DirectorySync(path.to_owned()));
+    directory.sync_all()
 }
 
-/// NTFS needs no directory handle to make a rename or unlink durable, and `File::open` cannot
-/// open a directory there (it fails with "Access is denied"), so there is nothing to do. This is
-/// the same rule as the WAL fold's directory sync.
+/// Non-Unix builds currently perform no directory sync. `File::open` cannot open
+/// Windows directories this way; this helper makes no Windows directory-durability
+/// guarantee and emits no successful directory-sync observation there.
 #[cfg(not(unix))]
 pub fn sync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Every newly created parent is synced too: a synced file in an uncommitted
-/// directory would disappear together with the directory after a crash.
-pub fn durable_dir(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
-        return Ok(());
+fn sync_file(file: &fs::File) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-io-trace"))]
+    let file = io_trace::SyncFile::new(file, io_trace::Event::FileSync);
+    file.sync_all()
+}
+
+/// Establish a directory and repeat every publication barrier up to the supplied
+/// state root. Existing directories may be remnants of an interrupted creation;
+/// their existence does not prove that their parent entries were synced.
+/// The state root must already exist. No directory above it is created or synced.
+/// Directory barriers are implemented only on Unix; see `sync_dir`.
+pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
+    let root = state_root.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "move state root {} must already exist: {error}",
+                state_root.display()
+            ),
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(invalid(format!(
+            "move state root {} is not a directory",
+            state_root.display()
+        )));
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    durable_dir(parent)?;
-    match broca_owner_only::create_dir(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
+    let mut target = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    loop {
+        match target.canonicalize() {
+            Ok(existing) => {
+                target = existing;
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(
+                    target
+                        .components()
+                        .next_back()
+                        .ok_or_else(|| invalid("move directory has no existing ancestor"))?
+                        .as_os_str()
+                        .to_owned(),
+                );
+                if !target.pop() {
+                    return Err(invalid("move directory has no existing ancestor"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
-    sync_dir(path)?;
-    sync_dir(parent)
+    // Resolve existing symlinks before normalizing the missing suffix: a parent
+    // component is relative to that physical ancestor, not its original spelling.
+    for name in missing.into_iter().rev() {
+        if name == std::ffi::OsStr::new("..") {
+            target.pop();
+        } else {
+            target.push(name);
+        }
+    }
+    let relative = target.strip_prefix(&root).map_err(|_| {
+        invalid(format!(
+            "move directory {} is outside state root {}",
+            path.display(),
+            state_root.display()
+        ))
+    })?;
+    let mut directory = root.clone();
+    for part in relative.components() {
+        directory.push(part);
+        match broca_owner_only::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for directory in target.ancestors() {
+        sync_dir(directory)?;
+        if directory == root {
+            break;
+        }
+    }
+    Ok(())
 }
 
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -108,11 +177,11 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 
 /// The caller serializes writes to this destination. The cut-fence scan checks
 /// only completed `.json` files, never a temporary with a partially written intent.
-pub fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+pub fn atomic_json(state_root: &Path, path: &Path, value: &impl Serialize) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("cut path has no parent"))?;
-    durable_dir(parent)?;
+    durable_dir(state_root, parent)?;
     let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(value).map_err(invalid)?;
     let mut file = broca_owner_only::OpenOptions::new()
@@ -128,41 +197,134 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 pub fn unlink(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => sync_dir(path.parent().unwrap_or(Path::new("."))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // A prior removal may have reached cache but failed its directory barrier.
+    // If the parent itself is absent, make that absence durable at its nearest
+    // existing ancestor instead of treating missing staging directories as errors.
+    let mut parent = path.parent().unwrap_or(Path::new("."));
+    loop {
+        match sync_dir(parent) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    Some(ancestor) => parent = ancestor,
+                    None => return Err(error),
+                }
+            }
+            result => return result,
+        }
     }
 }
 
-pub fn freeze(wal: &Path, wanted: &Freeze) -> io::Result<Result<Freeze, MoveRefusal>> {
+fn existing_freeze(
+    path: &Path,
+    wanted: &Freeze,
+) -> io::Result<Option<Result<Freeze, MoveRefusal>>> {
+    let file = match broca_owner_only::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let owner: Freeze = serde_json::from_reader(&file).map_err(invalid)?;
+    if owner.cut_id != wanted.cut_id {
+        return Ok(Some(Err(MoveRefusal::Moving {
+            cut_id: owner.cut_id,
+        })));
+    }
+    // A prior process may have published the entry but died before its directory
+    // barrier. Complete both barriers even when the cached JSON is readable.
+    sync_file(&file)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+    Ok(Some(Ok(owner)))
+}
+
+struct FreezeTemp(PathBuf);
+impl Drop for FreezeTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+fn freeze_temp(path: &Path) -> io::Result<(fs::File, FreezeTemp)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("moving.{}.{id}.tmp", std::process::id()));
+        match broca_owner_only::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((file, FreezeTemp(temp))),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn publication_ready(_destination: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    io_trace::observe(io_trace::Event::BeforePublish(_destination.to_owned()))?;
+    Ok(())
+}
+
+fn exclusive_link(temp: &Path, destination: &Path) -> io::Result<()> {
+    let result = publication_ready(destination).and_then(|()| fs::hard_link(temp, destination));
+    result.map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot publish freeze {} with an exclusive hard link: {error}",
+                destination.display()
+            ),
+        )
+    })
+}
+
+pub fn freeze(
+    state_root: &Path,
+    wal: &Path,
+    wanted: &Freeze,
+) -> io::Result<Result<Freeze, MoveRefusal>> {
     if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {
         return Ok(Err(MoveRefusal::Moved {
             holder: moved.holder,
         }));
     }
     let path = wal.with_extension("moving");
-    durable_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    durable_dir(state_root, parent)?;
     let bytes = serde_json::to_vec(wanted).map_err(invalid)?;
-    let mut options = broca_owner_only::OpenOptions::new();
-    options.write(true).create_new(true);
-    match options.open(&path) {
-        Ok(mut file) => {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            sync_dir(path.parent().unwrap())?;
-            Ok(Ok(wanted.clone()))
+    loop {
+        if let Some(owner) = existing_freeze(&path, wanted)? {
+            return Ok(owner);
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let owner = read_json::<Freeze>(&path)?.ok_or_else(|| invalid("freeze disappeared"))?;
-            if owner.cut_id == wanted.cut_id {
-                Ok(Ok(owner))
-            } else {
-                Ok(Err(MoveRefusal::Moving {
-                    cut_id: owner.cut_id,
-                }))
+        let (mut file, temp) = freeze_temp(&path)?;
+        file.write_all(&bytes)?;
+        sync_file(&file)?;
+        // A same-directory hard link publishes the complete, synced inode and
+        // fails exclusively if another cut already owns the destination.
+        match exclusive_link(&temp.0, &path) {
+            Ok(()) => {
+                #[cfg(test)]
+                io_trace::observe(io_trace::Event::Published(path.clone()))?;
+                drop(file);
+                match fs::remove_file(&temp.0) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                sync_dir(parent)?;
+                return Ok(Ok(wanted.clone()));
             }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -171,11 +333,18 @@ pub fn abort_freeze(wal: &Path, cut_id: &str) -> io::Result<()> {
         if owner.cut_id == cut_id {
             unlink(&wal.with_extension("moving"))?;
         }
+    } else {
+        unlink(&wal.with_extension("moving"))?;
     }
     Ok(())
 }
 
-pub fn release(wal: &Path, cut_id: &str, holder: &str) -> io::Result<Result<(), MoveRefusal>> {
+pub fn release(
+    state_root: &Path,
+    wal: &Path,
+    cut_id: &str,
+    holder: &str,
+) -> io::Result<Result<(), MoveRefusal>> {
     let moved_path = wal.with_extension("moved");
     if let Some(moved) = read_json::<Moved>(&moved_path)? {
         if moved.cut_id == cut_id && moved.holder == holder {
@@ -185,8 +354,8 @@ pub fn release(wal: &Path, cut_id: &str, holder: &str) -> io::Result<Result<(), 
                         cut_id: owner.cut_id,
                     }));
                 }
-                unlink(&wal.with_extension("moving"))?;
             }
+            unlink(&wal.with_extension("moving"))?;
             return Ok(Ok(()));
         }
         return Ok(Err(MoveRefusal::Moved {
@@ -203,6 +372,7 @@ pub fn release(wal: &Path, cut_id: &str, holder: &str) -> io::Result<Result<(), 
     // Publish the tombstone first. A crash before unlink still refuses both reads
     // and writes; tombstone precedence prevents the old WAL being exposed.
     atomic_json(
+        state_root,
         &moved_path,
         &Moved {
             cut_id: cut_id.to_owned(),
@@ -318,13 +488,13 @@ pub fn staging_path(wal_root: &Path, cut_id: &str, address: &str) -> io::Result<
 }
 
 /// Verify before publishing staging; a mismatch leaves no file for activation.
-pub fn stage(path: &Path, bytes: &[u8], digest: &str) -> io::Result<()> {
+pub fn stage(state_root: &Path, path: &Path, bytes: &[u8], digest: &str) -> io::Result<()> {
     use sha2::{Digest, Sha256};
     if format!("{:x}", Sha256::digest(bytes)) != digest {
         return Err(invalid("digest_mismatch"));
     }
     let parent = path.parent().ok_or_else(|| invalid("staging path"))?;
-    durable_dir(parent)?;
+    durable_dir(state_root, parent)?;
     let temp = path.with_extension("wal.tmp");
     let mut file = broca_owner_only::OpenOptions::new()
         .write(true)
@@ -342,5 +512,10 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(all(feature = "test-io-trace", not(debug_assertions)))]
+compile_error!("test-io-trace is a test-only migration feature and must not ship");
+#[cfg(any(test, feature = "test-io-trace"))]
+#[doc(hidden)]
+pub mod io_trace;
 #[cfg(test)]
 mod tests;
