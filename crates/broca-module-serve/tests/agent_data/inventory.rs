@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -38,13 +39,14 @@ async fn cancelled_agent_data_request(connection_close: bool) {
         rig.index.clone(),
         door.clone(),
     ));
+    rig.seed(&rig.session("held"), "run", true);
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     wire.send(
         7,
         1,
         10,
         FrameType::Request,
-        json!({"method":"agent_data.import","params":rig.params(CUT, &[rig.session("incoming")])}),
+        json!({"method":"agent_data.diverged","params":rig.params(CUT, &[rig.session("held")])}),
     )
     .await;
     tokio::time::timeout(Duration::from_secs(5), door.entered.notified())
@@ -62,17 +64,226 @@ async fn cancelled_agent_data_request(connection_close: bool) {
     tokio::time::timeout(Duration::from_secs(5), door.dropped.notified())
         .await
         .expect("closed route must drop the in-flight agent-data handler");
-    assert_nothing_staged(&rig);
+    assert!(!rig.root.join("wal-staging").exists());
+    assert!(rig.wal.wal_path(&rig.session("held")).exists());
 }
 
 #[tokio::test]
-async fn route_goodbye_cancels_inflight_agent_data_handler() {
+async fn route_goodbye_cancels_inflight_read_only_agent_data_handler() {
     cancelled_agent_data_request(false).await;
 }
 
 #[tokio::test]
-async fn connection_eof_cancels_inflight_agent_data_handler() {
+async fn connection_eof_cancels_inflight_read_only_agent_data_handler() {
     cancelled_agent_data_request(true).await;
+}
+
+#[derive(Default)]
+struct ParkExportDoor {
+    covered: AtomicU64,
+    exporting: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    exported: tokio::sync::Notify,
+    exported_bytes: Mutex<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl SessionDoor for ParkExportDoor {
+    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+        self.covered.fetch_add(1, Ordering::SeqCst);
+        Ok(0)
+    }
+    async fn export(&self, _: &str, bytes: &[u8]) -> Result<(), SessionDoorError> {
+        self.exporting.notify_one();
+        self.resume.notified().await;
+        *self.exported_bytes.lock().unwrap() = bytes.to_vec();
+        self.exported.notify_one();
+        Ok(())
+    }
+    async fn read(&self, _: &str, _: u64, _: &str) -> Result<DoorRead, SessionDoorError> {
+        unreachable!()
+    }
+}
+
+async fn export_survives_closed_route(connection_close: bool) {
+    let door = Arc::new(ParkExportDoor::default());
+    let mut rig = Rig::new("inventory-export-goodbye", Arc::new(FakeDoor::default()));
+    rig.service = Arc::new(AgentDataService::new(
+        rig.root.clone(),
+        rig.registry.as_ref().clone(),
+        rig.wal.clone(),
+        rig.index.clone(),
+        door.clone(),
+    ));
+    let session = rig.session("held");
+    rig.seed(&session, "run", true);
+    let expected = rig.bytes(&session);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let params = rig.params(CUT, &[session]);
+    wire.call("prepare", params.clone()).await.unwrap();
+    assert_eq!(door.covered.load(Ordering::SeqCst), 1);
+    wire.send(
+        7,
+        1,
+        10,
+        FrameType::Request,
+        json!({"method":"agent_data.export","params":params}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), door.exporting.notified())
+        .await
+        .unwrap();
+    if connection_close {
+        use tokio::io::AsyncWriteExt;
+        wire.stream.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut wire.serving)
+            .await
+            .expect("connection teardown must not wait on the parked mutation")
+            .unwrap()
+            .unwrap();
+    } else {
+        let goodbye =
+            Frame::build_with_version(2, FrameType::Goodbye, flags(), 7, 1, 11, Vec::new())
+                .unwrap();
+        write_frame(&mut wire.stream, &goodbye).await.unwrap();
+        // A subsequent control response proves the server processed GOODBYE before
+        // the parked export is released, rather than merely writing it to a socket.
+        wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+            .await;
+        assert_eq!(wire.next().await.header.ty, FrameType::Response);
+    }
+    door.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), door.exported.notified())
+        .await
+        .expect("export must finish after its route closes");
+    assert_eq!(*door.exported_bytes.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn route_goodbye_does_not_drop_export_between_cover_and_export() {
+    export_survives_closed_route(false).await;
+}
+
+#[tokio::test]
+async fn connection_eof_does_not_drop_export_between_cover_and_export() {
+    export_survives_closed_route(true).await;
+}
+
+#[derive(Default)]
+struct ParkPrepareDoor {
+    covering: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+    calls: AtomicU64,
+    covers: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl SessionDoor for ParkPrepareDoor {
+    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.covering.notify_one();
+        self.resume.notified().await;
+        self.covers.fetch_add(1, Ordering::SeqCst);
+        self.completed.notify_one();
+        Ok(0)
+    }
+    async fn export(&self, _: &str, _: &[u8]) -> Result<(), SessionDoorError> {
+        unreachable!()
+    }
+    async fn read(&self, _: &str, _: u64, _: &str) -> Result<DoorRead, SessionDoorError> {
+        unreachable!()
+    }
+}
+
+async fn prepare_survives_closed_route(connection_close: bool) {
+    let door = Arc::new(ParkPrepareDoor::default());
+    let mut rig = Rig::new("inventory-prepare-close", Arc::new(FakeDoor::default()));
+    rig.service = Arc::new(AgentDataService::new(
+        rig.root.clone(),
+        rig.registry.as_ref().clone(),
+        rig.wal.clone(),
+        rig.index.clone(),
+        door.clone(),
+    ));
+    let session = rig.session("held");
+    rig.seed(&session, "run", true);
+    let path = rig.wal.wal_path(&session).with_extension("moving");
+    let end_offset = rig.bytes(&session).len() as u64;
+    let params = rig.params(CUT, &[session]);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    wire.send(
+        7,
+        1,
+        10,
+        FrameType::Request,
+        json!({"method":"agent_data.prepare","params":params}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), door.covering.notified())
+        .await
+        .expect("prepare must reach cover");
+    let frozen = std::fs::read(&path).expect("prepare must freeze the WAL before awaiting cover");
+    let freeze: broca_wal::migration::Freeze = serde_json::from_slice(&frozen).unwrap();
+    assert_eq!(freeze.cut_id, CUT);
+    assert_eq!(freeze.end_offset, end_offset);
+    assert_eq!(door.covers.load(Ordering::SeqCst), 0);
+    if connection_close {
+        use tokio::io::AsyncWriteExt;
+        wire.stream.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut wire.serving)
+            .await
+            .expect("connection teardown must not await parked prepare")
+            .unwrap()
+            .unwrap();
+    } else {
+        let goodbye =
+            Frame::build_with_version(2, FrameType::Goodbye, flags(), 7, 1, 11, Vec::new())
+                .unwrap();
+        write_frame(&mut wire.stream, &goodbye).await.unwrap();
+        // The health reply proves the server processed GOODBYE before we
+        // release the paused cover call, not merely that the frame was sent.
+        wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+            .await;
+        assert_eq!(wire.next().await.header.ty, FrameType::Response);
+    }
+    door.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), door.completed.notified())
+        .await
+        .expect("prepare must finish cover after its route closes");
+    assert_eq!(std::fs::read(&path).unwrap(), frozen);
+    let mut retry = Wire::new(&rig, entorhinal(), true).await;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        retry.call("prepare", params.clone()),
+    )
+    .await
+    .expect("lost-reply prepare must replay without another cover")
+    .unwrap();
+    let cut_path = rig.root.join("agent-data/cuts").join(format!("{CUT}.json"));
+    let completed = std::fs::read(&cut_path).unwrap();
+    let state: broca_module::cut_state::CutState = serde_json::from_slice(&completed).unwrap();
+    assert!(state.intent.is_none());
+    assert_eq!(state.replies["agent_data.prepare"].value, reply);
+    let replay = tokio::time::timeout(Duration::from_secs(5), retry.call("prepare", params))
+        .await
+        .expect("repeated prepare must remain idempotent")
+        .unwrap();
+    assert_eq!(replay, reply);
+    assert_eq!(std::fs::read(cut_path).unwrap(), completed);
+    assert_eq!(std::fs::read(path).unwrap(), frozen);
+    assert_eq!(door.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(door.covers.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn route_goodbye_does_not_drop_prepare_between_freeze_and_cover() {
+    prepare_survives_closed_route(false).await;
+}
+
+#[tokio::test]
+async fn connection_eof_does_not_drop_prepare_between_freeze_and_cover() {
+    prepare_survives_closed_route(true).await;
 }
 
 #[tokio::test]
@@ -106,6 +317,58 @@ async fn busy_one_ref_reads_only_its_wal_after_inventory_build() {
     assert_eq!(response.header.ty, FrameType::Response);
     let health: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(health["metrics"]["agent_data_ops"]["busy"], 1);
+    assert_eq!(
+        health["metrics"]["agent_data_inventory"],
+        json!({"ready":true,"unreadable":0})
+    );
+}
+
+#[tokio::test]
+async fn diverged_held_ref_reads_one_local_snapshot_live_or_archived() {
+    for archived in [false, true] {
+        let rig = Rig::new(
+            if archived {
+                "diverged-one-archive-read"
+            } else {
+                "diverged-one-live-read"
+            },
+            Arc::new(FakeDoor::default()),
+        );
+        let session = rig.session("held");
+        rig.seed(&session, "run", true);
+        let bytes = rig.bytes(&session);
+        let reference = contract::session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        rig.door.plant(CUT, &reference, bytes.clone());
+        if archived {
+            let directory = rig.root.join("wal-archive");
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut writer =
+                broca_wal::archive::ArchiveWriter::create(directory.join("fold-1.ark"))
+                    .unwrap()
+                    .without_feature_floor();
+            writer
+                .append(&broca_core::session_addr(&session), &bytes)
+                .unwrap();
+            writer.seal().unwrap();
+            std::fs::remove_file(rig.wal.wal_path(&session)).unwrap();
+        }
+        let mut wire = Wire::new(&rig, entorhinal(), true).await;
+        let before = rig.wal.move_read_count();
+        let reply = wire
+            .call("diverged", rig.params(CUT, &[session]))
+            .await
+            .unwrap();
+        assert_eq!(reply["refs"][0]["state"], "at_cut");
+        assert_eq!(
+            rig.wal.move_read_count() - before,
+            1,
+            "retention classification and reply must reuse the same local snapshot"
+        );
+    }
 }
 
 #[tokio::test]
@@ -133,6 +396,13 @@ async fn incomplete_inventory_is_unknown_until_boot_build_finishes() {
     let absent = rig.session("not-here");
     let mut wire = Wire::without_inventory(&rig, entorhinal(), true, Value::Null).await;
     let params = rig.params(CUT, &[absent]);
+    wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+        .await;
+    let health: Value = serde_json::from_slice(&wire.next().await.body).unwrap();
+    assert_eq!(
+        health["metrics"]["agent_data_inventory"],
+        json!({"ready":false,"unreadable":0})
+    );
     let reply = wire.call("diverged", params.clone()).await.unwrap();
     assert_eq!(reply["refs"][0]["state"], "unknown");
     assert_eq!(rig.wal.move_read_count(), 0);
@@ -143,7 +413,7 @@ async fn incomplete_inventory_is_unknown_until_boot_build_finishes() {
 }
 
 #[tokio::test]
-async fn durable_run_started_after_build_publishes_new_session() {
+async fn unsynced_run_started_after_build_publishes_new_session() {
     let rig = Rig::new("inventory-admission", Arc::new(FakeDoor::default()));
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     let session = rig.session("new-session");
@@ -153,12 +423,14 @@ async fn durable_run_started_after_build_publishes_new_session() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(rig
-        .wal
-        .move_session_refs(std::iter::once(reference.as_str()))
-        .sessions
-        .is_empty());
-    wal.sync().unwrap();
+    assert_eq!(
+        rig.wal
+            .move_session_refs(std::iter::once(reference.as_str()))
+            .sessions
+            .len(),
+        1
+    );
+    drop(wal);
     let reply = wire
         .call("busy", json!({"refs":rig.params(CUT, &[session])["refs"]}))
         .await

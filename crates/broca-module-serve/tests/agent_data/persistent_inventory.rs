@@ -70,6 +70,25 @@ async fn second_boot_reuses_unchanged_wals_without_payload_reads() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn cache_persists_raw_device_and_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let mut rig = Rig::new("persistent-raw-identity", Arc::new(FakeDoor::default()));
+    let session = rig.session("present");
+    rig.seed(&session, "run", true);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let metadata = std::fs::metadata(rig.wal.wal_path(&session)).unwrap();
+    let cache: Value =
+        serde_json::from_slice(&std::fs::read(rig.root.join("move-inventory.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        cache["addresses"][broca_core::session_addr(&session)]["source"]["stamp"]["file_id"],
+        json!([metadata.dev(), metadata.ino()])
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn grown_wal_scans_only_from_its_cached_committed_end() {
     let mut rig = Rig::new("persistent-inventory-growth", Arc::new(FakeDoor::default()));
     let current = rig.session("current");
@@ -96,6 +115,60 @@ async fn grown_wal_scans_only_from_its_cached_committed_end() {
     );
     assert_eq!(cached_refs(&rig, &current), 1);
     assert_eq!(cached_refs(&rig, &historical), 0);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn appending_writer_during_cold_build_finishes_complete() {
+    let mut rig = Rig::new("persistent-growing-build", Arc::new(FakeDoor::default()));
+    for i in 0..64 {
+        rig.seed(&rig.session(&format!("small-{i}")), "run", true);
+    }
+    let session = rig.session("active");
+    rig.seed(&session, "active-run", false);
+    let record = WalRecord::RunFinished {
+        reason: broca_protocol::RunFinishReason::Completed,
+        ts_ms: None,
+        usage: Default::default(),
+        error: None,
+        retries_used: 0,
+    };
+    let mut wal = rig.wal.open(&session).unwrap();
+    for _ in 0..20_000 {
+        wal.append(1, &record, false).unwrap();
+    }
+    wal.sync().unwrap();
+    drop(wal);
+    restart(&mut rig);
+    let mut wal = rig.wal.open(&session).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        wal.append(1, &record, false).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut appends = 1;
+        while !writer_stop.load(Ordering::Relaxed) {
+            wal.append(1, &record, false).unwrap();
+            appends += 1;
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        appends
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rig.service.wait_inventory(),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let appends = writer.join().unwrap();
+    result.expect("cold inventory must finish while the writer keeps appending");
+    assert!(appends > 1);
+    assert_eq!(rig.wal.move_inventory_health(), (true, 0));
+    assert_eq!(cached_refs(&rig, &session), 1);
 }
 
 #[tokio::test]
@@ -207,6 +280,13 @@ async fn cached_wal_that_becomes_unreadable_cannot_prove_absence() {
             .unwrap()["refs"][0]["state"],
         "unknown"
     );
+    wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+        .await;
+    let health: Value = serde_json::from_slice(&wire.next().await.body).unwrap();
+    assert_eq!(
+        health["metrics"]["agent_data_inventory"],
+        json!({"ready":true,"unreadable":1})
+    );
 }
 
 #[tokio::test]
@@ -233,6 +313,87 @@ fn rewrite_cache(path: &std::path::Path, mut cache: Value) {
     let addresses = serde_json::to_vec(&cache["addresses"]).unwrap();
     cache["checksum"] = json!(broca_wal::migration::digest(&addresses));
     std::fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn reader_feature_changes_invalidate_only_dependent_entries() {
+    let mut rig = Rig::new("persistent-reader-features", Arc::new(FakeDoor::default()));
+    let a = rig.session("a");
+    let b = rig.session("b");
+    rig.seed(&a, "a-run", true);
+    rig.seed(&b, "b-run", true);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let path = rig.root.join("move-inventory.json");
+    let mut cache: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cache["reader_features"] = json!(["future-reader/v99"]);
+    rewrite_cache(&path, cache);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(
+        rig.wal.move_inventory_build_stats().payload_reads,
+        0,
+        "capability-table changes alone must not cause a cold boot"
+    );
+    let mut cache: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entry = &mut cache["addresses"][broca_core::session_addr(&a)];
+    entry["used_features"] = json!(["future-frame/v99"]);
+    entry["triples"] = json!([]);
+    rewrite_cache(&path, cache);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(rig.wal.move_inventory_build_stats().payload_reads, 1);
+    assert_eq!(rig.wal.move_inventory_build_stats().reused, 1);
+    assert_eq!(cached_refs(&rig, &a), 1);
+    assert_eq!(cached_refs(&rig, &b), 1);
+}
+
+#[tokio::test]
+async fn cache_records_explicit_frame_requirements_not_just_record_features() {
+    let mut rig = Rig::new("persistent-used-features", Arc::new(FakeDoor::default()));
+    let session = rig.session("gated");
+    let record = started(&session, "run");
+    let frame =
+        broca_wal::framing::encode_with_requires(1, 1, &["compaction/v1"], &record).unwrap();
+    let mut wal = rig.wal.open(&session).unwrap();
+    wal.append_preencoded(1, &record, true, frame).unwrap();
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let path = rig.root.join("move-inventory.json");
+    let cache: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        cache["addresses"][broca_core::session_addr(&session)]["used_features"],
+        json!(["compaction/v1"])
+    );
+    wal.append(1, &record, true).unwrap();
+    drop(wal);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    let cache: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        cache["addresses"][broca_core::session_addr(&session)]["used_features"],
+        json!(["compaction/v1"]),
+        "suffix reads must retain the prefix's declared requirements"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn legacy_wal_without_lineage_reuses_unchanged_identity() {
+    let mut rig = Rig::new("persistent-legacy", Arc::new(FakeDoor::default()));
+    let session = rig.session("legacy");
+    std::fs::create_dir_all(rig.root.join("wal")).unwrap();
+    let bytes = broca_wal::framing::encode(1, 1, &started(&session, "legacy-run")).unwrap();
+    std::fs::write(rig.wal.wal_path(&session), bytes).unwrap();
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(rig.wal.move_inventory_build_stats().payload_reads, 1);
+    assert_eq!(cached_refs(&rig, &session), 1);
+    restart(&mut rig);
+    rig.service.wait_inventory().await;
+    assert_eq!(rig.wal.move_inventory_build_stats().payload_reads, 0);
+    assert_eq!(rig.wal.move_inventory_build_stats().reused, 1);
+    assert_eq!(cached_refs(&rig, &session), 1);
 }
 
 #[tokio::test]

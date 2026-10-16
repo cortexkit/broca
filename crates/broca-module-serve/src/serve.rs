@@ -1122,17 +1122,32 @@ where
                     .entry(channel)
                     .or_insert_with(|| conn_cancel.child_token())
                     .clone();
+                let read_only = crate::agent_data::request_is_read_only(&frame.body);
+                let reply_cancel = cancel.clone();
                 request_tasks.spawn(async move {
                     tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => Ok(()),
+                        _ = cancel.cancelled(), if read_only => Ok(()),
                         result = async move {
+                    let operation = async move {
                     let _permit = slots
                         .acquire_owned()
                         .await
                         .map_err(|e| ServeIoError(e.to_string()))?;
-                    let result =
-                        crate::agent_data::dispatch(service.as_deref(), &caller, &frame.body).await;
+                    Ok::<_, ServeIoError>(crate::agent_data::dispatch(service.as_deref(), &caller, &frame.body).await)
+                    };
+                    let result = if read_only {
+                        operation.await?
+                    } else {
+                        // The connection's JoinSet aborts its waiters on EOF.
+                        // A separate task owns mutations but no egress sender,
+                        // so EOF drops only this waiter and cannot tear a move.
+                        tokio::spawn(operation).await.map_err(|e| ServeIoError(e.to_string()))??
+                    };
+                    // Mutating calls must finish even after the route closes:
+                    // dropping one between door cover and export can strand a
+                    // partially applied move. Only its unobserved reply is lost.
+                    if reply_cancel.is_cancelled() { return Ok(()); }
                     match result {
                         Ok(reply) => {
                             send_json_response(&writer, ver, channel, epoch, corr, &reply).await
@@ -1497,6 +1512,7 @@ async fn handle_control_request(
             // scripts/audit-export-lane.py are that shape deliberately.
             let mut metrics = serde_json::json!({
                     "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
+                    "agent_data_inventory": crate::agent_data::inventory_health(routes.agent_data.as_deref()),
                     "retention_unreadable_sessions": retention_unreadable,
                     "retention_repairs_pending": health_registry.retention_repairs_pending(),
                     "stall_watchdog": crate::stall::health_gauges(),

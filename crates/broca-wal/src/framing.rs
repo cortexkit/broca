@@ -341,6 +341,29 @@ struct GatedRequires {
     record: IgnoredAny,
 }
 
+/// Read requirements from an already verified, complete prefix. Keeping the
+/// original envelope matters: an explicit gate may require more than the
+/// decoded record's current `required_features()` implementation does.
+pub(crate) fn verified_prefix_features(mut bytes: &[u8]) -> Result<Vec<String>, FrameError> {
+    let mut features = std::collections::BTreeSet::new();
+    while !bytes.is_empty() {
+        let Some(header) = bytes.get(..HEADER_LEN) else {
+            return Err(FrameError::NonTailIncompleteFrame);
+        };
+        let len = u32::from_le_bytes(header[..4].try_into().expect("four-byte length")) as usize;
+        let Some(frame) = bytes.get(..HEADER_LEN + len) else {
+            return Err(FrameError::NonTailIncompleteFrame);
+        };
+        if header[4] == 3 {
+            let envelope: GatedRequires =
+                serde_json::from_slice(&frame[HEADER_LEN..]).map_err(FrameError::Deserialize)?;
+            features.extend(envelope.requires);
+        }
+        bytes = &bytes[frame.len()..];
+    }
+    Ok(features.into_iter().collect())
+}
+
 /// Second pass over a gated payload, run only once every required feature is known.
 #[derive(Deserialize)]
 struct GatedRecord {

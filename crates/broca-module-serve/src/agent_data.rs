@@ -75,7 +75,6 @@ pub struct AgentDataService {
     cuts: CutStore,
     artifacts: FileCutArtifacts,
     wal: Arc<FileWalStore>,
-    inventory_cancel: tokio_util::sync::CancellationToken,
     op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
@@ -96,12 +95,14 @@ impl AgentDataService {
             cuts: CutStore::new(&root),
             artifacts: FileCutArtifacts::new(root.clone(), registry, wal.clone(), index, driver),
             wal,
-            inventory_cancel: tokio_util::sync::CancellationToken::new(),
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
     pub fn start_inventory(&self) {
-        self.wal.start_move_inventory(self.inventory_cancel.clone());
+        // The store may outlive this service and be shared with another one.
+        // A service drop must not cancel their one-shot boot inventory.
+        self.wal
+            .start_move_inventory(tokio_util::sync::CancellationToken::new());
     }
     pub async fn wait_inventory(&self) {
         self.start_inventory();
@@ -118,6 +119,18 @@ const OPS: [&str; 10] = [
     "status",
 ];
 
+pub(crate) fn request_is_read_only(bytes: &[u8]) -> bool {
+    let Ok(rpc) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    matches!(
+        rpc.get("method").and_then(Value::as_str),
+        Some(
+            "agent_data.describe" | "agent_data.busy" | "agent_data.diverged" | "agent_data.status"
+        )
+    )
+}
+
 pub(crate) fn health_counts(service: Option<&AgentDataService>) -> Value {
     Value::Object(
         OPS.iter()
@@ -132,6 +145,13 @@ pub(crate) fn health_counts(service: Option<&AgentDataService>) -> Value {
     )
 }
 
+pub(crate) fn inventory_health(service: Option<&AgentDataService>) -> Value {
+    service.map_or(Value::Null, |service| {
+        let (ready, unreadable) = service.wal.move_inventory_health();
+        json!({"ready": ready, "unreadable": unreadable})
+    })
+}
+
 struct OpObservation {
     op: String,
     cut_id: String,
@@ -142,12 +162,6 @@ impl Drop for OpObservation {
     fn drop(&mut self) {
         tracing::info!(op = %self.op, cut_id = %self.cut_id, ref_count = self.ref_count,
             elapsed_ms = self.start.elapsed().as_millis() as u64, "agent-data op finished");
-    }
-}
-
-impl Drop for AgentDataService {
-    fn drop(&mut self) {
-        self.inventory_cancel.cancel();
     }
 }
 
@@ -536,13 +550,16 @@ impl MoveDriver for Driver {
                 ));
             }
             let mut sealed = receiver;
+            let mut divergence = None;
             let bytes = if op == Op::Diverged {
                 let local = local_probe.expect("held divergence ref has local bytes");
-                match broca_module::move_files::retained_move_copy(
+                match broca_module::move_files::retained_move_copy_from_bytes(
                     self.wal.as_ref(),
                     session.expect("held ref resolved"),
+                    &local,
                 ) {
                     Ok(true) => {
+                        divergence = Some(broca_module::move_files::LocalDivergence::Advanced);
                         sealed = false;
                         local
                     }
@@ -552,7 +569,14 @@ impl MoveDriver for Driver {
                     }
                     Ok(false) => {
                         match self.incoming(&reference.r#ref, cut_id).await {
-                            Ok(bytes) => bytes,
+                            Ok(bytes) => {
+                                divergence = Some(if bytes.starts_with(&local) {
+                                    broca_module::move_files::LocalDivergence::AtCut
+                                } else {
+                                    broca_module::move_files::LocalDivergence::Advanced
+                                });
+                                bytes
+                            }
                             Err(error) => match error.verification_cause {
                                 Some(cause) => {
                                     // Divergence entries carry only a state, not a
@@ -560,6 +584,8 @@ impl MoveDriver for Driver {
                                     // without adding fields or logging WAL content.
                                     tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
                                     sealed = false;
+                                    divergence =
+                                        Some(broca_module::move_files::LocalDivergence::Unknown);
                                     local
                                 }
                                 None => return Err(error.refusal),
@@ -612,7 +638,7 @@ impl MoveDriver for Driver {
             } else {
                 session.expect("local ref resolved").clone()
             };
-            let local_archive = if matches!(op, Op::Abort | Op::Busy) {
+            let local_archive = if matches!(op, Op::Abort | Op::Busy | Op::Diverged) {
                 None
             } else if self
                 .wal
@@ -634,6 +660,7 @@ impl MoveDriver for Driver {
                 format,
                 lineage_id,
                 local_archive,
+                divergence,
             });
         }
         Ok(MovePlans {
@@ -702,16 +729,7 @@ impl MoveDriver for Driver {
                 }
             }).collect::<Vec<_>>()}),
             Op::Diverged => json!({"refs":plans.iter().map(|p| {
-                let state = match broca_module::move_files::retained_move_copy(self.wal.as_ref(), &p.session) {
-                    Ok(true) => "advanced",
-                    Err(_) => "unknown",
-                    Ok(false) if p.sealed_digest.is_none() => "unknown",
-                    Ok(false) => match self.wal.bytes_for_move(&p.session) {
-                    Ok(local) if p.bytes.starts_with(local.as_deref().unwrap_or_default()) => "at_cut",
-                    Ok(_) => "advanced",
-                    Err(_) => "unknown",
-                    },
-                };
+                let state = p.divergence.unwrap_or(broca_module::move_files::LocalDivergence::Unknown).as_str();
                 json!({"state":state})
             }).collect::<Vec<_>>()}),
             Op::Describe => {

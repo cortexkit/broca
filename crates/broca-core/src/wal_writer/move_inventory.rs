@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 mod persistent;
+#[cfg(test)]
+mod tests;
 pub use persistent::MoveInventoryBuildStats;
 
 #[derive(Default)]
@@ -43,7 +45,7 @@ fn insert(inventory: &mut MoveInventory, address: &str, session: &BindIdentity) 
 
 impl FileWalStore {
     /// Start once at boot, never from reference resolution. Until publication,
-    /// missing refs are unknown. Cancellation leaves that incomplete state intact.
+    /// missing refs are unknown. Interrupted builds finish explicitly incomplete.
     pub fn start_move_inventory(self: &Arc<Self>, cancel: CancellationToken) {
         let mut state = self.move_inventory.state.lock().unwrap();
         if state.started {
@@ -54,7 +56,7 @@ impl FileWalStore {
         let store = self.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("move-inventory".into())
-            .spawn(move || persistent::build(&store, &cancel))
+            .spawn(move || store.run_inventory_build(|| persistent::build(&store, &cancel)))
         {
             let mut state = self.move_inventory.state.lock().unwrap();
             state
@@ -65,6 +67,28 @@ impl FileWalStore {
             drop(state);
             self.move_inventory.ready.notify_waiters();
         }
+    }
+
+    fn run_inventory_build(&self, build: impl FnOnce()) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+        let mut state = self
+            .move_inventory
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if result.is_err() || !state.finished {
+            let reason = if result.is_err() {
+                "move inventory build panicked"
+            } else {
+                "move inventory build cancelled before completion"
+            };
+            tracing::error!(reason, "move inventory finished incomplete");
+            state.inventory.unreadable.push(reason.into());
+            state.finished = true;
+        }
+        self.move_inventory.state.clear_poison();
+        drop(state);
+        self.move_inventory.ready.notify_waiters();
     }
 
     /// Wait for the boot scan, including a scan that finished with unreadable
@@ -135,13 +159,22 @@ impl FileWalStore {
     pub fn move_inventory_build_stats(&self) -> MoveInventoryBuildStats {
         self.move_inventory.state.lock().unwrap().stats
     }
+
+    /// Process-local build progress, not an assertion of WAL durability.
+    pub fn move_inventory_health(&self) -> (bool, usize) {
+        let state = self
+            .move_inventory
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (state.finished, state.inventory.unreadable.len())
+    }
 }
 
 pub(super) struct IndexedWal {
     wal: FileWal,
     address: String,
     inventory: Arc<InventoryState>,
-    pending: Mutex<Vec<BindIdentity>>,
 }
 
 impl IndexedWal {
@@ -150,56 +183,24 @@ impl IndexedWal {
             wal,
             address,
             inventory,
-            pending: Mutex::default(),
         }
     }
 
-    fn appended(&self, record: &WalRecord, sync: bool) {
+    fn publishing(&self, record: &WalRecord) {
+        // This is a conservative candidate set, not a durability claim: requests
+        // verify the actual bytes. Publish before writing so an unsynced drop or
+        // failed append cannot hide an identity that may have reached disk.
         if let WalRecord::RunStarted { session, .. } = record {
-            self.pending.lock().unwrap().push(session.clone());
-        }
-        if sync {
-            self.publish();
-        }
-    }
-
-    fn publish(&self) {
-        let mut pending = self.pending.lock().unwrap();
-        if pending.is_empty() {
-            return;
-        }
-        let mut state = self.inventory.state.lock().unwrap();
-        for session in pending.drain(..) {
-            insert(&mut state.inventory, &self.address, &session);
-        }
-    }
-
-    fn uncertain_write(&self, record: Option<&WalRecord>) {
-        if matches!(record, Some(WalRecord::RunStarted { .. }))
-            || !self.pending.lock().unwrap().is_empty()
-        {
-            self.inventory
-                .state
-                .lock()
-                .unwrap()
-                .inventory
-                .unreadable
-                .push(format!(
-                    "{}: identity durability could not be confirmed",
-                    self.address
-                ));
+            let mut state = self.inventory.state.lock().unwrap();
+            insert(&mut state.inventory, &self.address, session);
         }
     }
 }
 
 impl Wal for IndexedWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        let seq = self
-            .wal
-            .append(fence, record, sync)
-            .inspect_err(|_| self.uncertain_write(Some(record)))?;
-        self.appended(record, sync);
-        Ok(seq)
+        self.publishing(record);
+        self.wal.append(fence, record, sync)
     }
     fn append_preencoded(
         &mut self,
@@ -208,19 +209,11 @@ impl Wal for IndexedWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        let seq = self
-            .wal
-            .append_preencoded(fence, record, sync, frame)
-            .inspect_err(|_| self.uncertain_write(Some(record)))?;
-        self.appended(record, sync);
-        Ok(seq)
+        self.publishing(record);
+        self.wal.append_preencoded(fence, record, sync, frame)
     }
     fn sync(&self) -> Result<(), WalError> {
-        self.wal
-            .sync()
-            .inspect_err(|_| self.uncertain_write(None))?;
-        self.publish();
-        Ok(())
+        self.wal.sync()
     }
     fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
         self.wal.replay()

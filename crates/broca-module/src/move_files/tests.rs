@@ -133,6 +133,7 @@ impl Rig {
                 format: "broca-wal/v3;features=".into(),
                 lineage_id: lineage,
                 local_archive: None,
+                divergence: None,
             });
         }
         let params = json!({"cutId":CUT,"refs":plans.iter().map(|p|json!({"ref_kind":"broca-session","ref":p.reference})).collect::<Vec<_>>()});

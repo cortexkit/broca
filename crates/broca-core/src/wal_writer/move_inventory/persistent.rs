@@ -5,9 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 mod pacing;
+#[cfg(test)]
+mod tests;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 3;
 const CACHE_LIMIT: u64 = 128 * 1024 * 1024;
+const CHECKPOINT_ADDRESSES: usize = 1024;
+const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MoveInventoryBuildStats {
@@ -25,7 +29,7 @@ pub struct MoveInventoryBuildStats {
 #[serde(deny_unknown_fields)]
 struct FileStamp {
     len: u64,
-    file_id: Option<u64>,
+    file_id: Option<(u64, u64)>,
     modified_ns: Option<u64>,
 }
 
@@ -37,7 +41,7 @@ impl FileStamp {
         }
         Ok(Self {
             len: metadata.len(),
-            file_id: file_wal::file_identity(path)?,
+            file_id: persistent_file_identity(&metadata),
             modified_ns: metadata
                 .modified()
                 .ok()
@@ -45,6 +49,19 @@ impl FileStamp {
                 .and_then(|elapsed| elapsed.as_nanos().try_into().ok()),
         })
     }
+}
+
+#[cfg(unix)]
+fn persistent_file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    // Persist raw identifiers, not a standard-library hash whose algorithm can
+    // change between compiler releases and invalidate every restart hint.
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn persistent_file_identity(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +89,7 @@ struct CachedAddress {
     committed_end: u64,
     last_seq: u64,
     triples: Vec<BindIdentity>,
+    used_features: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,14 +105,60 @@ fn invalid(message: &str) -> WalError {
     WalError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
+fn changed(message: &str) -> WalError {
+    WalError::Io(io::Error::new(io::ErrorKind::WouldBlock, message))
+}
+
 fn cache_path(store: &FileWalStore) -> PathBuf {
     store.root.with_file_name("move-inventory.json")
+}
+
+fn sweep_stale_temps(store: &FileWalStore) {
+    let path = cache_path(store);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("move-inventory.tmp-"))
+        else {
+            continue;
+        };
+        let Some((pid, nonce)) = suffix.split_once('-') else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() || nonce.parse::<u128>().is_err() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        // Another store may be saving a hint concurrently. Leave recent files
+        // alone; only abandoned regular temporaries older than a day are swept.
+        let stale = metadata.is_file()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age.as_secs() >= 24 * 60 * 60);
+        if stale {
+            if let Err(error) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(%error, path = %entry.path().display(), "cannot remove stale move inventory temporary");
+            }
+        }
+    }
 }
 
 fn load(
     store: &FileWalStore,
     stats: &mut MoveInventoryBuildStats,
 ) -> BTreeMap<String, CachedAddress> {
+    sweep_stale_temps(store);
     let result = (|| -> Result<Cache, WalError> {
         let path = cache_path(store);
         let metadata = std::fs::symlink_metadata(&path).map_err(WalError::Io)?;
@@ -121,10 +185,7 @@ fn load(
         stats.cache_bytes += bytes.len() as u64;
         let cache: Cache = serde_json::from_slice(&bytes)
             .map_err(|error| invalid(&format!("invalid move inventory cache: {error}")))?;
-        if cache.version != CACHE_VERSION
-            || cache.reader_features != reader_features()
-            || cache.checksum != checksum(&cache.addresses)?
-        {
+        if cache.version != CACHE_VERSION || cache.checksum != checksum(&cache.addresses)? {
             return Err(invalid(
                 "move inventory cache version or checksum does not match",
             ));
@@ -145,7 +206,19 @@ fn load(
         Ok(cache)
     })();
     match result {
-        Ok(cache) => cache.addresses,
+        Ok(cache) => {
+            let known = reader_features();
+            cache
+                .addresses
+                .into_iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .used_features
+                        .iter()
+                        .all(|feature| known.contains(feature))
+                })
+                .collect()
+        }
         Err(error) => {
             tracing::warn!(%error, "move inventory cache unavailable; rebuilding from WALs");
             BTreeMap::new()
@@ -160,8 +233,8 @@ fn checksum(addresses: &BTreeMap<String, CachedAddress>) -> Result<String, WalEr
 }
 
 fn reader_features() -> Vec<String> {
-    // A downgraded reader must not reuse a newer reader's success over frames it
-    // cannot decode. Inventory-format changes additionally bump CACHE_VERSION.
+    // Only entries using an unknown feature need decoding after a downgrade.
+    // New reader capabilities do not invalidate unrelated restart hints.
     let mut features = broca_wal::KNOWN_FEATURES
         .iter()
         .map(|name| (*name).to_owned())
@@ -284,6 +357,93 @@ fn locations(
     unreadable: &mut Vec<String>,
     stats: &mut MoveInventoryBuildStats,
 ) -> Result<BTreeMap<String, Source>, WalError> {
+    locations_after_live(store, cancel, unreadable, stats, || {})
+}
+
+fn locations_after_live(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    unreadable: &mut Vec<String>,
+    stats: &mut MoveInventoryBuildStats,
+    after_live: impl FnOnce(),
+) -> Result<BTreeMap<String, Source>, WalError> {
+    // Folds copy into a sealed archive before deleting live files. Listing live
+    // first ensures a fold between listings is seen in at least one location.
+    let (live, ambiguous) = live_locations(store, cancel, unreadable)?;
+    after_live();
+    let mut sources = archive_locations(store, cancel, unreadable, stats)?;
+    for (address, path) in live {
+        cancelled(cancel)?;
+        // Live always overrides archived history at the same address.
+        sources.insert(
+            address,
+            Source::Live {
+                path,
+                stamp: FileStamp {
+                    len: 0,
+                    file_id: None,
+                    modified_ns: None,
+                },
+                lineage_id: None,
+                sealed_tail: false,
+            },
+        );
+    }
+    for address in ambiguous {
+        sources.remove(&address);
+        unreadable.push(address);
+    }
+    Ok(sources)
+}
+
+type LiveLocations = (
+    BTreeMap<String, PathBuf>,
+    std::collections::BTreeSet<String>,
+);
+
+fn live_locations(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    unreadable: &mut Vec<String>,
+) -> Result<LiveLocations, WalError> {
+    let mut live = BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for root in [&store.root, &store.ephemeral_root()] {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable.push(root.display().to_string());
+                continue;
+            }
+        };
+        for entry in entries {
+            cancelled(cancel)?;
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(_) => {
+                    unreadable.push(root.display().to_string());
+                    continue;
+                }
+            };
+            if path.extension().is_some_and(|ext| ext == "wal") {
+                if let Some(address) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    if live.insert(address.to_owned(), path.clone()).is_some() {
+                        ambiguous.insert(address.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok((live, ambiguous))
+}
+
+fn archive_locations(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    unreadable: &mut Vec<String>,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<BTreeMap<String, Source>, WalError> {
     let mut sources = BTreeMap::new();
     let mut paths = store.archive_containers()?.unwrap_or_default();
     paths.sort_by_key(|path| broca_wal::archive::fold_timestamp(path).unwrap_or(0));
@@ -304,7 +464,7 @@ fn locations(
             }
             if reader.state().map_err(WalError::Io)? == broca_wal::archive::ContainerState::Unsealed
             {
-                return Ok(Vec::new());
+                return Err(invalid("inventory archive is not sealed yet"));
             }
             // Verified v2 indexes prove member coverage without touching payloads.
             // V1 containers need header walks, which also skip every payload.
@@ -343,7 +503,7 @@ fn locations(
                     .collect(),
             };
             if stamp != FileStamp::at(&path)? {
-                return Err(invalid("archive changed during inventory"));
+                return Err(changed("archive changed during inventory"));
             }
             Ok(entries)
         })();
@@ -360,58 +520,71 @@ fn locations(
             }
         }
     }
-    let mut live = BTreeMap::new();
-    let mut ambiguous = std::collections::BTreeSet::new();
-    for root in [&store.root, &store.ephemeral_root()] {
-        let entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                unreadable.push(root.display().to_string());
-                continue;
-            }
-        };
-        for entry in entries {
-            cancelled(cancel)?;
-            let path = match entry {
-                Ok(entry) => entry.path(),
-                Err(_) => {
-                    unreadable.push(root.display().to_string());
-                    continue;
-                }
-            };
-            if path.extension().is_some_and(|ext| ext == "wal") {
-                if let Some(address) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    if live.insert(address.to_owned(), path.clone()).is_some() {
-                        ambiguous.insert(address.to_owned());
-                    }
-                }
-            }
-        }
-    }
-    for (address, path) in live {
-        cancelled(cancel)?;
-        // A live file overrides an archived copy of the same address. The scan
-        // opens its headers later, so enumeration holds no live WALs open.
-        sources.insert(
-            address,
-            Source::Live {
-                path,
-                stamp: FileStamp {
-                    len: 0,
-                    file_id: None,
-                    modified_ns: None,
-                },
-                lineage_id: None,
-                sealed_tail: false,
-            },
-        );
-    }
-    for address in ambiguous {
-        sources.remove(&address);
-        unreadable.push(address);
-    }
     Ok(sources)
+}
+
+fn scan_address(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    address: &str,
+    source: Source,
+    old: Option<&CachedAddress>,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<Option<CachedAddress>, WalError> {
+    let mut source = source;
+    for attempt in 0..3 {
+        cancelled(cancel)?;
+        let result = scan_address_once(store, cancel, address, source, old, stats);
+        if !matches!(&result, Err(WalError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            || attempt == 2
+        {
+            return result;
+        }
+        let Some(current) = resolve_address(store, cancel, address, stats)? else {
+            return Ok(None);
+        };
+        source = current;
+    }
+    unreachable!("bounded scan always returns on its final attempt")
+}
+
+fn resolve_address(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    address: &str,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<Option<Source>, WalError> {
+    let mut unreadable = Vec::new();
+    let mut current = locations(store, cancel, &mut unreadable, stats)?;
+    if !unreadable.is_empty() {
+        return Err(invalid(&format!(
+            "cannot re-resolve inventory address: {}",
+            unreadable.join(", ")
+        )));
+    }
+    Ok(current.remove(address))
+}
+
+fn scan_address_once(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    address: &str,
+    source: Source,
+    old: Option<&CachedAddress>,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<Option<CachedAddress>, WalError> {
+    match scan(store, address, source, old, stats) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            // A fold or activation can remove the enumerated path. Re-resolve
+            // live first, then the newest archive; only a complete census can
+            // prove that an address now has no bytes anywhere.
+            resolve_address(store, cancel, address, stats)?
+                .map(|source| scan(store, address, source, old, stats))
+                .transpose()
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn add_records(
@@ -433,17 +606,23 @@ fn add_records(
 }
 
 fn same_live_lineage(old: &Source, current: &Source) -> bool {
+    // Legacy logs have no lineage. Their stable file identity and unchanged
+    // stamp still prove the same append-only prefix; without either identity
+    // mechanism we must decode again instead of reusing an absence proof.
     matches!((old, current),
-        (Source::Live { path: a, stamp: x, lineage_id: Some(l), .. },
-         Source::Live { path: b, stamp: y, lineage_id: Some(r), .. })
-        if a == b && x.file_id == y.file_id && l == r)
+        (Source::Live { path: a, stamp: x, lineage_id: l, .. },
+         Source::Live { path: b, stamp: y, lineage_id: r, .. })
+        if a == b && (l.is_some() || x.file_id.is_some()) && x.file_id == y.file_id && l == r)
 }
 
 fn reusable(old: &CachedAddress, current: &Source) -> bool {
     match current {
-        Source::Live { stamp, .. } => {
+        Source::Live {
+            stamp, sealed_tail, ..
+        } => {
             same_live_lineage(&old.source, current)
-                && old.source == *current
+                && matches!(&old.source, Source::Live { stamp: previous, sealed_tail: previous_tail, .. }
+                    if previous == stamp && previous_tail == sealed_tail)
                 && old.committed_end == stamp.len
         }
         Source::Archive { payload_len, .. } => {
@@ -458,6 +637,17 @@ fn scan(
     location: Source,
     old: Option<&CachedAddress>,
     stats: &mut MoveInventoryBuildStats,
+) -> Result<CachedAddress, WalError> {
+    scan_after_stamp(store, address, location, old, stats, || {})
+}
+
+fn scan_after_stamp(
+    store: &FileWalStore,
+    address: &str,
+    location: Source,
+    old: Option<&CachedAddress>,
+    stats: &mut MoveInventoryBuildStats,
+    after_stamp: impl FnOnce(),
 ) -> Result<CachedAddress, WalError> {
     if address.len() != 16 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid("invalid inventory WAL address"));
@@ -480,7 +670,9 @@ fn scan(
         stats.reused += 1;
         return Ok(old.clone());
     }
+    after_stamp();
     let mut triples = Vec::new();
+    let mut used_features;
     let (committed_end, last_seq) = match &source {
         Source::Live {
             path,
@@ -497,7 +689,7 @@ fn scan(
             });
             let mut range = None;
             if let Some(old) = suffix {
-                if let Some(file_id) = stamp.file_id {
+                if let Some(file_id) = file_wal::file_identity(path)? {
                     stats.payload_reads += 1;
                     stats.payload_bytes += stamp.len - old.committed_end;
                     store.move_reads.fetch_add(1, Ordering::Relaxed);
@@ -518,6 +710,7 @@ fn scan(
                     }
                 }
             }
+            let reused_prefix = range.is_some();
             let range = match range {
                 Some(range) => range,
                 None => {
@@ -527,30 +720,60 @@ fn scan(
                     file_wal::read_records_range(path, store.max_read_bytes, 0, None, None)?
                 }
             };
+            used_features = range.used_features().to_vec();
+            if reused_prefix {
+                used_features.extend(
+                    old.expect("validated cached suffix")
+                        .used_features
+                        .iter()
+                        .cloned(),
+                );
+            }
             if range.lineage_id.is_some_and(|id| {
                 lineage_id
                     .as_ref()
                     .is_some_and(|expected| id.to_string() != *expected)
             }) {
-                return Err(invalid("inventory WAL lineage changed during read"));
+                return Err(changed("inventory WAL lineage changed during read"));
             }
-            add_records(&mut triples, address, &range)?;
-            if FileStamp::at(path)? != *stamp {
-                return Err(invalid("WAL changed during inventory read"));
-            }
-            let last_seq = match range.records() {
-                WalRangeRecords::Complete(records) => records
-                    .last()
-                    .map(|frame| frame.seq)
-                    .or_else(|| suffix.map(|old| old.last_seq))
-                    .unwrap_or(0),
-                _ => 0,
-            };
-            let end = if *sealed_tail {
-                stamp.len
+            let after_stamp = FileStamp::at(path)?;
+            let grew = if after_stamp.len > stamp.len {
+                let after = live_source(path.clone(), stats)?;
+                matches!(&after, Source::Live { stamp: later, .. }
+                    if later.len >= after_stamp.len && same_live_lineage(&source, &after))
             } else {
-                range.next_anchor.map_or(0, |anchor| anchor.byte_end)
+                false
             };
+            if after_stamp != *stamp && !grew {
+                return Err(changed("WAL changed during inventory read"));
+            }
+            let WalRangeRecords::Complete(records) = range.records() else {
+                return Err(invalid("inventory WAL records are incomplete"));
+            };
+            let mut last_seq = suffix.map_or(0, |old| old.last_seq);
+            let mut end = suffix.map_or(0, |old| old.committed_end);
+            // A growing append-only WAL still proves its stamped prefix. Only
+            // retain frames ending at strict anchors within that prefix; later
+            // in-process RunStarted appends publish their own candidates.
+            for frame in records {
+                let anchor = range.anchor_at(frame.seq);
+                if grew && anchor.is_none() {
+                    return Err(changed("growing inventory WAL has no strict byte anchors"));
+                }
+                if anchor.is_some_and(|anchor| anchor.byte_end > stamp.len) {
+                    break;
+                }
+                if let WalRecord::RunStarted { session, .. } = &frame.record {
+                    if session_addr(session) == address && !triples.contains(session) {
+                        triples.push(session.clone());
+                    }
+                }
+                last_seq = frame.seq;
+                end = anchor.map_or(0, |anchor| anchor.byte_end);
+            }
+            if *sealed_tail {
+                end = stamp.len;
+            }
             (end, last_seq)
         }
         Source::Archive {
@@ -568,9 +791,10 @@ fn scan(
                 .map_err(WalError::Io)?
                 .ok_or_else(|| invalid("archive inventory member disappeared"))?;
             let range = file_wal::read_verified_member_range(&member.payload, 0, 0, None)?;
+            used_features = range.used_features().to_vec();
             add_records(&mut triples, address, &range)?;
             if FileStamp::at(path)? != *stamp {
-                return Err(invalid("archive changed during inventory read"));
+                return Err(changed("archive changed during inventory read"));
             }
             (
                 *payload_len,
@@ -578,49 +802,96 @@ fn scan(
             )
         }
     };
+    used_features.sort();
+    used_features.dedup();
     Ok(CachedAddress {
         source,
         committed_end,
         last_seq,
         triples,
+        used_features,
     })
 }
 
 pub(super) fn build(store: &FileWalStore, cancel: &CancellationToken) {
+    build_with_hooks(store, cancel, |_| {}, |_| {})
+}
+
+fn build_with_hooks(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    mut after_pass: impl FnMut(usize),
+    mut after_address: impl FnMut(usize),
+) {
     let start = std::time::Instant::now();
     let mut stats = MoveInventoryBuildStats::default();
     let cached = load(store, &mut stats);
     let mut inventory = MoveInventory::default();
     let mut next_cache = BTreeMap::new();
+    let mut checkpoint = (0, std::time::Instant::now());
     // The cache never defines which addresses exist. Every boot enumerates the
     // current roots/indexes, including locations absent from the previous cache.
-    match locations(store, cancel, &mut inventory.unreadable, &mut stats) {
-        Ok(locations) => {
-            for (address, source) in locations {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                let work = std::time::Instant::now();
-                let reads_before = stats.payload_reads;
-                match scan(store, &address, source, cached.get(&address), &mut stats) {
-                    Ok(entry) => {
-                        for session in &entry.triples {
-                            insert(&mut inventory, &address, session);
+    for pass in 0..2 {
+        match locations(store, cancel, &mut inventory.unreadable, &mut stats) {
+            Ok(locations) => {
+                for (address, source) in locations {
+                    if next_cache.contains_key(&address) {
+                        continue;
+                    }
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let work = std::time::Instant::now();
+                    let reads_before = stats.payload_reads;
+                    match scan_address(
+                        store,
+                        cancel,
+                        &address,
+                        source,
+                        cached.get(&address),
+                        &mut stats,
+                    ) {
+                        Ok(Some(entry)) => {
+                            for session in &entry.triples {
+                                insert(&mut inventory, &address, session);
+                            }
+                            next_cache.insert(address, entry);
                         }
-                        next_cache.insert(address, entry);
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::error!(address, %error, "move inventory cannot read WAL");
+                            inventory.unreadable.push(address);
+                        }
                     }
-                    Err(error) => {
-                        tracing::error!(address, %error, "move inventory cannot read WAL");
-                        inventory.unreadable.push(address);
+                    if stats.payload_reads != reads_before {
+                        pacing::after_payload(work.elapsed(), cancel);
                     }
+                    // Partial hints are safe: every boot still takes a fresh census
+                    // and validates each entry. Bound lost work across restarts,
+                    // without rewriting an already reusable warm cache in chunks.
+                    if stats.payload_reads > 0
+                        && next_cache.len() > checkpoint.0
+                        && (next_cache.len() - checkpoint.0 >= CHECKPOINT_ADDRESSES
+                            || checkpoint.1.elapsed() >= CHECKPOINT_INTERVAL)
+                    {
+                        if let Err(error) = save(store, next_cache.clone()) {
+                            tracing::warn!(%error, "move inventory checkpoint could not be saved");
+                        }
+                        checkpoint = (next_cache.len(), std::time::Instant::now());
+                    }
+                    after_address(next_cache.len());
+                    std::thread::yield_now();
                 }
-                if stats.payload_reads != reads_before {
-                    pacing::after_payload(work.elapsed(), cancel);
-                }
-                std::thread::yield_now();
             }
+            Err(error) => inventory.unreadable.push(error.to_string()),
         }
-        Err(error) => inventory.unreadable.push(error.to_string()),
+        after_pass(pass);
+        if inventory.unreadable.is_empty() || pass == 1 {
+            break;
+        }
+        // Retry failures once after the other addresses have been scanned. A fresh
+        // census also finds members of an archive that was being sealed earlier.
+        inventory.unreadable.clear();
     }
     if cancel.is_cancelled() {
         return;
@@ -633,7 +904,7 @@ pub(super) fn build(store: &FileWalStore, cancel: &CancellationToken) {
         return;
     }
     let mut state = store.move_inventory.state.lock().unwrap();
-    // Merge identities from RunStarted writes synced while this scan ran. The
+    // Merge candidates from RunStarted writes published while this scan ran. The
     // saved hints can lag those writes: the next boot detects their larger WAL
     // length and reads the appended records before proving inventory complete.
     inventory.sessions.append(&mut state.inventory.sessions);

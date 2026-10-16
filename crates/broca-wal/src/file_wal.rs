@@ -92,6 +92,7 @@ pub struct WalRangeRead {
     file_present: Option<bool>,
     archive_lookup_missed: bool,
     anchors: Vec<WalByteAnchor>,
+    used_features: Vec<String>,
 }
 
 impl WalRangeRead {
@@ -166,6 +167,7 @@ impl WalRangeRead {
             file_present: None,
             archive_lookup_missed: false,
             anchors,
+            used_features: Vec::new(),
         }
     }
 
@@ -178,6 +180,7 @@ impl WalRangeRead {
             file_present: None,
             archive_lookup_missed: false,
             anchors: Vec::new(),
+            used_features: Vec::new(),
         }
     }
 
@@ -187,6 +190,12 @@ impl WalRangeRead {
             .binary_search_by_key(&seq, |anchor| anchor.seq)
             .ok()
             .map(|index| self.anchors[index])
+    }
+
+    /// Feature requirements from the verified source frames, including explicit
+    /// gates not implied by decoded records. A suffix reports only its own frames.
+    pub fn used_features(&self) -> &[String] {
+        &self.used_features
     }
 }
 
@@ -1094,13 +1103,14 @@ pub fn read_records_range_from_valid_anchor(
     let Some(decoded) = decode_anchored_suffix(&suffix, anchor.byte_end, expected_next)? else {
         return Ok(None);
     };
-    let range = select_range(
-        decoded.records,
+    let range = select_decoded_range(
+        decoded,
+        &suffix,
+        anchor.byte_end,
         Some(file_id),
         after_seq,
         through_seq,
-        decoded.lineage_id,
-    );
+    )?;
     if range
         .records
         .windows(2)
@@ -1141,6 +1151,7 @@ pub fn read_records_range(
                 file_present: Some(false),
                 archive_lookup_missed: false,
                 anchors: Vec::new(),
+                used_features: Vec::new(),
             });
         }
         Err(error) => return Err(WalError::Io(error)),
@@ -1163,26 +1174,21 @@ pub fn read_records_range(
             let suffix = read_open_file_capped(&mut file, anchor.byte_end, max_bytes, file_size)?;
             if let Some(decoded) = decode_anchored_suffix(&suffix, anchor.byte_end, expected_next)?
             {
-                return Ok(select_range(
-                    decoded.records,
+                return select_decoded_range(
+                    decoded,
+                    &suffix,
+                    anchor.byte_end,
                     Some(file_id),
                     after_seq,
                     through_seq,
-                    decoded.lineage_id,
-                ));
+                );
             }
         }
     }
 
     let bytes = read_open_file_capped(&mut file, 0, max_bytes, file_size)?;
     let decoded = decode_bytes(&bytes, 0, 1)?;
-    Ok(select_range(
-        decoded.records,
-        file_id,
-        after_seq,
-        through_seq,
-        decoded.lineage_id,
-    ))
+    select_decoded_range(decoded, &bytes, 0, file_id, after_seq, through_seq)
 }
 
 /// Decode a digest-verified archive member in place, preserving WAL lineage and sequence
@@ -1196,13 +1202,14 @@ pub fn read_verified_member_range(
     through_seq: Option<u64>,
 ) -> Result<WalRangeRead, WalError> {
     let decoded = decode_bytes(bytes, 0, 1)?;
-    Ok(select_range(
-        decoded.records,
+    select_decoded_range(
+        decoded,
+        bytes,
+        0,
         Some(member_identity),
         after_seq,
         through_seq,
-        decoded.lineage_id,
-    ))
+    )
 }
 
 struct DecodedBytes {
@@ -1442,6 +1449,32 @@ fn decode_bytes_seeded(
         valid_end: absolute_start + offset as u64,
         lineage_id,
     })
+}
+
+fn select_decoded_range(
+    decoded: DecodedBytes,
+    bytes: &[u8],
+    absolute_start: u64,
+    file_id: Option<u64>,
+    after_seq: u64,
+    through_seq: Option<u64>,
+) -> Result<WalRangeRead, WalError> {
+    let used_features = crate::framing::verified_prefix_features(
+        &bytes[..(decoded.valid_end - absolute_start) as usize],
+    )
+    .map_err(|source| WalError::Corrupt {
+        offset: absolute_start as usize,
+        source,
+    })?;
+    let mut range = select_range(
+        decoded.records,
+        file_id,
+        after_seq,
+        through_seq,
+        decoded.lineage_id,
+    );
+    range.used_features = used_features;
+    Ok(range)
 }
 
 fn select_range(
