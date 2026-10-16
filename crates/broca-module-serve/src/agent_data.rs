@@ -126,11 +126,7 @@ pub(crate) fn request_is_read_only(bytes: &[u8]) -> bool {
     matches!(
         rpc.get("method").and_then(Value::as_str),
         Some(
-            "agent_data.describe"
-                | "agent_data.busy"
-                | "agent_data.diverged"
-                | "agent_data.prepare"
-                | "agent_data.status"
+            "agent_data.describe" | "agent_data.busy" | "agent_data.diverged" | "agent_data.status"
         )
     )
 }

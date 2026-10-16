@@ -169,6 +169,123 @@ async fn connection_eof_does_not_drop_export_between_cover_and_export() {
     export_survives_closed_route(true).await;
 }
 
+#[derive(Default)]
+struct ParkPrepareDoor {
+    covering: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+    calls: AtomicU64,
+    covers: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl SessionDoor for ParkPrepareDoor {
+    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.covering.notify_one();
+        self.resume.notified().await;
+        self.covers.fetch_add(1, Ordering::SeqCst);
+        self.completed.notify_one();
+        Ok(0)
+    }
+    async fn export(&self, _: &str, _: &[u8]) -> Result<(), SessionDoorError> {
+        unreachable!()
+    }
+    async fn read(&self, _: &str, _: u64, _: &str) -> Result<DoorRead, SessionDoorError> {
+        unreachable!()
+    }
+}
+
+async fn prepare_survives_closed_route(connection_close: bool) {
+    let door = Arc::new(ParkPrepareDoor::default());
+    let mut rig = Rig::new("inventory-prepare-close", Arc::new(FakeDoor::default()));
+    rig.service = Arc::new(AgentDataService::new(
+        rig.root.clone(),
+        rig.registry.as_ref().clone(),
+        rig.wal.clone(),
+        rig.index.clone(),
+        door.clone(),
+    ));
+    let session = rig.session("held");
+    rig.seed(&session, "run", true);
+    let path = rig.wal.wal_path(&session).with_extension("moving");
+    let end_offset = rig.bytes(&session).len() as u64;
+    let params = rig.params(CUT, &[session]);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    wire.send(
+        7,
+        1,
+        10,
+        FrameType::Request,
+        json!({"method":"agent_data.prepare","params":params}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), door.covering.notified())
+        .await
+        .expect("prepare must reach cover");
+    let frozen = std::fs::read(&path).expect("prepare must freeze the WAL before awaiting cover");
+    let freeze: broca_wal::migration::Freeze = serde_json::from_slice(&frozen).unwrap();
+    assert_eq!(freeze.cut_id, CUT);
+    assert_eq!(freeze.end_offset, end_offset);
+    assert_eq!(door.covers.load(Ordering::SeqCst), 0);
+    if connection_close {
+        use tokio::io::AsyncWriteExt;
+        wire.stream.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut wire.serving)
+            .await
+            .expect("connection teardown must not await parked prepare")
+            .unwrap()
+            .unwrap();
+    } else {
+        let goodbye =
+            Frame::build_with_version(2, FrameType::Goodbye, flags(), 7, 1, 11, Vec::new())
+                .unwrap();
+        write_frame(&mut wire.stream, &goodbye).await.unwrap();
+        // The health reply proves the server processed GOODBYE before we
+        // release the paused cover call, not merely that the frame was sent.
+        wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+            .await;
+        assert_eq!(wire.next().await.header.ty, FrameType::Response);
+    }
+    door.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), door.completed.notified())
+        .await
+        .expect("prepare must finish cover after its route closes");
+    assert_eq!(std::fs::read(&path).unwrap(), frozen);
+    let mut retry = Wire::new(&rig, entorhinal(), true).await;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        retry.call("prepare", params.clone()),
+    )
+    .await
+    .expect("lost-reply prepare must replay without another cover")
+    .unwrap();
+    let cut_path = rig.root.join("agent-data/cuts").join(format!("{CUT}.json"));
+    let completed = std::fs::read(&cut_path).unwrap();
+    let state: broca_module::cut_state::CutState = serde_json::from_slice(&completed).unwrap();
+    assert!(state.intent.is_none());
+    assert_eq!(state.replies["agent_data.prepare"].value, reply);
+    let replay = tokio::time::timeout(Duration::from_secs(5), retry.call("prepare", params))
+        .await
+        .expect("repeated prepare must remain idempotent")
+        .unwrap();
+    assert_eq!(replay, reply);
+    assert_eq!(std::fs::read(cut_path).unwrap(), completed);
+    assert_eq!(std::fs::read(path).unwrap(), frozen);
+    assert_eq!(door.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(door.covers.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn route_goodbye_does_not_drop_prepare_between_freeze_and_cover() {
+    prepare_survives_closed_route(false).await;
+}
+
+#[tokio::test]
+async fn connection_eof_does_not_drop_prepare_between_freeze_and_cover() {
+    prepare_survives_closed_route(true).await;
+}
+
 #[tokio::test]
 async fn busy_one_ref_reads_only_its_wal_after_inventory_build() {
     let rig = Rig::new("inventory-cost", Arc::new(FakeDoor::default()));
