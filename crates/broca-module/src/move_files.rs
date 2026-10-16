@@ -31,6 +31,24 @@ pub struct PlannedSession {
     pub lineage_id: String,
     /// Verified archive-member bytes, never an archive container.
     pub local_archive: Option<Vec<u8>>,
+    /// Read-only verdict from the same local snapshot used during planning.
+    pub divergence: Option<LocalDivergence>,
+}
+
+#[derive(Clone, Copy)]
+pub enum LocalDivergence {
+    AtCut,
+    Advanced,
+    Unknown,
+}
+impl LocalDivergence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AtCut => "at_cut",
+            Self::Advanced => "advanced",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -162,8 +180,25 @@ pub fn retained_move_copy(wal: &FileWalStore, session: &BindIdentity) -> Result<
     let Some(bytes) = wal.bytes_for_move(session).map_err(unavailable)? else {
         return Ok(false);
     };
+    retained_bytes(&bytes)
+}
+
+/// Classify a previously read local snapshot without reopening its WAL.
+pub fn retained_move_copy_from_bytes(
+    wal: &FileWalStore,
+    session: &BindIdentity,
+    bytes: &[u8],
+) -> Result<bool, ErrorBody> {
+    if wal.resolve_live_path(session).map_err(unavailable)? == Some(wal.ephemeral_wal_path(session))
+    {
+        return Ok(true);
+    }
+    retained_bytes(bytes)
+}
+
+fn retained_bytes(bytes: &[u8]) -> Result<bool, ErrorBody> {
     let range =
-        broca_wal::file_wal::read_verified_member_range(&bytes, 0, 0, None).map_err(unavailable)?;
+        broca_wal::file_wal::read_verified_member_range(bytes, 0, 0, None).map_err(unavailable)?;
     match range.records() {
         broca_wal::WalRangeRecords::Complete(records) => {
             Ok(broca_core::is_retention_lineage(records))

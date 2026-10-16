@@ -113,10 +113,52 @@ fn cache_path(store: &FileWalStore) -> PathBuf {
     store.root.with_file_name("move-inventory.json")
 }
 
+fn sweep_stale_temps(store: &FileWalStore) {
+    let path = cache_path(store);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("move-inventory.tmp-"))
+        else {
+            continue;
+        };
+        let Some((pid, nonce)) = suffix.split_once('-') else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() || nonce.parse::<u128>().is_err() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        // Another store may be saving a hint concurrently. Leave recent files
+        // alone; only abandoned regular temporaries older than a day are swept.
+        let stale = metadata.is_file()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age.as_secs() >= 24 * 60 * 60);
+        if stale {
+            if let Err(error) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(%error, path = %entry.path().display(), "cannot remove stale move inventory temporary");
+            }
+        }
+    }
+}
+
 fn load(
     store: &FileWalStore,
     stats: &mut MoveInventoryBuildStats,
 ) -> BTreeMap<String, CachedAddress> {
+    sweep_stale_temps(store);
     let result = (|| -> Result<Cache, WalError> {
         let path = cache_path(store);
         let metadata = std::fs::symlink_metadata(&path).map_err(WalError::Io)?;

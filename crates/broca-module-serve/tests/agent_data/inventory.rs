@@ -207,6 +207,54 @@ async fn busy_one_ref_reads_only_its_wal_after_inventory_build() {
 }
 
 #[tokio::test]
+async fn diverged_held_ref_reads_one_local_snapshot_live_or_archived() {
+    for archived in [false, true] {
+        let rig = Rig::new(
+            if archived {
+                "diverged-one-archive-read"
+            } else {
+                "diverged-one-live-read"
+            },
+            Arc::new(FakeDoor::default()),
+        );
+        let session = rig.session("held");
+        rig.seed(&session, "run", true);
+        let bytes = rig.bytes(&session);
+        let reference = contract::session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        rig.door.plant(CUT, &reference, bytes.clone());
+        if archived {
+            let directory = rig.root.join("wal-archive");
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut writer =
+                broca_wal::archive::ArchiveWriter::create(directory.join("fold-1.ark"))
+                    .unwrap()
+                    .without_feature_floor();
+            writer
+                .append(&broca_core::session_addr(&session), &bytes)
+                .unwrap();
+            writer.seal().unwrap();
+            std::fs::remove_file(rig.wal.wal_path(&session)).unwrap();
+        }
+        let mut wire = Wire::new(&rig, entorhinal(), true).await;
+        let before = rig.wal.move_read_count();
+        let reply = wire
+            .call("diverged", rig.params(CUT, &[session]))
+            .await
+            .unwrap();
+        assert_eq!(reply["refs"][0]["state"], "at_cut");
+        assert_eq!(
+            rig.wal.move_read_count() - before,
+            1,
+            "retention classification and reply must reuse the same local snapshot"
+        );
+    }
+}
+
+#[tokio::test]
 async fn empty_refs_do_not_start_or_read_inventory() {
     let rig = Rig::new("empty-inventory", Arc::new(FakeDoor::default()));
     rig.seed(&rig.session("broken"), "broken-run", true);

@@ -265,3 +265,27 @@ fn unsealed_archive_cannot_prove_absence() {
         .unreadable
         .is_empty());
 }
+
+#[test]
+fn load_sweeps_only_stale_regular_cache_temporaries() {
+    let rig = Rig::new();
+    let stale = rig.root.join("move-inventory.tmp-1-2");
+    let recent = rig.root.join("move-inventory.tmp-3-4");
+    let unrelated = rig.root.join("move-inventory.tmp-operator-notes");
+    let directory = rig.root.join("move-inventory.tmp-5-6");
+    for path in [&stale, &recent, &unrelated] {
+        std::fs::write(path, b"partial cache").unwrap();
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    load(&rig.store, &mut MoveInventoryBuildStats::default());
+    assert!(!stale.exists());
+    assert!(recent.exists());
+    assert!(unrelated.exists());
+    assert!(directory.exists());
+}

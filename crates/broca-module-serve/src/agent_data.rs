@@ -554,13 +554,16 @@ impl MoveDriver for Driver {
                 ));
             }
             let mut sealed = receiver;
+            let mut divergence = None;
             let bytes = if op == Op::Diverged {
                 let local = local_probe.expect("held divergence ref has local bytes");
-                match broca_module::move_files::retained_move_copy(
+                match broca_module::move_files::retained_move_copy_from_bytes(
                     self.wal.as_ref(),
                     session.expect("held ref resolved"),
+                    &local,
                 ) {
                     Ok(true) => {
+                        divergence = Some(broca_module::move_files::LocalDivergence::Advanced);
                         sealed = false;
                         local
                     }
@@ -570,7 +573,14 @@ impl MoveDriver for Driver {
                     }
                     Ok(false) => {
                         match self.incoming(&reference.r#ref, cut_id).await {
-                            Ok(bytes) => bytes,
+                            Ok(bytes) => {
+                                divergence = Some(if bytes.starts_with(&local) {
+                                    broca_module::move_files::LocalDivergence::AtCut
+                                } else {
+                                    broca_module::move_files::LocalDivergence::Advanced
+                                });
+                                bytes
+                            }
                             Err(error) => match error.verification_cause {
                                 Some(cause) => {
                                     // Divergence entries carry only a state, not a
@@ -578,6 +588,8 @@ impl MoveDriver for Driver {
                                     // without adding fields or logging WAL content.
                                     tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
                                     sealed = false;
+                                    divergence =
+                                        Some(broca_module::move_files::LocalDivergence::Unknown);
                                     local
                                 }
                                 None => return Err(error.refusal),
@@ -630,7 +642,7 @@ impl MoveDriver for Driver {
             } else {
                 session.expect("local ref resolved").clone()
             };
-            let local_archive = if matches!(op, Op::Abort | Op::Busy) {
+            let local_archive = if matches!(op, Op::Abort | Op::Busy | Op::Diverged) {
                 None
             } else if self
                 .wal
@@ -652,6 +664,7 @@ impl MoveDriver for Driver {
                 format,
                 lineage_id,
                 local_archive,
+                divergence,
             });
         }
         Ok(MovePlans {
@@ -720,16 +733,7 @@ impl MoveDriver for Driver {
                 }
             }).collect::<Vec<_>>()}),
             Op::Diverged => json!({"refs":plans.iter().map(|p| {
-                let state = match broca_module::move_files::retained_move_copy(self.wal.as_ref(), &p.session) {
-                    Ok(true) => "advanced",
-                    Err(_) => "unknown",
-                    Ok(false) if p.sealed_digest.is_none() => "unknown",
-                    Ok(false) => match self.wal.bytes_for_move(&p.session) {
-                    Ok(local) if p.bytes.starts_with(local.as_deref().unwrap_or_default()) => "at_cut",
-                    Ok(_) => "advanced",
-                    Err(_) => "unknown",
-                    },
-                };
+                let state = p.divergence.unwrap_or(broca_module::move_files::LocalDivergence::Unknown).as_str();
                 json!({"state":state})
             }).collect::<Vec<_>>()}),
             Op::Describe => {

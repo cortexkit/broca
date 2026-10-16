@@ -14258,3 +14258,29 @@ new = "_ = cancel.cancelled() => Ok(()), // NON-VACUITY BREAK: cancel mutations 
 file = "crates/broca-module-serve/src/serve.rs"
 old = "tokio::spawn(operation).await.map_err(|e| ServeIoError(e.to_string()))??"
 new = "operation.await? // NON-VACUITY BREAK: remove the independent operation owner."
+
+[[control]]
+id = "agent-data-cache-sweeps-stale-temporaries"
+guards = "load removes stale generated cache temporaries while preserving fresh and unrelated paths"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::load_sweeps_only_stale_regular_cache_temporaries"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "    sweep_stale_temps(store);"
+new = "    // NON-VACUITY BREAK: abandon old cache temporary files forever."
+
+[[control]]
+id = "agent-data-diverged-reuses-local-snapshot"
+guards = "diverged verifies one local WAL snapshot and reuses its retention and prefix verdict"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::diverged_held_ref_reads_one_local_snapshot_live_or_archived"]
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''            Op::Diverged => json!({"refs":plans.iter().map(|p| {'''
+new = '''            Op::Diverged => json!({"refs":plans.iter().map(|p| {
+                let _ = self.wal.bytes_for_move(&p.session); // NON-VACUITY BREAK: reread the local WAL in reply. '''
