@@ -295,6 +295,40 @@ fn gemini_3_flash_tier_uses_thinking_level_without_a_budget() {
     assert!(generation["thinkingConfig"].get("thinkingBudget").is_none());
 }
 
+fn assert_argon_wire_shape(wire_id: &str, level: &str) {
+    let mut frozen = google_codeassist_frozen_config(wire_id);
+    frozen.project_id = Some("test-project".into());
+    let rendered: Value =
+        serde_json::from_slice(&GoogleCodeAssist.render(&frozen, &fixed_request())).unwrap();
+    assert_eq!(rendered["model"], json!(wire_id));
+    assert_eq!(
+        rendered["request"]["generationConfig"]["thinkingConfig"],
+        json!({"includeThoughts": true, "thinkingLevel": level})
+    );
+    assert!(rendered["request"]["generationConfig"]["thinkingConfig"]
+        .get("thinkingBudget")
+        .is_none());
+    assert!(rendered["request"].get("toolConfig").is_none());
+    assert_eq!(rendered["request"]["tools"].as_array().unwrap().len(), 1);
+}
+
+// Argon Low's native capture uses uppercase LOW and omits toolConfig despite declaring tools.
+// The registry defines the corresponding MEDIUM and HIGH tiers with the same request shape.
+#[test]
+fn argon_low_matches_native_wire_shape() {
+    assert_argon_wire_shape("gemini-4-argon-low", "LOW");
+}
+
+#[test]
+fn argon_medium_matches_native_wire_shape() {
+    assert_argon_wire_shape("gemini-4-argon-medium", "MEDIUM");
+}
+
+#[test]
+fn argon_high_matches_native_wire_shape() {
+    assert_argon_wire_shape("gemini-4-argon-high", "HIGH");
+}
+
 /// The requestId in the golden is deterministic: rendering the same fixed request twice
 /// yields byte-identical bytes (the render-twice cache-stability gate).
 #[test]

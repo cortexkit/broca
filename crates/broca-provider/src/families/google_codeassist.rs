@@ -63,7 +63,7 @@ pub struct GoogleCodeAssist;
 impl WireFamily for GoogleCodeAssist {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
         // Start with the shared Gemini body, then apply the generation defaults selected by the
-        // frozen Antigravity wire tier. Different Gemini 3 families use different thinking knobs.
+        // frozen Antigravity wire tier. Different Gemini families use different thinking knobs.
         let mut inner = build_request_body(frozen, opts);
         apply_antigravity_generation_defaults(&mut inner, frozen);
 
@@ -206,8 +206,13 @@ fn apply_antigravity_generation_defaults(body: &mut Value, frozen: &FrozenRender
             .map_or(tier_ceiling, |explicit| explicit.min(tier_ceiling));
         body["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
     }
-    if let Some(thinking_config) = antigravity_thinking_config(&frozen.wire_model_id) {
-        body["generationConfig"]["thinkingConfig"] = thinking_config;
+    if let Some(tier) = antigravity_tier(&frozen.wire_model_id) {
+        body["generationConfig"]["thinkingConfig"] = tier.thinking_config;
+        if tier.omit_tool_config {
+            body.as_object_mut()
+                .expect("Gemini request object")
+                .remove("toolConfig");
+        }
     }
 }
 
@@ -236,7 +241,33 @@ fn antigravity_max_output_tokens(wire_model_id: &str) -> Option<u32> {
 /// has thinking settings here. The catalog resolver uses it to decide which reasoning variants a
 /// route can render.
 pub fn tier_thinking_config(wire_model_id: &str) -> Option<Value> {
-    antigravity_thinking_config(wire_model_id)
+    antigravity_tier(wire_model_id).map(|tier| tier.thinking_config)
+}
+
+struct CodeAssistTier {
+    thinking_config: Value,
+    omit_tool_config: bool,
+}
+
+fn antigravity_tier(wire_model_id: &str) -> Option<CodeAssistTier> {
+    // Native Argon requests use uppercase levels and omit toolConfig even with tools present.
+    // Keep that wire policy with the tier's thinking settings so admission and render agree.
+    let argon_level = match wire_model_id {
+        "gemini-4-argon-low" => Some("LOW"),
+        "gemini-4-argon-medium" => Some("MEDIUM"),
+        "gemini-4-argon-high" => Some("HIGH"),
+        _ => None,
+    };
+    if let Some(level) = argon_level {
+        return Some(CodeAssistTier {
+            thinking_config: json!({"includeThoughts": true, "thinkingLevel": level}),
+            omit_tool_config: true,
+        });
+    }
+    antigravity_thinking_config(wire_model_id).map(|thinking_config| CodeAssistTier {
+        thinking_config,
+        omit_tool_config: false,
+    })
 }
 
 fn antigravity_thinking_config(wire_model_id: &str) -> Option<Value> {

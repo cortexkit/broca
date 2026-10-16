@@ -12348,6 +12348,47 @@ old = "if now >= question.expires_at_ms {"
 new = "if now > question.expires_at_ms { // NON-VACUITY BREAK: miss the exact lapse deadline"
 
 [[control]]
+id = "code-assist-argon-tier-is-applied"
+guards = "Argon variants switch to native per-level ids rather than being admitted without a tier"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_variants"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/reasoning_variants.rs"
+expect_red = ["gated::code_assist_argon_resolves_default_and_variants_to_native_tiers"]
+file = "crates/broca-provider/src/families/google_codeassist.rs"
+old = '"gemini-4-argon-high" => Some("HIGH"),'
+new = '"gemini-4-argon-unregistered" => Some("HIGH"), // NON-VACUITY BREAK: drop the high tier'
+
+[[control]]
+id = "code-assist-variant-requires-catalog-row"
+guards = "a requested variant without a catalog row is refused rather than admitted unapplied"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_variants"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/reasoning_variants.rs"
+expect_red = ["gated::code_assist_variant_without_a_catalog_row_is_refused_but_no_variant_is_admitted"]
+file = "crates/broca-catalog/src/live.rs"
+old = 'let Some(options) = options else {'
+new = '''if options.is_none() { return Ok(()); } // NON-VACUITY BREAK: admit without applying
+    let Some(options) = options else {'''
+
+[[control]]
+id = "code-assist-variant-requires-route-tiers"
+guards = "a catalog-defined variant without Code Assist tiers is refused rather than admitted unapplied"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_variants"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/reasoning_variants.rs"
+expect_red = ["gated::code_assist_variant_on_a_model_without_tiers_is_refused"]
+file = "crates/broca-catalog/src/live.rs"
+old = 'if tiers.is_empty() {'
+new = '''if tiers.is_empty() { return Ok(()); } // NON-VACUITY BREAK: admit without applying
+    if tiers.is_empty() {'''
+
+[[control]]
 id = "retention-consent-withdraw-body-is-content-free"
 # Only the content-free withdrawal wire test runs; other `it` tests are
 # skipped, so failures unique to them will not fail this mutation proof.

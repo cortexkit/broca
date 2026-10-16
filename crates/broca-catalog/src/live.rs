@@ -25,7 +25,7 @@ pub use broca_provider::policy::{CrossModelThinking, ThinkingEchoScope};
 pub use broca_provider::service_tier::ServiceTier;
 use broca_provider::spec::{AuthKind, ReasoningOptions};
 pub use broca_provider::variant::FrozenVariant;
-use broca_provider::variant::{freeze_variant, note_variant_not_applied, resolve_variant};
+use broca_provider::variant::{freeze_variant, resolve_variant};
 use broca_provider::{live_provider_with_clock_and_refresher, ProviderHttpClient};
 // Re-exported so a consumer (the module executor) can name the resolved family for the
 // (provider, auth-method) consistency guard without depending on broca-provider directly.
@@ -93,6 +93,7 @@ const ANTIGRAVITY_TIER_ALIASES: &[(&str, &str)] = &[
     ("gemini-3.6-flash", "gemini-3.6-flash-medium"),
     ("gemini-3.7-flash", "gemini-3.7-flash-medium"),
     ("gemini-3.8-flash", "gemini-3.8-flash-medium"),
+    ("gemini-4-argon", "gemini-4-argon-medium"),
     ("gemini-3-flash", "gemini-3-flash-medium"),
     ("gemini-3-pro", "gemini-3-pro-low"),
 ];
@@ -1142,18 +1143,13 @@ fn apply_service_tier(
 /// Admit a fresh variant on Google Code Assist, where a thinking level is rendered as a backend
 /// tier id rather than as request parameters.
 ///
-/// - No catalog row for the id: admitted, recorded on the run, NOT applied, and warned once.
-///   Several Antigravity ids (e.g. `antigravity-gemini-3.5-flash`, `antigravity-gemini-3.1-pro`)
-///   have no row yet, callers already send variants to them, and refusing would stop those
-///   sends. This is the only case the exemption covers; it ends for an id once the catalog
-///   serves a row for it.
+/// - No catalog row for the id: refused because its variants cannot be known.
 /// - A name the row does not define: refused, as on every family.
 /// - A defined name with a tier of that name for the model: applied by switching the wire model
 ///   id to that tier, whose thinking settings the renderer then sends.
 /// - A defined name with no such tier: refused, naming the tiers the route does have.
 /// - A model the family has no tiers for at all (`antigravity-claude-sonnet-4-6-thinking`,
-///   served through an alias row): admitted and NOT applied, like a missing row, because this
-///   route has no way to send any level for it.
+///   served through an alias row): refused because this route cannot send any level for it.
 fn apply_code_assist_variant(
     frozen: &mut FrozenRenderConfig,
     requested: &str,
@@ -1163,12 +1159,17 @@ fn apply_code_assist_variant(
     output_limit: Option<u64>,
 ) -> Result<(), ResolutionError> {
     let Some(options) = options else {
-        note_variant_not_applied(
-            catalog_model,
-            requested,
-            "the catalog has no row for this model, so it cannot say which variants it defines",
-        );
-        return Ok(());
+        return Err(ResolutionError::VariantUnsupported(
+            broca_provider::variant::VariantRefusal {
+                model: catalog_model.into(),
+                variant: requested.into(),
+                defined: Vec::new(),
+                reason: format!(
+                    "model '{catalog_model}' cannot use variant '{requested}': the catalog has no \
+                     row for this model, so its variants cannot be known"
+                ),
+            },
+        ));
     };
     let variant = resolve_variant(
         frozen.family_id,
@@ -1181,16 +1182,28 @@ fn apply_code_assist_variant(
     .map_err(ResolutionError::VariantUnsupported)?;
     let tiers = google_codeassist_tiers(model_id);
     if tiers.is_empty() {
-        note_variant_not_applied(
-            catalog_model,
-            requested,
-            &format!(
-                "the Google Code Assist route sends a reasoning level as a backend tier id and \
-                 has no tiers for '{}'",
-                frozen.wire_model_id
-            ),
-        );
-        return Ok(());
+        return Err(ResolutionError::VariantUnsupported(
+            broca_provider::variant::VariantRefusal {
+                model: catalog_model.into(),
+                variant: requested.into(),
+                defined: broca_provider::variant::derive_variants(
+                    frozen.family_id,
+                    &frozen.wire_model_id,
+                    options,
+                    output_limit,
+                )
+                .names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                reason: format!(
+                    "model '{catalog_model}' cannot use variant '{requested}': the Google Code \
+                     Assist route sends a reasoning level as a backend tier id and has no tiers \
+                     for '{}'",
+                    frozen.wire_model_id
+                ),
+            },
+        ));
     }
     let Some(tier) = google_codeassist_tier_wire_id(model_id, &variant.name) else {
         return Err(ResolutionError::VariantUnsupported(
