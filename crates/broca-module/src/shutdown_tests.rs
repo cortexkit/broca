@@ -157,10 +157,13 @@ impl Fixture {
     }
 
     fn for_admission() -> Self {
-        // Admission assertions inspect records, not crash durability. Keep real fsyncs
-        // out of their shutdown budget; the other fixtures still exercise disk barriers.
-        // The admission tests' time limit is only a hang guard, not a disk-latency bound.
+        // Admission assertions inspect records, not crash durability.
         Self::build(false, None, false, false, None, false)
+    }
+
+    fn for_seal_records(with_index: bool) -> Self {
+        // These assertions check terminal metadata and index updates, not survival across a crash.
+        Self::build(false, None, with_index, false, None, false)
     }
 
     /// A run stopped inside a batch of two planned calls: the first was dispatched (its intent
@@ -211,8 +214,13 @@ impl Fixture {
                 poll_gate,
             }),
         );
-        let index = with_index
-            .then(|| Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap()));
+        let index = with_index.then(|| {
+            Arc::new(if fsync {
+                broca_store::SqliteStore::open(root.join("run-index.db")).unwrap()
+            } else {
+                broca_store::SqliteStore::open_in_memory().unwrap()
+            })
+        });
         if let Some(index) = &index {
             opener = opener.with_run_index(index.clone());
         }
@@ -241,17 +249,26 @@ impl Fixture {
     }
 
     async fn stop(&self) {
-        assert!(
+        let clean = broca_test_support::wait_for(
+            "shutdown seal completes",
             self.registry
-                .stop_and_seal_with_budget(Duration::ZERO, Duration::from_secs(2))
-                .await
-        );
+                .stop_and_seal_with_budget(Duration::ZERO, broca_test_support::EVENT_HANG_GUARD),
+            || {
+                format!(
+                    "slots={:?}, report={:?}",
+                    self.registry.slot_counts(),
+                    self.registry.shutdown_report()
+                )
+            },
+        )
+        .await;
+        assert!(clean, "{:?}", self.registry.shutdown_report());
         assert_eq!(self.registry.slot_counts().open, 0);
     }
 
     fn records(&self) -> Vec<WalRecord> {
-        // Reopen the file after the actor and its writer are gone, rather than inspecting a
-        // live writer's page-cache view or inferring Interrupted from a missing terminal.
+        // Read from a new file store after the actor's WAL writer is gone, rather
+        // than relying on records cached by that writer.
         FileWalStore::new(self.root.join("wal"))
             .read_records(&self.key)
             .unwrap()
@@ -291,8 +308,9 @@ async fn shutdown_seal_moves_the_index_row_off_active() {
     // counting active runs from the index would never have seen zero on that host again.
     // The seal now touches the index after the durable terminal, so the index is at worst
     // behind the WAL, never ahead of it, and never stale forever.
-    let f = Fixture::with_run_index(false);
+    let f = Fixture::for_seal_records(true);
     f.start().await;
+    let _held_physical_sync = f.wal.sync_gate.arm();
     let index = f.index.clone().expect("this fixture carries a run index");
     let before = index
         .lookup_run("shutdown-run")
@@ -326,8 +344,9 @@ async fn shutdown_seal_terminal_carries_a_timestamp() {
     // exports `occurred_at_ms: NULL`, which no period total includes, so the sealed run's
     // spend disappears from the window it occurred in. Found on the first live seal with a
     // session in flight; this arm keeps it found.
-    let f = Fixture::new(false);
+    let f = Fixture::for_seal_records(false);
     f.start().await;
+    let _held_physical_sync = f.wal.sync_gate.arm();
     f.stop().await;
     let ts_ms = f.records().into_iter().find_map(|r| match r {
         WalRecord::RunFinished { ts_ms, .. } => Some(ts_ms),
@@ -749,8 +768,8 @@ impl broca_wal::Wal for GatedSyncWal {
     }
 
     fn sync(&self) -> Result<(), broca_wal::WalError> {
-        self.gate.wait();
         if self.fsync {
+            self.gate.wait();
             self.inner.sync()
         } else {
             Ok(())

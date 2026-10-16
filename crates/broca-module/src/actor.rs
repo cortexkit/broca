@@ -6432,10 +6432,10 @@ mod tests {
         }
     }
 
-    /// An opener that wires the EndsButTerminalLost executor with real file stores.
-    pub(super) struct SeamOpener {
+    /// An actor-test opener with a real lease and a selectable WAL backend.
+    pub(super) struct SeamOpener<W: WalStore = FileWalStore> {
         pub(super) lease_store: Arc<FileLeaseStore>,
-        pub(super) wal_store: Arc<FileWalStore>,
+        pub(super) wal_store: Arc<W>,
         pub(super) idle_ttl: Duration,
         pub(super) executor: Arc<dyn RunExecutor>,
     }
@@ -6456,7 +6456,7 @@ mod tests {
     //
     // So do not "fix" the duplication by routing these through the real opener: it would couple
     // every actor test to fsync proof and re-assert, slowly, what opener.rs already pins.
-    impl LineageOpener for SeamOpener {
+    impl<W: WalStore + 'static> LineageOpener for SeamOpener<W> {
         async fn open(
             &self,
             key: &LineageKey,
@@ -6600,33 +6600,28 @@ mod tests {
     }
 
     async fn wait_for_active_step(registry: &LineageRegistry, key: &BindIdentity, expected: u64) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match registry.route_status(key).await.expect("status resolves") {
-                    LineageStatus::Active { step, .. } if step == expected => return,
-                    LineageStatus::Active { step, .. } if step < expected => {
-                        tokio::task::yield_now().await;
-                    }
-                    other => panic!("expected active step {expected}, got {other:?}"),
+        broca_test_support::wait_until("active step becomes visible", || async {
+            match registry.route_status(key).await.expect("status resolves") {
+                LineageStatus::Active { step, .. } if step == expected => Ok(()),
+                LineageStatus::Active { step, .. } if step < expected => {
+                    Err(format!("step={step}, expected={expected}"))
                 }
+                other => panic!("expected active step {expected}, got {other:?}"),
             }
         })
-        .await
-        .expect("active step becomes visible");
+        .await;
     }
 
     async fn wait_for_idle(registry: &LineageRegistry, key: &BindIdentity) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if registry.route_status(key).await.expect("status resolves") == LineageStatus::Idle
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
+        broca_test_support::wait_until("run reaches idle", || async {
+            let status = registry.route_status(key).await.expect("status resolves");
+            if status == LineageStatus::Idle {
+                Ok(())
+            } else {
+                Err(format!("status={status:?}"))
             }
         })
-        .await
-        .expect("run reaches idle");
+        .await;
     }
 
     struct RetentionDone;
@@ -6818,6 +6813,8 @@ mod tests {
         first_step_entered: Notify,
         release_first_step: Notify,
         second_step_entered: Notify,
+        second_step_pending: Notify,
+        allow_second_step: Notify,
         release_second_step: Notify,
     }
 
@@ -6827,6 +6824,8 @@ mod tests {
                 first_step_entered: Notify::new(),
                 release_first_step: Notify::new(),
                 second_step_entered: Notify::new(),
+                second_step_pending: Notify::new(),
+                allow_second_step: Notify::new(),
                 release_second_step: Notify::new(),
             }
         }
@@ -6872,6 +6871,8 @@ mod tests {
                     .await
                 }
                 2 => {
+                    self.second_step_pending.notify_one();
+                    self.allow_second_step.notified().await;
                     self.second_step_entered.notify_one();
                     self.release_second_step.notified().await;
                     Self::scripted_step(vec![
@@ -6897,7 +6898,7 @@ mod tests {
     }
 
     struct TwoStepCoreExecutor {
-        wal_store: Arc<FileWalStore>,
+        wal_store: Arc<super::wal_test_support::MemoryWalStore>,
         provider: Arc<BlockingTwoStepProvider>,
         plane: StubToolPlane,
     }
@@ -7407,6 +7408,12 @@ mod tests {
     }
 
     impl WalStore for FlakyReadWalStore {
+        fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
+            // Preserve authoritative absence so status can consult an expiry tombstone
+            // instead of trying to read a transcript that retention already deleted.
+            self.inner.wal_present(session)
+        }
+
         fn open(
             &self,
             session: &BindIdentity,
@@ -7614,7 +7621,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("proj")).unwrap();
         let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
-        let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
+        let wal_store = Arc::new(super::wal_test_support::MemoryWalStore::default());
         let provider = Arc::new(BlockingTwoStepProvider::new());
         let executor = Arc::new(TwoStepCoreExecutor {
             wal_store: wal_store.clone(),
@@ -7642,26 +7649,59 @@ mod tests {
             .route_send(&key, request, RunKind::FreshOrResume)
             .await
             .expect("send is admitted");
-        tokio::time::timeout(
-            Duration::from_secs(1),
+        broca_test_support::wait_for(
+            "provider enters step one",
             provider.first_step_entered.notified(),
+            || format!("slots={:?}", registry.slot_counts()),
         )
-        .await
-        .expect("provider enters step one");
+        .await;
         wait_for_active_step(&registry, &key, 1).await;
 
         provider.release_first_step.notify_one();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            provider.second_step_entered.notified(),
+        broca_test_support::wait_for(
+            "second step is pending",
+            provider.second_step_pending.notified(),
+            || format!("slots={:?}", registry.slot_counts()),
         )
-        .await
-        .expect("provider enters step two");
+        .await;
+        let entered = broca_test_support::wait_for(
+            "provider enters step two",
+            provider.second_step_entered.notified(),
+            || format!("slots={:?}", registry.slot_counts()),
+        );
+        tokio::pin!(entered);
+        assert!(futures::poll!(&mut entered).is_pending());
+        // Force a scheduler-sized gap without CPU load or disk delays. Entry is an
+        // event, so the wait must survive the former one-second latency assumption.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        provider.allow_second_step.notify_one();
+        entered.await;
         wait_for_active_step(&registry, &key, 2).await;
 
         provider.release_second_step.notify_one();
         wait_for_idle(&registry, &key).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct HeldRetentionCompletion {
+        completed: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl RunExecutor for HeldRetentionCompletion {
+        async fn execute(
+            &self,
+            job: RunJob,
+            out: mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            let result = RetentionDone.execute(job, out).await;
+            self.completed.notify_one();
+            self.release.notified().await;
+            result
+        }
     }
 
     #[tokio::test]
@@ -7676,11 +7716,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("proj")).unwrap();
         let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
+        let executor = Arc::new(HeldRetentionCompletion {
+            completed: Notify::new(),
+            release: Notify::new(),
+        });
         let opener = Arc::new(SeamOpener {
             lease_store: Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal_store: Arc::new(FileWalStore::new(dir.join("wal"))),
+            wal_store: Arc::new(super::wal_test_support::MemoryWalStore::default()),
             idle_ttl: Duration::from_secs(60),
-            executor: Arc::new(RetentionDone),
+            executor: executor.clone(),
         });
         let registry = LineageRegistry::new(opener);
 
@@ -7695,7 +7739,22 @@ mod tests {
                 .await
                 .expect("route large request");
             assert!(matches!(outcome, SendOutcome::Active { .. }));
-            wait_for_idle(&registry, &key).await;
+            broca_test_support::wait_for(
+                "executor records terminal",
+                executor.completed.notified(),
+                || format!("slots={:?}", registry.slot_counts()),
+            )
+            .await;
+            let idle = wait_for_idle(&registry, &key);
+            tokio::pin!(idle);
+            assert!(futures::poll!(&mut idle).is_pending());
+            // Completion delivery can lag the terminal. Retained-identity assertions
+            // must not impose a one-second scheduler deadline on that delivery.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::time::resume();
+            executor.release.notify_one();
+            idle.await;
         }
 
         let handle = registry.actor_for(&key).await.expect("actor remains open");
@@ -7708,7 +7767,11 @@ mod tests {
             "inspect retained admission identities"
         );
         let (retained_runs, retained_bytes) =
-            rx.await.expect("actor reports retained identity state");
+            broca_test_support::wait_for("actor reports retained identity state", rx, || {
+                format!("slots={:?}", registry.slot_counts())
+            })
+            .await
+            .expect("actor reports retained identity state");
         assert_eq!(
             retained_runs, EPISODES,
             "every admission retains an identity"
@@ -9739,6 +9802,10 @@ mod pre_user;
 #[cfg(test)]
 #[path = "pre_user_tests.rs"]
 mod pre_user_tests;
+
+#[cfg(test)]
+#[path = "wal_test_support.rs"]
+mod wal_test_support;
 
 #[cfg(test)]
 #[path = "sealed_attempt_tests.rs"]
