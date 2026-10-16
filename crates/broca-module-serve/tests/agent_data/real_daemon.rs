@@ -178,8 +178,14 @@ impl Live {
         std::fs::write(&script,format!("#!/bin/sh\nexec '{quoted}' --exact real_daemon::supervised_fake_session_door --ignored --nocapture\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let config_file = config.join("cortexkit/subc.jsonc");
+        // Launch broca under its dev name, as every test rig does, never the production
+        // `ck-broca` name that operator tools and process lists treat as the live module.
+        let broca = broca_test_support::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-broca"),
+            broca_test_support::scratch_root(),
+        );
         std::fs::write(&config_file,serde_json::to_vec_pretty(&json!({"version":1,"modules":{
-            "broca":{"program":env!("CARGO_BIN_EXE_ck-broca"),"args":[],"enabled":true,"reserved":true,"env":{
+            "broca":{"program":broca,"args":[],"enabled":true,"reserved":true,"env":{
                 "BROCA_STATE_ROOT":rig.root,"BROCA_PROVIDER_BASE_URL":"http://127.0.0.1:9","XDG_DATA_HOME":data}},
             "entorhinal":{"program":fake_bin,"args":[],"enabled":true,"reserved":true,"env":{
                 "FAKE_AFT_MODULE_ID":"entorhinal","FAKE_AFT_LAUNCH_NONCE_PATH":nonce}},
