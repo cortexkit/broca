@@ -29,9 +29,13 @@ fn tracked_descriptor() -> serde_json::Value {
 
 /// The backup descriptor declares seven entries. Engram includes only `portable` entries in
 /// each backup generation; `rebuild`, `device-local` and `excluded` entries are left out.
-/// Forever transcripts are portable in `wal/` and `wal-archive/`. Retention transcripts in
-/// `wal-ephemeral/` are `excluded`, with a stated reason: deleting a live WAL cannot remove a
-/// backup that already holds it, so a retained session must never be captured.
+/// Only durable sessions are backed up, and none live in today's trees: `wal/` and
+/// `wal-archive/` hold sidekicks, one-shots, consults, masons and other modules' sessions,
+/// which their creators relaunch rather than restore, so both are `excluded`. Retention
+/// transcripts in `wal-ephemeral/` are `excluded` too: deleting a live WAL cannot remove a
+/// backup that already holds it, so a retained session must never be captured. Billing does
+/// not depend on these trees surviving a disk loss: astrocyte ingests every export fact into
+/// its own backed-up store within seconds.
 #[test]
 fn the_tracked_descriptor_declares_brocas_seven_entries_with_their_classes() {
     let d = tracked_descriptor();
@@ -66,8 +70,8 @@ fn the_tracked_descriptor_declares_brocas_seven_entries_with_their_classes() {
         ("broca/leases", "device-local", "filetree"),
         ("broca/request-dumps", "device-local", "filetree"),
         ("broca/run-index", "rebuild", "whole-db"),
-        ("broca/session-archive", "portable", "filetree"),
-        ("broca/session-wals", "portable", "filetree"),
+        ("broca/session-archive", "excluded", "filetree"),
+        ("broca/session-wals", "excluded", "filetree"),
     ]
     .iter()
     .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
@@ -81,20 +85,16 @@ fn the_tracked_descriptor_declares_brocas_seven_entries_with_their_classes() {
     );
 
     // The captured set, stated as its own assertion because it is the fact a machine-loss
-    // runbook depends on: a folded session lives only in `wal-archive/`, so leaving that tree
-    // out of the captured set leaves every session older than the fold window without an
-    // off-machine copy.
-    let mut portable: Vec<&str> = entries
+    // runbook depends on. It is empty until durable sessions get a tree of their own; a
+    // session tree turning portable again would back up thousands of single-use sessions.
+    let portable: Vec<&str> = entries
         .iter()
         .filter(|e| e["class"] == "portable")
         .filter_map(|e| e["entry_id"].as_str())
         .collect();
-    portable.sort();
-    assert_eq!(
-        portable,
-        vec!["broca/session-archive", "broca/session-wals"],
-        "the captured set changed; a machine-loss recovery would restore something the \
-         contract does not describe, or miss transcripts that live in only one of these trees"
+    assert!(
+        portable.is_empty(),
+        "the captured set changed to {portable:?}; only a durable-session tree may be portable"
     );
     for (id, path) in [
         ("broca/session-wals", "wal"),

@@ -3,17 +3,18 @@
   "module_id": "broca",
   "entries": [
     {
-      "entry_id": "broca/session-wals",
-      "class": "portable",
-      "mechanism": "filetree",
-      "path": "wal",
-      "cursor_authority": "seq"
+            "entry_id": "broca/session-wals",
+            "class": "excluded",
+            "mechanism": "filetree",
+            "path": "wal",
+            "reason": "non-durable sessions (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, and none live in this tree"
     },
     {
-      "entry_id": "broca/session-archive",
-      "class": "portable",
-      "mechanism": "filetree",
-      "path": "wal-archive"
+            "entry_id": "broca/session-archive",
+            "class": "excluded",
+            "mechanism": "filetree",
+            "path": "wal-archive",
+            "reason": "folded non-durable sessions from wal/; only sessions marked durable are backed up, and none live in this tree"
     },
     {
       "entry_id": "broca/ephemeral-wals",
