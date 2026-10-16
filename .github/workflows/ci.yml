@@ -133,6 +133,11 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
         run: bash scripts/ci-integration.sh build "$RUNNER_TEMP/integration.tar.zst"
+      # Asks nextest which tests the Linux preflight selects, so it runs here where nextest and
+      # the freshly built test binaries already exist, not in the operator scripts job.
+      - name: Linux preflight excludes every rig-dependent test
+        if: matrix.os == 'ubuntu'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-portable-test-selection.py
       - name: Cargo cache telemetry
         run: echo "Archive cache exact hit = ${{ steps.cargo-cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

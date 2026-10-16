@@ -192,6 +192,16 @@ fi
 ./scripts/rust-test-gate.sh --prewarm "$@" >>"$LOG" 2>&1
 EXIT=$?
 
+# The Linux preflight's exclusion list must cover every rig-dependent test. The check asks
+# nextest which tests the filter selects, so it needs the test binaries the run above just
+# built; that is why it runs here and not with the operator script suites. CI runs it in the
+# Ubuntu archive job for the same reason.
+if [ "$EXIT" -eq 0 ]; then
+    echo "==> portable preflight selection check"
+    PYTHONDONTWRITEBYTECODE=1 "${BROCA_SUITES_PYTHON:-python3}" scripts/test-portable-test-selection.py >>"$LOG" 2>&1
+    EXIT=$?
+fi
+
 echo "==> gate exit: $EXIT"
 if [ "$EXIT" -ne 0 ]; then
     echo "==> failure region (last error in log):"
