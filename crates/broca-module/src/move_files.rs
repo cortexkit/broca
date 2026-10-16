@@ -833,9 +833,35 @@ impl CutArtifacts for FileCutArtifacts {
                     &cut_id,
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),
-                    |session| self.driver.drop_projection(session),
+                    |session| {
+                        let plan = locked
+                            .plans
+                            .iter()
+                            .find(|plan| &plan.session == session)
+                            .ok_or_else(|| "installed session has no move plan".to_owned())?;
+                        let range = broca_wal::file_wal::read_verified_member_range(
+                            &plan.bytes,
+                            0,
+                            0,
+                            None,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+                            return Err(
+                                "installed move WAL has incomplete identity records".to_owned()
+                            );
+                        };
+                        self.wal
+                            .publish_move_records(&broca_core::session_addr(session), records);
+                        self.driver.drop_projection(session)
+                    },
                 )
-                .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;
+                .map_err(|e| {
+                    self.wal.invalidate_move_inventory(format!(
+                        "cut {cut_id} installation did not complete"
+                    ));
+                    self.install_error(&cut_id, _state, &locked, e)
+                })?;
             }
             Op::Abort => {
                 self.rollback(request, _state).await?;

@@ -13672,33 +13672,21 @@ new = '''#[serde(default)] // NON-VACUITY BREAK: accept unrecoverable old author
 
 [[control]]
 id = "agent-data-partial-address-inventory"
-guards = "participant discovery isolates unreadable inventory locations while ordinary inventory remains strict"
+guards = "participant lookup preserves known refs beside unreadable WALs and ambiguous addresses while ordinary inventory remains strict"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test agent_data"
 features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
-expect_red = ["discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed"]
-only = false
-file = "crates/broca-core/src/wal_writer.rs"
-old = 'self.address_inventory(true)'
-new = 'self.address_inventory(false) /* NON-VACUITY BREAK: one bad location blocks all discovery */'
-
-[[control]]
-id = "agent-data-discovery-skips-unreadable-wals"
-guards = "an unreadable WAL is logged and isolated instead of failing every requested ref"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--test agent_data"
-features = ["test-clock"]
-test_file = "crates/broca-module-serve/tests/agent_data.rs"
-expect_red = ["divergence_is_per_ref_when_one_held_wal_is_unreadable"]
+expect_red = ["discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed", "divergence_is_per_ref_when_one_held_wal_is_unreadable"]
 only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
-old = '''inventory.unreadable.push(address);
-                    continue;'''
-new = '''inventory.unreadable.push(address);
-                    return Err(unavailable("NON-VACUITY BREAK: fail the whole scan"));'''
+old = '''            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));'''
+new = '''            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));
+        // NON-VACUITY BREAK: one unreadable location blocks even known refs.
+        if !inventory.unreadable.is_empty() {
+            return SessionInventory { sessions: BTreeMap::new(), unreadable: inventory.unreadable };
+        }'''
 
 [[control]]
 id = "agent-data-activation-digest-never-outage"
@@ -13948,3 +13936,39 @@ expect_red = ["optional_tool_has_own_budget"]
 file = "crates/broca-fetch-plan/src/admit.rs"
 old = "deadline.min(started + OPTIONAL_TOOL_BUDGET)"
 new = "deadline /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "agent-data-named-ref-no-full-scan"
+guards = "a busy probe reads only its named WAL after boot inventory publication"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::busy_one_ref_reads_only_its_wal_after_inventory_build"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = '''    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
+'''
+new = '''    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
+        // NON-VACUITY BREAK: restore request-time full WAL discovery.
+        for address in self.wal.move_addresses().unwrap().0 {
+            let _ = self.wal.read_address_records_for_move(&address);
+        }
+'''
+
+[[control]]
+id = "agent-data-incomplete-inventory-is-unknown"
+guards = "an inventory that has not completed cannot prove an unresolved ref is absent"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::incomplete_inventory_is_unknown_until_boot_build_finishes"]
+only = false
+file = "crates/broca-core/src/wal_writer/move_inventory.rs"
+old = '''        if !state.finished {
+'''
+new = '''        if false { // NON-VACUITY BREAK: claim a still-building inventory is complete.
+'''
