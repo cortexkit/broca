@@ -2754,6 +2754,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "retention_unreadable_sessions",
         "retention_repairs_pending",
         "agent_data_ops",
+        "agent_data_inventory",
     ]
     .into_iter()
     .collect();
@@ -2810,6 +2811,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "import":0,"release":0,"activate":0,"abort":0,"status":0
         })
     );
+    // Null here: this in-process rig wires no agent-data service, so no move inventory is
+    // built. On the real daemon it reads `{ready, unreadable}`; agent_data's inventory tests
+    // assert those values, including `unreadable` staying zero once a build completes.
+    assert_eq!(metrics["agent_data_inventory"], serde_json::Value::Null);
     // The counter lock keeps the stale-frame sibling out during this interval. Equal readings
     // show that this rig's health probe and valid route request did not drop a frame, while the
     // unsigned values above ensure each metric remains present when its process count is zero.
