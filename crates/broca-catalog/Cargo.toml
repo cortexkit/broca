@@ -30,6 +30,7 @@ broca-core = { path = "../broca-core", optional = true }
 base64 = { version = "0.22", optional = true }
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 # build.rs validates the vendored snapshot parses at build time (fails the build,

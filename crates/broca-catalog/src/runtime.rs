@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
 use broca_provider::spec::{
     Capabilities, CapabilityFlag, CostSchedule, CostTier, Limits, ModelSpec, Overlay, ProviderSpec,
@@ -1198,6 +1199,28 @@ impl CatalogCache {
     /// response as the LKG. A persistence failure leaves the prior document in place, because a
     /// refresh that cannot survive restart is not yet last-known-good.
     pub fn refresh(&self, response: FusiformCatalogResponse) -> Result<(), CatalogRefreshError> {
+        self.refresh_with_poll_summary(response, None)
+    }
+
+    /// Refresh the cache after a complete poll, carrying the poll start time and page count so the
+    /// success record is emitted beside the refusal-counter update below.
+    pub fn refresh_polled(
+        &self,
+        response: FusiformCatalogResponse,
+        page_count: usize,
+        poll_started: Instant,
+    ) -> Result<(), CatalogRefreshError> {
+        self.refresh_with_poll_summary(response, Some((page_count, poll_started)))
+    }
+
+    fn refresh_with_poll_summary(
+        &self,
+        response: FusiformCatalogResponse,
+        poll_summary: Option<(usize, Instant)>,
+    ) -> Result<(), CatalogRefreshError> {
+        let catalog_version = response.catalog_version;
+        let resolved_at_ms = response.resolved_at_ms;
+        let model_count = response.models.len();
         let outcome = self.refresh_inner(response);
         // Recorded here rather than at each return so a future arm cannot forget it: the whole
         // point is distinguishing a poll that missed once from one that will never succeed.
@@ -1214,6 +1237,22 @@ impl CatalogCache {
                     .write()
                     .expect("catalog refusal lock poisoned");
                 *total = total.saturating_add(1);
+            }
+        }
+        drop(refusals);
+        if outcome.is_ok() {
+            if let Some((page_count, poll_started)) = poll_summary {
+                let elapsed_ms =
+                    u64::try_from(poll_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(
+                    target: "catalog",
+                    "fusiform catalog refresh succeeded pages={} catalog_version={} resolved_at_ms={} models={} elapsed_ms={}",
+                    page_count,
+                    catalog_version,
+                    resolved_at_ms,
+                    model_count,
+                    elapsed_ms,
+                );
             }
         }
         outcome
