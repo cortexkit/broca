@@ -3055,7 +3055,7 @@ new = "!matches!(phase, Phase::AwaitFrame | Phase::Idle) && false && reader_age 
 
 [[control]]
 id = "idle-wal-writers-do-not-starve-blocking-pool"
-guards = "resident WAL writers leave Tokio's blocking pool available for finite work and DNS"
+guards = "started resident WAL writers leave Tokio's blocking pool available for finite work and DNS"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"

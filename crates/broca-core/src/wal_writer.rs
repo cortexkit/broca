@@ -2355,13 +2355,14 @@ mod tests {
 
     #[test]
     fn idle_writers_leave_tiny_blocking_pool_available_for_jobs_and_dns() {
+        const BLOCKING_THREADS: usize = 2;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .max_blocking_threads(2)
+            .max_blocking_threads(BLOCKING_THREADS)
             .build()
             .unwrap();
         runtime.block_on(async {
-            let handles: Vec<_> = (0..8)
+            let handles: Vec<_> = (0..BLOCKING_THREADS)
                 .map(|_| {
                     WalHandle::spawn(
                         Box::new(CountingWal {
@@ -2375,6 +2376,17 @@ mod tests {
                 .collect();
 
             let bound = std::time::Duration::from_secs(2);
+            // Spawning a thread does not mean its writer loop has started. Acknowledge
+            // one barrier per pool slot before probing: if writers use the shared pool,
+            // every slot is now occupied until shutdown, regardless of scheduling order.
+            // More writers than slots would deadlock this readiness check in that case.
+            let ready = tokio::time::timeout(bound, async {
+                for handle in &handles {
+                    handle.sync().await?;
+                }
+                Ok::<_, WalWriteError>(())
+            })
+            .await;
             let (job, dns) = tokio::join!(
                 tokio::time::timeout(bound, tokio::task::spawn_blocking(|| 42)),
                 tokio::time::timeout(bound, tokio::net::lookup_host("localhost:80")),
@@ -2390,6 +2402,9 @@ mod tests {
                 let _ = handle.shutdown().await;
             }
 
+            ready
+                .expect("WAL writers did not acknowledge startup barriers")
+                .unwrap();
             assert_eq!(
                 job.expect("idle WAL writers starved a finite blocking job")
                     .unwrap(),
