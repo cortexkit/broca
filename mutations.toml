@@ -14125,3 +14125,53 @@ expect_red = ["wal_writer::move_inventory::persistent::tests::unsealed_archive_c
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = 'return Err(invalid("inventory archive is not sealed yet"));'
 new = 'return Ok(Vec::new()); // NON-VACUITY BREAK: silently skip the only copy.'
+
+[[control]]
+id = "agent-data-inventory-accepts-append-only-growth"
+guards = "a live append during a scan preserves the validated stamped prefix"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::append_during_scan_keeps_only_the_stamped_strict_prefix"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "if after != source && !grew {"
+new = "if after != source { // NON-VACUITY BREAK: reject ordinary append-only growth."
+
+[[control]]
+id = "agent-data-inventory-clips-stamped-prefix"
+guards = "frames appended past the stamped length never enter that cache prefix or sequence anchor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::append_during_scan_keeps_only_the_stamped_strict_prefix"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "if anchor.is_some_and(|anchor| anchor.byte_end > stamp.len) {"
+new = "if false { // NON-VACUITY BREAK: cache beyond the stamped prefix."
+
+[[control]]
+id = "agent-data-inventory-retries-changed-addresses"
+guards = "a changed archive address is re-resolved a bounded number of times"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::changed_archive_stamp_is_reresolved_before_giving_up"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "|| attempt == 2"
+new = "|| attempt == 0 // NON-VACUITY BREAK: never retry a changed address.\n"
+
+[[control]]
+id = "agent-data-inventory-final-failure-pass"
+guards = "transient failures get a final census and scan after other boot work"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
+expect_red = ["wal_writer::move_inventory::persistent::tests::final_pass_recovers_a_transiently_unreadable_address"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "if inventory.unreadable.is_empty() || pass == 1 {"
+new = "if true { // NON-VACUITY BREAK: omit the end-of-build failure pass."

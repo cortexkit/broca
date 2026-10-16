@@ -102,6 +102,10 @@ fn invalid(message: &str) -> WalError {
     WalError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
+fn changed(message: &str) -> WalError {
+    WalError::Io(io::Error::new(io::ErrorKind::WouldBlock, message))
+}
+
 fn cache_path(store: &FileWalStore) -> PathBuf {
     store.root.with_file_name("move-inventory.json")
 }
@@ -445,7 +449,7 @@ fn archive_locations(
                     .collect(),
             };
             if stamp != FileStamp::at(&path)? {
-                return Err(invalid("archive changed during inventory"));
+                return Err(changed("archive changed during inventory"));
             }
             Ok(entries)
         })();
@@ -473,22 +477,55 @@ fn scan_address(
     old: Option<&CachedAddress>,
     stats: &mut MoveInventoryBuildStats,
 ) -> Result<Option<CachedAddress>, WalError> {
+    let mut source = source;
+    for attempt in 0..3 {
+        cancelled(cancel)?;
+        let result = scan_address_once(store, cancel, address, source, old, stats);
+        if !matches!(&result, Err(WalError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            || attempt == 2
+        {
+            return result;
+        }
+        let Some(current) = resolve_address(store, cancel, address, stats)? else {
+            return Ok(None);
+        };
+        source = current;
+    }
+    unreachable!("bounded scan always returns on its final attempt")
+}
+
+fn resolve_address(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    address: &str,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<Option<Source>, WalError> {
+    let mut unreadable = Vec::new();
+    let mut current = locations(store, cancel, &mut unreadable, stats)?;
+    if !unreadable.is_empty() {
+        return Err(invalid(&format!(
+            "cannot re-resolve inventory address: {}",
+            unreadable.join(", ")
+        )));
+    }
+    Ok(current.remove(address))
+}
+
+fn scan_address_once(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    address: &str,
+    source: Source,
+    old: Option<&CachedAddress>,
+    stats: &mut MoveInventoryBuildStats,
+) -> Result<Option<CachedAddress>, WalError> {
     match scan(store, address, source, old, stats) {
         Ok(entry) => Ok(Some(entry)),
         Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             // A fold or activation can remove the enumerated path. Re-resolve
             // live first, then the newest archive; only a complete census can
             // prove that an address now has no bytes anywhere.
-            let mut unreadable = Vec::new();
-            let mut current = locations(store, cancel, &mut unreadable, stats)?;
-            if !unreadable.is_empty() {
-                return Err(invalid(&format!(
-                    "cannot re-resolve inventory address: {}",
-                    unreadable.join(", ")
-                )));
-            }
-            current
-                .remove(address)
+            resolve_address(store, cancel, address, stats)?
                 .map(|source| scan(store, address, source, old, stats))
                 .transpose()
         }
@@ -544,6 +581,17 @@ fn scan(
     old: Option<&CachedAddress>,
     stats: &mut MoveInventoryBuildStats,
 ) -> Result<CachedAddress, WalError> {
+    scan_after_stamp(store, address, location, old, stats, || {})
+}
+
+fn scan_after_stamp(
+    store: &FileWalStore,
+    address: &str,
+    location: Source,
+    old: Option<&CachedAddress>,
+    stats: &mut MoveInventoryBuildStats,
+    after_stamp: impl FnOnce(),
+) -> Result<CachedAddress, WalError> {
     if address.len() != 16 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid("invalid inventory WAL address"));
     }
@@ -565,6 +613,7 @@ fn scan(
         stats.reused += 1;
         return Ok(old.clone());
     }
+    after_stamp();
     let mut triples = Vec::new();
     let (committed_end, last_seq) = match &source {
         Source::Live {
@@ -617,25 +666,41 @@ fn scan(
                     .as_ref()
                     .is_some_and(|expected| id.to_string() != *expected)
             }) {
-                return Err(invalid("inventory WAL lineage changed during read"));
+                return Err(changed("inventory WAL lineage changed during read"));
             }
-            add_records(&mut triples, address, &range)?;
-            if FileStamp::at(path)? != *stamp {
-                return Err(invalid("WAL changed during inventory read"));
+            let after = live_source(path.clone(), stats)?;
+            let grew = matches!(&after, Source::Live { stamp: later, .. }
+                if later.len > stamp.len && same_live_lineage(&source, &after));
+            if after != source && !grew {
+                return Err(changed("WAL changed during inventory read"));
             }
-            let last_seq = match range.records() {
-                WalRangeRecords::Complete(records) => records
-                    .last()
-                    .map(|frame| frame.seq)
-                    .or_else(|| suffix.map(|old| old.last_seq))
-                    .unwrap_or(0),
-                _ => 0,
+            let WalRangeRecords::Complete(records) = range.records() else {
+                return Err(invalid("inventory WAL records are incomplete"));
             };
-            let end = if *sealed_tail {
-                stamp.len
-            } else {
-                range.next_anchor.map_or(0, |anchor| anchor.byte_end)
-            };
+            let mut last_seq = suffix.map_or(0, |old| old.last_seq);
+            let mut end = suffix.map_or(0, |old| old.committed_end);
+            // A growing append-only WAL still proves its stamped prefix. Only
+            // retain frames ending at strict anchors within that prefix; later
+            // in-process RunStarted appends publish their own candidates.
+            for frame in records {
+                let anchor = range.anchor_at(frame.seq);
+                if grew && anchor.is_none() {
+                    return Err(changed("growing inventory WAL has no strict byte anchors"));
+                }
+                if anchor.is_some_and(|anchor| anchor.byte_end > stamp.len) {
+                    break;
+                }
+                if let WalRecord::RunStarted { session, .. } = &frame.record {
+                    if session_addr(session) == address && !triples.contains(session) {
+                        triples.push(session.clone());
+                    }
+                }
+                last_seq = frame.seq;
+                end = anchor.map_or(0, |anchor| anchor.byte_end);
+            }
+            if *sealed_tail {
+                end = stamp.len;
+            }
             (end, last_seq)
         }
         Source::Archive {
@@ -655,7 +720,7 @@ fn scan(
             let range = file_wal::read_verified_member_range(&member.payload, 0, 0, None)?;
             add_records(&mut triples, address, &range)?;
             if FileStamp::at(path)? != *stamp {
-                return Err(invalid("archive changed during inventory read"));
+                return Err(changed("archive changed during inventory read"));
             }
             (
                 *payload_len,
@@ -672,6 +737,14 @@ fn scan(
 }
 
 pub(super) fn build(store: &FileWalStore, cancel: &CancellationToken) {
+    build_after_pass(store, cancel, |_| {})
+}
+
+fn build_after_pass(
+    store: &FileWalStore,
+    cancel: &CancellationToken,
+    mut after_pass: impl FnMut(usize),
+) {
     let start = std::time::Instant::now();
     let mut stats = MoveInventoryBuildStats::default();
     let cached = load(store, &mut stats);
@@ -679,41 +752,53 @@ pub(super) fn build(store: &FileWalStore, cancel: &CancellationToken) {
     let mut next_cache = BTreeMap::new();
     // The cache never defines which addresses exist. Every boot enumerates the
     // current roots/indexes, including locations absent from the previous cache.
-    match locations(store, cancel, &mut inventory.unreadable, &mut stats) {
-        Ok(locations) => {
-            for (address, source) in locations {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                let work = std::time::Instant::now();
-                let reads_before = stats.payload_reads;
-                match scan_address(
-                    store,
-                    cancel,
-                    &address,
-                    source,
-                    cached.get(&address),
-                    &mut stats,
-                ) {
-                    Ok(Some(entry)) => {
-                        for session in &entry.triples {
-                            insert(&mut inventory, &address, session);
+    for pass in 0..2 {
+        match locations(store, cancel, &mut inventory.unreadable, &mut stats) {
+            Ok(locations) => {
+                for (address, source) in locations {
+                    if next_cache.contains_key(&address) {
+                        continue;
+                    }
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let work = std::time::Instant::now();
+                    let reads_before = stats.payload_reads;
+                    match scan_address(
+                        store,
+                        cancel,
+                        &address,
+                        source,
+                        cached.get(&address),
+                        &mut stats,
+                    ) {
+                        Ok(Some(entry)) => {
+                            for session in &entry.triples {
+                                insert(&mut inventory, &address, session);
+                            }
+                            next_cache.insert(address, entry);
                         }
-                        next_cache.insert(address, entry);
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::error!(address, %error, "move inventory cannot read WAL");
+                            inventory.unreadable.push(address);
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::error!(address, %error, "move inventory cannot read WAL");
-                        inventory.unreadable.push(address);
+                    if stats.payload_reads != reads_before {
+                        pacing::after_payload(work.elapsed(), cancel);
                     }
+                    std::thread::yield_now();
                 }
-                if stats.payload_reads != reads_before {
-                    pacing::after_payload(work.elapsed(), cancel);
-                }
-                std::thread::yield_now();
             }
+            Err(error) => inventory.unreadable.push(error.to_string()),
         }
-        Err(error) => inventory.unreadable.push(error.to_string()),
+        after_pass(pass);
+        if inventory.unreadable.is_empty() || pass == 1 {
+            break;
+        }
+        // Retry failures once after the other addresses have been scanned. A fresh
+        // census also finds members of an archive that was being sealed earlier.
+        inventory.unreadable.clear();
     }
     if cancel.is_cancelled() {
         return;

@@ -118,6 +118,60 @@ async fn grown_wal_scans_only_from_its_cached_committed_end() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn appending_writer_during_cold_build_finishes_complete() {
+    let mut rig = Rig::new("persistent-growing-build", Arc::new(FakeDoor::default()));
+    for i in 0..64 {
+        rig.seed(&rig.session(&format!("small-{i}")), "run", true);
+    }
+    let session = rig.session("active");
+    rig.seed(&session, "active-run", false);
+    let record = WalRecord::RunFinished {
+        reason: broca_protocol::RunFinishReason::Completed,
+        ts_ms: None,
+        usage: Default::default(),
+        error: None,
+        retries_used: 0,
+    };
+    let mut wal = rig.wal.open(&session).unwrap();
+    for _ in 0..20_000 {
+        wal.append(1, &record, false).unwrap();
+    }
+    wal.sync().unwrap();
+    drop(wal);
+    restart(&mut rig);
+    let mut wal = rig.wal.open(&session).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        wal.append(1, &record, false).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut appends = 1;
+        while !writer_stop.load(Ordering::Relaxed) {
+            wal.append(1, &record, false).unwrap();
+            appends += 1;
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        appends
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rig.service.wait_inventory(),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let appends = writer.join().unwrap();
+    result.expect("cold inventory must finish while the writer keeps appending");
+    assert!(appends > 1);
+    assert_eq!(rig.wal.move_inventory_health(), (true, 0));
+    assert_eq!(cached_refs(&rig, &session), 1);
+}
+
+#[tokio::test]
 async fn replaced_wal_lineage_is_rescanned_instead_of_reusing_identities() {
     let mut rig = Rig::new(
         "persistent-inventory-replacement",
@@ -225,6 +279,13 @@ async fn cached_wal_that_becomes_unreadable_cannot_prove_absence() {
             .await
             .unwrap()["refs"][0]["state"],
         "unknown"
+    );
+    wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
+        .await;
+    let health: Value = serde_json::from_slice(&wire.next().await.body).unwrap();
+    assert_eq!(
+        health["metrics"]["agent_data_inventory"],
+        json!({"ready":true,"unreadable":1})
     );
 }
 
