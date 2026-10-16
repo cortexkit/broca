@@ -4,6 +4,11 @@ use broca_protocol::{BindIdentity, BindPrincipal, SessionScope};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+// CROSS JOIN fixes the outer loop at the small live-retention inventory. An
+// ordinary JOIN can scan every run (and its large session row) even when there
+// are no retained lineages, on every sweep and clock-change notification.
+const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1";
+
 /// BindPrincipal::Unknown preserves arbitrary JSON from later WAL writers. Retention
 /// accepts only recognized principal identity fields to avoid keeping transcript content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +192,7 @@ impl SqliteStore {
 
     pub fn retention_lineages_with_discovery(&self) -> Result<Vec<BindIdentity>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id WHERE r.withdrawals_owed=1 AND l.expired_at_ms IS NULL")?;
+        let mut stmt = conn.prepare(DISCOVERY_SQL)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
@@ -218,6 +223,80 @@ pub(crate) fn write_questions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_run(
+        conn: &rusqlite::Connection,
+        run: &str,
+        session: &str,
+        lineage: Option<&str>,
+        owed: bool,
+    ) {
+        conn.execute("INSERT INTO run_index (run_id, session, state, lineage_id, withdrawals_owed) VALUES (?1, ?2, 'finished', ?3, ?4)", params![run, session, lineage, owed]).unwrap();
+    }
+
+    #[test]
+    fn discovery_without_live_retention_does_not_scan_runs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let session = serde_json::to_string(&BindIdentity::new("/p", "h", "s")).unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..4000 {
+            insert_run(
+                &conn,
+                &format!("run-{i}"),
+                &session,
+                Some("ordinary-lineage"),
+                true,
+            );
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        for expired_only in [false, true] {
+            if expired_only {
+                conn.execute("INSERT INTO retention_lineage VALUES ('expired', 'expired-session', 1, 0, 1, 0, 2)", []).unwrap();
+            }
+            let mut stmt = conn.prepare(DISCOVERY_SQL).unwrap();
+            assert!(stmt.query([]).unwrap().next().unwrap().is_none());
+            assert_eq!(
+                stmt.get_status(rusqlite::StatementStatus::FullscanStep),
+                0,
+                "no live retention must not walk run_index"
+            );
+            assert!(
+                stmt.get_status(rusqlite::StatementStatus::VmStep) < 100,
+                "empty live retention must use constant query work"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_matches_owed_runs_of_live_lineages_only() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let a = BindIdentity::new("/p", "h", "a");
+        let b = BindIdentity::new("/p", "h", "b");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("INSERT INTO retention_lineage VALUES ('live', 'not-run-json', 1, 0, 1, 0, NULL), ('expired', 'old-session', 1, 0, 1, 0, 2)", []).unwrap();
+            let a = serde_json::to_string(&a).unwrap();
+            let b = serde_json::to_string(&b).unwrap();
+            let not_owed =
+                serde_json::to_string(&BindIdentity::new("/p", "h", "not-owed")).unwrap();
+            let expired = serde_json::to_string(&BindIdentity::new("/p", "h", "expired")).unwrap();
+            let unknown = serde_json::to_string(&BindIdentity::new("/p", "h", "unknown")).unwrap();
+            for (run, session, lineage, owed) in [
+                ("a1", &a, Some("live"), true),
+                ("a2", &a, Some("live"), true),
+                ("b", &b, Some("live"), true),
+                ("not-owed", &not_owed, Some("live"), false),
+                ("expired", &expired, Some("expired"), true),
+                ("unknown", &unknown, None, true),
+            ] {
+                insert_run(&conn, run, session, lineage, owed);
+            }
+        }
+        let mut actual = store.retention_lineages_with_discovery().unwrap();
+        actual.sort_by(|a, b| a.session.cmp(&b.session));
+        assert_eq!(actual, vec![a, b]);
+    }
 
     #[test]
     fn retention_scope_round_trips_only_known_principal_identities() {

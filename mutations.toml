@@ -13972,3 +13972,16 @@ old = '''        if !state.finished {
 '''
 new = '''        if false { // NON-VACUITY BREAK: claim a still-building inventory is complete.
 '''
+
+[[control]]
+id = "retention-discovery-live-lineages-before-runs"
+guards = "empty or expired-only retention inventory cannot scan the ordinary run index"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention_withdrawals.rs"
+expect_red = ["retention_withdrawals::tests::discovery_without_live_retention_does_not_scan_runs"]
+only = false
+file = "crates/broca-store/src/retention_withdrawals.rs"
+old = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1";'
+new = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id WHERE r.withdrawals_owed=1 AND l.expired_at_ms IS NULL"; // NON-VACUITY BREAK: restore the run-driven sweep query.'
