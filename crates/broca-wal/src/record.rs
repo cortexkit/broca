@@ -3611,6 +3611,14 @@ mod schema_tests {
         assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
     }
 
+    #[test]
+    fn contentful_attempt_progress_bytes_are_pinned_before_gap_metrics() {
+        // Keep the full content-bearing shape stable when optional measurements are added.
+        let bytes = br#"{"type":"model_attempt_finished","step_id":2,"attempt":1,"request_body_len":12,"request_body_sha256":"aa","http_status":200,"response_body_len":3,"response_body_sha256":"bb","outcome":"complete","ts_ms":50,"first_content_at_ms":10,"last_content_at_ms":20,"content_bytes":3,"non_content_bytes":4,"non_content_bytes_after_last_content":0,"events_after_last_content":0}"#;
+        let record: WalRecord = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&record).unwrap(), bytes.to_vec());
+    }
+
     /// The attempt record's bytes are pinned, and every outcome this build writes round-trips.
     #[test]
     fn model_attempt_finished_bytes_are_pinned_and_every_outcome_round_trips() {
