@@ -61,6 +61,8 @@ runs = [{'name': n, 'databaseId': i, 'headSha': os.environ['EXPECT_SHA'], 'statu
 if mode == 'empty': runs = []
 elif mode == 'missing-ci': runs = runs[1:]
 elif mode == 'missing-mutations': runs = runs[:1]
+elif mode == 'mutations-failed': runs[1]['conclusion'] = 'failure'
+elif mode == 'mutations-pending': runs[1]['status'] = 'in_progress'; runs[1]['conclusion'] = ''
 elif mode == 'failed': runs[0]['conclusion'] = 'failure'
 elif mode == 'pending': runs[0]['status'] = 'in_progress'; runs[0]['conclusion'] = ''
 elif mode == 'cancelled': runs[0]['conclusion'] = 'cancelled'
@@ -120,8 +122,15 @@ print(json.dumps(runs))
     def test_missing_ci_workflow_refuses(self):
         self.assert_not_tagged_or_staged(self.release(CI_MODE='missing-ci'))
 
-    def test_missing_mutation_workflow_refuses(self):
-        self.assert_not_tagged_or_staged(self.release(CI_MODE='missing-mutations'))
+    def test_mutation_runs_never_hold_a_release(self):
+        # Only CI gates a release: a missing, failed or still-running mutation replay is a
+        # work item, and the commit still tags and stages.
+        for mode in ('missing-mutations', 'mutations-failed', 'mutations-pending'):
+            with self.subTest(mode=mode):
+                self.git('tag', '-d', 'v0.3.198') if self.git('tag', '--list', 'v0.3.198').stdout else None
+                result = self.release(CI_MODE=mode)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.git('rev-parse', 'v0.3.198^{commit}').stdout.strip(), self.sha)
 
     def test_failed_ci_refuses(self):
         self.assert_not_tagged_or_staged(self.release(CI_MODE='failed'))

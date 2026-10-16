@@ -36,7 +36,10 @@ done
 [[ -n "$python_bin" ]] || refuse 'Python 3.11+ is required to read the workspace version'
 workspace_version="$("$python_bin" -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
 [[ "$workspace_version" == "$version" ]] || refuse "workspace version is $workspace_version, not $version; bump it before the train"
-bash scripts/ci-status.sh "$sha" CI 'Mutation catalogue' || refuse 'CI is not green for this exact commit; no tag created'
+# Only CI gates a release. Mutation replay proves the tests catch planted breaks, says nothing
+# new about whether this build is correct, and takes ~50 minutes; it runs on every master push
+# and nightly, and a failing row is a work item, not a reason to hold a release.
+bash scripts/ci-status.sh "$sha" --only CI || refuse 'CI is not green for this exact commit; no tag created'
 
 # CI lookup may take time. Recheck the commit and upstream before publishing a tag.
 check_master

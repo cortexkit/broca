@@ -20,8 +20,10 @@
 # full sha, and REFUSE with exit 2 when the result set is empty — because "no runs" and "the
 # query did not match" are the same output and only one of them is safe to act on.
 #
-# Usage: ci-status.sh [<commit-ish> [required-workflow-name ...]]  default HEAD
-# Exit 0 all runs concluded success · 1 a run failed or is still going · 2 cannot compare.
+# Usage: ci-status.sh [<commit-ish> [--only] [required-workflow-name ...]]  default HEAD
+# Without --only, every run on the commit must have concluded success. With --only, only runs
+# of the named workflows are judged (each must be present); other workflows' runs are ignored.
+# Exit 0 all judged runs concluded success · 1 one failed or is still going · 2 cannot compare.
 
 set -euo pipefail
 
@@ -90,14 +92,23 @@ if not runs:
     raise SystemExit(2)
 
 print(f"    commit {full[:12]}   runs {len(runs)}")
+required = sys.argv[3:]
+only = bool(required) and required[0] == "--only"
+if only:
+    required = required[1:]
+    if not required:
+        print("ci-status: --only needs at least one workflow name", file=sys.stderr)
+        raise SystemExit(2)
 # A green unrelated workflow cannot stand in for a missing required workflow.
-missing = set(sys.argv[3:]) - {r.get("name") for r in runs}
+missing = set(required) - {r.get("name") for r in runs}
 if missing:
     print("ci-status: missing required workflows: " + ", ".join(sorted(missing)), file=sys.stderr)
     raise SystemExit(2)
 if any(r.get("headSha") != full for r in runs):
     print("ci-status: a returned run names a different commit -- cannot compare", file=sys.stderr)
     raise SystemExit(2)
+if only:
+    runs = [r for r in runs if r.get("name") in set(required)]
 bad = []
 for r in runs:
     concl = r.get("conclusion") or "-"

@@ -220,16 +220,18 @@ class WorkflowGraph(unittest.TestCase):
                 with self.subTest(event=event, path=path):
                     self.assertEqual(any(fnmatchcase(path, p) for p in filters['paths']), expected)
 
-    def test_release_required_workflows_exclude_native_windows_mutations(self):
+    def test_release_requires_only_ci(self):
         windows = self.workflow('mutations-windows.yml')['name']
         self.assertEqual(windows, 'Mutation catalogue (Windows)')
+        linux = self.workflow('mutations.yml')['name']
         release = (ROOT / 'scripts/release.sh').read_text()
         calls = [shlex.split(line) for line in release.splitlines()
                  if line.startswith('bash scripts/ci-status.sh ')]
         self.assertEqual(len(calls), 1)
         required = calls[0][3:calls[0].index('||')]
-        self.assertEqual(required, ['CI', 'Mutation catalogue'])
+        self.assertEqual(required, ['--only', 'CI'])
         self.assertNotIn(windows, required)
+        self.assertNotIn(linux, required)
 
     def test_windows_workflow_keeps_coverage_preflight_and_native_fixtures(self):
         workflow = self.workflow('mutations-windows.yml')
