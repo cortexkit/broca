@@ -13289,8 +13289,8 @@ test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["ordinary_address_reader_keeps_the_moved_fence"]
 only = false
 file = "crates/broca-core/src/wal_writer.rs"
-old = 'if !for_move {'
-new = 'if false && !for_move { // NON-VACUITY BREAK: expose a moved copy to ordinary readers'
+old = 'broca_wal::migration::guard(&path, "", false)?;'
+new = 'if false { broca_wal::migration::guard(&path, "", false)?; } // NON-VACUITY BREAK: expose moved copies to ordinary readers'
 
 [[control]]
 id = "agent-data-address-reader-move-back"
@@ -13302,24 +13302,14 @@ features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["move_and_move_back_replays_and_rejoins_only_a_prefix"]
 only = false
-file = "crates/broca-core/src/wal_writer.rs"
-old = 'self.read_address_records_inner(address, true)'
-new = 'self.read_address_records_inner(address, false) /* NON-VACUITY BREAK */'
-
-[[control]]
-id = "agent-data-address-reader-only-participant"
-guards = "no source outside the agent-data participant may call the moved-reader bypass"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--test agent_data_source"
-features = ["test-clock"]
-test_file = "crates/broca-module-serve/tests/agent_data_source.rs"
-expect_red = ["only_agent_data_can_call_the_move_address_reader"]
-only = false
-file = "crates/broca-module-serve/src/lib.rs"
-old = 'pub mod agent_data;'
-new = '''pub mod agent_data;
-pub fn non_vacuity_move_reader(wal: &broca_core::FileWalStore) { let _ = wal.read_address_records_for_move("0123456789abcdef"); } // NON-VACUITY BREAK'''
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = '''Source::Live { path, .. } => live_source(path, stats)?,
+        source => source,'''
+new = '''Source::Live { path, .. } => {
+            broca_wal::migration::guard(&path, "", false)?; // NON-VACUITY BREAK: fence moved copies from participant inventory
+            live_source(path, stats)?
+        }
+        source => source,'''
 
 [[control]]
 id = "agent-data-incoming-ref-binding"
@@ -13611,20 +13601,6 @@ old = 'state.refs = None;'
 new = '// NON-VACUITY BREAK: retain the refused first request as a hidden ref-set latch'
 
 [[control]]
-id = "agent-data-address-reader-function-item"
-guards = "the move-read bypass identifier cannot escape via function items or aliases outside the participant"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--test agent_data_source"
-test_file = "crates/broca-module-serve/tests/agent_data_source.rs"
-expect_red = ["only_agent_data_can_call_the_move_address_reader"]
-only = false
-file = "crates/broca-module-serve/src/lib.rs"
-old = 'pub mod agent_data;'
-new = '''pub mod agent_data;
-pub fn non_vacuity_move_item(wal: &broca_core::FileWalStore) { let reader = broca_core::FileWalStore::read_address_records_for_move; let _ = reader(wal, "0123456789abcdef"); } // NON-VACUITY BREAK'''
-
-[[control]]
 id = "agent-data-cut-records-session-addresses"
 guards = "intent durably records every resolved session address before cut artifacts can change"
 runner = "cargo"
@@ -13653,7 +13629,21 @@ old = '''SessionInventory {
                 sessions: state.expect("bound cut exists").sessions,
                 unreadable: Vec::new(),
             }'''
-new = 'self.local_sessions()? /* NON-VACUITY BREAK: scan unrelated WALs during recovery */'
+new = '''{
+                let inventory = SessionInventory {
+                    sessions: state.expect("bound cut exists").sessions,
+                    unreadable: Vec::new(),
+                };
+                // NON-VACUITY BREAK: read every local WAL again during bound-cut recovery.
+                if let Ok((addresses, _)) = self.wal.move_addresses() {
+                    for address in addresses {
+                        if let Err(error) = self.wal.read_address_records(&address) {
+                            tracing::error!(%address, %error, "scan during cut recovery");
+                        }
+                    }
+                }
+                inventory
+            }'''
 
 [[control]]
 id = "agent-data-unreadable-is-not-absence"
@@ -13967,7 +13957,7 @@ new = "deadline /* NON-VACUITY BREAK */"
 
 [[control]]
 id = "agent-data-named-ref-no-full-scan"
-guards = "a busy probe reads only its named WAL after boot inventory publication"
+guards = "a busy probe resolves the named ref from boot inventory without rereading its WAL before the requested snapshot"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test agent_data"
@@ -13979,11 +13969,13 @@ file = "crates/broca-module-serve/src/agent_data.rs"
 old = '''    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
 '''
 new = '''    fn local_sessions(&self, refs: &Refs) -> SessionInventory {
-        // NON-VACUITY BREAK: restore request-time full WAL discovery.
-        for address in self.wal.move_addresses().unwrap().0 {
-            let _ = self.wal.read_address_records_for_move(&address);
-        }
-'''
+        let inventory = self
+            .wal
+            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));
+        // NON-VACUITY BREAK: reread each requested WAL during ref resolution.
+        for (_, session) in inventory.sessions.values() {
+            let _ = self.wal.bytes_for_move(session);
+        }'''
 
 [[control]]
 id = "agent-data-incomplete-inventory-is-unknown"

@@ -284,7 +284,12 @@ impl Rig {
         }
     }
     fn new(tag: &str, door: Arc<FakeDoor>) -> Self {
-        let root = root(tag);
+        Self::open(root(tag), door)
+    }
+    fn reopen(&self) -> Self {
+        Self::open(self.root.clone(), self.door.clone())
+    }
+    fn open(root: PathBuf, door: Arc<FakeDoor>) -> Self {
         std::fs::create_dir_all(&root).unwrap();
         broca_wal::migration::durable_dir(&root, &root.join("wal")).unwrap();
         let wal = Arc::new(FileWalStore::new(root.join("wal")));
@@ -664,7 +669,7 @@ async fn describe_is_internal_and_declares_the_agent_owned_store() {
 #[tokio::test]
 async fn move_and_move_back_replays_and_rejoins_only_a_prefix() {
     let door = Arc::new(FakeDoor::default());
-    let source = Rig::new("source", door.clone());
+    let mut source = Rig::new("source", door.clone());
     let receiver = Rig::new("receiver", door.clone());
     let session = source.session("moves");
     source.seed_tool_run(&session, "original-run");
@@ -780,6 +785,11 @@ async fn move_and_move_back_replays_and_rejoins_only_a_prefix() {
         source_reader.management("session.send", json!({})).await,
         "session_moved",
     );
+    drop(from);
+    drop(source_reader);
+    // Reopen while the tombstone is present so the boot inventory must rediscover the old copy.
+    source = source.reopen();
+    let mut from = Wire::new(&source, entorhinal(), true).await;
     receiver.seed(&session, "receiver-run", true);
     receiver
         .index
