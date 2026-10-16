@@ -154,6 +154,71 @@ fn supervised_fake_session_door() {
     });
 }
 
+fn live_logs(state_root: &Path) -> String {
+    let supervisor = state_root.join("supervisor");
+    let data_home = supervisor.join("data/cortexkit");
+    let mut logs = broca_test_support::rig_process_logs(&supervisor, "daemon");
+    logs.push_str(&broca_test_support::rig_log_diagnostics(
+        &data_home, state_root,
+    ));
+    for module in ["engram", "entorhinal"] {
+        broca_test_support::append_file_tail(
+            &mut logs,
+            &format!("supervised {module} stderr"),
+            &data_home.join(format!("run/logs/{module}.stderr.log")),
+        );
+    }
+    logs
+}
+
+struct LiveLogGuard([PathBuf; 2]);
+impl LiveLogGuard {
+    fn diagnostics(&self) -> String {
+        self.0.iter().map(|root| live_logs(root)).collect()
+    }
+}
+impl Drop for LiveLogGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", self.diagnostics());
+        }
+    }
+}
+
+#[test]
+fn real_daemon_failure_diagnostics_include_each_module_and_daemon() {
+    let logs = LiveLogGuard([root("source-logs"), root("receiver-logs")]);
+    for (index, state_root) in logs.0.iter().enumerate() {
+        let directory = state_root.join("supervisor/data/cortexkit/run/logs");
+        std::fs::create_dir_all(&directory).unwrap();
+        for module in ["broca", "engram", "entorhinal"] {
+            std::fs::write(
+                directory.join(format!("{module}.stderr.log")),
+                format!("{module} startup failure {index}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.join("subc.2026-10-16.log"),
+            format!("daemon spawn failure {index}"),
+        )
+        .unwrap();
+    }
+    let diagnostics = logs.diagnostics();
+    for index in 0..2 {
+        for module in ["broca", "engram", "entorhinal"] {
+            assert!(
+                diagnostics.contains(&format!("{module} startup failure {index}")),
+                "{diagnostics}"
+            );
+        }
+        assert!(
+            diagnostics.contains(&format!("daemon spawn failure {index}")),
+            "{diagnostics}"
+        );
+    }
+}
+
 struct Live {
     daemon: broca_test_support::RigChild,
     conn: Arc<SubcConnection>,
@@ -173,7 +238,12 @@ impl Live {
         let connection = runtime.join("subc-connection.json");
         let nonce = root.join("entorhinal.nonce");
         let script = root.join("fake-engram.sh");
-        let executable = std::env::current_exe().unwrap();
+        // The build directory may be on removable storage, where macOS can block exec
+        // before the fake module can register or write any diagnostics.
+        let executable = broca_test_support::ckdev_binary(
+            std::env::current_exe().unwrap(),
+            broca_test_support::scratch_root(),
+        );
         let quoted = executable.to_string_lossy().replace('\'', "'\\''");
         std::fs::write(&script,format!("#!/bin/sh\nexec '{quoted}' --exact real_daemon::supervised_fake_session_door --ignored --nocapture\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -211,7 +281,7 @@ impl Live {
             assert!(
                 daemon.try_wait().unwrap().is_none(),
                 "daemon exited during boot: {}",
-                broca_test_support::rig_process_logs(&root, "daemon")
+                live_logs(&rig.root)
             );
             std::future::ready(if connection.exists() && nonce.exists() {
                 Ok(())
@@ -220,7 +290,7 @@ impl Live {
                     "connection={}, nonce={}; {}",
                     connection.exists(),
                     nonce.exists(),
-                    broca_test_support::rig_process_logs(&root, "daemon")
+                    live_logs(&rig.root)
                 ))
             })
         })
@@ -245,12 +315,12 @@ impl Live {
                 },
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{error}: {}", live_logs(&rig.root)));
         Self {
             daemon,
             conn,
             route,
-            logs: root,
+            logs: rig.root.clone(),
         }
     }
     async fn call(&self, method: &str, params: Value) -> Result<Value, Value> {
@@ -261,12 +331,7 @@ impl Live {
             .conn
             .route_unary_reply(&self.route, request, EVENT_HANG_GUARD)
             .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{e}: {}",
-                    broca_test_support::rig_process_logs(&self.logs, "daemon")
-                )
-            });
+            .unwrap_or_else(|e| panic!("{e}: {}", live_logs(&self.logs)));
         match answer {
             Ok(bytes) => Ok(serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone()),
             Err(error) => Err(serde_json::to_value(error).unwrap()),
@@ -295,13 +360,16 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
         eprintln!("SKIP real agent-data lane: daemon rigs are absent");
         return;
     }
+    let shared = root("real-door");
+    std::fs::create_dir_all(&shared).unwrap();
+    let source = Rig::new("real-source", Arc::new(FakeDoor::default()));
+    let receiver = Rig::new("real-receiver", Arc::new(FakeDoor::default()));
+    // Keep the log paths outside the timed future: cancelling startup must not
+    // discard the only diagnostics for a module that never registered.
+    let logs = LiveLogGuard([source.root.clone(), receiver.root.clone()]);
     event_timeout(
         "two real agent-data daemons move and move back",
         async {
-            let shared = root("real-door");
-            std::fs::create_dir_all(&shared).unwrap();
-            let source = Rig::new("real-source", Arc::new(FakeDoor::default()));
-            let receiver = Rig::new("real-receiver", Arc::new(FakeDoor::default()));
             let session = source.session("real-move");
             source.seed_tool_run(&session, "source-tool-run");
             let params = source.params(CUT, std::slice::from_ref(&session));
@@ -365,12 +433,7 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
             from.stop().await;
             to.stop().await;
         },
-        || {
-            format!(
-                "rig logs under {}",
-                broca_test_support::scratch_root().display()
-            )
-        },
+        || logs.diagnostics(),
     )
     .await
     .expect("agent-data real-daemon lane exceeded its own deadline");
@@ -387,6 +450,7 @@ async fn required_daemon_lane_refuses_to_skip_missing_binaries() {
                 "real_daemon::two_real_daemons_move_and_move_back_through_the_attested_door",
                 "--nocapture",
             ])
+            .env("BROCA_STATE_ROOT", missing.join("state"))
             .env("BROCA_REQUIRE_SUBC", "1")
             .env("SUBC_CORE_BIN", missing.join("no-daemon"))
             .env("FAKE_AFT_STUB_BIN", missing.join("no-fake"))
