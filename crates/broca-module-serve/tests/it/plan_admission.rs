@@ -1832,6 +1832,7 @@ async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing()
     *rig.script.compaction_plane.lock().unwrap() = Some(plane.clone());
     let mut plan = vector("plans/broca-head.json");
     plan["compaction_item"] = json!({"provider":"magic-context","preset":"head","params":{}});
+    plan["composition"]["compaction"] = json!({"provider":"magic-context"});
     // A valid transform would require declaration and an installed hook plane if admitted.
     // The unsupported compaction item must refuse first, before either path can do work.
     let steps = json!([{
@@ -1928,8 +1929,8 @@ impl subc_client_rs::ModuleHandler for CompactionScript {
 }
 
 fn compaction_only_plan(provider: &str) -> Value {
-    let composition =
-        json!({"providers":[{"provider":provider,"tools":[]}], "step_transform_items":[]});
+    let composition = json!({"providers":[{"provider":provider,"tools":[]}],
+        "compaction":{"provider":provider}, "step_transform_items":[]});
     json!({
         "tool_items":[], "system_text_items":[], "step_transform_items":[],
         "compaction_item":{"provider":provider, "preset":"head", "params":{}},
@@ -2428,8 +2429,8 @@ async fn real_daemon_reports_a_transient_compaction_describe_as_fetch_unavailabl
     real.finish().await;
 }
 
-/// A provider that serves the role is admitted through the real admitter and runs Setup as
-/// before: admission asked only `role.describe`, and Setup followed on the run.
+/// A plan repeating its compaction provider in the composition is admitted unchanged.
+/// Admission asks only `role.describe`; `compaction.setup` runs after the plan is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_daemon_admits_a_declaring_compaction_provider_and_runs_setup() {
     let describe = json!({"majors": [{"version": "compaction-provider/v1",
@@ -2447,6 +2448,8 @@ async fn real_daemon_admits_a_declaring_compaction_provider_and_runs_setup() {
     result(&frame);
     let records = real.rig.wait_for_finished(1).await;
     let started = run_started(&records);
+    let frozen: Value = serde_json::from_str(manifest_of(started[0]).plan.as_json_text()).unwrap();
+    assert_eq!(frozen, plan);
     assert_eq!(
         manifest_of(started[0])
             .role_versions
