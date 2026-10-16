@@ -14109,7 +14109,7 @@ runner = "cargo"
 package = "broca-core"
 target = "--lib"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
-expect_red = ["wal_writer::move_inventory::persistent::tests::vanished_live_path_falls_back_to_archived_member"]
+expect_red = ["wal_writer::move_inventory::persistent::tests::vanished_live_path_falls_back_to_archived_member", "wal_writer::move_inventory::persistent::tests::deleted_address_is_dropped_after_a_complete_reresolution"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {"
 new = "Err(WalError::Io(error)) if false && error.kind() == io::ErrorKind::NotFound => { // NON-VACUITY BREAK"
