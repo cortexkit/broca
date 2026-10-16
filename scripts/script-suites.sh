@@ -61,6 +61,7 @@ suites=(
     scripts/test-wal-archive-instruments.py
     scripts/test-wal-retention-readers.py
     scripts/test-step-timing.py
+    scripts/tests/test-attempt-telemetry.py
     scripts/test-rekey-harness.py
     # The WAL readers' handling of gated (version-3) frames: decoded when their features
     # are known, reported as newer-writer when not.
