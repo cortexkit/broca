@@ -2024,7 +2024,10 @@ pub struct ReconciledRunState {
 }
 
 /// Walk the WAL to resolve a run and retain terminal metadata that the durable index omits.
-pub fn reconcile_run_state(records: &[WalRecord], run_id: &str) -> Option<ReconciledRunState> {
+pub fn reconcile_run_state<'a>(
+    records: impl IntoIterator<Item = &'a WalRecord>,
+    run_id: &str,
+) -> Option<ReconciledRunState> {
     use crate::{projection::IndeterminateToolCalls, RunIndexState};
 
     let mut active_run: Option<String> = None;

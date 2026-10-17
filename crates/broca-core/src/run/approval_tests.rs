@@ -1627,6 +1627,104 @@ async fn expire_rig(mut rig: Rig) -> Rig {
 }
 #[cfg(feature = "test-clock")]
 #[tokio::test]
+#[ignore = "release-build measurement of late approval on a 15 MB WAL"]
+async fn large_wal_late_approval_cost() {
+    let mut rig = expire_rig(Rig::file_backed("pass")).await;
+    *rig.questions.answer.lock().unwrap() = "approve";
+    rig.control.manifest = Some(Arc::new(frozen(Vec::new(), None, false)));
+    let frames = rig.frames();
+    let start = frames
+        .iter()
+        .find(|f| matches!(f.record, WalRecord::RunStarted { .. }))
+        .unwrap()
+        .record
+        .clone();
+    let terminal = frames
+        .iter()
+        .find(|f| matches!(f.record, WalRecord::RunFinished { .. }))
+        .unwrap()
+        .record
+        .clone();
+    let message = frames
+        .iter()
+        .rev()
+        .find(|f| matches!(f.record, WalRecord::ModelStepFinished { .. }))
+        .unwrap()
+        .record
+        .clone();
+    for episode in 0..500 {
+        let mut start = start.clone();
+        if let WalRecord::RunStarted { run_id, .. } = &mut start {
+            *run_id = RunId(format!("padding-{episode}"));
+        }
+        let mut message = message.clone();
+        if let WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } = &mut message
+        {
+            let mut expanded = assistant_message.as_ref().clone();
+            expanded.content = vec![ContentBlock::Text {
+                text: "x".repeat(30_000),
+            }];
+            *assistant_message = expanded.into();
+        }
+        for record in [start, message, terminal.clone()] {
+            rig.writer.record(record).into_result().unwrap();
+        }
+    }
+    rig.writer.sync().await.unwrap();
+    struct Counted<'a> {
+        inner: &'a crate::FileWalStore,
+        full: AtomicUsize,
+    }
+    impl crate::WalStore for Counted<'_> {
+        fn open(
+            &self,
+            bind: &BindIdentity,
+        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+            self.inner.open(bind)
+        }
+        fn read_records(
+            &self,
+            bind: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.full.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_records(bind)
+        }
+    }
+    let counted = Counted {
+        inner: &rig.tools.store,
+        full: AtomicUsize::new(0),
+    };
+    let started = std::time::Instant::now();
+    let snapshot = counted.read_records(&rig.bind).unwrap();
+    let mut history = approval_gate::History::new(&rig.writer, snapshot).unwrap();
+    let loaded_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let started = std::time::Instant::now();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    println!(
+        "WAL_COST late_approval: bytes={} full={} load_ms={loaded_ms:.3} admission_ms={:.3}",
+        std::fs::metadata(rig.tools.store.wal_path(&rig.bind))
+            .unwrap()
+            .len(),
+        counted.full.load(Ordering::SeqCst),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
+    assert_eq!(counted.full.load(Ordering::SeqCst), 1);
+    rig.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
 async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_every_cut() {
     let mut rig = expire_rig(Rig::file_backed("pass")).await;
     *rig.questions.answer.lock().unwrap() = "approve";

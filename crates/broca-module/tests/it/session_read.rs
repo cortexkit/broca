@@ -28,6 +28,8 @@ use broca_wal::{DispatchOutcome, FileWal, RunConfig, Wal, WalRecord};
 use tokio::sync::{mpsc, Mutex};
 #[path = "session_read/attribution.rs"]
 mod attribution;
+#[path = "session_read/wal_cost.rs"]
+mod wal_cost;
 
 struct ScriptedCoreExec {
     wal_store: Arc<FileWalStore>,
