@@ -815,6 +815,87 @@ mod gated {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An OAuth render config exactly as a run admitted before the Claude Code persona
+    /// (billing block, `metadata.user_id`, persona key order) existed recorded it. A resumed run
+    /// renders from this blob, so its request bytes must never move.
+    const PRE_PERSONA_OAUTH_FROZEN_CONFIG: &str = r#"{
+        "family_id": "anthropic_messages",
+        "renderer_version": 2,
+        "wire_model_id": "claude-opus-4-8",
+        "max_output_tokens": 2048,
+        "reasoning": {
+            "mode": "anthropic_interleaved", "budget_tokens": 1024, "last_turn_only": true,
+            "echo_scope": "all_assistant_messages", "cross_model": "any_anthropic_model"
+        },
+        "tool_id": "passthrough",
+        "system_prompt": {
+            "mode": "required_identity_lead",
+            "identity": "You are Claude Code, Anthropic's official CLI for Claude."
+        },
+        "usage": "anthropic_usage",
+        "token_limit_field": "max_tokens"
+    }"#;
+
+    /// The first request such a run sent for the input `hi`, as rendered when it was admitted.
+    const PRE_PERSONA_OAUTH_STEP_ONE_BYTES: &str = concat!(
+        r#"{"max_tokens":2048,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"#,
+        r#""model":"claude-opus-4-8","stream":true,"system":[{"text":"You are Claude Code, "#,
+        r#"Anthropic's official CLI for Claude.","type":"text"}],"#,
+        r#""thinking":{"budget_tokens":1024,"type":"enabled"}}"#
+    );
+
+    /// A WAL whose run was admitted under the pre-persona OAuth shape resumes through the
+    /// generic path (read the recorded blob, rebuild the renderer from it) and re-sends exactly
+    /// the bytes it sent before. The recorded blob also re-serializes unchanged, because resume
+    /// compares it with the provider's config and refuses on any difference.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_persona_oauth_wal_resumes_with_its_recorded_bytes() {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-pre-persona-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let recorded: serde_json::Value =
+            serde_json::from_str(PRE_PERSONA_OAUTH_FROZEN_CONFIG).expect("blob is JSON");
+        let admitted: FrozenRenderConfig =
+            serde_json::from_value(recorded.clone()).expect("pre-persona blob deserializes");
+        assert_eq!(
+            serde_json::to_value(&admitted).expect("serialize the recorded config"),
+            recorded,
+            "a recorded pre-persona config must re-serialize to the same blob"
+        );
+        let run = request(&dir);
+        seed_resumable_request(&dir, &run, &admitted);
+
+        let wal = FileWalStore::new(dir.join("wal"));
+        let prior = read_prior_run_config(&wal, &run.session)
+            .expect("read prior config")
+            .expect("a run was started");
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config.clone())
+                .expect("recorded blob deserializes");
+        let provider = FrozenProvider::new(rebuilt);
+        let summary = drive_request(&dir, &provider, run)
+            .await
+            .expect("resume ok");
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+
+        let resumed = provider
+            .sent
+            .lock()
+            .unwrap()
+            .get(&0)
+            .cloned()
+            .expect("resume rendered step one");
+        assert_eq!(
+            String::from_utf8(resumed).expect("rendered bytes are UTF-8"),
+            PRE_PERSONA_OAUTH_STEP_ONE_BYTES,
+            "a run admitted before the persona must resume with its recorded bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// First-party Anthropic's no-request default, exactly as `resolve_cache_policy` in
     /// broca-module-serve freezes it (that crate's tests pin the same value).
     #[tokio::test]
