@@ -34,6 +34,7 @@ fn resolve_runtime_override(
         &broca_catalog::live::ResolveOptions::default(),
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: match frozen {
                 Some(recorded) => recorded.get("base_url").and_then(serde_json::Value::as_str),
                 None => overrides.base_url("deepseek"),
@@ -92,6 +93,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some(&base_url),
             max_output_tokens: None,
             variant: None,
@@ -422,6 +424,7 @@ fn resolve_drift_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some(
                 recorded
                     .and_then(|config| config.frozen_render_config["base_url"].as_str())
@@ -760,6 +763,7 @@ fn resolve_tier_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some("http://host-a.example"),
             max_output_tokens: recorded.and_then(frozen_max_output_tokens),
             variant: None,
@@ -874,6 +878,7 @@ fn resolve_variant_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some("http://host-a.example"),
             max_output_tokens: recorded.and_then(frozen_max_output_tokens),
             variant: restored.as_ref(),
@@ -969,6 +974,31 @@ fn resume_reads_the_recorded_thinking_echo_scope() {
 
     recorded.frozen_render_config = with_reasoning(serde_json::json!({ "mode": "none" }));
     assert_eq!(frozen_thinking_echo_scope(&recorded), None);
+}
+
+/// A resume restores the Claude Code persona from the recorded blob. A blob written before the
+/// persona existed has no `claude_code_persona` key and reads back as `None`, which the resolver
+/// keeps (`EpisodePersona::Recorded(None)`), so that episode resumes with its old bytes.
+#[test]
+fn resume_reads_the_recorded_claude_code_persona() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-persona-restore-{}", std::process::id()));
+    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
+    let mut recorded = drift_run_config(&drift_request(&root), &started);
+    recorded.frozen_render_config = serde_json::json!({ "family_id": "anthropic_messages" });
+    assert_eq!(frozen_claude_code_persona(&recorded), None);
+
+    let persona = serde_json::json!({
+        "version": "2.1.280",
+        "device_id": "0".repeat(64),
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "prompt_id": "33333333-3333-4333-8333-333333333333"
+    });
+    recorded.frozen_render_config = serde_json::json!({
+        "family_id": "anthropic_messages", "claude_code_persona": persona
+    });
+    let restored = frozen_claude_code_persona(&recorded).expect("the recorded persona restores");
+    assert_eq!(serde_json::to_value(&restored).unwrap(), persona);
 }
 
 #[test]

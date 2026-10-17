@@ -30,6 +30,9 @@ broca-module = { path = "../broca-module" }
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 cortexkit-role-step-transform-provider = { workspace = true }
 broca-provider = { path = "../broca-provider" }
+# Random bytes for the Claude Code persona's install id and per-episode prompt id. Already in
+# the lockfile (broca-wal uses the same version).
+getrandom = "0.3"
 # The real executor's tool plane (consumer connection → subc → aft) + the catalog→live
 # provider resolver + the SQLite-backed durable run index. These make the binary drive a
 # real model + real tools (replacing the placeholder), so they are the module binary's

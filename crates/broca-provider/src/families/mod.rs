@@ -420,6 +420,7 @@ pub fn resolve_frozen(
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
         structured_output: None,
+        claude_code_persona: None,
     })
 }
 
@@ -476,6 +477,7 @@ fn frozen_from_family_defaults(
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
         structured_output: None,
+        claude_code_persona: None,
     }
 }
 

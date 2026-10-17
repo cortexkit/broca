@@ -59,6 +59,7 @@ mod gated {
             ..ResolveOptions::default()
         };
         let render = EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: None,
             max_output_tokens: None,
             variant: restored,

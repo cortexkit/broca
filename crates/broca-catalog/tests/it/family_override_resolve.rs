@@ -167,6 +167,7 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
                     project_id: Some("proj-override"),
@@ -208,6 +209,7 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
                     project_id: Some("proj-override"),
@@ -243,6 +245,7 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
                     project_id: Some("proj-override"),
@@ -271,6 +274,7 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                     project_id: None,
@@ -301,6 +305,7 @@ mod gated {
                 None,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
                     project_id: Some("proj-override"),
@@ -332,6 +337,7 @@ mod gated {
     fn chatgpt_ids_resolve_verbatim_with_no_tier_suffixes() {
         common::install_snapshot();
         let options = ResolveOptions {
+            claude_code_persona: None,
             auth_method: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
             project_id: None,
@@ -410,6 +416,7 @@ mod gated {
                     2048,
                     &AuthMode::Bearer(CHATGPT_JWT.into()),
                     &ResolveOptions {
+                        claude_code_persona: None,
                         auth_method: None,
                         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                         project_id: None,
@@ -460,6 +467,7 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                     project_id: None,
@@ -492,6 +500,7 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                     project_id: None,
@@ -526,6 +535,7 @@ mod gated {
     fn chatgpt_pause_only_construction_skips_auth_but_ordinary_none_stays_strict() {
         common::install_snapshot();
         let options = ResolveOptions {
+            claude_code_persona: None,
             auth_method: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
             project_id: None,
@@ -580,6 +590,7 @@ mod gated {
             2048,
             &AuthMode::Bearer("not-a-codex-token".into()),
             &ResolveOptions {
+                claude_code_persona: None,
                 auth_method: None,
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                 project_id: None,

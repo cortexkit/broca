@@ -332,7 +332,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::RouteOpenRetry::default_patience(),
     )))
     .with_methods(auth_methods.clone())
-    .with_provider_overrides(provider_overrides);
+    .with_provider_overrides(provider_overrides)
+    .with_claude_code_install_id(
+        match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {
+            Ok(install_id) => Some(install_id),
+            Err(error) => {
+                // Without an install id there is no stable device id, so OAuth episodes are
+                // admitted without the Claude Code persona rather than with an unstable one.
+                tracing::warn!(%error, "Claude Code install id unavailable; OAuth runs omit the persona");
+                None
+            }
+        },
+    );
     let cache_table =
         broca_module_serve::CacheTtlTable::load_default_path().map_err(ServeIoError)?;
     executor_impl = executor_impl.with_cache_table(cache_table);
@@ -2102,6 +2113,18 @@ mod executor {
         }
     }
 
+    /// The Claude Code persona the episode froze at start, re-applied on resume. A blob recorded
+    /// before the persona existed has no `claude_code_persona` key and reads back as `None`,
+    /// the shape that episode rendered with.
+    fn frozen_claude_code_persona(
+        config: &broca_wal::RunConfig,
+    ) -> Option<broca_catalog::live::ClaudeCodePersona> {
+        config
+            .frozen_render_config
+            .get("claude_code_persona")
+            .and_then(|persona| serde_json::from_value(persona.clone()).ok())
+    }
+
     fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool {
         config
             .frozen_render_config
@@ -2407,6 +2430,10 @@ mod executor {
         /// The routing module broca asks which provider account a new run uses, and reports
         /// each run's account evidence to. `None` without the vault credential source.
         routing: Option<Arc<RoutingClient>>,
+        /// This installation's id, the root of the Claude Code persona's device id (see
+        /// `broca_module_serve::claude_code_identity`). `None` admits Anthropic OAuth episodes
+        /// without a persona, in the shape they had before it existed.
+        claude_code_install_id: Option<String>,
     }
 
     impl LiveLoopExecutor {
@@ -2433,7 +2460,14 @@ mod executor {
                 cache_table: CacheTtlTable::shipped_defaults(),
                 opencode_auth_path: None,
                 routing: None,
+                claude_code_install_id: None,
             }
+        }
+
+        /// Install the id the Claude Code persona's device id derives from.
+        pub fn with_claude_code_install_id(mut self, install_id: Option<String>) -> Self {
+            self.claude_code_install_id = install_id;
+            self
         }
 
         pub fn with_hook_plane(mut self, hooks: Arc<broca_subc::SubcHookPlane>) -> Self {
@@ -3263,7 +3297,37 @@ mod executor {
                     .as_ref()
                     .and_then(|prior| frozen_prompt_cache_key(&prior.config))
             };
+            // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
+            // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
+            // its episode recorded, or its recorded absence, below.
+            let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
+                (Some(install_id), true) => {
+                    match broca_module_serve::claude_code_identity::fresh_persona(
+                        install_id,
+                        resolution.account_id.as_deref(),
+                        resolution
+                            .selection
+                            .as_ref()
+                            .map_or(job.req.model.provider_module_id.as_str(), |selection| {
+                                selection.credential_id.as_str()
+                            }),
+                        &job.req.session,
+                    ) {
+                        Ok(persona) => Some(persona),
+                        Err(error) => {
+                            tracing::warn!(%error, "Claude Code persona unavailable for this episode");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let restored_persona = prior_run
+                .as_ref()
+                .filter(|_| !fresh_episode)
+                .and_then(|prior| frozen_claude_code_persona(&prior.config));
             let resolve_options = broca_catalog::live::ResolveOptions {
+                claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
                 family_override,
                 project_id: resolution.project_id.as_deref(),
@@ -3383,6 +3447,13 @@ mod executor {
                         .map(|prior| frozen_responses_tools_non_strict(&prior.config)),
                     // Restored as recorded, never re-decided from a catalog that may have moved.
                     structured_output: restored_structured_output.as_ref(),
+                    // Restored as recorded, including a recorded absence: an OAuth episode
+                    // admitted before the persona existed resumes with its old bytes.
+                    claude_code_persona: if fresh_episode {
+                        broca_catalog::live::EpisodePersona::Fresh
+                    } else {
+                        broca_catalog::live::EpisodePersona::Recorded(restored_persona.as_ref())
+                    },
                 },
             ) {
                 Ok(r) => r,
@@ -4140,6 +4211,7 @@ mod executor {
                         .into(),
                 ),
                 &broca_catalog::live::ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: method,
                     family_override,
                     project_id: None,
@@ -4295,6 +4367,7 @@ mod executor {
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
+                claude_code_persona: None,
                 auth_method: Some(AuthMethod::Chatgpt),
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                 project_id: None,

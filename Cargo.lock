@@ -313,6 +313,7 @@ dependencies = [
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
+ "getrandom 0.3.4",
  "libc",
  "rusqlite",
  "serde",
@@ -382,6 +383,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tungstenite",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -627,9 +629,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "cortexkit-anthropic-policy"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f0989104beccb62001b824bbabe7b60fa868929363bd566643c42a127b005b1"
+checksum = "94c99c61daef9c3ebd0995346753b16f216e2ad13a5b151f7bacccb8e31a85e1"
 dependencies = [
  "httpdate",
  "serde_json",
@@ -2950,6 +2952,12 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

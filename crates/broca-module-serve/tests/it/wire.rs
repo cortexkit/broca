@@ -126,6 +126,7 @@ impl Provider for ResolvedStubProvider {
 
 fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
     ResolveOptions {
+        claude_code_persona: None,
         auth_method: Some(broca_catalog::live::AuthMethod::Chatgpt),
         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
         project_id: None,

@@ -15830,3 +15830,72 @@ expect_red = ["structured_output_render::anthropic_submit_tool_never_forces_a_to
 file = "crates/broca-provider/src/structured_output.rs"
 old = "                    if forcing {"
 new = "                    if false && forcing { // NON-VACUITY BREAK: pass a forcing tool_choice through."
+
+[[control]]
+id = "claude-persona-cc-version-suffix-positions"
+guards = "the Claude Code persona's cc_version suffix samples UTF-16 positions 4, 7 and 20 of the first user text, as the shared wire vectors pin"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/claude_oauth_wire_vectors.rs"
+expect_red = ["claude_oauth_wire_vectors::each_vector_suffix_follows_from_its_first_user_text"]
+file = "crates/broca-provider/src/claude_code_persona.rs"
+old = "const SUFFIX_POSITIONS: [usize; 3] = [4, 7, 20];"
+new = "const SUFFIX_POSITIONS: [usize; 3] = [4, 7, 21]; // NON-VACUITY BREAK: sample the wrong position."
+
+[[control]]
+id = "claude-persona-cch-hash-seed"
+guards = "the Claude Code persona's cch is xxHash64 with seed 0x4d659218e32a3268 over the canonical body, as the shared wire vectors pin"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/claude_oauth_wire_vectors.rs"
+expect_red = ["claude_oauth_wire_vectors::primitives_reproduce_the_vector_unit_checks", "claude_oauth_wire_vectors::each_vector_cch_follows_from_its_canonical_body_and_signs_in_place"]
+file = "crates/broca-provider/src/claude_code_persona.rs"
+old = "pub const CCH_SEED: u64 = 0x4d65_9218_e32a_3268;"
+new = "pub const CCH_SEED: u64 = 0x4d65_9218_e32a_3269; // NON-VACUITY BREAK: wrong seed."
+
+[[control]]
+id = "claude-persona-billing-block-leads-system"
+guards = "a persona render puts the billing block at system[0], the only place the cch signature is located and signed; elsewhere the request goes out unsigned"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/claude_oauth_wire_vectors.rs"
+expect_red = ["claude_oauth_wire_vectors::broca_renders_each_vectors_persona_exactly"]
+file = "crates/broca-provider/src/families/anthropic_messages.rs"
+old = "            system.insert(0, block);"
+new = "            system.push(block); // NON-VACUITY BREAK: the billing block no longer leads."
+
+[[control]]
+id = "claude-persona-per-turn-control-beta"
+guards = "the persona's anthropic-beta list adds per-turn-control for Sonnet 5.5 as well as Opus 5.5, as the shared wire vectors pin"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/claude_oauth_wire_vectors.rs"
+expect_red = ["claude_oauth_wire_vectors::each_vector_beta_list_follows_from_its_body_model_and_host_betas", "claude_oauth_wire_vectors::broca_renders_each_vectors_persona_exactly"]
+file = "crates/broca-provider/src/claude_code_persona.rs"
+old = '''    if base_model.starts_with("claude-opus-5-5") || base_model.starts_with("claude-sonnet-5-5") {'''
+new = '''    if base_model.starts_with("claude-opus-5-5") { // NON-VACUITY BREAK: Sonnet 5.5 loses per-turn-control.'''
+
+[[control]]
+id = "claude-persona-resume-keeps-a-recorded-absence"
+guards = "an OAuth episode recorded without the Claude Code persona resumes without it, so it re-sends its old bytes instead of adopting the persona offered to new episodes"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_variants"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/reasoning_variants.rs"
+expect_red = ["gated::the_persona_is_frozen_for_fresh_oauth_episodes_and_restored_as_recorded"]
+file = "crates/broca-catalog/src/live.rs"
+old = "        EpisodePersona::Recorded(recorded) => recorded.cloned(),"
+new = "        EpisodePersona::Recorded(recorded) => recorded.or(fresh).cloned(), // NON-VACUITY BREAK: adopt the fresh persona on resume."
