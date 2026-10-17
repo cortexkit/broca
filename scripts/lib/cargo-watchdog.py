@@ -87,6 +87,16 @@ def main() -> int:
     ):
         parser.error("--deadline-seconds must be a positive number")
 
+    if os.name == "nt":
+        # Windows has no SIGHUP or process groups, and selectors cannot watch pipes there. The
+        # watchdog exists for the macOS stuck-lock case; on Windows run Cargo directly, keeping
+        # its output and exit status, and let the CI job timeout catch a hang.
+        try:
+            return subprocess.run(command).returncode
+        except OSError as error:
+            print(f"cargo watchdog: could not start step '{args.step}': {error}", file=sys.stderr)
+            return 127
+
     try:
         lock_timeout = positive_seconds("BROCA_CARGO_LOCK_TIMEOUT_SECONDS", "300")
         idle_timeout = positive_seconds("BROCA_CARGO_IDLE_TIMEOUT_SECONDS", "900")

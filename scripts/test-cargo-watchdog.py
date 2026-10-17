@@ -85,5 +85,27 @@ class CargoWatchdogTests(unittest.TestCase):
         self.assertEqual(result.stderr, "fixture cargo diagnostic\n")
 
 
+class WindowsPassThroughTests(unittest.TestCase):
+    """Windows lacks SIGHUP, process groups and pipe selectors; the watchdog must not use them."""
+
+    def test_windows_runs_the_command_directly_and_keeps_its_status(self):
+        import importlib.util
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("cargo_watchdog", WATCHDOG)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        argv = ["cargo-watchdog.py", "--step", "windows fixture", "--",
+                sys.executable, "-c", "raise SystemExit(7)"]
+        # signal.SIGHUP is absent on Windows; removing it proves the Windows path never reads it.
+        sighup = module.signal.SIGHUP
+        del module.signal.SIGHUP
+        try:
+            with mock.patch.object(module.os, "name", "nt"), mock.patch.object(sys, "argv", argv):
+                self.assertEqual(module.main(), 7)
+        finally:
+            module.signal.SIGHUP = sighup
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
