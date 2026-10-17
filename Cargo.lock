@@ -143,6 +143,7 @@ dependencies = [
  "broca-protocol",
  "broca-provider",
  "broca-test-support",
+ "cortexkit-chatgpt-policy",
  "futures",
  "serde",
  "serde_json",
@@ -334,6 +335,7 @@ dependencies = [
  "bytes",
  "chrono",
  "cortexkit-anthropic-policy",
+ "cortexkit-chatgpt-policy",
  "futures",
  "httpdate",
  "memchr",
@@ -592,6 +594,15 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f0989104beccb62001b824bbabe7b60fa868929363bd566643c42a127b005b1"
 dependencies = [
+ "httpdate",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-chatgpt-policy"
+version = "0.1.0"
+dependencies = [
+ "base64",
  "httpdate",
  "serde_json",
 ]

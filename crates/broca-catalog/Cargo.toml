@@ -15,9 +15,9 @@ default = ["bundled-catalog"]
 bundled-catalog = []
 # Pull in the provider's live transport so catalog-resolved configs can actually run
 # (the catalog→live resolver in `live.rs` + the end-to-end test). Also needs the core
-# `Provider` trait the resolver returns a boxed instance of. base64 decodes the ChatGPT
-# token's JWT payload to extract the codex account id (the live auth-resolution path only).
-live = ["broca-provider/live", "dep:broca-core", "dep:base64"]
+# `Provider` trait the resolver returns a boxed instance of, and the shared ChatGPT policy
+# that resolves the codex account id (the live auth-resolution path only).
+live = ["broca-provider/live", "dep:broca-core", "dep:cortexkit-chatgpt-policy"]
 
 [dependencies]
 broca-owner-only.workspace = true
@@ -26,8 +26,8 @@ broca-provider = { path = "../broca-provider" }
 # Only the `live` resolver needs the core `Provider` trait (the resolver returns a
 # `Box<dyn Provider>`); optional so the default catalog build stays core-free.
 broca-core = { path = "../broca-core", optional = true }
-# Decodes the ChatGPT JWT payload for the codex account-id header (live path only).
-base64 = { version = "0.22", optional = true }
+# Resolves the codex account-id header from the vault or the ChatGPT token (live path only).
+cortexkit-chatgpt-policy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -49,3 +49,5 @@ tokio = { workspace = true, features = ["test-util"] }
 # The mixed-pipe warm proof negotiates the same Responses socket compression as production.
 tokio-tungstenite.workspace = true
 futures.workspace = true
+# Tests build ChatGPT JWTs whose payloads carry each account-id claim shape.
+base64 = "0.22"

@@ -1244,7 +1244,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
     }
     ProviderError {
         refusal: None,
-        class: response_error_class(code),
+        class: response_error_class(event, code),
         message,
         status: None,
         retry_after_secs: None,
@@ -1264,7 +1264,18 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
     }
 }
 
-fn response_error_class(code: Option<&str>) -> ErrorClass {
+fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
+    // A used-up plan allowance, or a plan without the requested use, cannot be granted by
+    // re-sending, so the shared ChatGPT policy's account-wall and not-included stream classes
+    // end the step. Its rate-limit and overload classes are transient, as the table below
+    // already makes every code it does not list.
+    if matches!(
+        cortexkit_chatgpt_policy::classify_stream_failure(event),
+        cortexkit_chatgpt_policy::Classification::AccountLimitExhausted { .. }
+            | cortexkit_chatgpt_policy::Classification::UsageNotIncluded
+    ) {
+        return ErrorClass::Permanent;
+    }
     match code {
         Some("context_length_exceeded" | "context_window_exceeded") => ErrorClass::ContextOverflow,
         Some(
@@ -1273,12 +1284,10 @@ fn response_error_class(code: Option<&str>) -> ErrorClass {
             | "credit_balance_exhausted"
             | "organization_spend_limit_exceeded"
             | "project_spend_limit_exceeded"
-            | "usage_not_included"
             | "invalid_prompt"
             | "cyber_policy"
             | "bio_policy"
-            | "misalignment_policy_violation"
-            | "usage_limit_reached",
+            | "misalignment_policy_violation",
         ) => ErrorClass::Permanent,
         // The Responses backend uses unknown codes for transient failures. Model requests
         // have no side effects, so only codes known to mean the request cannot succeed as
@@ -1307,6 +1316,36 @@ fn map_incomplete_reason(reason: &str) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ChatGPT/Codex stream-failure codes, in the `response.failed` shape and both bare
+    /// `error` shapes: the plan-allowance codes end the step, the throttle and overload codes
+    /// retry, and only `code` is read, so a `type` naming the same value changes nothing.
+    #[test]
+    fn chatgpt_stream_failure_codes_keep_their_classes() {
+        for (code, class) in [
+            ("usage_limit_reached", ErrorClass::Permanent),
+            ("usage_not_included", ErrorClass::Permanent),
+            ("rate_limit_exceeded", ErrorClass::Transient),
+            ("slow_down", ErrorClass::Transient),
+            ("server_is_overloaded", ErrorClass::Transient),
+        ] {
+            for event in [
+                serde_json::json!({"type":"response.failed","response":{"error":{"code":code}}}),
+                serde_json::json!({"type":"error","error":{"code":code}}),
+                serde_json::json!({"type":"error","code":code}),
+            ] {
+                let nested = event["type"] == "response.failed";
+                let error = response_stream_error(&event, nested, false);
+                assert_eq!(error.class, class, "{event}");
+                assert_eq!(error.provider_code.as_deref(), Some(code), "{event}");
+                assert_eq!(error.status, None);
+            }
+        }
+        let typed = serde_json::json!({"type":"response.failed","response":{"error":{"type":"usage_not_included"}}});
+        let error = response_stream_error(&typed, true, false);
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert_eq!(error.provider_code, None);
+    }
 
     fn extract_assistant_text(events: &[NormalizedEvent]) -> String {
         for event in events {

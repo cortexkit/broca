@@ -15599,3 +15599,148 @@ expect_red = ["input_token_cap::unreported_usage_fails_closed_before_dispatch"]
 file = "crates/broca-core/src/input_budget.rs"
 old = "        let cause = if self.usage_unreported {"
 new = "        let cause = if false && self.usage_unreported { // NON-VACUITY BREAK: run past unknown usage."
+
+[[control]]
+id = "chatgpt-policy-vault-account-id-first"
+guards = "a non-blank vault-served ChatGPT account id wins over the access token's claim"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::a_vault_account_id_wins_over_the_token_claim"]
+file = "crates/cortexkit-chatgpt-policy/src/account.rs"
+old = "    vault_account_id\n        .filter(|account_id| !account_id.trim().is_empty())\n        .map(str::to_owned)\n        .or_else(|| token_account_id(access_token))"
+new = "    token_account_id(access_token) // NON-VACUITY BREAK: the token claim before the vault id\n        .or_else(|| vault_account_id.filter(|account_id| !account_id.trim().is_empty()).map(str::to_owned))"
+
+[[control]]
+id = "chatgpt-policy-upstream-key-prefix"
+guards = "only a ChatGPT 401 whose message starts by naming an sk- key is the backend's own key rejection"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::a_401_naming_an_sk_key_is_an_upstream_key_rejection"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = ".map(|message| message.starts_with(UPSTREAM_KEY_PREFIX))"
+new = ".map(|message| message.contains(\"sk-\")) // NON-VACUITY BREAK: any mention of a key"
+
+[[control]]
+id = "chatgpt-policy-usage-limit-needs-429"
+guards = "the ChatGPT usage-limit body is an exhausted account (AccountLimitExhausted) only on HTTP 429"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::the_usage_limit_429_is_an_account_wall_with_the_body_reset"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "    if status != 429 {\n        return None;"
+new = "    if status != 429 && status != 403 { // NON-VACUITY BREAK: a 403 usage body is a wall\n        return None;"
+
+[[control]]
+id = "chatgpt-policy-usage-not-included-any-status"
+guards = "usage_not_included is its own class at any HTTP status, not a throttle or other refusal"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::usage_not_included_is_its_own_class_at_any_status"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        Some(USAGE_NOT_INCLUDED) => Classification::UsageNotIncluded,\n        // A full context window"
+new = "        Some(\"never-sent\") => Classification::UsageNotIncluded, // NON-VACUITY BREAK\n        // A full context window"
+
+[[control]]
+id = "chatgpt-policy-credential-401"
+guards = "a ChatGPT 401 whose body carries no provider code that classifies it is a credential failure"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::a_credential_401_is_an_auth_failure", "tests::a_401_naming_an_sk_key_is_an_upstream_key_rejection"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        _ if status == 401 => Classification::AuthFailure,"
+new = "        _ if status == 402 => Classification::AuthFailure, // NON-VACUITY BREAK"
+
+[[control]]
+id = "chatgpt-policy-ordinary-429-rate-limited"
+guards = "any other ChatGPT 429 is an ordinary rate limit"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::an_ordinary_429_is_a_rate_limit"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        _ if status == 429 => Classification::RateLimited,"
+new = "        _ if status == 4290 => Classification::RateLimited, // NON-VACUITY BREAK"
+
+[[control]]
+id = "chatgpt-policy-overloaded-503"
+guards = "a ChatGPT 503 is an overloaded backend"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::a_busy_backend_is_overloaded"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "    matches!(status, 503 | 529)"
+new = "    matches!(status, 529) // NON-VACUITY BREAK"
+
+[[control]]
+id = "chatgpt-policy-stream-usage-limit"
+guards = "a usage_limit_reached stream failure is an exhausted account (AccountLimitExhausted)"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::stream_failures_classify_by_code"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        Some(USAGE_LIMIT_REACHED) => Classification::AccountLimitExhausted {"
+new = "        Some(\"never-sent\") => Classification::AccountLimitExhausted { // NON-VACUITY BREAK"
+
+[[control]]
+id = "chatgpt-policy-stream-usage-not-included"
+guards = "a usage_not_included stream failure is its own class"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::stream_failures_classify_by_code"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        Some(USAGE_NOT_INCLUDED) => Classification::UsageNotIncluded,\n        Some(\"rate_limit_exceeded\""
+new = "        Some(\"never-sent\") => Classification::UsageNotIncluded, // NON-VACUITY BREAK\n        Some(\"rate_limit_exceeded\""
+
+[[control]]
+id = "chatgpt-policy-stream-rate-limited"
+guards = "rate_limit_exceeded and slow_down stream failures are rate limits"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::stream_failures_classify_by_code"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        Some(\"rate_limit_exceeded\" | \"slow_down\") => Classification::RateLimited,"
+new = "        Some(\"rate_limit_exceeded\") => Classification::RateLimited, // NON-VACUITY BREAK"
+
+[[control]]
+id = "chatgpt-policy-stream-overloaded"
+guards = "a server_is_overloaded stream failure is an overloaded backend"
+runner = "cargo"
+package = "cortexkit-chatgpt-policy"
+target = "--lib"
+test_file = "crates/cortexkit-chatgpt-policy/src/tests.rs"
+expect_red = ["tests::stream_failures_classify_by_code"]
+file = "crates/cortexkit-chatgpt-policy/src/classify.rs"
+old = "        Some(\"server_is_overloaded\") => Classification::Overloaded,"
+new = "        Some(\"never-sent\") => Classification::Overloaded, // NON-VACUITY BREAK"
+
+[[control]]
+id = "responses-stream-plan-allowance-from-chatgpt-policy"
+guards = "the Responses stream normalizer makes usage_limit_reached and usage_not_included failures permanent through cortexkit-chatgpt-policy's classify_stream_failure"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/families/openai_responses.rs"
+expect_red = ["families::openai_responses::tests::chatgpt_stream_failure_codes_keep_their_classes"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = "    if matches!(\n        cortexkit_chatgpt_policy::classify_stream_failure(event),"
+new = "    if false && matches!( // NON-VACUITY BREAK: ignore the shared stream classes\n        cortexkit_chatgpt_policy::classify_stream_failure(event),"
