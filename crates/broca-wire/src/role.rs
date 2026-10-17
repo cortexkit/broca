@@ -38,6 +38,10 @@ pub const LINEAGE_CHANGED: &str = "lineage_changed";
 pub const UNKNOWN_MID: &str = "unknown_mid";
 /// `run.result` names no run of the session.
 pub const UNKNOWN_RUN: &str = "unknown_run";
+/// Provisional because the pinned 0.2.1 contract has no refusal for this transport limit.
+/// llm-runner 0.2.3 is expected to pin a terminal response with frame size, limit, and the
+/// message or atomic-group identity.
+pub const REPLY_TOO_LARGE: &str = "reply_too_large";
 /// A send whose delivery mode the runner does not declare, with `detail.delivery` naming it.
 /// broca declares every mode the role defines (`queue`, `steer` and `interrupt`), so it never
 /// answers this code; it is listed so the code set matches the role's.

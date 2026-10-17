@@ -74,18 +74,7 @@ fn ordinal_of_mid(mid: &str) -> Option<u64> {
 }
 
 fn json_bytes(value: &impl Serialize) -> u64 {
-    struct Count(u64);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len() as u64);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, value).map_or(u64::MAX, |()| count.0)
+    broca_protocol::serialized_json_bytes(value)
 }
 
 // Optional cursor members are omitted entirely when absent. Include the comma, quoted key,
@@ -100,7 +89,24 @@ fn cursor_bytes<T: Serialize>(name: &str, cursor: &Option<T>) -> u64 {
 /// Ranges keep their oldest messages; tails keep their newest. Late entries share the same
 /// budget, not a second budget of their own. Keep at least one message and one late entry when
 /// present: atomic oversized items or the fixed metadata can still exceed the budget.
-fn cap_page_bytes(page: &mut SessionReadResponse, cap: u64, tail: bool) {
+fn reply_frame_limit_refusal(bytes: u64, subject: ReplyTooLargeSubject) -> Option<ServeError> {
+    if bytes > broca_wire::SUBC_MAX_FRAME_BYTES {
+        Some(ServeError::ReplyTooLarge {
+            bytes,
+            limit: broca_wire::SUBC_MAX_FRAME_BYTES,
+            subject,
+        })
+    } else {
+        None
+    }
+}
+
+fn cap_page_bytes(
+    page: &mut SessionReadResponse,
+    cap: u64,
+    tail: bool,
+    session: &str,
+) -> Result<(), ServeError> {
     let mut total = json_bytes(page);
     let mut start = 0;
     let mut end = page.messages.len();
@@ -132,6 +138,23 @@ fn cap_page_bytes(page: &mut SessionReadResponse, cap: u64, tail: bool) {
             total = total.saturating_add(cursor_bytes("next_late_after", &page.next_late_after));
         }
     }
+    let frame_bytes = broca_wire::serialized_result_frame_bytes(page);
+    let subject = page.messages.first().map_or_else(
+        || ReplyTooLargeSubject::AtomicGroup {
+            session: session.to_owned(),
+            kind: "session_read_metadata".into(),
+            from_ordinal: 0,
+            to_ordinal: 0,
+        },
+        |message| ReplyTooLargeSubject::Message {
+            session: session.to_owned(),
+            ordinal: message.ordinal,
+        },
+    );
+    if let Some(error) = reply_frame_limit_refusal(frame_bytes, subject) {
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -604,6 +627,21 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     }
 }
 
+/// The content-free identifier attached to a reply that cannot fit one transport frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyTooLargeSubject {
+    Message {
+        session: String,
+        ordinal: u64,
+    },
+    AtomicGroup {
+        session: String,
+        kind: String,
+        from_ordinal: u64,
+        to_ordinal: u64,
+    },
+}
+
 /// An error from the serve surface (distinct from a successful per-request outcome). Opening
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
@@ -623,6 +661,12 @@ pub enum ServeError {
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
     Open(String, Option<broca_protocol::ErrorClass>),
+    /// A whole message or model-view atomic group would exceed one encoded subc frame.
+    ReplyTooLarge {
+        bytes: u64,
+        limit: u64,
+        subject: ReplyTooLargeSubject,
+    },
     /// The session's WAL holds a frame that requires WAL features this build does not know
     /// (`missing`): a newer broca wrote it. Nothing was written and retrying cannot help, so
     /// it answers with its own wire code rather than [`ServeError::Open`]. `reason` is the
@@ -734,6 +778,25 @@ impl std::fmt::Display for ServeError {
             ServeError::Open(s, _) | ServeError::WalNewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
+            ServeError::ReplyTooLarge {
+                bytes,
+                limit,
+                subject,
+            } => match subject {
+                ReplyTooLargeSubject::Message { session, ordinal } => write!(
+                    f,
+                    "message {session} at ordinal {ordinal} needs a {bytes}-byte frame, over the {limit}-byte limit"
+                ),
+                ReplyTooLargeSubject::AtomicGroup {
+                    session,
+                    kind,
+                    from_ordinal,
+                    to_ordinal,
+                } => write!(
+                    f,
+                    "atomic group {kind} in session {session} [{from_ordinal}, {to_ordinal}) needs a {bytes}-byte frame, over the {limit}-byte limit"
+                ),
+            },
             ServeError::SendRetracted { submission_id } => {
                 write!(f, "submission '{submission_id}' was retracted")
             }
@@ -1141,12 +1204,33 @@ impl ServeHandler for crate::LineageRegistry {
                 requested: req.lineage_id.unwrap(),
             });
         }
-        page.try_into().map_err(|error| {
+        let groups = page.atomic_groups.clone();
+        let page: broca_wire::ModelPage = page.try_into().map_err(|error| {
             ServeError::Open(
                 format!("model page source: {error}"),
                 Some(broca_protocol::ErrorClass::Permanent),
             )
-        })
+        })?;
+        let subject = groups.first().map_or_else(
+            || ReplyTooLargeSubject::AtomicGroup {
+                session: req.session.session.clone(),
+                kind: "model_view_metadata".into(),
+                from_ordinal: req.from_ordinal.unwrap_or(0),
+                to_ordinal: req.from_ordinal.unwrap_or(0),
+            },
+            |group| ReplyTooLargeSubject::AtomicGroup {
+                session: req.session.session.clone(),
+                kind: group.kind.into(),
+                from_ordinal: group.from_ordinal,
+                to_ordinal: group.to_ordinal,
+            },
+        );
+        if let Some(error) =
+            reply_frame_limit_refusal(broca_wire::serialized_result_frame_bytes(&page), subject)
+        {
+            return Err(error);
+        }
+        Ok(page)
     }
 
     async fn compaction_ready(
@@ -1640,7 +1724,12 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
-        cap_page_bytes(&mut response, cap, from_ordinal.is_none());
+        cap_page_bytes(
+            &mut response,
+            cap,
+            from_ordinal.is_none(),
+            &req.session.session,
+        )?;
         Ok(response)
     }
 
@@ -1770,13 +1859,32 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
-        Ok(broca_wire::RunResultResponse {
+        let response = broca_wire::RunResultResponse {
             run_id: run_id.0,
             state,
             reason,
             error,
             final_message,
-        })
+        };
+        let subject = response.final_message.as_ref().map_or_else(
+            || ReplyTooLargeSubject::AtomicGroup {
+                session: session.session.clone(),
+                kind: "run_result".into(),
+                from_ordinal: 0,
+                to_ordinal: 0,
+            },
+            |message| ReplyTooLargeSubject::Message {
+                session: session.session.clone(),
+                ordinal: message.ordinal,
+            },
+        );
+        if let Some(error) = reply_frame_limit_refusal(
+            broca_wire::serialized_result_frame_bytes(&response),
+            subject,
+        ) {
+            return Err(error);
+        }
+        Ok(response)
     }
 
     async fn baseline(

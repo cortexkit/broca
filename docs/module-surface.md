@@ -96,10 +96,13 @@ A consumer can be both. The surface is **session-centric**: consumers address
 
 ## 4. The wire surface
 
-Unary responses that exceed subc's 64 MiB frame-body cap fail only their correlated
-call with an `Error` whose code is `response_too_large`. No oversized reply bytes
-are sent, and sibling calls keep using the connection. This also bounds oversized
-error messages. The cap is `subc-protocol` 0.31.0's `MAX_FRAME_BODY_LEN`.
+Unary reply frames larger than **4,194,304 bytes including the fixed 21-byte frame header** are
+never sent: broca answers that correlated request with an error and keeps the connection open.
+The 21-byte header is `subc-protocol` 0.31.0's `HEADER_LEN` (`src/lib.rs:417`), encoded by
+`EnvelopeHeader::encode` (`src/lib.rs:714-725`). `session.read` and `run.result` use the typed
+`reply_too_large` refusal when an indivisible message or group would cross that limit; other
+unary replies use the transport adapter's generic oversize refusal. The codec's larger
+`MAX_FRAME_BODY_LEN` is only an allocation ceiling, not the daemon's response-frame limit.
 
 A TCP reset on either half instead ends the connection with the classified
 `reset` serve cause, not a generic serve error. Sibling calls cannot survive an
@@ -151,10 +154,12 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
 - A transcript page is also capped by bytes, measured over the complete serialized reply body
   (default and maximum **3 MiB / 3,145,728 bytes**). Larger `max_bytes` requests are capped to
   that maximum. Messages and late approvals share the budget, including tools, attribution,
-  head fields and continuation cursors. A range page stops early with `next_from_ordinal`;
-  a tail page keeps its newest messages. One message and one late entry, when present, are
-  always kept whole, never truncated. Oversized atomic items, their combined minimum, or
-  unpaged metadata can therefore exceed the budget; this is not a strict frame-size guarantee.
+  head fields and continuation cursors. A single message and a late entry remain whole when they
+  exceed the page target, but a complete encoded frame that exceeds the transport limit is refused
+  as `reply_too_large`, with its frame byte count and message identity; message content is not
+  included in the refusal. Model-view pages use the same target and keep replacement groups and
+  insertion/anchor groups whole. An atomic group that cannot fit one complete frame is refused with
+  its group identity rather than being split or truncated.
 - `tool_calls[].call_key` is `<lineage_id>:<wal_seq>` of the call's own `tool_dispatch_intent`,
   derived on read and never stored. `dispatched_to` is that intent's `module_id`, absent on an
   intent written before broca recorded it. Sending `call_key` to providers waits until each
@@ -164,7 +169,9 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   one pass over the whole WAL fills the first time a read needs them.
 - `run.result`'s `final_message.text` joins the final assistant message's text parts with
   nothing inserted, leaving reasoning out; a completed run with no text answers `""`.
-  It is unpaged and not bounded by `session.read.max_bytes`.
+  It is not paged and is not subject to `session.read.max_bytes`; when its complete encoded frame
+  exceeds the transport limit, broca refuses `reply_too_large` and names the final message by
+  session and ordinal without including its content.
 - `session.baseline` and the admitting send's `baseline`: sessions are admitted without a fetch
   plan, so `items` is empty and `composition_digest` absent; `tool_names` are the first
   episode's tools; both generations are 0. The send reply carries it only when the session's

@@ -2873,7 +2873,8 @@ async fn send_json_response<T: serde::Serialize>(
 ) -> Result<(), ServeIoError> {
     let envelope = ResultEnvelope { result };
     let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;
-    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {
+    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
+    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
         // No bytes from this reply have reached the wire, so a small correlated Error
         // can fail this call without invalidating any sibling request on the connection.
         return send_error(
@@ -2883,7 +2884,7 @@ async fn send_json_response<T: serde::Serialize>(
             epoch,
             corr,
             "response_too_large",
-            "response exceeds the protocol frame body limit",
+            "response exceeds the transport frame limit",
         )
         .await;
     }
@@ -2945,6 +2946,7 @@ async fn send_serve_error(
             );
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
+        ServeError::ReplyTooLarge { .. } => broca_wire::REPLY_TOO_LARGE,
         ServeError::SessionHeld(_) => "session_held",
         ServeError::Open(_, _) => "open_failed",
         ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
@@ -3005,6 +3007,33 @@ async fn send_serve_error(
         }
     };
     let mut body = ErrorBody::new(code, err.to_string());
+    if let ServeError::ReplyTooLarge {
+        bytes,
+        limit,
+        subject,
+    } = err
+    {
+        let mut detail = serde_json::json!({"bytes": bytes, "limit": limit});
+        match subject {
+            broca_module::serve::ReplyTooLargeSubject::Message { session, ordinal } => {
+                detail["message"] = serde_json::json!({"session": session, "ordinal": ordinal});
+            }
+            broca_module::serve::ReplyTooLargeSubject::AtomicGroup {
+                session,
+                kind,
+                from_ordinal,
+                to_ordinal,
+            } => {
+                detail["atomic_group"] = serde_json::json!({
+                    "session": session,
+                    "kind": kind,
+                    "from_ordinal": from_ordinal,
+                    "to_ordinal": to_ordinal,
+                });
+            }
+        }
+        body = body.with_detail(detail);
+    }
     if let ServeError::Open(_, Some(class)) = err {
         body = body.with_detail(serde_json::json!({"class": class.shared_class()}));
     }
@@ -3403,10 +3432,12 @@ async fn send_error_bytes(
     corr: u64,
     mut body: Vec<u8>,
 ) -> Result<(), ServeIoError> {
-    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {
+    if body.len().saturating_add(subc_protocol::HEADER_LEN)
+        > broca_wire::SUBC_MAX_FRAME_BYTES as usize
+    {
         body = serde_json::to_vec(&ErrorBody::new(
             "response_too_large",
-            "error response exceeds the protocol frame body limit",
+            "error response exceeds the transport frame limit",
         ))
         .map_err(|error| ServeIoError(error.to_string()))?;
     }
@@ -4380,12 +4411,12 @@ mod tests {
         async fn status(&self, session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
             if session.session == "oversized-error-response" {
                 return Err(ServeError::Transient(
-                    "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize),
+                    "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize),
                 ));
             }
             if session.session == "oversized-response" {
                 return Ok(StatusResponse::Active {
-                    run_id: "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize),
+                    run_id: "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize),
                     step: 1,
                 });
             }
@@ -5220,6 +5251,21 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn reply_frame_size_uses_the_real_header_length_and_result_envelope() {
+        let result = serde_json::json!({"answer":"ok"});
+        let envelope = serde_json::to_vec(&serde_json::json!({"result":result})).unwrap();
+        assert_eq!(
+            broca_wire::serialized_result_frame_bytes(&result),
+            envelope.len() as u64 + subc_protocol::HEADER_LEN as u64
+        );
+        assert_eq!(
+            broca_wire::SUBC_FRAME_HEADER_BYTES,
+            subc_protocol::HEADER_LEN as u64
+        );
+        assert_eq!(broca_wire::SUBC_MAX_FRAME_BYTES, 4_194_304);
     }
 
     #[tokio::test]
