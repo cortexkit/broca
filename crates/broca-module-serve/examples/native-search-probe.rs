@@ -20,9 +20,26 @@
 //! Anthropic `anthropic-beta` header, `--query` replaces the default user question,
 //! `--wire-model` sends to another model of the same family and `--credential-id` uses another
 //! login than the source session's.
+//! `--frozen` renders from a frozen render config JSON file instead of a WAL (the model handle
+//! then names `--frozen-provider` and there is no credential id unless `--credential-id` gives
+//! one). `--system-file` renders a file's text as a system message before the user turn, which
+//! gives a fixed prompt-cache prefix. `--billing-block` inserts a text block as the body's first
+//! `system` block, the place Claude Code puts its `x-anthropic-billing-header: ...` text.
+//!
+//! WIRE OPTIONS, all opt-in and applied after rendering, so `request-body.json` always holds
+//! the identity (uncompressed) body: `--header name=value` replaces a header (the name matches
+//! case-insensitively) or adds it, `--drop-header name` removes one, and `--gzip` sends the body
+//! the way Claude Code 2.1.302 does: the identity JSON plus `\n` and 0 to 256 random spaces and
+//! tabs, gzip-compressed at level 6, with `content-encoding: gzip`. The credential header cannot
+//! be overridden or dropped. Headers are edited in the order: `--extra-beta`, `--header`,
+//! `--drop-header`, then `--gzip`'s `content-encoding`.
+//!
 //! Output in `--out`: `request-body.json`, `response.raw` (the bytes as received),
 //! `normalized.jsonl` (one line per normalizer event, or its error) and `summary.json`
-//! (status, response header names and values minus cookies, normalizer outcome).
+//! (status, request id, prompt-cache usage, response header names and values minus cookies,
+//! the identity and wire body sizes, normalizer outcome). Without `--send` the tool writes
+//! `planned-request.json` instead: the url, the headers it would send (the credential shown as
+//! a placeholder) and the wire body sizes, plus `request-body.wire.gz` when `--gzip` is set.
 //!
 //! CREDENTIAL. The secret comes from the credentials module over subc by the handle in broca's
 //! `dev-tools-handles.json` under the config home (override: `BROCA_DEVTOOLS_HANDLES`).
@@ -53,8 +70,29 @@ const DEFAULT_QUERY: &str =
 #[command(about = "Send one request with a server-run tool added and save the raw response")]
 struct Args {
     /// A session WAL whose last `run_started` supplies the frozen render config and credential.
+    #[arg(long, required_unless_present = "frozen", conflicts_with = "frozen")]
+    wal: Option<PathBuf>,
+    /// A frozen render config JSON file, used in place of the one a `--wal` session would supply.
     #[arg(long)]
-    wal: PathBuf,
+    frozen: Option<PathBuf>,
+    /// The provider module id of the model handle when rendering from `--frozen`.
+    #[arg(long, default_value = "anthropic")]
+    frozen_provider: String,
+    /// A file whose text is rendered as a system message before the user turn.
+    #[arg(long)]
+    system_file: Option<PathBuf>,
+    /// A text block inserted as the rendered body's first `system` block (Anthropic bodies).
+    #[arg(long)]
+    billing_block: Option<String>,
+    /// `name=value`: replace the header of that name (case-insensitive) or add it. Repeatable.
+    #[arg(long = "header")]
+    header_overrides: Vec<String>,
+    /// Remove the header of this name (case-insensitive). Repeatable.
+    #[arg(long = "drop-header")]
+    drop_headers: Vec<String>,
+    /// Send the body as Claude Code 2.1.302 does: padded, gzip level 6, `content-encoding: gzip`.
+    #[arg(long)]
+    gzip: bool,
     /// Directory for the output files. Created if missing.
     #[arg(long)]
     out: PathBuf,
@@ -139,6 +177,323 @@ fn source_config(
             .map(|a| a.credential_id.clone()),
         serde_json::to_value(&config.generation).unwrap_or(Value::Null),
     ))
+}
+
+/// The frozen config, model, credential id and generation from `--wal` or `--frozen`.
+fn load_source(
+    args: &Args,
+) -> Result<
+    (
+        FrozenRenderConfig,
+        broca_protocol::ModelHandle,
+        Option<String>,
+        Value,
+    ),
+    String,
+> {
+    match (&args.wal, &args.frozen) {
+        (Some(wal), _) => source_config(wal),
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            let frozen: FrozenRenderConfig = serde_json::from_str(&text)
+                .map_err(|e| format!("decode {}: {e}", path.display()))?;
+            let model = broca_protocol::ModelHandle::new(
+                args.frozen_provider.clone(),
+                frozen.wire_model_id.clone(),
+            );
+            Ok((frozen, model, None, Value::Null))
+        }
+        (None, None) => Err("pass --wal or --frozen".into()),
+    }
+}
+
+/// Header names the wire options may not touch: the credential stays exactly what the family's
+/// endpoint attached, so an override can never put an operator-typed secret on the command line.
+const CREDENTIAL_HEADERS: [&str; 2] = ["authorization", "x-api-key"];
+
+/// Send-time encodings and header edits, applied to the request after the family has built it.
+/// Nothing here touches the rendered body bytes; `gzip_body` returns new wire bytes beside them.
+mod wire_edit {
+    use std::io::Write;
+
+    /// Claude Code 2.1.302 appends a `\n` and then `floor(random * 257)` characters, so 0 to 256.
+    pub const MAX_PAD: usize = 256;
+    /// Claude Code leaves the level to Bun, whose default deflate level is 6.
+    pub const GZIP_LEVEL: u32 = 6;
+
+    /// A gzip-encoded body and the sizes the probe reports about it.
+    pub struct GzipBody {
+        pub wire: Vec<u8>,
+        pub identity_len: usize,
+        /// Count of spaces and tabs after the `\n`, so the padded text is identity + 1 + this.
+        pub pad_len: usize,
+        pub padded_len: usize,
+    }
+
+    /// A small seeded generator (splitmix64), enough to draw padding without a new dependency.
+    pub struct SplitMix(pub u64);
+
+    impl SplitMix {
+        /// Seeded from the standard library's per-process random hasher keys.
+        pub fn from_entropy() -> Self {
+            use std::hash::{BuildHasher, Hasher};
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            );
+            Self(hasher.finish())
+        }
+
+        pub fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// The identity body followed by `\n` and 0 to 256 spaces and tabs, as Claude Code pads a
+    /// body before compressing it. Trailing whitespace keeps it valid JSON.
+    pub fn pad(identity: &[u8], rng: &mut SplitMix) -> Vec<u8> {
+        let pad_len = (rng.next_u64() % (MAX_PAD as u64 + 1)) as usize;
+        let mut out = Vec::with_capacity(identity.len() + 1 + pad_len);
+        out.extend_from_slice(identity);
+        out.push(b'\n');
+        for _ in 0..pad_len {
+            out.push(if rng.next_u64() & 1 == 0 { b' ' } else { b'\t' });
+        }
+        out
+    }
+
+    /// Pad and gzip once. The gzip header is `1f8b 08 00 00000000 00 ff` (no name, mtime 0, OS
+    /// byte 255). Captures of Claude Code 2.1.302 show the same ten bytes on an ordinary
+    /// (non-block-mode) gzip body.
+    pub fn gzip_body(identity: &[u8], rng: &mut SplitMix) -> std::io::Result<GzipBody> {
+        let padded = pad(identity, rng);
+        let mut encoder =
+            flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
+        encoder.write_all(&padded)?;
+        let wire = encoder.finish()?;
+        Ok(GzipBody {
+            wire,
+            identity_len: identity.len(),
+            pad_len: padded.len() - identity.len() - 1,
+            padded_len: padded.len(),
+        })
+    }
+
+    /// Replace every header of this name (compared case-insensitively) with one `name: value`
+    /// at the first one's position, or append it when absent.
+    pub fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+        match headers
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            Some(first) => {
+                headers[first] = (name.to_string(), value.to_string());
+                let mut index = 0;
+                headers.retain(|(k, _)| {
+                    let keep = index == first || !k.eq_ignore_ascii_case(name);
+                    index += 1;
+                    keep
+                });
+            }
+            None => headers.push((name.to_string(), value.to_string())),
+        }
+    }
+
+    /// Remove every header of this name, compared case-insensitively.
+    pub fn drop_header(headers: &mut Vec<(String, String)>, name: &str) {
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+    }
+
+    /// Mark the body gzip-encoded. Claude Code's runtime sends `content-encoding` right after
+    /// `x-client-request-id`, so it goes there when that header exists, otherwise last.
+    pub fn set_gzip_header(headers: &mut Vec<(String, String)>) {
+        drop_header(headers, "content-encoding");
+        let entry = ("content-encoding".to_string(), "gzip".to_string());
+        match headers
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case("x-client-request-id"))
+        {
+            Some(at) => headers.insert(at + 1, entry),
+            None => headers.push(entry),
+        }
+    }
+
+    /// Decode a response body by its `content-encoding`. `Ok(None)` means an encoding this
+    /// tool cannot decode (such as `br` or `zstd`), and the caller keeps the raw bytes.
+    pub fn decode_response(encoding: Option<&str>, raw: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        match encoding.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("identity") => return Ok(Some(raw.to_vec())),
+            Some("gzip") => {
+                flate2::read::MultiGzDecoder::new(raw).read_to_end(&mut out)?;
+            }
+            // HTTP's `deflate` is the zlib-wrapped stream.
+            Some("deflate") => {
+                flate2::read::ZlibDecoder::new(raw).read_to_end(&mut out)?;
+            }
+            Some(_) => return Ok(None),
+        }
+        Ok(Some(out))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Read;
+
+        fn gunzip(bytes: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .expect("valid gzip");
+            out
+        }
+
+        #[test]
+        fn gzip_round_trips_to_the_identity_body_plus_padding() {
+            let identity = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+            for seed in 0..200u64 {
+                let mut rng = SplitMix(seed);
+                let gz = gzip_body(identity, &mut rng).expect("gzip");
+                let plain = gunzip(&gz.wire);
+                assert_eq!(plain.len(), gz.padded_len);
+                assert_eq!(
+                    &plain[..identity.len()],
+                    identity,
+                    "prefix is the identity body"
+                );
+                assert_eq!(
+                    plain[identity.len()],
+                    b'\n',
+                    "padding starts with a newline"
+                );
+                let tail = &plain[identity.len() + 1..];
+                assert_eq!(tail.len(), gz.pad_len);
+                assert!(tail.iter().all(|b| *b == b' ' || *b == b'\t'));
+                assert_eq!(gz.identity_len, identity.len());
+                // Still the same JSON document once parsed.
+                let parsed: serde_json::Value = serde_json::from_slice(&plain).expect("json");
+                let original: serde_json::Value = serde_json::from_slice(identity).unwrap();
+                assert_eq!(parsed, original);
+            }
+        }
+
+        #[test]
+        fn gzip_header_matches_claude_codes_runtime_header() {
+            let mut rng = SplitMix(7);
+            let gz = gzip_body(b"{}", &mut rng).expect("gzip");
+            assert_eq!(
+                &gz.wire[..10],
+                &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff],
+                "no flags, mtime 0, XFL 0 at level 6, OS byte 255"
+            );
+        }
+
+        #[test]
+        fn pad_length_stays_in_bounds_and_reaches_both_ends_of_its_range() {
+            let mut rng = SplitMix(42);
+            let (mut min, mut max) = (usize::MAX, 0);
+            let (mut spaces, mut tabs) = (0usize, 0usize);
+            for _ in 0..20_000 {
+                let padded = pad(b"{}", &mut rng);
+                assert_eq!(&padded[..3], b"{}\n");
+                let pad_len = padded.len() - 3;
+                assert!(pad_len <= MAX_PAD, "pad {pad_len} exceeds {MAX_PAD}");
+                min = min.min(pad_len);
+                max = max.max(pad_len);
+                spaces += padded[3..].iter().filter(|b| **b == b' ').count();
+                tabs += padded[3..].iter().filter(|b| **b == b'\t').count();
+            }
+            assert_eq!(min, 0, "an empty pad must be possible");
+            assert_eq!(max, MAX_PAD, "a full 256-character pad must be possible");
+            assert!(spaces > 0 && tabs > 0, "both padding characters appear");
+        }
+
+        #[test]
+        fn header_edits_replace_case_insensitively_add_and_drop() {
+            let mut headers = vec![
+                ("User-Agent".to_string(), "old".to_string()),
+                ("x-app".to_string(), "cli".to_string()),
+                ("user-agent".to_string(), "duplicate".to_string()),
+            ];
+            set_header(&mut headers, "user-agent", "new");
+            set_header(&mut headers, "x-stainless-retry-count", "0");
+            assert_eq!(
+                headers,
+                vec![
+                    ("user-agent".to_string(), "new".to_string()),
+                    ("x-app".to_string(), "cli".to_string()),
+                    ("x-stainless-retry-count".to_string(), "0".to_string()),
+                ]
+            );
+            drop_header(&mut headers, "X-App");
+            assert!(!headers.iter().any(|(k, _)| k == "x-app"));
+        }
+
+        #[test]
+        fn gzip_header_lands_after_the_client_request_id_and_replaces_a_stale_one() {
+            let mut headers = vec![
+                ("Content-Encoding".to_string(), "br".to_string()),
+                ("x-client-request-id".to_string(), "id".to_string()),
+                ("accept-encoding".to_string(), "gzip".to_string()),
+            ];
+            set_gzip_header(&mut headers);
+            assert_eq!(
+                headers,
+                vec![
+                    ("x-client-request-id".to_string(), "id".to_string()),
+                    ("content-encoding".to_string(), "gzip".to_string()),
+                    ("accept-encoding".to_string(), "gzip".to_string()),
+                ]
+            );
+            let mut bare = vec![("a".to_string(), "b".to_string())];
+            set_gzip_header(&mut bare);
+            assert_eq!(bare.last().unwrap().0, "content-encoding");
+        }
+
+        #[test]
+        fn response_decoding_handles_gzip_and_refuses_unknown_encodings() {
+            let mut rng = SplitMix(1);
+            let gz = gzip_body(b"data: {}", &mut rng).unwrap();
+            let decoded = decode_response(Some("gzip"), &gz.wire).unwrap().unwrap();
+            assert!(decoded.starts_with(b"data: {}\n"));
+            assert_eq!(decode_response(None, b"x").unwrap().unwrap(), b"x");
+            assert!(decode_response(Some("br"), b"x").unwrap().is_none());
+        }
+    }
+}
+
+/// Split a `--header name=value` argument at its first `=`.
+fn parse_header_override(raw: &str) -> Result<(String, String), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("--header '{raw}' is not name=value"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("--header '{raw}' has an empty name"));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
+fn refuse_credential_header(name: &str, flag: &str) -> Result<(), String> {
+    if CREDENTIAL_HEADERS
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(name.trim()))
+    {
+        return Err(format!(
+            "{flag} may not change the credential header '{name}'"
+        ));
+    }
+    Ok(())
 }
 
 struct Secret {
@@ -228,7 +583,20 @@ async fn main() {
 async fn run(args: Args) -> Result<(), String> {
     std::fs::create_dir_all(&args.out)
         .map_err(|e| format!("create {}: {e}", args.out.display()))?;
-    let (mut frozen, mut model, wal_credential, generation) = source_config(&args.wal)?;
+    // Reject bad wire options before any credential is fetched.
+    let header_overrides = args
+        .header_overrides
+        .iter()
+        .map(|raw| {
+            let (name, value) = parse_header_override(raw)?;
+            refuse_credential_header(&name, "--header")?;
+            Ok((name, value))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for name in &args.drop_headers {
+        refuse_credential_header(name, "--drop-header")?;
+    }
+    let (mut frozen, mut model, wal_credential, generation) = load_source(&args)?;
     if let Some(wire_model) = &args.wire_model {
         frozen.wire_model_id = wire_model.clone();
         model = broca_protocol::ModelHandle::new(model.provider_module_id.clone(), wire_model);
@@ -248,7 +616,19 @@ async fn run(args: Args) -> Result<(), String> {
     let body: Vec<u8> = match &args.body_file {
         Some(path) => std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?,
         None => {
-            let mut opts = CallOptions::new(vec![Message {
+            let mut prompt = Vec::new();
+            if let Some(path) = &args.system_file {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
+                prompt.push(Message {
+                    cache_prefix_blocks: None,
+                    origin: None,
+                    ordinal: None,
+                    role: Role::System,
+                    content: vec![ContentBlock::Text { text }],
+                });
+            }
+            prompt.push(Message {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -256,33 +636,47 @@ async fn run(args: Args) -> Result<(), String> {
                 content: vec![ContentBlock::Text {
                     text: args.query.clone(),
                 }],
-            }]);
+            });
+            let mut opts = CallOptions::new(prompt);
             opts.step_context = Some(StepContext {
                 run_id: "native-search-probe".into(),
                 step_index: 1,
             });
             opts.target_model = Some(model);
             let rendered = family.render(&frozen, &opts);
-            let mut value: Value = serde_json::from_slice(&rendered)
-                .map_err(|e| format!("rendered body is not JSON: {e}"))?;
-            let obj = value
-                .as_object_mut()
-                .ok_or("rendered body is not an object")?;
-            for tool in &args.inject_tool {
-                let tool: Value =
-                    serde_json::from_str(tool).map_err(|e| format!("--inject-tool: {e}"))?;
-                let tools = obj.entry("tools").or_insert_with(|| json!([]));
-                tools
-                    .as_array_mut()
-                    .ok_or("the body's tools field is not an array")?
-                    .push(tool);
+            if args.inject_tool.is_empty() && args.merge.is_none() && args.billing_block.is_none() {
+                // Unmodified: send the family's rendered bytes exactly as broca would.
+                rendered
+            } else {
+                let mut value: Value = serde_json::from_slice(&rendered)
+                    .map_err(|e| format!("rendered body is not JSON: {e}"))?;
+                let obj = value
+                    .as_object_mut()
+                    .ok_or("rendered body is not an object")?;
+                for tool in &args.inject_tool {
+                    let tool: Value =
+                        serde_json::from_str(tool).map_err(|e| format!("--inject-tool: {e}"))?;
+                    let tools = obj.entry("tools").or_insert_with(|| json!([]));
+                    tools
+                        .as_array_mut()
+                        .ok_or("the body's tools field is not an array")?
+                        .push(tool);
+                }
+                if let Some(merge) = &args.merge {
+                    let merge: Map<String, Value> =
+                        serde_json::from_str(merge).map_err(|e| format!("--merge: {e}"))?;
+                    obj.extend(merge);
+                }
+                if let Some(text) = &args.billing_block {
+                    obj.get_mut("system")
+                        .and_then(Value::as_array_mut)
+                        .ok_or("--billing-block needs a body with a system array")?
+                        .insert(0, json!({ "type": "text", "text": text }));
+                }
+                // The same canonical serializer the family renders with, so the only bytes that
+                // differ from an unmodified render are the edits above.
+                broca_protocol::canonical_json_bytes(&value)
             }
-            if let Some(merge) = &args.merge {
-                let merge: Map<String, Value> =
-                    serde_json::from_str(merge).map_err(|e| format!("--merge: {e}"))?;
-                obj.extend(merge);
-            }
-            serde_json::to_vec(&value).map_err(|e| e.to_string())?
         }
     };
     let mut redactions = 0u64;
@@ -293,22 +687,32 @@ async fn run(args: Args) -> Result<(), String> {
         &mut redactions,
     );
     println!("request body: {} bytes", body.len());
-    if !args.send {
-        println!("render-only: pass --send to send the request");
-        return Ok(());
-    }
 
-    let credential_id = args
-        .credential_id
-        .clone()
-        .or(wal_credential)
-        .ok_or("the WAL has no auth_selection; pass --credential-id")?;
-    println!("credential: {credential_id} (via vault handle)");
-    let secret = fetch_secret(&args, &credential_id).await?;
-    let auth = if frozen.family_id == WireFamilyId::OpenAiResponsesChatgpt {
-        chatgpt_headers(&secret, &args.cache_scope)?
+    // The credential is fetched only to send. Without --send the endpoint is built with a
+    // placeholder so the planned headers and wire sizes can be checked offline.
+    let secret = if args.send {
+        let credential_id = args
+            .credential_id
+            .clone()
+            .or(wal_credential)
+            .ok_or("the source has no auth_selection; pass --credential-id")?;
+        println!("credential: {credential_id} (via vault handle)");
+        Some(fetch_secret(&args, &credential_id).await?)
     } else {
-        AuthHandle::Bearer(secret.token.clone())
+        None
+    };
+    let token = secret
+        .as_ref()
+        .map(|s| s.token.clone())
+        .unwrap_or_else(|| DRY_RUN_TOKEN.to_string());
+    let auth = if frozen.family_id == WireFamilyId::OpenAiResponsesChatgpt {
+        let placeholder = Secret {
+            token: token.clone(),
+            account_id: Some("dry-run-account".into()),
+        };
+        chatgpt_headers(secret.as_ref().unwrap_or(&placeholder), &args.cache_scope)?
+    } else {
+        AuthHandle::Bearer(token.clone())
     };
     let mut request = family.endpoint(&frozen, &auth, body);
     drop(auth);
@@ -326,12 +730,43 @@ async fn run(args: Args) -> Result<(), String> {
             None => request.headers.push(("anthropic-beta".into(), extra)),
         }
     }
+    for (name, value) in &header_overrides {
+        wire_edit::set_header(&mut request.headers, name, value);
+    }
+    for name in &args.drop_headers {
+        wire_edit::drop_header(&mut request.headers, name);
+    }
+    // Gzip is a send-time encoding: `request.body` stays the identity bytes written above, and
+    // the compressed bytes are a separate wire body.
+    let identity_len = request.body.len();
+    let gzip = if args.gzip {
+        let gz = wire_edit::gzip_body(&request.body, &mut wire_edit::SplitMix::from_entropy())
+            .map_err(|e| format!("gzip: {e}"))?;
+        wire_edit::set_gzip_header(&mut request.headers);
+        Some(gz)
+    } else {
+        None
+    };
+    let wire_body: Vec<u8> = match &gzip {
+        Some(gz) => gz.wire.clone(),
+        None => request.body.clone(),
+    };
+    let gzip_summary = gzip.as_ref().map(|gz| {
+        json!({
+            "level": wire_edit::GZIP_LEVEL,
+            "identity_len": gz.identity_len,
+            "pad_len": gz.pad_len,
+            "padded_len": gz.padded_len,
+            "compressed_len": gz.wire.len(),
+            "header_hex": gz.wire.iter().take(10).map(|b| format!("{b:02x}")).collect::<String>(),
+        })
+    });
     // Header names and the non-secret values, so the report can show what was sent.
     let sent_headers: Map<String, Value> = request
         .headers
         .iter()
         .map(|(k, v)| {
-            let shown = if k == "authorization" || v.contains(&secret.token) {
+            let shown = if k.eq_ignore_ascii_case("authorization") || v.contains(&token) {
                 json!("<credential>")
             } else if k == "chatgpt-account-id" {
                 json!("<account id>")
@@ -341,6 +776,47 @@ async fn run(args: Args) -> Result<(), String> {
             (k.clone(), shown)
         })
         .collect();
+    let header_order: Vec<&str> = request.headers.iter().map(|(k, _)| k.as_str()).collect();
+
+    let Some(secret) = secret else {
+        let planned = json!({
+            "url": request.url,
+            "headers": sent_headers,
+            "header_order": header_order,
+            "request_identity_len": identity_len,
+            "request_wire_len": wire_body.len(),
+            "gzip": gzip_summary,
+        });
+        let pretty = serde_json::to_string_pretty(&planned).unwrap_or_default();
+        write_checked(
+            &args.out.join("planned-request.json"),
+            pretty.as_bytes(),
+            None,
+            &mut redactions,
+        );
+        if gzip.is_some() {
+            write_checked(
+                &args.out.join("request-body.wire.gz"),
+                &wire_body,
+                None,
+                &mut redactions,
+            );
+        }
+        println!(
+            "render-only: wire body {} bytes (identity {identity_len}); pass --send to send",
+            wire_body.len()
+        );
+        print_result_line(&json!({
+            "sent": false,
+            "request_identity_len": identity_len,
+            "request_wire_len": wire_body.len(),
+            "gzip_pad_len": gzip.as_ref().map(|gz| gz.pad_len),
+            "user_agent": sent_headers.get("user-agent"),
+            "anthropic_beta": sent_headers.get("anthropic-beta"),
+            "content_encoding": sent_headers.get("content-encoding"),
+        }));
+        return Ok(());
+    };
 
     let client = broca_provider::build_provider_http_client();
     let mut builder = client.post(&request.url);
@@ -350,7 +826,7 @@ async fn run(args: Args) -> Result<(), String> {
     println!("sending to {} ...", request.url);
     let exchange = async {
         let response = builder
-            .body(request.body.clone())
+            .body(wire_body.clone())
             .send()
             .await
             .map_err(|e| format!("send: {e}"))?;
@@ -371,34 +847,54 @@ async fn run(args: Args) -> Result<(), String> {
         tokio::time::timeout(Duration::from_secs(args.hard_cap_secs), exchange)
             .await
             .map_err(|_| "hard cap reached before the response ended".to_string())??;
-    println!("status {status}, {} response bytes", bytes.len());
+    let request_id = response_headers
+        .get("request-id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    println!(
+        "status {status}, request-id {request_id}, {} response bytes",
+        bytes.len()
+    );
     write_checked(
         &args.out.join("response.raw"),
         &bytes,
         Some(&secret.token),
         &mut redactions,
     );
+    // The provider HTTP client has no decompression feature, so a compressed answer to an
+    // `accept-encoding` override arrives raw and is decoded here.
+    let response_encoding = response_headers
+        .get("content-encoding")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let decoded = wire_edit::decode_response(response_encoding.as_deref(), &bytes)
+        .map_err(|e| format!("decode {response_encoding:?} response: {e}"))?;
 
     // What broca's own stream normalizer makes of the response.
     let mut normalizer = family.normalizer(&frozen, StepId(1));
     let mut lines = Vec::new();
     let mut normalizer_outcome = json!({"ok": true});
-    if status == 200 {
-        let pushed = normalizer.push(&bytes).and_then(|mut events| {
-            events.extend(normalizer.finish()?);
-            Ok(events)
-        });
-        match pushed {
-            Ok(events) => {
-                normalizer_outcome = json!({"ok": true, "events": events.len()});
-                for event in events {
-                    lines.push(format!("{event:?}"));
+    match (&decoded, status) {
+        (Some(decoded), 200) => {
+            let pushed = normalizer.push(decoded).and_then(|mut events| {
+                events.extend(normalizer.finish()?);
+                Ok(events)
+            });
+            match pushed {
+                Ok(events) => {
+                    normalizer_outcome = json!({"ok": true, "events": events.len()});
+                    for event in events {
+                        lines.push(format!("{event:?}"));
+                    }
                 }
+                Err(e) => normalizer_outcome = json!({"ok": false, "error": format!("{e:?}")}),
             }
-            Err(e) => normalizer_outcome = json!({"ok": false, "error": format!("{e:?}")}),
         }
-    } else {
-        normalizer_outcome = json!({"skipped": "non-200 status"});
+        (None, _) => {
+            normalizer_outcome = json!({"skipped": "response content-encoding not decodable"})
+        }
+        _ => normalizer_outcome = json!({"skipped": "non-200 status"}),
     }
     write_checked(
         &args.out.join("normalized.jsonl"),
@@ -406,13 +902,35 @@ async fn run(args: Args) -> Result<(), String> {
         Some(&secret.token),
         &mut redactions,
     );
+    let (usage_start, usage_final, message_start_keys) = decoded
+        .as_deref()
+        .map(sse_usage)
+        .unwrap_or((Value::Null, Value::Null, Value::Null));
+    let error = match (&decoded, status) {
+        (Some(decoded), s) if s != 200 => {
+            let text = String::from_utf8_lossy(decoded);
+            let text: String = text.chars().take(2000).collect();
+            json!(text.replace(&secret.token, "<REDACTED-CREDENTIAL>"))
+        }
+        _ => Value::Null,
+    };
     let summary = json!({
         "status": status,
+        "request_id": request_id,
         "url": request.url,
         "sent_headers": sent_headers,
+        "header_order": header_order,
         "response_headers": response_headers,
-        "request_body_len": request.body.len(),
+        "response_content_encoding": response_encoding,
+        "request_body_len": identity_len,
+        "request_identity_len": identity_len,
+        "request_wire_len": wire_body.len(),
+        "gzip": gzip_summary,
         "response_bytes": bytes.len(),
+        "usage_start": usage_start,
+        "usage_final": usage_final,
+        "message_start_keys": message_start_keys,
+        "error": error,
         "normalizer": normalizer_outcome,
     });
     let pretty = serde_json::to_string_pretty(&summary).unwrap_or_default();
@@ -423,6 +941,26 @@ async fn run(args: Args) -> Result<(), String> {
         &mut redactions,
     );
     println!(
+        "usage {}",
+        serde_json::to_string(&summary["usage_start"]).unwrap_or_default()
+    );
+    print_result_line(&json!({
+        "sent": true,
+        "status": status,
+        "request_id": summary["request_id"],
+        "cache_read_input_tokens": summary["usage_start"].get("cache_read_input_tokens"),
+        "cache_creation_input_tokens": summary["usage_start"].get("cache_creation_input_tokens"),
+        "input_tokens": summary["usage_start"].get("input_tokens"),
+        "output_tokens": summary["usage_final"].get("output_tokens"),
+        "request_identity_len": identity_len,
+        "request_wire_len": wire_body.len(),
+        "gzip_pad_len": gzip.as_ref().map(|gz| gz.pad_len),
+        "response_content_encoding": summary["response_content_encoding"],
+        "error_type": summary["error"].as_str()
+            .and_then(|e| serde_json::from_str::<Value>(e).ok())
+            .and_then(|e| e["error"]["type"].as_str().map(str::to_string)),
+    }));
+    println!(
         "{}",
         serde_json::to_string_pretty(&summary["normalizer"]).unwrap_or_default()
     );
@@ -431,4 +969,44 @@ async fn run(args: Args) -> Result<(), String> {
         println!("WARNING: {redactions} output file(s) contained the credential and were redacted");
     }
     Ok(())
+}
+
+/// One `RESULT {json}` line on stdout, so a wrapper script can collect each probe's outcome
+/// without parsing the other output. It never holds a header value that could be a credential.
+fn print_result_line(result: &Value) {
+    println!(
+        "RESULT {}",
+        serde_json::to_string(result).unwrap_or_default()
+    );
+}
+
+/// The token attached when the tool only renders, so the planned headers show the credential
+/// header's place without any credential existing in this process.
+const DRY_RUN_TOKEN: &str = "dry-run-placeholder-not-a-credential";
+
+/// From an Anthropic SSE stream: the `message_start` usage (where the prompt-cache read and
+/// write counts are), the last `message_delta` usage, and the `message_start` message's keys
+/// (so a field a beta adds is visible). Each is `null` when absent.
+fn sse_usage(body: &[u8]) -> (Value, Value, Value) {
+    let text = String::from_utf8_lossy(body);
+    let (mut start, mut last, mut keys) = (Value::Null, Value::Null, Value::Null);
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                start = event["message"]["usage"].clone();
+                if let Some(message) = event["message"].as_object() {
+                    keys = json!(message.keys().collect::<Vec<_>>());
+                }
+            }
+            Some("message_delta") => last = event["usage"].clone(),
+            _ => {}
+        }
+    }
+    (start, last, keys)
 }
