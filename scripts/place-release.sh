@@ -156,7 +156,7 @@ if pid:
     except Exception as error:
         active_runs = [{"session": name, "run_id": None} for name in sessions]
         errors = [f"cannot read pre-restart run snapshot: {error}"]
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], "idle": []}
     try:
         wals = {
             wal.name: wal
@@ -170,7 +170,12 @@ if pid:
     for active in active_runs:
         name, run_id = active.get("session"), active.get("run_id")
         status = UNCONFIRMED
-        if isinstance(name, str) and isinstance(run_id, str):
+        # live-runs.py lists sessions by recent writes, so a session whose last run had already
+        # finished can appear. The snapshot read its WAL and found no open run: nothing to seal.
+        # A missing or unreadable WAL never sets this, so it stays unconfirmed.
+        if active.get("no_open_run") is True:
+            status = "idle"
+        elif isinstance(name, str) and isinstance(run_id, str):
             wal = wals.get(name)
             if wal is not None:
                 try:
@@ -193,13 +198,16 @@ else:
             wal = wals.get(active["session"])
             if wal is not None:
                 active["run_id"] = active_run_id(wal)
+                if active["run_id"] is None:
+                    active["no_open_run"] = True
     except Exception as error:
         errors.append(str(error))
     seal_error = "; ".join(errors)
     active_path.write_text(json.dumps({"runs": active_runs, "error": seal_error}))
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], "idle": []}
 
 runs_sealed = statuses[SEALED]
+sessions_idle = [run["session"] for run in statuses["idle"]]
 runs_unconfirmed = statuses[UNCONFIRMED]
 runs_cancelled = statuses[CANCELLED]
 sessions_sealed = [run["session"] for run in runs_sealed]
@@ -220,6 +228,7 @@ pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
                                        "sessions_sealed": sessions_sealed,
                                        "sessions_unconfirmed": sessions_unconfirmed,
                                        "sessions_cancelled": sessions_cancelled,
+                                       "sessions_idle": sessions_idle,
                                        "seal_error": seal_error,
                                        "live_run_snapshot": snapshot}))
 PY

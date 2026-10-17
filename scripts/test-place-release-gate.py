@@ -641,9 +641,15 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         wal.mkdir()
         session = wal / "session.wal"
         unsealed = wal / "unsealed.wal"
+        finished = wal / "finished.wal"
         session.write_bytes(
             wal_frame(1, {"type": "run_started", "run_id": "run-before"})
             + wal_frame(2, {"type": "step_started"})
+        )
+        # Listed by recent writes, but its last run had already finished: nothing to seal.
+        finished.write_bytes(
+            wal_frame(1, {"type": "run_started", "run_id": "run-done"})
+            + wal_frame(2, {"type": "run_finished", "reason": "completed"})
         )
         unsealed.write_bytes(
             wal_frame(1, {"type": "run_started", "run_id": "run-open"})
@@ -660,20 +666,22 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         ck.write_text(f'#!/bin/sh\ncat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
         ck.chmod(0o755)
         result = self.place("--restart", "--live-approved", "--report", str(report),
-                            PLACE_RELEASE_GATE_CMD='echo "live runs          2"; echo "  live  session.wal  last write 0s ago"; echo "  live  unsealed.wal  last write 0s ago"; exit 1', **env)
+                            PLACE_RELEASE_GATE_CMD='echo "live runs          3"; echo "  live  session.wal  last write 0s ago"; echo "  live  unsealed.wal  last write 0s ago"; echo "  live  finished.wal  last write 0s ago"; exit 1', **env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("live restart approved by " + subprocess.check_output(["id", "-un"], text=True).strip(), result.stdout)
         self.assertIn("live runs accepted immediately before restart", result.stdout)
         self.assertIn("(pid 4243)", result.stdout)
         data = json.loads(report.read_text())
         self.assertEqual(data["pid"], "4243")
-        self.assertEqual(data["sessions_at_restart"], ["session.wal", "unsealed.wal"])
+        self.assertEqual(data["sessions_at_restart"], ["session.wal", "unsealed.wal", "finished.wal"])
         self.assertEqual(data["active_runs_at_restart"], [
             {"session": "session.wal", "run_id": "run-before"},
             {"session": "unsealed.wal", "run_id": "run-open"},
+            {"session": "finished.wal", "run_id": None, "no_open_run": True},
         ])
         self.assertEqual(data["sessions_sealed"], ["session.wal"])
         self.assertEqual(data["sessions_unconfirmed"], ["unsealed.wal"])
+        self.assertEqual(data["sessions_idle"], ["finished.wal"])
         self.assertEqual(data["sessions_cancelled"], [])
         self.assertEqual(data["runs_sealed"], [{"session": "session.wal", "run_id": "run-before"}])
         self.assertEqual(data["runs_unconfirmed"], [{"session": "unsealed.wal", "run_id": "run-open"}])
