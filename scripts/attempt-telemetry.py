@@ -230,12 +230,12 @@ def scan_corpus(
 ) -> ScanResult:
     wal_dir = (
         state_root_path / "wal"
-        if any((state_root_path / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-archive"))
+        if any((state_root_path / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-durable", "wal-archive", "wal-archive-durable"))
         else state_root_path
     )
     if not any(
         root.is_dir()
-        for root in (wal_dir, wal_dir.parent / "wal-ephemeral", wal_dir.parent / "wal-archive")
+        for root in (wal_dir, wal_dir.parent / "wal-ephemeral", wal_dir.parent / "wal-durable", wal_dir.parent / "wal-archive", wal_dir.parent / "wal-archive-durable")
     ):
         raise ProbeRefusal(f"no WAL directory at {wal_dir}")
 

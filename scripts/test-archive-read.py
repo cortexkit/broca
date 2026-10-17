@@ -59,6 +59,25 @@ class ArchiveReadTests(unittest.TestCase):
                 value["record"]["usage"] = {"output_tokens": 40}
         return values
 
+    def test_durable_archive_and_live_override_without_ordinary_trees(self):
+        live = fixtures.write_wal(self.root, "aaaaaaaaaaaaaaaa.wal", self.records())
+        live_bytes = live.read_bytes()
+        container = self.seal(10, live)
+        durable_archive = self.root / "wal-archive-durable"
+        durable_archive.mkdir()
+        container.rename(durable_archive / container.name)
+        live.unlink()
+        (self.root / "wal").rmdir()
+        (self.root / "wal-archive").rmdir()
+        selected = logical_wals(self.root / "wal")
+        self.assertEqual([wal.name for wal in selected], [live.name])
+        self.assertTrue(read_records(selected[0]))
+        durable = self.root / "wal-durable"
+        durable.mkdir()
+        current = durable / live.name
+        current.write_bytes(live_bytes)
+        self.assertEqual(logical_wals(self.root / "wal"), [current])
+
     def assert_archived_sidecar_skip(self, suffix):
         hidden = fixtures.write_wal(self.root, "aaaaaaaaaaaaaaaa.wal", self.records())
         visible = fixtures.write_wal(self.root, "bbbbbbbbbbbbbbbb.wal", self.records())
@@ -366,6 +385,6 @@ class ArchiveReadTests(unittest.TestCase):
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ArchiveReadTests)
     print(f"archive suite anchors: {suite.countTestCases()}", flush=True)
-    if suite.countTestCases() != 19:
+    if suite.countTestCases() != 20:
         raise SystemExit("archive suite anchor count changed")
     unittest.main(verbosity=2)

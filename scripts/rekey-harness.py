@@ -114,7 +114,7 @@ def main() -> int:
     if not db_path.exists():
         print(f"rekey: cannot compare -- no run-index at {db_path}", file=sys.stderr)
         return 2
-    if not wal_dir.is_dir() and not (root / "wal-ephemeral").is_dir():
+    if not any((root / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-durable")):
         print(f"rekey: cannot compare -- no wal directory at {wal_dir}", file=sys.stderr)
         return 2
 
@@ -224,7 +224,7 @@ def main() -> int:
         if old_wal is None:
             # A filtered WAL still on disk belongs to deletion recovery. Re-keying its
             # rows or renaming it would separate it from its address's tombstone.
-            if any((directory / wal_name(old_key)).exists() for directory in (wal_dir, root / "wal-ephemeral")):
+            if any((directory / wal_name(old_key)).exists() for directory in (wal_dir, root / "wal-ephemeral", root / "wal-durable")):
                 tombstoned_sources += 1
                 continue
             if address in archived_addresses:
@@ -237,7 +237,7 @@ def main() -> int:
             plan.append((old_key, new_key, None, None))
             continue
         new_wal = old_wal.with_name(wal_name(new_key))
-        destination = next((directory / new_wal.name for directory in (wal_dir, root / "wal-ephemeral")
+        destination = next((directory / new_wal.name for directory in (wal_dir, root / "wal-ephemeral", root / "wal-durable")
                             if (directory / new_wal.name).exists()), None)
         if destination is not None:
             wal_collisions.append((old_key, destination))

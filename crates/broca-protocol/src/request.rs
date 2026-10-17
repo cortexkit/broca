@@ -4,6 +4,19 @@
 
 use std::sync::Arc;
 
+/// Session classes are opaque labels, not paths or provider identities.
+pub fn validate_session_class(value: &str) -> Result<(), &'static str> {
+    if (1..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err("session_class must contain 1-32 lowercase ASCII letters, digits, '_' or '-'")
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

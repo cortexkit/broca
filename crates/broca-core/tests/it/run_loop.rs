@@ -265,6 +265,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -339,6 +340,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 fn req(name: &str, tools: Vec<Tool>, stop_when: Vec<StopCondition>) -> RunRequest {
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -905,6 +907,7 @@ async fn zero_step_count_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -980,6 +983,7 @@ async fn zero_context_limit_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -1144,6 +1148,7 @@ async fn volatile_cache_tail_with_tools_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -3713,6 +3718,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         tail: Vec::new(),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            session_class: None,
             lineage_retention: None,
             compaction: None,
             effort_history: None,

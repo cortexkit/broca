@@ -334,6 +334,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

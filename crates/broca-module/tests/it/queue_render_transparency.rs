@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, Notify};
 
 fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -345,6 +346,7 @@ impl LineageOpener for RecOpener {
 
 fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -680,6 +682,7 @@ async fn crash_recovery_preserves_stop_before_tool_dispatch() {
     wal.append(
         1,
         &broca_wal::WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

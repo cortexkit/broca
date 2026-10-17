@@ -122,6 +122,7 @@ async fn loop_drives_aimock_through_real_aft() {
     let provider = LiveProvider::new(OpenAiChat, frozen, auth);
 
     let req = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

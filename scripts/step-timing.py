@@ -427,8 +427,8 @@ def scan_corpus(
     state_root: pathlib.Path,
     timestamp_reader: TimestampReader = envelope_timestamp,
 ) -> ScanResult:
-    wal_dir = state_root / "wal" if any((state_root / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-archive")) else state_root
-    if not any(root.is_dir() for root in (wal_dir, wal_dir.parent / "wal-ephemeral", wal_dir.parent / "wal-archive")):
+    wal_dir = state_root / "wal" if any((state_root / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-durable", "wal-archive", "wal-archive-durable")) else state_root
+    if not any(root.is_dir() for root in (wal_dir, wal_dir.parent / "wal-ephemeral", wal_dir.parent / "wal-durable", wal_dir.parent / "wal-archive", wal_dir.parent / "wal-archive-durable")):
         raise ProbeRefusal(f"no WAL directory at {wal_dir}")
 
     paths = logical_wals(wal_dir)

@@ -389,7 +389,28 @@ impl FileCutArtifacts {
     ) -> Result<Vec<(PathBuf, PathBuf)>, ErrorBody> {
         plans
             .iter()
-            .map(|p| Ok((self.staged(cut_id, p)?, self.wal.wal_path(&p.session))))
+            .map(|p| {
+                let range = broca_wal::file_wal::read_verified_member_range(&p.bytes, 0, 0, None)
+                    .map_err(unavailable)?;
+                let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+                    return Err(unavailable("incoming move WAL has no complete records"));
+                };
+                let class = records
+                    .iter()
+                    .find_map(|frame| match &frame.record {
+                        broca_wal::WalRecord::RunStarted { session_class, .. } => {
+                            Some(session_class.as_deref())
+                        }
+                        _ => None,
+                    })
+                    .flatten();
+                Ok((
+                    self.staged(cut_id, p)?,
+                    self.wal
+                        .move_destination(&p.session, class)
+                        .map_err(unavailable)?,
+                ))
+            })
             .collect()
     }
     fn owned_freeze(
@@ -888,6 +909,10 @@ impl CutArtifacts for FileCutArtifacts {
                         };
                         self.wal
                             .publish_move_records(&broca_core::session_addr(session), records);
+                        // Ownership sidecars retain the canonical wal/ address so every
+                        // transcript tree shares one move refusal and one writer lease.
+                        migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
+                            .map_err(|error| error.to_string())?;
                         self.driver.drop_projection(session)
                     },
                 )

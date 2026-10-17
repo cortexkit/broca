@@ -73,6 +73,8 @@ mod optional_tools;
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/retention.rs"]
 mod retention;
+#[path = "llm_runner_conformance/session_class.rs"]
+mod session_class;
 /// The `it` target's real-daemon diagnostics (log tails, watchdog stall files, decoded session
 /// WALs), included by path so this rig prints the same evidence when a suite case fails.
 #[allow(dead_code)]
@@ -654,6 +656,7 @@ struct BrocaSubject {
     /// turns dumps on. The retention scenarios scan it for content that must never be dumped.
     dump_dir: Option<PathBuf>,
     binary: Option<PathBuf>,
+    backup_classes: Option<Vec<String>>,
 }
 
 impl BrocaSubject {
@@ -669,6 +672,7 @@ impl BrocaSubject {
             project_root: project_root.canonicalize().unwrap(),
             dump_dir: None,
             binary: None,
+            backup_classes: None,
         }
     }
 
@@ -722,6 +726,20 @@ impl BrocaSubject {
             }
         });
         let mut config = config;
+        let broca_config = config_home.join("cortexkit/broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(
+                &self
+                    .backup_classes
+                    .as_ref()
+                    .map(|classes| json!({"backup_classes": classes}))
+                    .unwrap_or_else(|| json!({})),
+            )
+            .unwrap(),
+        )
+        .map_err(|error| fail(error.to_string()))?;
+        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
         }
@@ -861,9 +879,9 @@ impl BrocaSubject {
 
     /// The records of `session`'s WAL on `live`'s state root.
     fn records(&self, live: &Live, session: &str) -> Vec<broca_wal::WalRecord> {
-        let path = broca_core::FileWalStore::new(live.state_root.join("wal"))
-            .wal_path(&self.bind_identity(session));
-        broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES)
+        use broca_core::WalStore;
+        broca_core::FileWalStore::new(live.state_root.join("wal"))
+            .read_records(&self.bind_identity(session))
             .unwrap_or_default()
             .into_iter()
             .map(|framed| framed.record)

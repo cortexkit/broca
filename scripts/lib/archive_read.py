@@ -21,6 +21,9 @@ from lib import wal_gate
 class ArchiveRefusal(RuntimeError):
     """The corpus cannot be reported on without hiding unavailable evidence."""
 
+LIVE_TREES = ("wal", "wal-ephemeral", "wal-durable")
+ARCHIVE_TREES = ("wal-archive", "wal-archive-durable")
+
 
 def move_exclusions(wal_dir: pathlib.Path, *, refuse_sidecars: bool = False) -> set[str]:
     """Exclude sessions being moved between machines before reading their WAL bytes.
@@ -69,8 +72,8 @@ def move_exclusions(wal_dir: pathlib.Path, *, refuse_sidecars: bool = False) -> 
                                  f"{intent['op']} intent, refs={json.dumps(refs)}; "
                                  "rerun after the move finishes")
     roots = [wal_dir]
-    if wal_dir.name in ("wal", "wal-ephemeral"):
-        roots = [wal_dir.parent / "wal", wal_dir.parent / "wal-ephemeral"]
+    if wal_dir.name in LIVE_TREES:
+        roots = [wal_dir.parent / name for name in LIVE_TREES]
     excluded = set()
     for root in roots:
         try:
@@ -206,7 +209,7 @@ def is_tombstoned(wal: pathlib.Path) -> bool:
     if lineage is None:
         return False
     directories = {wal.with_suffix(".expired")}
-    if wal.parent.name in ("wal", "wal-ephemeral"):
+    if wal.parent.name in LIVE_TREES:
         directories.add(wal.parent.parent / "wal-ephemeral" / f"{wal.stem}.expired")
     for directory in directories:
         try:
@@ -436,7 +439,7 @@ def logical_wals(wal_dir: pathlib.Path, *, include_archives: bool) -> list[pathl
 
 
 def logical_wals(wal_dir: pathlib.Path, *, include_archives: bool = True):
-    """Resolve wal/ and wal-ephemeral/, then select the newest archived snapshot.
+    """Resolve all live trees, then select the newest archived snapshot.
 
     Only .wal inputs are considered, never .expired/ children or .deleting files.
     Verify each live file's lineage and omit only its own matching tombstone. A
@@ -456,11 +459,10 @@ def logical_wals(wal_dir: pathlib.Path, *, include_archives: bool = True):
     is not stable enough to certify absence.
     """
     excluded = move_exclusions(wal_dir)
-    archive_dir = wal_dir.parent / "wal-archive"
     try:
         roots = [wal_dir]
-        if wal_dir.name in ("wal", "wal-ephemeral"):
-            roots = [wal_dir.parent / "wal", wal_dir.parent / "wal-ephemeral"]
+        if wal_dir.name in LIVE_TREES:
+            roots = [wal_dir.parent / name for name in LIVE_TREES]
         selected = {}
         occupied = {}
         for root in roots:
@@ -476,8 +478,12 @@ def logical_wals(wal_dir: pathlib.Path, *, include_archives: bool = True):
                 occupied[path.stem] = path
                 if not is_tombstoned(path):
                     selected[path.stem] = path
-        containers = ([p for p in archive_dir.iterdir() if p.suffix == ".ark"]
-                      if include_archives and archive_dir.exists() else [])
+        containers = []
+        if include_archives:
+            for name in ARCHIVE_TREES:
+                directory = wal_dir.parent / name
+                if directory.exists():
+                    containers.extend(p for p in directory.iterdir() if p.suffix == ".ark")
         for path in sorted(containers, key=fold_timestamp, reverse=True):
             for member in _members(path):
                 if member.address not in occupied and member.address not in excluded:

@@ -286,6 +286,7 @@ impl Session {
 
     async fn send(&self, send_id: &str, text: &str, delivery: Delivery) -> SendResponse {
         let request = RunRequest {
+            session_class: None,
             retention: None,
             title: None,
             on_restart: None,
@@ -325,6 +326,7 @@ impl Session {
         };
         self.registry
             .send(SendRequest {
+                session_class: None,
                 retention: None,
                 stop_sequences_named: false,
                 title: None,

@@ -186,6 +186,7 @@ impl SessionClient {
     /// are bundled in `SendSpec` so the call stays tidy.
     pub async fn send(&self, spec: SendSpec<'_>) -> Result<SendOutcome, ConnError> {
         let params = SendParams {
+            session_class: None,
             title: None,
             on_restart: None,
             keep_warm: None,
@@ -594,6 +595,7 @@ mod tests {
         assert_request_preserves_legacy_shape("session.import", &import);
 
         let send = SendParams {
+            session_class: None,
             title: None,
             on_restart: None,
             keep_warm: None,

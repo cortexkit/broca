@@ -477,6 +477,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -524,6 +525,7 @@ async fn send_with_materialization(
     let req = req(key, run, text);
     rig.registry
         .send(broca_module::serve::SendRequest {
+            session_class: None,
             retention: None,
             stop_sequences_named: false,
             title: None,
@@ -1489,6 +1491,7 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,
@@ -2429,6 +2432,7 @@ async fn check_scoped_session_reads(agent_run: bool) {
         let response = rig
             .registry
             .send(broca_module::serve::SendRequest {
+                session_class: None,
                 retention: None,
                 stop_sequences_named: false,
                 title: None,
@@ -2708,6 +2712,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -3121,6 +3126,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -3250,6 +3256,7 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

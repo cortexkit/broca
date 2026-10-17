@@ -315,7 +315,7 @@ def main() -> int:
         return _self_test()
 
     wal_dir = pathlib.Path(args.state_root) / "wal"
-    if not wal_dir.is_dir() and not (wal_dir.parent / "wal-ephemeral").is_dir():
+    if not any((wal_dir.parent / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-durable")):
         print(f"cannot compare: no wal directory at {wal_dir}", file=sys.stderr)
         return 2
 

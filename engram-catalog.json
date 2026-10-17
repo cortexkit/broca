@@ -3,6 +3,18 @@
   "module_id": "broca",
   "entries": [
     {
+      "entry_id": "broca/durable-wals",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "wal-durable"
+    },
+    {
+      "entry_id": "broca/durable-archive",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "wal-archive-durable"
+    },
+    {
             "entry_id": "broca/session-wals",
             "class": "excluded",
             "mechanism": "filetree",

@@ -74,6 +74,7 @@ fn retracted(id: &str) -> WalRecord {
 
 fn consume(run: &str, sub: &str) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

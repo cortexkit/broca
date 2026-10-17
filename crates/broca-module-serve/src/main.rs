@@ -130,6 +130,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
+    let backup_classes = broca_module_serve::session_class::BackupClasses::load_default_path()
+        .map_err(ServeIoError)?;
     let provider_overrides =
         broca_module_serve::provider_overrides::ProviderOverrides::load_default_path()
             .map_err(ServeIoError)?;
@@ -251,7 +253,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     create_state_directories(&state_root)?;
     let _archive_timer = archive_config.spawn(state_root.clone());
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
-    let wal_store = Arc::new(FileWalStore::new(state_root.join("wal")));
+    let wal_store =
+        Arc::new(FileWalStore::new(state_root.join("wal")).with_backup_classes(backup_classes.0));
     let crash_orphan_wal = wal_store.clone();
     let run_index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
@@ -4997,6 +5000,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunStarted {
+                    session_class: None,
                     retention: None,
                     hooks: None,
                     title: None,

@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

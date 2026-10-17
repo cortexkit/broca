@@ -2565,12 +2565,13 @@ where
                 return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
                     .await;
             }
-            let describe = broca_wire::broca_role_describe_with_writers(
+            let mut describe = broca_wire::broca_role_describe_with_writers(
                 env!("CARGO_PKG_VERSION"),
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
             );
+            describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;
             if sent.is_ok() {
@@ -4711,6 +4712,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

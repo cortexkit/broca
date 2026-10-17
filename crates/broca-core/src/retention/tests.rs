@@ -13,6 +13,7 @@ pub(crate) const MARKER: &str = "retention-content-must-not-be-projected-5d8e7b"
 
 pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention,
         hooks: None,
         title: Some(MARKER.into()),

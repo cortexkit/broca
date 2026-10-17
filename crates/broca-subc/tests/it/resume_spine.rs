@@ -161,6 +161,7 @@ fn request(project_root: &Path) -> RunRequest {
     }];
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

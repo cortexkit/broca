@@ -1118,6 +1118,7 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2548,6 +2549,7 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    session_class: None,
                     retention: None,
                     hooks: None,
                     title: None,

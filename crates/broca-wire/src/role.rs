@@ -173,7 +173,22 @@ pub struct RunResultResponse {
 /// never a session, so it is the same on every route. The answer is the role's own type, so
 /// a member the role adds reaches broca's answer as the role defines it; its bytes are pinned in
 /// `tests/golden/role_describe.json`.
-pub type RoleDescribeResponse = cortexkit_role_llm_runner::describe::RoleDescribe;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleDescribeResponse {
+    #[serde(flatten)]
+    pub role: cortexkit_role_llm_runner::describe::RoleDescribe,
+    pub session_class: SessionClassCapability,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionClassCapability {
+    pub backup_classes: Vec<String>,
+}
+impl std::ops::Deref for RoleDescribeResponse {
+    type Target = cortexkit_role_llm_runner::describe::RoleDescribe;
+    fn deref(&self) -> &Self::Target {
+        &self.role
+    }
+}
 
 /// Discovery for a build that can read compaction WAL records but cannot yet write them.
 /// The serving adapter must opt in after installing the provider adapter and ready/model ops.
@@ -217,6 +232,7 @@ pub fn broca_role_describe_with_writers(
         "interrupt",
         "plans",
         "fetch-plan-optional-tools/v1",
+        "session_class",
     ]
     .map(String::from)
     .to_vec();
@@ -230,7 +246,7 @@ pub fn broca_role_describe_with_writers(
     if retention_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::RETENTION.into());
     }
-    let mut describe = RoleDescribeResponse::new(
+    let mut describe = cortexkit_role_llm_runner::describe::RoleDescribe::new(
         vec![Major {
             version: LLM_RUNNER_V1.into(),
             ops,
@@ -254,7 +270,12 @@ pub fn broca_role_describe_with_writers(
             2_592_000, 3_600_000,
         ));
     }
-    describe
+    RoleDescribeResponse {
+        role: describe,
+        session_class: SessionClassCapability {
+            backup_classes: vec!["head".into()],
+        },
+    }
 }
 
 /// `session.baseline` params: none. Strict.
@@ -668,7 +689,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "174f2b7bef5dafb296dda13202fe970dbeef26d36596daffd08eeb1b1cb50c65",
+            "cac93c1c77aee1a10a6aff0f8e45e97a73dd82e3dd98eccb3c7b521838eb8819",
         );
     }
 
@@ -825,7 +846,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "8b8bf812761e5d7aa43c16e34d93b79f08a262b326e45a54cb548f9b432f7464";
+        "de8d616194d50c942361192348942203270518677a53165f50f4051c57ae928a";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

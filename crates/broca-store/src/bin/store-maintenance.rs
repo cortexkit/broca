@@ -45,6 +45,7 @@ fn state_root_refusal(
     if matches!(operation, "control-head" | "reconcile-active")
         && !wal_dir_exists
         && !state_root.join("wal-archive").is_dir()
+        && !state_root.join("wal-archive-durable").is_dir()
     {
         return Some(format!(
             "store-maintenance: {} has no wal/ directory, so every row would decline for a \
@@ -94,7 +95,15 @@ fn main() -> ExitCode {
         operation,
         &state_root,
         database.is_file(),
-        state_root.join("wal").is_dir(),
+        [
+            "wal",
+            "wal-ephemeral",
+            "wal-durable",
+            "wal-archive",
+            "wal-archive-durable",
+        ]
+        .iter()
+        .any(|name| state_root.join(name).is_dir()),
     ) {
         eprintln!("{refusal}");
         return ExitCode::from(2);
@@ -237,19 +246,30 @@ struct ExistingManifest {
 
 fn wal_addresses(wal_dir: &std::path::Path) -> std::io::Result<std::collections::BTreeSet<String>> {
     let mut addresses = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(wal_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("wal") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("WAL filename is not UTF-8: {}", path.display()),
-            ));
+    for name in ["wal", "wal-ephemeral", "wal-durable"] {
+        let directory = wal_dir
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join(name);
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         };
-        addresses.insert(stem.to_owned());
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("wal") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("WAL filename is not UTF-8: {}", path.display()),
+                ));
+            };
+            addresses.insert(stem.to_owned());
+        }
     }
     Ok(addresses)
 }
@@ -599,9 +619,20 @@ fn private_mode(state_root: &std::path::Path, dry_run: bool) -> ExitCode {
     // scan then tightens the database, reports success, and leaves every session log exactly as
     // it was, which is where all the prompt text lives.
     let wal_dir = state_root.join("wal");
-    let wal_files = std::fs::read_dir(&wal_dir)
-        .map(|entries| entries.filter_map(Result::ok).count())
-        .unwrap_or(0);
+    let wal_files: usize = [
+        "wal",
+        "wal-durable",
+        "wal-ephemeral",
+        "wal-archive",
+        "wal-archive-durable",
+    ]
+    .iter()
+    .map(|name| {
+        std::fs::read_dir(state_root.join(name))
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    })
+    .sum();
     if wal_files == 0 {
         eprintln!(
             "store-maintenance: {} holds no session logs, so this run would report success \

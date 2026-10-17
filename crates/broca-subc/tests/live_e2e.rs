@@ -126,6 +126,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
         execution_mode: ExecutionMode::Parallel,
     };
     let req = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -145,7 +146,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
             role: broca_protocol::content::Role::User,
             content: vec![ContentBlock::Text {
                 text: "Use the read tool to read the file \"status.txt\", then reply with its \
-           exact contents verbatim and nothing else."
+       exact contents verbatim and nothing else."
                     .into(),
             }],
         }],
@@ -259,7 +260,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
         module: None,
         execution_mode: ExecutionMode::Parallel,
     };
-    let req = RunRequest { retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, project_id: None, principal: None, run_id: RunId("live-demo".into()),
+    let req = RunRequest { session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, project_id: None, principal: None, run_id: RunId("live-demo".into()),
     scope: None,
     session: BindIdentity::new(&rig.dir, "dogfood", "live-1"),
     model: ModelHandle::new("anthropic", MODEL),
@@ -389,6 +390,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
         execution_mode: ExecutionMode::Parallel,
     };
     let req = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -408,8 +410,8 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
             role: broca_protocol::content::Role::User,
             content: vec![ContentBlock::Text {
                 text: "Think carefully, step by step, about which IANA timezone identifier Madrid \
-           uses and why, before doing anything. Then call get_time with that exact \
-           timezone, and finally tell me the time."
+       uses and why, before doing anything. Then call get_time with that exact \
+       timezone, and finally tell me the time."
                     .into(),
             }],
         }],

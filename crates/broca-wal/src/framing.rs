@@ -172,6 +172,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
     SCOPE_FEATURE,
+    SESSION_CLASS_FEATURE,
     STEER_QUEUE_FEATURE,
     STEP_TRANSFORMS_FEATURE,
 ];
@@ -207,6 +208,9 @@ pub const RESTART_PAUSE_FEATURE: &str = "restart-pause/v1";
 /// must not ignore them and keep content indefinitely. Reader builds enforce retention across
 /// admission, projection, reads and deletion; production sends stay off until capability rollout.
 pub const RETENTION_FEATURE: &str = "retention/v1";
+
+/// Labels fixed on the first send govern later admission and backup placement.
+pub const SESSION_CLASS_FEATURE: &str = "session-class/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -835,6 +839,7 @@ mod tests {
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
                 SCOPE_FEATURE,
+                SESSION_CLASS_FEATURE,
                 STEER_QUEUE_FEATURE,
                 STEP_TRANSFORMS_FEATURE,
             ]
@@ -1555,5 +1560,37 @@ mod tests {
                 matches!(other, DecodeStep::TornTail)
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_class_tests {
+    use super::*;
+    #[test]
+    fn session_class_is_optional_and_independently_must_understand() {
+        let bytes = include_str!("../tests/golden/pre_step_transforms/run_started.json").trim();
+        let plain: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert!(plain.required_features().is_empty());
+        assert_eq!(serde_json::to_string(&plain).unwrap(), bytes);
+        let mut value: serde_json::Value = serde_json::from_str(bytes).unwrap();
+        value["session_class"] = serde_json::json!("head");
+        let classed: WalRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(classed.required_features(), &[SESSION_CLASS_FEATURE]);
+        assert_eq!(
+            serde_json::from_slice::<WalRecord>(&serde_json::to_vec(&classed).unwrap()).unwrap(),
+            classed
+        );
+        let known: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != SESSION_CLASS_FEATURE)
+            .collect();
+        assert!(
+            matches!(decode_next_with(&encode(1, 1, &classed).unwrap(), &known), DecodeStep::NewerWriter { missing, .. } if missing == [SESSION_CLASS_FEATURE])
+        );
+        assert!(matches!(
+            decode_next_with(&encode(1, 1, &plain).unwrap(), &known),
+            DecodeStep::Record { .. }
+        ));
     }
 }

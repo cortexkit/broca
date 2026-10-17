@@ -157,6 +157,7 @@ pub enum LineageCmd {
     /// Start a run now (idle) or durably queue it (active). The submission payload stays
     /// boxed because it is much larger than the other command variants.
     Send {
+        session_class: Option<String>,
         retention: Option<u64>,
         stop_sequences_named: bool,
         conversation_key: Option<String>,
@@ -267,6 +268,7 @@ pub enum SendOutcome {
         holder: String,
     },
     RetentionInvalid(crate::retention::InvalidRetention),
+    SessionClassInvalid(String),
     VariantUnsupported(broca_core::run::VariantRefusal),
     /// The run started immediately (the lineage was idle).
     Active {
@@ -1059,6 +1061,7 @@ pub struct LineageActor<W: WalStore> {
     retention_lineage: bool,
     retention_deadline: Option<u64>,
     admitting_retention: Option<u64>,
+    admitting_session_class: Option<String>,
     warm_task: Option<tokio::task::JoinHandle<()>>,
     withdrawal_task: Option<crate::approval::WithdrawalTask>,
     withdrawal_index_lock: Arc<std::sync::Mutex<()>>,
@@ -1327,6 +1330,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             retention_lineage: writer.is_retention_lineage() == Some(true),
             retention_deadline: None,
             admitting_retention: None,
+            admitting_session_class: None,
             warm_task: None,
             withdrawal_task: None,
             withdrawal_index_lock: Arc::default(),
@@ -1703,6 +1707,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 false
             }
             LineageCmd::Send {
+                session_class,
                 retention,
                 stop_sequences_named,
                 conversation_key,
@@ -1731,6 +1736,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         conversation_key,
                         title,
                         retention,
+                        session_class,
                         stop_sequences_named,
                     )
                     .await;
@@ -2308,6 +2314,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         conversation_key: Option<String>,
         title: Option<String>,
         retention: Option<u64>,
+        session_class: Option<String>,
         stop_sequences_named: bool,
     ) -> SendOutcome {
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
@@ -2322,6 +2329,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             };
         }
         self.admitting_retention = None;
+        self.admitting_session_class = session_class.clone();
         if retention.is_some() {
             let records = match self.read_wal_framed_records().await {
                 Ok(records) => records,
@@ -2347,6 +2355,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return SendOutcome::Transient(format!(
                 "startup durable-work recovery is still pending: {error}"
             ));
+        }
+        if let Some(class) = session_class.as_deref() {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            let frozen = checkpoint
+                .last_episode
+                .as_ref()
+                .map(|_| checkpoint.session_class.as_deref());
+            self.admitting_session_class = match crate::session_class::admit(Some(class), frozen) {
+                Ok(class) => class,
+                Err(message) => return SendOutcome::SessionClassInvalid(message),
+            };
         }
 
         // THE OWNER CHECK COMES FIRST, before a keyed retry is answered: a resend of an
@@ -3623,6 +3645,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .unwrap_or_else(|| broca_protocol::SubmissionId(String::new())),
         );
         req.retention = self.admitting_retention;
+        req.session_class = if admits_the_session {
+            self.admitting_session_class.clone()
+        } else {
+            prior_snapshot.checkpoint_at_head.session_class.clone()
+        };
         req.submission_id = submission_id.clone();
         // Core writes both on the episode's `RunStarted` when it opens one, so the WAL alone
         // can answer a later retry with the same key.
@@ -6372,6 +6399,7 @@ mod tests {
             // normally. The guard's terminal is suppressed by the seam, so this clean
             // return delivers NOTHING to the actor — only the backstop can recover it.
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -6496,6 +6524,7 @@ mod tests {
     pub(super) fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         use broca_protocol::content::{ContentBlock, Message, Role};
         RunRequest {
+            session_class: None,
             retention: None,
             title: None,
             on_restart: None,
@@ -6636,6 +6665,7 @@ mod tests {
             let mut config = min_config();
             config.tools_were_omitted = job.control.tools_were_omitted;
             job.writer.record(WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -6693,6 +6723,7 @@ mod tests {
             _out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -6756,6 +6787,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -6977,6 +7009,7 @@ mod tests {
 
             if ordinal == 1 {
                 job.writer.record(WalRecord::RunStarted {
+                    session_class: None,
                     retention: None,
                     hooks: None,
                     title: None,
@@ -7141,6 +7174,7 @@ mod tests {
         ) -> Result<RunSummary, RunError> {
             let ordinal = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             job.writer.record(WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -7238,6 +7272,7 @@ mod tests {
                 started.len() == 1
             };
             job.writer.record(WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -7451,6 +7486,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -8118,6 +8154,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -8703,6 +8740,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -8784,6 +8822,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -9253,6 +9292,7 @@ mod import_idempotency_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -9346,6 +9386,7 @@ mod import_idempotency_tests {
         let writer =
             WalHandle::spawn(wal_store.open(&key).expect("open WAL"), 1).expect("spawn WAL writer");
         writer.record(broca_wal::WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

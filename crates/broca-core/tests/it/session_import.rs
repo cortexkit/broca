@@ -258,6 +258,7 @@ async fn materialized_import_prefix_merges_with_a_following_episode_tail() {
     };
     let next_config = (**config).clone();
     writer.record(WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,
@@ -424,6 +425,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
     };
     let records = vec![
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -457,6 +459,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
             retries_used: 0,
         },
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -548,6 +551,7 @@ fn complete_import_records_for_test(
     };
     vec![
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

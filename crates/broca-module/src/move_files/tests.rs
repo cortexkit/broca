@@ -356,6 +356,7 @@ async fn actor_critical_section_holds_dispatch_until_completion_and_then_refuses
         .unwrap();
         handle
             .send(crate::actor::LineageCmd::Send {
+                session_class: None,
                 retention: None,
                 stop_sequences_named: false,
                 conversation_key: None,

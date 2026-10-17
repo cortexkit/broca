@@ -529,6 +529,39 @@ fn append_manifest_line(entry: &ManifestAppend, lineage_id: WalLineageId) -> std
 }
 
 impl FileWal {
+    /// A status/warm open can precede the first send. Move only an unstarted file,
+    /// under its caller's session lease, before the first record fixes its placement.
+    pub fn relocate_unstarted(&mut self, destination: &Path) -> Result<(), WalError> {
+        if self.path == destination {
+            return Ok(());
+        }
+        if self.next_seq != 1 {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot relocate a started session WAL",
+            )));
+        }
+        if wal_file_exists(destination)? {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "conflicting first-send WAL placement",
+            )));
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL destination has no directory",
+            ))
+        })?;
+        let source_parent = self.path.parent().unwrap().to_path_buf();
+        crate::migration::durable_dir(parent.parent().unwrap_or(parent), parent)
+            .map_err(WalError::Io)?;
+        std::fs::rename(&self.path, destination).map_err(WalError::Io)?;
+        self.path = destination.to_path_buf();
+        self.dir_needs_sync.set(true);
+        self.sync()?;
+        crate::migration::sync_dir(&source_parent).map_err(WalError::Io)
+    }
     /// Open (creating if absent) the WAL at `path`, recovering `next_seq` from the
     /// last committed record. Creation writes a fresh lineage identity; an existing legacy file
     /// remains unidentified until its next append. A torn trailing frame (an append that crashed

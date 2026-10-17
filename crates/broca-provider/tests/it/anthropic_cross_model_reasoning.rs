@@ -324,6 +324,7 @@ fn keep_all_scope_strips_only_the_foreign_signed_thinking() {
 fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() {
     let records = vec![
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

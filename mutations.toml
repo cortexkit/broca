@@ -3660,8 +3660,8 @@ target = "--lib"
 test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
 expect_red = ["wal_writer::retention_tests::dual_live_wals_are_an_error_naming_both_paths"]
 file = "crates/broca-core/src/wal_writer.rs"
-old = "        if portable_live && ephemeral_live {"
-new = "        if false && portable_live && ephemeral_live { // NON-VACUITY BREAK: pick one of two live lineages"
+old = "                if let Some(prior) = live {"
+new = "                if let Some(prior) = live.filter(|_| false) { // NON-VACUITY BREAK: ignore dual live copies"
 
 [[control]]
 id = "retention-gate-persister-projection"
@@ -3750,7 +3750,7 @@ new = "    // NON-VACUITY BREAK: let an operator reproject write retention conte
 
 [[control]]
 id = "retention-fold-skips-ephemeral"
-guards = "the cold-WAL fold enumerates only wal/ and never archives a wal-ephemeral/ session"
+guards = "the cold-WAL fold enumerates ordinary and durable live trees but never archives a wal-ephemeral session"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -3759,8 +3759,8 @@ expect_red = ["wal_fold::tests::fold_never_enumerates_ephemeral_wals_even_when_c
 # The break also fails every fold test whose state root has no wal-ephemeral/ directory.
 only = false
 file = "crates/broca-core/src/wal_fold.rs"
-old = "    for entry in fs::read_dir(root.join(\"wal\"))? {"
-new = "    // NON-VACUITY BREAK: let ephemeral WALs into the archive.\n    for entry in fs::read_dir(root.join(\"wal\"))?.chain(fs::read_dir(root.join(\"wal-ephemeral\"))?) {"
+old = "    for entry in fs::read_dir(tree.live(root))? {"
+new = "    // NON-VACUITY BREAK: let ephemeral WALs into the archive.\n    for entry in fs::read_dir(tree.live(root))?.chain(fs::read_dir(root.join(\"wal-ephemeral\"))?) {"
 
 [[control]]
 id = "retention-matching-tombstone-stays-expired"
@@ -5898,8 +5898,8 @@ target = "--lib"
 test_file = "crates/broca-wal/src/framing.rs"
 expect_red = ["framing::tests::agent_run_scope_round_trips_and_old_readers_refuse_its_identity"]
 file = "crates/broca-wal/src/record.rs"
-old = "if scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some()) {"
-new = "if false && scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some()) { // NON-VACUITY BREAK"
+old = "scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some())"
+new = "false && scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some()) /* NON-VACUITY BREAK */"
 
 [[control]]
 id = "agent-run-frozen-run-id-before-wal"
@@ -6164,8 +6164,8 @@ test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::status_of_expired_session_refuses_without_opening_or_deleting"]
 select = "expected"
 file = "crates/broca-module/src/opener.rs"
-old = "self.open_mode(key, gen, registry, None, true).await"
-new = "self.open_mode(key, gen, registry, None, false).await // NON-VACUITY BREAK: mutate cold expired status"
+old = "self.open_mode(key, gen, registry, None, None, true).await"
+new = "self.open_mode(key, gen, registry, None, None, false).await // NON-VACUITY BREAK: mutate cold expired status"
 
 [[control]]
 id = "retention-full-read-presence"
@@ -6524,8 +6524,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::cold_status_rechecks_clock_without_the_mutating_opener"]
 file = "crates/broca-module/src/opener.rs"
-old = "self.open_mode(key, gen, registry, None, true).await"
-new = "self.open_mode(key, gen, registry, None, false).await // NON-VACUITY BREAK: open without leased status classification"
+old = "self.open_mode(key, gen, registry, None, None, true).await"
+new = "self.open_mode(key, gen, registry, None, None, false).await // NON-VACUITY BREAK: open without leased status classification"
 
 [[control]]
 id = "retention-audit-live-status-admission-order"
@@ -6635,8 +6635,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::status_classifies_created_expired_retention_under_the_open_lease"]
 file = "crates/broca-module/src/opener.rs"
-old = "self.open_mode(key, gen, registry, None, true).await"
-new = "self.open_mode(key, gen, registry, None, false).await // NON-VACUITY BREAK: classify outside leased status mode"
+old = "self.open_mode(key, gen, registry, None, None, true).await"
+new = "self.open_mode(key, gen, registry, None, None, false).await // NON-VACUITY BREAK: classify outside leased status mode"
 
 [[control]]
 id = "retention-followup-status-no-full-read"
@@ -14395,3 +14395,51 @@ old = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
     ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),'''
 new = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
     // NON-VACUITY BREAK: forget the retired bare 3.7 route.'''
+
+[[control]]
+id = "session-class-freezes-first-send"
+guards = "session_class cannot change after the first send, including an unclassed first send"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/session_class.rs"
+expect_red = ["session_class::tests::class_freezes_at_first_send_including_absence"]
+file = "crates/broca-module/src/session_class.rs"
+old = "        if frozen.is_some_and(|current| current != Some(class)) {"
+new = "        if false && frozen.is_some_and(|current| current != Some(class)) { // NON-VACUITY BREAK: allow relabelling"
+
+[[control]]
+id = "session-class-retention-beats-durable"
+guards = "a retained head session creates only an ephemeral WAL, never a backed-up durable WAL"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/session_class_tests.rs"
+expect_red = ["wal_writer::session_class_tests::retention_beats_durable_class"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "        } else if retention.is_some() {"
+new = "        } else if retention.is_some() && session_class != Some(\"head\") { // NON-VACUITY BREAK: back up retained heads"
+
+[[control]]
+id = "session-class-fold-separates-trees"
+guards = "durable and non-durable WALs are folded into distinct archive containers and extracted back into their original trees"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_fold/tests.rs"
+expect_red = ["wal_fold::tests::fold_separates_durable_containers_and_preserves_placement_on_restore"]
+file = "crates/broca-core/src/wal_fold.rs"
+old = '            Self::Durable => "wal-archive-durable",'
+new = '            Self::Durable => "wal-archive", // NON-VACUITY BREAK: mix backup populations'
+
+[[control]]
+id = "session-class-move-reader-finds-durable"
+guards = "the move inventory discovers a durable session even when the configured backup classes have changed"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/session_class_tests.rs"
+expect_red = ["wal_writer::session_class_tests::durable_live_readers_and_move_inventory_find_session"]
+file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
+old = "    for root in [&store.root, &store.ephemeral_root(), &store.durable_root()] {"
+new = "    for root in [&store.root, &store.ephemeral_root()] { // NON-VACUITY BREAK: omit durable inventory"

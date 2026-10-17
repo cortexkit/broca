@@ -95,6 +95,7 @@ async fn register_held(rig: &Rig, gate: Arc<Gate>) -> tokio::task::JoinHandle<()
 
 fn request(session: BindIdentity, frozen: &broca_wal::PlanManifest) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

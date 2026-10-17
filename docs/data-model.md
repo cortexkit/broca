@@ -21,9 +21,12 @@ broca does not consult `XDG_DATA_HOME`.
 ```text
 <state root>/
   wal/<addr>.wal            one append-only WAL per session              (section 2)
+  wal-durable/<addr>.wal    live WALs selected for backup at first send
+  wal-ephemeral/<addr>.wal  retained WALs, never backed up or folded
   wal-archive/              sealed archive containers of cold WALs       (section 3)
     fold-<unix-ms>.ark
     fold-<unix-ms>.journal
+  wal-archive-durable/      sealed containers of durable WALs only
   run-index.db              SQLite: run index, materialized transcript,   (section 4)
                             admission checkpoints, usage export facts
   caps.db                   SQLite: budget caps                           (section 4.6)
@@ -53,6 +56,14 @@ Each session has one WAL file:
 ```text
 <state root>/wal/<addr>.wal
 ```
+
+Durable sessions use the sibling `wal-durable/` tree, and sessions with retention
+use `wal-ephemeral/` regardless of class. The first send freezes `session_class`;
+the daemon's `backup_classes` setting (default `["head"]`) chooses whether that
+new session is durable. Existing live/archive placement is authoritative after
+configuration changes. Readers resolve all three live trees before consulting
+`wal-archive/` and `wal-archive-durable/`; duplicate live copies are an error,
+not a priority rule. Only the durable trees are captured by Engram, the backup service.
 
 A session is identified by its **bind triple** `(project_root, harness, session)`. `addr`
 is **FNV-1a 64-bit** over the UTF-8 bytes of
@@ -88,7 +99,7 @@ no records. It is not an error, and it counts as "live" for archive resolution (
 3.3).
 
 Only files named `<16 lowercase hex>.wal` are WALs. While restoring an archived session,
-broca writes a temporary `.extract-<pid>-<n>.tmp` file in `wal/` and renames it into
+broca writes a temporary `.extract-<pid>-<n>.tmp` file in its original live tree and renames it into
 place; ignore anything else in the directory.
 
 ### 2.2 Frame layout
@@ -505,7 +516,7 @@ trailer   := index_len:u32 (= 4 + 32*count)  "WALK"(4)
 ### 3.3 Finding a session that is archived, not live
 
 1. Compute `addr` (section 2.1).
-2. If `wal/<addr>.wal` exists (even with zero bytes), **it is authoritative**. Read it and
+2. If `<addr>.wal` exists in `wal/`, `wal-durable/` or `wal-ephemeral/` (even with zero bytes), **it is authoritative**. Read it and
    stop. A live file always wins over any archive copy, which may be older.
 3. Otherwise list `wal-archive/*.ark`, order by numeric stamp, **newest first**, and for
    each container: skip it if it has disappeared since you listed it, skip it if it is

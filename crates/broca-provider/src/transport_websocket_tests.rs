@@ -1102,6 +1102,7 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::Fra
     let dir = broca_test_support::scratch_root().join(label);
     let bind = BindIdentity::new(dir.join("project"), "websocket-auth", label);
     let request = RunRequest {
+        session_class: None,
         retention: None,
         on_restart: None,
         keep_warm: None,
@@ -1428,17 +1429,15 @@ async fn websocket_over_age_socket_is_retired_before_the_next_send() {
 }
 
 fn tool_run_request(bind: &BindIdentity) -> RunRequest {
-    RunRequest {
-        retention: None,
-        on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, title: None,
-        project_id: None, principal: None, scope: None, run_id: RunId("ws-run".into()), session: bind.clone(),
-        model: ModelHandle::new("openai", "m"),
-        input: vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "lookup".into() }], cache_prefix_blocks: None, origin: None, ordinal: None }],
-        tools: vec![serde_json::from_value(serde_json::json!({"name":"lookup","description":"lookup","input_schema":{"type":"object","properties":{"x":{"type":"integer"}}},"execution_mode":"parallel"})).unwrap()],
-        policy_allowed: std::collections::HashSet::from(["lookup".into()]), tool_choice: ToolChoice::Auto, generation: GenerationConfig::default(),
-        cache: None, stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None,
-        budget: None, context_limit: None, work_class: None, context_management: None, variant: None, service_tier: None, inherit_frozen_cache: false,
-    }
+    RunRequest { session_class: None, retention: None,
+    on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, title: None,
+    project_id: None, principal: None, scope: None, run_id: RunId("ws-run".into()), session: bind.clone(),
+    model: ModelHandle::new("openai", "m"),
+    input: vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "lookup".into() }], cache_prefix_blocks: None, origin: None, ordinal: None }],
+    tools: vec![serde_json::from_value(serde_json::json!({"name":"lookup","description":"lookup","input_schema":{"type":"object","properties":{"x":{"type":"integer"}}},"execution_mode":"parallel"})).unwrap()],
+    policy_allowed: std::collections::HashSet::from(["lookup".into()]), tool_choice: ToolChoice::Auto, generation: GenerationConfig::default(),
+    cache: None, stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None,
+    budget: None, context_limit: None, work_class: None, context_management: None, variant: None, service_tier: None, inherit_frozen_cache: false, }
 }
 
 #[tokio::test]

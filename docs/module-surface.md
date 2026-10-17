@@ -129,7 +129,7 @@ role.describe {} → the llm-runner/v1 major, its ops and capability groups, max
 session.subscribe { from?: "start" | "live" | cursor } (dedicated route; §9)
     → stream of events (control reliable+replayable, display live+lossy); see §7,§8,§16
 
-session.send { session, prompt, system?, send_id?, cache?, model?, tool_providers?, stop_when?, seed_from?, context_management?, delivery?, conversation_key?, title? }
+    session.send { session, prompt, system?, send_id?, session_class?, retention?, cache?, model?, tool_providers?, stop_when?, seed_from?, context_management?, delivery?, conversation_key?, title? }
     title?: 1-200 Unicode scalar values, not blank, no control characters; else invalid_params {field: "title"}
     → { state: "active" | "pending" | "finished", run_id?, submission_id?, reason?, baseline? } (DRIVER; §11)
 
@@ -1026,3 +1026,30 @@ own keyed retry remains an explicit re-auth resume. Both pauses support cancel.
 `run.status` reports restart pauses with `state: "paused"`, `reason: "restart"`
 and `pause_reason: "restart"`. Authentication-pause `run.status` responses retain
 their existing format (`reason: "auth_required"`, without `pause_reason`).
+
+### Session class and backup placement
+
+`session.send.session_class` is an optional top-level opaque label beside `send_id`
+and `retention`. Its grammar is `[a-z0-9_-]{1,32}`; explicit null, non-string values,
+uppercase, whitespace and all other characters are refused as `invalid_params`,
+naming `session_class`. The first send freezes the label, including its absence.
+Later sends may omit it or repeat the same label, but cannot add or change it.
+The label is recorded on `RunStarted`, not sent to model providers.
+
+The daemon reads `backup_classes` from `broca.jsonc`, defaulting to `["head"]`.
+`role.describe.capabilities` includes `session_class`, and its
+`session_class.backup_classes` lists the configured labels. A first send whose
+class is listed creates its live WAL in `wal-durable/`; its folded containers live
+in `wal-archive-durable/`. Unclassed sessions and other labels use `wal/` and
+`wal-archive/`. Changing configuration never moves an existing session, including
+when an archived session is reopened. Each fold container belongs to exactly one
+of these populations. A send with `retention` always uses `wal-ephemeral/` and is
+never backed up, even if its class is listed: deletion takes precedence.
+
+Engram captures only `wal-durable/` and `wal-archive-durable/`. Live-first reads,
+exports and move discovery resolve all three live trees and both archive trees;
+session addressing and leases remain keyed by the original session triple.
+Classed records require the must-understand WAL feature `session-class/v1`.
+A `v0.3.205` reader refuses those records by feature name; unclassed records retain
+their old bytes and remain readable. The reader, writer and capability ship
+together, with no writer switch or second rollout release.

@@ -542,6 +542,10 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    /// The session_class label recorded by the session's first send. Absence also
+    /// represents checkpoints created before WALs recorded session classes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_class: Option<String>,
     /// Sequence of the last record folded into this checkpoint.
     pub at_seq: u64,
     pub last_episode: Option<LastEpisodeV1>,
@@ -587,6 +591,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            session_class: None,
             at_seq: 0,
             last_episode: None,
             ownership: Some(SessionOwnershipV1::default()),
@@ -637,6 +642,7 @@ impl AdmissionCheckpointV1 {
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
         match record {
             WalRecord::RunStarted {
+                session_class,
                 retention,
                 on_restart,
                 keep_warm,
@@ -658,6 +664,9 @@ impl AdmissionCheckpointV1 {
                             reason: "a new RunStarted opened before the previous episode reached a durable RunFinished".into(),
                         });
                     }
+                }
+                if self.last_episode.is_none() {
+                    self.session_class = session_class.clone();
                 }
                 if let Some(ownership) = self.ownership.as_mut() {
                     if ownership.episodes == 0 {
@@ -1193,6 +1202,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -2094,6 +2104,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            session_class: None,
             lineage_retention: None,
             compaction: None,
             effort_history: None,

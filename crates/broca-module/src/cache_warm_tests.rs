@@ -810,6 +810,7 @@ impl Fixture {
         });
         let records = [
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,

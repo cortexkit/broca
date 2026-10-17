@@ -108,9 +108,25 @@ fn deserialize_on_restart<'de, D: serde::Deserializer<'de>>(
     broca_protocol::request::OnRestart::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("session_class: {error}")))?;
+    broca_protocol::request::validate_session_class(&value).map_err(serde::de::Error::custom)?;
+    Ok(Some(value))
+}
+
 /// `session.send` params. The session comes from the bound route identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendParams {
+    /// Opaque session label, frozen on the first send; omission on later sends inherits it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_session_class"
+    )]
+    pub session_class: Option<String>,
     /// Graceful restart policy for this send. Omitted means interrupt.
     #[serde(
         default,
@@ -2294,6 +2310,7 @@ mod tests {
         assert_eq!(
             send_params_keys(),
             &[
+                "session_class",
                 "on_restart",
                 "keep_warm",
                 "retention",
@@ -3481,5 +3498,82 @@ mod agent_run_scope_tests {
             serde_json::from_str::<AgentRunScopesUnsupported>(pinned).unwrap(),
             refusal
         );
+    }
+}
+
+#[cfg(test)]
+mod session_class_tests {
+    use super::SendParams;
+    use serde_json::{json, Value};
+
+    fn refusal(value: Value) {
+        let error =
+            serde_json::from_value::<SendParams>(json!({"session_class": value})).unwrap_err();
+        assert!(error.to_string().contains("session_class"), "{error}");
+    }
+    #[test]
+    fn absent_class_preserves_wire_bytes() {
+        let request: SendParams = serde_json::from_value(json!({})).unwrap();
+        assert!(request.session_class.is_none());
+        assert!(serde_json::to_value(request)
+            .unwrap()
+            .get("session_class")
+            .is_none());
+    }
+    #[test]
+    fn accepts_lowercase_digits_underscore_hyphen_and_length_boundaries() {
+        for class in [
+            "a",
+            "0",
+            "_",
+            "-",
+            "head",
+            "saved_2-head",
+            "abcdefghijklmnopqrstuvwxyz012345",
+        ] {
+            let request: SendParams =
+                serde_json::from_value(json!({"session_class":class})).unwrap();
+            assert_eq!(request.session_class.as_deref(), Some(class));
+        }
+    }
+    #[test]
+    fn refuses_empty_class() {
+        refusal(json!(""));
+    }
+    #[test]
+    fn refuses_long_class() {
+        refusal(json!("a".repeat(33)));
+    }
+    #[test]
+    fn refuses_uppercase_class() {
+        refusal(json!("Head"));
+    }
+    #[test]
+    fn refuses_whitespace_class() {
+        for value in [" ", "head x", "head\n", "\thead"] {
+            refusal(json!(value));
+        }
+    }
+    #[test]
+    fn refuses_path_class() {
+        for value in ["head/x", "..", "head\\x", "head.x"] {
+            refusal(json!(value));
+        }
+    }
+    #[test]
+    fn refuses_unicode_class() {
+        for value in ["hé", "あ", "🦀"] {
+            refusal(json!(value));
+        }
+    }
+    #[test]
+    fn refuses_null_class() {
+        refusal(Value::Null);
+    }
+    #[test]
+    fn refuses_nonstring_class() {
+        for value in [json!(1), json!(true), json!([]), json!({})] {
+            refusal(value);
+        }
     }
 }

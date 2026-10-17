@@ -79,6 +79,7 @@ impl SendParamsExt for SendParams {
         run_id: RunId,
     ) -> Result<SendRequest, broca_core::RunError> {
         let SendParams {
+            session_class,
             on_restart,
             keep_warm,
             retention,
@@ -204,6 +205,7 @@ impl SendParamsExt for SendParams {
             inherit_frozen: Default::default(),
         };
         Ok(SendRequest {
+            session_class,
             retention,
             stop_sequences_named: false,
             conversation_key,
@@ -345,6 +347,7 @@ mod tests {
 
     fn make_send_params(system: Option<String>, prompt: &str) -> SendParams {
         SendParams {
+            session_class: None,
             title: None,
             on_restart: None,
             keep_warm: None,

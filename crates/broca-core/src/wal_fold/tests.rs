@@ -5,6 +5,125 @@ use broca_wal::{RunConfig, RunOrigin};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const START: u64 = COLD_MS * 3;
+
+#[test]
+fn fold_separates_durable_containers_and_preserves_placement_on_restore() {
+    let f = Fixture::new();
+    let (ordinary, ordinary_bytes) = f.session("ordinary-tree", Some(1));
+    let (durable, _) = f.session("durable-tree", Some(1));
+    let path = f.store.wal_path(&durable);
+    // Existing directory placement survives changes to the backup_classes setting.
+    fs::create_dir_all(f.store.durable_root()).unwrap();
+    fs::rename(&path, f.store.durable_wal_path(&durable)).unwrap();
+    let durable_bytes = fs::read(f.store.durable_wal_path(&durable)).unwrap();
+    let report = f.fold();
+    assert_eq!(report.removed, 2);
+    for (tree, wanted, forbidden) in [
+        ("wal-archive", &ordinary, &durable),
+        ("wal-archive-durable", &durable, &ordinary),
+    ] {
+        let containers: Vec<_> = fs::read_dir(f.root.join(tree))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ark"))
+            .collect();
+        assert_eq!(containers.len(), 1);
+        assert!(broca_wal::archive::read_newest_member(
+            &containers,
+            &crate::session_addr(wanted),
+            MAX_BYTES
+        )
+        .unwrap()
+        .is_some());
+        assert!(broca_wal::archive::read_newest_member(
+            &containers,
+            &crate::session_addr(forbidden),
+            MAX_BYTES
+        )
+        .unwrap()
+        .is_none());
+    }
+    let reader =
+        std::sync::Arc::new(FileWalStore::new(f.root.join("wal")).with_backup_classes(vec![]));
+    assert_eq!(
+        reader.bytes_for_move(&durable).unwrap().unwrap(),
+        durable_bytes
+    );
+    assert_eq!(
+        reader.read_records(&durable).unwrap().len(),
+        reader
+            .read_address_records(&crate::session_addr(&durable))
+            .unwrap()
+            .len()
+    );
+    assert!(reader
+        .addresses()
+        .unwrap()
+        .contains(&crate::session_addr(&durable)));
+    reader.start_move_inventory(tokio_util::sync::CancellationToken::new());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                reader.wait_move_inventory(),
+            )
+            .await
+            .unwrap();
+        });
+    let reference =
+        cortexkit_role_llm_runner::session_ref("runner", "/fold-test", &durable.session);
+    let inventory = reader.move_session_refs(std::iter::once(reference.as_str()));
+    assert!(
+        inventory.unreadable.is_empty(),
+        "{:?}",
+        inventory.unreadable
+    );
+    assert!(inventory.sessions.contains_key(&reference));
+    drop(
+        reader
+            .open_with_class(&durable, None, Some("head"))
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read(reader.durable_wal_path(&durable)).unwrap(),
+        durable_bytes
+    );
+    assert!(!reader.wal_path(&durable).exists());
+    drop(
+        reader
+            .open_with_class(&ordinary, None, Some("head"))
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read(reader.wal_path(&ordinary)).unwrap(),
+        ordinary_bytes
+    );
+    assert!(!reader.durable_wal_path(&ordinary).exists());
+    let folded = f.fold_at(START + 1);
+    let journal = folded.journal.unwrap();
+    assert!(journal.starts_with("wal-archive-durable/"));
+    let restored = run(
+        &f.root,
+        &FoldOptions {
+            write: true,
+            resume: Some(journal),
+            unfold: true,
+            ..Default::default()
+        },
+        START + 2,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(restored.restored, 1);
+    assert_eq!(
+        fs::read(reader.durable_wal_path(&durable)).unwrap(),
+        durable_bytes
+    );
+    assert!(!reader.wal_path(&durable).exists());
+}
 struct Fixture {
     root: PathBuf,
     store: FileWalStore,
@@ -37,6 +156,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -131,7 +251,7 @@ fn fold_never_enumerates_ephemeral_wals_even_when_cold() {
     crate::wal_writer::retention_tests::write_decoded_fixture(&path, &records);
     let bytes = fs::read(&path).unwrap();
     assert_eq!(
-        wal_paths(&f.root).unwrap(),
+        wal_paths(&f.root, Tree::Ordinary).unwrap(),
         vec![f.store.wal_path(&portable)]
     );
     let report = f.fold();
@@ -454,7 +574,10 @@ fn tree_shrinks_and_members_equal_prefold_digests() {
     ];
     let report = f.fold();
     assert_eq!(report.removed, 2);
-    assert_eq!(wal_paths(&f.root).unwrap().len(), warm.len());
+    assert_eq!(
+        wal_paths(&f.root, Tree::Ordinary).unwrap().len(),
+        warm.len()
+    );
     let journal = Journal::load(f.root.join("wal-archive").join(report.journal.unwrap())).unwrap();
     assert_eq!(
         report.removed,
@@ -508,7 +631,7 @@ fn excluded_classes_have_exact_membership_and_report_only_writes_nothing() {
         f.root.join("wal").join(format!("{moved_addr}.wal")),
     )
     .unwrap();
-    let paths = wal_paths(&f.root).unwrap();
+    let paths = wal_paths(&f.root, Tree::Ordinary).unwrap();
     let before: Vec<_> = paths
         .iter()
         .map(|p| {
@@ -539,7 +662,7 @@ fn excluded_classes_have_exact_membership_and_report_only_writes_nothing() {
     let report = f.fold();
     assert_eq!(report.candidates, [session_addr(&cold)]);
     assert_eq!(report.removed, 1);
-    assert_eq!(wal_paths(&f.root).unwrap().len(), 3);
+    assert_eq!(wal_paths(&f.root, Tree::Ordinary).unwrap().len(), 3);
 }
 
 #[test]
@@ -681,7 +804,7 @@ fn crash_at_each_artifact_journal_boundary_never_strands_sessions() {
             assert_eq!(resumed.removed, 2 - done_before);
         }
         assert!(after.terminal());
-        assert!(wal_paths(&f.root).unwrap().is_empty());
+        assert!(wal_paths(&f.root, Tree::Ordinary).unwrap().is_empty());
         for (session, _) in &sessions {
             assert!(!f.store.read_records(session).unwrap().is_empty());
         }
@@ -1184,6 +1307,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         }),
     ]]);
     let req = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
