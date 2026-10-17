@@ -10819,10 +10819,7 @@ package = "broca-core"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-core/src/context/model_page.rs"
-expect_red = [
-  "context::model_page::tests::model_view_pages_use_the_full_body_budget_and_keep_replacement_groups_whole",
-  "context::model_page::tests::model_view_budget_counts_sources_and_continuation_metadata",
-]
+expect_red = ["context::model_page::tests::model_view_budget_counts_sources_and_continuation_metadata"]
 file = "crates/broca-core/src/context/model_page.rs"
 old = '''    let max_bytes = request
         .max_bytes
