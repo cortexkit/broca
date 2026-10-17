@@ -357,6 +357,165 @@ pub fn kill_and_reap(child: &mut tokio::process::Child) {
     }
 }
 
+/// Stop a rig's supervisor and every process it launched, returning only once none of them
+/// is still running, so the rig can then remove the directory they write into.
+///
+/// On Unix, [`kill_and_reap`] ends only the supervisor. Its modules are left running as
+/// orphans: a module still starting up goes on creating its state files, so the rig's
+/// directory removal can fail on a directory a module is still filling, or a module can
+/// recreate the directory after it was removed.
+///
+/// The tree is frozen with SIGSTOP from the supervisor down, and a process's children are
+/// listed only once it is stopped and so can no longer fork. That way no module can be
+/// launched or respawned between being listed and being killed. Every frozen process is
+/// then killed, the supervisor reaped, and the rest awaited until they are gone. A process
+/// still running at the deadline, or a failure of the process tools, is reported rather
+/// than panicking, because this runs from `Drop`, often during another panic. A supervisor
+/// that already exited before cleanup leaves no tree to find; [`kill_and_reap`] reports it.
+///
+/// On Windows [`kill_and_reap`] already ends the whole tree and waits for it.
+pub fn kill_and_reap_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        let descendants = match (child.try_wait(), child.id()) {
+            (Ok(None), Some(root)) => unix_tree::freeze_descendants(root),
+            _ => Vec::new(),
+        };
+        unix_tree::signal("KILL", &descendants);
+        kill_and_reap(child);
+        unix_tree::await_exit(&descendants);
+    }
+    #[cfg(not(unix))]
+    kill_and_reap(child);
+}
+
+/// Remove a rig's scratch directory, reporting a failure instead of hiding it.
+///
+/// Call it only after [`kill_and_reap_tree`] or an equivalent has ended every process that
+/// writes into the directory. While another panic unwinds the failure is printed, because
+/// a second panic would abort the test binary; otherwise it fails the test.
+pub fn remove_rig_dir(dir: impl AsRef<std::path::Path>) {
+    let dir = dir.as_ref();
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let message = format!("test rig: cannot remove {}: {error}", dir.display());
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
+    }
+}
+
+/// Unix process-tree helpers built on the `pgrep` and `kill` utilities, because this crate
+/// forbids the unsafe calls that signalling a process directly would take.
+#[cfg(unix)]
+mod unix_tree {
+    use super::{Duration, Instant};
+    use std::process::{Command, Stdio};
+
+    /// Stop `root` and then every process below it, top-down. Returns the descendants
+    /// (without `root`) in the order they were stopped.
+    pub(super) fn freeze_descendants(root: u32) -> Vec<u32> {
+        signal("STOP", &[root]);
+        let mut tree = vec![root];
+        let mut next = 0;
+        while let Some(&parent) = tree.get(next) {
+            next += 1;
+            for pid in children(parent) {
+                if !tree.contains(&pid) {
+                    signal("STOP", &[pid]);
+                    tree.push(pid);
+                }
+            }
+        }
+        tree.remove(0);
+        tree
+    }
+
+    /// Send `name` (as `kill -s` spells it) to `pids`. A process that has already exited is
+    /// not an error, so only a failure to run `kill` at all is reported.
+    pub(super) fn signal(name: &str, pids: &[u32]) {
+        if pids.is_empty() {
+            return;
+        }
+        let result = Command::new("kill")
+            .args(["-s", name])
+            .args(pids.iter().map(u32::to_string))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Err(error) = result {
+            eprintln!("test rig: cannot send SIG{name} to {pids:?}: {error}");
+        }
+    }
+
+    fn children(parent: u32) -> Vec<u32> {
+        match Command::new("pgrep")
+            .args(["-P", &parent.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect(),
+            Err(error) => {
+                eprintln!("test rig: cannot list children of {parent}: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// True while `pid` names a process that can still run. On Linux a zombie counts as
+    /// gone: it can no longer write, and in a container whose first process does not reap
+    /// orphans it may never disappear. Elsewhere the system's init process reaps orphans
+    /// promptly, so `kill -0` is enough.
+    pub(super) fn exists(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // The state follows the command name, which may itself contain ')'.
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .is_some_and(|state| !matches!(state, "Z" | "X"))
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+    }
+
+    /// Wait until no process in `pids` can still run, up to a deadline.
+    pub(super) fn await_exit(pids: &[u32]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut running = pids.to_vec();
+        loop {
+            running.retain(|&pid| exists(pid));
+            if running.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                eprintln!("test rig: processes still running after cleanup: {running:?}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +860,118 @@ mod tests {
         );
         // Cleanup is also safe after the process has already been reaped.
         kill_and_reap(&mut child);
+    }
+
+    /// Launch `sleeping_child` from this test binary. A separate function, because the
+    /// ckdev guard tracks every value derived from a `current_exe()` binding as a build
+    /// path, and the caller only writes out the child's pid.
+    #[cfg(unix)]
+    fn spawn_sleeping_child() -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::tests::sleeping_child", "--nocapture"])
+            .env("BROCA_TEST_SUPPORT_SLEEP", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// A stand-in supervisor: it launches one long-running child, the way a daemon launches
+    /// a module, publishes that child's pid, and waits for it.
+    #[cfg(unix)]
+    #[test]
+    fn tree_supervisor_child() {
+        let Some(pid_file) = std::env::var_os("BROCA_TEST_SUPPORT_TREE_SUPERVISOR") else {
+            return;
+        };
+        let pid_file = std::path::PathBuf::from(pid_file);
+        let mut module = spawn_sleeping_child();
+        // Publish by rename so the test never reads a partly written pid.
+        let staging = pid_file.with_extension("tmp");
+        std::fs::write(&staging, module.id().to_string()).unwrap();
+        std::fs::rename(&staging, &pid_file).unwrap();
+        let _ = module.wait();
+    }
+
+    /// Killing only the supervisor leaves its child running for the rest of its 60 s sleep,
+    /// the way a killed daemon leaves a module running that can still write into the rig's
+    /// directory. Tree cleanup must have ended that child by the time it returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tree_cleanup_ends_the_supervisors_children_before_returning() {
+        let pid_file = crate::scratch_root().join(format!(
+            "tree-cleanup-module-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut supervisor = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::tree_supervisor_child",
+                "--nocapture",
+            ])
+            .env("BROCA_TEST_SUPPORT_TREE_SUPERVISOR", &pid_file)
+            // Nested libtest banners bypass this test's capture and corrupt the parent's results.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let module: u32 = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse().ok())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervisor must launch its child");
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(unix_tree::exists(module), "child {module} is not running");
+        kill_and_reap_tree(&mut supervisor);
+        let survived = unix_tree::exists(module);
+        if survived {
+            unix_tree::signal("KILL", &[module]);
+        }
+        assert!(
+            !survived,
+            "child {module} outlived its supervisor's cleanup"
+        );
+        assert!(supervisor.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn rig_dir_removal_accepts_a_missing_directory() {
+        remove_rig_dir(crate::scratch_root().join("rig-dir-that-was-never-created"));
+    }
+
+    /// A failed removal must fail the test that owns the rig, not vanish into a `let _`.
+    #[test]
+    fn rig_dir_removal_failure_is_reported() {
+        // `remove_dir_all` refuses a regular file, even for root, which would ignore a
+        // permission-based failure.
+        let path = crate::scratch_root().join(format!(
+            "rig-dir-removal-failure-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"not a directory").unwrap();
+        let result = std::panic::catch_unwind(|| remove_rig_dir(&path));
+        std::fs::remove_file(&path).unwrap();
+        let message = result.expect_err("a failed removal must panic");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("panic carries the formatted message");
+        assert!(message.contains("cannot remove"), "{message}");
     }
 
     #[tokio::test]

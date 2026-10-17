@@ -38,7 +38,7 @@ pub use ckdev::{
     ckdev_binary, ckdev_binary_pair, ckdev_binary_with_companion, ckdev_command,
     retry_executable_file_busy,
 };
-pub use process::kill_and_reap;
+pub use process::{kill_and_reap, kill_and_reap_tree, remove_rig_dir};
 pub use rig_logs::{append_file_tail, rig_log_diagnostics};
 pub use rig_stdio::{
     dump_rig_process_logs_on_failure, rig_command, rig_process_logs, tokio_rig_command, RigChild,

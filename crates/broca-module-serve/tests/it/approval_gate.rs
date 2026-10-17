@@ -398,9 +398,12 @@ impl Drop for Rig {
         for task in &self.tasks {
             task.abort();
         }
-        broca_test_support::kill_and_reap(&mut self.daemon);
+        // The daemon's modules write into this directory (broca creates its state root while
+        // it starts), and killing only the daemon leaves them running. End the whole tree
+        // first, so nothing can refill or recreate the directory during or after removal.
+        broca_test_support::kill_and_reap_tree(&mut self.daemon);
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
-        let _ = std::fs::remove_dir_all(&self.dir);
+        broca_test_support::remove_rig_dir(&self.dir);
     }
 }
 impl Rig {
@@ -991,9 +994,15 @@ async fn setup_failure_without_wal_preserves_panic_and_reaps_daemon() {
         println!("{stdout}");
         return;
     }
-    let pid = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("APPROVAL_SETUP_DAEMON_PID="))
+    // libtest prints `test <name> ... ` without a newline before the child's own output, so
+    // a marker may share a line with that prefix.
+    let marker = |name: &str| {
+        stdout.lines().find_map(|line| {
+            line.split_once(name)
+                .map(|(_, value)| value.trim().to_owned())
+        })
+    };
+    let pid = marker("APPROVAL_SETUP_DAEMON_PID=")
         .expect("child must report the daemon pid")
         .parse::<u32>()
         .unwrap();
@@ -1023,14 +1032,107 @@ async fn setup_failure_without_wal_preserves_panic_and_reaps_daemon() {
         "{stderr}"
     );
     assert!(!survived, "daemon {pid} survived unwinding");
-    let dir = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("APPROVAL_SETUP_RIG_DIR="))
-        .expect("child must report its rig directory");
+    let dir = marker("APPROVAL_SETUP_RIG_DIR=").expect("child must report its rig directory");
     assert!(
-        !std::path::Path::new(dir).exists(),
-        "rig directory survived unwinding: {dir}"
+        !std::path::Path::new(&dir).exists(),
+        "rig directory survived unwinding: {dir}\n{stderr}"
     );
+}
+
+/// The pid of the broca module, from the daemon's own record of the modules it launched.
+/// Broca can still be starting when `Rig::start` returns, so wait for the daemon to list it.
+#[cfg(unix)]
+async fn broca_module_pid(rig: &Rig) -> u32 {
+    let live = rig.dir.join("data/cortexkit/run/live-children.json");
+    let read = || -> Option<u32> {
+        let record: Value = serde_json::from_slice(&std::fs::read(&live).ok()?).ok()?;
+        record["children"]
+            .as_array()?
+            .iter()
+            .find(|child| child["module_id"] == "broca")?["pid"]
+            .as_u64()?
+            .try_into()
+            .ok()
+    };
+    wait("broca module launched", || read().is_some()).await;
+    read().unwrap()
+}
+
+/// Keeps a module process alive, stopped where it is, across a rig's cleanup.
+///
+/// A stopped process alone does not stay alive: when the daemon dies, the module's process
+/// group is left with no member whose parent is in another group of the same session, and
+/// the kernel then sends a stopped member SIGHUP, which ends it. Adding a `sleep` started by
+/// this test to that group keeps it attached. Dropping the hold kills both processes.
+#[cfg(unix)]
+struct HeldModule {
+    pid: u32,
+    anchor: std::process::Child,
+}
+#[cfg(unix)]
+impl HeldModule {
+    fn stop(pid: u32) -> Self {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: getpgid only reads the group id of the process holding `pid`.
+        let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert!(
+            group > 0,
+            "no process group for module {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        let anchor = std::process::Command::new("sleep")
+            .arg("120")
+            .process_group(group)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("cannot join module {pid}'s group {group}: {error}"));
+        let stopped = std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(stopped.success(), "cannot stop module {pid}");
+        Self { pid, anchor }
+    }
+}
+#[cfg(unix)]
+impl Drop for HeldModule {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &self.pid.to_string()])
+            // Cleanup has usually ended the module already; that is the passing case.
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = self.anchor.kill();
+        let _ = self.anchor.wait();
+    }
+}
+
+/// Killing only the daemon orphans its modules. Broca, often still starting up then, goes
+/// on creating files under its state root, so it can recreate the rig directory or make
+/// its removal fail. Holding broca stopped keeps it alive across the rig's cleanup unless
+/// cleanup itself ends it, so the check below fails whenever cleanup leaves a module running.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rig_cleanup_ends_supervised_modules_before_removing_its_directory() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let Some(rig) = Rig::start("cleanup-modules", true).await else {
+            return;
+        };
+        let pid = broca_module_pid(&rig).await;
+        let hold = HeldModule::stop(pid);
+        let dir = rig.dir.clone();
+        drop(rig);
+        let running = subc_os::Process::open(pid)
+            .unwrap()
+            .is_some_and(|process| process.observe().is_some());
+        drop(hold);
+        assert!(!running, "broca module {pid} outlived rig cleanup");
+        assert!(!dir.exists(), "rig directory survived cleanup: {dir:?}");
+    })
+    .await
+    .expect("bounded real daemon cleanup scenario");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
