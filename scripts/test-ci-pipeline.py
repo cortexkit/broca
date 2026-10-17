@@ -47,6 +47,9 @@ class ArchiveShards(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         (self.root / 'scripts').mkdir()
+        library = self.root / 'scripts/lib'
+        library.mkdir()
+        shutil.copy2(ROOT / 'scripts/lib/cargo-watchdog.py', library / 'cargo-watchdog.py')
         for name in ('ci-integration.sh', 'rust-test-gate.sh'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         bins = self.root / 'bin'

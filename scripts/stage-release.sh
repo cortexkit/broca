@@ -383,7 +383,7 @@ export CK_BUILD_LOCK_DIGEST
 echo "== provenance   rev  ${CK_BUILD_REV}"
 echo "                lock ${CK_BUILD_LOCK_DIGEST}"
 
-if ! cargo build --release --locked -p broca-module-serve --quiet; then
+if ! python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve --quiet; then
     cat >&2 <<'DRIFT'
 stage-release: build refused under --locked.
 
