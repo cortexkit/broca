@@ -13,7 +13,7 @@ description = "broca provider module: owns one provider's SSE transport + auth, 
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
 # The live Anthropic provider (LiveAnthropicProvider): a real HTTP/SSE front for
 # Provider::step. OFF by default so the pure normalize path stays reqwest-free.
-live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:sha2", "dep:tokio-tungstenite", "dep:tungstenite", "tokio/rt"]
+live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:sha2", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
 
 [dependencies]
 broca-owner-only.workspace = true
@@ -39,7 +39,10 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"], optional = true }
+# The decoders are exactly the `accept-encoding` Claude Code sends to Anthropic's first-party API
+# (gzip, deflate, br, zstd). Only the client used for `api.anthropic.com` turns them on; the client
+# for every other host leaves them off, so those requests carry no `accept-encoding` header.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "gzip", "deflate", "brotli", "zstd"], optional = true }
 futures = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = "1"
@@ -53,6 +56,9 @@ sha2 = { workspace = true, optional = true }
 # Codex's Responses socket client, including its permessage-deflate support; rustls only.
 tungstenite = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
+# Request-body gzip for Anthropic's first-party API. Already in the lockfile through tungstenite,
+# with the same zlib-rs backend.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
 broca-owner-only = { workspace = true, features = ["test-support"] }

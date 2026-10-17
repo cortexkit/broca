@@ -111,7 +111,7 @@ data: {"type":"response.incomplete","delta":"cut"#
     let mut trace = AttemptTrace::default();
     let clock = broca_core::clock::Clock::default();
     let error = drive_attempt(
-        &reqwest::Client::new(),
+        &reqwest::Client::new().into(),
         &request,
         &clock,
         normalizer,
