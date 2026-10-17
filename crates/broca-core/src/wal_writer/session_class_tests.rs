@@ -108,7 +108,9 @@ async fn durable_live_readers_and_move_inventory_find_session() {
         record
     );
     assert_eq!(store.wal_present(&session), Some(true));
-    assert!(store.file_identity(&session).unwrap().is_some());
+    // File identity exists only where the platform reports one (Unix); off Unix it is absent
+    // for every WAL, so a durable WAL must match that, not claim an identity.
+    assert_eq!(store.file_identity(&session).unwrap().is_some(), cfg!(unix));
     assert!(store.lineage_exists(&session, None).unwrap());
     assert!(store.addresses().unwrap().contains(&address));
     assert!(store.move_addresses().unwrap().0.contains(&address));
