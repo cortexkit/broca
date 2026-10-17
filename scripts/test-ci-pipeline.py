@@ -250,7 +250,23 @@ class WorkflowGraph(unittest.TestCase):
             self.assertEqual(job['env'][f'BROCA_REQUIRE_{name}'], '1')
         for name in ('SUBC_CORE_BIN', 'FAKE_AFT_STUB_BIN', 'CK_CLAUSTRUM_BIN', 'CK_AUTH_BIN'):
             self.assertTrue(job['env'][name].endswith('.exe'))
+        self.assertEqual(job['env']['CARGO_TARGET_DIR'], r'D:\broca-target')
+        for name in ('TMP', 'TEMP'):
+            self.assertEqual(job['env'][name], r'D:\broca-temp')
         steps = job['steps']
+        prepare = steps[0]
+        self.assertEqual(prepare['name'], 'Prepare Windows build and temporary directories')
+        self.assertEqual(prepare['shell'], 'pwsh')
+        self.assertIn('$env:TEMP', prepare['run'])
+        self.assertIn('$env:CARGO_TARGET_DIR', prepare['run'])
+        cargo_cache = next(s for s in steps if s.get('id') == 'cargo-cache')
+        self.assertEqual(cargo_cache['with']['workspaces'], 'broca -> target')
+        self.assertEqual(cargo_cache['with']['cache-targets'], 'false')
+        self.assertEqual(cargo_cache['with']['cache-directories'], r'D:\broca-target')
+        replay = next(s for s in steps if s.get('name') == 'Replay selected Windows proofs')
+        self.assertIn('Get-PSDrive -Name C,D', replay['run'])
+        self.assertIn('report_free_space before', replay['run'])
+        self.assertIn('report_free_space after', replay['run'])
         self.assertIn('python3 scripts/verify-windows-mutations.py --self-test', [s.get('run') for s in steps])
         coverage = next(s for s in steps if s.get('name') == 'Require complete native Windows coverage')
         self.assertEqual(coverage['if'], 'always()')
@@ -351,6 +367,12 @@ with open(os.environ['EVENTS'], 'a') as f:
 with open(os.environ['EVENTS'], 'a') as f:
     f.write(json.dumps(sys.argv[1:]) + '\\n')
 ''')
+        self.tool('powershell.exe', f'#!{sys.executable}\n' + '''import sys
+assert sys.argv[1:3] == ['-NoProfile', '-Command']
+assert sys.argv[3].startswith('Get-PSDrive -Name C,D')
+print('C: 100.00 GiB free')
+print('D: 100.00 GiB free')
+''')
         cases = [
             ({'EVENT': 'schedule'}, ['--all']),
             ({'EVENT': 'workflow_dispatch'}, ['--all']),
@@ -377,6 +399,10 @@ with open(os.environ['EVENTS'], 'a') as f:
                                          env={**env, 'MODE': selected['mode'], 'BASE': selected.get('base', '')},
                                          text=True, capture_output=True, timeout=5)
                     self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    self.assertEqual(run.stdout.count('Free space before replay:'), 1)
+                    self.assertEqual(run.stdout.count('Free space after replay:'), 1)
+                    self.assertEqual(run.stdout.count('C: 100.00 GiB free'), 2)
+                    self.assertEqual(run.stdout.count('D: 100.00 GiB free'), 2)
                     commands = [json.loads(line) for line in self.events.read_text().splitlines()]
                     self.assertEqual(commands, [
                         ['scripts/verify-windows-mutations.py', *flags, '--shard', f'{shard}/12',
