@@ -10497,7 +10497,7 @@ expect_red = ["runtime::tests::existing_model_overlay_replaces_prices_and_preser
 select = "expected"
 file = "crates/broca-catalog/src/runtime.rs"
 old = 'model.structured_output = value;'
-new = 'model.structured_output = value.filter(|_| false /* NON-VACUITY BREAK */);'
+new = 'let _ = value; model.structured_output = CapabilityFlag::Absent; /* NON-VACUITY BREAK */'
 
 [[control]]
 id = "catalog-overlay-refuses-unknown-model-fields"
