@@ -8655,6 +8655,18 @@ old = "    broca_owner_only::create_dir(state_root.join(\"leases\"))"
 new = "    std::fs::create_dir(state_root.join(\"leases\")) // NON-VACUITY BREAK"
 
 [[control]]
+id = "serve-boot-creates-portable-descriptor-directories"
+guards = "every portable filetree in the placed descriptor already exists before a session is written"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["state_directory_tests::portable_descriptor_directories_are_created_before_any_session"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "    for name in [\"wal-durable\", \"wal-archive-durable\"] {"
+new = "    for name in [\"wal-durable\"] { // NON-VACUITY BREAK"
+
+[[control]]
 id = "windows-stall-file-owner-only"
 guards = "stall log opens use the shared private creator"
 runner = "cargo"

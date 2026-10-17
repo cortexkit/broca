@@ -5391,7 +5391,23 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
                 Err(error)
             }
         })
-        .map_err(|e| ServeIoError(format!("create lease directory: {e}")))
+        .map_err(|e| ServeIoError(format!("create lease directory: {e}")))?;
+
+    for name in ["wal-durable", "wal-archive-durable"] {
+        let path = state_root.join(name);
+        match broca_owner_only::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(error) => {
+                return Err(ServeIoError(format!(
+                    "create state directory {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(all(test, windows))]
@@ -5405,5 +5421,134 @@ mod windows_acl_tests {
         create_state_directories(&root).unwrap();
         assert_private(&root);
         assert_private(&root.join("leases"));
+        assert_private(&root.join("wal-durable"));
+        assert_private(&root.join("wal-archive-durable"));
+    }
+}
+
+#[cfg(test)]
+mod state_directory_tests {
+    use super::create_state_directories;
+    use std::path::PathBuf;
+
+    fn fresh_root(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "broca-state-directory-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        root
+    }
+
+    #[test]
+    fn portable_descriptor_directories_are_created_before_any_session() {
+        let state_root = fresh_root("portable");
+        create_state_directories(&state_root).expect("create startup state directories");
+        let descriptor_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("engram-catalog.json");
+        let placed_descriptor = state_root.join("engram-catalog.json");
+        std::fs::copy(&descriptor_path, &placed_descriptor)
+            .expect("place the tracked backup descriptor in the scratch state root");
+        let descriptor: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&placed_descriptor).expect("read placed backup descriptor"),
+        )
+        .expect("placed descriptor is JSON");
+
+        let entries = descriptor["entries"]
+            .as_array()
+            .expect("placed descriptor entries are a list");
+        let mut portable_entries = 0;
+        for entry in entries.iter().filter(|entry| entry["class"] == "portable") {
+            portable_entries += 1;
+            let entry_id = entry["entry_id"]
+                .as_str()
+                .expect("portable entry has an id");
+            assert_eq!(
+                entry["mechanism"], "filetree",
+                "portable entry {entry_id} must name a boot-created directory"
+            );
+            let relative_path = entry["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("portable entry {entry_id} has no path"));
+            let path = state_root.join(relative_path);
+            assert!(
+                path.is_dir(),
+                "portable entry {entry_id} names {}, but startup did not create that directory",
+                path.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .expect("read portable directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o700, "portable entry {entry_id} must be owner-only");
+            }
+            assert_eq!(
+                std::fs::read_dir(&path)
+                    .expect("read newly created portable directory")
+                    .count(),
+                0,
+                "boot must create {entry_id} before any session writes a WAL"
+            );
+        }
+        assert!(
+            portable_entries > 0,
+            "placed descriptor has no portable entries"
+        );
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_does_not_change_modes_of_existing_durable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_root = fresh_root("existing");
+        std::fs::create_dir_all(&state_root).expect("create existing state root");
+        let expected = [("wal-durable", 0o750), ("wal-archive-durable", 0o755)];
+        for (name, mode) in expected {
+            let path = state_root.join(name);
+            std::fs::create_dir(&path).expect("create existing durable directory");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set existing directory mode");
+        }
+
+        create_state_directories(&state_root).expect("leave existing directories in place");
+
+        for (name, mode) in expected {
+            let path = state_root.join(name);
+            let actual = std::fs::metadata(path)
+                .expect("read existing directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(actual, mode, "startup changed existing {name} permissions");
+        }
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn startup_directory_errors_name_the_path() {
+        let state_root = fresh_root("blocked");
+        std::fs::create_dir_all(&state_root).expect("create blocked state root");
+        let blocked = state_root.join("wal-durable");
+        std::fs::write(&blocked, "not a directory").expect("occupy durable directory path");
+
+        let error =
+            create_state_directories(&state_root).expect_err("file blocks directory creation");
+
+        assert!(
+            error.to_string().contains(&blocked.display().to_string()),
+            "startup error must name the path {}: {error}",
+            blocked.display()
+        );
+        let _ = std::fs::remove_dir_all(&state_root);
     }
 }
