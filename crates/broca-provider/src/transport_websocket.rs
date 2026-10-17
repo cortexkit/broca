@@ -22,8 +22,8 @@ const FAILURE_LIMIT: usize = 6;
 // Retire before the backend's 60-minute connection lifetime, not in the middle of a response.
 const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
 const BETA: &str = "responses_websockets=2026-02-06";
-// A refused upgrade's body is read only to recognise a usage-limit refusal, which fits well within
-// this many bytes. It is never logged or stored.
+// Only the first 512 bytes of a refused upgrade's body are read, and only to recognise a ChatGPT
+// usage-limit refusal (whose body is about 200 bytes). The body is never logged or stored.
 const UPGRADE_BODY_CLASSIFY_LIMIT: usize = 512;
 
 enum UpgradeFailure {
@@ -715,9 +715,10 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     Some(AttemptFailure::http(error, forbidden))
 }
 
-/// Response headers of a refused upgrade that are safe to log: request ids for asking the backend
-/// about one refusal, the server, the content type, and the Codex backend's own `x-codex-*`
-/// headers. Everything else is left out because it may carry a cookie or credential.
+/// Response headers of a refused upgrade that are safe to log: the request ids an operator can
+/// quote to the backend's support, the server, the content type, and the Codex backend's own
+/// `x-codex-*` headers. Every other header is left out because it may carry a cookie or
+/// credential.
 fn safe_upgrade_header(name: &str) -> bool {
     matches!(
         name,
@@ -749,10 +750,10 @@ fn warn_upgrade_refusal(status: u16, headers: &reqwest::header::HeaderMap, next:
     );
 }
 
-/// The ChatGPT account-limit refusal a refused upgrade's body states, if it states one. Only the
-/// first [`UPGRADE_BODY_CLASSIFY_LIMIT`] bytes are read, and they go through the same ChatGPT
-/// classification as an HTTPS error answer. Any other answer returns `None`, and the request is
-/// sent over HTTPS for the backend to answer there.
+/// Return the ChatGPT account-limit error stated by a refused upgrade's body, if the body states
+/// one. Only the first [`UPGRADE_BODY_CLASSIFY_LIMIT`] bytes are classified, the same way as an
+/// HTTPS error answer. Any other body returns `None`, and the caller sends the request over HTTPS
+/// for the backend to answer there.
 fn upgrade_account_limit(
     status: u16,
     headers: &reqwest::header::HeaderMap,
