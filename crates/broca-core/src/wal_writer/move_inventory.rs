@@ -203,14 +203,16 @@ impl IndexedWal {
         if self.wal.last_seq() != 0 {
             return Ok(());
         }
-        if let (
-            Some((ordinary, ephemeral, durable, classes)),
-            WalRecord::RunStarted {
-                retention,
-                session_class,
-                ..
-            },
-        ) = (&self.placement, record)
+        // Read the first record's placement fields; this never constructs a record. The retention
+        // source guard scans for record construction, and a tuple pattern here reads like one.
+        let Some((ordinary, ephemeral, durable, classes)) = &self.placement else {
+            return Ok(());
+        };
+        if let WalRecord::RunStarted {
+            retention,
+            session_class,
+            ..
+        } = record
         {
             let path = if retention.is_some() {
                 ephemeral
