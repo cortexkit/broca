@@ -1332,10 +1332,19 @@ async fn read_one<R: AsyncRead + Unpin>(r: &mut R) -> Frame {
     read_frame(r).await.unwrap().expect("a frame")
 }
 
+/// A fresh scratch directory for one fixture, never shared with another call.
+///
+/// The name carries a per-call sequence number, not just the tag, because a helper that
+/// several tests use passes the same tag for all of them. With a tag-only name, those tests
+/// running in parallel got one directory: each setup deleted it and rebuilt it under the
+/// others, so a test failed opening its store, appending to its WAL, or read another test's
+/// session markers. The scratch root is already private to this process, so a unique name
+/// needs no clean-up of a previous directory before use.
 fn tmpdir(tag: &str) -> std::path::PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir = broca_test_support::scratch_root()
-        .join(format!("broca-serve-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+        .join(format!("broca-serve-{}-{tag}-{call}", std::process::id()));
     std::fs::create_dir_all(dir.join("proj")).unwrap();
     dir
 }
@@ -7085,6 +7094,36 @@ async fn unreadable_moved_ownership_fails_closed_without_repair() {
     }
     assert_eq!(std::fs::read(&route.wal_path).unwrap(), before);
     route.finish().await;
+}
+
+/// Two moved-session routes alive at once, which is what happens when the tests built on
+/// `protected_moved_route` run in parallel inside one test binary. The second route's setup
+/// must not touch the first route's scratch directory: when both shared one directory, the
+/// second setup deleted the first route's WAL, store and markers and rewrote them, so the
+/// first route answered from the second route's pending-release cut (`session_moving`), or
+/// its own setup failed opening the store or appending to a WAL that had just been removed.
+#[tokio::test]
+async fn overlapping_protected_moved_routes_keep_separate_scratch_state() {
+    let mut first = protected_moved_route("basal", false).await;
+    let before = std::fs::read(&first.wal_path).unwrap();
+    // Set up the second route while the first is still serving: the interleaving that
+    // parallel tests produce by chance, forced here on every run.
+    let second = protected_moved_route("basal", true).await;
+    let body = first
+        .expect_error(
+            2,
+            serde_json::json!({"method":"session.send","params":{"unknown":true}}),
+        )
+        .await;
+    let error: ErrorBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        error.code, "session_moved",
+        "the first route has no pending release, so a write must see only its moved marker: {error:?}"
+    );
+    assert_eq!(std::fs::read(&first.wal_path).unwrap(), before);
+    assert_ne!(first.dir, second.dir);
+    second.finish().await;
+    first.finish().await;
 }
 
 async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWalRoute {
