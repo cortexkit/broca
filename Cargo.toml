@@ -42,7 +42,7 @@ members = [
 # checkouts are used only to build integration-test rig binaries.
 
 [workspace.package]
-version = "0.3.207"
+version = "0.3.208"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
