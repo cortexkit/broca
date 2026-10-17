@@ -786,3 +786,16 @@ async fn import_reconciliation_syncs_staging_before_recording_imported() {
     assert!(state.intent.is_none());
     assert!(state.replies.contains_key(Op::Import.method()));
 }
+#[test]
+fn broca_diverged_reply_bytes_omit_absent_reasons() {
+    use broca_wire::agent_data::diverged::{DivergedEntry, DivergedReply, DivergedState};
+
+    let reply = DivergedReply::new(vec![
+        DivergedEntry::new(DivergedState::AtCut),
+        DivergedEntry::new(DivergedState::Unknown),
+    ]);
+    assert_eq!(
+        serde_json::to_vec(&reply).unwrap(),
+        br#"{"refs":[{"state":"at_cut"},{"state":"unknown"}]}"#
+    );
+}

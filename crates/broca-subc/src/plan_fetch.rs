@@ -91,11 +91,11 @@ impl SubcPlanFetcher {
                 detail: Some(Value::String(detail)),
                 retryable: false,
             })?;
-        Ok(Some(ScopeSelector {
+        Ok(Some(ScopeSelector::new(
             owner,
-            scope_ref: scope.scope_ref.clone(),
-            scope_epoch: Some(scope.scope_epoch),
-        }))
+            scope.scope_ref.clone(),
+            Some(scope.scope_epoch),
+        )))
     }
 
     async fn call(&self, provider: &str, op: &str, arguments: Value) -> Result<Value, FetchError> {

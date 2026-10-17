@@ -578,13 +578,13 @@ impl Rig {
             conn.route_open_management_scoped_within(
                 "broca",
                 &self.script.session,
-                ScopeSelector {
-                    owner: Principal::Reserved {
+                ScopeSelector::new(
+                    Principal::Reserved {
                         module_id: OWNER.into(),
                     },
-                    scope_ref: "approval-head".into(),
-                    scope_epoch: Some(1),
-                },
+                    "approval-head",
+                    Some(1),
+                ),
                 retry,
             )
             .await
