@@ -54,6 +54,7 @@ suites=(
     # Stubs codesign, file, stat, ps and lsof, so the placement gate's macOS-only signing
     # checks also run on a Linux runner.
     scripts/test-place-release-gate.py
+    scripts/test-place-release-seal.py
     scripts/test-train-push.py
     scripts/test-train-preflight.py
     scripts/test-watch-ci-resolve.py

@@ -27,6 +27,7 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PLACE = ROOT / "scripts" / "place-release.sh"
 VERIFY = ROOT / "scripts" / "verify-deploy.sh"
+
+
+def wal_frame(seq: int, record: dict) -> bytes:
+    payload = json.dumps(record, separators=(",", ":")).encode()
+    version, fence = 1, 1
+    digest = hashlib.sha256(
+        bytes((version,)) + struct.pack("<Q", seq) + struct.pack("<Q", fence) + payload
+    ).digest()
+    return struct.pack("<IBQQ", len(payload), version, seq, fence) + digest + payload
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "native Linux /proc and ELF tests")
@@ -629,8 +639,26 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         report = self.tmp / "report.json"
         wal = self.state / "wal"
         wal.mkdir()
-        shutil.copy2(ROOT / "scripts/fixtures/resume-close-out-sealed.wal", wal / "session.wal")
-        shutil.copy2(ROOT / "scripts/fixtures/resume-close-out-unsealed.wal", wal / "unsealed.wal")
+        session = wal / "session.wal"
+        unsealed = wal / "unsealed.wal"
+        session.write_bytes(
+            wal_frame(1, {"type": "run_started", "run_id": "run-before"})
+            + wal_frame(2, {"type": "step_started"})
+        )
+        unsealed.write_bytes(
+            wal_frame(1, {"type": "run_started", "run_id": "run-open"})
+            + wal_frame(2, {"type": "step_started"})
+        )
+        restart_records = self.tmp / "restart-records.wal"
+        restart_records.write_bytes(
+            wal_frame(3, {"type": "run_finished", "reason": "interrupted"})
+            + wal_frame(4, {"type": "run_started", "run_id": "run-after"})
+            + wal_frame(5, {"type": "step_started"})
+        )
+        restarted = self.tmp / "restarted"
+        ck = Path(env["PLACE_RELEASE_CK"])
+        ck.write_text(f'#!/bin/sh\ncat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
+        ck.chmod(0o755)
         result = self.place("--restart", "--live-approved", "--report", str(report),
                             PLACE_RELEASE_GATE_CMD='echo "live runs          2"; echo "  live  session.wal  last write 0s ago"; echo "  live  unsealed.wal  last write 0s ago"; exit 1', **env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -640,11 +668,48 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         data = json.loads(report.read_text())
         self.assertEqual(data["pid"], "4243")
         self.assertEqual(data["sessions_at_restart"], ["session.wal", "unsealed.wal"])
+        self.assertEqual(data["active_runs_at_restart"], [
+            {"session": "session.wal", "run_id": "run-before"},
+            {"session": "unsealed.wal", "run_id": "run-open"},
+        ])
         self.assertEqual(data["sessions_sealed"], ["session.wal"])
         self.assertEqual(data["sessions_unconfirmed"], ["unsealed.wal"])
+        self.assertEqual(data["sessions_cancelled"], [])
+        self.assertEqual(data["runs_sealed"], [{"session": "session.wal", "run_id": "run-before"}])
+        self.assertEqual(data["runs_unconfirmed"], [{"session": "unsealed.wal", "run_id": "run-open"}])
         self.assertEqual(data["seal_error"], "")
         self.assertEqual(Path(data["backup"]).read_bytes(), self.deployed_bytes)
         self.assertTrue(Path(data["backup"] + ".sha256").exists())
+
+    def test_shutdown_cancelled_terminal_is_reported_as_a_loud_failure(self):
+        env = self.restart_fixture()
+        report = self.tmp / "report.json"
+        wal = self.state / "wal"
+        wal.mkdir()
+        session = wal / "session.wal"
+        session.write_bytes(
+            wal_frame(1, {"type": "run_started", "run_id": "run-cancelled"})
+            + wal_frame(2, {"type": "step_started"})
+        )
+        restart_records = self.tmp / "restart-records.wal"
+        restart_records.write_bytes(wal_frame(3, {"type": "run_finished", "reason": "cancelled"}))
+        restarted = self.tmp / "restarted"
+        ck = Path(env["PLACE_RELEASE_CK"])
+        ck.write_text(f'#!/bin/sh\ncat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
+        ck.chmod(0o755)
+
+        result = self.place(
+            "--restart", "--live-approved", "--report", str(report),
+            PLACE_RELEASE_GATE_CMD='echo "live runs          1"; echo "  live  session.wal  last write 0s ago"; exit 1',
+            **env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("FAILURE", result.stderr)
+        self.assertIn("cancelled", result.stderr)
+        data = json.loads(report.read_text())
+        self.assertEqual(data["sessions_cancelled"], ["session.wal"])
+        self.assertEqual(data["runs_cancelled"], [{"session": "session.wal", "run_id": "run-cancelled"}])
 
     def test_live_approved_accepts_a_run_that_starts_between_placement_and_restart(self):
         env = self.restart_fixture()

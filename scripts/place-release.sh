@@ -115,8 +115,9 @@ source "$REPO_ROOT/scripts/signing-posture.sh"
 source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
+ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
 TMP=""
-trap 'rm -f "${TMP:-}" "$GATE_LOG"' EXIT
+trap 'rm -f "${TMP:-}" "$GATE_LOG" "$ACTIVE_RUNS_FILE"' EXIT
 
 # The live-run gate answers "is any run live RIGHT NOW". It only refuses when this invocation
 # will restart (--restart, --restart-only), because placement alone is an atomic rename that
@@ -135,29 +136,90 @@ run_gate() {
 
 write_report() {
   [ -n "$REPORT" ] || return 0
-  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" <<'PY'
-import importlib.util, json, pathlib, sys
-path, backup, pid, gate, scripts = sys.argv[1:]
+  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" <<'PY'
+import json, pathlib, sys
+path, backup, pid, gate, scripts, active_runs_file = sys.argv[1:]
 snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
 sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith("  live  ")]
-sealed = []
+sys.path.insert(0, scripts)
+from lib import state_root
+from lib.archive_read import logical_wals
+from lib.seal_readback import CANCELLED, SEALED, UNCONFIRMED, active_run_id, classify_run
+
+active_path = pathlib.Path(active_runs_file)
 seal_error = ""
-if pid and sessions:
-    # Read terminal records in the pre-restart session logs. A new process can
-    # start even if the old process left a run without a durable completion record.
+if pid:
     try:
-        sys.path.insert(0, scripts)
-        spec = importlib.util.spec_from_file_location("live_runs", pathlib.Path(scripts) / "live-runs.py")
-        live = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(live)
-        wals = {wal.name: wal for wal in live.logical_wals(live.state_root.default_state_root() / "wal", include_archives=False)}
-        sealed = [name for name in sessions if name in wals and live.tail_state(wals[name]) == live.SEALED]
+        saved = json.loads(active_path.read_text())
+        active_runs = saved["runs"]
+        errors = [saved["error"]] if saved.get("error") else []
     except Exception as error:
-        seal_error = str(error)
-pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid,
+        active_runs = [{"session": name, "run_id": None} for name in sessions]
+        errors = [f"cannot read pre-restart run snapshot: {error}"]
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: []}
+    try:
+        wals = {
+            wal.name: wal
+            for wal in logical_wals(
+                state_root.default_state_root() / "wal", include_archives=False
+            )
+        }
+    except Exception as error:
+        wals = {}
+        errors.append(str(error))
+    for active in active_runs:
+        name, run_id = active.get("session"), active.get("run_id")
+        status = UNCONFIRMED
+        if isinstance(name, str) and isinstance(run_id, str):
+            wal = wals.get(name)
+            if wal is not None:
+                try:
+                    status = classify_run(wal, run_id)
+                except Exception as error:
+                    errors.append(str(error))
+        statuses[status].append({"session": name, "run_id": run_id})
+    seal_error = "; ".join(errors)
+else:
+    active_runs = [{"session": name, "run_id": None} for name in sessions]
+    errors = []
+    try:
+        wals = {
+            wal.name: wal
+            for wal in logical_wals(
+                state_root.default_state_root() / "wal", include_archives=False
+            )
+        }
+        for active in active_runs:
+            wal = wals.get(active["session"])
+            if wal is not None:
+                active["run_id"] = active_run_id(wal)
+    except Exception as error:
+        errors.append(str(error))
+    seal_error = "; ".join(errors)
+    active_path.write_text(json.dumps({"runs": active_runs, "error": seal_error}))
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: []}
+
+runs_sealed = statuses[SEALED]
+runs_unconfirmed = statuses[UNCONFIRMED]
+runs_cancelled = statuses[CANCELLED]
+sessions_sealed = [run["session"] for run in runs_sealed]
+sessions_unconfirmed = [run["session"] for run in runs_unconfirmed]
+sessions_cancelled = [run["session"] for run in runs_cancelled]
+for run in runs_cancelled:
+    print(
+        f"place-release: FAILURE -- shutdown drain cancelled run {run['run_id']} "
+        f"in {run['session']}; a drain must not cancel a run.",
+        file=sys.stderr,
+    )
+pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
                                        "sessions_at_restart": sessions,
-                                       "sessions_sealed": sealed,
-                                       "sessions_unconfirmed": [name for name in sessions if name not in sealed],
+                                       "active_runs_at_restart": active_runs,
+                                       "runs_sealed": runs_sealed,
+                                       "runs_unconfirmed": runs_unconfirmed,
+                                       "runs_cancelled": runs_cancelled,
+                                       "sessions_sealed": sessions_sealed,
+                                       "sessions_unconfirmed": sessions_unconfirmed,
+                                       "sessions_cancelled": sessions_cancelled,
                                        "seal_error": seal_error,
                                        "live_run_snapshot": snapshot}))
 PY
