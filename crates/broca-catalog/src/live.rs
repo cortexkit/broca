@@ -1512,11 +1512,8 @@ fn chatgpt_codex_auth(
     // The vault-served account id wins: the vault parses it from the token at refresh
     // time, so it tracks a re-login that swaps accounts. The local JWT decode remains the
     // fallback for non-vault paths (opencode auth file, explicit Bearer).
-    let account_id = vault_account_id
-        .filter(|account_id| !account_id.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| chatgpt_account_id(&token))
-        .ok_or_else(|| {
+    let account_id =
+        cortexkit_chatgpt_policy::account_id(vault_account_id, &token).map_err(|_| {
             format!(
                 "the '{auth_provider}' ChatGPT (codex) token carries no chatgpt_account_id \
                  claim — is this a ChatGPT-subscription token (not a plain OpenAI platform \
@@ -1576,7 +1573,10 @@ fn chatgpt_codex_headers(
         // Presenting the codex identity here is the backend's de-facto client contract
         // for this OAuth path, the same class as the Claude-Code identity lead the
         // anthropic OAuth path requires in the request body.
-        ("originator".to_string(), "codex_cli_rs".to_string()),
+        (
+            "originator".to_string(),
+            cortexkit_chatgpt_policy::CODEX_CLI_ORIGINATOR.to_string(),
+        ),
         (
             "user-agent".to_string(),
             format!(
@@ -1589,43 +1589,13 @@ fn chatgpt_codex_headers(
     AuthHandle::Headers(headers)
 }
 
-/// Extract the ChatGPT account id from a token's JWT payload. The token is a JWT
-/// (`header.payload.signature`); the payload (base64url) carries the id under
-/// `chatgpt_account_id`, or nested under the `https://api.openai.com/auth` claim, or as the
-/// first organization id. Returns `None` if the token isn't a JWT or carries no such claim.
-/// Adapted from OpenCode's codex.ts `extractAccountIdFromClaims`
-/// (MIT, Copyright (c) 2025 opencode; see THIRD-PARTY-NOTICES.md).
-/// broca decodes the JWT locally and rejects empty account claims. Signature is NOT verified
-/// (we are a client reading our own token, not validating it).
+/// Extract the ChatGPT account id from a token's JWT payload alone, with no vault id. The
+/// shared ChatGPT policy reads the `chatgpt_account_id` claim, then the one nested under
+/// `https://api.openai.com/auth`, then the first organization id. Returns `None` if the token
+/// isn't a JWT or carries no such claim. The signature is not verified: broca reads its own
+/// token here, it does not validate it.
 fn chatgpt_account_id(token: &str) -> Option<String> {
-    use base64::Engine;
-    let payload_b64 = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims
-        .get("chatgpt_account_id")
-        .and_then(|v| v.as_str())
-        .filter(|account_id| !account_id.trim().is_empty())
-        .or_else(|| {
-            claims
-                .get("https://api.openai.com/auth")
-                .and_then(|a| a.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-                .filter(|account_id| !account_id.trim().is_empty())
-        })
-        .map(str::to_string)
-        .or_else(|| {
-            claims
-                .get("organizations")
-                .and_then(|o| o.as_array())
-                .and_then(|a| a.first())
-                .and_then(|o| o.get("id"))
-                .and_then(|v| v.as_str())
-                .filter(|account_id| !account_id.trim().is_empty())
-                .map(str::to_string)
-        })
+    cortexkit_chatgpt_policy::account_id(None, token).ok()
 }
 
 /// Read the method encoded by a provider's OpenCode auth entry without exposing its secret.
@@ -2415,6 +2385,48 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    /// The shared ChatGPT policy's account-id vectors, run through broca's codex auth: each
+    /// resolves to the vector's account header, or fails loud without one.
+    #[test]
+    fn shared_chatgpt_account_id_vectors_agree_with_codex_auth() {
+        let document: serde_json::Value = serde_json::from_str(include_str!(
+            "../../cortexkit-chatgpt-policy/test-vectors/account_ids.json"
+        ))
+        .unwrap();
+        let vectors = document["vectors"].as_array().unwrap();
+        assert!(vectors.len() >= 4);
+        for vector in vectors {
+            let name = vector["name"].as_str().unwrap();
+            let token = vector["access_token"].as_str().unwrap();
+            let result = chatgpt_codex_auth(
+                &AuthMode::Bearer(token.to_string()),
+                "openai",
+                Some("ses-1"),
+                vector["vault_account_id"].as_str(),
+            );
+            match vector["expected"]["account_id"].as_str() {
+                Some(expected) => {
+                    let (AuthHandle::Headers(headers), _) = result.unwrap() else {
+                        panic!("{name}: expected the codex header set");
+                    };
+                    assert_eq!(
+                        headers
+                            .iter()
+                            .find(|(header, _)| header == "chatgpt-account-id")
+                            .map(|(_, value)| value.as_str()),
+                        Some(expected),
+                        "{name}"
+                    );
+                }
+                None => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains("chatgpt_account_id"), "{name}");
+                    assert!(!error.contains(token), "{name}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ effect.
 | `broca-store` | Materialized session store and export index. |
 | `broca-owner-only` | Private-state file permissions and validation. |
 | `broca-diagnostics` | Blocking-job and egress instrumentation. |
+| `cortexkit-chatgpt-policy` | Shared ChatGPT/Codex account-id, refusal and quota-header policy. |
 | `ck-session-import`, `ck-import` | Log import readers and CLI. |
 | `broca-run`, `broca-bench`, `broca-replay` | Standalone runner, benchmarks and replay fixtures. |
 | `broca-test-support`, `broca-crash-harness` | Test support and crash-cut recovery checks. |

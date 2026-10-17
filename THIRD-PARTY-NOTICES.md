@@ -10,10 +10,11 @@ Source: https://github.com/openai/codex at revision
 `a6baf8867cb4c9726213c0884a5c8b11f0cfd8bf`.
 
 The ChatGPT Responses WebSocket transport in
-`crates/broca-provider/src/transport_websocket.rs`, and the 300-second idle limit
-and ChatGPT usage-limit classifier in `crates/broca-provider/src/transport.rs`,
-are adapted from Codex. broca connects these to its run-local transport, shared
-Responses normalizer, HTTPS fallback and account-limit error handling.
+`crates/broca-provider/src/transport_websocket.rs`, the 300-second idle limit in
+`crates/broca-provider/src/transport.rs`, and the ChatGPT usage-limit classifier in
+`crates/cortexkit-chatgpt-policy/src/classify.rs` are adapted from Codex. broca
+connects these to its run-local transport, shared Responses normalizer, HTTPS
+fallback and account-limit error handling.
 
 The full upstream license is in [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt).
 The applicable upstream NOTICE is:
@@ -41,9 +42,9 @@ from OpenCode's `packages/core/src/models-dev.ts` at revision
 `5716f8ba60e79ec60ec485b6e5291c0b0bc1f252`. broca maps settings by wire family
 instead of npm package and freezes them at admission.
 
-The ChatGPT header construction and account-claim extraction in
-`crates/broca-catalog/src/live.rs` follow OpenCode's `codex.ts` and
-`extractAccountIdFromClaims`. broca adds vault credential resolution, frozen
+The ChatGPT header construction in `crates/broca-catalog/src/live.rs` and the
+account-claim extraction in `crates/cortexkit-chatgpt-policy/src/account.rs` follow
+OpenCode's `codex.ts` and `extractAccountIdFromClaims`. broca adds vault credential resolution, frozen
 session scope and non-empty claim checks.
 
 ```text

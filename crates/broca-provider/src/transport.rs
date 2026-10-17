@@ -1,6 +1,7 @@
-// The 300-second idle limit and ChatGPT usage-limit classifier are adapted from OpenAI Codex,
+// The 300-second idle limit is adapted from OpenAI Codex,
 // revision a6baf8867cb4c9726213c0884a5c8b11f0cfd8bf (Apache-2.0). Copyright 2025 OpenAI.
-// See THIRD-PARTY-NOTICES.md and LICENSES/Apache-2.0.txt.
+// See THIRD-PARTY-NOTICES.md and LICENSES/Apache-2.0.txt. The ChatGPT usage-limit
+// classifier, also adapted from Codex, is in the cortexkit-chatgpt-policy crate.
 // broca applies these policies to its shared HTTP/WebSocket transport and account-limit errors.
 
 //! HTTP/SSE driver for every wire family, with run-local Responses sockets for ChatGPT
@@ -3227,26 +3228,25 @@ fn classify_http_error_in_family(
 /// So it's classed transient, which the vault-report path never reports: the transport retries
 /// it, since the same request seconds later succeeds, and a run that exhausts retries ends as an
 /// error rather than parking for a re-login nobody needs. The match needs the ChatGPT family AND
-/// a message naming an `sk-` key; a 401 that names nothing, or names a token, keeps its class.
+/// the shared ChatGPT policy's verdict: a 401 whose message starts by naming an `sk-` key. A 401
+/// that names nothing, or names a token, keeps its class.
 fn classify_chatgpt_upstream_key_rejection(
     family: crate::spec::WireFamilyId,
     status: u16,
     body: &str,
     error: ProviderError,
 ) -> ProviderError {
-    if family != crate::spec::WireFamilyId::OpenAiResponsesChatgpt || status != 401 {
+    if family != crate::spec::WireFamilyId::OpenAiResponsesChatgpt {
         return error;
     }
-    let message = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|body| {
-            body.get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
-    if !message.starts_with("Incorrect API key provided: sk-") {
+    // The observation time only dates a usage-limit reset, which a 401 never carries.
+    if cortexkit_chatgpt_policy::classify_response_with_retry_after(
+        status,
+        body,
+        UNIX_EPOCH,
+        error.retry_after_secs,
+    ) != cortexkit_chatgpt_policy::Classification::UpstreamKeyRejection
+    {
         return error;
     }
     ProviderError {
@@ -3344,7 +3344,7 @@ pub fn classify_account_limit_exhausted(
             }
         }
         crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
-            chatgpt_usage_limit_reached(body, now, error)
+            chatgpt_usage_limit_reached(status, body, now, error)
         }
         crate::spec::WireFamilyId::OpenAiChat => kimi_weekly_usage_limit_reached(body, error),
         // Code Assist wraps the Gemini request but answers errors in the same Google RPC shape,
@@ -3368,59 +3368,43 @@ pub fn classify_account_limit_exhausted(
 /// the `TOO_MANY_REQUESTS` arm matching `error_type == "usage_limit_reached"`), and reads
 /// `resets_at` as epoch seconds.
 ///
-/// `resets_at_ms` comes from `resets_at`, else from now plus `resets_in_seconds`, else from now
-/// plus the retry-after. Both relative fallbacks are marked `retry_after`, not a stated
-/// absolute reset from the body. `limit_window` is left empty: the captured bodies name the plan but not
-/// which window ran out, and inventing a window name would mislead a router. A ChatGPT 429 with any
-/// other body (an ordinary throttle) is returned unchanged and keeps retrying.
-fn chatgpt_usage_limit_reached(body: &str, now: SystemTime, error: ProviderError) -> ProviderError {
-    let Some(detail) = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|body| body.get("error").cloned())
+/// The shared ChatGPT policy (`cortexkit_chatgpt_policy::classify_response_with_retry_after`)
+/// makes that decision and computes the reset: `resets_at_ms` comes from `resets_at`, else from
+/// now plus `resets_in_seconds`, else from now plus the retry-after. Both relative fallbacks are
+/// marked `retry_after`, not a stated absolute reset from the body. `limit_window` is left empty:
+/// the captured bodies name the plan but not which window ran out, and inventing a window name
+/// would mislead a router. A ChatGPT 429 with any other body (an ordinary throttle) is returned
+/// unchanged and keeps retrying.
+fn chatgpt_usage_limit_reached(
+    status: u16,
+    body: &str,
+    now: SystemTime,
+    error: ProviderError,
+) -> ProviderError {
+    let cortexkit_chatgpt_policy::Classification::AccountLimitExhausted {
+        resets_at_ms,
+        resets_at_source,
+    } = cortexkit_chatgpt_policy::classify_response_with_retry_after(
+        status,
+        body,
+        now,
+        error.retry_after_secs,
+    )
     else {
         return error;
     };
-    if detail.get("type").and_then(Value::as_str) != Some(CHATGPT_USAGE_LIMIT_REACHED) {
-        return error;
-    }
-    let now_ms = system_time_millis(now);
-    let resets_at_ms = detail
-        .get("resets_at")
-        .and_then(Value::as_u64)
-        .map(|seconds| (seconds.saturating_mul(1_000), "body"))
-        .or_else(|| {
-            detail
-                .get("resets_in_seconds")
-                .and_then(Value::as_u64)
-                .map(|seconds| {
-                    (
-                        now_ms.saturating_add(seconds.saturating_mul(1_000)),
-                        "retry_after",
-                    )
-                })
-        })
-        .or_else(|| {
-            error.retry_after_secs.map(|seconds| {
-                (
-                    now_ms.saturating_add((seconds * 1_000.0) as u64),
-                    "retry_after",
-                )
-            })
-        });
     ProviderError {
         refusal: None,
         class: ErrorClass::Transient,
         provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_string()),
-        resets_at_ms: resets_at_ms.map(|(time, _)| time),
-        resets_at_source: resets_at_ms.map(|(_, source)| source.to_owned()),
+        resets_at_ms,
+        resets_at_source: resets_at_source.map(|source| source.as_str().to_owned()),
         limit_window: None,
         account_ref: None,
         credential_id: None,
         ..error
     }
 }
-
-const CHATGPT_USAGE_LIMIT_REACHED: &str = "usage_limit_reached";
 
 /// xAI's spending limit refusal: HTTP 402 or 403 with code `personal-team-blocked:spending-limit`.
 /// Class is permanent, with no resets_at_ms and no retry within the run.
@@ -6090,7 +6074,12 @@ mod tests {
         use super::{classify_chatgpt_upstream_key_rejection, CHATGPT_UPSTREAM_KEY_REJECTED};
         const UPSTREAM_KEY_BODY: &str = r#"{"error":{"message":"Incorrect API key provided: sk-svcac***********fvMA. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}"#;
         const TOKEN_EXPIRED_BODY: &str = r#"{"error":{"message":"Your authentication token has expired.","type":"invalid_request_error","code":"token_expired"}}"#;
-        const UPSTREAM_KEY_MESSAGE: &str = "401: chatgpt_upstream_key_rejected: the ChatGPT backend rejected an OpenAI API key on its own side (broca sent the account's OAuth token, not a key); not a credential failure.";
+        const UPSTREAM_KEY_MESSAGE: &str = concat!(
+            "401: chatgpt_upstream_key_rejected: the ChatGPT backend rejected an OpenAI API key ",
+            // Split so this copy is not a second match for the diagnostic's mutation anchor.
+            "on its own side (broca sent the account's OAuth token, not a key); ",
+            "not a credential failure."
+        );
         let family = WireFamilyId::OpenAiResponsesChatgpt;
         let now_ms = 1_789_579_322_081u64;
         let now = UNIX_EPOCH + Duration::from_millis(now_ms);
@@ -6329,6 +6318,176 @@ mod tests {
         ];
         for (label, actual, expected) in cases {
             assert_eq!(actual, expected, "{label}");
+        }
+    }
+
+    /// Run one answer through broca's ChatGPT HTTPS classification chain, as `drive_attempt`
+    /// does: Retry-After parsing, the status and code table, then both ChatGPT overlays.
+    fn run_chatgpt_chain(
+        status: u16,
+        headers: &[(String, String)],
+        body: &str,
+        now: SystemTime,
+    ) -> ProviderError {
+        use super::classify_chatgpt_upstream_key_rejection;
+        let family = WireFamilyId::OpenAiResponsesChatgpt;
+        let mut header_map = reqwest::header::HeaderMap::new();
+        for (name, value) in headers {
+            header_map.append(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        let retry = parse_retry_after_header(&header_map);
+        let headers = crate::wire::ResponseHeaders::new(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        let error = super::classify_http_error_in_family(
+            status,
+            body,
+            retry,
+            None,
+            Some(family),
+            headers.get("x-amzn-errortype"),
+        );
+        let error = classify_chatgpt_upstream_key_rejection(family, status, body, error);
+        classify_account_limit_exhausted(family, status, &headers, body, now, error)
+    }
+
+    /// The shared ChatGPT policy's golden vectors, run through broca's transport chain: each
+    /// vector's class must be what broca records for that answer.
+    #[test]
+    fn shared_chatgpt_response_vectors_agree_with_the_transport() {
+        use super::CHATGPT_UPSTREAM_KEY_REJECTED;
+        let document: Value = serde_json::from_str(include_str!(
+            "../../cortexkit-chatgpt-policy/test-vectors/responses.json"
+        ))
+        .unwrap();
+        let vectors = document["vectors"].as_array().unwrap();
+        assert!(vectors.len() >= 7);
+        for vector in vectors {
+            let name = vector["name"].as_str().unwrap();
+            let status = vector["status"].as_u64().unwrap() as u16;
+            let headers: Vec<(String, String)> = vector["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| {
+                    (
+                        pair[0].as_str().unwrap().to_owned(),
+                        pair[1].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            let body = vector["body"].as_str().unwrap();
+            let now = UNIX_EPOCH + Duration::from_millis(vector["now_ms"].as_u64().unwrap());
+            let error = run_chatgpt_chain(status, &headers, body, now);
+            let expected = &vector["expected"];
+            let account_wall = error.is_account_limit_exhausted();
+            let upstream = error.provider_code.as_deref() == Some(CHATGPT_UPSTREAM_KEY_REJECTED);
+            match expected["class"].as_str().unwrap() {
+                "account_limit_exhausted" => {
+                    assert!(account_wall, "{name}");
+                    assert_eq!(
+                        error.resets_at_ms,
+                        expected["resets_at_ms"].as_u64(),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        error.resets_at_source.as_deref(),
+                        expected["resets_at_source"].as_str(),
+                        "{name}"
+                    );
+                }
+                "usage_not_included" => {
+                    assert_eq!(error.class, ErrorClass::Permanent, "{name}");
+                    assert_eq!(
+                        error.provider_code.as_deref(),
+                        Some("usage_not_included"),
+                        "{name}"
+                    );
+                }
+                "auth_failure" => assert_eq!(error.class, ErrorClass::Auth, "{name}"),
+                "upstream_key_rejection" => {
+                    assert!(upstream, "{name}");
+                    assert_eq!(error.class, ErrorClass::Transient, "{name}");
+                }
+                "rate_limited" | "overloaded" => {
+                    assert_eq!(error.class, ErrorClass::Transient, "{name}");
+                    assert!(!account_wall && !upstream, "{name}");
+                }
+                other => panic!("{name}: unexpected class {other}"),
+            }
+        }
+    }
+
+    /// Over every vector body at every refusal status, the shared policy and broca's transport
+    /// agree on the classes broca acts on: an account wall, the backend's own key rejection, a
+    /// credential failure, and a plan without the requested use.
+    #[test]
+    fn the_shared_chatgpt_policy_agrees_with_the_transport_on_every_status() {
+        use super::CHATGPT_UPSTREAM_KEY_REJECTED;
+        use cortexkit_chatgpt_policy::Classification;
+        let document: Value = serde_json::from_str(include_str!(
+            "../../cortexkit-chatgpt-policy/test-vectors/responses.json"
+        ))
+        .unwrap();
+        let now = UNIX_EPOCH + Duration::from_millis(1_789_579_322_081);
+        let mut bodies: Vec<&str> = document["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vector| vector["body"].as_str().unwrap())
+            .collect();
+        bodies.extend([
+            "not json",
+            "{}",
+            r#"{"error":{"type":"api_error"}}"#,
+            r#"{"error":{"type":"overloaded_error"}}"#,
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            r#"{"error":{"code":"authentication_error"}}"#,
+            r#"{"error":{"type":"permission_error"}}"#,
+            r#"[{"error":{"code":"usage_not_included"}}]"#,
+        ]);
+        for status in [400, 401, 403, 404, 408, 410, 429, 500, 502, 503, 529] {
+            for body in &bodies {
+                let error = run_chatgpt_chain(status, &[], body, now);
+                let class = cortexkit_chatgpt_policy::classify_response(
+                    status,
+                    std::iter::empty::<(&str, &str)>(),
+                    body,
+                    now,
+                );
+                let label = format!("{status} {body}");
+                assert_eq!(
+                    matches!(class, Classification::AccountLimitExhausted { .. }),
+                    error.is_account_limit_exhausted(),
+                    "{label}"
+                );
+                assert_eq!(
+                    class == Classification::UpstreamKeyRejection,
+                    error.provider_code.as_deref() == Some(CHATGPT_UPSTREAM_KEY_REJECTED),
+                    "{label}"
+                );
+                assert_eq!(
+                    class == Classification::AuthFailure,
+                    error.class == ErrorClass::Auth,
+                    "{label}"
+                );
+                assert_eq!(
+                    class == Classification::UsageNotIncluded,
+                    error.provider_code.as_deref() == Some("usage_not_included"),
+                    "{label}"
+                );
+                if matches!(
+                    class,
+                    Classification::RateLimited | Classification::Overloaded
+                ) {
+                    assert_eq!(error.class, ErrorClass::Transient, "{label}");
+                }
+            }
         }
     }
 

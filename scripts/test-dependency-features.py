@@ -13,9 +13,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 
 # Members whose whole design is to stay free of Tokio declare it nowhere, not even for tests.
-# A member listed here must declare no Tokio at all; the feature-agreement rule below exists
-# so test builds that do pull Tokio agree, and a Tokio-free member cannot disagree.
-TOKIO_FREE_MEMBERS = {"broca-owner-only"}
+# The shared ChatGPT policy crate is embedded by other gateways and its own guard
+# (crates/cortexkit-chatgpt-policy/tests/dependency_policy.rs) refuses any dependency beyond
+# its JSON, HTTP-date and base64 decoders. A member listed here must declare no Tokio at all;
+# the feature-agreement rule below exists so test builds that do pull Tokio agree, and a
+# Tokio-free member cannot disagree.
+TOKIO_FREE_MEMBERS = {"cortexkit-chatgpt-policy", "broca-owner-only"}
 
 
 def cargo_output(*args):

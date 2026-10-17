@@ -1244,7 +1244,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
     }
     ProviderError {
         refusal: None,
-        class: response_error_class(code),
+        class: response_error_class(event, code),
         message,
         status: None,
         retry_after_secs: None,
@@ -1264,7 +1264,18 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
     }
 }
 
-fn response_error_class(code: Option<&str>) -> ErrorClass {
+fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
+    // A used-up plan allowance, or a plan without the requested use, cannot be granted by
+    // re-sending, so the shared ChatGPT policy's account-wall and not-included stream classes
+    // end the step. Its rate-limit and overload classes are transient, as the table below
+    // already makes every code it does not list.
+    if matches!(
+        cortexkit_chatgpt_policy::classify_stream_failure(event),
+        cortexkit_chatgpt_policy::Classification::AccountLimitExhausted { .. }
+            | cortexkit_chatgpt_policy::Classification::UsageNotIncluded
+    ) {
+        return ErrorClass::Permanent;
+    }
     match code {
         Some("context_length_exceeded" | "context_window_exceeded") => ErrorClass::ContextOverflow,
         Some(
@@ -1273,12 +1284,10 @@ fn response_error_class(code: Option<&str>) -> ErrorClass {
             | "credit_balance_exhausted"
             | "organization_spend_limit_exceeded"
             | "project_spend_limit_exceeded"
-            | "usage_not_included"
             | "invalid_prompt"
             | "cyber_policy"
             | "bio_policy"
-            | "misalignment_policy_violation"
-            | "usage_limit_reached",
+            | "misalignment_policy_violation",
         ) => ErrorClass::Permanent,
         // The Responses backend uses unknown codes for transient failures. Model requests
         // have no side effects, so only codes known to mean the request cannot succeed as
