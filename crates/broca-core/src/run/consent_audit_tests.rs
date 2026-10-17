@@ -991,7 +991,7 @@ impl broca_wal::Wal for IntentSyncWal {
                 .cv
                 .wait_timeout_while(
                     self.gate.released.lock().unwrap(),
-                    broca_test_support::EVENT_HANG_GUARD,
+                    std::time::Duration::from_secs(10),
                     |released| !*released,
                 )
                 .unwrap();
