@@ -127,7 +127,9 @@ jobs:
       - name: Install pinned mutation runner
         id: install-mutator
         if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+        # --force: the Rust cache restores ~/.cargo/bin, so an older ckdev-mutate.exe can already
+        # sit there without cargo's install record, and cargo then refuses to overwrite it.
+        run: cargo install --force --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
       - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         if: steps.mutate-cache.outputs.cache-hit != 'true'
         with:

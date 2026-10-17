@@ -197,7 +197,12 @@ async fn send(
     shape: &str,
     request: HttpRequest,
 ) -> Result<Answer, Box<dyn std::error::Error>> {
-    let mut builder = client.post(&request.url).timeout(Duration::from_secs(180));
+    // The identity client sends no accept-encoding, so the response is read as Anthropic
+    // wrote it, as the probe recorded before request gzip existed.
+    let mut builder = client
+        .without_response_decoding()
+        .post(&request.url)
+        .timeout(Duration::from_secs(180));
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }

@@ -2764,6 +2764,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // thinking blocks dropped because an earlier part of the conversation changed). Present
         // at zero so a daemon that stopped counting cannot pass for a healthy one.
         "input_transformations",
+        // Attempts sent without asking the provider for that report (every Claude Code persona
+        // request), so their missing report means "not measured" rather than zero. Present at
+        // zero, so the pair can tell "nothing transformed" from "nothing asked".
+        "input_transformations_unmeasured_attempts",
         // How each new run's provider account was chosen and how its reports to routing
         // fared. Null, not an empty object, in a process that asks routing nothing (no vault
         // credential source, as here); its counters are read through a real daemon in
@@ -2816,6 +2820,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     // Zero is the healthy reading: this rig's provider reports no transformations, and any
     // other number means some request was not an append-only extension of the one before.
     assert_eq!(metrics["input_transformations"], serde_json::json!(0));
+    assert_eq!(
+        metrics["input_transformations_unmeasured_attempts"],
+        serde_json::json!(0)
+    );
     assert_eq!(metrics["account_selection"], serde_json::Value::Null);
     // Zero on a healthy daemon: any other number is a retained session kept past its expiry.
     // The count belongs to this registry's retention service, so other tests cannot raise it.

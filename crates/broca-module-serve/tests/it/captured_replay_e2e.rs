@@ -991,12 +991,41 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
         varied["output_config"],
         serde_json::json!({"effort": "high"})
     );
-    // Apart from those two fields the requests are the same bytes.
+    // The two sends are different sessions on a Claude subscription route, so each carries its
+    // own Claude Code session id, prompt id and body signature. Those must differ; everything
+    // else in the persona must not.
+    let persona = |body: &serde_json::Value| {
+        let billing = body["system"][0]["text"]
+            .as_str()
+            .expect("the billing block leads the system prompt")
+            .to_owned();
+        let user: serde_json::Value = serde_json::from_str(
+            body["metadata"]["user_id"]
+                .as_str()
+                .expect("metadata.user_id is a JSON string"),
+        )
+        .expect("metadata.user_id parses");
+        let version = billing
+            .split("; ")
+            .find(|field| field.starts_with("x-anthropic-billing-header: cc_version="))
+            .expect("the billing block names its version")
+            .to_owned();
+        (version, user["device_id"].clone())
+    };
+    assert_eq!(
+        persona(varied),
+        persona(plain),
+        "both sessions claim the same Claude Code version and device"
+    );
+    // Apart from the variant's two fields and those per-session values, the requests are the
+    // same bytes.
     let strip = |body: &serde_json::Value| {
         let mut body = body.clone();
         let object = body.as_object_mut().unwrap();
         object.remove("thinking");
         object.remove("output_config");
+        object.remove("metadata");
+        object["system"].as_array_mut().unwrap().remove(0);
         serde_json::to_string(&body).unwrap()
     };
     assert_eq!(strip(varied), strip(plain));
