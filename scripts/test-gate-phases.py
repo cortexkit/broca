@@ -77,6 +77,9 @@ class GatePhases(unittest.TestCase):
         self.repo = self.parent / "broca"
         scripts = self.repo / "scripts"
         scripts.mkdir(parents=True)
+        library = scripts / "lib"
+        library.mkdir()
+        shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
         for name in ("gate.sh", "rust-test-gate.sh", "rust-test-prewarm.sh"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         # These independent dependency gates are not the behavior under test.
@@ -177,6 +180,9 @@ class RustGateFailures(unittest.TestCase):
         self.root = Path(self.tmp.name)
         scripts = self.root / "scripts"
         scripts.mkdir()
+        library = scripts / "lib"
+        library.mkdir()
+        shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
         shutil.copy2(ROOT / "scripts/rust-test-gate.sh", scripts)
         self.bins = self.root / "bin"
         self.bins.mkdir()
@@ -235,23 +241,22 @@ elif "--list" in args:
         self.assertIn("skipped (0 doctests)", result.stdout)
 
     def test_deadline_kills_descendant_not_only_direct_child(self):
-        source = (ROOT / "scripts/rust-test-gate.sh").read_text()
-        start = source.index("run_with_deadline() {")
-        body = source[start:source.index("\n}\n", start) + 3]
         pid_file = self.root / "descendant"
         child = self.root / "child.py"
-        child.write_text('''import pathlib, subprocess, sys
+        child.write_text('''import pathlib, subprocess, sys, time
 p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 pathlib.Path(sys.argv[1]).write_text(str(p.pid))
-p.wait()
+time.sleep(30)
 ''')
         result = subprocess.run(
-            ["bash", "-c", body + '\nrun_with_deadline 1 "$python_bin" "$1" "$2"',
-             "fixture", str(child), str(pid_file)],
-            env={**self.env, "python_bin": sys.executable},
+            [sys.executable, str(self.root / "scripts/lib/cargo-watchdog.py"),
+             "--step", "deadline fixture", "--deadline-seconds", "0.3", "--",
+             sys.executable, str(child), str(pid_file)],
+            env={**self.env, "BROCA_CARGO_IDLE_TIMEOUT_SECONDS": "5"},
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        self.assertIn("deadline fixture", result.stderr)
         pid = int(pid_file.read_text())
         try:
             time.sleep(0.1)

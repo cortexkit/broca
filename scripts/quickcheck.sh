@@ -38,12 +38,12 @@ set -x
 # Formatting every workspace crate was the largest cost of a warm one-crate
 # check. Format only the selected crates here; their clippy, lib/bin tests and
 # doctests remain below. gate.sh and CI still check whole-workspace formatting.
-cargo fmt "${PKGS[@]}" -- --check || exit $?
-cargo clippy --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} --all-targets -- -D warnings || exit $?
+python3 scripts/lib/cargo-watchdog.py --step "quickcheck cargo fmt for $*" -- cargo fmt "${PKGS[@]}" -- --check || exit $?
+python3 scripts/lib/cargo-watchdog.py --step "quickcheck cargo clippy for $*" -- cargo clippy --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} --all-targets -- -D warnings || exit $?
 # `--lib` and `--doc` make cargo refuse the whole command when any selected package has no
 # library target (ck-import is binary-only), so add those selectors only when at least one
 # named package has a library. `--bins` accepts library-only packages.
-lib_count=$(cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+lib_count=$(python3 scripts/lib/cargo-watchdog.py --step "quickcheck cargo metadata for $*" --discard-stderr -- cargo metadata --no-deps --format-version 1 | python3 -c '
 import json, sys
 wanted = set(sys.argv[1:])
 print(sum(1 for p in json.load(sys.stdin)["packages"]
@@ -61,7 +61,7 @@ LIB=()
 # quickcheck twice -- once for the worker, once for me -- before CI caught it on the release
 # commit. A cargo test --lib against a binary-target test does not fail, it reports success
 # over a set it never selected, which is indistinguishable from a real pass.
-cargo test --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} ${LIB[@]+"${LIB[@]}"} --bins --quiet || exit $?
+python3 scripts/lib/cargo-watchdog.py --step "quickcheck cargo unit and binary tests for $*" -- cargo test --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} ${LIB[@]+"${LIB[@]}"} --bins --quiet || exit $?
 # The doc lane is here rather than deferred to the full gate because rustdoc COMPILES an
 # indented block under a `///` comment as Rust. Our comment convention is to show the
 # tempting wrong form next to the right one, so writing that counter-example on a
@@ -69,7 +69,7 @@ cargo test --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} ${LIB[@]+"${LIB
 # it. The workspace has zero doctests today, so this costs ~7s of rustdoc per crate and
 # catches nothing; it is here for the first `///` counter-example anyone writes.
 if [ "$lib_count" -gt 0 ]; then
-    cargo test --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} --doc --quiet || exit $?
+    python3 scripts/lib/cargo-watchdog.py --step "quickcheck cargo doctests for $*" -- cargo test --locked "${PKGS[@]}" ${FEATURES[@]+"${FEATURES[@]}"} --doc --quiet || exit $?
 fi
 set +x
 echo "==> quickcheck OK: $*"

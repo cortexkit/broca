@@ -2,12 +2,13 @@
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
+WATCHDOG="scripts/lib/cargo-watchdog.py"
 
 # Build every test binary before any phase with a liveness deadline runs.
 # Compile time lands here, visibly, so the test timings/deadlines measure tests
 # rather than a cold build consuming the count guard's entire budget.
 PREWARM_START=$(date +%s)
-cargo test --workspace --lib --bins --tests --no-run "$@" \
+python3 "$WATCHDOG" --step "prewarm cargo test binary build" -- cargo test --workspace --lib --bins --tests --no-run "$@" \
     || { echo "==> prewarm build FAILED"; exit 1; }
 
 # Sign and warm-exec every test executable so the one-time Gatekeeper
@@ -20,7 +21,7 @@ cargo test --workspace --lib --bins --tests --no-run "$@" \
 # phase instead, and the only symptom is phases that take minutes longer for no
 # visible reason. Printing the number turns a silent skip into a readable one.
 WARM_BINS="$(mktemp)"
-cargo test --workspace --lib --bins --tests --no-run "$@" --message-format=json 2>/dev/null \
+python3 "$WATCHDOG" --step "prewarm cargo executable inventory" --discard-stderr -- cargo test --workspace --lib --bins --tests --no-run "$@" --message-format=json \
     | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | sort -u >"$WARM_BINS"
 WARM_COUNT=$(wc -l <"$WARM_BINS" | tr -d ' ')
 if [ "$WARM_COUNT" -eq 0 ]; then

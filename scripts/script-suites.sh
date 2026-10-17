@@ -80,6 +80,7 @@ suites=(
     scripts/test-script-options.py
     # Keep Tokio test clocks dev-only and the live transport stack out of non-live graphs.
     scripts/test-dependency-features.py
+    scripts/test-cargo-watchdog.py
     scripts/tests/test_clock_safety.py
     # Vendored Cingulate consent contract: checksums, pins and broca's mapping.
     crates/broca-subc/tests/fixtures/consent/verify.py

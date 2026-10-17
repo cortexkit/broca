@@ -31,6 +31,7 @@ if [[ -z "$python_bin" ]]; then
   echo "python3 or python is required to count tests for the gate" >&2
   exit 127
 fi
+cargo_watchdog="$repo_root/scripts/lib/cargo-watchdog.py"
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]] && ! command -v cargo-nextest >/dev/null 2>&1; then
   echo "cargo-nextest is required; install it with: cargo install cargo-nextest --locked" >&2
@@ -73,7 +74,11 @@ run_phase() {
   local started=$SECONDS
 
   echo "==> $label"
-  "$@"
+  if [[ "${1:-}" == cargo ]]; then
+    "$python_bin" "$cargo_watchdog" --step "$label" -- "$@"
+  else
+    "$@"
+  fi
   local elapsed=$((SECONDS - started))
   record_phase "$label" "$elapsed"
   echo "    ok (${elapsed}s)"
@@ -105,12 +110,9 @@ print_summary() {
 }
 trap print_summary EXIT
 
-# Hard wall-clock deadline for a command. The counting commands have wedged
-# before (a zero-CPU park under machine-wide build load): the compile finishes,
-# the process never exits, and the gate silently hangs for hours. A parked
-# count is worse than a failed one — kill it and fail loud. The deadline is
-# generous (the lib/bins test phase has already built most dependencies by the
-# time a count runs) and overridable for slow machines.
+# Keep the existing hard deadline for inventory commands alongside the
+# watchdog's no-progress limits; the watchdog owns the Cargo process group for
+# both kinds of timeout.
 count_deadline_secs="${GATE_COUNT_DEADLINE_SECS:-1800}"
 
 # The real-subc e2e arms skip when their sibling binaries are absent, and a skip reports
@@ -121,41 +123,6 @@ count_deadline_secs="${GATE_COUNT_DEADLINE_SECS:-1800}"
 # failure that names itself instead of a silent subtraction from what the gate covers.
 export BROCA_REQUIRE_SUBC=1
 
-run_with_deadline() {
-  local secs="$1"
-  shift
-  # Windows has no os.setsid, and its os.execvp spawns a child and exits instead of replacing
-  # the process, so $! would track a Python that is already gone while cargo keeps running.
-  # There the command runs directly and the deadline kills only that process, as before.
-  local deadline_new_session=0
-  if "$python_bin" -c 'import os, sys; sys.exit(0 if hasattr(os, "setsid") else 1)'; then
-    deadline_new_session=1
-  fi
-  if (( deadline_new_session )); then
-    # A new session gives the command and its descendants a private process group.
-    # Killing only cargo's PID leaves rustc/test children alive after the deadline.
-    "$python_bin" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
-  else
-    "$@" &
-  fi
-  local pid=$!
-  local waited=0
-  while kill -0 "$pid" 2>/dev/null; do
-    if (( waited >= secs )); then
-      if (( deadline_new_session )); then
-        kill -KILL -- "-$pid" 2>/dev/null || true
-      else
-        kill -KILL "$pid" 2>/dev/null || true
-      fi
-      wait "$pid" 2>/dev/null || true
-      echo "gate: command exceeded its ${secs}s liveness deadline (wedged?): $*" >&2
-      return 124
-    fi
-    sleep 5
-    waited=$((waited + 5))
-  done
-  wait "$pid"
-}
 
 count_cargo_integration_tests() {
   local tmp
@@ -163,7 +130,8 @@ count_cargo_integration_tests() {
   # This output is PARSED (the count guard), never displayed — force color off so
   # CI's CARGO_TERM_COLOR=always cannot wrap the `Running` lines in ANSI codes and
   # break the target regex.
-  if ! run_with_deadline "$count_deadline_secs" env CARGO_TERM_COLOR=never cargo test --workspace "${cargo_feature_args[@]}" --tests -- --list >"$tmp" 2>&1; then
+  if ! "$python_bin" "$cargo_watchdog" --step "count cargo integration tests" --deadline-seconds "$count_deadline_secs" -- \
+    env CARGO_TERM_COLOR=never cargo test --workspace "${cargo_feature_args[@]}" --tests -- --list >"$tmp" 2>&1; then
     cat "$tmp" >&2
     rm -f "$tmp"
     return 1
@@ -238,7 +206,8 @@ count_nextest_integration_tests() {
   if [[ -n "$nextest_profile" ]]; then
     cmd+=(-P "$nextest_profile")
   fi
-  if ! run_with_deadline "$count_deadline_secs" "${cmd[@]}" >"$tmp" 2>"$err_tmp"; then
+  if ! "$python_bin" "$cargo_watchdog" --step "count nextest integration tests" --deadline-seconds "$count_deadline_secs" -- \
+    "${cmd[@]}" >"$tmp" 2>"$err_tmp"; then
     cat "$err_tmp" >&2
     rm -f "$tmp" "$err_tmp"
     return 1
@@ -262,7 +231,8 @@ PY
 count_doc_tests() {
   local tmp
   tmp="$(mktemp)"
-  if ! run_with_deadline "$count_deadline_secs" cargo test --workspace "${cargo_feature_args[@]}" --doc -- --list >"$tmp" 2>&1; then
+  if ! "$python_bin" "$cargo_watchdog" --step "count cargo doctests" --deadline-seconds "$count_deadline_secs" -- \
+    cargo test --workspace "${cargo_feature_args[@]}" --doc -- --list >"$tmp" 2>&1; then
     cat "$tmp" >&2
     rm -f "$tmp"
     return 1
@@ -325,7 +295,7 @@ run_integration_phase() {
     return 1
   fi
 
-  cmd=(cargo nextest run --workspace "${cargo_feature_args[@]}" -E "$nextest_filter")
+  cmd=("$python_bin" "$cargo_watchdog" --step "cargo nextest integration tests" -- cargo nextest run --workspace "${cargo_feature_args[@]}" -E "$nextest_filter")
   if [[ -n "$nextest_profile" ]]; then
     cmd+=(-P "$nextest_profile")
   fi

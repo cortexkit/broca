@@ -100,8 +100,9 @@ SUBC_SIBLING="../subconscious"
 if [ -z "${SUBC_CORE_BIN:-}" ] && [ -f "$SUBC_SIBLING/Cargo.toml" ]; then
     SUBC_TARGET="${BROCA_SUBC_TARGET_DIR:-$HOME/.cache/broca-subc-target}"
     echo "==> building the subc rig binaries into $SUBC_TARGET"
-    if ! cargo build --manifest-path "$SUBC_SIBLING/Cargo.toml" --target-dir "$SUBC_TARGET" \
+    if ! python3 scripts/lib/cargo-watchdog.py --step "build subc test rigs" -- cargo build --manifest-path "$SUBC_SIBLING/Cargo.toml" --target-dir "$SUBC_TARGET" \
         -p subc-core --bins >>"$LOG" 2>&1; then
+        grep -E 'cargo watchdog:|gate: command exceeded' "$LOG" >&2 || true
         echo "gate: REFUSING -- could not build ck-subc and fake-aft-stub from $SUBC_SIBLING (see $LOG)" >&2
         exit 2
     fi
@@ -122,8 +123,9 @@ CLAUSTRUM_SIBLING="../claustrum"
 if [ -z "${CK_CLAUSTRUM_BIN:-}" ] && [ -f "$CLAUSTRUM_SIBLING/Cargo.toml" ]; then
     CLAUSTRUM_TARGET="${BROCA_CLAUSTRUM_TARGET_DIR:-$HOME/.cache/broca-claustrum-target}"
     echo "==> building the vault rig binaries into $CLAUSTRUM_TARGET"
-    if ! cargo build --release --manifest-path "$CLAUSTRUM_SIBLING/Cargo.toml" \
+    if ! python3 scripts/lib/cargo-watchdog.py --step "build claustrum test rigs" -- cargo build --release --manifest-path "$CLAUSTRUM_SIBLING/Cargo.toml" \
         --target-dir "$CLAUSTRUM_TARGET" --bin ck-claustrum --bin ck-auth >>"$LOG" 2>&1; then
+        grep -E 'cargo watchdog:|gate: command exceeded' "$LOG" >&2 || true
         echo "gate: REFUSING -- could not build ck-claustrum and ck-auth from $CLAUSTRUM_SIBLING (see $LOG)" >&2
         exit 2
     fi
@@ -165,14 +167,14 @@ fi
 # reached into a sibling repo's working tree and failed this gate on code we do not own.
 gate_fmt_pkgs=()
 while IFS= read -r p; do gate_fmt_pkgs+=(-p "$p"); done < <(
-    cargo metadata --no-deps --format-version 1 2>/dev/null |
+    python3 scripts/lib/cargo-watchdog.py --step "enumerate workspace packages with cargo metadata" --discard-stderr -- cargo metadata --no-deps --format-version 1 |
         python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"]]'
 )
 if [ ${#gate_fmt_pkgs[@]} -eq 0 ]; then
     echo "gate: REFUSING -- could not enumerate workspace packages for fmt." >&2
     exit 2
 fi
-if ! cargo fmt "${gate_fmt_pkgs[@]}" -- --check; then
+if ! python3 scripts/lib/cargo-watchdog.py --step "workspace cargo fmt check" -- cargo fmt "${gate_fmt_pkgs[@]}" -- --check; then
     echo "==> formatting failed; skipping the prewarm (it cannot affect this result)" >&2
     exit 1
 fi

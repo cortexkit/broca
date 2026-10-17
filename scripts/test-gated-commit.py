@@ -90,6 +90,9 @@ class QuickcheckSelection(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / "scripts").mkdir()
         shutil.copy2(ROOT / "scripts/quickcheck.sh", self.root / "scripts")
+        library = self.root / "scripts/lib"
+        library.mkdir()
+        shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
         bins = self.root / ".cargo/bin"
         bins.mkdir(parents=True)
         self.events = self.root / "events"
