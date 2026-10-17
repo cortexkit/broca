@@ -2179,10 +2179,13 @@ async fn real_daemon_model_view_refuses_a_group_that_cannot_fit_one_frame() {
     assert_eq!(refusal["code"], broca_wire::REPLY_TOO_LARGE);
     assert!(refusal["detail"]["bytes"].as_u64().unwrap() > broca_wire::SUBC_MAX_FRAME_BYTES);
     assert_eq!(refusal["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
-    assert_eq!(refusal["detail"]["atomic_group"]["kind"], "replacement");
-    assert_eq!(refusal["detail"]["atomic_group"]["from_ordinal"], 0);
-    assert_eq!(refusal["detail"]["atomic_group"]["to_ordinal"], 1);
-    assert!(refusal["detail"]["atomic_group"]["session"].is_string());
+    // llm-runner 0.2.3's typed detail: the subject names the model-view group by its source.
+    let subject = &refusal["detail"]["subject"];
+    assert_eq!(subject["kind"], "model_group");
+    assert_eq!(subject["source"]["kind"], "replacement");
+    assert_eq!(subject["source"]["from_ordinal"], 0);
+    assert_eq!(subject["source"]["to_ordinal"], 1);
+    assert!(subject["source"]["compaction_id"].is_string());
 }
 
 /// The module a compaction-admission test names as the plan's compaction provider.
