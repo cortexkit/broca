@@ -46,6 +46,9 @@ use broca_protocol::{
 use broca_wal::WalRecord;
 use tokio::sync::{mpsc, Notify};
 
+#[path = "it/boundary_cancel.rs"]
+mod boundary_cancel;
+
 // ---------------------------------------------------------------------------------------------
 // The scripted provider and tool plane.
 // ---------------------------------------------------------------------------------------------

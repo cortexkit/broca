@@ -12,6 +12,28 @@
 
 use super::*;
 
+/// Cancellation must not change the bytes or reader requirements of existing boundaries.
+#[test]
+fn pre_cancel_at_boundaries_keep_their_bytes_and_frame_requirements() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+
+    for pinned in [
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"tool_batch_finished","batch_id":"r-b1"}"#,
+        r#"{"type":"turn_finished","step_id":1}"#,
+        r#"{"type":"run_paused","run_id":"r","reason":"auth_required"}"#,
+        r#"{"type":"run_finished","reason":"cancelled","usage":{},"retries_used":0}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty());
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
 #[test]
 fn attempt_bytes_before_content_progress_stay_identical() {
     let pinned = include_str!("../../tests/fixtures/model_attempt_before_progress.json").trim_end();
@@ -52,6 +74,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::TurnFinished { .. } => "turn_finished",
         WalRecord::BudgetFired { .. } => "budget_fired",
         WalRecord::RunFinished { .. } => "run_finished",
+        WalRecord::RunCancelRequested { .. } => "run_cancel_requested",
         WalRecord::RunPaused { .. } => "run_paused",
         WalRecord::RunConfigRefrozen { .. } => "run_config_refrozen",
         WalRecord::RunAuthRefrozen { .. } => "run_auth_refrozen",
@@ -155,6 +178,47 @@ const DEFERRED_CALL_PINNED: &[&str] = &[
     r#"{"type":"question_withdrawal_acknowledged","call_key":"lineage:7","answer":"not_sent","reason":"expired"}"#,
 ];
 
+const CANCEL_AT_PINNED: &[&str] = &[
+    r#"{"type":"run_cancel_requested","run_id":"r","at":"step_boundary"}"#,
+    r#"{"type":"run_cancel_requested","run_id":"r","at":"now"}"#,
+];
+
+#[test]
+fn cancellation_records_are_must_understand_and_round_trip() {
+    use crate::framing::{decode_next, encode, DecodeStep, RUN_CANCEL_AT_FEATURE};
+    for bytes in CANCEL_AT_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+        assert_eq!(record.required_features(), &[RUN_CANCEL_AT_FEATURE]);
+        let frame = encode(7, 3, &record).unwrap();
+        let DecodeStep::Record { framed, .. } = decode_next(&frame) else {
+            panic!("reader must know cancel-at")
+        };
+        assert_eq!(framed.record, record);
+        if bytes.contains("step_boundary") {
+            if let Some(path) = std::env::var_os("BROCA_CANCEL_AT_WAL_FIXTURE") {
+                let start: WalRecord = serde_json::from_str(r#"{"type":"run_started","run_id":"r","session":{"project_root":"/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}}"#).unwrap();
+                let mut affected = encode(1, 3, &start).unwrap();
+                affected
+                    .extend(encode(2, 3, &WalRecord::StepStarted { step_id: StepId(1) }).unwrap());
+                let mut plain = affected.clone();
+                affected.extend(encode(3, 3, &record).unwrap());
+                std::fs::write(&path, affected).unwrap();
+                let step: WalRecord = serde_json::from_str(r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"text","text":"done"}]},"usage":{},"retries_used":0}"#).unwrap();
+                plain.extend(encode(3, 3, &step).unwrap());
+                let terminal: WalRecord = serde_json::from_str(
+                    r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
+                )
+                .unwrap();
+                plain.extend(encode(4, 3, &terminal).unwrap());
+                let mut plain_path = path;
+                plain_path.push(".plain");
+                std::fs::write(plain_path, plain).unwrap();
+            }
+        }
+    }
+}
+
 /// The pre-compaction byte pins stay separate from new record fixtures. In addition to the
 /// record JSON, pin the feature envelope: changing it would make a rollback read different
 /// bytes or refuse a session it previously understood.
@@ -202,7 +266,11 @@ fn pre_compaction_records_keep_their_bytes_and_frame_requirements() {
 
 #[test]
 fn every_record_kind_keeps_its_pinned_bytes() {
-    for pinned in PINNED.iter().chain(DEFERRED_CALL_PINNED) {
+    for pinned in PINNED
+        .iter()
+        .chain(DEFERRED_CALL_PINNED)
+        .chain(CANCEL_AT_PINNED)
+    {
         let decoded: WalRecord = serde_json::from_str(pinned)
             .unwrap_or_else(|error| panic!("pinned record must decode: {error}\n{pinned}"));
         assert_ne!(
@@ -253,6 +321,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .copied()
         .chain(include_str!("../../tests/fixtures/compaction_records.jsonl").lines())
         .chain(DEFERRED_CALL_PINNED.iter().copied())
+        .chain(CANCEL_AT_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -272,6 +341,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "turn_finished",
         "budget_fired",
         "run_finished",
+        "run_cancel_requested",
         "run_paused",
         "run_config_refrozen",
         "run_auth_refrozen",

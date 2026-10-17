@@ -136,7 +136,7 @@ session.send { session, prompt, system?, send_id?, cache?, model?, tool_provider
 session.retract { session, submission_id }
     → { retracted: true } | { retracted: false, reason: "already_started" } (§11)
 
-run.cancel { run_id } → { ack } (cooperative → Interrupted; §13)
+run.cancel { run_id, at?: "now" | "step_boundary" } → "ack" | "not_active" (§13)
 run.status { run_id | session }
     → { state, run_id?, step?, last_error?, head: cursor, title? } (state enum §14)
 ```
@@ -696,12 +696,32 @@ not compare that stamp with an authority or reject an append solely because it i
 
 ## 13. Cancel token + provider watchdog (core change)
 
-Add a **`CancellationToken`** into `run_loop_with_store`, checked at turn boundaries and
-around dispatch → `Interrupted` → `RunFinished{Interrupted}` at a safe WAL boundary
-(cooperative; the durability core's fail-to-doctor — never a false `Cancelled`). Add a
-**per-run provider-call timeout/watchdog** (today the model-stream await is unbounded and
-pins the lease until process death; the tool path already has a 10s timeout) that
-cooperatively cancels at a safe boundary, releasing the lease.
+`run.cancel` is owner-only. Omitted `at` (or `at: "now"`) retains immediate cancellation:
+the model stream is cancelled and sent tool calls retain the existing at-most-once recovery
+rules. `at: "step_boundary"` finishes the in-flight model step and its entire tool batch,
+records the results, and writes no further `StepStarted` before `RunFinished{Cancelled}`.
+Discovery advertises `run_cancel.at: ["now", "step_boundary"]` under the existing `run_cancel`
+capability group. An unlisted or non-string `at` is refused as `invalid_params` naming `at`,
+with no writes. Both modes answer the JSON string `"ack"` or `"not_active"`.
+
+A boundary request is durable (`RunCancelRequested`, requiring `run-cancel-at/v1`) before
+`"ack"`. Duplicate boundary requests are idempotent; a later immediate request durably
+escalates it. Recovery never repeats a sent call or starts another model step: it completes
+recorded tool work using the existing dispatch evidence, or repairs ambiguous calls with
+their unknown-outcome results. A model response lost in a crash is not regenerated. A terminal
+the current step reaches first, including `completed`, `max_steps` or `error`, still wins.
+Readers predating this feature refuse affected WALs by name; ordinary sessions keep their
+existing bytes and remain readable on rollback.
+
+A paused run is already at a boundary and is cancelled without another model step. A queued
+submission is not an active run: cancellation answers `"not_active"`; use `session.retract`
+to remove it. An active tool batch awaiting human approval still owns that wait, so boundary
+cancellation waits for the decision/expiry and the batch's results; an immediate cancellation
+can end the wait. A compaction wait before model I/O is already a safe boundary: cancellation
+records the wait's `cancel` exit and seals `Cancelled` without recalling compaction or the model.
+
+The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
+ends `Interrupted`, not `Cancelled`, and releases the lease.
 
 ## 14. run.status enum + durable run index + busy-vs-stale
 
@@ -971,7 +991,7 @@ module-side. The §21 changes are **broca-core/WAL/store**, not subc-core.
   preserve prior episodes and never let an episode terminal seal the lineage.
 - Queue retract/consume races must remain unambiguous across crashes; durable
   cursors must remain continuous across reopening; authentication continuation
-  retains the run_id; cancellation seals Interrupted.
+  retains the run_id; cancellation seals Cancelled.
 - Module tests cover actor admission, fan-out backpressure, the attach barrier,
   durable run indexing, and tool-route lifecycle.
 - End-to-end tests cover multiple clients, reopening, multiple turns, terminal

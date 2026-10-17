@@ -350,6 +350,8 @@ pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastEpisodeV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_at: Option<broca_wal::record::RunCancelAt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_restart: Option<broca_protocol::request::OnRestart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<broca_protocol::PauseReason>,
@@ -679,6 +681,7 @@ impl AdmissionCheckpointV1 {
                     history.observe(&config.frozen_render_config);
                 }
                 self.last_episode = Some(LastEpisodeV1 {
+                    cancel_at: None,
                     on_restart: *on_restart,
                     pause_reason: None,
                     keep_warm: *keep_warm,
@@ -729,6 +732,15 @@ impl AdmissionCheckpointV1 {
             WalRecord::RunAuthRefrozen { auth_selection, .. } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.config.auth_selection = Some(auth_selection.clone());
+                }
+            }
+            WalRecord::RunCancelRequested { run_id, at } => {
+                if let Some(episode) = self.last_episode.as_mut().filter(|ep| {
+                    ep.run_id == *run_id
+                        && ep.disposition != EpisodeDisposition::Finished
+                        && ep.cancel_at != Some(broca_wal::record::RunCancelAt::Now)
+                }) {
+                    episode.cancel_at = Some(*at);
                 }
             }
             WalRecord::StepStarted { .. } => {

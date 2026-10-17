@@ -248,7 +248,8 @@ pub fn broca_role_describe_with_writers(
     // a turn that ends first leaves it in the transcript for the next episode. So a steer's
     // `delivered` receipt is either absent (not rendered yet) or final, never `pending` or
     // `unknown`.
-    .with_steer_receipt(steer_receipt::GUARANTEED);
+    .with_steer_receipt(steer_receipt::GUARANTEED)
+    .with_run_cancel(vec!["now".into(), "step_boundary".into()]);
     if retention_writer {
         describe.retention = Some(cortexkit_role_llm_runner::describe::Retention::new(
             2_592_000, 3_600_000,
@@ -668,7 +669,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "174f2b7bef5dafb296dda13202fe970dbeef26d36596daffd08eeb1b1cb50c65",
+            "1e6cdf72edbbccc8195f25bf136182f51c7fe7bdebf3f5c9b84fa0194aaee959",
         );
     }
 
@@ -825,7 +826,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "8b8bf812761e5d7aa43c16e34d93b79f08a262b326e45a54cb548f9b432f7464";
+        "dea8bf14fafb0424aeb581d476d529f020dc5c19dc9a0e086135f1130b94778b";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

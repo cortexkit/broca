@@ -91,6 +91,7 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     /// Run metadata beside the prompt, never part of model input or WAL message bytes.
     pub message_runs: Vec<Option<RunAttribution>>,
     /// Last transcript position produced by each run whose RunFinished is durable. Positions
@@ -1248,6 +1249,7 @@ fn replay_seeded_with_compaction<'a>(
     let mut on_restart = None;
     let mut marker_order_version = None;
     let mut run_id = seed_run_id;
+    let mut cancel_at = None;
     let mut seeded_budget = seed_budget;
     // A tail can begin after the current episode's RunStarted. Only a RunStarted observed in
     // this walk may require a durable terminal before another episode opens.
@@ -1352,6 +1354,7 @@ fn replay_seeded_with_compaction<'a>(
                 on_restart = *on_restart_policy;
                 run_config = Some((**config).clone());
                 run_id = Some(rid.clone());
+                cancel_at = None;
                 seeded_budget = None;
                 saw_run_started = true;
                 render_episodes.push(broca_protocol::request::EpisodeRenderInput {
@@ -1566,6 +1569,17 @@ fn replay_seeded_with_compaction<'a>(
                         ep.open_step = None;
                         ep.open_batch_id = None;
                     }
+                }
+            }
+            WalRecord::RunCancelRequested {
+                run_id: cancelled_run,
+                at,
+            } => {
+                if run_id.as_ref() == Some(cancelled_run)
+                    && ep.finished.is_none()
+                    && cancel_at != Some(broca_wal::record::RunCancelAt::Now)
+                {
+                    cancel_at = Some(*at);
                 }
             }
             WalRecord::TurnFinished { .. } => {}
@@ -1878,6 +1892,7 @@ fn replay_seeded_with_compaction<'a>(
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
     Ok(ReplayState {
+        cancel_at,
         message_runs,
         run_finals,
         compaction,
@@ -2545,6 +2560,7 @@ mod projection_boundary_tests {
                 ownership: Some(crate::SessionOwnershipV1::default()),
                 at_seq: 8,
                 last_episode: Some(crate::LastEpisodeV1 {
+                    cancel_at: None,
                     on_restart: None,
                     pause_reason: None,
                     keep_warm: None,

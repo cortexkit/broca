@@ -465,10 +465,10 @@ pub struct RunControl {
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
-    /// Cancel signal. When tripped, the loop stops COOPERATIVELY at the next safe WAL
-    /// boundary (a turn boundary, where there is no pending tool_use to strand) and
-    /// finishes the run `Cancelled`. `None` ⇒ never cancelled. A `CancellationToken`
-    /// (not a bare flag) so a future coordinator can `select!` on its `cancelled()`.
+    /// Immediate cancellation: abort the model stream and stop dispatch, closing the batch
+    /// under the existing at-most-once rules before finishing `Cancelled`. `None` disables
+    /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
+    /// forbid the next StepStarted without aborting this step's model or tool work.
     pub cancel: Option<CancellationToken>,
     /// Per-model-call timeout (the provider watchdog). The model-stream await is
     /// otherwise unbounded and would pin the lease until process death; on timeout the
@@ -1614,6 +1614,7 @@ where
         .and_then(|first| first.manifest.clone());
     prior.marker_order_version = episode.and_then(|episode| episode.marker_order_version);
     prior.keep_warm = episode.and_then(|episode| episode.keep_warm);
+    prior.cancel_at = episode.and_then(|episode| episode.cancel_at);
     if let Some(compaction) = &snapshot.checkpoint_at_head.compaction {
         prior.compaction = compaction.clone();
         if let Some(state) = compaction.state() {
@@ -2899,6 +2900,12 @@ where
                     .as_ref()
                     .expect("compaction item owns replies"),
             });
+    let recovered_cancel = is_resume && !append_episode && prior.cancel_at.is_some();
+    if recovered_cancel {
+        if let Some(inbox) = &control.steer {
+            inbox.restore_boundary_cancel();
+        }
+    }
     // Replay can infer that a no-tool final step or committed hard stop ended the episode even
     // when a crash lost its RunFinished. That inferred LineageIdle is correct for reads, but it is
     // not a durable seal: the append invariant requires a synced RunFinished before RunStarted.
@@ -3156,6 +3163,48 @@ where
                     crate::resume::DeferredCloseKind::WithdrawElicitation,
                 )
         });
+        // A crash cannot undo an acknowledged cancel. Repair sent calls without dispatching
+        // again; only a durable pending tool turn may finish before a boundary cancellation.
+        if recovered_cancel
+            && !prior.run_finished_durable
+            && (prior.cancel_at == Some(broca_wal::record::RunCancelAt::Now)
+                || !matches!(
+                    &prior.resolution,
+                    ReplayResolution::Resume { pending: Some(pending) }
+                        if pending.deferred.is_empty() && pending.approved.is_empty()
+                ))
+        {
+            writer.record(resume_sealing);
+            for record in &close_out {
+                writer.record(record.clone());
+            }
+            writer.sync().await?;
+            if let Some(history) = &approval_history {
+                approval_gate::report_close_out(history, &close_out, &req.session, control).await;
+            }
+            let reason = match &prior.resolution {
+                ReplayResolution::LineageIdle { last_reason } => *last_reason,
+                _ => RunFinishReason::Cancelled,
+            };
+            control.close_steers();
+            let (summary, seq) = finish_run(
+                writer,
+                control,
+                out,
+                &resolved_run_id,
+                reason,
+                prior.completed_steps,
+                prior.usage,
+                prior.retries_used,
+                None,
+                prior_last_step_finish_reason,
+            )
+            .await?;
+            if let Some(projector) = projector {
+                projector.enqueue_terminal(seq);
+            }
+            return Ok(summary);
+        }
         let prepared_open = prior.open_tool_batch.as_ref().is_some_and(|batch| {
             batch.calls.iter().any(|(_, state)| {
                 matches!(
@@ -3874,7 +3923,7 @@ where
         // Cancellation is observed only after any firing implied by the durable preceding
         // turn is itself durable and visible. This prevents a cancel race from creating a
         // live-only budget message or suppressing a message replay must reconstruct.
-        if is_cancelled(control) {
+        if is_cancelled(control) || boundary_cancelled(control) || recovered_cancel {
             break RunFinishReason::Cancelled;
         }
         // A stop request ends the run here, before this step writes anything: no `StepStarted`,
@@ -3916,9 +3965,12 @@ where
         // The inbox's lock makes "which steers are before this StepStarted" the same question
         // for the WAL and for this prompt (see `crate::steer`).
         let mut steered = match &control.steer {
-            Some(inbox) => inbox.take_at_step(|| {
+            Some(inbox) => match inbox.try_take_at_step(|| {
                 writer.record(WalRecord::StepStarted { step_id });
-            }),
+            }) {
+                Some(steered) => steered,
+                None => break RunFinishReason::Cancelled,
+            },
             None => {
                 writer.record(WalRecord::StepStarted { step_id });
                 Vec::new()
@@ -4114,6 +4166,9 @@ where
             replayed_compaction_answer = false;
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
+        if boundary_cancelled(control) && compaction_runtime.is_some() {
+            break RunFinishReason::Cancelled;
+        }
 
         // Run the model step, draining the normalized stream, under the optional
         // provider-call watchdog. A timeout means the model stream didn't terminate in time:
@@ -5114,7 +5169,7 @@ async fn pause_run_impl(
     // Cancellation wins until the pause itself is durable. This closes the admission-to-pause
     // race where the actor has acknowledged the run, receives cancel, and the provider then
     // reports an auth failure: seal the episode instead of publishing a pause nobody can abandon.
-    if is_cancelled(control) {
+    if is_cancelled(control) || boundary_cancelled(control) {
         if let Some((calls, ctx)) = open {
             approval_gate::close_open(calls, ctx, writer).await?;
             approval_gate::report_open(calls, ctx, control).await;
@@ -5604,6 +5659,13 @@ enum StepOutcome {
 /// Whether the run's cancel token (if any) has been tripped.
 fn is_cancelled(control: &RunControl) -> bool {
     control.cancel.as_ref().is_some_and(|t| t.is_cancelled())
+}
+
+fn boundary_cancelled(control: &RunControl) -> bool {
+    control
+        .steer
+        .as_ref()
+        .is_some_and(|inbox| inbox.boundary_cancel().is_cancelled())
 }
 
 /// Whether the module has asked the run to stop (see [`RunControl::stop_requested`]).
@@ -7163,6 +7225,9 @@ async fn send(out: &mpsc::Sender<OutputEvent>, ev: OutputEvent) -> bool {
     out.send(ev).await.is_ok()
 }
 
+#[cfg(test)]
+#[path = "run/boundary_cancel_tests.rs"]
+mod boundary_cancel_tests;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
 use hook_dispatch::{
@@ -8543,6 +8608,7 @@ mod tests {
                 ownership: Some(crate::SessionOwnershipV1::default()),
                 at_seq: 8,
                 last_episode: Some(crate::LastEpisodeV1 {
+                    cancel_at: None,
                     on_restart: None,
                     pause_reason: None,
                     keep_warm: None,

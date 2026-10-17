@@ -2416,6 +2416,22 @@ where
             }
         }
         OP_CANCEL => {
+            if req
+                .params
+                .get("at")
+                .is_some_and(|at| !matches!(at.as_str(), Some("now" | "step_boundary")))
+            {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("at".into()),
+                    "run.cancel.at must be now or step_boundary",
+                )
+                .await;
+            }
             let params: CancelParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2431,8 +2447,24 @@ where
                     .await
                 }
             };
+            let at = match params.at.as_deref() {
+                None | Some("now") => broca_wal::record::RunCancelAt::Now,
+                Some("step_boundary") => broca_wal::record::RunCancelAt::StepBoundary,
+                _ => {
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        Some("at".into()),
+                        "run.cancel.at is not a supported cancellation point",
+                    )
+                    .await
+                }
+            };
             match handler
-                .cancel(&session, broca_protocol::RunId(params.run_id))
+                .cancel_at(&session, broca_protocol::RunId(params.run_id), at)
                 .await
             {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,

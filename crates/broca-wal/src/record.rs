@@ -516,6 +516,13 @@ pub enum WalRecord {
         #[serde(default)]
         retries_used: u32,
     },
+    /// An accepted cancellation, synced before its acknowledgement. This record does not seal
+    /// the episode: recovery still repairs the current tool batch using its dispatch evidence.
+    /// Older readers must refuse the feature rather than start a model step after cancellation.
+    RunCancelRequested {
+        run_id: RunId,
+        at: RunCancelAt,
+    },
     /// Episode PAUSE — a NON-terminal durable record (distinct from `RunFinished`).
     /// Written when a run cannot proceed but is RESUMABLE: a mid-run auth failure
     /// (`needs_reauth`/revoke) pauses the episode rather than ending it, so replay
@@ -1031,6 +1038,7 @@ impl WalRecord {
             STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
         };
         match self {
+            WalRecord::RunCancelRequested { .. } => &[crate::framing::RUN_CANCEL_AT_FEATURE],
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionAnswer { .. } => &[crate::framing::COMPACTION_FEATURE],
@@ -1218,6 +1226,15 @@ impl WalRecord {
             _ => &[],
         }
     }
+}
+
+/// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings
+/// before writing, rather than interpreting an unknown point as immediate cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunCancelAt {
+    Now,
+    StepBoundary,
 }
 
 // `WalRecord::required_features` returns sorted static slices without allocation. Records

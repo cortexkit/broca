@@ -784,6 +784,7 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         | WalRecord::BudgetFired { .. }
         | WalRecord::RunFinished { .. }
         | WalRecord::RunPaused { .. }
+        | WalRecord::RunCancelRequested { .. }
         | WalRecord::Queued { .. }
         | WalRecord::Steered { .. }
         | WalRecord::Retracted { .. }

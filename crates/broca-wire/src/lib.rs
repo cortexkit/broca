@@ -469,6 +469,8 @@ pub struct RetractParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelParams {
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
 }
 
 /// `run.status` params. An absent `run_id` selects session status; a present value selects one
