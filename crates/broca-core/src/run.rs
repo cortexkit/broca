@@ -2143,6 +2143,7 @@ fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Optio
     };
 
     Some(ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
         message: message.into(),
@@ -6259,6 +6260,7 @@ async fn run_step<P: Provider>(
         _ => StepOutcome::Failed {
             retries_used: 0,
             error: ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::ProviderUnavailable,
                 message: "provider stream ended without an assembled assistant message and Finished control"
@@ -7811,6 +7813,7 @@ mod tests {
     #[test]
     fn stamp_credential_names_the_credential_only_on_credential_scoped_errors() {
         let error = |class, status: Option<u16>, code: Option<&str>| ProviderError {
+            provider_subcode: None,
             refusal: None,
             class,
             message: "m".into(),
@@ -7995,6 +7998,7 @@ mod tests {
     fn failed_step() -> Result<StepOutcome, RunFinishReason> {
         Ok(StepOutcome::Failed {
             error: ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::ProviderUnavailable,
                 message: "provider stream ended without an assembled assistant message and Finished control".into(),

@@ -22,6 +22,7 @@ pub mod policy;
 pub mod reasoning;
 pub mod registry;
 pub mod request_dump;
+mod request_invalid;
 mod safe_provider_code;
 pub mod service_tier;
 pub mod spec;
@@ -41,6 +42,7 @@ pub mod transport;
 
 pub use broca_protocol::provider::NormalizedEvent;
 pub use normalize::{AnthropicNormalizer, NormalizeError};
+pub use request_invalid::safe_provider_subcode;
 pub use safe_provider_code::safe_provider_code;
 
 #[cfg(feature = "live")]

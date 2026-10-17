@@ -720,8 +720,11 @@ impl GeminiNormalizer {
             // Error envelopes are terminal even when HTTP succeeded; EOF must not replace
             // the provider's diagnosis with a generic stream-truncation error.
             self.emitted_final = true;
-            out.push(NormalizedEvent::Control(ProviderControl::Error {
-                error: broca_protocol::ProviderError {
+            // An in-band envelope states its HTTP status in `code`, so a 400 INVALID_ARGUMENT
+            // here is the same request-validation refusal as one sent as an HTTP 400.
+            let error = crate::request_invalid::classify_request_invalid(
+                broca_protocol::ProviderError {
+                    provider_subcode: None,
                     class,
                     message: message.to_owned(),
                     status,
@@ -734,6 +737,10 @@ impl GeminiNormalizer {
                     credential_id: None,
                     refusal: None,
                 },
+                Some(error),
+            );
+            out.push(NormalizedEvent::Control(ProviderControl::Error {
+                error,
                 retries_used: 0,
             }));
             return Ok(());

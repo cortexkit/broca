@@ -93,6 +93,7 @@ fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 fn auth_error_step() -> Vec<NormalizedEvent> {
     vec![NormalizedEvent::Control(ProviderControl::Error {
         error: ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
             message: "expired".into(),

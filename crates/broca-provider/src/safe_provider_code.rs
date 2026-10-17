@@ -28,6 +28,7 @@ pub fn safe_provider_code(code: &str) -> bool {
             | "output_ceiling"
             | "previous_process_ended_unsealed"
             | "websocket_auth_rejected"
+            | "request_invalid"
     )
 }
 
@@ -55,6 +56,7 @@ mod tests {
             "output_ceiling",
             "previous_process_ended_unsealed",
             "websocket_auth_rejected",
+            "request_invalid",
         ] {
             assert!(safe_provider_code(code), "known safe code rejected: {code}");
         }

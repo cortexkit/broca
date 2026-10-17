@@ -244,8 +244,14 @@ the next one). Synced before the caller sees the terminal.
 
 `ProviderError`: `class` (`transient`, `permanent`, `auth_required` (older records may say
 `auth`), `context_overflow`, `provider_unavailable`), `message`, and absent-when-unset
-`status` (u16), `retry_after_secs` (float), `provider_code`, `resets_at_ms` (u64),
-`limit_window`, `account_ref`, `credential_id`.
+`status` (u16), `retry_after_secs` (float), `provider_code`, `provider_subcode`, `resets_at_ms`
+(u64), `limit_window`, `account_ref`, `credential_id`.
+
+`provider_code: "request_invalid"` marks a provider's HTTP 400 that rejected the request itself
+(`invalid_request_error`, or Google's `INVALID_ARGUMENT`) when no more specific code applies;
+class `permanent`, never re-sent. `provider_subcode` carries the provider's own short code
+beneath it (for example `invalid_json_schema`), only when it matches `[a-z0-9_]{1,64}`; it is
+an open, diagnostic-only vocabulary and is absent on every other error.
 
 `credential_id` is the full credential id the run froze in `auth_selection.credential_id`
 (with shape `<method>:<provider>:<account>`), stamped by the run on exactly the credential-scoped

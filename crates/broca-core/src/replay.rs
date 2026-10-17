@@ -2862,6 +2862,7 @@ mod projection_boundary_tests {
                 failure: Some(QueuedAdmissionFailure {
                     run_id: RunId("r2".into()),
                     error: ProviderError {
+                        provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
                         message: "unknown model".into(),
@@ -2890,6 +2891,7 @@ mod projection_boundary_tests {
     #[test]
     fn reconciled_failed_retraction_carries_its_error() {
         let error = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
             message: "unknown model".into(),

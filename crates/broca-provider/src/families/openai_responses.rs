@@ -1252,6 +1252,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         );
     }
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: response_error_class(event, code),
         message,

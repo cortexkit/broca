@@ -1436,6 +1436,7 @@ async fn paused_budgeted_run_projects_once_at_pause() {
     let provider = RecordingProvider::new(vec![vec![NormalizedEvent::Control(
         ProviderControl::Error {
             error: broca_protocol::ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,
                 message: "credential expired".into(),

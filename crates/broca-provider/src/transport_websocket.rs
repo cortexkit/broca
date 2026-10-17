@@ -438,6 +438,12 @@ pub(super) async fn drive(
             .error
             .provider_code
             .filter(|code| crate::safe_provider_code(code));
+        // Already shape-checked where it was set; checked again because this is the boundary
+        // whose rule is that nothing but safe metadata leaves a websocket failure.
+        failure.error.provider_subcode = failure
+            .error
+            .provider_subcode
+            .filter(|code| crate::safe_provider_subcode(code));
         if !trace.chunk_error_warned && !trace.defer_failure_warning {
             warn_failure(&failure, trace);
         }

@@ -101,6 +101,20 @@ pub struct ProviderError {
     /// Provider-specific error code, for telemetry/observability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
+    /// The provider's own short code for an error broca has already given a typed
+    /// `provider_code`, kept as a finer-grained diagnostic beneath it. Today it is set only on a
+    /// [`REQUEST_INVALID`] error, where it carries the provider's reason for refusing the request
+    /// (OpenAI's `invalid_json_schema`, for example), so a caller can see WHICH request field was
+    /// wrong without broca keeping the provider's message, which may echo request content or
+    /// credentials.
+    ///
+    /// It is an open vocabulary the provider defines, so a consumer must never route on it:
+    /// routing reads `class` and `provider_code`. The producer only admits a value matching
+    /// `[a-z0-9_]{1,64}` (anything else is dropped, never rewritten), so it is always a short
+    /// identifier and never message text. `provider_subcode` is absent on every other error, so
+    /// their serialized bytes are unchanged by this field's existence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_subcode: Option<String>,
     /// Refusal diagnostics are flattened alongside the role code in provider_code.
     #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Box<ProviderRefusal>>,
@@ -151,6 +165,18 @@ pub const ACCOUNT_LIMIT_EXHAUSTED: &str = "account_limit_exhausted";
 /// the run.
 pub const BILLING_EXHAUSTED: &str = "billing_exhausted";
 
+/// The `provider_code` of a provider's HTTP 400 that rejected the REQUEST as invalid (a request
+/// validation refusal: OpenAI's and Anthropic's `invalid_request_error`, Google's
+/// `INVALID_ARGUMENT`), when no more specific code applies. Class stays
+/// [`ErrorClass::Permanent`] and the transport never re-sends it: the same bytes are refused the
+/// same way.
+///
+/// It says the request shape was wrong, not that the provider is failing. A router that counts
+/// consecutive failures against a provider's health should not count this one: the provider
+/// answered correctly. The provider's own reason, when it gave a short code, rides in
+/// [`ProviderError::provider_subcode`].
+pub const REQUEST_INVALID: &str = "request_invalid";
+
 /// The `provider_code` a run gives its terminal error when it ended [`ErrorClass::Transient`]
 /// because the provider rate-limited the request after the transport's in-step retries: an HTTP
 /// 429, or a rate-limit error the provider sent without one (Anthropic's in-band SSE
@@ -172,6 +198,11 @@ impl ProviderError {
     /// Whether this is a [`BILLING_EXHAUSTED`] refusal.
     pub fn is_billing_exhausted(&self) -> bool {
         self.provider_code.as_deref() == Some(BILLING_EXHAUSTED)
+    }
+
+    /// Whether this is a [`REQUEST_INVALID`] refusal.
+    pub fn is_request_invalid(&self) -> bool {
+        self.provider_code.as_deref() == Some(REQUEST_INVALID)
     }
 
     /// Whether this is a transient rate limit on the request (an HTTP 429, or a raw rate-limit

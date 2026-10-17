@@ -1673,3 +1673,97 @@ fn wrapped_chatgpt_refusals_keep_their_classes() {
     assert!(!failure.retry_forbidden);
     assert_eq!(trace.account_observation.limit, None);
 }
+
+/// The production refusal of a structured-output schema, as the ChatGPT backend wraps it in a
+/// websocket error frame. RECONSTRUCTED, NOT CAPTURED: only `status`, `error.type`, `error.code`
+/// and `error.param` were recorded; the message text is written for the test, with a bearer
+/// token in it to prove the message never leaves the frame.
+fn request_invalid_frame() -> Value {
+    serde_json::json!({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_json_schema","param":"text.format.schema","message":"Invalid schema for response_format 'result': PRIVATE-SCHEMA-TEXT Bearer mock-token"}})
+}
+
+/// A wrapped request-validation 400 takes its typed code from the frame's `error.type` and its
+/// detail from `error.code`. The message is never read into either.
+#[test]
+fn wrapped_request_invalid_frame_extracts_type_and_code_only() {
+    let mut trace = AttemptTrace::default();
+    let failure = responses_websocket::wrapped_error(
+        request_invalid_frame().to_string().as_bytes(),
+        &mut trace,
+    )
+    .expect("a wrapped 400 is a refusal");
+    assert_eq!(failure.error.class, ErrorClass::Permanent);
+    assert_eq!(
+        failure.error.provider_code.as_deref(),
+        Some(broca_protocol::error::REQUEST_INVALID)
+    );
+    assert_eq!(
+        failure.error.provider_subcode.as_deref(),
+        Some("invalid_json_schema")
+    );
+    assert_eq!(failure.error.status, Some(400));
+    assert_eq!(trace.http_status, Some(400));
+    // With `error.code` null, `error.type` alone still marks it request_invalid.
+    let mut frame = request_invalid_frame();
+    frame["error"]["code"] = Value::Null;
+    let failure = responses_websocket::wrapped_error(frame.to_string().as_bytes(), &mut trace)
+        .expect("a wrapped 400 is a refusal");
+    assert_eq!(
+        failure.error.provider_code.as_deref(),
+        Some(broca_protocol::error::REQUEST_INVALID)
+    );
+    assert_eq!(failure.error.provider_subcode, None);
+    // A wrapped 400 without the request-validation type gets no typed code.
+    let mut frame = request_invalid_frame();
+    frame["error"]["type"] = Value::String("permission_error".into());
+    let failure = responses_websocket::wrapped_error(frame.to_string().as_bytes(), &mut trace)
+        .expect("a wrapped 400 is a refusal");
+    assert_ne!(
+        failure.error.provider_code.as_deref(),
+        Some(broca_protocol::error::REQUEST_INVALID)
+    );
+    assert_eq!(failure.error.provider_subcode, None);
+}
+
+/// Through the real websocket step: the refusal ends the step on its one attempt, carries the
+/// typed code and detail through the websocket failure handling (which replaces the message and
+/// keeps only allowlisted codes), and still omits the body.
+#[tokio::test]
+async fn websocket_request_invalid_ends_the_step_with_typed_code_and_no_body() {
+    let mock = Mock::start(
+        vec![vec![request_invalid_frame()], text_events()],
+        false,
+        false,
+    )
+    .await;
+    let provider = provider(&mock);
+    let events = step(&provider, 1, &opts()).await;
+    let error = terminal_error(&events);
+    assert_eq!(error.class, ErrorClass::Permanent);
+    assert_eq!(
+        error.provider_code.as_deref(),
+        Some(broca_protocol::error::REQUEST_INVALID)
+    );
+    assert_eq!(
+        error.provider_subcode.as_deref(),
+        Some("invalid_json_schema")
+    );
+    assert_eq!(error.status, Some(400));
+    assert_eq!(
+        error.message,
+        "Responses websocket attempt failed (HttpError); response body omitted"
+    );
+    let rendered = serde_json::to_string(error).unwrap();
+    assert!(!rendered.contains("PRIVATE-SCHEMA-TEXT"), "{rendered}");
+    assert!(!rendered.contains("mock-token"), "{rendered}");
+    assert!(!rendered.contains("text.format.schema"), "{rendered}");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        NormalizedEvent::Control(ProviderControl::Error {
+            retries_used: 0,
+            ..
+        })
+    )));
+    assert_eq!(attempts(&events).len(), 1);
+    assert_eq!(mock.observed.lock().unwrap().requests.len(), 1);
+}

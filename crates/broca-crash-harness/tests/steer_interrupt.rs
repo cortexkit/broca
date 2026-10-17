@@ -214,6 +214,7 @@ impl RunExecutor for CoreExec {
         let mut control = job.control;
         if std::mem::take(&mut *self.script.pause_next_run.lock().unwrap()) {
             control.pause_for_auth_at_start = Some(broca_protocol::ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,
                 message: "credential needs re-authentication".into(),

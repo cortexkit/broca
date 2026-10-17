@@ -16136,3 +16136,30 @@ expect_red = ["executor::tests::deepseek_episode_admitted_before_the_reasoning_e
 file = "crates/broca-catalog/src/live.rs"
 old = '''            config.reasoning_content_required = recorded;'''
 new = '''            let _ = recorded; // NON-VACUITY BREAK: ignore the recorded choice'''
+[[control]]
+id = "request-invalid-400-classification"
+guards = "a provider's request-validation 400 (invalid_request_error, or Google's INVALID_ARGUMENT) gets the typed request_invalid code in every family and on the Responses websocket frame"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_request_invalid_tests.rs"
+expect_red = ["request_invalid::tests::only_a_permanent_400_with_the_body_discriminator_is_relabelled", "transport::tests::request_invalid::openai_and_chatgpt_invalid_request_400_is_request_invalid_with_the_provider_code", "transport::tests::request_invalid::anthropic_invalid_request_400_is_request_invalid_without_a_detail", "transport::tests::request_invalid::gemini_and_codeassist_invalid_argument_400_is_request_invalid", "transport::tests::request_invalid::gemini_and_codeassist_in_band_invalid_argument_is_request_invalid", "transport::websocket_tests::wrapped_request_invalid_frame_extracts_type_and_code_only"]
+file = "crates/broca-provider/src/request_invalid.rs"
+old = "    if !is_validation_refusal {"
+new = "    if true /* NON-VACUITY BREAK: never recognize a request-validation refusal */ {"
+
+[[control]]
+id = "request-invalid-subcode-shape"
+guards = "the provider's own code is kept as provider_subcode only when it is a short lowercase identifier, never arbitrary provider text"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_request_invalid_tests.rs"
+expect_red = ["transport::tests::request_invalid::a_provider_code_outside_the_identifier_shape_is_dropped_not_rewritten"]
+file = "crates/broca-provider/src/request_invalid.rs"
+old = "        .filter(|code| safe_provider_subcode(code))\n"
+new = "        // NON-VACUITY BREAK: keep any provider code as the subcode.\n"

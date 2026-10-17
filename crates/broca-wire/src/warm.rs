@@ -307,6 +307,7 @@ mod golden {
             (
                 refusal(WarmRefusalDetail::WarmFailed {
                     error: broca_protocol::error::ProviderError {
+                        provider_subcode: None,
                         refusal: None,
                         class: broca_protocol::error::ErrorClass::Transient,
                         message: "529: overloaded".into(),
