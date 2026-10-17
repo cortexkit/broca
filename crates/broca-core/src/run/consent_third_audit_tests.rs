@@ -279,7 +279,7 @@ async fn live_expired_older_approval_proves_recorded_duplicate_before_adoption()
             tokio::task::yield_now().await;
         }
     };
-    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (result, ()) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(
             rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false),
             interrupt

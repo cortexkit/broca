@@ -14351,6 +14351,28 @@ new = '''    pub async fn wait_idle(&mut self) {
         let wal_path = self.wal_path.clone();'''
 
 [[control]]
+id = "test-event-waits-reject-short-joined-futures"
+guards = "short wall-clock timeouts around joined test futures must be classified or use the shared hang guard"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test event_wait_guard"
+test_file = "crates/broca-test-support/tests/event_wait_guard.rs"
+expect_red = ["short_real_time_polls_are_classified"]
+expect_message = "ordinary_approved_cancel_during_intent_sync_is_not_sent"
+file = "crates/broca-core/src/run/consent_audit_tests.rs"
+old = '''    let result = broca_test_support::event_timeout(
+        "ordinary intent gate to release",
+        async { tokio::join!(batch, interrupt) },
+        || broca_test_support::record_kinds(rig.frames()),
+    )
+    .await;'''
+new = '''    // NON-VACUITY BREAK: reintroduce a short deadline around a joined file-WAL test.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(batch, interrupt)
+    })
+    .await;'''
+
+[[control]]
 id = "agent-data-historical-run-billing-identity"
 guards = "each imported run's floor uses its RunStarted identity, including historical re-keyed triples"
 runner = "cargo"

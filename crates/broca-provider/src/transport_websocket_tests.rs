@@ -1316,7 +1316,7 @@ async fn websocket_two_long_stream_cuts_switch_to_https_and_complete() {
             mock.cut_gates.add_permits(1);
         }
     };
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(exercise, release);
     })
     .await
@@ -1478,7 +1478,7 @@ async fn websocket_retried_tool_step_dispatches_only_the_successful_completion()
             mock.cut_gates.add_permits(1);
         }
     };
-    let (result, _) = tokio::time::timeout(Duration::from_secs(10), async {
+    let (result, _) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(run, release)
     })
     .await
