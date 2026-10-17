@@ -146,6 +146,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
         AGENT_RUN_WRITER_FOR_TEST.set(true);
         let response = registry
             .send(SendRequest {
+                session_class: None,
                 retention: None,
                 stop_sequences_named: false,
                 title: None,
@@ -267,6 +268,7 @@ async fn writer_refuses_paused_retries_without_the_frozen_run_scope() {
         request.principal = Some(basal());
         let result = registry
             .send(SendRequest {
+                session_class: None,
                 retention: None,
                 stop_sequences_named: false,
                 title: None,

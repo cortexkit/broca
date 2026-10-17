@@ -89,6 +89,7 @@ pub enum OutputEvent {
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
+    pub session_class: Option<String>,
     /// Retention accepted for this send, recorded in a new episode's `RunStarted` but never
     /// included in a provider request. Resuming an existing episode cannot change its policy.
     pub retention: Option<u64>,
@@ -222,6 +223,7 @@ impl RunRequest {
         submission_id: broca_protocol::SubmissionId,
     ) -> Self {
         RunRequest {
+            session_class: None,
             retention: None,
             on_restart: req.on_restart,
             keep_warm: req.keep_warm,
@@ -3586,6 +3588,7 @@ where
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
         let run_started_seq = writer.record(WalRecord::RunStarted {
+            session_class: req.session_class.clone(),
             retention: req.retention,
             hooks: control.input_hooks.clone().map(|mut hooks| {
                 // RunStarted.input holds the rendered final value, unlike Queued.request.
@@ -7601,6 +7604,7 @@ mod tests {
             },
         };
         let mut req = RunRequest {
+            session_class: None,
             retention: None,
             title: None,
             on_restart: None,
@@ -8601,6 +8605,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.
                 lineage_retention: Some(crate::LineageRetention::Forever),
                 compaction: None,

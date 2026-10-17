@@ -175,6 +175,7 @@ pub(super) struct IndexedWal {
     wal: FileWal,
     address: String,
     inventory: Arc<InventoryState>,
+    placement: Option<(PathBuf, PathBuf, PathBuf, Vec<String>)>,
 }
 
 impl IndexedWal {
@@ -183,7 +184,47 @@ impl IndexedWal {
             wal,
             address,
             inventory,
+            placement: None,
         }
+    }
+
+    pub(super) fn with_placement(
+        mut self,
+        ordinary: PathBuf,
+        ephemeral: PathBuf,
+        durable: PathBuf,
+        classes: Vec<String>,
+    ) -> Self {
+        self.placement = Some((ordinary, ephemeral, durable, classes));
+        self
+    }
+
+    fn place_first_send(&mut self, record: &WalRecord) -> Result<(), WalError> {
+        if self.wal.last_seq() != 0 {
+            return Ok(());
+        }
+        if let (
+            Some((ordinary, ephemeral, durable, classes)),
+            WalRecord::RunStarted {
+                retention,
+                session_class,
+                ..
+            },
+        ) = (&self.placement, record)
+        {
+            let path = if retention.is_some() {
+                ephemeral
+            } else if session_class
+                .as_ref()
+                .is_some_and(|class| classes.contains(class))
+            {
+                durable
+            } else {
+                ordinary
+            };
+            self.wal.relocate_unstarted(path)?;
+        }
+        Ok(())
     }
 
     fn publishing(&self, record: &WalRecord) {
@@ -199,6 +240,7 @@ impl IndexedWal {
 
 impl Wal for IndexedWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
+        self.place_first_send(record)?;
         self.publishing(record);
         self.wal.append(fence, record, sync)
     }
@@ -209,6 +251,7 @@ impl Wal for IndexedWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
+        self.place_first_send(record)?;
         self.publishing(record);
         self.wal.append_preencoded(fence, record, sync, frame)
     }

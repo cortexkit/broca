@@ -306,6 +306,7 @@ async fn fixture<F: WireFamily + 'static>(
         vec![]
     };
     let request = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -516,6 +517,43 @@ async fn gemini_run_exports_server_bytes_and_usage_metadata() {
     )
     .await;
     assert_gemini_export("gemini", &captured, &root);
+}
+
+#[tokio::test]
+async fn durable_live_and_archived_exports_match_server_bytes() {
+    let tag = "durable-export";
+    let (root, _, captured) = fixture(
+        tag,
+        Gemini,
+        gemini_frozen_config("m"),
+        vec![data_sse(gemini_chunk())],
+        false,
+    )
+    .await;
+    let store = FileWalStore::new(root.join("wal"));
+    let bind = BindIdentity::new(root.join("proj"), "test", tag);
+    std::fs::create_dir_all(store.durable_root()).unwrap();
+    std::fs::rename(store.wal_path(&bind), store.durable_wal_path(&bind)).unwrap();
+    assert_gemini_export(tag, &captured, &root);
+    let options = broca_core::wal_fold::FoldOptions {
+        write: true,
+        ..Default::default()
+    };
+    let report = broca_core::wal_fold::fold(
+        &root,
+        broca_core::wal_fold::FoldSettings {
+            options: &options,
+            cold_ms: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(!store.durable_wal_path(&bind).exists());
+    let out = root.join("out-archived");
+    let summary = export(&root, &[tag.into()], None, &out).unwrap();
+    assert_eq!(summary.calls_exported, 1);
+    assert!(summary.calls_skipped.is_empty());
+    check_bodies(&out, &captured);
 }
 #[tokio::test]
 async fn codeassist_run_exports_server_bytes_and_usage_metadata() {

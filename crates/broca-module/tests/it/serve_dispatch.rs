@@ -22,6 +22,7 @@ const LONG_TTL: Duration = Duration::from_secs(3600);
 fn send_req(key: &broca_protocol::BindIdentity, run: &str) -> SendRequest {
     let req = req(key, run);
     SendRequest {
+        session_class: None,
         retention: None,
         stop_sequences_named: false,
         title: None,

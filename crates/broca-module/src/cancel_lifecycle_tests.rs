@@ -19,14 +19,12 @@ impl RunExecutor for PauseBeforeCancel {
                 job.on_admitted, Some(&job.prior_snapshot),
             ).await;
         }
-        job.writer.record(WalRecord::RunStarted {
-            retention: None, hooks: None, title: None, on_restart: None, keep_warm: None,
-            marker_order_version: None, manifest: None, scope: None, send_id: None,
-            request_identity_digest: None, project_id: None, principal: None,
-            ts_ms: Some(100), run_id: job.req.run_id.clone(), session: job.req.session.clone(),
-            config: Box::new(min_config()), input: job.req.input.clone().into(),
-            origin: broca_wal::RunOrigin::Fresh, submission_id: None,
-        });
+        job.writer.record(WalRecord::RunStarted { session_class: None, retention: None, hooks: None, title: None, on_restart: None, keep_warm: None,
+        marker_order_version: None, manifest: None, scope: None, send_id: None,
+        request_identity_digest: None, project_id: None, principal: None,
+        ts_ms: Some(100), run_id: job.req.run_id.clone(), session: job.req.session.clone(),
+        config: Box::new(min_config()), input: job.req.input.clone().into(),
+        origin: broca_wal::RunOrigin::Fresh, submission_id: None, });
         job.writer.sync().await?;
         let _ = job.on_admitted.take().unwrap().send(Ok(job.req.run_id.clone()));
         self.release.notified().await;

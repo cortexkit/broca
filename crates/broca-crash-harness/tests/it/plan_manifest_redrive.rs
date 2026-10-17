@@ -85,6 +85,7 @@ fn later_send() -> SendRequest {
     submission.tools = None;
     submission.policy_allowed = Default::default();
     SendRequest {
+        session_class: None,
         retention: None,
         stop_sequences_named: false,
         title: None,

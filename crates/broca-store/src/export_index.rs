@@ -721,6 +721,7 @@ mod tests {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,

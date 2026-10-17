@@ -36,6 +36,9 @@ pub use move_inventory::{MoveInventory, MoveInventoryBuildStats};
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    fn backup_classes(&self) -> Vec<String> {
+        vec!["head".into()]
+    }
     /// Move admission is checked even for cached projections and already-open actors.
     fn check_move(&self, _session: &BindIdentity, _write: bool) -> Result<(), WalError> {
         Ok(())
@@ -58,6 +61,17 @@ pub trait WalStore: Send + Sync {
             )));
         }
         self.open(session)
+    }
+
+    /// The caller holds the session's exclusive writer lease while choosing
+    /// first-send placement. Read-only resolution must never choose a new tree.
+    fn open_with_class(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        _session_class: Option<&str>,
+    ) -> Result<Box<dyn Wal + Send>, WalError> {
+        self.open_with_retention(session, retention)
     }
 
     /// Read the first run's frozen policy, independently of any materialized watermark.
@@ -210,6 +224,7 @@ pub trait WalStore: Send + Sync {
 /// to the same log across processes and restarts.
 pub struct FileWalStore {
     root: PathBuf,
+    backup_classes: Vec<String>,
     max_read_bytes: u64,
     move_inventory: Arc<move_inventory::InventoryState>,
     move_reads: AtomicU64,
@@ -226,6 +241,7 @@ pub struct FileWalStore {
 ///   confirmed miss makes `session.read` refuse for every session in an unfolded tree.
 #[derive(Default)]
 struct ArchiveLookup {
+    durable: bool,
     live_present: bool,
     consulted: bool,
     member: Option<broca_wal::archive::ArchiveMember>,
@@ -343,7 +359,7 @@ impl FileWalStore {
                 Err(error)
             }
         };
-        for root in [&self.root, &self.ephemeral_root()] {
+        for root in [&self.root, &self.ephemeral_root(), &self.durable_root()] {
             match std::fs::read_dir(root) {
                 Ok(entries) => {
                     for entry in entries {
@@ -423,14 +439,15 @@ impl FileWalStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            backup_classes: vec!["head".into()],
             max_read_bytes: DEFAULT_MAX_READ_BYTES,
             move_inventory: Arc::default(),
             move_reads: AtomicU64::new(0),
         }
     }
 
-    /// Portable creation path (FNV-1a of the bind identity). Readers must use
-    /// [`Self::resolve_live_path`] instead: a live lineage may be ephemeral.
+    /// Non-durable creation path (FNV-1a of the bind identity). Readers must use
+    /// [`Self::resolve_live_path`] instead: a live lineage may be durable or ephemeral.
     ///
     /// THE HASH IS THE ADDRESS AND THE TRIPLE INSIDE THE RECORDS IS NOT CHECKED AGAINST IT.
     /// `RunStarted` embeds the bind triple verbatim, but nothing on the read or replay path
@@ -447,13 +464,55 @@ impl FileWalStore {
         self.root.join(format!("{}.wal", session_addr(session)))
     }
 
-    /// The portable directory is passed to the constructor for compatibility with
+    /// The ordinary directory is passed to the constructor for compatibility with
     /// existing deployments. Ephemeral WALs are its sibling in the same state root.
     pub fn ephemeral_root(&self) -> PathBuf {
         self.root
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .join("wal-ephemeral")
+    }
+
+    pub fn with_backup_classes(mut self, classes: Vec<String>) -> Self {
+        self.backup_classes = classes;
+        self
+    }
+
+    pub fn durable_root(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("wal-durable")
+    }
+
+    pub fn durable_wal_path(&self, session: &BindIdentity) -> PathBuf {
+        self.durable_root()
+            .join(format!("{}.wal", session_addr(session)))
+    }
+
+    /// Move installation preserves the tree of a session already present locally.
+    /// For a new session, the receiving daemon applies its configured backup classes
+    /// to the incoming WAL's first RunStarted label.
+    pub fn move_destination(
+        &self,
+        session: &BindIdentity,
+        session_class: Option<&str>,
+    ) -> Result<PathBuf, WalError> {
+        if let Some(path) = self.resolve_live_path(session)? {
+            return Ok(path);
+        }
+        let archived = self.archived_member(session)?;
+        let durable = if archived.member.is_some() {
+            archived.durable
+        } else {
+            session_class
+                .is_some_and(|class| self.backup_classes.iter().any(|value| value == class))
+        };
+        Ok(if durable {
+            self.durable_wal_path(session)
+        } else {
+            self.wal_path(session)
+        })
     }
 
     pub fn ephemeral_wal_path(&self, session: &BindIdentity) -> PathBuf {
@@ -483,27 +542,24 @@ impl FileWalStore {
     }
 
     fn resolve_live_address(&self, address: &str) -> Result<Option<PathBuf>, WalError> {
-        let portable = self.root.join(format!("{address}.wal"));
-        let ephemeral = self.ephemeral_root().join(format!("{address}.wal"));
-        let portable_live = broca_wal::wal_file_exists(&portable)?;
-        let ephemeral_live = broca_wal::wal_file_exists(&ephemeral)?;
-        if portable_live && ephemeral_live {
-            return Err(WalError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "conflicting live WALs: {} and {}",
-                    portable.display(),
-                    ephemeral.display()
-                ),
-            )));
+        let mut live: Option<PathBuf> = None;
+        for root in [&self.root, &self.ephemeral_root(), &self.durable_root()] {
+            let path = root.join(format!("{address}.wal"));
+            if broca_wal::wal_file_exists(&path)? {
+                if let Some(prior) = live {
+                    return Err(WalError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "conflicting live WALs: {} and {}",
+                            prior.display(),
+                            path.display()
+                        ),
+                    )));
+                }
+                live = Some(path);
+            }
         }
-        Ok(if portable_live {
-            Some(portable)
-        } else if ephemeral_live {
-            Some(ephemeral)
-        } else {
-            None
-        })
+        Ok(live)
     }
 
     fn read_path(&self, session: &BindIdentity) -> Result<PathBuf, WalError> {
@@ -588,10 +644,23 @@ impl FileWalStore {
         session: &BindIdentity,
         retention: Option<u64>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
+        self.open_with_class(session, retention, None)
+    }
+
+    pub fn open_with_class(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+    ) -> Result<Box<dyn Wal + Send>, WalError> {
         self.check_move(session, true)?;
         let lookup = self.archived_member(session)?;
         let path = if let Some(member) = lookup.member {
-            let path = self.wal_path(session);
+            let path = if lookup.durable {
+                self.durable_wal_path(session)
+            } else {
+                self.wal_path(session)
+            };
             // Extraction preserves the logical address and payload, so the move
             // identity inventory remains valid without decoding the member again.
             extraction::restore(&path, &member.payload).map_err(WalError::Io)?;
@@ -600,6 +669,10 @@ impl FileWalStore {
             path
         } else if retention.is_some() {
             self.ephemeral_wal_path(session)
+        } else if session_class
+            .is_some_and(|class| self.backup_classes.iter().any(|value| value == class))
+        {
+            self.durable_wal_path(session)
         } else {
             self.wal_path(session)
         };
@@ -640,11 +713,19 @@ impl FileWalStore {
         } else {
             wal.with_recovery_cap(self.append_cap(retained_size::SizeScope::Session)?)
         };
-        Ok(Box::new(move_inventory::IndexedWal::new(
-            wal,
-            session_addr(session),
-            self.move_inventory.clone(),
-        )))
+        Ok(Box::new(
+            move_inventory::IndexedWal::new(
+                wal,
+                session_addr(session),
+                self.move_inventory.clone(),
+            )
+            .with_placement(
+                self.wal_path(session),
+                self.ephemeral_wal_path(session),
+                self.durable_wal_path(session),
+                self.backup_classes.clone(),
+            ),
+        ))
     }
 
     /// Resolve only after live absence: a live WAL is authoritative even when an archive
@@ -671,11 +752,28 @@ impl FileWalStore {
         };
         #[cfg(test)]
         ARCHIVE_LOOKUPS.with(|count| count.set(count.get() + 1));
-        let member = broca_wal::archive::read_newest_member(&paths, address, self.max_read_bytes)
-            .map_err(WalError::Io)?;
+        let (durable_paths, ordinary_paths): (Vec<_>, Vec<_>) =
+            paths.into_iter().partition(|path| {
+                path.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "wal-archive-durable")
+            });
+        let ordinary =
+            broca_wal::archive::read_newest_member(&ordinary_paths, address, self.max_read_bytes)
+                .map_err(WalError::Io)?;
+        let durable =
+            broca_wal::archive::read_newest_member(&durable_paths, address, self.max_read_bytes)
+                .map_err(WalError::Io)?;
+        if ordinary.is_some() && durable.is_some() {
+            return Err(WalError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conflicting archived WALs in wal-archive and wal-archive-durable",
+            )));
+        }
         Ok(ArchiveLookup {
             consulted: true,
-            member,
+            durable: durable.is_some(),
+            member: durable.or(ordinary),
             ..Default::default()
         })
     }
@@ -685,24 +783,28 @@ impl FileWalStore {
     /// Discovery is off the live hot path. Do not cache it: another process can publish a
     /// newer sealed pass, and a stale list would silently serve an older transcript.
     fn archive_containers(&self) -> Result<Option<Vec<PathBuf>>, WalError> {
-        let directory = self
-            .root
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join("wal-archive");
-        let entries = match std::fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(WalError::Io(error)),
-        };
         let mut paths = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(WalError::Io)?.path();
-            if path.extension().is_some_and(|extension| extension == "ark") {
-                paths.push(path);
+        let mut exists = false;
+        for name in ["wal-archive", "wal-archive-durable"] {
+            let directory = self
+                .root
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(name);
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(WalError::Io(error)),
+            };
+            exists = true;
+            for entry in entries {
+                let path = entry.map_err(WalError::Io)?.path();
+                if path.extension().is_some_and(|extension| extension == "ark") {
+                    paths.push(path);
+                }
             }
         }
-        Ok(Some(paths))
+        Ok(exists.then_some(paths))
     }
 
     /// Build the archive membership cache now, so the first new session after a restart
@@ -1005,6 +1107,17 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn backup_classes(&self) -> Vec<String> {
+        self.backup_classes.clone()
+    }
+    fn open_with_class(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+    ) -> Result<Box<dyn Wal + Send>, WalError> {
+        FileWalStore::open_with_class(self, session, retention, session_class)
+    }
     fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
         FileWalStore::check_move(self, session, write)
     }
@@ -1618,12 +1731,26 @@ impl WalHandle {
     where
         W: WalStore + 'static,
     {
+        Self::open_and_spawn_observed_with_class(
+            wal_store, session, lease, observer, retention, None,
+        )
+        .await
+    }
+
+    pub async fn open_and_spawn_observed_with_class<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        lease: Box<dyn LeaseHandle>,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+    ) -> Result<(WalHandle, Box<dyn LeaseHandle>), WalOpenError> {
         let check_store = wal_store.clone();
         let check_session = session.clone();
         let opened = spawn_blocking(JobKind::WalWriter, move || {
             let fence = lease.epoch();
             let wal = wal_store
-                .open_with_retention(&session, retention)
+                .open_with_class(&session, retention, session_class.as_deref())
                 .map_err(WalOpenError::from_wal)?;
             let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
             Ok::<_, WalOpenError>((wal, last_seq, fence, lease))
@@ -3200,3 +3327,6 @@ mod shutdown_tests;
 
 #[cfg(test)]
 pub(crate) mod retention_tests;
+
+#[cfg(test)]
+mod session_class_tests;

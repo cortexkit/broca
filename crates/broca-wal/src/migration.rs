@@ -448,6 +448,17 @@ pub fn check(wal: &Path, session_ref: &str, write: bool) -> io::Result<Result<()
     {
         return Err(invalid("wal-staging is not a live session population"));
     }
+    // Move sidecars stay at the original session address in wal/, regardless of
+    // which live tree holds the transcript bytes.
+    let canonical = wal
+        .parent()
+        .filter(|parent| {
+            parent
+                .file_name()
+                .is_some_and(|name| name == "wal-durable" || name == "wal-ephemeral")
+        })
+        .and_then(|parent| Some(parent.parent()?.join("wal").join(wal.file_name()?)));
+    let wal = canonical.as_deref().unwrap_or(wal);
     if write {
         if let Some(cut_id) = cut_fence(wal.parent().unwrap_or(Path::new(".")), session_ref)? {
             return Ok(Err(MoveRefusal::Moving { cut_id }));

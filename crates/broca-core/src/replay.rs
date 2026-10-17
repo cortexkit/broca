@@ -2473,6 +2473,7 @@ mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -2554,6 +2555,7 @@ mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                session_class: None,
                 lineage_retention: None,
                 compaction: None,
                 effort_history: None,

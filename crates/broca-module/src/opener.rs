@@ -143,6 +143,9 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     fn compaction_supported(&self) -> bool {
         self.executor.compaction_plane().is_some()
     }
+    fn backup_classes(&self) -> Vec<String> {
+        self.wal_store.backup_classes()
+    }
 
     async fn open(
         &self,
@@ -159,7 +162,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         gen: u64,
         registry: RegistryHandle,
     ) -> Result<ActorHandle, OpenError> {
-        self.open_mode(key, gen, registry, None, true).await
+        self.open_mode(key, gen, registry, None, None, true).await
     }
 
     async fn open_with_retention(
@@ -169,7 +172,20 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         registry: RegistryHandle,
         retention: Option<u64>,
     ) -> Result<ActorHandle, OpenError> {
-        self.open_mode(key, gen, registry, retention, false).await
+        self.open_mode(key, gen, registry, retention, None, false)
+            .await
+    }
+
+    async fn open_with_class(
+        &self,
+        key: &LineageKey,
+        gen: u64,
+        registry: RegistryHandle,
+        retention: Option<u64>,
+        session_class: Option<String>,
+    ) -> Result<ActorHandle, OpenError> {
+        self.open_mode(key, gen, registry, retention, session_class, false)
+            .await
     }
 }
 
@@ -190,6 +206,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         gen: u64,
         registry: RegistryHandle,
         retention: Option<u64>,
+        session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
         self.wal_store
@@ -326,12 +343,13 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         //    writer with the fan-out observer. The lease moves through that blocking operation so
         //    cancellation cannot release it while recovery still touches the WAL. A failed proof
         //    returns no handle, and the registry cannot publish an Open slot.
-        let (writer, lease) = WalHandle::open_and_spawn_observed_with_retention(
+        let (writer, lease) = WalHandle::open_and_spawn_observed_with_class(
             self.wal_store.clone(),
             key.clone(),
             lease,
             Some(observer),
             retention,
+            session_class,
         )
         .await
         .map_err(|error| match error {

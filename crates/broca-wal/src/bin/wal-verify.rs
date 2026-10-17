@@ -259,15 +259,39 @@ fn main() -> ExitCode {
 }
 
 fn take_inventory(dir: &Path) -> Result<Inventory, String> {
-    let wal_dir = if dir.join("wal").is_dir() {
-        dir.join("wal")
+    let live_trees = ["wal", "wal-ephemeral", "wal-durable"];
+    let state_root = if live_trees
+        .iter()
+        .chain(["wal-archive", "wal-archive-durable"].iter())
+        .any(|name| dir.join(name).is_dir())
+    {
+        Some(dir)
+    } else if dir
+        .file_name()
+        .is_some_and(|name| live_trees.iter().any(|tree| name == *tree))
+    {
+        dir.parent()
     } else {
-        dir.to_path_buf()
+        None
     };
+    let wal_dir = state_root
+        .map(|root| root.join("wal"))
+        .unwrap_or_else(|| dir.to_path_buf());
 
     let mut files = Vec::new();
-    collect_wals(&wal_dir, &mut files)
-        .map_err(|error| format!("cannot read {}: {error}", wal_dir.display()))?;
+    if let Some(root) = state_root {
+        for name in live_trees {
+            let directory = root.join(name);
+            match collect_wals(&directory, &mut files) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot read {}: {error}", directory.display())),
+            }
+        }
+    } else {
+        collect_wals(&wal_dir, &mut files)
+            .map_err(|error| format!("cannot read {}: {error}", wal_dir.display()))?;
+    }
     files.sort();
 
     let mut frames = 0usize;
@@ -305,7 +329,7 @@ fn take_inventory(dir: &Path) -> Result<Inventory, String> {
                 bytes += size;
                 per_wal.insert(
                     file.strip_prefix(&wal_dir)
-                        .unwrap_or(file)
+                        .unwrap_or_else(|_| Path::new(file.file_name().unwrap()))
                         .to_string_lossy()
                         .into_owned(),
                     (records.len(), size),
@@ -343,25 +367,24 @@ fn take_inventory(dir: &Path) -> Result<Inventory, String> {
         ));
     }
 
-    let archive_dir = wal_dir
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("wal-archive");
     let mut archives = Vec::new();
-    match std::fs::read_dir(&archive_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry.map_err(|e| e.to_string())?.path();
-                if path.extension().is_some_and(|e| e == "ark") {
-                    archives.push((
-                        broca_wal::archive::fold_timestamp(&path).map_err(|e| e.to_string())?,
-                        path,
-                    ));
+    for name in ["wal-archive", "wal-archive-durable"] {
+        let archive_dir = wal_dir.parent().unwrap_or_else(|| Path::new("")).join(name);
+        match std::fs::read_dir(&archive_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry.map_err(|e| e.to_string())?.path();
+                    if path.extension().is_some_and(|e| e == "ark") {
+                        archives.push((
+                            broca_wal::archive::fold_timestamp(&path).map_err(|e| e.to_string())?,
+                            path,
+                        ));
+                    }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.to_string()),
     }
     archives.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
     for (_, path) in archives {
@@ -513,6 +536,40 @@ fn collect_wals(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod move_reader_tests {
     use super::*;
+    #[test]
+    fn inventory_finds_durable_live_and_archived_wals_without_ordinary_tree() {
+        use broca_wal::Wal;
+        let root = broca_test_support::scratch_root()
+            .join(format!("verify-durable-{}", std::process::id()));
+        let path = root.join("wal-durable/1234567890abcdef.wal");
+        let mut wal = broca_wal::FileWal::open(&path).unwrap();
+        wal.append(
+            1,
+            &broca_wal::WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            true,
+        )
+        .unwrap();
+        drop(wal);
+        let before = take_inventory(&root).unwrap();
+        assert_eq!(before.files, 1);
+        assert_eq!(before.frames, 1);
+        let archive = root.join("wal-archive-durable/fold-10.ark");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+            .unwrap()
+            .without_feature_floor();
+        writer
+            .append("1234567890abcdef", &std::fs::read(&path).unwrap())
+            .unwrap();
+        writer.seal().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let after = take_inventory(&root).unwrap();
+        assert_eq!(before.per_wal, after.per_wal);
+        assert_eq!(before.files, after.files);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn inventory_ignores_staging_and_moved_wals_but_keeps_frozen_reads() {
         use broca_wal::Wal;

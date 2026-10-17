@@ -125,6 +125,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    session_class: None,
                     retention: None,
                     hooks: None,
                     title: None,
@@ -177,6 +178,7 @@ impl Fixture {
         let (self_tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
+            admitting_session_class: None,
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]
             agent_run_writer_for_test: AGENT_RUN_WRITER_FOR_TEST.get(),
@@ -254,6 +256,7 @@ impl Fixture {
                 SendKey::SendId("old".into()),
                 false,
                 broca_protocol::Delivery::Queue,
+                None,
                 None,
                 None,
                 None,
@@ -353,6 +356,7 @@ async fn degraded_retract_preserves_good_scan_sets_and_refuses_negative_answers(
             None,
             None,
             Some(60),
+            None,
             false,
         )
         .await;

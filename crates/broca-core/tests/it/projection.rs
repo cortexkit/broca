@@ -64,6 +64,7 @@ fn run_config() -> RunConfig {
 
 fn started(run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

@@ -203,6 +203,7 @@ pub struct SessionImportResponse {
 /// A `session.send` request: start a run now (idle lineage) or durably queue new work.
 #[derive(Clone)]
 pub struct SendRequest {
+    pub session_class: Option<String>,
     pub retention: Option<u64>,
     /// Routing affinity for this send's admission, never frozen into run data.
     pub conversation_key: Option<String>,
@@ -753,6 +754,10 @@ impl From<OpenError> for ServeError {
             OpenError::SessionMoved { holder } => Self::SessionMoved { holder },
             OpenError::Expired { expired_at_ms } => ServeError::Expired { expired_at_ms },
             OpenError::RetentionInvalid(detail) => ServeError::RetentionInvalid(detail),
+            OpenError::SessionClassInvalid(message) => ServeError::InvalidParams {
+                field: "session_class".into(),
+                message,
+            },
             OpenError::LeaseHeld(s) => ServeError::SessionHeld(s),
             // Legacy open errors erased the cause; do not infer retryability from text.
             OpenError::Open(s) => ServeError::Open(s, None),
@@ -854,6 +859,9 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    fn backup_classes(&self) -> Vec<String> {
+        vec!["head".into()]
+    }
     /// Check the move latch before authorization reads frozen session metadata.
     /// File-backed handlers enforce the durable fence even for already-bound routes.
     async fn check_migration(&self, _session: &LineageKey, _write: bool) -> Result<(), ServeError> {
@@ -1187,6 +1195,9 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn backup_classes(&self) -> Vec<String> {
+        crate::LineageRegistry::backup_classes(self)
+    }
     async fn check_migration(&self, session: &LineageKey, write: bool) -> Result<(), ServeError> {
         self.check_move(session, write).map_err(Into::into)
     }
@@ -1371,7 +1382,7 @@ impl ServeHandler for crate::LineageRegistry {
             }
         }
         match self
-            .route_submission_with_retention(
+            .route_submission_with_class(
                 &req.session,
                 req.run_id,
                 *req.request,
@@ -1386,11 +1397,16 @@ impl ServeHandler for crate::LineageRegistry {
                 req.conversation_key,
                 req.title,
                 req.retention,
+                req.session_class,
                 req.stop_sequences_named,
             )
             .await?
         {
             SendOutcome::RetentionInvalid(detail) => Err(ServeError::RetentionInvalid(detail)),
+            SendOutcome::SessionClassInvalid(message) => Err(ServeError::InvalidParams {
+                field: "session_class".into(),
+                message,
+            }),
             SendOutcome::Finished {
                 run_id,
                 reason,

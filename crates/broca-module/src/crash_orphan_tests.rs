@@ -33,6 +33,7 @@ impl RunExecutor for Recording {
     ) -> Result<RunSummary, broca_core::RunError> {
         self.executed.lock().unwrap().push(job.req.run_id.0.clone());
         job.writer.record(WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -246,6 +247,7 @@ impl Drop for Fixture {
 
 fn run_started(key: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

@@ -240,7 +240,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         broca_core::ChargeBasis::MeteredApi
     );
     install_test_catalog();
-    let mut req = broca_core::RunRequest { retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    let mut req = broca_core::RunRequest { session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -264,8 +264,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         stop_when: vec![],
         submission_id: None,
         context_management: None,
-        inherit_frozen_cache: false,
-    };
+        inherit_frozen_cache: false, };
     assert!(executor
         .cache_policy_for_episode(true, None, &req, None)
         .unwrap()
@@ -439,7 +438,7 @@ fn resolve_drift_revision(
 }
 
 fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
-    broca_core::RunRequest { retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    broca_core::RunRequest { session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -463,8 +462,7 @@ fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
         stop_when: vec![],
         submission_id: None,
         context_management: None,
-        inherit_frozen_cache: false,
-    }
+        inherit_frozen_cache: false, }
 }
 
 /// The RunConfig a run started with `started` would have written into RunStarted.
@@ -564,24 +562,22 @@ async fn resume_through_core(
     let mut wal = wal_store.open(&req.session).unwrap();
     wal.append(
         1,
-        &broca_wal::WalRecord::RunStarted {
-            retention: None,
-            hooks: None,
- title: None,
- on_restart: None,
- keep_warm: None, marker_order_version: None, send_id: None, request_identity_digest: None,
- manifest: None,
-            scope: None,
-            project_id: None,
-            principal: None,
-            ts_ms: None,
-            run_id: req.run_id.clone(),
-            session: req.session.clone(),
-            config: Box::new(recorded),
-            input: req.input.clone().into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: None,
-        },
+        &broca_wal::WalRecord::RunStarted { session_class: None, retention: None,
+        hooks: None,
+         title: None,
+         on_restart: None,
+         keep_warm: None, marker_order_version: None, send_id: None, request_identity_digest: None,
+         manifest: None,
+        scope: None,
+        project_id: None,
+        principal: None,
+        ts_ms: None,
+        run_id: req.run_id.clone(),
+        session: req.session.clone(),
+        config: Box::new(recorded),
+        input: req.input.clone().into(),
+        origin: broca_wal::RunOrigin::Fresh,
+        submission_id: None, },
         true,
     )
     .unwrap();

@@ -31,6 +31,7 @@ pub mod provider_overrides;
 pub mod run_routing;
 pub mod send_audit;
 pub mod serve;
+pub mod session_class;
 pub mod stall;
 pub mod state_root;
 pub mod transport_config;

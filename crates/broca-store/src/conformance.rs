@@ -2334,6 +2334,7 @@ pub(crate) fn run_started(
     framed(
         seq,
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

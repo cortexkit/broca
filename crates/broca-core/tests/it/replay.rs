@@ -70,6 +70,7 @@ fn run_config() -> RunConfig {
 /// The ONE atomic run-start record (config + input).
 fn start(run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,
@@ -674,6 +675,7 @@ fn tool_then_text() -> Vec<Vec<NormalizedEvent>> {
 
 fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -773,6 +775,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -877,6 +880,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
     });
     let lease = FileLeaseStore::new(dir.join("lease"));
     let req = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -1415,6 +1419,7 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
 /// A text-only request that runs one model step and ends `Completed`.
 fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -1816,6 +1821,7 @@ async fn append_seals_an_inferred_natural_end_before_starting_the_next_episode()
     let mut file = wal.open(&session).expect("open WAL for crash cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -1913,6 +1919,7 @@ async fn append_seals_an_inferred_hard_stop_before_starting_the_next_episode() {
     let mut file = wal.open(&session).expect("open WAL for hard-stop cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2320,6 +2327,7 @@ async fn cross_episode_resume_is_exactly_once() {
 
     // A tool request whose model calls `edit` once, then answers.
     let req1 = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -2401,6 +2409,7 @@ async fn cross_episode_resume_is_exactly_once() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -2789,6 +2798,7 @@ async fn append_episode_cannot_introduce_a_system_prompt_mid_lineage() {
 /// resume, so this id is only the caller's handle).
 fn req2(session: &BindIdentity) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -3021,6 +3031,7 @@ fn budgeted_start(run: &str) -> WalRecord {
             submission_id,
             ..
         } => WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -3356,6 +3367,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,

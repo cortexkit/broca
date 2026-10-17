@@ -542,6 +542,7 @@ mod tests {
             framed(
                 1,
                 broca_wal::WalRecord::RunStarted {
+                    session_class: None,
                     retention: None,
                     hooks: None,
                     title: None,

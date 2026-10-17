@@ -110,7 +110,7 @@ def main() -> int:
     args = ap.parse_args()
 
     wal_dir = pathlib.Path(args.state_root).expanduser() / "wal"
-    if not any((wal_dir.parent / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-archive")):
+    if not any((wal_dir.parent / name).is_dir() for name in ("wal", "wal-ephemeral", "wal-durable", "wal-archive", "wal-archive-durable")):
         print(f"wal-scan: cannot compare -- no WAL directory at {wal_dir}", file=sys.stderr)
         return 2
 

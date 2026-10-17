@@ -25,6 +25,7 @@ impl RunExecutor for DispatchHeld {
         let call = ToolCallId("shutdown-call".into());
         let batch = BatchId("shutdown-batch".into());
         job.writer.record(WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -529,6 +530,7 @@ async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
     let (reply, rx) = oneshot::channel();
     handle
         .send(LineageCmd::Send {
+            session_class: None,
             retention: None,
             stop_sequences_named: false,
             title: None,
@@ -610,6 +612,7 @@ async fn shutdown_rejects_new_admission() {
     let (reply, rx) = oneshot::channel();
     handle
         .send(LineageCmd::Send {
+            session_class: None,
             retention: None,
             stop_sequences_named: false,
             title: None,

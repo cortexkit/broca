@@ -197,6 +197,10 @@ pub enum WalRecord {
         /// record a shorter value; absence leaves the lineage's policy unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retention: Option<u64>,
+        /// Session label frozen at the first send and repeated on later episodes.
+        /// Readers must understand it before admitting another send into the session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_class: Option<String>,
         /// Boxed — `RunConfig` is large and dwarfs every other variant; boxing
         /// keeps `WalRecord` small (this record is once-per-run, off the hot path).
         config: Box<RunConfig>,
@@ -1024,8 +1028,20 @@ impl WalRecord {
             WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
             _ => None,
         };
-        if scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some()) {
+        let base = if scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some())
+        {
             agent_run_features(base)
+        } else {
+            base
+        };
+        if matches!(
+            self,
+            WalRecord::RunStarted {
+                session_class: Some(_),
+                ..
+            }
+        ) {
+            session_class_features(base)
         } else {
             base
         }
@@ -1289,6 +1305,57 @@ fn agent_run_features(base: &[&str]) -> &'static [&'static str] {
         mask | (1 << bit)
     });
     let set = &AGENT_RUN_FEATURE_SETS[mask];
+    &set.names[..set.len]
+}
+
+// Precompute the possible feature-name combinations so append discovers them without allocating.
+const CLASS_BASE_FEATURES: [&str; 7] = [
+    crate::framing::AGENT_RUN_SCOPE_FEATURE,
+    crate::framing::DEFERRED_CALL_FEATURE,
+    crate::framing::FLOW_SCOPE_FEATURE,
+    crate::framing::PLAN_MANIFEST_FEATURE,
+    crate::framing::RETENTION_FEATURE,
+    crate::framing::SCOPE_FEATURE,
+    crate::framing::STEP_TRANSFORMS_FEATURE,
+];
+struct ClassFeatures {
+    names: [&'static str; 8],
+    len: usize,
+}
+static CLASS_FEATURE_SETS: [ClassFeatures; 128] = {
+    let mut sets = [const {
+        ClassFeatures {
+            names: [""; 8],
+            len: 0,
+        }
+    }; 128];
+    let mut mask = 0;
+    while mask < sets.len() {
+        let mut bit = 0;
+        while bit < CLASS_BASE_FEATURES.len() {
+            if bit == 6 {
+                sets[mask].names[sets[mask].len] = crate::framing::SESSION_CLASS_FEATURE;
+                sets[mask].len += 1;
+            }
+            if mask & (1 << bit) != 0 {
+                sets[mask].names[sets[mask].len] = CLASS_BASE_FEATURES[bit];
+                sets[mask].len += 1;
+            }
+            bit += 1;
+        }
+        mask += 1;
+    }
+    sets
+};
+fn session_class_features(base: &[&str]) -> &'static [&'static str] {
+    let mask = base.iter().fold(0, |mask, name| {
+        let bit = CLASS_BASE_FEATURES
+            .iter()
+            .position(|known| known == name)
+            .expect("classed RunStarted features must be listed");
+        mask | (1 << bit)
+    });
+    let set = &CLASS_FEATURE_SETS[mask];
     &set.names[..set.len]
 }
 
@@ -2118,6 +2185,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2170,6 +2238,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2330,6 +2399,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2381,6 +2451,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2416,6 +2487,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2468,6 +2540,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2524,6 +2597,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -2634,6 +2708,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -2792,6 +2867,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,

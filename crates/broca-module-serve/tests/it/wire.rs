@@ -229,6 +229,7 @@ impl RunExecutor for FakeExec {
         }
         self.started.fetch_add(1, Ordering::SeqCst);
         job.writer.record(broca_wal::WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -348,6 +349,7 @@ impl RunExecutor for ReauthCoreExec {
             config.budget = job.req.budget.clone();
             config.stop_when = job.req.stop_when.clone();
             job.writer.record(WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -403,6 +405,7 @@ impl RunExecutor for ReauthCoreExec {
                 account_decision: None,
             });
             job.writer.record(WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -726,6 +729,7 @@ async fn over_cap_admission_is_typed_and_leaves_no_wal_or_run_index_row() {
     };
     let error = registry
         .send(broca_module::serve::SendRequest {
+            session_class: None,
             retention: None,
             stop_sequences_named: false,
             title: None,
@@ -790,6 +794,7 @@ fn under_cap_request(
 
 fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendRequest {
     SendRequest {
+        session_class: None,
         retention: None,
         stop_sequences_named: false,
         title: None,
@@ -834,6 +839,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
 
 fn budget_send(session: BindIdentity, run_id: &str) -> SendRequest {
     SendRequest {
+        session_class: None,
         retention: None,
         stop_sequences_named: false,
         title: None,
@@ -960,6 +966,7 @@ async fn unresolved_decrement_to_zero_allows_admission_at_the_export_head() {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -5804,6 +5811,7 @@ impl PreparedWalRoute {
                 file.append(
                     1,
                     &WalRecord::RunStarted {
+                        session_class: None,
                         retention: None,
                         hooks: None,
                         title: None,

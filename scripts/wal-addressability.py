@@ -110,9 +110,6 @@ def archived_addresses(wal_dir: pathlib.Path) -> set[str]:
     8:24 and length as <Q at 24, not what I typed. A duplicate parser is also the thing
     that drifts the first time the format moves.
     """
-    directory = wal_dir.parent / "wal-archive"
-    if not directory.exists():
-        return set()
     found: set[str] = set()
     archived_size(wal_dir, "0" * 16, collect=found)
     return found
@@ -126,15 +123,13 @@ def archived_size(
     Headers are the index-recovery authority. Unsealed passes still own live files
     and must not count as reachable archives, even if a complete member is present.
     """
-    directory = wal_dir.parent / "wal-archive"
     paths = []
-    if not directory.exists():
-        return None
-    for path in directory.glob("*.ark"):
-        stamp = path.name.removeprefix("fold-").removesuffix(".ark")
-        if not stamp.isdecimal() or path.name != f"fold-{int(stamp)}.ark":
-            raise ValueError(f"invalid archive filename: {path}")
-        paths.append((int(stamp), path))
+    for name in ("wal-archive", "wal-archive-durable"):
+        for path in (wal_dir.parent / name).glob("*.ark"):
+            stamp = path.name.removeprefix("fold-").removesuffix(".ark")
+            if not stamp.isdecimal() or path.name != f"fold-{int(stamp)}.ark":
+                raise ValueError(f"invalid archive filename: {path}")
+            paths.append((int(stamp), path))
     for _, path in sorted(paths, reverse=True):
         with path.open("rb") as archive:
             size = archive.seek(0, 2)

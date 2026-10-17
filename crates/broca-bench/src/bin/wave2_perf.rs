@@ -426,6 +426,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
     let suffix = format!("projection-{episodes}-{iteration}");
     let writer = fixture.writer.as_ref().expect("writer is present");
     writer.record(WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,
@@ -483,6 +484,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
 
 fn request(session: &BindIdentity, episode: usize) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

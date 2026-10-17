@@ -19,6 +19,7 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

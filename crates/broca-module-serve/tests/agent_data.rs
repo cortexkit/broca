@@ -371,6 +371,7 @@ impl Rig {
 }
 fn started(session: &BindIdentity, run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

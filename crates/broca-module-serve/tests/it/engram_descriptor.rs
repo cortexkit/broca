@@ -27,17 +27,17 @@ fn tracked_descriptor() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("tracked descriptor is not JSON: {e}"))
 }
 
-/// The backup descriptor declares seven entries. Engram includes only `portable` entries in
+/// The backup descriptor declares nine entries. Engram includes only `portable` entries in
 /// each backup generation; `rebuild`, `device-local` and `excluded` entries are left out.
-/// Only durable sessions are backed up, and none live in today's trees: `wal/` and
-/// `wal-archive/` hold sidekicks, one-shots, consults, masons and other modules' sessions,
-/// which their creators relaunch rather than restore, so both are `excluded`. Retention
+/// Only durable sessions are backed up, in their own trees. `wal/` and
+/// `wal-archive/` hold disposable sessions whose callers relaunch rather than restore
+/// them, so both are `excluded`. Retention
 /// transcripts in `wal-ephemeral/` are `excluded` too: deleting a live WAL cannot remove a
 /// backup that already holds it, so a retained session must never be captured. Billing does
-/// not depend on these trees surviving a disk loss: astrocyte ingests every export fact into
-/// its own backed-up store within seconds.
+/// not depend on these trees surviving a disk loss: the billing collector ingests export
+/// facts into its own backed-up store.
 #[test]
-fn the_tracked_descriptor_declares_brocas_seven_entries_with_their_classes() {
+fn the_tracked_descriptor_declares_brocas_nine_entries_with_their_classes() {
     let d = tracked_descriptor();
     assert_eq!(d["module_id"], "broca");
 
@@ -66,6 +66,8 @@ fn the_tracked_descriptor_declares_brocas_seven_entries_with_their_classes() {
         // than grow a taxonomy for one instance. If a producer ever returns, its contract is
         // written first and this row changes with it.
         ("broca/caps", "rebuild", "whole-db"),
+        ("broca/durable-wals", "portable", "filetree"),
+        ("broca/durable-archive", "portable", "filetree"),
         ("broca/ephemeral-wals", "excluded", "filetree"),
         ("broca/leases", "device-local", "filetree"),
         ("broca/request-dumps", "device-local", "filetree"),
@@ -84,22 +86,21 @@ fn the_tracked_descriptor_declares_brocas_seven_entries_with_their_classes() {
          captures, so this must be a deliberate edit rather than a surprise"
     );
 
-    // The captured set, stated as its own assertion because it is the fact a machine-loss
-    // runbook depends on. It is empty until durable sessions get a tree of their own; a
-    // session tree turning portable again would back up thousands of single-use sessions.
-    let portable: Vec<&str> = entries
+    // Pin the captured entries independently: making wal/ or wal-archive/ portable
+    // would silently include disposable sessions in every backup generation.
+    let mut portable: Vec<&str> = entries
         .iter()
         .filter(|e| e["class"] == "portable")
         .filter_map(|e| e["entry_id"].as_str())
         .collect();
-    assert!(
-        portable.is_empty(),
-        "the captured set changed to {portable:?}; only a durable-session tree may be portable"
-    );
+    portable.sort();
+    assert_eq!(portable, ["broca/durable-archive", "broca/durable-wals"]);
     for (id, path) in [
         ("broca/session-wals", "wal"),
         ("broca/session-archive", "wal-archive"),
         ("broca/ephemeral-wals", "wal-ephemeral"),
+        ("broca/durable-wals", "wal-durable"),
+        ("broca/durable-archive", "wal-archive-durable"),
     ] {
         let entry = entries.iter().find(|e| e["entry_id"] == id).unwrap();
         assert_eq!(entry["path"], path, "{id} must describe `{path}/`");

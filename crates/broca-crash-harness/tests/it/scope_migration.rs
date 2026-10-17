@@ -271,6 +271,7 @@ fn owner_send() -> SendRequest {
     let mut request = adopt.to_submission();
     request.scope = stamped();
     SendRequest {
+        session_class: None,
         retention: None,
         stop_sequences_named: false,
         title: None,

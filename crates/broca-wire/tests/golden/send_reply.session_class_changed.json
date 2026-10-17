@@ -1,0 +1,1 @@
+{"code":"invalid_params","detail":{"field":"session_class"},"message":"session_class differs from the session's first send"}

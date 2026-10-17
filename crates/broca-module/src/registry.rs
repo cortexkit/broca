@@ -154,6 +154,7 @@ pub enum OpenError {
         expired_at_ms: u64,
     },
     RetentionInvalid(crate::retention::InvalidRetention),
+    SessionClassInvalid(String),
     /// The session's lease is held by another live writer (another process/host).
     LeaseHeld(String),
     /// The lease store / WAL / replay failed while opening.
@@ -216,6 +217,7 @@ impl std::fmt::Display for OpenError {
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             OpenError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
+            OpenError::SessionClassInvalid(message) => f.write_str(message),
             OpenError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
             OpenError::Open(s)
             | OpenError::Classified { reason: s, .. }
@@ -409,6 +411,9 @@ pub trait LineageOpener: Send + Sync {
     fn compaction_supported(&self) -> bool {
         false
     }
+    fn backup_classes(&self) -> Vec<String> {
+        vec!["head".into()]
+    }
 
     /// Open the actor for `key`, registering it under `gen`. The opener gives the actor a
     /// [`RegistryHandle`] (so the actor's close/finalizer can transition its own slot) and
@@ -424,6 +429,17 @@ pub trait LineageOpener: Send + Sync {
             return Err(OpenError::Open("retention opener is not configured".into()));
         }
         self.open(key, gen, registry).await
+    }
+    async fn open_with_class(
+        &self,
+        key: &LineageKey,
+        gen: u64,
+        registry: RegistryHandle,
+        retention: Option<u64>,
+        _session_class: Option<String>,
+    ) -> Result<ActorHandle, OpenError> {
+        self.open_with_retention(key, gen, registry, retention)
+            .await
     }
     /// File-backed implementations classify status under the same session lease used
     /// for opening, and must refuse expired retained history without creating a writer.
@@ -849,6 +865,9 @@ impl LineageRegistry {
 
     pub fn compaction_supported(&self) -> bool {
         self.inner.opener.compaction_supported()
+    }
+    pub fn backup_classes(&self) -> Vec<String> {
+        self.inner.opener.backup_classes()
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
@@ -1299,13 +1318,14 @@ impl LineageRegistry {
         key: &LineageKey,
         retention: Option<u64>,
     ) -> Result<ActorHandle, OpenError> {
-        self.actor_for_mode(key, retention, false).await
+        self.actor_for_mode(key, retention, None, false).await
     }
 
     async fn actor_for_mode(
         &self,
         key: &LineageKey,
         retention: Option<u64>,
+        session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
         self.check_move(key, true)?;
@@ -1390,7 +1410,13 @@ impl LineageRegistry {
                     } else {
                         self.inner
                             .opener
-                            .open_with_retention(key, gen, self.handle(), retention)
+                            .open_with_class(
+                                key,
+                                gen,
+                                self.handle(),
+                                retention,
+                                session_class.clone(),
+                            )
                             .await
                     };
                     {
@@ -1431,7 +1457,7 @@ impl LineageRegistry {
     ) -> Result<crate::actor::SendOutcome, OpenError> {
         let run_id = req.run_id.clone();
         // Internal callers provide a stable explicit run id and use this helper's retry semantics.
-        self.route_submission_with_retention(
+        self.route_submission_with_class(
             key,
             run_id,
             req.to_submission(),
@@ -1443,6 +1469,7 @@ impl LineageRegistry {
             None,
             req.title.clone(),
             req.retention,
+            req.session_class.clone(),
             false,
         )
         .await
@@ -1600,13 +1627,55 @@ impl LineageRegistry {
         retention: Option<u64>,
         stop_sequences_named: bool,
     ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_class(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            retention,
+            None,
+            stop_sequences_named,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_class(
+        &self,
+        key: &LineageKey,
+        run_id: RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<crate::actor::SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        stop_sequences_named: bool,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
         use crate::actor::{LineageCmd, SendOutcome};
+        if let Some(class) = &session_class {
+            broca_protocol::request::validate_session_class(class)
+                .map_err(|message| OpenError::SessionClassInvalid(message.into()))?;
+        }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
         loop {
-            let handle = self.actor_for_retention(key, retention).await?;
+            let handle = self
+                .actor_for_mode(key, retention, session_class.clone(), false)
+                .await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Send {
+                session_class: session_class.clone(),
                 retention,
                 stop_sequences_named,
                 conversation_key: conversation_key.clone(),
@@ -2793,7 +2862,7 @@ impl LineageRegistry {
         }
         use crate::actor::{LineageCmd, LineageStatus};
         loop {
-            let handle = self.actor_for_mode(key, None, true).await?;
+            let handle = self.actor_for_mode(key, None, None, true).await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             if handle.send(LineageCmd::Status { reply }).await.is_err() {
                 continue;
@@ -3261,9 +3330,9 @@ impl LineageRegistry {
                         OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. } => {
                             sweep.not_live += 1;
                         }
-                        OpenError::Expired { .. } | OpenError::RetentionInvalid(_) => {
-                            sweep.open_failed += 1
-                        }
+                        OpenError::Expired { .. }
+                        | OpenError::RetentionInvalid(_)
+                        | OpenError::SessionClassInvalid(_) => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
                         OpenError::Open(reason)
                         | OpenError::Classified { reason, .. }
@@ -4321,6 +4390,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

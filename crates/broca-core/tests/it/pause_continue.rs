@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -113,6 +114,7 @@ fn edit_tool() -> Tool {
 
 fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,
@@ -159,6 +161,7 @@ fn seed_resume_without_terminal(
     let mut seeded = FileWal::open(wal.wal_path(session)).expect("open wal");
     let recs = vec![
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

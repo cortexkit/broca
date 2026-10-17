@@ -22,7 +22,7 @@ from unittest import mock
 from lib.archive_read import ArchiveRefusal, logical_wals, read_lineage_id, read_records
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
-EXPECTED_SUITE_ANCHORS = 16
+EXPECTED_SUITE_ANCHORS = 17
 OLD = uuid.UUID("00000000-0000-4000-8000-000000000001")
 PORTABLE = uuid.UUID("00000000-0000-4000-8000-000000000002")
 EPHEMERAL = uuid.UUID("00000000-0000-4000-8000-000000000003")
@@ -181,6 +181,16 @@ class RetentionReaders(unittest.TestCase):
                     self.assertIn("migratable                       2", out)
                     self.assertIn("rows with no WAL on disk         0", out)
                     self.assertIn("tombstoned WALs left untouched   1", out)
+
+    def test_all_seven_readers_find_durable_live_wals(self):
+        durable = self.root / "wal-durable"
+        durable.mkdir()
+        source = self.paths["portable"]
+        source.rename(durable / source.name)
+        self.paths["portable"] = durable / source.name
+        self.assertEqual({p.name for p in logical_wals(self.root / "wal")},
+                         {self.paths[label].name for label in ("portable", "ephemeral")})
+        self.assert_live_results()
 
     def test_all_seven_readers_select_only_live_lineages(self):
         self.assert_live_results()

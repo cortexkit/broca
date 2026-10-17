@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, Notify};
 fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
@@ -294,6 +295,7 @@ impl LineageOpener for FreeOpener {
 
 fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
     RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

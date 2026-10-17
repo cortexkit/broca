@@ -67,6 +67,7 @@ fn seed() -> Vec<Message> {
 fn start(input: Vec<Message>) -> WalRecord {
     let frozen = anthropic_frozen_config("claude-opus-5-5");
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

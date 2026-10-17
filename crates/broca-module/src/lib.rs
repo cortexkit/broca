@@ -17,6 +17,7 @@ pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod serve;
+pub mod session_class;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
 pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};

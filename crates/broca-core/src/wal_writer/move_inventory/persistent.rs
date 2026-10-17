@@ -408,7 +408,7 @@ fn live_locations(
 ) -> Result<LiveLocations, WalError> {
     let mut live = BTreeMap::new();
     let mut ambiguous = std::collections::BTreeSet::new();
-    for root in [&store.root, &store.ephemeral_root()] {
+    for root in [&store.root, &store.ephemeral_root(), &store.durable_root()] {
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,

@@ -210,8 +210,10 @@ impl WalArchiveConfig {
 /// own start time, so a tree that has never folded waits a full interval rather than
 /// folding on the first poll.
 fn last_pass(root: &Path) -> Option<SystemTime> {
-    let newest = std::fs::read_dir(root.join("wal-archive"))
-        .ok()?
+    let newest = ["wal-archive", "wal-archive-durable"]
+        .into_iter()
+        .filter_map(|name| std::fs::read_dir(root.join(name)).ok())
+        .flatten()
         .filter_map(|entry| {
             let path = entry.ok()?.path();
             if !path
@@ -418,6 +420,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    session_class: None,
                     retention: None,
                     hooks: None,
                     title: None,
@@ -753,6 +756,7 @@ mod identity_tests {
         wal.append(
             1,
             &broca_wal::WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,

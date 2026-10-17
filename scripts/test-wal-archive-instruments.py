@@ -40,6 +40,15 @@ def container(*members, sealed=True):
 
 
 class ArchiveInstruments(unittest.TestCase):
+    def test_durable_archive_is_reachable_without_ordinary_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            archive = root / "wal-archive-durable"
+            archive.mkdir()
+            addr = "1234567890abcdef"
+            (archive / "fold-10.ark").write_bytes(container((addr, b"durable transcript")))
+            self.assertEqual(wa.archived_addresses(root / "wal"), {addr})
+            self.assertEqual(wa.archived_size(root / "wal", addr), len(b"durable transcript"))
     def test_store_named_archived_session_reachable_and_container_never_swept(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

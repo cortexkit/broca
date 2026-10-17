@@ -26,6 +26,7 @@ async fn replay_before_run_finished_preserves_live_max_steps_reason_for_text_onl
     ));
     let session = BindIdentity::new(&dir, "terminal-reason", "s1");
     let request = RunRequest {
+        session_class: None,
         retention: None,
         title: None,
         on_restart: None,

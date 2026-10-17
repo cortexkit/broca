@@ -23,10 +23,50 @@ use std::{
 const COLD_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 const MAX_BYTES: u64 = broca_wal::file_wal::DEFAULT_MAX_READ_BYTES;
 
+#[derive(Clone, Copy)]
+enum Tree {
+    Ordinary,
+    Durable,
+}
+impl Tree {
+    fn resume_name(self, name: &str) -> String {
+        if matches!(self, Self::Durable) {
+            format!("wal-archive-durable/{name}")
+        } else {
+            name.into()
+        }
+    }
+    fn live(self, root: &Path) -> PathBuf {
+        root.join(match self {
+            Self::Ordinary => "wal",
+            Self::Durable => "wal-durable",
+        })
+    }
+    fn archive(self, root: &Path) -> PathBuf {
+        root.join(match self {
+            Self::Ordinary => "wal-archive",
+            Self::Durable => "wal-archive-durable",
+        })
+    }
+    fn for_journal(journal: &Journal) -> Self {
+        if journal
+            .path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "wal-archive-durable")
+        {
+            Self::Durable
+        } else {
+            Self::Ordinary
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct FoldOptions {
     pub write: bool,
-    /// Canonical journal basename, never an arbitrary filesystem path.
+    /// Canonical journal basename, optionally prefixed with `wal-archive-durable/`.
+    /// Other directory prefixes and arbitrary filesystem paths are refused.
     pub resume: Option<String>,
     /// Explicitly record abandonment, including any missing live sources.
     pub abandon: bool,
@@ -370,11 +410,13 @@ fn journal_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
 /// canonical basename, so this hands back exactly what the option wants and nothing that
 /// would let a caller reach into pass state it should not touch.
 pub fn unfinished_pass(root: &Path) -> io::Result<Option<String>> {
-    Ok(unfinished(&root.join("wal-archive"))?
-        .first()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .map(str::to_owned))
+    for tree in [Tree::Ordinary, Tree::Durable] {
+        if let Some(path) = unfinished(&tree.archive(root))?.first() {
+            let name = path.file_name().unwrap().to_string_lossy();
+            return Ok(Some(tree.resume_name(&name)));
+        }
+    }
+    Ok(None)
 }
 
 fn unfinished(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -453,9 +495,76 @@ fn run_with_threshold(
     identities: &BTreeMap<String, BindIdentity>,
     cold_ms: u64,
 ) -> io::Result<FoldReport> {
-    if !root.join("wal").is_dir() {
-        return Err(invalid("state root must contain wal/"));
+    if let Some(name) = options
+        .resume
+        .as_deref()
+        .and_then(|name| name.strip_prefix("wal-archive-durable/"))
+    {
+        let options = FoldOptions {
+            resume: Some(name.into()),
+            write: options.write,
+            abandon: options.abandon,
+            unfold: options.unfold,
+        };
+        return run_tree(
+            root,
+            &options,
+            start,
+            boundary,
+            identities,
+            cold_ms,
+            Tree::Durable,
+        );
     }
+    if options.resume.is_some() {
+        return run_tree(
+            root,
+            options,
+            start,
+            boundary,
+            identities,
+            cold_ms,
+            Tree::Ordinary,
+        );
+    }
+    if !Tree::Ordinary.live(root).is_dir() && !Tree::Durable.live(root).is_dir() {
+        return Err(invalid("state root must contain wal/ or wal-durable/"));
+    }
+    let mut report = FoldReport::default();
+    // Only durable archives are backed up. A container holding both populations
+    // would either back up disposable sessions or omit durable ones.
+    for tree in [Tree::Ordinary, Tree::Durable] {
+        if !tree.live(root).is_dir() {
+            continue;
+        }
+        let next = run_tree(root, options, start, boundary, identities, cold_ms, tree)?;
+        report.candidates.extend(next.candidates);
+        for (reason, sessions) in next.skipped {
+            report.skipped.entry(reason).or_default().extend(sessions);
+        }
+        report.removed += next.removed;
+        report.restored += next.restored;
+        report.superseded += next.superseded;
+        if next.journal.is_some() {
+            report.journal = next.journal;
+        }
+        report.resolved_from_store.extend(next.resolved_from_store);
+        report.cold_pre_schema.extend(next.cold_pre_schema);
+        report.permanent_skip_notice = report.permanent_skip_notice.or(next.permanent_skip_notice);
+    }
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tree(
+    root: &Path,
+    options: &FoldOptions,
+    start: u64,
+    boundary: &mut dyn FnMut(&Path) -> io::Result<()>,
+    identities: &BTreeMap<String, BindIdentity>,
+    cold_ms: u64,
+    tree: Tree,
+) -> io::Result<FoldReport> {
     if options.unfold && (options.resume.is_none() || options.abandon) {
         return Err(invalid(
             "--unfold requires --resume and cannot combine with --abandon",
@@ -464,7 +573,7 @@ fn run_with_threshold(
     if options.abandon && options.resume.is_none() {
         return Err(invalid("--abandon requires --resume"));
     }
-    let dir = root.join("wal-archive");
+    let dir = tree.archive(root);
     let _pass = if options.write {
         Some(acquire_archive_pass(root).map_err(|e| match e {
             LeaseError::Held { .. } => {
@@ -480,7 +589,8 @@ fn run_with_threshold(
     let mut report = FoldReport::default();
     if let Some(name) = &options.resume {
         let mut journal = Journal::load(journal_path(&dir, name)?)?;
-        report.journal = Some(name.clone());
+        let resume_name = tree.resume_name(name);
+        report.journal = Some(resume_name.clone());
         let ark = journal.path.with_extension("ark");
         if options.unfold {
             return unfold(root, &journal, &ark, options.write);
@@ -515,7 +625,7 @@ fn run_with_threshold(
                 }
             }
             drop(_pass);
-            return run_with_threshold(
+            return run_tree(
                 root,
                 &FoldOptions {
                     write: options.write,
@@ -525,6 +635,7 @@ fn run_with_threshold(
                 boundary,
                 identities,
                 cold_ms,
+                tree,
             );
         }
         if options.abandon {
@@ -532,7 +643,7 @@ fn run_with_threshold(
             for addr in journal.latest().keys() {
                 live_present.insert(
                     addr.clone(),
-                    live_bytes(&root.join("wal").join(format!("{addr}.wal")))?.is_some(),
+                    live_bytes(&tree.live(root).join(format!("{addr}.wal")))?.is_some(),
                 );
             }
             for (addr, present) in &live_present {
@@ -566,11 +677,11 @@ fn run_with_threshold(
             Err(error) => {
                 let mut missing = Vec::new();
                 for addr in journal.latest().keys() {
-                    if live_bytes(&root.join("wal").join(format!("{addr}.wal")))?.is_none() {
+                    if live_bytes(&tree.live(root).join(format!("{addr}.wal")))?.is_none() {
                         missing.push(addr.clone());
                     }
                 }
-                return Err(invalid(format!("cannot resume {}: {error}. Missing live sessions: {missing:?}. If the container is gone these sessions have LOST DATA. --resume {name} --abandon --write records explicit abandonment without deleting evidence", ark.display())));
+                return Err(invalid(format!("cannot resume {}: {error}. Missing live sessions: {missing:?}. If the container is gone these sessions have LOST DATA. --resume {resume_name} --abandon --write records explicit abandonment without deleting evidence", ark.display())));
             }
         };
         if reader.state()? == ContainerState::Sealed {
@@ -588,14 +699,14 @@ fn run_with_threshold(
             return Ok(report);
         }
         if !options.write {
-            return preview(root, start, identities, cold_ms);
+            return preview(root, start, identities, cold_ms, tree);
         }
         // No source was unlinked before the seal. Retire this attempt and start
         // from live bytes with a FRESH stamp: rebuilding under the old start time
         // could lose precedence to a stale member from a later interrupted pass.
         // Keep the retired journal as evidence rather than deleting its history.
         for addr in journal.latest().keys() {
-            if live_bytes(&root.join("wal").join(format!("{addr}.wal")))?.is_none() {
+            if live_bytes(&tree.live(root).join(format!("{addr}.wal")))?.is_none() {
                 return Err(invalid(format!("unsealed pass {} has missing live session {addr}; refusing to discard potentially recoverable bytes. Repair the container or explicitly --abandon after investigation", ark.display())));
             }
         }
@@ -604,10 +715,10 @@ fn run_with_threshold(
         sync_dir(&dir)?;
     }
     if !options.write {
-        return preview(root, start, identities, cold_ms);
+        return preview(root, start, identities, cold_ms, tree);
     }
     if let Some(path) = unfinished(&dir)?.first() {
-        return Err(invalid(format!("unfinished archive pass {}; use --resume {} (or explicit --abandon) before starting another", path.display(), path.file_name().unwrap().to_string_lossy())));
+        return Err(invalid(format!("unfinished archive pass {}; use --resume {} (or explicit --abandon) before starting another", path.display(), tree.resume_name(&path.file_name().unwrap().to_string_lossy()))));
     }
     broca_owner_only::create_dir_all(&dir)?;
     sync_dir(root)?;
@@ -638,7 +749,7 @@ fn run_with_threshold(
     let ark = journal.path.with_extension("ark");
     let mut writer = None;
     let leases = FileLeaseStore::new(root.join("leases"));
-    for path in wal_paths(root)? {
+    for path in wal_paths(root, tree)? {
         let addr = path.file_stem().unwrap().to_string_lossy().into_owned();
         let Some(bytes) = live_bytes(&path)? else {
             report.skip("missing", &addr);
@@ -729,22 +840,14 @@ fn run_with_threshold(
             hook();
         }
     });
-    report.journal = Some(
-        journal
-            .path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned(),
-    );
+    report.journal = Some(tree.resume_name(&journal.path.file_name().unwrap().to_string_lossy()));
     finish(root, &mut journal, &ark, true, &mut report, boundary)?;
     Ok(report)
 }
-fn wal_paths(root: &Path) -> io::Result<Vec<PathBuf>> {
+fn wal_paths(root: &Path, tree: Tree) -> io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    // Only portable WALs may enter archives. Ephemeral content must never enter
-    // a backup, even when it is cold but has not yet reached its retention deadline.
-    for entry in fs::read_dir(root.join("wal"))? {
+    // Retained WALs never enter either archive, even before their deletion deadline.
+    for entry in fs::read_dir(tree.live(root))? {
         let entry = entry?;
         if entry.path().extension().is_some_and(|e| e == "wal") && entry.file_type()?.is_file() {
             if entry.path().with_extension("moving").try_exists()?
@@ -763,9 +866,10 @@ fn preview(
     start: u64,
     identities: &BTreeMap<String, BindIdentity>,
     cold_ms: u64,
+    tree: Tree,
 ) -> io::Result<FoldReport> {
     let mut report = FoldReport::default();
-    for path in wal_paths(root)? {
+    for path in wal_paths(root, tree)? {
         let addr = path.file_stem().unwrap().to_string_lossy().into_owned();
         let Some(bytes) = live_bytes(&path)? else {
             report.skip("missing", &addr);
@@ -862,7 +966,9 @@ fn finish(
         if digest(&member.payload) != before {
             return Err(invalid(format!("journal/member digest mismatch: {addr}")));
         }
-        let path = root.join("wal").join(format!("{addr}.wal"));
+        let path = Tree::for_journal(journal)
+            .live(root)
+            .join(format!("{addr}.wal"));
         let state = match live_bytes(&path)? {
             Some(bytes) if digest(&bytes) != before => {
                 report.superseded += 1;
@@ -870,7 +976,7 @@ fn finish(
             }
             Some(_) => {
                 fs::remove_file(&path).map_err(at(&path))?;
-                sync_dir(&root.join("wal"))?;
+                sync_dir(&Tree::for_journal(journal).live(root))?;
                 report.removed += 1;
                 State::Done
             }
@@ -997,7 +1103,9 @@ fn unfold(root: &Path, journal: &Journal, ark: &Path, write: bool) -> io::Result
                 session_addr
             )));
         }
-        let path = root.join("wal").join(format!("{}.wal", session_addr));
+        let path = Tree::for_journal(journal)
+            .live(root)
+            .join(format!("{}.wal", session_addr));
         if let Some(bytes) = live_bytes(&path)? {
             if digest(&bytes) != *before {
                 return Err(invalid(format!(
@@ -1023,7 +1131,7 @@ fn unfold(root: &Path, journal: &Journal, ark: &Path, write: bool) -> io::Result
         file.write_all(&member.payload)?;
         file.sync_all()?;
         fs::rename(&temp, &path)?;
-        sync_dir(&root.join("wal"))?;
+        sync_dir(&Tree::for_journal(journal).live(root))?;
         report.restored += 1;
     }
     Ok(report)

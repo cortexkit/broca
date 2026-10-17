@@ -1775,6 +1775,7 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -2124,6 +2125,7 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                session_class: None,
                 retention: None,
                 hooks: None,
                 title: None,
@@ -2810,6 +2812,7 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,

@@ -48,6 +48,7 @@ fn terminal() -> WalRecord {
 
 fn started(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        session_class: None,
         retention: None,
         hooks: None,
         title: None,

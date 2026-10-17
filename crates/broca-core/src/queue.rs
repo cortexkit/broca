@@ -358,6 +358,7 @@ mod tests {
 
     fn consumed(run: &str, sub: &str) -> WalRecord {
         WalRecord::RunStarted {
+            session_class: None,
             retention: None,
             hooks: None,
             title: None,
