@@ -4239,7 +4239,73 @@ async fn transcript_reply_body_budget_applies_to_tail_range_and_large_requests()
 }
 
 #[tokio::test]
-async fn imported_message_larger_than_three_mib_is_served_whole() {
+async fn model_view_pages_fit_the_serialized_wire_reply_and_continue_exactly() {
+    let rig = crate::common::Rig::new(
+        "model-read-reply-budget",
+        crate::common::FakeExecutor::auto(),
+        Duration::from_secs(3600),
+    );
+    let key = rig.key("session");
+    let messages: Vec<_> = (0..3)
+        .map(|_| {
+            Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "x".repeat(1_250_000),
+                }],
+            )
+        })
+        .collect();
+    rig.registry
+        .import(SessionImportRequest {
+            project_id: None,
+            principal: None,
+            session: key.clone(),
+            run_id: RunId("import-model-budget".into()),
+            messages: messages.clone(),
+            source_ref: "fixture:model-read-budget".into(),
+        })
+        .await
+        .unwrap();
+
+    let first = rig
+        .registry
+        .read_model(SessionReadRequest::new(key.clone(), Some(0), Some(100)))
+        .await
+        .unwrap();
+    assert_eq!(first.messages.len(), 2);
+    assert_eq!(first.next_from_ordinal, Some(2));
+    assert!(serde_json::to_vec(&first).unwrap().len() < 3 * 1024 * 1024);
+    for (entry, ordinal) in first.messages.iter().zip(0..2) {
+        assert_eq!(entry.source.from_ordinal(), ordinal);
+        assert_eq!(
+            serde_json::to_value(&entry.message).unwrap(),
+            serde_json::to_value(&messages[ordinal as usize]).unwrap()
+        );
+    }
+
+    let second = rig
+        .registry
+        .read_model(SessionReadRequest::new(
+            key,
+            first.next_from_ordinal,
+            Some(100),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.messages.len(), 1);
+    assert_eq!(second.messages[0].source.from_ordinal(), 2);
+    assert_eq!(
+        serde_json::to_value(&second.messages[0].message).unwrap(),
+        serde_json::to_value(&messages[2]).unwrap()
+    );
+    assert_eq!(second.next_from_ordinal, None);
+    assert!(serde_json::to_vec(&second).unwrap().len() < 3 * 1024 * 1024);
+    drop(rig);
+}
+
+#[tokio::test]
+async fn imported_message_over_page_target_is_served_whole_when_frame_fits() {
     let rig = crate::common::Rig::new(
         "read-oversized-import",
         crate::common::FakeExecutor::auto(),
@@ -4249,7 +4315,7 @@ async fn imported_message_larger_than_three_mib_is_served_whole() {
     let message = Message::new(
         Role::User,
         vec![ContentBlock::Text {
-            text: "x".repeat(4 * 1024 * 1024),
+            text: "x".repeat(3 * 1024 * 1024 + 128),
         }],
     );
     rig.registry
@@ -4274,4 +4340,53 @@ async fn imported_message_larger_than_three_mib_is_served_whole() {
         serde_json::to_value(&message).unwrap()
     );
     assert!(serde_json::to_vec(&response).unwrap().len() > 3 * 1024 * 1024);
+    assert!(
+        broca_wire::serialized_result_frame_bytes(&response) <= broca_wire::SUBC_MAX_FRAME_BYTES
+    );
+}
+
+#[tokio::test]
+async fn imported_message_over_frame_limit_is_refused_with_identity() {
+    let rig = crate::common::Rig::new(
+        "read-oversized-import-frame",
+        crate::common::FakeExecutor::auto(),
+        Duration::from_secs(3600),
+    );
+    let key = rig.key("session");
+    let message = Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "x".repeat(4 * 1024 * 1024),
+        }],
+    );
+    rig.registry
+        .import(SessionImportRequest {
+            project_id: None,
+            principal: None,
+            session: key.clone(),
+            run_id: RunId("import-over-frame".into()),
+            messages: vec![message],
+            source_ref: "fixture:oversized-frame-message".into(),
+        })
+        .await
+        .unwrap();
+    let error = rig
+        .registry
+        .read(SessionReadRequest::new(key.clone(), Some(0), Some(100)))
+        .await
+        .unwrap_err();
+    match error {
+        broca_module::serve::ServeError::ReplyTooLarge {
+            bytes,
+            limit,
+            subject: broca_module::serve::ReplyTooLargeSubject::Message { session, ordinal },
+        } => {
+            assert!(bytes > limit);
+            assert_eq!(limit, broca_wire::SUBC_MAX_FRAME_BYTES);
+            assert_eq!(session, key.session);
+            assert_eq!(ordinal, 0);
+        }
+        other => panic!("expected a frame-size refusal naming the message, got {other:?}"),
+    }
+    drop(rig);
 }

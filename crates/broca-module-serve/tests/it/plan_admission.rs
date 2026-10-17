@@ -1988,7 +1988,11 @@ async fn compaction_daemon(
     (daemon, connection)
 }
 
-async fn apply_scripted_compaction(tag: &str, coverage: Option<Value>) -> (Vec<u8>, Value) {
+async fn apply_scripted_compaction(
+    tag: &str,
+    coverage: Option<Value>,
+    applied_text: &str,
+) -> Result<(Vec<u8>, Value), Value> {
     use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
     let (mut rig, _) = plan_rig(tag).await;
     let (mut daemon, connection) = compaction_daemon(&rig.dir, json!({})).await;
@@ -1997,7 +2001,7 @@ async fn apply_scripted_compaction(tag: &str, coverage: Option<Value>) -> (Vec<u
         "replacement":[{"role":"user", "content":[{"type":"text","text":"initial head"}]}]});
     let mut applied = json!({"answer":"compaction_message", "compaction": {
         "compaction_id":"coverage", "version":2, "range":{"from":0,"to":1},
-        "replacement":[{"role":"user", "content":[{"type":"text","text":"applied head"}]}]
+        "replacement":[{"role":"user", "content":[{"type":"text","text":applied_text}]}]
     }});
     if let Some(coverage) = coverage {
         applied["coverage"] = coverage;
@@ -2049,13 +2053,23 @@ async fn apply_scripted_compaction(tag: &str, coverage: Option<Value>) -> (Vec<u
             .unwrap()
             .declares("compaction")
     );
-    let page = rig
+    let page_reply = rig
         .request(
             7,
             json!({"method":"session.read","params":{"view":"model"}}),
         )
         .await;
-    let page = result(&page);
+    if page_reply.header.ty == FrameType::Error {
+        let refusal = error_body(&page_reply);
+        rig.script.hold_model(false);
+        rig.wait_for_finished(1).await;
+        rig.finish().await;
+        provider.abort();
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+        return Err(refusal);
+    }
+    let page = result(&page_reply);
     assert_eq!(page["compaction_id"], "coverage");
     assert_eq!(page["version"], 2);
     assert_eq!(
@@ -2107,10 +2121,10 @@ async fn apply_scripted_compaction(tag: &str, coverage: Option<Value>) -> (Vec<u
     provider.abort();
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
-    (
+    Ok((
         serde_json::to_vec(&record).unwrap(),
         page["messages"].clone(),
-    )
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2127,16 +2141,48 @@ async fn real_daemon_compaction_apply_mid_turn_model_view_and_coverage_ignore() 
         );
         return;
     }
-    let without = apply_scripted_compaction("compaction-no-coverage", None).await;
+    let without = apply_scripted_compaction("compaction-no-coverage", None, "applied head")
+        .await
+        .unwrap();
     let with = apply_scripted_compaction(
         "compaction-with-coverage",
         Some(json!({"ordinal":0,"end_mid":"m0"})),
+        "applied head",
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(
         with, without,
         "the optional trim hint changes neither durable view bytes nor model input"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_daemon_model_view_refuses_a_group_that_cannot_fit_one_frame() {
+    if !subc_core_bin().exists() {
+        assert!(
+            std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
+            "real daemon required: {:?} is missing",
+            subc_core_bin()
+        );
+        println!(
+            "SKIP real_daemon_model_view_refuses_a_group: {:?} is missing",
+            subc_core_bin()
+        );
+        return;
+    }
+
+    let oversized = "x".repeat(4_194_000);
+    let refusal = apply_scripted_compaction("model-view-over-frame", None, &oversized)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal["code"], broca_wire::REPLY_TOO_LARGE);
+    assert!(refusal["detail"]["bytes"].as_u64().unwrap() > broca_wire::SUBC_MAX_FRAME_BYTES);
+    assert_eq!(refusal["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
+    assert_eq!(refusal["detail"]["atomic_group"]["kind"], "replacement");
+    assert_eq!(refusal["detail"]["atomic_group"]["from_ordinal"], 0);
+    assert_eq!(refusal["detail"]["atomic_group"]["to_ordinal"], 1);
+    assert!(refusal["detail"]["atomic_group"]["session"].is_string());
 }
 
 /// The module a compaction-admission test names as the plan's compaction provider.

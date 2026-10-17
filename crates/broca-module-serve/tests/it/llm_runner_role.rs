@@ -602,6 +602,35 @@ async fn run_result_answers_the_final_text() {
     rig.finish().await;
 }
 
+#[tokio::test]
+async fn run_result_refuses_a_final_message_that_exceeds_the_frame_limit() {
+    use broca_protocol::ContentBlock;
+
+    let mut rig = Rig::start("run-result-frame-limit").await;
+    rig.script.push(&[Step::Blocks(vec![ContentBlock::Text {
+        text: "x".repeat(4 * 1024 * 1024),
+    }])]);
+    let sent = rig.send("large-answer", "answer", None).await;
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+
+    let body = refusal(
+        &call(
+            &mut rig,
+            "run.result",
+            serde_json::json!({"run_id": run_id}),
+        )
+        .await,
+    );
+    assert_eq!(body["code"], broca_wire::REPLY_TOO_LARGE);
+    assert!(body["detail"]["bytes"].as_u64().unwrap() > broca_wire::SUBC_MAX_FRAME_BYTES);
+    assert_eq!(body["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
+    assert_eq!(body["detail"]["message"]["session"], rig.session.session);
+    assert_eq!(body["detail"]["message"]["ordinal"], 1);
+    rig.finish().await;
+}
+
 /// Durable role reads still answer after a closed session is folded, without restoring its WAL.
 #[tokio::test]
 async fn run_result_answers_the_final_text_from_an_archived_session() {

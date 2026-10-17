@@ -19,6 +19,25 @@ use broca_protocol::request::{
 use broca_protocol::{BudgetConfig, DisplayEvent, FinishReason, ToolCallId, Usage};
 use serde::{Deserialize, Serialize};
 
+/// The complete encoded subc frame limit, including its fixed 21-byte header.
+pub const SUBC_MAX_FRAME_BYTES: u64 = 4_194_304;
+
+/// The subc frame header is always 21 bytes. Include it with the JSON body when checking the
+/// transport limit; otherwise a body can fit the limit before framing and exceed it afterward.
+/// This matches `subc_protocol::HEADER_LEN`, defined in `subc-protocol/src/lib.rs:417`.
+pub const SUBC_FRAME_HEADER_BYTES: u64 = 21;
+
+#[derive(Serialize)]
+struct ResultEnvelope<'a, T: Serialize> {
+    result: &'a T,
+}
+
+/// Count a unary JSON reply as the full encoded frame, including its result envelope and header.
+pub fn serialized_result_frame_bytes(result: &impl Serialize) -> u64 {
+    broca_protocol::serialized_json_bytes(&ResultEnvelope { result })
+        .saturating_add(SUBC_FRAME_HEADER_BYTES)
+}
+
 /// A route request: the method name plus its operation-specific params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteRequest {
@@ -578,10 +597,13 @@ pub struct ReadParams {
     /// A byte cap on the page. Transcript reads budget the complete serialized reply body,
     /// with a default and maximum of 3 MiB (3,145,728 bytes); larger requests are capped to
     /// [`READ_MAXIMUM_MAX_BYTES`]. Messages and late approvals share that budget, including all
-    /// metadata and continuation cursors. One message and one late entry, when present, are
-    /// kept whole; oversized atomic items or fixed metadata can therefore exceed the cap.
-    /// Model reads separately budget serialized entries (source plus message), currently with
-    /// a 4 MiB default and 16 MiB maximum, and serve replacement groups whole rather than truncated.
+    /// metadata and continuation cursors. One message and one late entry, when present, are kept
+    /// whole even when they exceed `max_bytes`. The complete encoded frame (including its fixed
+    /// header) is still bounded: `reply_too_large` names the message or atomic group if it cannot
+    /// fit the transport limit.
+    /// Model reads use the same serialized reply-body budget and 3 MiB default/maximum. They
+    /// keep replacement groups and insertion-and-anchor groups whole; a whole group is refused
+    /// only when its complete encoded reply frame exceeds the transport frame limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
     /// Ask for the values a hook replaced on each message it changed. broca runs no hooks yet,

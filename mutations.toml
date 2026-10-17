@@ -10812,6 +10812,55 @@ old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
 new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"
 
 [[control]]
+id = "session-read-model-page-reply-body-budget"
+guards = "model-view pages use the shared 3 MiB full-reply budget rather than the former 4/16 MiB limits"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context/model_page.rs"
+expect_red = ["context::model_page::tests::model_view_budget_counts_sources_and_continuation_metadata"]
+file = "crates/broca-core/src/context/model_page.rs"
+old = '''    let max_bytes = request
+        .max_bytes
+        .unwrap_or(broca_protocol::READ_REPLY_MAX_BYTES)
+        .min(broca_protocol::READ_REPLY_MAX_BYTES);'''
+new = '''    let max_bytes = request
+        .max_bytes
+        .unwrap_or(4 * 1024 * 1024)
+        .min(16 * 1024 * 1024); // NON-VACUITY BREAK'''
+
+[[control]]
+id = "session-read-model-page-keeps-insertion-anchor-group"
+guards = "model-view insertions stay with their anchored transcript message"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context/model_page.rs"
+expect_red = ["context::model_page::tests::model_view_insertions_stay_with_their_anchored_message"]
+file = "crates/broca-core/src/context/model_page.rs"
+old = '''        if let Some(insertion) = groups.last_mut().filter(|group| {
+            group.kind == "insertion" && group.anchor == ordinal && group.next_ordinal == ordinal
+        }) {'''
+new = '''        if let Some(insertion) = groups.last_mut().filter(|group| {
+            false && group.kind == "insertion" && group.anchor == ordinal && group.next_ordinal == ordinal
+        }) { // NON-VACUITY BREAK'''
+
+[[control]]
+id = "session-read-refuses-over-frame-whole-message"
+guards = "a complete reply frame over the transport limit is refused with the message identity"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read.rs"
+expect_red = ["session_read::imported_message_over_frame_limit_is_refused_with_identity"]
+file = "crates/broca-module/src/serve.rs"
+old = "    if bytes > broca_wire::SUBC_MAX_FRAME_BYTES {"
+new = "    if bytes > u64::MAX { // NON-VACUITY BREAK"
+
+[[control]]
 id = "serve-reader-authorization-off-ingress"
 guards = "health pings and GOODBYE are read while authorization waits"
 runner = "cargo"
@@ -10900,8 +10949,8 @@ test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
 select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
-old = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {"
-new = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversize tears down connection"
+old = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);\n    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {"
+new = "    let body = serde_json::to_vec(&envelope).map_err(|e| ServeIoError(e.to_string()))?;\n    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);\n    if false && frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize { // NON-VACUITY BREAK: frame oversize loses its call"
 
 [[control]]
 id = "serve-oversized-error-is-call-local"
@@ -10913,8 +10962,8 @@ test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::oversized_response_fails_only_its_call_and_sibling_completes"]
 select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
-old = "    if body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize {\n        body = serde_json::to_vec(&ErrorBody::new("
-new = "    if false && body.len() > subc_protocol::MAX_FRAME_BODY_LEN as usize { // NON-VACUITY BREAK: oversized error tears down connection\n        body = serde_json::to_vec(&ErrorBody::new("
+old = "    if body.len().saturating_add(subc_protocol::HEADER_LEN)\n        > broca_wire::SUBC_MAX_FRAME_BYTES as usize\n    {\n        body = serde_json::to_vec(&ErrorBody::new("
+new = "    if false && body.len().saturating_add(subc_protocol::HEADER_LEN)\n        > broca_wire::SUBC_MAX_FRAME_BYTES as usize\n    { // NON-VACUITY BREAK: oversized error loses its call\n        body = serde_json::to_vec(&ErrorBody::new("
 
 [[control]]
 id = "serve-write-reset-is-classified-close"

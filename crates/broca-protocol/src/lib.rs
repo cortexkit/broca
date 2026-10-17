@@ -19,6 +19,25 @@ pub const STEP_TRANSFORM_HOOK_CAP: u64 = 30_000;
 /// Shared `session.read` reply-body budget: 3 MiB, before transport framing.
 pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;
 
+/// Count the exact bytes a value occupies as compact JSON without building a second body buffer.
+/// Serialization failures return `u64::MAX`, which callers treat as over budget.
+pub fn serialized_json_bytes(value: &impl serde::Serialize) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_or(u64::MAX, |()| count.0)
+}
+
 pub mod approval;
 pub mod caller;
 pub mod canonical;

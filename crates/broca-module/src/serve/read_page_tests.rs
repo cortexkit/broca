@@ -67,7 +67,13 @@ fn reply_body_cap_includes_envelope_for_tail_and_range() {
     assert!(serde_json::to_vec(&original).unwrap().len() > THREE_MIB);
     for tail in [false, true] {
         let mut capped = original.clone();
-        cap_page_bytes(&mut capped, broca_wire::READ_DEFAULT_MAX_BYTES, tail);
+        cap_page_bytes(
+            &mut capped,
+            broca_wire::READ_DEFAULT_MAX_BYTES,
+            tail,
+            "test-session",
+        )
+        .unwrap();
         assert!(serde_json::to_vec(&capped).unwrap().len() < THREE_MIB);
         let kept = usize::from(tail);
         assert_eq!(capped.messages, original.messages[kept..kept + 1]);
@@ -83,10 +89,10 @@ fn exact_reply_boundary_includes_changed_range_cursor() {
     expected.next_from_ordinal = Some(11);
     let bytes = serde_json::to_vec(&expected).unwrap().len() as u64;
     let mut fits = original.clone();
-    cap_page_bytes(&mut fits, bytes + 1, false);
+    cap_page_bytes(&mut fits, bytes + 1, false, "test-session").unwrap();
     assert_eq!(fits, expected);
     let mut boundary = original;
-    cap_page_bytes(&mut boundary, bytes, false);
+    cap_page_bytes(&mut boundary, bytes, false, "test-session").unwrap();
     assert_eq!(boundary.messages.len(), 1);
     assert_eq!(boundary.next_from_ordinal, Some(10));
     assert!(serde_json::to_vec(&boundary).unwrap().len() < bytes as usize);
@@ -101,7 +107,7 @@ fn late_only_reply_counts_envelope_and_continuation_cursor() {
     expected.next_late_after = Some("l:\"9".into());
     let bytes = serde_json::to_vec(&expected).unwrap().len() as u64;
     let mut capped = original;
-    cap_page_bytes(&mut capped, bytes + 1, false);
+    cap_page_bytes(&mut capped, bytes + 1, false, "test-session").unwrap();
     assert_eq!(capped, expected);
     assert!(serde_json::to_vec(&capped).unwrap().len() < (bytes + 1) as usize);
 }
@@ -117,7 +123,7 @@ fn messages_and_late_entries_share_one_reply_budget() {
     expected.next_late_after = Some("l:1".into());
     let cap = serde_json::to_vec(&expected).unwrap().len() as u64 + 1;
     let mut capped = original;
-    cap_page_bytes(&mut capped, cap, false);
+    cap_page_bytes(&mut capped, cap, false, "test-session").unwrap();
     assert_eq!(capped, expected);
     assert!(serde_json::to_vec(&capped).unwrap().len() < cap as usize);
 }
@@ -126,18 +132,18 @@ fn messages_and_late_entries_share_one_reply_budget() {
 fn oversized_atomic_items_and_fixed_metadata_are_not_truncated() {
     let original = page(vec![message(0, THREE_MIB + 1)]);
     let mut capped = original.clone();
-    cap_page_bytes(&mut capped, THREE_MIB as u64, false);
+    cap_page_bytes(&mut capped, THREE_MIB as u64, false, "test-session").unwrap();
     assert_eq!(capped, original);
     assert!(serde_json::to_vec(&capped).unwrap().len() > THREE_MIB);
 
     let mut original = page(Vec::new());
     original.late_approvals = Some(vec![late("l:1", THREE_MIB + 1)]);
     let mut capped = original.clone();
-    cap_page_bytes(&mut capped, THREE_MIB as u64, false);
+    cap_page_bytes(&mut capped, THREE_MIB as u64, false, "test-session").unwrap();
     assert_eq!(capped, original);
 
     let original = page(Vec::new());
     let mut capped = original.clone();
-    cap_page_bytes(&mut capped, 1, false);
+    cap_page_bytes(&mut capped, 1, false, "test-session").unwrap();
     assert_eq!(capped, original, "unpaged tools and metadata stay whole");
 }
