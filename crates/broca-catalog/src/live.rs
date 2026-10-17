@@ -2323,6 +2323,100 @@ mod tests {
         assert_eq!(chatgpt_account_id("only.two"), None);
     }
 
+    /// The full account-id resolution order: a non-blank vault id verbatim, then the top-level
+    /// claim, then the nested `https://api.openai.com/auth` claim, then the first organization id.
+    /// Blank or non-string values fall through, values are never trimmed, and the payload must be
+    /// unpadded base64url JSON.
+    #[test]
+    fn chatgpt_account_id_resolution_order_and_token_shape() {
+        use base64::Engine;
+        let encode = |claims: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).unwrap())
+        };
+        let token =
+            |claims: serde_json::Value| format!("eyJhbGciOiJub25lIn0.{}.sig", encode(claims));
+        let resolve = |vault: Option<&str>, token: &str| {
+            chatgpt_codex_auth(
+                &AuthMode::Bearer(token.to_string()),
+                "openai",
+                Some("ses-1"),
+                vault,
+            )
+            .map(|(handle, _)| {
+                let AuthHandle::Headers(headers) = handle else {
+                    panic!("expected the codex header set");
+                };
+                headers
+                    .into_iter()
+                    .find(|(name, _)| name == "chatgpt-account-id")
+                    .map(|(_, value)| value)
+                    .unwrap()
+            })
+        };
+        let every_shape = token(serde_json::json!({
+            "chatgpt_account_id": "acct-top",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-nested"},
+            "organizations": [{"id": "org-first"}],
+        }));
+        assert_eq!(resolve(None, &every_shape).as_deref(), Ok("acct-top"));
+        assert_eq!(
+            resolve(Some(" acct-vault "), &every_shape).as_deref(),
+            Ok(" acct-vault "),
+            "a vault id wins and is used as served"
+        );
+        let blank_top = token(serde_json::json!({
+            "chatgpt_account_id": " ",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-nested"},
+        }));
+        assert_eq!(resolve(None, &blank_top).as_deref(), Ok("acct-nested"));
+        let numeric_top = token(serde_json::json!({
+            "chatgpt_account_id": 7,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-nested"},
+        }));
+        assert_eq!(resolve(None, &numeric_top).as_deref(), Ok("acct-nested"));
+        let blank_nested = token(serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": ""},
+            "organizations": [{"id": "org-first"}, {"id": "org-second"}],
+        }));
+        assert_eq!(resolve(None, &blank_nested).as_deref(), Ok("org-first"));
+        let blank_first_org = token(serde_json::json!({
+            "organizations": [{"id": ""}, {"id": "org-second"}],
+        }));
+        assert!(
+            resolve(None, &blank_first_org).is_err(),
+            "only the first organization counts"
+        );
+        let untrimmed = token(serde_json::json!({"chatgpt_account_id": " acct "}));
+        assert_eq!(resolve(None, &untrimmed).as_deref(), Ok(" acct "));
+        let unsigned = format!(
+            "eyJhbGciOiJub25lIn0.{}",
+            encode(serde_json::json!({"chatgpt_account_id": "acct-unsigned"}))
+        );
+        assert_eq!(resolve(None, &unsigned).as_deref(), Ok("acct-unsigned"));
+        // `{"chatgpt_account_id":"acct"}` is 29 bytes, so its padded encodings end in `=`.
+        let claims = br#"{"chatgpt_account_id":"acct"}"#;
+        for payload in [
+            base64::engine::general_purpose::URL_SAFE.encode(claims),
+            base64::engine::general_purpose::STANDARD.encode(claims),
+        ] {
+            assert!(payload.ends_with('='));
+            let padded = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+            assert!(
+                resolve(None, &padded).is_err(),
+                "a padded payload is not read"
+            );
+        }
+        assert_eq!(
+            resolve(None, NO_CLAIM),
+            Err(
+                "the 'openai' ChatGPT (codex) token carries no chatgpt_account_id claim — is \
+                 this a ChatGPT-subscription token (not a plain OpenAI platform key)?"
+                    .to_owned()
+            )
+        );
+    }
+
     #[test]
     fn chatgpt_codex_auth_fails_loud_without_account_claim() {
         // A token with no chatgpt_account_id must FAIL with a clear, non-secret message —

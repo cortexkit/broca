@@ -6081,6 +6081,257 @@ mod tests {
         assert_eq!(error.resets_at_ms, None);
     }
 
+    /// Every ChatGPT-family HTTP refusal, run through the same chain the live HTTPS transport
+    /// runs: the provider-code and status table, then the upstream-key overlay, then the
+    /// account-limit overlay. Each row pins the complete recorded error, field by field, so a
+    /// change in where the ChatGPT decisions live cannot change what a run records.
+    #[test]
+    fn chatgpt_http_refusals_keep_their_recorded_errors() {
+        use super::{classify_chatgpt_upstream_key_rejection, CHATGPT_UPSTREAM_KEY_REJECTED};
+        const UPSTREAM_KEY_BODY: &str = r#"{"error":{"message":"Incorrect API key provided: sk-svcac***********fvMA. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}"#;
+        const TOKEN_EXPIRED_BODY: &str = r#"{"error":{"message":"Your authentication token has expired.","type":"invalid_request_error","code":"token_expired"}}"#;
+        const UPSTREAM_KEY_MESSAGE: &str = "401: chatgpt_upstream_key_rejected: the ChatGPT backend rejected an OpenAI API key on its own side (broca sent the account's OAuth token, not a key); not a credential failure.";
+        let family = WireFamilyId::OpenAiResponsesChatgpt;
+        let now_ms = 1_789_579_322_081u64;
+        let now = UNIX_EPOCH + Duration::from_millis(now_ms);
+        let classify = |status: u16, headers: &[(&str, &str)], body: &str, retry: Option<f64>| {
+            let headers = crate::wire::ResponseHeaders::new(headers.iter().copied());
+            let error = super::classify_http_error_in_family(
+                status,
+                body,
+                retry,
+                None,
+                Some(family),
+                headers.get("x-amzn-errortype"),
+            );
+            let error = classify_chatgpt_upstream_key_rejection(family, status, body, error);
+            classify_account_limit_exhausted(family, status, &headers, body, now, error)
+        };
+        let expected = |status: u16,
+                        class: ErrorClass,
+                        message: String,
+                        retry_after_secs: Option<f64>,
+                        provider_code: Option<&str>,
+                        resets: Option<(u64, &str)>| ProviderError {
+            refusal: None,
+            class,
+            message,
+            status: Some(status),
+            retry_after_secs,
+            provider_code: provider_code.map(str::to_owned),
+            resets_at_ms: resets.map(|(time, _)| time),
+            resets_at_source: resets.map(|(_, source)| source.to_owned()),
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+        };
+        let usage_no_reset = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#;
+        let usage_string_reset = r#"{"error":{"type":"usage_limit_reached","resets_at":"1790021043","resets_in_seconds":60}}"#;
+        let usage_not_included_code =
+            r#"{"error":{"message":"not in plan","code":"usage_not_included"}}"#;
+        let usage_not_included_type =
+            r#"{"error":{"type":"usage_not_included","message":"not in plan"}}"#;
+        let not_an_sk_key = r#"{"error":{"message":"Incorrect API key provided: sess-123","code":"invalid_api_key"}}"#;
+        let indented_sk_key = r#"{"error":{"message":" Incorrect API key provided: sk-123"}}"#;
+        let throttle = r#"{"error":{"type":"rate_limit_exceeded","message":"Rate limit reached"}}"#;
+        let overloaded = r#"{"error":{"message":"overloaded"}}"#;
+        let anthropic_wall_headers = [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", "1790740800"),
+        ];
+        let cases: Vec<(&str, ProviderError, ProviderError)> = vec![
+            (
+                "captured usage limit: the body's absolute reset wins over Retry-After",
+                classify(429, &[], CHATGPT_USAGE_LIMIT_BODY, Some(30.0)),
+                expected(
+                    429,
+                    ErrorClass::Transient,
+                    format!("429: {CHATGPT_USAGE_LIMIT_BODY}"),
+                    Some(30.0),
+                    Some(ACCOUNT_LIMIT_EXHAUSTED),
+                    Some((1_790_021_043_000, "body")),
+                ),
+            ),
+            (
+                "usage limit without body resets falls back to Retry-After",
+                classify(429, &[], usage_no_reset, Some(30.5)),
+                expected(
+                    429,
+                    ErrorClass::Transient,
+                    format!("429: {usage_no_reset}"),
+                    Some(30.5),
+                    Some(ACCOUNT_LIMIT_EXHAUSTED),
+                    Some((now_ms + 30_500, "retry_after")),
+                ),
+            ),
+            (
+                "usage limit without any reset keeps the reset unknown",
+                classify(429, &[], usage_no_reset, None),
+                expected(
+                    429,
+                    ErrorClass::Transient,
+                    format!("429: {usage_no_reset}"),
+                    None,
+                    Some(ACCOUNT_LIMIT_EXHAUSTED),
+                    None,
+                ),
+            ),
+            (
+                "a non-numeric resets_at is skipped for resets_in_seconds",
+                classify(429, &[], usage_string_reset, None),
+                expected(
+                    429,
+                    ErrorClass::Transient,
+                    format!("429: {usage_string_reset}"),
+                    None,
+                    Some(ACCOUNT_LIMIT_EXHAUSTED),
+                    Some((now_ms + 60_000, "retry_after")),
+                ),
+            ),
+            (
+                "the usage-limit body on a 403 is not an account wall",
+                classify(403, &[], CHATGPT_USAGE_LIMIT_BODY, None),
+                expected(
+                    403,
+                    ErrorClass::Permanent,
+                    format!("403: {CHATGPT_USAGE_LIMIT_BODY}"),
+                    None,
+                    Some("usage_limit_reached"),
+                    None,
+                ),
+            ),
+            (
+                "usage_not_included as a code",
+                classify(429, &[], usage_not_included_code, None),
+                expected(
+                    429,
+                    ErrorClass::Permanent,
+                    format!("429: {usage_not_included_code}"),
+                    None,
+                    Some("usage_not_included"),
+                    None,
+                ),
+            ),
+            (
+                "usage_not_included as a type",
+                classify(429, &[], usage_not_included_type, None),
+                expected(
+                    429,
+                    ErrorClass::Permanent,
+                    format!("429: {usage_not_included_type}"),
+                    None,
+                    Some("usage_not_included"),
+                    None,
+                ),
+            ),
+            (
+                "captured upstream sk- key rejection keeps its Retry-After",
+                classify(401, &[], UPSTREAM_KEY_BODY, Some(2.0)),
+                expected(
+                    401,
+                    ErrorClass::Transient,
+                    UPSTREAM_KEY_MESSAGE.to_owned(),
+                    Some(2.0),
+                    Some(CHATGPT_UPSTREAM_KEY_REJECTED),
+                    None,
+                ),
+            ),
+            (
+                "the sk- body on a 403 is not an upstream key rejection",
+                classify(403, &[], UPSTREAM_KEY_BODY, None),
+                expected(
+                    403,
+                    // The invalid_api_key code outranks the 403 status default.
+                    ErrorClass::Auth,
+                    format!("403: auth rejected — re-authenticate to get a fresh token. body: {UPSTREAM_KEY_BODY}"),
+                    None,
+                    Some("invalid_api_key"),
+                    None,
+                ),
+            ),
+            (
+                "a 401 naming a key that is not sk- is our credential",
+                classify(401, &[], not_an_sk_key, None),
+                expected(
+                    401,
+                    ErrorClass::Auth,
+                    format!("401: auth rejected — re-authenticate to get a fresh token. body: {not_an_sk_key}"),
+                    None,
+                    Some("invalid_api_key"),
+                    None,
+                ),
+            ),
+            (
+                "the sk- prefix must start the message",
+                classify(401, &[], indented_sk_key, None),
+                expected(
+                    401,
+                    ErrorClass::Auth,
+                    format!("401: auth rejected — re-authenticate to get a fresh token. body: {indented_sk_key}"),
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "an expired ChatGPT token is a credential failure",
+                classify(401, &[], TOKEN_EXPIRED_BODY, None),
+                expected(
+                    401,
+                    ErrorClass::Auth,
+                    format!("401: auth rejected — re-authenticate to get a fresh token. body: {TOKEN_EXPIRED_BODY}"),
+                    None,
+                    Some("token_expired"),
+                    None,
+                ),
+            ),
+            (
+                "an ordinary throttle stays a retryable rate limit",
+                classify(429, &[], throttle, Some(2.0)),
+                expected(
+                    429,
+                    ErrorClass::Transient,
+                    format!("429: {throttle}"),
+                    Some(2.0),
+                    Some("rate_limit_exceeded"),
+                    None,
+                ),
+            ),
+            (
+                "Anthropic's account-wall headers mean nothing on the ChatGPT family",
+                classify(429, &anthropic_wall_headers, throttle, None),
+                expected(
+                    429,
+                    ErrorClass::Transient,
+                    format!("429: {throttle}"),
+                    None,
+                    Some("rate_limit_exceeded"),
+                    None,
+                ),
+            ),
+            (
+                "a non-JSON 429 is an ordinary throttle",
+                classify(429, &[], "busy", None),
+                expected(429, ErrorClass::Transient, "429: busy".to_owned(), None, None, None),
+            ),
+            (
+                "an overloaded 503 is retryable",
+                classify(503, &[], overloaded, None),
+                expected(
+                    503,
+                    ErrorClass::Transient,
+                    format!("503: {overloaded}"),
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+        ];
+        for (label, actual, expected) in cases {
+            assert_eq!(actual, expected, "{label}");
+        }
+    }
+
     #[tokio::test]
     async fn a_kimi_weekly_usage_limit_ends_the_run_after_one_attempt() {
         let server = ScriptedServer::start(vec![ScriptResponse::Http {

@@ -1308,6 +1308,36 @@ fn map_incomplete_reason(reason: &str) -> FinishReason {
 mod tests {
     use super::*;
 
+    /// The ChatGPT/Codex stream-failure codes, in the `response.failed` shape and both bare
+    /// `error` shapes: the plan-allowance codes end the step, the throttle and overload codes
+    /// retry, and only `code` is read, so a `type` naming the same value changes nothing.
+    #[test]
+    fn chatgpt_stream_failure_codes_keep_their_classes() {
+        for (code, class) in [
+            ("usage_limit_reached", ErrorClass::Permanent),
+            ("usage_not_included", ErrorClass::Permanent),
+            ("rate_limit_exceeded", ErrorClass::Transient),
+            ("slow_down", ErrorClass::Transient),
+            ("server_is_overloaded", ErrorClass::Transient),
+        ] {
+            for event in [
+                serde_json::json!({"type":"response.failed","response":{"error":{"code":code}}}),
+                serde_json::json!({"type":"error","error":{"code":code}}),
+                serde_json::json!({"type":"error","code":code}),
+            ] {
+                let nested = event["type"] == "response.failed";
+                let error = response_stream_error(&event, nested, false);
+                assert_eq!(error.class, class, "{event}");
+                assert_eq!(error.provider_code.as_deref(), Some(code), "{event}");
+                assert_eq!(error.status, None);
+            }
+        }
+        let typed = serde_json::json!({"type":"response.failed","response":{"error":{"type":"usage_not_included"}}});
+        let error = response_stream_error(&typed, true, false);
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert_eq!(error.provider_code, None);
+    }
+
     fn extract_assistant_text(events: &[NormalizedEvent]) -> String {
         for event in events {
             if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) = event {
