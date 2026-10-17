@@ -15899,3 +15899,16 @@ expect_red = ["gated::the_persona_is_frozen_for_fresh_oauth_episodes_and_restore
 file = "crates/broca-catalog/src/live.rs"
 old = "        EpisodePersona::Recorded(recorded) => recorded.cloned(),"
 new = "        EpisodePersona::Recorded(recorded) => recorded.or(fresh).cloned(), // NON-VACUITY BREAK: adopt the fresh persona on resume."
+
+[[control]]
+id = "claude-persona-suffix-pinned-across-compaction"
+guards = "a persona run renders the session's pinned cc_version suffix, so a compaction that replaces the first user message does not change the billing text of the session's later episodes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/claude_code_identity.rs"
+expect_red = ["claude_code_identity::tests::a_compaction_that_replaces_the_first_user_message_keeps_the_next_episodes_cc_version"]
+file = "crates/broca-provider/src/families/anthropic_messages.rs"
+old = "        Some(pinned) => pinned.clone(),"
+new = "        Some(_) => persona_rules::cc_version_suffix(&persona_rules::first_user_message_text(messages), &persona.version), // NON-VACUITY BREAK: recompute from the rendered view."

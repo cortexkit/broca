@@ -2464,6 +2464,54 @@ mod executor {
             }
         }
 
+        /// The `cc_version` suffix pinned for a new episode's session: the one the session's
+        /// latest episode froze, or else one computed from the session's first durable user
+        /// message (read from its WAL, never a compaction view). `None` when the WAL cannot be
+        /// read, which leaves the renderer computing it from each request as before.
+        async fn session_cc_version_suffix(
+            &self,
+            req: &broca_core::RunRequest,
+            last_episode_frozen_config: Option<&serde_json::Value>,
+            durable_head: u64,
+        ) -> Option<String> {
+            use broca_core::WalStore as _;
+            use broca_module_serve::claude_code_identity::{
+                first_durable_cc_version_suffix, inherited_cc_version_suffix,
+            };
+            if let Some(inherited) = inherited_cc_version_suffix(last_episode_frozen_config) {
+                return Some(inherited);
+            }
+            // An empty WAL holds no earlier message, so the new input's is the first.
+            let durable = if durable_head == 0 {
+                Vec::new()
+            } else {
+                let wal_store = Arc::clone(&self.wal_store);
+                let session = req.session.clone();
+                let read = tokio::task::spawn_blocking(move || {
+                    wal_store
+                        .read_records(&session)
+                        .map_err(|error| error.to_string())
+                        .and_then(|records| {
+                            broca_core::replay_transcript(&records)
+                                .map_err(|error| error.to_string())
+                        })
+                })
+                .await;
+                match read {
+                    Ok(Ok(transcript)) => transcript,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "session transcript unreadable; the cc_version suffix is not pinned");
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "session transcript read failed; the cc_version suffix is not pinned");
+                        return None;
+                    }
+                }
+            };
+            first_durable_cc_version_suffix(&durable, &req.input)
+        }
+
         /// Install the id the Claude Code persona's device id derives from.
         pub fn with_claude_code_install_id(mut self, install_id: Option<String>) -> Self {
             self.claude_code_install_id = install_id;
@@ -3300,8 +3348,21 @@ mod executor {
             // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
             // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
             // its episode recorded, or its recorded absence, below.
+            let speaks_as_claude_code = job.req.model.provider_module_id.as_str() == "anthropic"
+                && resolution.method != Some(AuthMethod::ApiKey);
             let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
-                (Some(install_id), true) => {
+                (Some(install_id), true) if speaks_as_claude_code => {
+                    let cc_version_suffix = self
+                        .session_cc_version_suffix(
+                            &job.req,
+                            prior_snapshot
+                                .checkpoint_at_head
+                                .last_episode
+                                .as_ref()
+                                .map(|episode| &episode.config.frozen_render_config),
+                            prior_snapshot.head_seq,
+                        )
+                        .await;
                     match broca_module_serve::claude_code_identity::fresh_persona(
                         install_id,
                         resolution.account_id.as_deref(),
@@ -3312,6 +3373,7 @@ mod executor {
                                 selection.credential_id.as_str()
                             }),
                         &job.req.session,
+                        cc_version_suffix,
                     ) {
                         Ok(persona) => Some(persona),
                         Err(error) => {

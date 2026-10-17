@@ -308,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         account_id.as_deref(),
         &credential,
         &session,
+        claude_code_identity::first_durable_cc_version_suffix(&[], &request_options().prompt),
     )?;
     println!(
         "credential={credential} model={model} account_uuid={} dry_run={dry_run}",

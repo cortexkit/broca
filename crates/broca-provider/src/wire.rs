@@ -246,6 +246,13 @@ pub struct ClaudeCodePersona {
     /// `cc_prompt_id` in the billing block: one UUID per episode, shared by all its steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
+    /// The 3-hex `cc_version` suffix, pinned for the whole session: computed once from the
+    /// session's first durable user message and inherited by its later episodes, so a
+    /// compaction that rewrites that message does not change the billing text. Absent (a
+    /// persona recorded before the suffix was pinned) means the renderer computes it from the
+    /// first user message of the request it renders, as such an episode always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_version_suffix: Option<String>,
 }
 
 impl ClaudeCodePersona {

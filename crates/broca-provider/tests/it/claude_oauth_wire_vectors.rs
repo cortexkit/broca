@@ -173,6 +173,7 @@ fn fixed_persona(vectors: &Value) -> ClaudeCodePersona {
         account_uuid: Some(fixed["accountUuid"].as_str().unwrap().to_string()),
         session_id: fixed["claudeCodeSessionId"].as_str().unwrap().to_string(),
         prompt_id: Some(fixed["promptId"].as_str().unwrap().to_string()),
+        cc_version_suffix: None,
     }
 }
 
@@ -286,6 +287,18 @@ fn broca_frozen(case: &Value, vectors: &Value) -> FrozenRenderConfig {
     if case["input"]["subagent"] == true {
         persona.prompt_id = None;
     }
+    // The suffix pinned at admission, from the conversation's first user message, as broca
+    // freezes it for a new session; the vector's billing block must agree with it.
+    persona.cc_version_suffix =
+        broca_provider::families::anthropic_messages::cc_version_suffix_for_transcript(
+            &broca_request(case).prompt,
+            &persona.version,
+        );
+    assert_eq!(
+        persona.cc_version_suffix.as_deref(),
+        case["output"]["cc_version_suffix"]["suffix"].as_str(),
+        "the admission-time suffix matches the vector"
+    );
     frozen.claude_code_persona = Some(persona);
     frozen.variant = Some(FrozenVariant {
         name: "vector".into(),

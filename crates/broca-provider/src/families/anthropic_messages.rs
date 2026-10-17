@@ -115,7 +115,8 @@ fn persona(frozen: &FrozenRenderConfig) -> Option<&ClaudeCodePersona> {
 
 /// The unsigned billing block for `messages`, or `None` when they hold no user message (the
 /// reference client adds the block only then). Its text depends only on the frozen persona
-/// and the first user message, so it is the same on every step of a run.
+/// (with the session's pinned `cc_version` suffix) and, for a persona recorded before the
+/// suffix was pinned, the first user message, so it is the same on every step of a run.
 fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Value> {
     if !messages
         .iter()
@@ -123,8 +124,13 @@ fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Valu
     {
         return None;
     }
-    let first_user_text = persona_rules::first_user_message_text(messages);
-    let suffix = persona_rules::cc_version_suffix(&first_user_text, &persona.version);
+    let suffix = match &persona.cc_version_suffix {
+        Some(pinned) => pinned.clone(),
+        None => persona_rules::cc_version_suffix(
+            &persona_rules::first_user_message_text(messages),
+            &persona.version,
+        ),
+    };
     let text = persona_rules::billing_header_text(
         &persona.version,
         &suffix,
@@ -133,6 +139,22 @@ fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Valu
         persona.prompt_id.as_deref(),
     );
     Some(json!({ "type": "text", "text": text }))
+}
+
+/// The `cc_version` suffix for a transcript under client `version`: computed from its first user
+/// message exactly as the renderer reads that message off the wire, or `None` when the
+/// transcript holds no user message. Admission uses it to pin a session's suffix from the
+/// session's first durable user message.
+pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> Option<String> {
+    let first_user = messages.iter().find(|message| message.role == Role::User)?;
+    let single = std::slice::from_ref(first_user);
+    let id_map = crate::tool_id_alias::ToolIdMap::build(single, &id_grammar());
+    let name_map = crate::tool_name_alias::ToolNameMap::build(&[], single);
+    let wire = convert_message(first_user, false, &id_map, &name_map);
+    Some(persona_rules::cc_version_suffix(
+        &persona_rules::first_user_message_text(std::slice::from_ref(&wire)),
+        version,
+    ))
 }
 
 /// A persona body's bytes: written in the persona's key order, then signed (`cch`). These are
@@ -1025,6 +1047,7 @@ mod tests {
             account_uuid: None,
             session_id: "11111111-1111-4111-8111-111111111111".into(),
             prompt_id: None,
+            cc_version_suffix: None,
         });
         // Adaptive thinking, so the request can be warmed (a manual budget cannot).
         frozen.variant = Some(crate::variant::FrozenVariant {
