@@ -4178,6 +4178,11 @@ mod tests {
                 "{}",
                 case["name"]
             );
+            if case["name"] == "model-view atomic group exceeds the transport frame limit" {
+                let route_frame = model_group_reply_too_large_vector_through_route(refusal).await;
+                assert_eq!(route_frame.header.ty, FrameType::Error);
+                assert_eq!(route_frame.body, expected, "{}", case["name"]);
+            }
         }
     }
 
@@ -4216,21 +4221,9 @@ mod tests {
         assert_eq!(frame.body, expected);
     }
 
-    #[tokio::test]
-    async fn model_group_reply_too_large_vector_is_emitted_through_route_dispatch() {
-        let vectors: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/llm-runner-v1/reply-too-large.json"
-        ))
-        .unwrap();
-        let case = vectors["refusals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| {
-                case["name"] == "model-view atomic group exceeds the transport frame limit"
-            })
-            .unwrap();
-        let refusal = &case["refusal"];
+    async fn model_group_reply_too_large_vector_through_route(
+        refusal: &serde_json::Value,
+    ) -> Frame {
         let source_json = refusal["detail"]["subject"]["source"].clone();
         let compaction_id = source_json["compaction_id"].as_str().unwrap().to_owned();
         let version = source_json["version"].as_u64().unwrap();
@@ -4277,27 +4270,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let frame = rx.recv().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error);
-        #[derive(serde::Serialize)]
-        struct ExpectedError<'a> {
-            code: &'a str,
-            message: &'a str,
-            detail: &'a broca_module::serve::ReplyTooLargeDetail,
-        }
-        assert_eq!(
-            frame.body,
-            serde_json::to_vec(&ExpectedError {
-                code: refusal["code"].as_str().unwrap(),
-                message: refusal["message"].as_str().unwrap(),
-                detail: &detail,
-            })
-            .unwrap()
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap(),
-            *refusal
-        );
+        rx.recv().await.unwrap()
     }
 
     #[tokio::test]
