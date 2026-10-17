@@ -45,9 +45,9 @@ struct Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::kill_and_reap_tree(&mut self.child);
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
-        let _ = std::fs::remove_dir_all(&self.dir);
+        broca_test_support::remove_rig_dir(&self.dir);
     }
 }
 
@@ -79,7 +79,7 @@ impl Rig {
 
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-launch-nonce-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         let config_home = dir.join("config");
         let runtime_dir = dir.join("runtime");
         // Pinned under the rig: the daemon derives its module log capture directory and the

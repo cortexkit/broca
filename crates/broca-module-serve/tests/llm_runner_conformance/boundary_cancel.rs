@@ -43,7 +43,7 @@ async fn boundary_cancel_during_tool_then_send_is_provider_valid_and_byte_stable
     );
     let scratch =
         broca_test_support::scratch_root().join(format!("boundary-daemon-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("root");

@@ -196,9 +196,9 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        broca_test_support::kill_and_reap(self.child.get_mut());
+        broca_test_support::kill_and_reap_tree(self.child.get_mut());
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
-        let _ = std::fs::remove_dir_all(&self.dir);
+        broca_test_support::remove_rig_dir(&self.dir);
     }
 }
 
@@ -236,7 +236,7 @@ impl Daemon {
             std::process::id(),
             &digest[..12]
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         let config_home = dir.join("config");
         let runtime_dir = dir.join("runtime");
         let config_path = config_home.join("cortexkit").join("subc.jsonc");

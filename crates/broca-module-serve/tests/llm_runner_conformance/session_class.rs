@@ -22,7 +22,7 @@ fn rigs_present() -> bool {
 }
 fn scratch(tag: &str) -> PathBuf {
     let path = broca_test_support::scratch_root().join(format!("{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
+    broca_test_support::remove_rig_dir(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }

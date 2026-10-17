@@ -242,7 +242,7 @@ pub struct Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.serving.abort();
-        broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::kill_and_reap_tree(&mut self.child);
     }
 }
 impl Daemon {
