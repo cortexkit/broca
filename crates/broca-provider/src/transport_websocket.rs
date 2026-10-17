@@ -390,7 +390,7 @@ where
 
 pub(super) async fn drive(
     session: &Session,
-    client: &reqwest::Client,
+    client: &ProviderHttpClient,
     request: &PreparedHttpRequest,
     clock: &Clock,
     normalizer: Box<dyn StreamNormalizer>,
@@ -447,7 +447,7 @@ pub(super) async fn drive(
 
 async fn drive_socket(
     session: &Session,
-    client: &reqwest::Client,
+    client: &ProviderHttpClient,
     request: &PreparedHttpRequest,
     clock: &Clock,
     normalizer: Box<dyn StreamNormalizer>,
@@ -820,7 +820,7 @@ mod pump_tests {
             body: br#"{"model":"m","input":[]}"#.to_vec(),
         }
         .into();
-        let client = reqwest::Client::new();
+        let client: ProviderHttpClient = reqwest::Client::new().into();
         let clock = Clock::default();
         let (tx, _rx) = mpsc::channel(256);
         for step in 1..=2 {

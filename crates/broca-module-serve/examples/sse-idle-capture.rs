@@ -892,7 +892,8 @@ async fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("create response.raw: {e}"))?;
 
     let client = broca_provider::build_provider_http_client();
-    let mut builder = client.post(&request.url);
+    // The client that does not decode, so `response.raw` keeps the bytes exactly as they arrived.
+    let mut builder = client.without_response_decoding().post(&request.url);
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }

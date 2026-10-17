@@ -15830,3 +15830,55 @@ expect_red = ["structured_output_render::anthropic_submit_tool_never_forces_a_to
 file = "crates/broca-provider/src/structured_output.rs"
 old = "                    if forcing {"
 new = "                    if false && forcing { // NON-VACUITY BREAK: pass a forcing tool_choice through."
+
+[[control]]
+id = "provider-request-gzip-only-for-the-first-party-host"
+guards = "request gzip and accept-encoding go only to api.anthropic.com, never to a custom base URL, relay or mock"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_request_gzip_tests.rs"
+expect_red = ["transport::request_gzip_tests::a_request_to_any_other_host_is_never_gzipped"]
+file = "crates/broca-provider/src/transport_request_gzip.rs"
+old = "url.host_str() == Some(ANTHROPIC_API_HOST)"
+new = "url.host_str().is_some() /* NON-VACUITY BREAK: every host qualifies. */"
+
+[[control]]
+id = "provider-request-gzip-size-gate-starts-at-4096-units"
+guards = "request gzip starts at exactly 4,096 UTF-16 units of rendered body, as Claude Code counts it"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_request_gzip.rs"
+expect_red = ["transport::request_gzip::tests::the_size_gate_counts_utf16_units_from_exactly_4096"]
+file = "crates/broca-provider/src/transport_request_gzip.rs"
+old = "text.encode_utf16().count() >= MIN_BODY_UTF16_UNITS"
+new = "text.encode_utf16().count() > MIN_BODY_UTF16_UNITS /* NON-VACUITY BREAK: exclude the boundary. */"
+
+[[control]]
+id = "provider-request-gzip-req-id-400-passes-through"
+guards = "an Anthropic 400 carrying a req_ request id is not taken for a gzip refusal and is not re-sent"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_request_gzip_tests.rs"
+expect_red = ["transport::request_gzip_tests::an_anthropic_400_with_a_request_id_is_not_resent"]
+file = "crates/broca-provider/src/transport_request_gzip.rs"
+old = "let anthropic_answered = has_request_id || has_cf_ray;"
+new = "let anthropic_answered = has_request_id && has_cf_ray; // NON-VACUITY BREAK: require both."
+
+[[control]]
+id = "provider-request-gzip-refusal-latches-gzip-off"
+guards = "a refused gzip request turns request gzip off for the rest of the process"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport_request_gzip_tests.rs"
+expect_red = ["transport::request_gzip_tests::a_gzip_rejection_resends_once_uncompressed_and_latches_gzip_off"]
+file = "crates/broca-provider/src/transport_request_gzip.rs"
+old = "if !self.latch.swap(true, Ordering::AcqRel) {"
+new = "if !self.latch.load(Ordering::Acquire) { // NON-VACUITY BREAK: never set the latch."

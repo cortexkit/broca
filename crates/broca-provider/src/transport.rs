@@ -72,8 +72,92 @@ mod retention_tests;
 #[path = "transport_websocket.rs"]
 mod responses_websocket;
 
-/// Shareable HTTP transport handle. Clones retain the same reqwest connection pool.
-pub type ProviderHttpClient = reqwest::Client;
+#[path = "transport_request_gzip.rs"]
+pub mod request_gzip;
+
+#[cfg(test)]
+#[path = "transport_request_gzip_tests.rs"]
+mod request_gzip_tests;
+
+/// Shareable HTTP transport handle. Clones retain the same reqwest connection pools.
+///
+/// It holds two reqwest clients because reqwest decides response decoding per client, and a
+/// client that decodes also adds an `accept-encoding` header to every request it sends.
+/// Anthropic's first-party API gets Claude Code's `accept-encoding` and a client that decodes
+/// what comes back; every other host gets a client without decoding, so its requests go out
+/// exactly as they did before decoding existed.
+#[derive(Clone, Debug)]
+pub struct ProviderHttpClient {
+    /// Every host except `api.anthropic.com`. No response decoding and no `accept-encoding`.
+    identity: reqwest::Client,
+    /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
+    decoding: reqwest::Client,
+    request_gzip: request_gzip::RequestGzipPolicy,
+}
+
+impl ProviderHttpClient {
+    fn build(
+        builder: impl Fn() -> reqwest::ClientBuilder,
+        request_gzip: request_gzip::RequestGzipPolicy,
+    ) -> Self {
+        let build = |decode: bool| {
+            builder()
+                .gzip(decode)
+                .deflate(decode)
+                .brotli(decode)
+                .zstd(decode)
+                .build()
+                .expect("the provider HTTP client configuration is valid")
+        };
+        Self {
+            identity: build(false),
+            decoding: build(true),
+            request_gzip,
+        }
+    }
+
+    /// The client for a request: the decoding one only for Anthropic's first-party host.
+    fn for_host(&self, anthropic_api_host: bool) -> &reqwest::Client {
+        if anthropic_api_host {
+            &self.decoding
+        } else {
+            &self.identity
+        }
+    }
+
+    /// The one-attempt HTTP/1.1 pool-escape client, with this client's request-gzip policy.
+    fn http1_escape(&self) -> Self {
+        Self::build(|| provider_client_builder().http1_only(), self.request_gzip)
+    }
+
+    /// The client that never decodes responses, for diagnostic tools that record a response
+    /// exactly as it came off the connection.
+    pub fn without_response_decoding(&self) -> &reqwest::Client {
+        &self.identity
+    }
+
+    /// A client that sends `api.anthropic.com` to a local test server, with its own gzip latch.
+    #[cfg(test)]
+    fn resolving_anthropic_api_to(address: std::net::SocketAddr, gzip_enabled: bool) -> Self {
+        Self::build(
+            || provider_client_builder().resolve(request_gzip::ANTHROPIC_API_HOST, address),
+            request_gzip::RequestGzipPolicy::isolated(gzip_enabled),
+        )
+    }
+}
+
+/// Tests drive single attempts with a plain reqwest client against local servers, which never
+/// take the Anthropic host's path; request gzip stays off for them.
+#[cfg(test)]
+impl From<reqwest::Client> for ProviderHttpClient {
+    fn from(client: reqwest::Client) -> Self {
+        Self {
+            identity: client.clone(),
+            decoding: client,
+            request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
+        }
+    }
+}
 
 /// A live provider: any wire family + its frozen render config + a runtime auth
 /// credential, driven over reqwest. Generic over the family so the same transport
@@ -183,11 +267,13 @@ struct ChunkWarning {
 /// What one provider attempt received, filled in while the attempt runs so it is complete at
 /// whatever point the attempt ends, including a cancellation that drops it mid-read.
 ///
-/// The digest covers the RAW response body bytes exactly as they came off the connection,
-/// before the stream normalizer parses them: that is the only form a caller can compare with
-/// what the provider says it sent. (The HTTP client has no decompression enabled, so these
-/// are the bytes on the wire.) For sockets it covers UTF-8 text payloads before SSE adaptation,
-/// not compressed frames or control-frame payloads.
+/// The digest covers the response body bytes as the HTTP client hands them over, before the
+/// stream normalizer parses them: that is the only form a caller can compare with what the
+/// provider says it sent. For every host but `api.anthropic.com` the client does no decoding,
+/// so these are the bytes on the wire. Requests to `api.anthropic.com` accept compressed
+/// answers, and there these are the decoded bytes, the same ones an uncompressed answer would
+/// carry; the compressed size is not recorded. For sockets it covers UTF-8 text payloads before
+/// SSE adaptation, not compressed frames or control-frame payloads.
 #[derive(Clone, Default)]
 struct AttemptTrace {
     ephemeral_session: bool,
@@ -433,24 +519,15 @@ fn build_retry_normalizer<F: WireFamily>(
 /// and stream deadlines wrap the request future. A long-lived caller can therefore share this
 /// client to retain its connection pool without changing request bytes or policy.
 pub fn build_provider_http_client() -> ProviderHttpClient {
-    build_provider_http_client_with_protocol(false)
+    ProviderHttpClient::build(
+        provider_client_builder,
+        request_gzip::RequestGzipPolicy::from_env(),
+    )
 }
 
-/// Build the one-attempt HTTP/1.1 pool-escape client through the shared client configuration.
-fn build_provider_http1_client() -> ProviderHttpClient {
-    build_provider_http_client_with_protocol(true)
-}
-
-fn build_provider_http_client_with_protocol(http1_only: bool) -> ProviderHttpClient {
-    let builder = reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT);
-    let builder = if http1_only {
-        builder.http1_only()
-    } else {
-        builder
-    };
-    builder
-        .build()
-        .expect("the provider HTTP client configuration is valid")
+/// The connection settings both of a provider client's reqwest clients share.
+fn provider_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT)
 }
 
 impl<F: WireFamily + 'static> LiveProvider<F> {
@@ -748,19 +825,19 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WARM_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Send one prepared warm request and read its answer.
+///
+/// A warm to `api.anthropic.com` has the same wire shape as the step it warms: a compressed
+/// body when the step's would be, and one uncompressed re-send if the compression is refused.
 async fn send_warm(
-    client: &reqwest::Client,
+    client: &ProviderHttpClient,
     clock: &Clock,
     request: HttpRequest,
     family: crate::spec::WireFamilyId,
     served_account_ref: Option<String>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
     let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
-    let mut builder = client.post(&request.url);
-    for (name, value) in &request.headers {
-        builder = builder.header(name, value);
-    }
-    let sent_at_ms = now_millis();
+    let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
+    let identity = Bytes::from(request.body);
     let failed = |message: String| {
         broca_core::WarmFailure::Provider(ProviderError {
             refusal: None,
@@ -777,16 +854,39 @@ async fn send_warm(
         })
     };
     let exchange = async {
-        let response = builder
-            .body(request.body)
+        let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
+        let (sent_at_ms, status, header_map, body) = loop {
+            let sent_at_ms = now_millis();
+            let response = attempt_request_builder(
+                client,
+                &request.url,
+                &request.headers,
+                anthropic_api_host,
+                gzip.is_some(),
+            )
+            .body(gzip.clone().unwrap_or_else(|| identity.clone()))
             .send()
             .await
             .map_err(|error| failed(format!("warm request failed: {error}")))?;
-        let status = response.status();
-        let retry_after_secs = parse_retry_after_header(response.headers());
-        let headers = response_headers(response.headers());
-        let ratelimit_headers: Vec<(String, String)> = response
-            .headers()
+            let status = response.status();
+            let header_map = response.headers().clone();
+            let body = read_warm_body(response, &failed).await?;
+            if gzip.is_some() {
+                if let Some(rejection) = request_gzip::classify_rejection(
+                    status.as_u16(),
+                    &header_map,
+                    &String::from_utf8_lossy(&body),
+                ) {
+                    client.request_gzip.latch(status.as_u16(), rejection);
+                    gzip = None;
+                    continue;
+                }
+            }
+            break (sent_at_ms, status, header_map, body);
+        };
+        let retry_after_secs = parse_retry_after_header(&header_map);
+        let headers = response_headers(&header_map);
+        let ratelimit_headers: Vec<(String, String)> = header_map
             .iter()
             .filter(|(name, _)| {
                 name.as_str()
@@ -799,16 +899,6 @@ async fn send_warm(
                     .map(|value| (name.as_str().to_owned(), value.to_owned()))
             })
             .collect();
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
-            if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
-                return Err(failed("warm answer exceeded its size limit".into()));
-            }
-            body.extend_from_slice(&chunk);
-        }
         if !status.is_success() {
             let code = status.as_u16();
             let text = String::from_utf8_lossy(&body);
@@ -856,6 +946,86 @@ async fn send_warm(
     tokio::time::timeout(WARM_TIMEOUT, exchange)
         .await
         .unwrap_or_else(|_| Err(failed("warm timed out waiting for its answer".into())))
+}
+
+/// Read a whole warm answer, up to its size limit.
+async fn read_warm_body(
+    response: reqwest::Response,
+    failed: &impl Fn(String) -> broca_core::WarmFailure,
+) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
+        if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
+            return Err(failed("warm answer exceeded its size limit".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// The compressed body for this send, or `None` to send the identity body. Compressed only for
+/// `api.anthropic.com`, under the client's request-gzip policy, with fresh padding each call so
+/// every attempt, retries included, is padded and compressed anew. A failure to compress sends
+/// the identity body.
+async fn encode_request_gzip(
+    client: &ProviderHttpClient,
+    anthropic_api_host: bool,
+    body: &Bytes,
+) -> Option<Bytes> {
+    if !anthropic_api_host || !client.request_gzip.should_gzip(body) {
+        return None;
+    }
+    // A level-6 pass over a large prompt takes milliseconds, so it runs on the blocking pool
+    // rather than on a runtime worker that is also driving other streams.
+    let identity = body.clone();
+    let encoded = spawn_blocking(JobKind::Render, move || {
+        request_gzip::gzip_with_fresh_padding(&identity)
+    })
+    .await;
+    match encoded {
+        Ok(Ok(gzip)) => Some(Bytes::from(gzip.wire)),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "request gzip failed; sending the body uncompressed");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "request gzip task failed; sending the body uncompressed");
+            None
+        }
+    }
+}
+
+/// A POST with the family's headers, plus the wire-only headers for `api.anthropic.com`:
+/// `content-encoding: gzip` when the body is compressed, and Claude Code's `accept-encoding`
+/// unless the family set one. The family's headers come first and in order, as before.
+fn attempt_request_builder(
+    client: &ProviderHttpClient,
+    url: &str,
+    headers: &[(String, String)],
+    anthropic_api_host: bool,
+    gzip: bool,
+) -> reqwest::RequestBuilder {
+    let mut builder = client.for_host(anthropic_api_host).post(url);
+    let mut has_accept_encoding = false;
+    for (name, value) in headers {
+        if gzip && name.eq_ignore_ascii_case("content-encoding") {
+            continue;
+        }
+        has_accept_encoding |= name.eq_ignore_ascii_case("accept-encoding");
+        builder = builder.header(name, value);
+    }
+    if gzip {
+        builder = builder.header(reqwest::header::CONTENT_ENCODING, "gzip");
+    }
+    if anthropic_api_host && !has_accept_encoding {
+        builder = builder.header(
+            reqwest::header::ACCEPT_ENCODING,
+            request_gzip::CLAUDE_CODE_ACCEPT_ENCODING,
+        );
+    }
+    builder
 }
 
 static DUMP_REQUEST_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -1474,7 +1644,7 @@ fn system_time_millis(time: SystemTime) -> u64 {
 // separated at the async handoff; grouping them would only hide their ownership boundaries.
 #[allow(clippy::too_many_arguments)]
 fn spawn_transport_task<F: WireFamily + 'static>(
-    client: reqwest::Client,
+    client: ProviderHttpClient,
     clock: Clock,
     family: Arc<F>,
     frozen: Arc<FrozenRenderConfig>,
@@ -1674,7 +1844,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
 // computed on the render worker; bundling it would only rename the same inputs.
 #[allow(clippy::too_many_arguments)]
 async fn drive_step_attempts<NormalizerFactory, Normalizer>(
-    shared_client: &reqwest::Client,
+    shared_client: &ProviderHttpClient,
     clock: &Clock,
     mut request: PreparedHttpRequest,
     request_digest: &RequestDigest,
@@ -1774,7 +1944,7 @@ where
         let escape_client = use_escape_client.then(|| {
             #[cfg(test)]
             escape_client_builds.fetch_add(1, Ordering::SeqCst);
-            build_provider_http1_client()
+            shared_client.http1_escape()
         });
         let client = escape_client.as_ref().unwrap_or(shared_client);
 
@@ -2380,7 +2550,7 @@ async fn publish_completion(
 
 #[cfg(test)]
 async fn drive_stream(
-    client: &reqwest::Client,
+    client: &ProviderHttpClient,
     request: &PreparedHttpRequest,
     normalizer: Box<dyn StreamNormalizer>,
     tx: &mpsc::Sender<NormalizedEvent>,
@@ -2390,7 +2560,7 @@ async fn drive_stream(
 
 #[cfg(test)]
 async fn drive_stream_with_header_timeout(
-    client: &reqwest::Client,
+    client: &ProviderHttpClient,
     request: &PreparedHttpRequest,
     normalizer: Box<dyn StreamNormalizer>,
     tx: &mpsc::Sender<NormalizedEvent>,
@@ -2417,7 +2587,7 @@ async fn drive_stream_with_header_timeout(
 /// its account, session, originator and user-agent headers for nothing. Only the body needs an
 /// owned handle, and `Bytes` gives that with a refcount bump rather than a copy.
 async fn drive_attempt(
-    client: &reqwest::Client,
+    client: &ProviderHttpClient,
     request: &PreparedHttpRequest,
     clock: &Clock,
     mut normalizer: Box<dyn StreamNormalizer>,
@@ -2430,32 +2600,58 @@ async fn drive_attempt(
         normalizer.private_error_diagnostics();
     }
     trace.transport = Some("https".into());
-    let mut builder = client.post(&request.url);
-    for (name, value) in &request.headers {
-        builder = builder.header(name, value);
-    }
-    // Stamped as the request is handed to the client: a provider's prompt cache counts its
-    // lifetime from the request, and after a restart this stamp is what dates it.
-    trace.sent_at_ms = Some(now_millis());
-    trace.sent_at = Some(std::time::Instant::now());
-    let resp = tokio::time::timeout(header_timeout, builder.body(request.body.clone()).send())
-        .await
-        .map_err(|_| {
-            AttemptFailure::transport(
-                stream_timeout_error("waiting for response headers"),
-                AttemptOutcome::HeaderTimeout,
+    let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
+    let gzip = encode_request_gzip(client, anthropic_api_host, &request.body).await;
+    // What the trace held before anything was sent, so a refused compressed send leaves no
+    // trace of itself in the attempt's record: the uncompressed re-send is the attempt.
+    let unsent_trace = gzip.is_some().then(|| trace.clone());
+    let mut resp = send_attempt(
+        client,
+        request,
+        anthropic_api_host,
+        gzip,
+        header_timeout,
+        trace,
+    )
+    .await?;
+    // A 400 from Anthropic to a compressed request has its body read to tell a JSON parse
+    // failure from an ordinary invalid request. When it is ordinary, that text is the error.
+    let mut error_text = None;
+    if let Some(unsent_trace) = unsent_trace {
+        let status = resp.status().as_u16();
+        let rejection = match request_gzip::screen_headers(status, resp.headers()) {
+            request_gzip::HeaderVerdict::Pass => None,
+            request_gzip::HeaderVerdict::Rejected(rejection) => Some(rejection),
+            request_gzip::HeaderVerdict::NeedsBody => {
+                let text = read_error_text(&mut resp, trace).await;
+                let rejection = request_gzip::body_shows_invalid_json(&text)
+                    .then_some(request_gzip::Rejection::InvalidJsonAtOrigin);
+                if rejection.is_none() {
+                    error_text = Some(text);
+                }
+                rejection
+            }
+        };
+        if let Some(rejection) = rejection {
+            // Claude Code's fallback: latch gzip off, then send the same request once more
+            // with the unpadded identity body and no `content-encoding`. The re-send happens
+            // inside this attempt, so it uses none of the step's retry attempts; its time
+            // still counts toward the step's waiting allowance like any attempt time. A
+            // network error on the compressed send never gets here: it fails the attempt.
+            client.request_gzip.latch(status, rejection);
+            drop(resp);
+            *trace = unsent_trace;
+            resp = send_attempt(
+                client,
+                request,
+                anthropic_api_host,
+                None,
+                header_timeout,
+                trace,
             )
-        })?
-        .map_err(|e| {
-            // A connect error means no request bytes reached a server. Anything else before a
-            // status line leaves it unknown whether the body was written, so it is not guessed.
-            let outcome = if e.is_connect() {
-                AttemptOutcome::ConnectFailed
-            } else {
-                AttemptOutcome::NoStatus
-            };
-            AttemptFailure::transport(transport_error(&e.to_string()), outcome)
-        })?;
+            .await?;
+        }
+    }
 
     let status = resp.status();
     trace.http_status = Some(status.as_u16());
@@ -2475,20 +2671,9 @@ async fn drive_attempt(
             .get("x-should-retry")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
-        let text = match collect_error_body_traced(
-            resp.bytes_stream(),
-            MAX_HTTP_ERROR_BODY_READ_BYTES,
-            trace,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(failure) => {
-                // HTTP headers remain authoritative when the diagnostic body is broken.
-                // Preserve their classification and retry metadata instead of treating the
-                // body-read problem as a network failure.
-                format!("<error body unreadable: {}>", failure.error.message)
-            }
+        let text = match error_text {
+            Some(text) => text,
+            None => read_error_text(&mut resp, trace).await,
         };
         let error = classify_http_error_in_family(
             code,
@@ -2537,6 +2722,65 @@ async fn drive_attempt(
     apply_chatgpt_response_deadline(result, request, trace)
 }
 
+/// Send the request once and wait for its response headers. `gzip` is the compressed body to
+/// send instead of the identity one; see [`attempt_request_builder`] for the headers.
+async fn send_attempt(
+    client: &ProviderHttpClient,
+    request: &PreparedHttpRequest,
+    anthropic_api_host: bool,
+    gzip: Option<Bytes>,
+    header_timeout: Duration,
+    trace: &mut AttemptTrace,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let builder = attempt_request_builder(
+        client,
+        &request.url,
+        &request.headers,
+        anthropic_api_host,
+        gzip.is_some(),
+    );
+    let body = gzip.unwrap_or_else(|| request.body.clone());
+    // Stamped as the request is handed to the client: a provider's prompt cache counts its
+    // lifetime from the request, and after a restart this stamp is what dates it.
+    trace.sent_at_ms = Some(now_millis());
+    trace.sent_at = Some(std::time::Instant::now());
+    tokio::time::timeout(header_timeout, builder.body(body).send())
+        .await
+        .map_err(|_| {
+            AttemptFailure::transport(
+                stream_timeout_error("waiting for response headers"),
+                AttemptOutcome::HeaderTimeout,
+            )
+        })?
+        .map_err(|e| {
+            // A connect error means no request bytes reached a server. Anything else before a
+            // status line leaves it unknown whether the body was written, so it is not guessed.
+            let outcome = if e.is_connect() {
+                AttemptOutcome::ConnectFailed
+            } else {
+                AttemptOutcome::NoStatus
+            };
+            AttemptFailure::transport(transport_error(&e.to_string()), outcome)
+        })
+}
+
+/// Read a non-2xx body for its diagnostic text into `trace`, leaving the response's headers
+/// readable.
+async fn read_error_text(resp: &mut reqwest::Response, trace: &mut AttemptTrace) -> String {
+    let chunks = futures::stream::unfold(resp, |resp| async move {
+        resp.chunk().await.transpose().map(|chunk| (chunk, resp))
+    });
+    match collect_error_body_traced(chunks, MAX_HTTP_ERROR_BODY_READ_BYTES, trace).await {
+        Ok(text) => text,
+        Err(failure) => {
+            // HTTP headers remain authoritative when the diagnostic body is broken.
+            // Preserve their classification and retry metadata instead of treating the
+            // body-read problem as a network failure.
+            format!("<error body unreadable: {}>", failure.error.message)
+        }
+    }
+}
+
 fn apply_chatgpt_response_deadline(
     result: Result<Vec<NormalizedEvent>, AttemptFailure>,
     request: &PreparedHttpRequest,
@@ -2561,7 +2805,7 @@ fn apply_chatgpt_response_deadline(
 }
 
 struct AttemptTransport<'a> {
-    client: &'a reqwest::Client,
+    client: &'a ProviderHttpClient,
     clock: &'a Clock,
     websocket: Option<&'a responses_websocket::Session>,
 }
@@ -7460,7 +7704,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             drive_stream_with_header_timeout(
-                &reqwest::Client::new(),
+                &reqwest::Client::new().into(),
                 &PreparedHttpRequest::from(request),
                 Box::new(CountingNormalizer(Arc::new(AtomicUsize::new(0)))),
                 &tx,
@@ -7521,7 +7765,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             drive_stream(
-                &reqwest::Client::new(),
+                &reqwest::Client::new().into(),
                 &PreparedHttpRequest::from(request),
                 Box::new(CountingNormalizer(Arc::new(AtomicUsize::new(0)))),
                 &tx,
@@ -7812,7 +8056,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let error = drive_stream(
-            &reqwest::Client::builder().build().unwrap(),
+            &reqwest::Client::builder().build().unwrap().into(),
             &PreparedHttpRequest::from(request),
             Box::new(CountingNormalizer(Arc::new(AtomicUsize::new(0)))),
             &tx,

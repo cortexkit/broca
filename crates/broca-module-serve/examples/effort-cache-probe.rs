@@ -87,7 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for turn in 1..=2 {
         let body = OpenAiResponsesChatgpt.render(&frozen, &opts);
         let request = OpenAiResponsesChatgpt.endpoint(&frozen, &auth, body);
-        let mut builder = client.post(&request.url).timeout(Duration::from_secs(180));
+        let mut builder = client
+            .without_response_decoding()
+            .post(&request.url)
+            .timeout(Duration::from_secs(180));
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }

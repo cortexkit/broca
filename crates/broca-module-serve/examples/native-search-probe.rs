@@ -213,79 +213,11 @@ fn load_source(
 const CREDENTIAL_HEADERS: [&str; 2] = ["authorization", "x-api-key"];
 
 /// Send-time encodings and header edits, applied to the request after the family has built it.
-/// Nothing here touches the rendered body bytes; `gzip_body` returns new wire bytes beside them.
+/// Nothing here touches the rendered body bytes; `gzip_with_fresh_padding` returns new wire bytes
+/// beside them.
 mod wire_edit {
-    use std::io::Write;
-
-    /// Claude Code 2.1.302 appends a `\n` and then `floor(random * 257)` characters, so 0 to 256.
-    pub const MAX_PAD: usize = 256;
-    /// Claude Code leaves the level to Bun, whose default deflate level is 6.
-    pub const GZIP_LEVEL: u32 = 6;
-
-    /// A gzip-encoded body and the sizes the probe reports about it.
-    pub struct GzipBody {
-        pub wire: Vec<u8>,
-        pub identity_len: usize,
-        /// Count of spaces and tabs after the `\n`, so the padded text is identity + 1 + this.
-        pub pad_len: usize,
-        pub padded_len: usize,
-    }
-
-    /// A small seeded generator (splitmix64), enough to draw padding without a new dependency.
-    pub struct SplitMix(pub u64);
-
-    impl SplitMix {
-        /// Seeded from the standard library's per-process random hasher keys.
-        pub fn from_entropy() -> Self {
-            use std::hash::{BuildHasher, Hasher};
-            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-            hasher.write_u64(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-            );
-            Self(hasher.finish())
-        }
-
-        pub fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-    }
-
-    /// The identity body followed by `\n` and 0 to 256 spaces and tabs, as Claude Code pads a
-    /// body before compressing it. Trailing whitespace keeps it valid JSON.
-    pub fn pad(identity: &[u8], rng: &mut SplitMix) -> Vec<u8> {
-        let pad_len = (rng.next_u64() % (MAX_PAD as u64 + 1)) as usize;
-        let mut out = Vec::with_capacity(identity.len() + 1 + pad_len);
-        out.extend_from_slice(identity);
-        out.push(b'\n');
-        for _ in 0..pad_len {
-            out.push(if rng.next_u64() & 1 == 0 { b' ' } else { b'\t' });
-        }
-        out
-    }
-
-    /// Pad and gzip once. The gzip header is `1f8b 08 00 00000000 00 ff` (no name, mtime 0, OS
-    /// byte 255). Captures of Claude Code 2.1.302 show the same ten bytes on an ordinary
-    /// (non-block-mode) gzip body.
-    pub fn gzip_body(identity: &[u8], rng: &mut SplitMix) -> std::io::Result<GzipBody> {
-        let padded = pad(identity, rng);
-        let mut encoder =
-            flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
-        encoder.write_all(&padded)?;
-        let wire = encoder.finish()?;
-        Ok(GzipBody {
-            wire,
-            identity_len: identity.len(),
-            pad_len: padded.len() - identity.len() - 1,
-            padded_len: padded.len(),
-        })
-    }
+    /// The encoder is the production one, so the probe sends what broca sends.
+    pub use broca_provider::transport::request_gzip::{gzip_with_fresh_padding, GZIP_LEVEL};
 
     /// Replace every header of this name (compared case-insensitively) with one `name: value`
     /// at the first one's position, or append it when absent.
@@ -348,75 +280,6 @@ mod wire_edit {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::io::Read;
-
-        fn gunzip(bytes: &[u8]) -> Vec<u8> {
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(bytes)
-                .read_to_end(&mut out)
-                .expect("valid gzip");
-            out
-        }
-
-        #[test]
-        fn gzip_round_trips_to_the_identity_body_plus_padding() {
-            let identity = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
-            for seed in 0..200u64 {
-                let mut rng = SplitMix(seed);
-                let gz = gzip_body(identity, &mut rng).expect("gzip");
-                let plain = gunzip(&gz.wire);
-                assert_eq!(plain.len(), gz.padded_len);
-                assert_eq!(
-                    &plain[..identity.len()],
-                    identity,
-                    "prefix is the identity body"
-                );
-                assert_eq!(
-                    plain[identity.len()],
-                    b'\n',
-                    "padding starts with a newline"
-                );
-                let tail = &plain[identity.len() + 1..];
-                assert_eq!(tail.len(), gz.pad_len);
-                assert!(tail.iter().all(|b| *b == b' ' || *b == b'\t'));
-                assert_eq!(gz.identity_len, identity.len());
-                // Still the same JSON document once parsed.
-                let parsed: serde_json::Value = serde_json::from_slice(&plain).expect("json");
-                let original: serde_json::Value = serde_json::from_slice(identity).unwrap();
-                assert_eq!(parsed, original);
-            }
-        }
-
-        #[test]
-        fn gzip_header_matches_claude_codes_runtime_header() {
-            let mut rng = SplitMix(7);
-            let gz = gzip_body(b"{}", &mut rng).expect("gzip");
-            assert_eq!(
-                &gz.wire[..10],
-                &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff],
-                "no flags, mtime 0, XFL 0 at level 6, OS byte 255"
-            );
-        }
-
-        #[test]
-        fn pad_length_stays_in_bounds_and_reaches_both_ends_of_its_range() {
-            let mut rng = SplitMix(42);
-            let (mut min, mut max) = (usize::MAX, 0);
-            let (mut spaces, mut tabs) = (0usize, 0usize);
-            for _ in 0..20_000 {
-                let padded = pad(b"{}", &mut rng);
-                assert_eq!(&padded[..3], b"{}\n");
-                let pad_len = padded.len() - 3;
-                assert!(pad_len <= MAX_PAD, "pad {pad_len} exceeds {MAX_PAD}");
-                min = min.min(pad_len);
-                max = max.max(pad_len);
-                spaces += padded[3..].iter().filter(|b| **b == b' ').count();
-                tabs += padded[3..].iter().filter(|b| **b == b'\t').count();
-            }
-            assert_eq!(min, 0, "an empty pad must be possible");
-            assert_eq!(max, MAX_PAD, "a full 256-character pad must be possible");
-            assert!(spaces > 0 && tabs > 0, "both padding characters appear");
-        }
 
         #[test]
         fn header_edits_replace_case_insensitively_add_and_drop() {
@@ -462,8 +325,7 @@ mod wire_edit {
 
         #[test]
         fn response_decoding_handles_gzip_and_refuses_unknown_encodings() {
-            let mut rng = SplitMix(1);
-            let gz = gzip_body(b"data: {}", &mut rng).unwrap();
+            let gz = gzip_with_fresh_padding(b"data: {}").unwrap();
             let decoded = decode_response(Some("gzip"), &gz.wire).unwrap().unwrap();
             assert!(decoded.starts_with(b"data: {}\n"));
             assert_eq!(decode_response(None, b"x").unwrap().unwrap(), b"x");
@@ -740,8 +602,8 @@ async fn run(args: Args) -> Result<(), String> {
     // the compressed bytes are a separate wire body.
     let identity_len = request.body.len();
     let gzip = if args.gzip {
-        let gz = wire_edit::gzip_body(&request.body, &mut wire_edit::SplitMix::from_entropy())
-            .map_err(|e| format!("gzip: {e}"))?;
+        let gz =
+            wire_edit::gzip_with_fresh_padding(&request.body).map_err(|e| format!("gzip: {e}"))?;
         wire_edit::set_gzip_header(&mut request.headers);
         Some(gz)
     } else {
@@ -819,7 +681,9 @@ async fn run(args: Args) -> Result<(), String> {
     };
 
     let client = broca_provider::build_provider_http_client();
-    let mut builder = client.post(&request.url);
+    // The client without response decoding, so `response.raw` holds the bytes exactly as they
+    // arrived and the summary can report the response's own `content-encoding`.
+    let mut builder = client.without_response_decoding().post(&request.url);
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }
@@ -862,7 +726,7 @@ async fn run(args: Args) -> Result<(), String> {
         Some(&secret.token),
         &mut redactions,
     );
-    // The provider HTTP client has no decompression feature, so a compressed answer to an
+    // The probe sends through the client that does not decode, so a compressed answer to an
     // `accept-encoding` override arrives raw and is decoded here.
     let response_encoding = response_headers
         .get("content-encoding")
