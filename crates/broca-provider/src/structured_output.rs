@@ -31,10 +31,13 @@ use crate::wire::FrozenRenderConfig;
 /// `text.format` without `strict` (`true`), or only as instructions in the system prompt
 /// (`false`).
 ///
-/// The ChatGPT/Codex backend refuses `oneOf` in strict mode, measured. Whether it accepts the
-/// same schema non-strictly has not been probed. This is the single switch to flip if a later
-/// probe shows the non-strict schema is refused too.
-pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = true;
+/// Off, because the backend validates `text.format` whatever `strict` says. Measured on the
+/// ChatGPT/Codex backend with a production schema whose root is an array: sent without
+/// `strict`, it was refused 400 `invalid_json_schema` ("'additionalProperties' is required to
+/// be supplied and to be false"); with `strict: false` it was still refused ("schema must be
+/// a JSON Schema of 'type: \"object\"'"). A request the provider refuses ends the run, so a
+/// schema outside the profile goes in the instructions only and is reported `best_effort`.
+pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = false;
 
 /// A family's named subset profile: the schema features a route of that family can enforce.
 /// The name is frozen with the run, so a resumed run is judged exactly as it was admitted.
@@ -797,7 +800,9 @@ mod tests {
                 Mode::FinalText,
                 json!({"type": "object"}),
                 "schema_outside_subset",
-                SchemaDelivery::NonStrict,
+                // The backend validates `text.format` even without `strict`, so a schema outside
+                // the profile goes in the instructions only.
+                SchemaDelivery::Unconstrained,
             ),
             (
                 WireFamilyId::AnthropicMessages,

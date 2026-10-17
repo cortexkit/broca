@@ -16083,3 +16083,17 @@ expect_red = ["transport::tests::retries_number_their_attempt_in_the_stainless_r
 file = "crates/broca-provider/src/transport.rs"
 old = "        number_attempt(&mut request.headers, attempt_index);"
 new = "        let _ = (attempt_index, number_attempt as fn(&mut [(String, String)], usize)); // NON-VACUITY BREAK: never number attempts."
+
+[[control]]
+id = "responses-out-of-subset-schema-never-sent-as-format"
+guards = "a final-text schema outside the OpenAI strict profile reaches Responses and ChatGPT routes only as instructions, never as text.format, which the backend validates even without strict"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/structured_output_render.rs"
+expect_red = ["structured_output_render::responses_final_text_is_strict_inside_openai_strict_and_plain_outside"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = false;"
+new = "pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = true; // NON-VACUITY BREAK: send the schema as text.format again."

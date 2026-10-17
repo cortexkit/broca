@@ -132,11 +132,20 @@ fn responses_final_text_is_strict_inside_openai_strict_and_plain_outside() {
         let (outside, decided) =
             with_structured_output(frozen, "openai", Mode::FinalText, one_of());
         assert_eq!(decided.reason.as_deref(), Some("schema_outside_subset"));
-        assert_eq!(decided.delivery, SchemaDelivery::NonStrict);
+        // The backend validates `text.format` even without `strict`, so a schema it cannot
+        // enforce is never sent as the format; it reaches the model as instructions.
+        assert_eq!(decided.delivery, SchemaDelivery::Unconstrained);
         let sent = body(family, &outside, &opts(false));
-        assert_eq!(
-            sent["text"]["format"],
-            json!({"type": "json_schema", "name": "city_report", "schema": one_of()})
+        assert!(
+            sent["text"].get("format").is_none(),
+            "an out-of-subset schema must not be sent as text.format: {}",
+            sent["text"]
+        );
+        assert!(
+            serde_json::to_string(&sent)
+                .unwrap()
+                .contains("city_report"),
+            "the schema still reaches the model through the instructions"
         );
     }
 }
