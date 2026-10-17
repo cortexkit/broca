@@ -920,9 +920,11 @@ pub trait ServeHandler: Send + Sync {
         if at == broca_wal::record::RunCancelAt::Now {
             self.cancel(session, run_id).await
         } else {
+            // Permanent: a serve implementation without the boundary runtime will not gain it
+            // on a retry, so a caller must not keep re-sending the same request.
             Err(ServeError::Open(
                 "step-boundary cancellation is not installed".into(),
-                None,
+                Some(broca_protocol::ErrorClass::Permanent),
             ))
         }
     }

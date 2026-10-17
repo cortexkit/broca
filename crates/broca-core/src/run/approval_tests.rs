@@ -2754,14 +2754,20 @@ async fn boundary_cancel_preserves_active_approval_wait_until_immediate_escalati
     rig.control.steer = Some(inbox.clone());
     rig.control.cancel = Some(immediate.clone());
     let mut batch = Box::pin(rig.batch(&crate::AllowAll, vec![call("held")], None, false));
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        tokio::select! {
-            result = &mut batch => panic!("approval wait ended early: {:?}", result.interruption),
-            () = async {
-                while rig.questions.outstanding.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
-            } => {},
-        }
-    }).await.unwrap();
+    broca_test_support::event_timeout(
+        "the approval question to be filed",
+        async {
+            tokio::select! {
+                result = &mut batch => panic!("approval wait ended early: {:?}", result.interruption),
+                () = async {
+                    while rig.questions.outstanding.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+                } => {},
+            }
+        },
+        || "no approval question outstanding".into(),
+    )
+    .await
+    .unwrap();
     inbox
         .request_boundary_cancel(&rig.writer, &RunId("r".into()))
         .await
