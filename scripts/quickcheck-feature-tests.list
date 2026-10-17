@@ -1,0 +1,9 @@
+# package|cargo-test-target|features|source-file|test-function|reason
+# Runs the fixture-backed resume suite when its package changes.
+broca-catalog|code_assist_variant_resume|broca-catalog/live|crates/broca-catalog/tests/code_assist_variant_resume.rs|a_resume_keeps_the_frozen_tier_after_the_alias_row_is_withdrawn|Checks catalog resume rendering without network or daemon access.
+# Runs the output-ceiling suite with the same live feature as the full gate.
+broca-catalog|default_max_output|broca-catalog/live|crates/broca-catalog/tests/default_max_output.rs|an_omitted_cap_freezes_the_models_catalog_output_limit|Pins catalog output-cap behavior against local fixture data.
+# Runs the feature-gated reasoning variants suite when its package changes.
+broca-catalog|reasoning_variants|broca-catalog/live|crates/broca-catalog/tests/reasoning_variants.rs|served_options_keep_null_empty_and_populated_as_three_states|Checks local reasoning option fixtures without provider calls.
+# Runs the service-tier suite against the gate's live catalog feature.
+broca-catalog|service_tier|broca-catalog/live|crates/broca-catalog/tests/service_tier.rs|an_absent_tier_renders_no_tier_bytes_on_any_family|Checks service-tier rendering from local catalog fixtures.

@@ -70,6 +70,8 @@ suites=(
     scripts/test-find-finalize-leaks.py
     # Every script locates broca's state root by the daemon's rule.
     scripts/test-state-root.py
+    # Verifies quickcheck's unconditional guards and feature propagation behavior.
+    scripts/test-quickcheck-guards.py
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.
     scripts/test-gate-phases.py
     scripts/test-ci-pipeline.py
