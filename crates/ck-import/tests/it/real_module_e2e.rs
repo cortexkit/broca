@@ -58,7 +58,7 @@ impl Drop for AiMock {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self.child);
         if !std::thread::panicking() {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            broca_test_support::remove_rig_dir(&self.dir);
         }
     }
 }
@@ -67,7 +67,7 @@ impl AiMock {
     async fn start() -> Option<Self> {
         let dir = broca_test_support::scratch_root()
             .join(format!("ck-import-aimock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         let fixtures = dir.join("fixtures.json");
         std::fs::write(
@@ -154,9 +154,9 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::kill_and_reap_tree(&mut self.child);
         if !std::thread::panicking() {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            broca_test_support::remove_rig_dir(&self.dir);
         }
     }
 }
@@ -180,7 +180,7 @@ impl Daemon {
         std::env::remove_var("SUBC_LAUNCH_NONCE");
         let dir = broca_test_support::scratch_root()
             .join(format!("ck-import-rig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         let config_home = dir.join("config");
         let runtime_dir = dir.join("runtime");
         let config_path = config_home.join("cortexkit/subc.jsonc");

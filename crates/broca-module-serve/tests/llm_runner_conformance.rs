@@ -651,7 +651,10 @@ impl Live {
             sigkill(*pid);
         }
         if let Some(mut daemon) = self.daemon.take() {
-            broca_test_support::kill_and_reap(&mut daemon);
+            // The daemon may already have respawned a module killed above. The tree kill stops
+            // the daemon before listing and killing its remaining processes, so no module
+            // outlives the rig and writes into the scratch directory while it is removed.
+            broca_test_support::kill_and_reap_tree(&mut daemon);
         }
         self.tools.abort();
         self.compactions.abort();
@@ -1777,7 +1780,7 @@ async fn describe_diagnostics_follow_each_call_across_two_routes_on_one_worker()
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     let scratch = broca_test_support::scratch_root()
         .join(format!("broca-describe-diagnostics-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let live = subject.spawn(&scratch.join("root")).await.unwrap();
@@ -1893,7 +1896,7 @@ async fn describe_diagnostics_follow_each_call_across_two_routes_on_one_worker()
     drop(one);
     drop(two);
     drop(live);
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
 }
 
 /// Every case required by this subject's advertised capabilities must run and pass.
@@ -1927,7 +1930,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     let scratch = broca_test_support::scratch_root()
         .join(format!("broca-llm-conformance-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let work_dir = scratch.join("suite");
@@ -2037,7 +2040,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             "missing real compaction cut at {point}"
         );
     }
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
 }
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume
@@ -2059,7 +2062,7 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     let scratch =
         broca_test_support::scratch_root().join(format!("broca-step-cut-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("root");
@@ -2209,7 +2212,7 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
     }
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
 }
 
 /// An interrupt into an existing session that names only the role's members (prompt, send_id,
@@ -2231,7 +2234,7 @@ async fn an_interrupt_naming_only_role_members_renders_the_frozen_request() {
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     let scratch = broca_test_support::scratch_root()
         .join(format!("broca-inherit-frozen-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("root");
@@ -2339,7 +2342,7 @@ async fn an_interrupt_naming_only_role_members_renders_the_frozen_request() {
     );
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
 }
 
 /// A read exposes the provider's held call without making an incomplete tool turn model input.
@@ -2357,7 +2360,7 @@ async fn held_provider_call_is_indeterminate_until_its_result() {
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     let scratch =
         broca_test_support::scratch_root().join(format!("broca-held-read-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("root");
@@ -2470,7 +2473,7 @@ async fn held_provider_call_is_indeterminate_until_its_result() {
     assert_eq!(subject.tool_invocations(&call.arguments).await, 1);
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
 }
 
 /// A daemon restarted without retention admission must still discover and delete
@@ -2492,7 +2495,7 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
     }
     let scratch =
         broca_test_support::scratch_root().join(format!("retention-boot-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("daemon");
@@ -2581,7 +2584,7 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
     }
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// Recovery must finish incomplete deletion steps before the module begins serving requests.
@@ -2602,7 +2605,7 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
     }
     let scratch = broca_test_support::scratch_root()
         .join(format!("retention-tombstone-boot-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("daemon");
@@ -2709,7 +2712,7 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
         }
     }
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// The production executor must expose the adapter to both the actor and the model loop.
@@ -2728,7 +2731,7 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
     );
     let scratch =
         broca_test_support::scratch_root().join(format!("production-hooks-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("root");
@@ -2907,7 +2910,7 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
     );
     let scratch = broca_test_support::scratch_root()
         .join(format!("step-transform-rollback-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let mut subject = BrocaSubject::new(&scratch).await;
     let writer_root = scratch.join("writer");

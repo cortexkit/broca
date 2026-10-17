@@ -33,9 +33,9 @@ pub(super) struct Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        broca_test_support::kill_and_reap(&mut self.child);
+        broca_test_support::kill_and_reap_tree(&mut self.child);
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
-        let _ = std::fs::remove_dir_all(&self.dir);
+        broca_test_support::remove_rig_dir(&self.dir);
     }
 }
 

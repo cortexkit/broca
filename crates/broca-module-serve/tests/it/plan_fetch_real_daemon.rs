@@ -207,7 +207,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     let root = broca_test_support::scratch_root()
         .join(format!("broca-plan-fetch-daemon-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    broca_test_support::remove_rig_dir(&root);
     let config_home = root.join("config");
     let runtime_dir = root.join("runtime");
     let data_home = root.join("data-home");
@@ -428,7 +428,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     for task in serving {
         task.abort();
     }
-    let _ = daemon.kill().await;
+    broca_test_support::kill_and_reap_tree(&mut daemon);
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&root);
+    broca_test_support::remove_rig_dir(&root);
 }

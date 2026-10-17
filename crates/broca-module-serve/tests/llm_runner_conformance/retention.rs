@@ -47,7 +47,7 @@ fn rigs_present(what: &str) -> bool {
 fn scratch(tag: &str) -> PathBuf {
     let scratch =
         broca_test_support::scratch_root().join(format!("retention-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     scratch
 }
@@ -623,7 +623,7 @@ async fn ck_broca_retention_marker_never_reaches_the_index_and_is_gone_after_exp
     assert_eq!(export_facts(&state), facts_after);
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// Every log line, across the log directory's files, in which the boot's usage-export catch-up
@@ -764,7 +764,7 @@ async fn ck_broca_matching_tombstone_keeps_a_live_wal_expired_below_its_instant(
     address_calls_answer(&route, "stone-run", expiry).await;
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// Every moved-aside WAL still waiting in `wal-ephemeral/` for its deletion.
@@ -1029,7 +1029,7 @@ async fn ck_broca_failed_retention_index_writes_still_expire_on_the_wal_deadline
     assert_eq!(row_lineage.as_deref(), Some(lineage.as_str()));
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// Arm the rig to hold the runner at `point` and report the session that reaches it.
@@ -1192,7 +1192,7 @@ async fn ck_broca_retention_sends_killed_at_each_record_boundary_resume_to_compl
         }
     }
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// The store key `meta` and `message` rows use: the session triple joined by U+001F.
@@ -1435,7 +1435,7 @@ async fn ck_broca_a_send_waits_for_unfinished_deletion_and_the_fresh_lineage_sur
     ));
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// A provider's error text never reaches the logs for a retention lineage. The model answers a
@@ -1534,7 +1534,7 @@ async fn ck_broca_retention_provider_errors_never_reach_the_logs() {
         Vec::<PathBuf>::new(),
         "the retention lineage's provider error outlived its deletion"
     );
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1581,7 +1581,7 @@ async fn ck_broca_shared_retention_clock_waits_for_actual_deletion() {
     );
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1693,7 +1693,7 @@ async fn ck_broca_retained_size_refusal_uses_real_serve_golden_and_durable_error
     drop(mid);
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 impl BrocaSubject {
@@ -1943,7 +1943,7 @@ async fn ck_broca_writer_admits_retention_and_records_policy() {
         )));
     drop(route);
     drop(live);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
 
 /// Run the independently built v0.3.193 reader on WALs admitted by this writer, including
@@ -2111,5 +2111,5 @@ async fn released_reader_reads_retained_writer_sessions_before_and_after_deletio
         ),
         Vec::<PathBuf>::new()
     );
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }

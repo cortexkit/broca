@@ -54,7 +54,7 @@ async fn released_03201_resumes_an_absent_optional_tool_manifest() {
     assert!(String::from_utf8_lossy(&version.stdout).contains("0.3.201"));
     let scratch = broca_test_support::scratch_root()
         .join(format!("optional-tools-rollback-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let mut subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("rig");

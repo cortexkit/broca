@@ -293,7 +293,7 @@ impl Drop for AiMock {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap(&mut self.child);
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "aimock");
-        let _ = std::fs::remove_dir_all(&self.dir);
+        broca_test_support::remove_rig_dir(&self.dir);
     }
 }
 
@@ -305,7 +305,7 @@ impl AiMock {
     async fn start_on_port(tag: &str, fixtures_json: &str, port: u16) -> Option<AiMock> {
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-mod-aimock-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         setup("create aimock dir", std::fs::create_dir_all(&dir).ok())?;
         let fixture_path = dir.join("fixtures.json");
         setup(
@@ -509,9 +509,9 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        broca_test_support::kill_and_reap(self.child.get_mut());
+        broca_test_support::kill_and_reap_tree(self.child.get_mut());
         if !std::thread::panicking() {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            broca_test_support::remove_rig_dir(&self.dir);
         }
     }
 }
@@ -723,7 +723,7 @@ impl Daemon {
 
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-mod-rig-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         let config_home = dir.join("config");
         let runtime_dir = dir.join("runtime");
         let config_path = config_home.join("cortexkit").join("subc.jsonc");

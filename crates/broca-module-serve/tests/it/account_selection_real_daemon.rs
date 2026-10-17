@@ -680,16 +680,10 @@ impl Drop for Rig {
             task.abort();
         }
         self.vault_task.abort();
-        // On Windows the daemon's job object ends its module children when the daemon dies.
-        #[cfg(unix)]
-        if let Some(pid) = self.daemon.id() {
-            for child in children(pid) {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &child.to_string()])
-                    .status();
-            }
-        }
-        broca_test_support::kill_and_reap(&mut self.daemon);
+        // The test removes the rig directory after dropping the rig, and the daemon's modules
+        // write into it. The tree kill stops the daemon before listing and killing its
+        // processes, so it cannot respawn a module in between.
+        broca_test_support::kill_and_reap_tree(&mut self.daemon);
     }
 }
 
@@ -747,7 +741,7 @@ impl Rig {
             std::process::id(),
             NEXT_RIG.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        broca_test_support::remove_rig_dir(&root);
         let config_home = root.join("config");
         let runtime_dir = root.join("runtime");
         let data_home = root.join("data-home");
@@ -1615,7 +1609,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
 
     let root = rig.root.clone();
     drop(rig);
-    let _ = std::fs::remove_dir_all(root);
+    broca_test_support::remove_rig_dir(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

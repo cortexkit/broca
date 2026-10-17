@@ -119,9 +119,9 @@ struct Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        broca_test_support::kill_and_reap(&mut self.daemon);
+        broca_test_support::kill_and_reap_tree(&mut self.daemon);
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
-        let _ = std::fs::remove_dir_all(&self.dir);
+        broca_test_support::remove_rig_dir(&self.dir);
     }
 }
 
@@ -158,7 +158,7 @@ impl Rig {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        broca_test_support::remove_rig_dir(&dir);
         let config_home = dir.join("config");
         let runtime_dir = dir.join("runtime");
         let config_path = config_home.join("cortexkit").join("subc.jsonc");

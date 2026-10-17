@@ -101,7 +101,7 @@ async fn released_0194_store_backfills_and_rollback_appends_are_rederived() {
     assert!(String::from_utf8_lossy(&version.stdout).contains("0.3.194"));
     let scratch = broca_test_support::scratch_root()
         .join(format!("run-attribution-rollback-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let mut subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("rig");
@@ -200,5 +200,5 @@ async fn released_0194_store_backfills_and_rollback_appends_are_rederived() {
     upgraded.kill_all();
     drop(upgraded);
     drop(store);
-    let _ = std::fs::remove_dir_all(scratch);
+    broca_test_support::remove_rig_dir(scratch);
 }
