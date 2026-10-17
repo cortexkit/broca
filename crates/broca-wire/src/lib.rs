@@ -3124,6 +3124,20 @@ mod keep_warm_tests {
             scope_refusal_golden::assert_golden(params, file, hash);
         }
     }
+
+    #[test]
+    fn send_params_cache_shared_prefix_matches_golden() {
+        let params: SendParams = serde_json::from_value(serde_json::json!({
+            "cache": {"key": "comment-review-3f9a1c2b7d5e0a91"},
+            "prompt_blocks": ["You are a concise reviewer.", "Review this comment."]
+        }))
+        .unwrap();
+        scope_refusal_golden::assert_golden(
+            params,
+            "send_params.cache_shared_prefix.json",
+            "88b2dd5ec22e75e42ee37fdbe719976e59514700fa2aacb63c6a26eff2581d66",
+        );
+    }
 }
 
 #[cfg(test)]

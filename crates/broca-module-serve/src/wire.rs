@@ -718,31 +718,68 @@ mod tests {
     }
 
     #[test]
-    fn prompt_block_cache_boundary_marks_the_first_anthropic_block() {
+    fn prompt_block_cache_boundary_marks_only_the_shared_anthropic_block() {
         let mut params = make_send_params(None, "");
         params.prompt_blocks = Some(vec!["invariant head".into(), "varying tail".into()]);
+        params.one_shot = Some(true);
+        params.cache = Some(CacheParams {
+            role: None,
+            ttl: None,
+            key: Some("comment-review-3f9a1c2b7d5e0a91".into()),
+            tail: None,
+            mode: None,
+        });
         let request = params
             .into_send_request(BindIdentity::new("/tmp", "h", "s"), RunId("r".into()))
             .unwrap();
+        assert!(request.skip_materialization);
         let mut frozen = anthropic_frozen_config("claude-opus-4-8");
-        frozen.cache = Some(CachePolicy {
-            version: 1,
-            class: CacheClass::Markers {
-                syntax: MarkerSyntax::AnthropicCacheControl,
-                ttl: CacheTtl::FiveMinutes,
-                max_breakpoints: 4,
-                lookback_blocks: 20,
-                tail: None,
-                omit_ttl: false,
-            },
-        });
+        let cache_policy = crate::cache_routing::resolve_cache_policy(
+            broca_catalog::live::WireFamilyId::AnthropicMessages,
+            "anthropic",
+            request.request.cache.as_ref(),
+            &crate::cache_routing::CacheTtlTable::shipped_defaults(),
+            &request.session,
+        )
+        .unwrap();
+        match &cache_policy
+            .as_ref()
+            .expect("the key-only request gets first-party Anthropic defaults")
+            .class
+        {
+            CacheClass::Markers { ttl, omit_ttl, .. } => {
+                assert_eq!(*ttl, CacheTtl::FiveMinutes);
+                assert!(
+                    *omit_ttl,
+                    "the default five-minute TTL is omitted on the wire"
+                );
+            }
+            other => panic!("expected Anthropic markers, got {other:?}"),
+        }
+        frozen.cache = cache_policy;
 
         let body = AnthropicMessages.shape(&frozen, &CallOptions::new(request.request.input));
         let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["text"], "invariant head");
-        assert!(blocks[0].get("cache_control").is_some());
+        assert_eq!(
+            blocks[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
         assert_eq!(blocks[1]["text"], "varying tail");
         assert!(blocks[1].get("cache_control").is_none());
+
+        fn count_cache_control(value: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    usize::from(fields.contains_key("cache_control"))
+                        + fields.values().map(count_cache_control).sum::<usize>()
+                }
+                serde_json::Value::Array(values) => values.iter().map(count_cache_control).sum(),
+                _ => 0,
+            }
+        }
+        assert_eq!(count_cache_control(&body), 1);
     }
 
     #[test]
