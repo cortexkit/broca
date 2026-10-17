@@ -17,7 +17,7 @@ live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:
 
 [dependencies]
 broca-owner-only.workspace = true
-cortexkit-anthropic-policy = { path = "../cortexkit-anthropic-policy" }
+cortexkit-anthropic-policy.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }
 # SIMD terminator search for the SSE field split, which runs once per record on the
 # token-streaming hot path. Already in the tree as a runtime transitive dep of

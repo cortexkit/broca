@@ -8,7 +8,7 @@ repository.workspace = true
 description = "broca canonical types: provider<->runner stream-parts, runner<->caller control-units, error taxonomy, usage, cache-tier markers, and std-only single-write diagnostics. No transport dependency."
 
 [dependencies]
-cortexkit-anthropic-policy = { path = "../cortexkit-anthropic-policy" }
+cortexkit-anthropic-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
