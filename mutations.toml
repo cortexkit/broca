@@ -1212,6 +1212,18 @@ file = "crates/broca-provider/src/transport_websocket.rs"
 old = "                    self.switch_to_https();"
 new = "                    self.fail(); // NON-VACUITY BREAK: ask for another upgrade on the next step"
 
+[[control]]
+id = "openrouter-credit-402-is-credit-insufficient"
+guards = "OpenRouter's 402 with limit_source openrouter_credits is a typed credit_insufficient refusal, not a plain permanent"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::openrouter_credit_402_is_credit_insufficient_with_the_affordable_max_tokens"]
+file = "crates/broca-provider/src/transport.rs"
+old = '!= Some("openrouter_credits")'
+new = '!= Some("openrouter_credits_never") // NON-VACUITY BREAK: never recognise the credit source'
+
 # This proof checks the following behavior: replaying a run keeps Deferred and Approved calls separate
 # and does not check them again.
 # Windows runs only the test or tests named in this row, skipping all other tests in the broca-core

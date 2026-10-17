@@ -1655,6 +1655,7 @@ mod executor {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             Err(e @ VaultError::Transport(_)) => AuthDecision::FailAdmissionTransient(format!(
                 "credentials service unreachable (transient — retry): {e}"
@@ -4602,6 +4603,7 @@ mod executor {
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                 }),
                 selection: Some(broca_core::AuthSelection {
                     credential_id: "chatgpt:openai".into(),
@@ -4770,6 +4772,7 @@ mod executor {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             });
             assert_eq!(
                 used_credential_for_report(&pause, selection(), Some(7)),
@@ -5252,6 +5255,7 @@ mod executor {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }
         }
 
@@ -5401,6 +5405,7 @@ mod executor {
                 limit_window: Some("seven_day".into()),
                 account_ref: Some("d4bc9dbc".into()),
                 credential_id: None,
+                affordable_max_tokens: None,
             };
             assert_eq!(wire_auth_status(&exhausted), None);
             let mut records = vec![run_started(1, "limit-run")];
@@ -5666,6 +5671,7 @@ mod executor {
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                 }),
                 None
             );

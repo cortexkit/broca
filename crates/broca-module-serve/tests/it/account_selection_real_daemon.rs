@@ -233,6 +233,8 @@ struct Vault {
     anthropic_apikey_listed: std::sync::atomic::AtomicBool,
     /// Once set, the listing also carries the OpenAI API key `apikey:openai`.
     openai_apikey_listed: std::sync::atomic::AtomicBool,
+    /// Once set, the listing also carries the OpenRouter API key `apikey:openrouter`.
+    openrouter_listed: std::sync::atomic::AtomicBool,
 }
 
 impl Vault {
@@ -356,6 +358,20 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                     }));
                 }
                 let relisted = self.relisted.load(std::sync::atomic::Ordering::SeqCst);
+                if self
+                    .openrouter_listed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    rows.push(json!({
+                        "id": "apikey:openrouter",
+                        "categories": ["llm-provider"],
+                        "type": "apikey",
+                        "serves": ["openrouter"],
+                        "state": "active",
+                        "record_version": 1,
+                        "operations": ["read"],
+                    }));
+                }
                 if !relisted {
                     rows.push(listed("oauth:anthropic:work", "acct-w"));
                 }
@@ -445,6 +461,11 @@ const OPENAI_INVALID_SCHEMA_BODY: &str = r#"{"error":{"message":"Invalid schema 
 
 const ANTHROPIC_CREDIT_BALANCE_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
 
+/// OpenRouter's 402 for a request its credit cannot pay for. RECONSTRUCTED from a production
+/// refusal: the message is verbatim, but the production `metadata` held more fields than the one
+/// kept here, and those were not recorded.
+const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
+
 fn reported_headers() -> Value {
     json!({
         "anthropic-ratelimit-unified-5h-utilization": "0.4200",
@@ -502,6 +523,8 @@ struct Upstream {
     credit_exhausted_anthropic: std::sync::atomic::AtomicBool,
     /// Answer OpenAI's request-validation 400 for a rejected structured-output schema.
     request_invalid_openai: std::sync::atomic::AtomicBool,
+    /// Answer OpenRouter's 402 for an unaffordable request ([`OPENROUTER_CREDIT_402_BODY`]).
+    credit_insufficient_openrouter: std::sync::atomic::AtomicBool,
     /// Answer an ordinary Anthropic rate-limit 429 with `retry-after: 0`, so the transport spends
     /// its whole in-step attempt budget without waiting.
     rate_limited_anthropic: std::sync::atomic::AtomicBool,
@@ -516,6 +539,7 @@ const CREDENTIALS: &[&str] = &[
     "antigravity:google",
     "apikey:anthropic:work",
     "apikey:openai",
+    "apikey:openrouter",
 ];
 
 async fn serve_upstream(upstream: Arc<Upstream>) -> String {
@@ -639,6 +663,17 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                 {
                     let body = OPENAI_INVALID_SCHEMA_BODY.as_bytes();
                     let reply = format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    return;
+                }
+                if upstream
+                    .credit_insufficient_openrouter
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let body = OPENROUTER_CREDIT_402_BODY.as_bytes();
+                    let reply = format!("HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
                     socket.write_all(reply.as_bytes()).await.unwrap();
                     socket.write_all(body).await.unwrap();
                     socket.shutdown().await.unwrap();
@@ -823,6 +858,14 @@ impl Rig {
                         "limit.context": 400000,
                         "limit.output": 8192,
                     },
+                    "openrouter/openai/gpt-4.1": {
+                        "capability.attachment": false,
+                        "capability.reasoning": false,
+                        "capability.tool_call": true,
+                        "existence": "present",
+                        "limit.context": 1047576,
+                        "limit.output": 32768,
+                    },
                     "google/gemini-3.8-flash-high": {
                         "capability.attachment": false,
                         "capability.reasoning": true,
@@ -847,6 +890,7 @@ impl Rig {
                 "providers": {
                     "anthropic": { "base_url": upstream_url },
                     "xai": { "base_url": upstream_url },
+                    "openrouter": { "base_url": upstream_url },
                     "google": { "base_url": upstream_url },
                     "openai": { "base_url": upstream_url },
                 }
@@ -857,7 +901,7 @@ impl Rig {
         let methods = root.join("auth-methods.json");
         std::fs::write(
             &methods,
-            br#"{"defaults":{"anthropic":"oauth","xai":"apikey","google":"antigravity","openai":"apikey"}}"#,
+            br#"{"defaults":{"anthropic":"oauth","xai":"apikey","google":"antigravity","openai":"apikey","openrouter":"apikey"}}"#,
         )
         .unwrap();
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
@@ -924,6 +968,7 @@ impl Rig {
             relisted: Default::default(),
             anthropic_apikey_listed: Default::default(),
             openai_apikey_listed: Default::default(),
+            openrouter_listed: Default::default(),
         });
         let routing_task = register(
             &connection_file,
@@ -2371,6 +2416,83 @@ async fn request_invalid_openai_status_matches_golden_through_real_serve() {
     let golden = std::fs::read(&path)
         .expect("generate the request-invalid golden through the real serve path");
     assert_eq!(bytes, golden);
+}
+
+/// An OpenRouter request its credit cannot pay for ends the run `credit_insufficient` after one
+/// attempt, naming the key in `credential_id` and the affordable `max_tokens`. The upstream answers
+/// [`OPENROUTER_CREDIT_402_BODY`], reconstructed from a production refusal.
+/// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credit_insufficient_openrouter_status_matches_golden_through_real_serve() {
+    let rig = Rig::start()
+        .await
+        .expect("the credit-insufficient golden requires the real daemon");
+    rig.upstream
+        .credit_insufficient_openrouter
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.vault
+        .openrouter_listed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = rig.client("credit-insufficient-openrouter").await;
+    let mut openrouter_spec = spec("send-credit-insufficient-openrouter", None);
+    openrouter_spec.provider = "openrouter";
+    openrouter_spec.model = "openai/gpt-4.1";
+    let run_id = match client.send(openrouter_spec).await.expect("send") {
+        SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. } => run_id,
+        other => panic!("unexpected send outcome {other:?}"),
+    };
+    let frames = rig.finished("credit-insufficient-openrouter").await;
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+            .count(),
+        1,
+        "an unaffordable request is never re-sent within the run"
+    );
+    assert!(rig
+        .upstream
+        .authorized_as
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|id| id == "apikey:openrouter"));
+    let status = broca_test_support::wait_until(
+        "credit_insufficient_openrouter_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["state"], "error");
+    assert_eq!(value["error"]["class"], "permanent");
+    assert_eq!(value["error"]["provider_code"], "credit_insufficient");
+    assert_eq!(value["error"]["status"], 402);
+    assert_eq!(value["error"]["credential_id"], "apikey:openrouter");
+    assert_eq!(value["error"]["affordable_max_tokens"], 97335);
+    assert!(value["error"].get("resets_at_ms").is_none());
+    assert_eq!(value["retries_used"], 0);
+    // An unaffordable request says nothing about whether the key is valid.
+    assert!(
+        rig.vault
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _)| method.starts_with("credential.list")
+                || method.starts_with("credential.get")),
+        "a credential-scoped refusal is never reported to the vault"
+    );
+    assert_golden_file(
+        &serde_json::to_vec(&status).unwrap(),
+        "run_status.credit_insufficient_openrouter.json",
+    );
 }
 
 /// Send on the labelled Anthropic API key `apikey:anthropic:work`, pinned the way routing pins a

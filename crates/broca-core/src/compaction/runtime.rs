@@ -254,7 +254,8 @@ pub(crate) struct Runtime<'a> {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum StepResult {
     Continue,
-    Terminal(RunFinishReason, Option<ProviderError>),
+    // Boxed: a run-ending error is rare, and inline it would make every `Continue` as large.
+    Terminal(RunFinishReason, Option<Box<ProviderError>>),
 }
 fn unavailable() -> Box<ProviderError> {
     Box::new(error(
@@ -287,6 +288,7 @@ pub(crate) fn error(
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 fn refusal(
@@ -749,7 +751,12 @@ impl Runtime<'_> {
                 {
                     return Ok(StepResult::Terminal(
                         RunFinishReason::Error,
-                        Some(refusal(self.provider, code, &reason, provider_code)),
+                        Some(Box::new(refusal(
+                            self.provider,
+                            code,
+                            &reason,
+                            provider_code,
+                        ))),
                     ));
                 }
             }
@@ -795,12 +802,12 @@ fn terminal_exit(exit: CompactionWaitExit) -> StepResult {
         CompactionWaitExit::Cancel => StepResult::Terminal(RunFinishReason::Cancelled, None),
         CompactionWaitExit::Exceeded => StepResult::Terminal(
             RunFinishReason::Error,
-            Some(error(
+            Some(Box::new(error(
                 None,
                 "compaction wait exceeded; request cannot be shown to fit",
                 Some("compaction_wait_exceeded".into()),
                 true,
-            )),
+            ))),
         ),
         CompactionWaitExit::Stopped | CompactionWaitExit::Interrupted => {
             StepResult::Terminal(RunFinishReason::Interrupted, None)

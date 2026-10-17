@@ -2874,6 +2874,7 @@ mod projection_boundary_tests {
                         limit_window: None,
                         account_ref: None,
                         credential_id: None,
+                        affordable_max_tokens: None,
                     },
                 }),
             },
@@ -2903,6 +2904,7 @@ mod projection_boundary_tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let records = [WalRecord::Retracted {
             submission_id: SubmissionId("sub-r2".into()),

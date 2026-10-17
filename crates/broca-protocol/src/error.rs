@@ -147,6 +147,15 @@ pub struct ProviderError {
     /// froze no credential selection. Content-free: it names the credential, never its secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<String>,
+    /// The largest `max_tokens` the credential's remaining credit could pay for when the provider
+    /// refused the request as unaffordable. Set only on a [`CREDIT_INSUFFICIENT`] error, and only
+    /// when the provider stated the number. Named after the request's `max_tokens` because that
+    /// is the field it bounds: OpenRouter prices a request by its maximum output, and its refusal
+    /// reads "requires more credits, or fewer max_tokens ... can only afford N". A caller can
+    /// re-send with `max_tokens` at most this value, or route elsewhere; it is not a count of
+    /// prompt tokens or of tokens left on the balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affordable_max_tokens: Option<u64>,
 }
 
 /// The `provider_code` of a rate-limit refusal that means ONE provider account has used up a
@@ -177,6 +186,15 @@ pub const BILLING_EXHAUSTED: &str = "billing_exhausted";
 /// [`ProviderError::provider_subcode`].
 pub const REQUEST_INVALID: &str = "request_invalid";
 
+/// The `provider_code` of a refusal because THIS request costs more than the credential's
+/// remaining credit can pay for now (OpenRouter's HTTP 402 whose `error.metadata.limit_source` is
+/// `openrouter_credits`). Distinct from [`BILLING_EXHAUSTED`], which says the balance or spending
+/// allowance is gone: here some credit remains, and a smaller request (see
+/// [`ProviderError::affordable_max_tokens`]) or a top-up can succeed. Class stays
+/// [`ErrorClass::Permanent`]: re-sending the same request within the run cannot succeed. It
+/// carries no `resets_at_ms`.
+pub const CREDIT_INSUFFICIENT: &str = "credit_insufficient";
+
 /// The `provider_code` a run gives its terminal error when it ended [`ErrorClass::Transient`]
 /// because the provider rate-limited the request after the transport's in-step retries: an HTTP
 /// 429, or a rate-limit error the provider sent without one (Anthropic's in-band SSE
@@ -205,6 +223,11 @@ impl ProviderError {
         self.provider_code.as_deref() == Some(REQUEST_INVALID)
     }
 
+    /// Whether this is a [`CREDIT_INSUFFICIENT`] refusal.
+    pub fn is_credit_insufficient(&self) -> bool {
+        self.provider_code.as_deref() == Some(CREDIT_INSUFFICIENT)
+    }
+
     /// Whether this is a transient rate limit on the request (an HTTP 429, or a raw rate-limit
     /// code with no status) that is not an exhausted account window. These are the errors a
     /// terminal relabels [`RATE_LIMITED`]. Server errors, overloads, stream cuts and timeouts
@@ -221,11 +244,15 @@ impl ProviderError {
 
     /// Whether this error is about the credential that made the request rather than about the
     /// request or the provider, so a terminal names that credential in `credential_id`: a
-    /// billing refusal, an exhausted account window, or a rate limit. THE ONE PLACE this set is
+    /// billing refusal, an unaffordable request, an exhausted account window, or a rate limit.
+    /// THE ONE PLACE this set is
     /// defined. Context overflow, policy refusals, bad requests, deadlines and every other error
     /// say nothing about which key to stop using, and never carry `credential_id`.
     pub fn is_credential_scoped(&self) -> bool {
-        self.is_billing_exhausted() || self.is_account_limit_exhausted() || self.is_rate_limited()
+        self.is_billing_exhausted()
+            || self.is_credit_insufficient()
+            || self.is_account_limit_exhausted()
+            || self.is_rate_limited()
     }
 }
 
@@ -252,6 +279,7 @@ mod tests {
             r#"{"class":"permanent","message":"400: credit","status":400,"provider_code":"billing_exhausted","credential_id":"apikey:anthropic:work"}"#,
             r#"{"class":"transient","message":"429: limit","status":429,"provider_code":"account_limit_exhausted","account_ref":"acct-a","credential_id":"oauth:anthropic:work"}"#,
             r#"{"class":"transient","message":"429: slow down","status":429,"retry_after_secs":30.0,"provider_code":"rate_limited","credential_id":"apikey:anthropic"}"#,
+            r#"{"class":"permanent","message":"402: credits","status":402,"provider_code":"credit_insufficient","credential_id":"apikey:openrouter","affordable_max_tokens":97335}"#,
         ] {
             let error: ProviderError = serde_json::from_str(bytes).unwrap();
             assert!(error.credential_id.is_some());

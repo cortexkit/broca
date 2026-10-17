@@ -786,6 +786,7 @@ impl GeminiNormalizer {
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                     refusal: None,
                 },
                 Some(error),

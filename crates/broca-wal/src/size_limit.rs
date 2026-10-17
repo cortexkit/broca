@@ -27,6 +27,7 @@ pub fn scoped_error(max_bytes: u64, scope: SizeScope) -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 

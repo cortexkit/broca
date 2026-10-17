@@ -3056,6 +3056,7 @@ mod schema_tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let records = vec![
             WalRecord::RunStarted {
@@ -3199,6 +3200,7 @@ mod schema_tests {
                         limit_window: None,
                         account_ref: None,
                         credential_id: None,
+                        affordable_max_tokens: None,
                     },
                 }),
             },
@@ -3234,6 +3236,7 @@ mod schema_tests {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             retries_used: 1,
         };
@@ -3254,6 +3257,7 @@ mod schema_tests {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
         };
         for (record, pinned) in [(finished, FINISHED), (paused, PAUSED)] {
@@ -3287,6 +3291,7 @@ mod schema_tests {
                 limit_window: Some("seven_day".into()),
                 account_ref: Some("d4bc9dbc".into()),
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             retries_used: 0,
         };
@@ -3322,6 +3327,7 @@ mod schema_tests {
             limit_window: None,
             account_ref: account.map(str::to_owned),
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let finished = |ts_ms, error, retries_used| WalRecord::RunFinished {
             ts_ms: Some(ts_ms),
@@ -3420,6 +3426,7 @@ mod schema_tests {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             retries_used: 0,
         };

@@ -1094,6 +1094,7 @@ mod gated {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let admitted = run_loop_with_control(
             request(&dir),

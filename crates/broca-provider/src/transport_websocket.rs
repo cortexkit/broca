@@ -31,7 +31,7 @@ enum UpgradeFailure {
     AuthRejected(u16),
     /// The upgrade's own body already says the account's usage limit is reached, so an HTTPS
     /// round trip would only repeat the refusal.
-    AccountLimit(u16, ProviderError),
+    AccountLimit(u16, Box<ProviderError>),
     /// No socket for this attempt: send it over HTTPS instead.
     Transport,
 }
@@ -162,7 +162,7 @@ impl Session {
                     upgrade_account_limit(status, response.headers(), response.body().as_deref())
                 {
                     warn_upgrade_refusal(status, response.headers(), "account_limit");
-                    return Err(UpgradeFailure::AccountLimit(status, error));
+                    return Err(UpgradeFailure::AccountLimit(status, Box::new(error)));
                 }
                 warn_upgrade_refusal(status, response.headers(), "https");
                 if status == 403 {
@@ -509,7 +509,7 @@ async fn drive_socket(
                 limit_window: error.limit_window.clone(),
             });
             // An exhausted account refills in hours or days: no retry within the step.
-            return Err(AttemptFailure::http(error, true));
+            return Err(AttemptFailure::http(*error, true));
         }
         Err(UpgradeFailure::Transport) => {
             return drive_attempt(

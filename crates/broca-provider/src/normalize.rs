@@ -447,6 +447,7 @@ impl AnthropicNormalizer {
                         limit_window: None,
                         account_ref: None,
                         credential_id: None,
+                        affordable_max_tokens: None,
                     },
                     retries_used: 0,
                 }));

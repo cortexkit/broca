@@ -226,6 +226,7 @@ impl RunExecutor for CoreExec {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             });
         }
         run_loop_on_writer_admitted(

@@ -405,6 +405,7 @@ impl RunExecutor for CoreExec {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             });
         }
         // A resume keeps the decision its episode froze; a fresh episode decides from its send,

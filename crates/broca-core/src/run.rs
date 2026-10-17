@@ -2155,6 +2155,7 @@ fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Optio
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     })
 }
 
@@ -2693,7 +2694,7 @@ where
                     prior.completed_steps,
                     prior.usage,
                     prior.retries_used,
-                    error,
+                    error.map(|error| *error),
                     prior.last_step_finish_reason,
                 )
                 .await?;
@@ -4329,7 +4330,7 @@ where
                 if let crate::compaction::runtime::StepResult::Terminal(reason, error) =
                     Box::pin(runtime.step(state, status, raw, cap_estimate, cache)).await?
                 {
-                    terminal_error = error;
+                    terminal_error = error.map(|error| *error);
                     break reason;
                 }
             }
@@ -6274,6 +6275,7 @@ async fn run_step<P: Provider>(
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             },
         },
     })
@@ -7828,6 +7830,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, RATE_LIMITED};
         use ErrorClass::*;
@@ -8013,6 +8016,7 @@ mod tests {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             },
             retries_used: 0,
         })
