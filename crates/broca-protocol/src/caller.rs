@@ -180,6 +180,8 @@ pub enum RunFinishReason {
     Completed,
     /// Structural max-steps terminal outcome.
     MaxSteps,
+    /// The session's hard input-token cap was reached, or input usage was unreported.
+    BudgetExhausted,
     /// A caller asked for this run to stop, via `run.cancel`. Distinct from `Interrupted`
     /// so the durable record separates "someone decided" from "something died" -- a
     /// distinction an audit surface cannot recover after the fact.

@@ -30,10 +30,10 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
     // from `KNOWN_FEATURES` alone would let an unintended table change pass unnoticed. The
     // expected list covers the features this build can read, including step transforms,
     // the reader-only compaction and deferred-call records, step-boundary cancellation and
-    // first-send session classes.
+    // first-send session classes and hard session input-token caps.
     assert_eq!(
         expected,
-        "agent-run-scopes/v1\narchive-index/v2\ncompaction-wait/v1\ncompaction/v1\ndeferred-call/v1\ndispatch-module/v1\nflow-scopes/v1\nplan-manifest/v1\nrestart-pause/v1\nretention/v1\nrun-cancel-at/v1\nscope/v1\nsession-class/v1\nsteer-queue/v1\nstep-transforms/v1\n"
+        "agent-run-scopes/v1\narchive-index/v2\ncompaction-wait/v1\ncompaction/v1\ndeferred-call/v1\ndispatch-module/v1\nflow-scopes/v1\ninput-token-cap/v1\nplan-manifest/v1\nrestart-pause/v1\nretention/v1\nrun-cancel-at/v1\nscope/v1\nsession-class/v1\nsteer-queue/v1\nstep-transforms/v1\n"
     );
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert!(

@@ -196,6 +196,31 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   behind a running turn, its recorded request carries the frozen model itself, so a build
   that does not know the inherited set still runs it on the session's model.
 
+#### Hard session input-token cap
+
+The `input_token_cap` discovery group enables optional `session.send.budget.max_input_tokens`
+(u64, at least 1). Once set, this session-wide cap can only decrease. Omission keeps it;
+an existing uncapped session may adopt one. Zero and a raise are `invalid_params` naming
+`budget.max_input_tokens`. `budget` is closed to unknown members; each `nudges` element is
+also closed to members other than `at_tool_calls` and `text`. These refusals name the unknown
+member. A cap-only budget does not require tool-call reminder fields.
+
+Consumed input is the saturating sum of each completed model step's fresh input, cache-read
+and cache-write tokens across every episode, all at face value. Output is excluded. The WAL
+and its constant-size admission checkpoint carry the sum across restarts; no step size is
+estimated. No step starts at or above the cap, and a crossing step dispatches none of its
+tools. Its never-executed error results (`reason: "budget_exhausted"`, the definite `max_steps`
+dispatch outcome) and run terminal share one durability barrier, preserving provider-valid
+call/result pairs for later sends. A lower cap accepted while a run is active applies at its
+next model or post-step boundary, including when delivered as queued work or a steer.
+
+The terminal reason and run state are `budget_exhausted`. `run.status` and `run.result` carry
+`detail: {limit, spent, cause}`, where `cause` is `limit_reached` or `usage_unreported`.
+Missing input usage fails closed; a reported zero is known usage. For `usage_unreported`,
+`spent` is only the measured sum before the first unreported step, not an estimate of that
+step's input. Capped sessions require the must-understand WAL feature `input-token-cap/v1`;
+older readers refuse them by that name rather than run without the cap.
+
 ### 4a. `session.warm`
 
 A provider caches a request's prefix for a fixed lifetime from when the request was sent. A

@@ -96,6 +96,8 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::LateDispatchIntent { .. } => "late_dispatch_intent",
         WalRecord::LateResult { .. } => "late_result",
         WalRecord::QuestionWithdrawalAcknowledged { .. } => "question_withdrawal_acknowledged",
+        WalRecord::InputTokenCapFrozen { .. } => "input_token_cap_frozen",
+        WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::Unknown => "unknown",
     }
 }
@@ -160,6 +162,44 @@ const PINNED: &[&str] = &[
     r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{"input_tokens":3,"cached_input_tokens":4000,"cache_write_tokens":0},"served_account_ref":"acct-1","ratelimit_headers":{"anthropic-ratelimit-unified-5h-utilization":"0.2","anthropic-ratelimit-unified-status":"allowed"},"sent_at_ms":1790000000000,"ttl_ms":3600000,"expires_at_ms":1790003600000}"#,
     r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{},"sent_at_ms":1790000000000}"#,
 ];
+
+const INPUT_CAP_PINNED: &[&str] = &[
+    r#"{"type":"input_token_cap_frozen","limit":150}"#,
+    r#"{"type":"input_token_budget_exhausted","detail":{"limit":150,"spent":150,"cause":"limit_reached"}}"#,
+    r#"{"type":"input_token_budget_exhausted","detail":{"limit":150,"spent":100,"cause":"usage_unreported"}}"#,
+];
+
+#[test]
+fn input_cap_records_are_must_understand_and_round_trip() {
+    use crate::framing::{decode_next, encode, DecodeStep, INPUT_TOKEN_CAP_FEATURE};
+    for bytes in INPUT_CAP_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+        assert_eq!(record.required_features(), &[INPUT_TOKEN_CAP_FEATURE]);
+        let DecodeStep::Record { framed, .. } = decode_next(&encode(7, 3, &record).unwrap()) else {
+            panic!("cap record must decode")
+        };
+        assert_eq!(framed.record, record);
+    }
+    let plain: WalRecord = serde_json::from_str(PINNED[1]).unwrap();
+    let mut capped = plain.clone();
+    let WalRecord::RunStarted { config, .. } = &mut capped else {
+        unreachable!()
+    };
+    config.budget = Some(BudgetConfig {
+        max_input_tokens: Some(150),
+        ..Default::default()
+    });
+    assert_eq!(capped.required_features(), &[INPUT_TOKEN_CAP_FEATURE]);
+    if let Some(path) = std::env::var_os("BROCA_INPUT_CAP_WAL_FIXTURE") {
+        let mut bytes = encode(1, 3, &capped).unwrap();
+        bytes.extend(encode(2, 3, &WalRecord::InputTokenCapFrozen { limit: 150 }).unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        let mut plain_path = path;
+        plain_path.push(".plain");
+        std::fs::write(plain_path, encode(1, 3, &plain).unwrap()).unwrap();
+    }
+}
 
 /// Records of tool calls held for a human's approval. Kept apart from `PINNED`, which holds the
 /// kinds and fields that existed before compaction and is checked against those builds' frame
@@ -270,6 +310,7 @@ fn every_record_kind_keeps_its_pinned_bytes() {
         .iter()
         .chain(DEFERRED_CALL_PINNED)
         .chain(CANCEL_AT_PINNED)
+        .chain(INPUT_CAP_PINNED)
     {
         let decoded: WalRecord = serde_json::from_str(pinned)
             .unwrap_or_else(|error| panic!("pinned record must decode: {error}\n{pinned}"));
@@ -322,6 +363,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(include_str!("../../tests/fixtures/compaction_records.jsonl").lines())
         .chain(DEFERRED_CALL_PINNED.iter().copied())
         .chain(CANCEL_AT_PINNED.iter().copied())
+        .chain(INPUT_CAP_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -342,6 +384,8 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "budget_fired",
         "run_finished",
         "run_cancel_requested",
+        "input_token_cap_frozen",
+        "input_token_budget_exhausted",
         "run_paused",
         "run_config_refrozen",
         "run_auth_refrozen",

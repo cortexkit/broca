@@ -814,7 +814,9 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => None,
         // An informational record, skipped exactly like `Unknown`.
-        WalRecord::QuestionWithdrawalAcknowledged { .. } => None,
+        WalRecord::InputTokenCapFrozen { .. }
+        | WalRecord::InputTokenBudgetExhausted { .. }
+        | WalRecord::QuestionWithdrawalAcknowledged { .. } => None,
     }
 }
 
@@ -936,6 +938,30 @@ mod tests {
             output_tokens: Some(output_tokens),
             ..Usage::default()
         }
+    }
+
+    #[test]
+    fn budget_exhausted_terminal_reason_reaches_export_facts() {
+        let records = vec![
+            started(1, "run", Some(100)),
+            step(2, 1, usage(10, 2), 0),
+            frame(
+                3,
+                WalRecord::RunFinished {
+                    reason: RunFinishReason::BudgetExhausted,
+                    ts_ms: Some(200),
+                    usage: usage(10, 2),
+                    error: None,
+                    retries_used: 0,
+                },
+            ),
+        ];
+        let segments = compute_segments(&records, "instance-a", &resolver);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&segments[0]).unwrap()["terminal_reason"],
+            "budget_exhausted"
+        );
     }
 
     #[test]

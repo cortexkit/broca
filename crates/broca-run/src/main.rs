@@ -540,7 +540,9 @@ async fn run(args: Args) -> Result<i32, String> {
     // A clean terminal is Completed or the structural MaxSteps; an Interrupt
     // (ambiguous dispatch) or Error is a non-zero exit for the orchestrator.
     let code = match summary.reason {
-        RunFinishReason::Completed | RunFinishReason::MaxSteps => 0,
+        RunFinishReason::Completed
+        | RunFinishReason::MaxSteps
+        | RunFinishReason::BudgetExhausted => 0,
         RunFinishReason::Interrupted
         | RunFinishReason::Cancelled
         | RunFinishReason::Error

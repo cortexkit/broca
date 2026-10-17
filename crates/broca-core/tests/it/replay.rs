@@ -2857,6 +2857,7 @@ async fn deterministic_send_id_reuse_rejects_changed_budget() {
 
     let mut first = text_request("r-budget-reuse", &session, "question");
     first.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 20,
             text: "first budget".into(),
@@ -2876,6 +2877,7 @@ async fn deterministic_send_id_reuse_rejects_changed_budget() {
 
     let mut reused = text_request("r-budget-reuse", &session, "question");
     reused.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 20,
             text: "different budget".into(),
@@ -3016,6 +3018,7 @@ fn post_pause_step_boundary_clears_auth_classification_at_every_cut() {
 fn budgeted_start(run: &str) -> WalRecord {
     let mut config = run_config();
     config.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 1,
             text: "nudge".into(),

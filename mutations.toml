@@ -15539,3 +15539,63 @@ only = false
 file = "crates/broca-module-serve/src/agent_data.rs"
 old = 'divergence_reason = Some(cause.to_owned());'
 new = 'divergence_reason = None; // NON-VACUITY BREAK'
+
+[[control]]
+id = "input-cap-before-model-step"
+guards = "no model step starts when session input is exactly at its cap"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/input_token_cap.rs"
+expect_red = ["input_token_cap::exactly_at_limit_starts_no_next_model_step"]
+file = "crates/broca-core/src/run.rs"
+old = "        // A session budget is independent of episode counters and reminder inheritance.\n        if let Some(detail) = input_budget.exhausted() {"
+new = "        // NON-VACUITY BREAK: bypass the before-step input fence.\n        if let Some(detail) = input_budget.exhausted().filter(|_| false) {"
+
+[[control]]
+id = "input-cap-before-tool-dispatch"
+guards = "a crossing completed step dispatches none of its tool calls"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/input_token_cap.rs"
+expect_red = ["input_token_cap::crossing_step_dispatches_no_tools_and_repairs_each_call"]
+file = "crates/broca-core/src/run.rs"
+old = "        completed_steps += 1;\n        if let Some(detail) = input_budget.exhausted() {"
+new = "        completed_steps += 1;\n        // NON-VACUITY BREAK: bypass the post-step input fence.\n        if let Some(detail) = input_budget.exhausted().filter(|_| false) {"
+
+[[control]]
+id = "input-cap-lower-only"
+guards = "later sends may adopt or lower a session input cap but never raise it"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/input_token_cap.rs"
+expect_red = ["input_token_cap::lower_only_omission_and_late_adoption"]
+file = "crates/broca-core/src/input_budget.rs"
+old = "        budget.check(true, self.limit)?;"
+new = "        budget.check(true, None)?; // NON-VACUITY BREAK: permit raising a frozen session cap."
+
+[[control]]
+id = "input-cap-wal-seeded-sum"
+guards = "input consumption includes every earlier episode after reopening the writer"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/input_token_cap.rs"
+expect_red = ["input_token_cap::wal_sum_survives_new_episode_and_new_runner"]
+file = "crates/broca-core/src/run.rs"
+old = "    writer.seed_input_token_limit(prior.input_budget.limit);"
+new = "    prior.input_budget.spent = 0; // NON-VACUITY BREAK: discard durable earlier input.\n    writer.seed_input_token_limit(prior.input_budget.limit);"
+
+[[control]]
+id = "input-cap-unreported-fails-closed"
+guards = "unreported input usage ends the run before tool dispatch instead of counting as zero"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/input_token_cap.rs"
+expect_red = ["input_token_cap::unreported_usage_fails_closed_before_dispatch"]
+file = "crates/broca-core/src/input_budget.rs"
+old = "        let cause = if self.usage_unreported {"
+new = "        let cause = if false && self.usage_unreported { // NON-VACUITY BREAK: run past unknown usage."

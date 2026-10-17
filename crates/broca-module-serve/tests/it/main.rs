@@ -47,6 +47,7 @@ mod chatgpt_websocket_live;
 mod early_args_boot;
 mod engram_descriptor;
 mod graceful_stop_real_daemon;
+mod input_token_cap;
 mod launch_nonce_e2e;
 mod llm_runner_role;
 mod log_levels_are_deliberate;

@@ -270,6 +270,7 @@ pub enum SendOutcome {
     },
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
+    InputTokenBudgetInvalid(String),
     VariantUnsupported(broca_core::run::VariantRefusal),
     /// The run started immediately (the lineage was idle).
     Active {
@@ -512,6 +513,7 @@ fn indexed_finish_reason(state: &RunIndexState) -> Option<broca_protocol::RunFin
         RunIndexState::Completed => Some(RunFinishReason::Completed),
         RunIndexState::Interrupted => Some(RunFinishReason::Interrupted),
         RunIndexState::MaxSteps => Some(RunFinishReason::MaxSteps),
+        RunIndexState::BudgetExhausted => Some(RunFinishReason::BudgetExhausted),
         RunIndexState::Cancelled => Some(RunFinishReason::Cancelled),
         RunIndexState::Error => Some(RunFinishReason::Error),
         RunIndexState::TransformUnavailable => Some(RunFinishReason::TransformUnavailable),
@@ -524,6 +526,7 @@ fn run_finish_index_state(reason: broca_protocol::RunFinishReason) -> RunIndexSt
     match reason {
         RunFinishReason::Completed => RunIndexState::Completed,
         RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
+        RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
         RunFinishReason::Cancelled => RunIndexState::Cancelled,
         RunFinishReason::Interrupted => RunIndexState::Interrupted,
         RunFinishReason::Error => RunIndexState::Error,
@@ -609,7 +612,14 @@ fn inherit_frozen_parameters(request: &mut SubmissionRequest, frozen: &broca_wal
             InheritedParam::ToolChoice => request.tool_choice = frozen.tool_choice.clone(),
             InheritedParam::Generation => request.generation = frozen.generation.clone(),
             InheritedParam::StopWhen => request.stop_when.clone_from(&frozen.stop_when),
-            InheritedParam::Budget => request.budget.clone_from(&frozen.budget),
+            InheritedParam::Budget => {
+                request.budget.clone_from(&frozen.budget);
+                // Inherit tool-call reminders without restoring the preceding episode's old cap.
+                // An omitted input cap comes from the session-wide WAL checkpoint instead.
+                if let Some(budget) = &mut request.budget {
+                    budget.max_input_tokens = None;
+                }
+            }
             InheritedParam::ContextLimit => request.context_limit = frozen.context_limit,
             InheritedParam::WorkClass => request.work_class.clone_from(&frozen.work_class),
             InheritedParam::ServiceTier => request.service_tier = frozen.service_tier,
@@ -2403,6 +2413,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(message) => return SendOutcome::SessionClassInvalid(message),
             };
         }
+        if let Some(limit) = request
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.max_input_tokens)
+        {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            let Some(budget) = checkpoint.input_budget else {
+                return SendOutcome::Error(
+                    "admission checkpoint has no session input accounting".into(),
+                );
+            };
+            if let Err(message) = budget.admit(Some(limit)) {
+                return SendOutcome::InputTokenBudgetInvalid(message);
+            }
+        }
 
         // THE OWNER CHECK COMES FIRST, before a keyed retry is answered: a resend of an
         // auth-paused run under a stamp the session cannot adopt must meet the same refusal
@@ -3070,6 +3098,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         return SendOutcome::PreUserUnavailable { provider };
                     }
                     let writer = self.writer.as_ref().expect("writer live while paused");
+                    if let Some(limit) = request
+                        .budget
+                        .as_ref()
+                        .and_then(|budget| budget.max_input_tokens)
+                    {
+                        writer.record(WalRecord::InputTokenCapFrozen { limit });
+                    }
                     writer.record(WalRecord::Steered {
                         retention: self.admitting_retention,
                         ts_ms: self.retention_timestamp(),
@@ -3169,6 +3204,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             hooks: prepared.hooks.clone(),
         };
         if !inbox.deliver(input, || {
+            if let Some(limit) = request
+                .budget
+                .as_ref()
+                .and_then(|budget| budget.max_input_tokens)
+            {
+                writer.record(WalRecord::InputTokenCapFrozen { limit });
+            }
             writer.record(record);
         }) {
             // The run has decided it renders no further step and is writing its terminal: there
@@ -4757,6 +4799,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let live_step = step_progress.lock().unwrap().clone();
                 let title = self.live_run_title(run_id).await?;
                 return Ok(Some(ReconciledRunState {
+                    budget_detail: None,
                     live_step,
                     state: RunIndexState::Active,
                     undelivered_steers: None,
@@ -4784,6 +4827,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     // Propagate read failures rather than reporting an unread cause or steer
                     // as absent; a genuinely absent WAL still permits the index fallback.
                     let reconciled = self.terminal_wal_state(run_id).await?;
+                    if row.state == RunIndexState::BudgetExhausted
+                        && reconciled
+                            .as_ref()
+                            .and_then(|state| state.budget_detail.clone())
+                            .is_none()
+                    {
+                        return Err(
+                            "budget_exhausted detail is unavailable from the durable WAL".into(),
+                        );
+                    }
                     let undelivered_steers = reconciled
                         .as_ref()
                         .and_then(|state| state.undelivered_steers.clone());
@@ -4793,12 +4846,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .title
                         .clone()
                         .or_else(|| reconciled.as_ref().and_then(|state| state.title.clone()));
+                    let budget_detail = reconciled
+                        .as_ref()
+                        .and_then(|state| state.budget_detail.clone());
                     let error = if row.state == RunIndexState::Error {
                         reconciled.and_then(|state| state.error)
                     } else {
                         None
                     };
                     return Ok(Some(ReconciledRunState {
+                        budget_detail,
                         live_step: None,
                         state: row.state,
                         undelivered_steers,
@@ -4815,7 +4872,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 // Interrupted rows cannot answer which calls are ambiguous, and legacy or
                 // synthetic rows can lack terminal metadata. Reconcile those rows from the WAL.
                 let reconciled = self.terminal_wal_state(run_id).await?;
+                if row.state == RunIndexState::BudgetExhausted
+                    && reconciled
+                        .as_ref()
+                        .and_then(|state| state.budget_detail.clone())
+                        .is_none()
+                {
+                    return Err(
+                        "budget_exhausted detail is unavailable from the durable WAL".into(),
+                    );
+                }
                 Ok(Some(ReconciledRunState {
+                    budget_detail: reconciled
+                        .as_ref()
+                        .and_then(|state| state.budget_detail.clone()),
                     live_step: None,
                     state: row.state,
                     undelivered_steers: reconciled

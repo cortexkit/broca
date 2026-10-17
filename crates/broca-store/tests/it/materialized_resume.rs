@@ -1190,6 +1190,7 @@ async fn budget_message_is_materialized_from_frozen_config() {
     let provider = RecordingProvider::new(scripts());
     let mut budgeted = request(&dir);
     budgeted.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 2,
             text: "durable budget reminder".into(),
@@ -1227,6 +1228,7 @@ async fn budgeted_tool_loop_projects_once_at_terminal_and_materializes_full_stat
     let provider = RecordingProvider::paced(scripts());
     let mut budgeted = request(&dir);
     budgeted.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 2,
             text: "durable budget reminder".into(),
@@ -1450,6 +1452,7 @@ async fn paused_budgeted_run_projects_once_at_pause() {
     )]]);
     let mut budgeted = request(&dir);
     budgeted.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 99,
         finalize_text: "finalize".into(),

@@ -189,6 +189,7 @@ pub fn edit_request() -> RunRequest {
 pub fn budget_request() -> RunRequest {
     let mut request = edit_request();
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 2,
             text: "Check the work, then continue exactly once.".into(),
@@ -196,6 +197,21 @@ pub fn budget_request() -> RunRequest {
         finalize_at_tool_calls: 99,
         finalize_text: "finalize".into(),
     });
+    request
+}
+
+pub fn input_cap_request() -> RunRequest {
+    let mut request = edit_request();
+    request.budget = Some(BudgetConfig {
+        max_input_tokens: Some(150),
+        ..Default::default()
+    });
+    request
+}
+
+pub fn input_cap_tool_request() -> RunRequest {
+    let mut request = input_cap_request();
+    request.budget.as_mut().unwrap().max_input_tokens = Some(100);
     request
 }
 
@@ -304,6 +320,30 @@ pub const BUDGET_NUDGE: Scenario = Scenario {
     expected: RunFinishReason::Completed,
 };
 
+/// Two model steps consume 100 then 50 input tokens. Truncating the WAL before or after
+/// either usage record must still yield a consumed sum of 150 after recovery.
+pub const INPUT_TOKEN_CAP: Scenario = Scenario {
+    name: "input_token_cap",
+    request: input_cap_request,
+    control: default_control,
+    scripts: two_edits_scripts,
+    render: Render::Canonical,
+    plane: edit_plane,
+    expected: RunFinishReason::BudgetExhausted,
+};
+
+/// The first model step reaches 100 input tokens and emits two tool calls. WAL truncation
+/// during their synthetic error results must not dispatch either call or lose the budget terminal.
+pub const INPUT_TOKEN_CAP_TOOLS: Scenario = Scenario {
+    name: "input_token_cap_tools",
+    request: input_cap_tool_request,
+    control: default_control,
+    scripts: two_edits_scripts,
+    render: Render::Canonical,
+    plane: edit_plane,
+    expected: RunFinishReason::BudgetExhausted,
+};
+
 /// The same failing read twice, so the third request carries repetition guidance.
 pub const REPETITION_GUIDANCE: Scenario = Scenario {
     name: "repetition_guidance",
@@ -331,6 +371,8 @@ pub const ALL: &[Scenario] = &[
     TWO_EDITS,
     ANTIGRAVITY_IDENTITY,
     BUDGET_NUDGE,
+    INPUT_TOKEN_CAP,
+    INPUT_TOKEN_CAP_TOOLS,
     REPETITION_GUIDANCE,
     TEXT_ONLY_MAX_STEPS,
 ];

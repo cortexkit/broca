@@ -91,6 +91,7 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    pub input_budget: crate::input_budget::InputTokenBudget,
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     /// Run metadata beside the prompt, never part of model input or WAL message bytes.
     pub message_runs: Vec<Option<RunAttribution>>,
@@ -255,8 +256,8 @@ pub struct PendingTurn {
     /// Already-durable terminals, reconstructed (real results, no_dispatch, or
     /// hard-stop) — included as-is, NEVER re-dispatched.
     pub existing: Vec<(ToolCallId, ToolResult)>,
-    /// Unprepared planned calls that never left the process (¬intent ∧ ¬terminal) — these
-    /// (and only these) are re-dispatched to complete the turn.
+    /// Unprepared calls with no dispatch intent or terminal result record. Only these calls
+    /// may be dispatched on recovery, and none may be dispatched after the input cap is spent.
     pub redispatch: Vec<ToolCallId>,
     /// Prepared calls still awaiting an answer; their mutate hooks must never run again.
     pub deferred: Vec<PreparedCall>,
@@ -1270,7 +1271,14 @@ fn replay_seeded_with_compaction<'a>(
     let mut render_episodes = Vec::new();
     let mut committed_tool_turns: Vec<(usize, usize)> = Vec::new();
 
+    let mut input_budget = crate::input_budget::InputTokenBudget::default();
     for (record_index, rec) in records.into_iter().enumerate() {
+        input_budget
+            .fold(rec)
+            .map_err(|reason| ReplayError::CorruptLineage {
+                episode_run_id: run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                reason,
+            })?;
         if let WalRecord::RunStarted {
             manifest: Some(manifest),
             ..
@@ -1759,8 +1767,10 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
-            // An informational record, skipped exactly like `Unknown`.
-            WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // These metadata records are omitted from prompt construction: they contain no messages.
+            WalRecord::InputTokenCapFrozen { .. }
+            | WalRecord::InputTokenBudgetExhausted { .. }
+            | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
         message_runs.truncate(prompt.len());
         message_runs.resize_with(prompt.len(), || {
@@ -1888,10 +1898,42 @@ fn replay_seeded_with_compaction<'a>(
         .and(run_id.as_ref())
         .filter(|_| ep.attributable)
         .map(producing_run);
-    let resolution = classify(ep);
+    if input_budget.exhausted().is_some() {
+        // A response can be durable before its terminal barrier. Preserve the budget reason
+        // for natural ends and completed repair batches, while leaving open calls resumable
+        // so recovery can write their never-executed results before closing the episode.
+        ep.natural_stop_reason = Some(RunFinishReason::BudgetExhausted);
+        ep.natural_end_extendable = false;
+        if ep.hard_stopped.is_some() {
+            ep.hard_stopped = Some(RunFinishReason::BudgetExhausted);
+        }
+    }
+    let mut resolution = classify(ep);
+    if input_budget.exhausted().is_some() {
+        match &mut resolution {
+            ReplayResolution::Resume {
+                pending: Some(pending),
+            }
+            | ReplayResolution::AuthRequired {
+                pending: Some(pending),
+                ..
+            } => {
+                // Recovery still needs the assistant and existing results to close the turn,
+                // but none of its unexecuted calls is authorized for redispatch.
+                pending.redispatch.clear();
+            }
+            ReplayResolution::Resume { pending: None } => {
+                resolution = ReplayResolution::LineageIdle {
+                    last_reason: RunFinishReason::BudgetExhausted,
+                };
+            }
+            _ => {}
+        }
+    }
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
     Ok(ReplayState {
+        input_budget,
         cancel_at,
         message_runs,
         run_finals,
@@ -1998,6 +2040,7 @@ pub fn latest_projection_boundary(
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
+    pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     /// Only the live actor fills this; WAL reconciliation never guesses an in-flight step.
     pub live_step: Option<broca_protocol::provider::InFlightStep>,
     pub state: crate::RunIndexState,
@@ -2041,6 +2084,7 @@ pub fn reconcile_run_state<'a>(
     let mut found: Option<ReconciledRunState> = None;
     let mut auth_selection = None;
     let mut title: Option<String> = None;
+    let mut budget_detail = None;
     // A queued send's submission id is `sub-<run id>` (see the coordinator's `queue_submission`),
     // so its `Queued` record can name this run before any `RunStarted` does.
     let queued_submission = format!("sub-{run_id}");
@@ -2058,6 +2102,7 @@ pub fn reconcile_run_state<'a>(
                     title = started_title.clone();
                 }
                 active_run = Some(rid.0.clone());
+                budget_detail = None;
                 pending_steer_ids.clear();
                 active_zero_step_seed = matches!(origin, broca_wal::RunOrigin::SeededFrom { .. });
                 has_completed_step = false;
@@ -2068,6 +2113,7 @@ pub fn reconcile_run_state<'a>(
                 if rid.0 == run_id {
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
+                        budget_detail: None,
                         live_step: None,
                         title: None,
                         state: RunIndexState::Active,
@@ -2082,6 +2128,7 @@ pub fn reconcile_run_state<'a>(
                     });
                 }
             }
+            WalRecord::InputTokenBudgetExhausted { detail } => budget_detail = Some(detail.clone()),
             WalRecord::ModelStepFinished {
                 usage,
                 finish_reason,
@@ -2130,6 +2177,7 @@ pub fn reconcile_run_state<'a>(
                     let state = match reason {
                         RunFinishReason::Completed => RunIndexState::Completed,
                         RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
+                        RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
                         RunFinishReason::Cancelled => RunIndexState::Cancelled,
                         RunFinishReason::Interrupted => RunIndexState::Interrupted,
                         RunFinishReason::Error => RunIndexState::Error,
@@ -2138,6 +2186,7 @@ pub fn reconcile_run_state<'a>(
                         }
                     };
                     found = Some(ReconciledRunState {
+                        budget_detail: budget_detail.clone(),
                         live_step: None,
                         title: None,
                         state,
@@ -2160,6 +2209,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } if rid.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    budget_detail: None,
                     live_step: None,
                     title: None,
                     state: RunIndexState::Paused,
@@ -2185,6 +2235,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } if failure.run_id.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    budget_detail: None,
                     live_step: None,
                     title: None,
                     state: RunIndexState::Error,
@@ -2203,6 +2254,7 @@ pub fn reconcile_run_state<'a>(
     }
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
+            budget_detail: None,
             live_step: None,
             state: RunIndexState::Interrupted,
             undelivered_steers: Some(pending_steer_ids.clone()),
@@ -2558,6 +2610,7 @@ mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 lineage_retention: None,
                 compaction: None,
@@ -2599,6 +2652,7 @@ mod projection_boundary_tests {
             .as_mut()
             .expect("projection seed has an episode");
         episode.config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![BudgetNudge {
                 at_tool_calls: 0,
                 text: "exact fire-time text".into(),
@@ -2645,6 +2699,7 @@ mod projection_boundary_tests {
             .as_mut()
             .expect("projection seed has an episode");
         episode.config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![
                 BudgetNudge {
                     at_tool_calls: 1,
@@ -2698,6 +2753,7 @@ mod projection_boundary_tests {
             .as_mut()
             .expect("projection seed has an episode");
         episode.config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![BudgetNudge {
                 at_tool_calls: 1,
                 text: "nudge".into(),

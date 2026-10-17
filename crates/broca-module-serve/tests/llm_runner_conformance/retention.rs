@@ -379,7 +379,9 @@ fn tool_call(id: &str, arguments: Value, result: Value, hold: bool) -> ScriptedP
 }
 
 fn turn(parts: Vec<ScriptedPart>) -> cortexkit_role_llm_runner_conformance::ScriptedTurn {
-    cortexkit_role_llm_runner_conformance::ScriptedTurn { parts }
+    cortexkit_role_llm_runner_conformance::ScriptedTurn::new(parts).with_usage(
+        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+    )
 }
 
 /// A send without `retention` into `session`, so it continues whatever lineage is there.

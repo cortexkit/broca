@@ -286,6 +286,7 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         "run_status",
         "run_cancel",
         "retract",
+        "input_token_cap",
         "dispatch_attribution",
         "streaming",
         "steer",

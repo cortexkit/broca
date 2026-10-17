@@ -731,6 +731,7 @@ async fn budgeted_and_legacy_owner_snapshots_match_the_full_wal() {
             unreachable!()
         };
         config.budget = Some(broca_protocol::BudgetConfig {
+            max_input_tokens: None,
             nudges: Vec::new(),
             finalize_at_tool_calls: 99,
             finalize_text: "finalize".into(),

@@ -310,6 +310,7 @@ where
                     && snapshot.watermark_seq <= safe_head
                     && checkpoint.ownership_complete()
                     && checkpoint.compaction_complete()
+                    && checkpoint.input_budget.is_some()
                 {
                     // Only a budgeted episode can seed replay from the checkpoint at the store
                     // watermark. Decide from this pre-tail state: if the tail opens or corruptly
@@ -1617,6 +1618,14 @@ where
     prior.marker_order_version = episode.and_then(|episode| episode.marker_order_version);
     prior.keep_warm = episode.and_then(|episode| episode.keep_warm);
     prior.cancel_at = episode.and_then(|episode| episode.cancel_at);
+    prior.input_budget = snapshot
+        .checkpoint_at_head
+        .input_budget
+        .clone()
+        .ok_or_else(|| {
+            RunError::Wal("admission checkpoint has no session input accounting".into())
+        })?;
+    writer.seed_input_token_limit(prior.input_budget.limit);
     if let Some(compaction) = &snapshot.checkpoint_at_head.compaction {
         prior.compaction = compaction.clone();
         if let Some(state) = compaction.state() {
@@ -2560,6 +2569,30 @@ where
             "retention disagrees with the lineage's frozen policy".into(),
         ));
     }
+    let mut input_budget = prior.input_budget.clone();
+    let frozen_input_limit = input_budget.limit;
+    let requested_limit = req
+        .budget
+        .as_ref()
+        .and_then(|budget| budget.max_input_tokens);
+    // A queued send was validated when accepted. A later accepted send may have lowered
+    // its limit while it waited; draining the earlier send must honor that tighter policy.
+    let requested_limit = if req.submission_id.is_some() {
+        requested_limit.map(|limit| input_budget.limit.map_or(limit, |frozen| frozen.min(limit)))
+    } else {
+        requested_limit
+    };
+    input_budget.limit = match input_budget.admit(requested_limit) {
+        Ok(limit) => limit,
+        Err(message) => {
+            let error = RunError::Config(message);
+            if let Some(ack) = on_admitted {
+                let _ = ack.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    let input_cap_changed = input_budget.limit != frozen_input_limit;
     // Saved approvals cannot authorize work without the requester adapter. Refuse
     // before any admission, recovery or terminal record can change the episode.
     let read_approval_frames = || -> Result<Vec<broca_wal::FramedRecord>, RunError> {
@@ -3135,6 +3168,12 @@ where
                 return Err(err);
             }
         }
+        if input_cap_changed {
+            writer.record(WalRecord::InputTokenCapFrozen {
+                limit: input_budget.limit.expect("changed cap is finite"),
+            });
+            writer.sync().await?;
+        }
         // A resume is durably ADMITTED the moment its prior state is reconstructed — its
         // RunStarted is already fsynced (a prior run wrote it). Fire the admission-ack HERE,
         // before the resolution match, so EVERY resume outcome (idempotent no-op / natural
@@ -3165,6 +3204,67 @@ where
                     crate::resume::DeferredCloseKind::WithdrawElicitation,
                 )
         });
+        // A durable model response may survive a cut before the terminal barrier. Reconcile
+        // its measured input before recovery can dispatch any of that response's tools.
+        if !prior.run_finished_durable {
+            if let Some(detail) = input_budget.exhausted() {
+                writer.record(resume_sealing);
+                writer.record(WalRecord::InputTokenBudgetExhausted { detail });
+                let pending = match &prior.resolution {
+                    ReplayResolution::Resume { pending }
+                    | ReplayResolution::AuthRequired { pending, .. } => pending.as_ref(),
+                    _ => None,
+                };
+                if let Some(pending) = pending {
+                    let calls: Vec<_> = pending.assistant.tool_calls().cloned().collect();
+                    let existing: Vec<_> = pending
+                        .existing
+                        .iter()
+                        .map(|(_, result)| result.clone())
+                        .collect();
+                    return finalize_hard_stop(
+                        control,
+                        &resolved_run_id,
+                        pending.step_id,
+                        &calls,
+                        &existing,
+                        pending.batch_id.is_some(),
+                        DispatchOutcome::MaxSteps,
+                        RunFinishReason::BudgetExhausted,
+                        writer,
+                        projector,
+                        out,
+                        prior.completed_steps,
+                        prior.usage,
+                        prior.retries_used,
+                        prior_last_step_finish_reason,
+                        &[],
+                        control.emit_control_payloads,
+                    )
+                    .await;
+                }
+                for record in &close_out {
+                    writer.record(record.clone());
+                }
+                let (summary, seq) = finish_run(
+                    writer,
+                    control,
+                    out,
+                    &resolved_run_id,
+                    RunFinishReason::BudgetExhausted,
+                    prior.completed_steps,
+                    prior.usage,
+                    prior.retries_used,
+                    None,
+                    prior_last_step_finish_reason,
+                )
+                .await?;
+                if let Some(projector) = projector {
+                    projector.enqueue_terminal(seq);
+                }
+                return Ok(summary);
+            }
+        }
         // A crash cannot undo an acknowledged cancel. Repair sent calls without dispatching
         // again; only a durable pending tool turn may finish before a boundary cancellation.
         if recovered_cancel
@@ -3653,6 +3753,11 @@ where
             // never re-drains it). `None` for a directly-started run.
             submission_id: req.submission_id.clone(),
         });
+        if input_cap_changed {
+            writer.record(WalRecord::InputTokenCapFrozen {
+                limit: input_budget.limit.expect("changed cap is finite"),
+            });
+        }
         if let Err(error) = writer.sync().await {
             let error = RunError::from(error);
             admit(&mut on_admitted, Err(error.clone()));
@@ -3894,6 +3999,12 @@ where
     });
 
     let reason = loop {
+        input_budget.limit = writer.input_token_limit().or(input_budget.limit);
+        // A session budget is independent of episode counters and reminder inheritance.
+        if let Some(detail) = input_budget.exhausted() {
+            writer.record(WalRecord::InputTokenBudgetExhausted { detail });
+            break RunFinishReason::BudgetExhausted;
+        }
         // Cooperative cancel at the TURN boundary (a safe WAL boundary: the prior turn's
         // batch is complete and committed, so there is no pending tool_use to strand).
         // Stop cleanly as Cancelled. Checked here, before the next model step, so a cancel
@@ -4268,6 +4379,8 @@ where
                 // Each step is a separate billed call → ACCUMULATE, never overwrite,
                 // or a multi-step run under-reports its own total spend.
                 total_usage += usage;
+                input_budget.observe(usage);
+                input_budget.limit = writer.input_token_limit().or(input_budget.limit);
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_usage = crate::compaction::wire_usage(
@@ -4414,7 +4527,11 @@ where
                         None => false,
                     };
 
-                if !has_tool_calls && !control.emit_control_payloads && !extend_for_steer {
+                if !has_tool_calls
+                    && !control.emit_control_payloads
+                    && !extend_for_steer
+                    && input_budget.exhausted().is_none()
+                {
                     // A no-tool message ends this loop, and terminal handling reads only the
                     // counters and finish reason below. Replay and materialization rebuild the
                     // terminal prompt from this WAL record, so the live path can transfer its
@@ -4587,6 +4704,33 @@ where
             }
         };
         completed_steps += 1;
+        if let Some(detail) = input_budget.exhausted() {
+            writer.record(WalRecord::InputTokenBudgetExhausted { detail });
+            let pending: Vec<_> = assembled.tool_calls().cloned().collect();
+            if !pending.is_empty() {
+                return finalize_hard_stop(
+                    control,
+                    &resolved_run_id,
+                    step_id,
+                    &pending,
+                    &rejected_tool_calls,
+                    cut_resume.is_some(),
+                    DispatchOutcome::MaxSteps,
+                    RunFinishReason::BudgetExhausted,
+                    writer,
+                    projector,
+                    out,
+                    completed_steps,
+                    total_usage,
+                    total_retries_used,
+                    last_step_finish_reason,
+                    &[],
+                    control.emit_control_payloads,
+                )
+                .await;
+            }
+            break RunFinishReason::BudgetExhausted;
+        }
         if finalize_turn {
             if !rejected_tool_calls.is_empty() {
                 let pending: Vec<_> = assembled.tool_calls().cloned().collect();
@@ -7078,7 +7222,16 @@ async fn finalize_hard_stop(
                 .iter()
                 .find(|result| result.tool_call_id == c.tool_call_id)
                 .cloned()
-                .unwrap_or_else(|| hard_stop_result(c, outcome))
+                .unwrap_or_else(|| {
+                    if reason == RunFinishReason::BudgetExhausted {
+                        error_result(
+                            c,
+                            "budget_exhausted: tool not executed; input-token cap stopped dispatch",
+                        )
+                    } else {
+                        hard_stop_result(c, outcome)
+                    }
+                })
         })
         .collect();
     // No ToolDispatchIntent — these calls were never dispatched.
@@ -7102,10 +7255,14 @@ async fn finalize_hard_stop(
             } else {
                 outcome
             },
-            reason: rejected
-                .iter()
-                .any(|result| result.tool_call_id == r.tool_call_id)
-                .then(|| "tool_args_trailing_garbage".into()),
+            reason: if reason == RunFinishReason::BudgetExhausted {
+                Some("budget_exhausted".into())
+            } else {
+                rejected
+                    .iter()
+                    .any(|result| result.tool_call_id == r.tool_call_id)
+                    .then(|| "tool_args_trailing_garbage".into())
+            },
             withdraw_elicitation: None,
             provider_held: None,
         });
@@ -8581,6 +8738,7 @@ mod tests {
             auth_selection: None,
             tools_were_omitted: false,
             budget: Some(BudgetConfig {
+                max_input_tokens: None,
                 nudges: Vec::new(),
                 finalize_at_tool_calls: 99,
                 finalize_text: "finalize".into(),
@@ -8605,6 +8763,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.
                 lineage_retention: Some(crate::LineageRetention::Forever),

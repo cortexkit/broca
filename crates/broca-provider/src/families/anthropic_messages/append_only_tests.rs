@@ -326,6 +326,7 @@ async fn a_multi_episode_session_renders_append_only() {
     marked.cache_prefix_blocks = Some(1);
     let mut second = request(&dir, "e2", model, marked);
     second.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 2,
             text: "Check the work so far before calling more tools.".into(),

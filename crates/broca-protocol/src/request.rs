@@ -352,13 +352,34 @@ pub struct BudgetNudge {
     pub text: String,
 }
 
-/// Per-run tool-call budget. The runner freezes this config at admission and replays every
-/// injection from the durable tool-call history.
+/// Tool-call reminders for this episode and an independent, lower-only session input cap.
+/// The runner freezes reminder config at admission and replays injections from durable history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetConfig {
+    /// Session-wide face-value input cap, including cache reads and writes. May only decrease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(default)]
     pub nudges: Vec<BudgetNudge>,
+    #[serde(default = "unlimited_tool_calls")]
     pub finalize_at_tool_calls: u64,
+    #[serde(default)]
     pub finalize_text: String,
+}
+
+fn unlimited_tool_calls() -> u64 {
+    u64::MAX
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: None,
+            nudges: Vec::new(),
+            finalize_at_tool_calls: u64::MAX,
+            finalize_text: String::new(),
+        }
+    }
 }
 
 /// Identifies which budget message was injected.

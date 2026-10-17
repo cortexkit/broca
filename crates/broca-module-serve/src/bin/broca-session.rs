@@ -1154,7 +1154,11 @@ impl<'a> RunTurnTracker<'a> {
 
     fn exit_code(&self) -> i32 {
         match self.finish_reason {
-            Some(RunFinishReason::Completed | RunFinishReason::MaxSteps) => 0,
+            Some(
+                RunFinishReason::Completed
+                | RunFinishReason::MaxSteps
+                | RunFinishReason::BudgetExhausted,
+            ) => 0,
             Some(
                 RunFinishReason::Interrupted
                 | RunFinishReason::Cancelled
@@ -1297,7 +1301,9 @@ async fn run_turn(
         return Ok(
             if matches!(
                 reason,
-                RunFinishReason::Completed | RunFinishReason::MaxSteps
+                RunFinishReason::Completed
+                    | RunFinishReason::MaxSteps
+                    | RunFinishReason::BudgetExhausted
             ) {
                 0
             } else {

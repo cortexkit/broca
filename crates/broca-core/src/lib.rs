@@ -24,6 +24,7 @@ pub mod consent;
 pub mod context;
 pub mod hooks;
 pub mod import;
+pub mod input_budget;
 pub mod lease;
 pub mod projection;
 pub mod projection_plan;

@@ -65,8 +65,10 @@ async fn released_03201_resumes_an_absent_optional_tool_manifest() {
             Script {
                 turns: ["new answer", "rollback answer"]
                     .into_iter()
-                    .map(|text| ScriptedTurn {
-                        parts: vec![ScriptedPart::Text(text.into())],
+                    .map(|text| {
+                        ScriptedTurn::new(vec![ScriptedPart::Text(text.into())]).with_usage(
+                            cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                        )
                     })
                     .collect(),
             },

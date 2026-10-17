@@ -1579,6 +1579,7 @@ where
         unreachable!("base record starts a run");
     };
     config.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 0,
             text: "budget reminder".into(),

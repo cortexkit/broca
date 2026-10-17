@@ -35,6 +35,7 @@ TERMINAL_STATES = (
     "completed",
     "error",
     "max_steps",
+    "budget_exhausted",
     "interrupted",
     "cancelled",
     # ADDED AFTER THE ENGINE HAD IT. TransformUnavailable has been a terminal since

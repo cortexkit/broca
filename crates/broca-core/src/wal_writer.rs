@@ -1625,6 +1625,8 @@ type EnqueueContentionProbe = Arc<dyn Fn() + Send + Sync>;
 
 /// The loop's handle to the writer task.
 pub struct WalHandle {
+    /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
+    input_token_limit: AtomicU64,
     move_check: Option<Arc<dyn Fn() -> Result<(), WalError> + Send + Sync>>,
     fence: u64,
     append_budget: Option<Mutex<AppendBudget>>,
@@ -1834,6 +1836,7 @@ impl WalHandle {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;
         Ok(WalHandle {
+            input_token_limit: AtomicU64::new(0),
             move_check: None,
             fence,
             append_budget,
@@ -1908,6 +1911,31 @@ impl WalHandle {
         self.enqueue_record(record, false)
     }
 
+    pub fn seed_input_token_limit(&self, limit: Option<u64>) {
+        if let Some(limit) = limit {
+            let mut old = self.input_token_limit.load(Ordering::SeqCst);
+            loop {
+                let new = if old == 0 { limit } else { old.min(limit) };
+                match self.input_token_limit.compare_exchange_weak(
+                    old,
+                    new,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => old = current,
+                }
+            }
+        }
+    }
+
+    pub fn input_token_limit(&self) -> Option<u64> {
+        match self.input_token_limit.load(Ordering::SeqCst) {
+            0 => None,
+            limit => Some(limit),
+        }
+    }
+
     fn enqueue_record(&self, record: WalRecord, reserved_terminal: bool) -> RecordOutcome {
         let (seq, frame) = if let Some(budget) = &self.append_budget {
             let seq = self.next_seq.load(Ordering::SeqCst);
@@ -1973,6 +2001,16 @@ impl WalHandle {
         }
         #[cfg(test)]
         self.run_after_reserve_probe(seq);
+        match &record {
+            WalRecord::InputTokenCapFrozen { limit } => self.seed_input_token_limit(Some(*limit)),
+            WalRecord::Queued { request, .. } => self.seed_input_token_limit(
+                request
+                    .budget
+                    .as_ref()
+                    .and_then(|budget| budget.max_input_tokens),
+            ),
+            _ => {}
+        }
         if self
             .tx
             .send(WalCommand::Append {

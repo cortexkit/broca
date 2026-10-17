@@ -312,6 +312,7 @@ name = "broca-protocol"
 version = "0.3.210"
 dependencies = [
  "cortexkit-anthropic-policy",
+ "cortexkit-role-llm-runner",
  "serde",
  "serde_json",
  "tokio",
@@ -653,9 +654,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89c849bffa362ef390b27eb7314d29c786c54171d656d5393feadc14253e588a"
+checksum = "7333245cf6e702a34b8d4411d307423c757a64145557122233bbdbc7f9a9aefa"
 dependencies = [
  "serde",
  "serde_json",
@@ -664,9 +665,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "545489fefda5573a2666fc29399511689c856c01b496d1e86d0a3bdb41cc6bf9"
+checksum = "6487ed3ec61f2b72c6050cd4e2e8c93ed0be170c5a41dc02c3fc648d141e9032"
 dependencies = [
  "async-trait",
  "cortexkit-role-compaction-provider",
