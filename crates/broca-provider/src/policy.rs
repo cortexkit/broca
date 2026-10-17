@@ -24,12 +24,13 @@ pub struct Quirks {
     pub usage: UsagePolicy,
     #[serde(default)]
     pub token_limit_field: TokenLimitField,
-    /// Whether this provider REQUIRES a non-empty `reasoning_content` on a tool-call
-    /// assistant message (an OpenAI-compatible subset — DeepSeek-reasoner, Kimi, Moonshot —
-    /// rejects the turn without it). When set, the OpenAI-Chat render supplies `""` on a
-    /// tool-call assistant message that has none. DEFAULT OFF: opt-in per provider via the
-    /// catalog overlay; no provider is opted in by default, so this changes no current
-    /// render. See `ReasoningContentRequired` framing in the codec spec (§6.3).
+    /// Whether this provider needs each earlier assistant turn's reasoning sent back as
+    /// `reasoning_content` (DeepSeek's thinking mode). When set, the OpenAI-Chat render puts
+    /// `reasoning_content` on EVERY assistant message: the stored reasoning text verbatim, or
+    /// `""` when the turn has none. DEFAULT OFF: the catalog opts in the `deepseek` provider
+    /// and any provider whose base URL host is `deepseek.com` or a subdomain of it; every other
+    /// provider renders without the field. See `ReasoningContentRequired` framing in the codec
+    /// spec (§6.3).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reasoning_content_required: bool,
     /// Whether this provider rejects `content: null` on a tool-call-only assistant turn

@@ -2133,6 +2133,16 @@ mod executor {
             .unwrap_or(false)
     }
 
+    /// Whether the episode froze the DeepSeek reasoning echo. A config recorded before DeepSeek
+    /// was opted in has no field and reads as false, so its resume keeps the bytes it was sending.
+    fn frozen_reasoning_content_required(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("reasoning_content_required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// The service tier the episode was admitted with, re-applied on resume from the durable
     /// `RunConfig` rather than the resuming send, and without re-checking the catalog's rates.
     fn frozen_service_tier(
@@ -3530,6 +3540,12 @@ mod executor {
                                 .unwrap_or(false)
                         },
                     ),
+                    // Restored as recorded: an absent field (an episode admitted before DeepSeek
+                    // was opted into the reasoning echo) reads back as false and keeps its bytes.
+                    reasoning_content_required: prior_run
+                        .as_ref()
+                        .filter(|_| !fresh_episode)
+                        .map(|prior| frozen_reasoning_content_required(&prior.config)),
                     // Older episodes omitted strict; only a fresh episode takes the new default.
                     responses_tools_non_strict: prior_run
                         .as_ref()

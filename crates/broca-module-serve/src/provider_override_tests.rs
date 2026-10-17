@@ -48,6 +48,13 @@ fn resolve_runtime_override(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            // As the executor restores it: a recorded blob without the field reads as false.
+            reasoning_content_required: frozen.map(|recorded| {
+                recorded
+                    .get("reasoning_content_required")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
             structured_output: None,
         },
     )
@@ -102,6 +109,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            reasoning_content_required: None,
             structured_output: None,
         },
     )
@@ -437,6 +445,7 @@ fn resolve_drift_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            reasoning_content_required: None,
             structured_output: None,
         },
     )
@@ -772,6 +781,7 @@ fn resolve_tier_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            reasoning_content_required: None,
             structured_output: None,
         },
     )
@@ -887,6 +897,7 @@ fn resolve_variant_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            reasoning_content_required: None,
             structured_output: None,
         },
     )
@@ -1013,6 +1024,96 @@ fn resume_reads_the_recorded_responses_tool_strictness() {
     assert!(frozen_responses_tools_non_strict(&recorded));
     recorded.frozen_render_config = serde_json::json!({"responses_tools_non_strict": false});
     assert!(!frozen_responses_tools_non_strict(&recorded));
+}
+
+#[test]
+fn resume_reads_the_recorded_reasoning_content_required() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-reasoning-echo-{}", std::process::id()));
+    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
+    let mut recorded = drift_run_config(&drift_request(&root), &started);
+    recorded.frozen_render_config = serde_json::json!({});
+    assert!(!frozen_reasoning_content_required(&recorded));
+    recorded.frozen_render_config = serde_json::json!({"reasoning_content_required": true});
+    assert!(frozen_reasoning_content_required(&recorded));
+}
+
+/// A conversation with a reasoning-carrying tool-call turn and a plain text turn, the two
+/// assistant shapes whose rendering the DeepSeek reasoning echo changes.
+fn deepseek_history() -> broca_protocol::CallOptions {
+    use broca_protocol::{ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult};
+    broca_protocol::CallOptions::new(vec![
+        Message::new(Role::User, vec![ContentBlock::Text { text: "look".into() }]),
+        Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::Reasoning { text: "read the file first".into(), signature: None },
+                ContentBlock::ToolCall(ToolCall {
+                    thought_signature: None,
+                    tool_call_id: ToolCallId("call_0".into()),
+                    tool_name: "read".into(),
+                    input: serde_json::json!({}),
+                }),
+            ],
+        ),
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("call_0".into()),
+                output: ToolOutput::Text { text: "contents".into() },
+                is_error: false,
+            })],
+        ),
+        Message::new(Role::Assistant, vec![ContentBlock::Text { text: "done".into() }]),
+        Message::new(Role::User, vec![ContentBlock::Text { text: "again".into() }]),
+    ])
+}
+
+fn assistant_reasoning(body: &[u8]) -> Vec<Option<serde_json::Value>> {
+    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .map(|message| message.get("reasoning_content").cloned())
+        .collect()
+}
+
+/// A DeepSeek episode admitted before DeepSeek was opted into the reasoning echo recorded no
+/// `reasoning_content_required`. Its resume restores that absence rather than taking today's
+/// catalog value, so the resumed config equals the recorded blob (core's drift guard compares
+/// the two and would otherwise refuse the resume) and renders without `reasoning_content`. A
+/// newly admitted episode of the same model gets the echo on every assistant turn.
+#[test]
+fn deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes() {
+    let fresh = resolve_runtime_override(&Default::default(), None);
+    let fresh_blob = fresh.provider.render_config_blob();
+    assert_eq!(fresh_blob["reasoning_content_required"], true);
+    assert_eq!(
+        assistant_reasoning(&fresh.provider.render_request(&deepseek_history())),
+        vec![
+            Some(serde_json::json!("read the file first")),
+            Some(serde_json::json!(""))
+        ]
+    );
+
+    let mut recorded = fresh_blob;
+    recorded
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoning_content_required");
+    let resumed = resolve_runtime_override(&Default::default(), Some(&recorded));
+    assert_eq!(
+        serde_json::to_vec(&resumed.provider.render_config_blob()).unwrap(),
+        serde_json::to_vec(&recorded).unwrap(),
+        "the resumed config must equal the recorded blob"
+    );
+    assert_eq!(
+        assistant_reasoning(&resumed.provider.render_request(&deepseek_history())),
+        vec![None, None],
+        "a resumed pre-echo episode renders no reasoning_content"
+    );
 }
 
 /// An executor whose tool plane is a stand-in subc connection that authenticates and then idles:

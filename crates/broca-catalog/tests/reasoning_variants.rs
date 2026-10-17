@@ -119,6 +119,7 @@ mod gated {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            reasoning_content_required: None,
             structured_output: None,
         };
         let resolved = if method == AuthMethod::Chatgpt {
