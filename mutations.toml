@@ -10857,8 +10857,8 @@ select = "expected"
 test_file = "crates/broca-module/tests/it/session_read.rs"
 expect_red = ["session_read::imported_message_over_frame_limit_is_refused_with_identity"]
 file = "crates/broca-module/src/serve.rs"
-old = "    if bytes > broca_wire::SUBC_MAX_FRAME_BYTES {"
-new = "    if bytes > u64::MAX { // NON-VACUITY BREAK"
+old = "    if bytes <= broca_wire::SUBC_MAX_FRAME_BYTES {"
+new = "    if bytes > broca_wire::SUBC_MAX_FRAME_BYTES { // NON-VACUITY BREAK"
 
 [[control]]
 id = "serve-reader-authorization-off-ingress"
@@ -14388,9 +14388,8 @@ features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
 expect_red = ["inventory::diverged_held_ref_reads_one_local_snapshot_live_or_archived"]
 file = "crates/broca-module-serve/src/agent_data.rs"
-old = '''            Op::Diverged => json!({"refs":plans.iter().map(|p| {'''
-new = '''            Op::Diverged => json!({"refs":plans.iter().map(|p| {
-                let _ = self.wal.bytes_for_move(&p.session); // NON-VACUITY BREAK: reread the local WAL in reply. '''
+old = "                let bytes = match self.wal.bytes_for_move(session) {"
+new = "                let _ = self.wal.bytes_for_move(session); // NON-VACUITY BREAK: reread the held WAL.\n                let bytes = match self.wal.bytes_for_move(session) {"
 
 [[control]]
 id = "agent-data-persistent-cache-validates-length"

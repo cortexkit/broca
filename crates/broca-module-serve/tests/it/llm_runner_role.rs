@@ -4,11 +4,11 @@
 //! Every run goes through the real core loop over a real file WAL (the delivery rig), so each
 //! record a test reads back was written by core or the lineage actor exactly as in production.
 
-use crate::delivery_rig;
-
+use broca_module::ServeHandler;
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::RunId;
-use broca_module::ServeHandler;
+
+use crate::delivery_rig;
 use delivery_rig::*;
 use std::time::Duration;
 
@@ -733,8 +733,9 @@ async fn run_result_refuses_a_final_message_that_exceeds_the_frame_limit() {
     assert_eq!(body["code"], broca_wire::REPLY_TOO_LARGE);
     assert!(body["detail"]["bytes"].as_u64().unwrap() > broca_wire::SUBC_MAX_FRAME_BYTES);
     assert_eq!(body["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
-    assert_eq!(body["detail"]["message"]["session"], rig.session.session);
-    assert_eq!(body["detail"]["message"]["ordinal"], 1);
+    assert_eq!(body["detail"]["subject"]["kind"], "message");
+    assert_eq!(body["detail"]["subject"]["session"], rig.session.session);
+    assert_eq!(body["detail"]["subject"]["ordinal"], 1);
     rig.finish().await;
 }
 

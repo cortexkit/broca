@@ -4217,6 +4217,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_group_reply_too_large_vector_is_emitted_through_route_dispatch() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/llm-runner-v1/reply-too-large.json"
+        ))
+        .unwrap();
+        let case = vectors["refusals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| {
+                case["name"] == "model-view atomic group exceeds the transport frame limit"
+            })
+            .unwrap();
+        let refusal = &case["refusal"];
+        let source_json = refusal["detail"]["subject"]["source"].clone();
+        let compaction_id = source_json["compaction_id"].as_str().unwrap().to_owned();
+        let version = source_json["version"].as_u64().unwrap();
+        let source: cortexkit_role_llm_runner::read::EntrySource =
+            serde_json::from_value(source_json).unwrap();
+        let page = broca_wire::ModelPage {
+            messages: vec![broca_wire::ModelEntry {
+                source: source.clone(),
+                message: broca_protocol::Message::new(broca_protocol::Role::Assistant, Vec::new()),
+            }],
+            lineage_id: None,
+            next_from_ordinal: None,
+            head: None,
+            compaction_id: Some(compaction_id),
+            version: Some(version),
+        };
+        let detail = broca_module::serve::ReplyTooLargeDetail::new(
+            refusal["detail"]["bytes"].as_u64().unwrap(),
+            refusal["detail"]["limit"].as_u64().unwrap(),
+            broca_module::serve::ReplyTooLargeSubject::ModelGroup {
+                source: page.messages[0].source.clone(),
+            },
+        );
+        let (sink_tx, _) = mpsc::channel(1);
+        let handler = Arc::new(MockSubscribeHandler {
+            sink_tx,
+            refuse_session: std::sync::atomic::AtomicBool::new(false),
+            model_reply_too_large: Some(detail.clone()),
+        });
+        let (writer, mut rx) = broca_diagnostics::channel(1, Arc::default());
+        execute_route_request(
+            crate::wire::RouteRequest {
+                method: OP_READ.into(),
+                params: serde_json::json!({"view":"model"}),
+            },
+            &writer,
+            PROTOCOL_VERSION,
+            7,
+            3,
+            11,
+            BrocaBindIdentity::new("/tmp/vector-project", "runner", "session"),
+            BindObservation::default(),
+            &handler,
+        )
+        .await
+        .unwrap();
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        #[derive(serde::Serialize)]
+        struct ExpectedError<'a> {
+            code: &'a str,
+            message: &'a str,
+            detail: &'a broca_module::serve::ReplyTooLargeDetail,
+        }
+        assert_eq!(
+            frame.body,
+            serde_json::to_vec(&ExpectedError {
+                code: refusal["code"].as_str().unwrap(),
+                message: refusal["message"].as_str().unwrap(),
+                detail: &detail,
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap(),
+            *refusal
+        );
+    }
+
+    #[tokio::test]
     async fn plan_model_mismatch_bytes_are_pinned() {
         use sha2::{Digest, Sha256};
         let refusal = broca_fetch_plan::Refusal::PlanModelMismatch {
@@ -4343,10 +4427,15 @@ mod tests {
     struct MockSubscribeHandler {
         sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
         refuse_session: std::sync::atomic::AtomicBool,
+        model_reply_too_large: Option<broca_module::serve::ReplyTooLargeDetail>,
     }
 
     #[async_trait::async_trait]
     impl ServeHandler for MockSubscribeHandler {
+        fn compaction_supported(&self) -> bool {
+            self.model_reply_too_large.is_some()
+        }
+
         async fn authorize_session(
             &self,
             _session: &BrocaBindIdentity,
@@ -4383,6 +4472,16 @@ mod tests {
         async fn read(&self, _req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
             unimplemented!()
         }
+        async fn read_model(
+            &self,
+            _req: SessionReadRequest,
+        ) -> Result<broca_wire::ModelPage, ServeError> {
+            Err(ServeError::ReplyTooLarge(
+                self.model_reply_too_large
+                    .clone()
+                    .expect("model-page test supplies a reply-too-large detail"),
+            ))
+        }
         async fn cancel(
             &self,
             _session: &BrocaBindIdentity,
@@ -4411,6 +4510,7 @@ mod tests {
         let handler = Arc::new(MockSubscribeHandler {
             sink_tx,
             refuse_session: std::sync::atomic::AtomicBool::new(false),
+            model_reply_too_large: None,
         });
 
         // Bounded channel of size 1 for the writer.
@@ -4621,6 +4721,7 @@ mod tests {
                 handler: Arc::new(MockSubscribeHandler {
                     sink_tx,
                     refuse_session: std::sync::atomic::AtomicBool::new(false),
+                    model_reply_too_large: None,
                 }),
                 writer,
                 written,
