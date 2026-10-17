@@ -12,6 +12,10 @@ fn every_open_failed_site_chooses_a_class() {
         ("From<OpenError>: erased cause", "None"),
         ("From<OpenError>: typed cause", "Some(class)"),
         (
+            "cancel_at: unsupported",
+            "Some(broca_protocol::ErrorClass::Permanent)",
+        ),
+        (
             "head: unsupported",
             "Some(broca_protocol::ErrorClass::Permanent)",
         ),

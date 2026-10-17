@@ -2757,9 +2757,13 @@ async fn boundary_cancel_preserves_active_approval_wait_until_immediate_escalati
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::select! {
             result = &mut batch => panic!("approval wait ended early: {:?}", result.interruption),
-            () = async {
-                while rig.questions.outstanding.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
-            } => {},
+            () = broca_test_support::wait_until("approval question to become outstanding", || async {
+                if rig.questions.outstanding.load(Ordering::SeqCst) == 0 {
+                    Err("no approval question is outstanding".to_owned())
+                } else {
+                    Ok(())
+                }
+            }) => {},
         }
     }).await.unwrap();
     inbox

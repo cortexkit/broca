@@ -922,7 +922,7 @@ pub trait ServeHandler: Send + Sync {
         } else {
             Err(ServeError::Open(
                 "step-boundary cancellation is not installed".into(),
-                None,
+                Some(broca_protocol::ErrorClass::Permanent),
             ))
         }
     }
