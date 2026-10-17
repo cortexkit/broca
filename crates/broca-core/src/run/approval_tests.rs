@@ -1650,12 +1650,13 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
     )
     .unwrap();
     let mut history = approval_gate::History::new(&rig.writer, before.clone()).unwrap();
-    // Each answer-feed traversal has a one-second budget; admission returning
-    // does not promise a ready approval was read. Hold the feed across two budgets to
-    // exercise that schedule without relying on a busy runner.
+    // Admission budgets the whole reconciliation, including the feed and WAL sync.
+    // Budget expiry leaves intake eligible for retry, not necessarily dispatched.
+    // Hold the feed across two budgets to force that schedule without runner load.
     let answer_gate = Arc::new(tokio::sync::Semaphore::new(0));
     *rig.questions.answer_gate.lock().unwrap() = Some(answer_gate.clone());
     let polls = rig.questions.polls.load(Ordering::SeqCst);
+    let gets = rig.questions.gets.load(Ordering::SeqCst);
     broca_test_support::event_timeout(
         "late approved call to finish",
         async {
@@ -1671,6 +1672,7 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
                 .unwrap();
             }
             assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 2);
+            assert_eq!(rig.questions.gets.load(Ordering::SeqCst), gets);
             assert!(rig.tools.sent.lock().unwrap().is_empty());
             assert!(!rig
                 .frames()
