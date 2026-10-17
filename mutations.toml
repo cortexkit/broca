@@ -9,6 +9,22 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "module-run-result-reuses-status-wal"
+guards = "A closed run result reuses the authoritative status snapshot instead of decoding the full WAL again"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+test_file = "crates/broca-module/tests/it/session_read/wal_cost.rs"
+expect_red = ["session_read::wal_cost::cold_run_result_reuses_status_snapshot"]
+expect_message = "run.result must reuse the status WAL snapshot"
+file = "crates/broca-module/src/serve.rs"
+old = '''        let final_message = if state == "completed" {
+            let records = match records {
+                Some(records) => records,'''
+new = '''        let final_message = if state == "completed" {
+            let records = match records {
+                Some(_records) => self.read_durable_wal(session).await?.0, // NON-VACUITY BREAK: discard the status snapshot'''
+[[control]]
 id = "windows-config-appdata-before-home"
 guards = "Windows config-home follows subc precedence: APPDATA and USERPROFILE beat HOME"
 runner = "cargo"

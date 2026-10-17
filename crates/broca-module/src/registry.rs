@@ -1884,41 +1884,56 @@ impl LineageRegistry {
         key: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<Option<broca_core::ReconciledRunState>, OpenError> {
+        self.route_run_state_with_wal(key, run_id)
+            .await
+            .map(|(state, _)| state)
+    }
+
+    /// Resolve run state and retain any authoritative WAL snapshot used to answer it.
+    /// Result extraction can reuse that snapshot. Actor-backed answers carry no snapshot,
+    /// so callers must still check the durable WAL for a just-written terminal.
+    pub(crate) async fn route_run_state_with_wal(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<
+        (
+            Option<broca_core::ReconciledRunState>,
+            Option<Vec<broca_wal::FramedRecord>>,
+        ),
+        OpenError,
+    > {
         self.check_expired(key, Some(&run_id.0)).await?;
         if matches!(
             self.check_move(key, true),
             Err(OpenError::SessionMoving { .. })
         ) {
-            let records = self
-                .read_durable_wal(key)
-                .await?
-                .0
-                .into_iter()
-                .map(|f| f.record)
-                .collect::<Vec<_>>();
-            return Ok(broca_core::reconcile_run_state(&records, &run_id.0));
+            let records = self.read_durable_wal(key).await?.0;
+            let state = broca_core::reconcile_run_state(
+                records.iter().map(|frame| &frame.record),
+                &run_id.0,
+            );
+            return Ok((state, Some(records)));
         }
         use crate::actor::LineageCmd;
         loop {
             let closed = !self.inner.slots.lock().unwrap().contains_key(key);
             if closed && self.inner.reader.is_some() {
-                let records = self
-                    .read_durable_wal(key)
-                    .await?
-                    .0
-                    .into_iter()
-                    .map(|frame| frame.record)
-                    .collect::<Vec<_>>();
+                let records = self.read_durable_wal(key).await?.0;
+                let state = broca_core::reconcile_run_state(
+                    records.iter().map(|frame| &frame.record),
+                    &run_id.0,
+                );
                 if matches!(
                     self.check_move(key, true),
                     Err(OpenError::SessionMoving { .. })
                 ) {
-                    return Ok(broca_core::reconcile_run_state(&records, &run_id.0));
+                    return Ok((state, Some(records)));
                 }
-                if let Some(state) = broca_core::reconcile_run_state(&records, &run_id.0) {
+                if let Some(state) = state {
                     if state.state.is_terminal() || state.state == broca_core::RunIndexState::Paused
                     {
-                        return Ok(Some(state));
+                        return Ok((Some(state), Some(records)));
                     }
                 }
                 // Missing or nonterminal WAL state is not proof of an unknown run: the index
@@ -1936,7 +1951,7 @@ impl LineageRegistry {
             match rx.await {
                 // A STORAGE failure resolving the run is surfaced as an error (so the wire
                 // reports it), never collapsed into "unknown run".
-                Ok(Ok(state)) => return Ok(state),
+                Ok(Ok(state)) => return Ok((state, None)),
                 Ok(Err(e)) => {
                     self.check_expired(key, Some(&run_id.0)).await?;
                     return Err(OpenError::Open(e));

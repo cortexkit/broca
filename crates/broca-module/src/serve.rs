@@ -1856,7 +1856,10 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<broca_wire::RunResultResponse, ServeError> {
-        let status = self.run_status(session, run_id.clone()).await?;
+        let (state, mut records) = self
+            .route_run_state_with_wal(session, run_id.clone())
+            .await?;
+        let status = run_status_response(state);
         let (mut state, reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
             RunStatusResponse::Active { .. } => ("active".to_owned(), None, None),
@@ -1870,13 +1873,15 @@ impl ServeHandler for crate::LineageRegistry {
                 ("transform_unavailable".to_owned(), None, None)
             }
         };
-        let mut records = None;
         if state == "active" {
             // The live actor still calls a run active for a moment after its terminal is
             // durable, while `session.read` and `session.head` already read that terminal from
             // the WAL. The durable terminal wins, so a caller that saw the run end on a page is
             // never told it is still running.
-            let (read, _) = self.read_durable_wal(session).await?;
+            let read = match records.take() {
+                Some(records) => records,
+                None => self.read_durable_wal(session).await?.0,
+            };
             if let Some((reason, terminal_error)) = durable_terminal(&read, &run_id) {
                 state = serde_json::to_value(reason)
                     .ok()
