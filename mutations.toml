@@ -16,6 +16,7 @@ package = "broca-module"
 target = "--test it"
 test_file = "crates/broca-module/tests/it/session_read/wal_cost.rs"
 expect_red = ["session_read::wal_cost::cold_run_result_reuses_status_snapshot"]
+expect_message = "run.result must reuse the status WAL snapshot"
 file = "crates/broca-module/src/serve.rs"
 old = '''        let final_message = if state == "completed" {
             let records = match records {

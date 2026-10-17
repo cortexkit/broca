@@ -1820,8 +1820,9 @@ impl LineageRegistry {
             .map(|(state, _)| state)
     }
 
-    /// Keep a closed session's proven snapshot for result extraction. Live actor replies
-    /// carry no snapshot: their durable terminal still needs a separate WAL check.
+    /// Resolve run state and retain any authoritative WAL snapshot used to answer it.
+    /// Result extraction can reuse that snapshot. Actor-backed answers carry no snapshot,
+    /// so callers must still check the durable WAL for a just-written terminal.
     pub(crate) async fn route_run_state_with_wal(
         &self,
         key: &LineageKey,

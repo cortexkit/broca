@@ -3,24 +3,47 @@ use broca_wal::{FramedRecord, WalByteAnchor, WalError, WalRangeRead};
 use std::time::{Instant, SystemTime};
 
 // Forward the file store's cheap probes and durability barriers: using the trait defaults
-// would measure fallback behavior that the production file store never takes.
+// would measure fallback behavior that the production file store never takes. Count
+// sequence-zero reads reaching the seeded tail separately from bounded prefix reads.
 struct CountingStore {
     inner: Arc<FileWalStore>,
     full: AtomicUsize,
     from_zero: AtomicUsize,
+    full_history: AtomicUsize,
+    tail_seq: u64,
 }
 
 impl CountingStore {
     fn reset(&self) {
         self.full.store(0, Ordering::SeqCst);
         self.from_zero.store(0, Ordering::SeqCst);
+        self.full_history.store(0, Ordering::SeqCst);
+    }
+
+    fn count_range(&self, after: u64, read: &WalRangeRead) {
+        if after == 0 {
+            self.from_zero.fetch_add(1, Ordering::SeqCst);
+            let records = match read.records() {
+                broca_wal::WalRangeRecords::Complete(records)
+                | broca_wal::WalRangeRecords::Partial(records)
+                | broca_wal::WalRangeRecords::Unknown(records) => records,
+                broca_wal::WalRangeRecords::Absent => &[],
+            };
+            if records
+                .last()
+                .is_some_and(|frame| frame.seq >= self.tail_seq)
+            {
+                self.full_history.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     fn report(&self, label: &str, start: Instant) {
         println!(
-            "WAL_COST {label}: full={} zero_ranges={} ms={:.3}",
+            "WAL_COST {label}: read_records={} zero_ranges={} full_history={} ms={:.3}",
             self.full.load(Ordering::SeqCst),
             self.from_zero.load(Ordering::SeqCst),
+            self.full_history.load(Ordering::SeqCst),
             start.elapsed().as_secs_f64() * 1000.0,
         );
     }
@@ -65,6 +88,7 @@ impl WalStore for CountingStore {
 
     fn read_records(&self, key: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
         self.full.fetch_add(1, Ordering::SeqCst);
+        self.full_history.fetch_add(1, Ordering::SeqCst);
         self.inner.read_records(key)
     }
 
@@ -75,10 +99,9 @@ impl WalStore for CountingStore {
         through: Option<u64>,
         anchor: Option<&WalByteAnchor>,
     ) -> Result<WalRangeRead, WalError> {
-        if after == 0 {
-            self.from_zero.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.read_records_range(key, after, through, anchor)
+        let read = self.inner.read_records_range(key, after, through, anchor)?;
+        self.count_range(after, &read);
+        Ok(read)
     }
 
     fn read_records_range_for_authorization(
@@ -88,11 +111,11 @@ impl WalStore for CountingStore {
         through: Option<u64>,
         anchor: Option<&WalByteAnchor>,
     ) -> Result<WalRangeRead, WalError> {
-        if after == 0 {
-            self.from_zero.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner
-            .read_records_range_for_authorization(key, after, through, anchor)
+        let read = self
+            .inner
+            .read_records_range_for_authorization(key, after, through, anchor)?;
+        self.count_range(after, &read);
+        Ok(read)
     }
 
     fn read_records_range_from_valid_anchor(
@@ -102,8 +125,13 @@ impl WalStore for CountingStore {
         through: Option<u64>,
         anchor: &WalByteAnchor,
     ) -> Result<Option<WalRangeRead>, WalError> {
-        self.inner
-            .read_records_range_from_valid_anchor(key, after, through, anchor)
+        let read = self
+            .inner
+            .read_records_range_from_valid_anchor(key, after, through, anchor)?;
+        if let Some(read) = &read {
+            self.count_range(after, read);
+        }
+        Ok(read)
     }
 
     fn flush_for_read(&self, key: &BindIdentity) -> Result<Option<u64>, WalError> {
@@ -157,11 +185,18 @@ fn seed(rig: &Rig, key: &BindIdentity) {
     );
 }
 
-fn counter(rig: &Rig) -> Arc<CountingStore> {
+fn counter(rig: &Rig, key: &BindIdentity) -> Arc<CountingStore> {
     Arc::new(CountingStore {
         inner: rig.wal_store.clone(),
         full: AtomicUsize::new(0),
         from_zero: AtomicUsize::new(0),
+        full_history: AtomicUsize::new(0),
+        tail_seq: rig
+            .wal_store
+            .read_records(key)
+            .unwrap()
+            .last()
+            .map_or(u64::MAX, |frame| frame.seq),
     })
 }
 
@@ -185,13 +220,18 @@ async fn cold_run_result_reuses_status_snapshot() {
     let rig = Rig::new("result-snapshot-count", Arc::new(NoopExec));
     let key = rig.key("result");
     two_episodes(&rig, &key);
-    let counting = counter(&rig);
+    let counting = counter(&rig, &key);
     let registry = registry(&rig, counting.clone());
     registry
         .run_result(&key, RunId("first".into()))
         .await
         .unwrap();
     assert_eq!(counting.full.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        counting.full_history.load(Ordering::SeqCst),
+        2,
+        "run.result must reuse the status WAL snapshot"
+    );
     assert_eq!(
         counting.from_zero.load(Ordering::SeqCst),
         2,
@@ -204,6 +244,7 @@ async fn cold_run_result_reuses_status_snapshot() {
         .unwrap();
     assert_eq!(counting.full.load(Ordering::SeqCst), 0);
     assert_eq!(counting.from_zero.load(Ordering::SeqCst), 1);
+    assert_eq!(counting.full_history.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -245,10 +286,16 @@ async fn run_result_snapshot_matches_full_replay_after_crash_and_archive() {
         let full = rig.wal_store.read_records(&key).unwrap();
         let transcript = broca_core::replay_transcript(&full).unwrap();
         assert_eq!(transcript.len(), 4, "{phase}");
-        let registry = registry(&rig, counter(&rig));
+        let registry = registry(&rig, counter(&rig, &key));
         for (run, ordinal, text) in [("first", 1, "first answer"), ("second", 3, "second answer")] {
             let response = registry.run_result(&key, RunId(run.into())).await.unwrap();
+            let expected =
+                broca_core::reconcile_run_state(full.iter().map(|frame| &frame.record), run)
+                    .unwrap();
+            assert_eq!(expected.state, RunIndexState::Completed, "{phase}");
             assert_eq!(response.state, "completed", "{phase}");
+            assert!(response.reason.is_none(), "{phase}");
+            assert_eq!(response.error, expected.error.map(Into::into), "{phase}");
             let message = response.final_message.unwrap();
             assert_eq!(message.ordinal, ordinal, "{phase}");
             assert_eq!(message.mid, format!("m{ordinal}"), "{phase}");
@@ -269,7 +316,7 @@ async fn large_wal_read_costs() {
     let rig = Rig::new("wal-cost", Arc::new(NoopExec));
     let key = rig.key("cost");
     seed(&rig, &key);
-    let counting = counter(&rig);
+    let counting = counter(&rig, &key);
     for materialized in [false, true] {
         if materialized {
             materialize_all(&rig, &key);
