@@ -617,6 +617,7 @@ mod gated {
                 websocket_request,
                 websocket_close_code,
                 input_transformations: _,
+                input_transformations_unmeasured: _,
                 credential_refresh,
                 served_account_ref,
                 content_progress: _,

@@ -162,6 +162,13 @@ pub struct ModelAttempt {
     /// the response did not report the list; an empty list means the provider reported none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_transformations: Option<Vec<InputTransformation>>,
+    /// The request did not ask the provider for that report, so an absent
+    /// `input_transformations` means "not measured", never "nothing was transformed". Set on
+    /// every Anthropic attempt sent without the thinking-binding beta, which includes every
+    /// Claude Code persona request. False (and omitted) on attempts that asked, on other
+    /// families, and on records written before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_transformations_unmeasured: bool,
     /// Present only on an attempt sent with a token refreshed inside the step, either after
     /// the previous attempt of the same step was rejected with an HTTP 401 or because the held
     /// token was about to expire: what broca asked the credential source for, why, and which

@@ -521,6 +521,13 @@ pub trait StreamNormalizer: Send {
     fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
         None
     }
+
+    /// Whether the request this stream answers did NOT ask the provider to report input
+    /// transformations, so a missing report means "not measured" rather than "none". False for
+    /// grammars without the report. A wrapping normalizer must forward this too.
+    fn input_transformations_unmeasured(&self) -> bool {
+        false
+    }
 }
 
 /// Response headers as the transport received them, reduced to what a normalizer can read:

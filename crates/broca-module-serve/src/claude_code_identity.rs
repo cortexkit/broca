@@ -24,35 +24,127 @@ use broca_provider::wire::{uuid_v4_text, ClaudeCodePersona};
 pub const INSTALL_ID_FILE: &str = "claude-code-install-id";
 
 /// Read this installation's id, creating it (32 random bytes as hex, owner-only) on first use.
+///
+/// The id is written to a temporary file in the same directory, synced, then linked into place
+/// with a no-clobber hard link, so the file at [`INSTALL_ID_FILE`] is never seen empty or half
+/// written, and two processes creating it at once both end up with the one that was linked
+/// first. A file that is malformed or cannot be read is logged at ERROR, moved aside as
+/// `claude-code-install-id.bad-<unix ms>` and replaced by a fresh id: the persona's device id
+/// then changes once, rather than the persona switching off for good.
 pub fn load_or_create_install_id(state_root: &Path) -> std::io::Result<String> {
     let path = state_root.join(INSTALL_ID_FILE);
-    let mut options = broca_owner_only::OpenOptions::new();
-    options.write(true).create_new(true);
-    match options.open(&path) {
-        Ok(mut file) => {
-            let mut bytes = [0u8; 32];
-            getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
-            let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-            file.write_all(id.as_bytes())?;
-            file.sync_all()?;
-            Ok(id)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            broca_owner_only::validate(&path)?;
-            let mut text = String::new();
-            std::fs::File::open(&path)?.read_to_string(&mut text)?;
-            let id = text.trim();
-            if id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                Ok(id.to_ascii_lowercase())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("{} does not hold a 64-hex install id", path.display()),
-                ))
+    // Each round either returns an id or removes the obstacle that prevented one; three rounds
+    // cover a bad file being replaced by a concurrent creator in between.
+    let mut last_error = None;
+    for _ in 0..3 {
+        match read_install_id(&path) {
+            Ok(Some(id)) => return Ok(id),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "Claude Code install id file is unreadable or malformed; moving it aside and creating a new id"
+                );
+                set_aside(&path)?;
+                last_error = Some(error);
+                continue;
             }
         }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+        let candidate: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        match publish_install_id(&path, &candidate) {
+            Ok(id) => return Ok(id),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other("the Claude Code install id could not be created")
+    }))
+}
+
+/// The id stored at `path`: `Ok(None)` when there is no file, an error when it cannot be read
+/// or does not hold 64 hex digits.
+fn read_install_id(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    broca_owner_only::validate(path)?;
+    let mut text = String::new();
+    std::fs::File::open(path)?.read_to_string(&mut text)?;
+    let id = text.trim();
+    if id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(Some(id.to_ascii_lowercase()))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} does not hold a 64-hex install id", path.display()),
+        ))
+    }
+}
+
+/// Write `candidate` to a synced temporary file and link it to `path` without replacing an
+/// existing file. Returns the id at `path` afterwards: `candidate`, or the id another process
+/// linked first.
+fn publish_install_id(path: &Path, candidate: &str) -> std::io::Result<String> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+    let temporary = path.with_file_name(format!(
+        "{INSTALL_ID_FILE}.tmp-{}-{}",
+        std::process::id(),
+        nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    let written = (|| {
+        let mut options = broca_owner_only::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&temporary)?;
+        file.write_all(candidate.as_bytes())?;
+        file.sync_all()
+    })();
+    let linked = written.and_then(|()| std::fs::hard_link(&temporary, path));
+    let _ = std::fs::remove_file(&temporary);
+    match linked {
+        Ok(()) => {
+            sync_parent(path);
+            Ok(candidate.to_string())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_install_id(path)?
+            .ok_or_else(|| std::io::Error::other("the linked install id vanished")),
         Err(error) => Err(error),
     }
+}
+
+/// Move a bad install id file aside, keeping it for inspection.
+fn set_aside(path: &Path) -> std::io::Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    match std::fs::rename(
+        path,
+        path.with_file_name(format!("{INSTALL_ID_FILE}.bad-{stamp}")),
+    ) {
+        Ok(()) => Ok(()),
+        // Another process already moved or replaced it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Make the new directory entry durable where the platform allows syncing a directory.
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// The `cc_version` suffix a new episode inherits from the session's latest episode: the one
@@ -127,6 +219,96 @@ fn is_uuid(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root = broca_test_support::scratch_root().join(format!(
+            "claude-code-install-id-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        broca_owner_only::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Two creators racing on a first boot converge: the second link finds the first one's file
+    /// and adopts its id instead of replacing it.
+    #[test]
+    fn a_second_creator_adopts_the_id_linked_first() {
+        let root = scratch("race");
+        let path = root.join(INSTALL_ID_FILE);
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        assert_eq!(publish_install_id(&path, &first).unwrap(), first);
+        assert_eq!(publish_install_id(&path, &second).unwrap(), first);
+        assert_eq!(load_or_create_install_id(&root).unwrap(), first);
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != INSTALL_ID_FILE)
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary file is left behind");
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let root = scratch_concurrent_root(&root);
+                std::thread::spawn(move || load_or_create_install_id(&root).unwrap())
+            })
+            .collect();
+        let ids: std::collections::BTreeSet<String> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "concurrent first boots converge on one id: {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scratch_concurrent_root(parent: &Path) -> std::path::PathBuf {
+        let root = parent.join("concurrent");
+        let _ = broca_owner_only::create_dir_all(&root);
+        root
+    }
+
+    /// A file a crash left empty, or one holding anything but an id, is moved aside and
+    /// replaced by a fresh id instead of disabling the persona.
+    #[test]
+    fn a_malformed_install_id_is_set_aside_and_replaced() {
+        for (label, contents) in [("empty", ""), ("garbage", "not an id")] {
+            let root = scratch(label);
+            let path = root.join(INSTALL_ID_FILE);
+            let mut options = broca_owner_only::OpenOptions::new();
+            options.write(true).create_new(true);
+            options
+                .open(&path)
+                .unwrap()
+                .write_all(contents.as_bytes())
+                .unwrap();
+
+            let id = load_or_create_install_id(&root).unwrap();
+            assert_eq!(id.len(), 64);
+            assert_eq!(read_install_id(&path).unwrap(), Some(id.clone()));
+            let set_aside: Vec<String> = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(&format!("{INSTALL_ID_FILE}.bad-")))
+                .collect();
+            assert_eq!(set_aside.len(), 1, "{label}: the bad file is kept aside");
+            assert_eq!(
+                std::fs::read_to_string(root.join(&set_aside[0])).unwrap(),
+                contents
+            );
+            assert_eq!(
+                load_or_create_install_id(&root).unwrap(),
+                id,
+                "{label}: stable"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 
     #[test]
     fn install_id_is_created_once_and_read_back() {

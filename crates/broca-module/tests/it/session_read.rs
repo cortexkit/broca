@@ -2191,6 +2191,7 @@ async fn session_read_and_control_projection_skip_provider_attempt_records() {
                     websocket_request: None,
                     websocket_close_code: None,
                     input_transformations: None,
+                    input_transformations_unmeasured: false,
                     credential_refresh: None,
                     served_account_ref: None,
                 });

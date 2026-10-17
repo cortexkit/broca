@@ -210,6 +210,24 @@ struct ResponsesCapture {
 #[cfg(unix)]
 impl ResponsesCapture {
     async fn start() -> Self {
+        Self::start_replying(concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"id\":\"msg_meta\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+            "\"content_index\":0,\"delta\":\"META-MUSE-OK\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,",
+            "\"content_index\":0,\"text\":\"META-MUSE-OK\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"id\":\"msg_meta\",\"type\":\"message\",\"role\":\"assistant\",",
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"META-MUSE-OK\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_meta\",",
+            "\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n"
+        ))
+        .await
+    }
+
+    /// Accept one provider request, record it, and answer with `body` as an SSE stream.
+    async fn start_replying(body: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -240,19 +258,6 @@ impl ResponsesCapture {
                 request.extend_from_slice(&chunk[..read]);
             }
 
-            let body = concat!(
-                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
-                "\"item\":{\"id\":\"msg_meta\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
-                "\"content_index\":0,\"delta\":\"META-MUSE-OK\"}\n\n",
-                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,",
-                "\"content_index\":0,\"text\":\"META-MUSE-OK\"}\n\n",
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
-                "\"item\":{\"id\":\"msg_meta\",\"type\":\"message\",\"role\":\"assistant\",",
-                "\"content\":[{\"type\":\"output_text\",\"text\":\"META-MUSE-OK\"}]}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_meta\",",
-                "\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n"
-            );
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
@@ -785,6 +790,14 @@ impl Daemon {
                     "existence": "present",
                     "limit.context": 1048576
                 });
+                lkg["models"]["anthropic/claude-opus-4-8"] = json!({
+                    "capability.attachment": true,
+                    "capability.reasoning": true,
+                    "capability.tool_call": true,
+                    "existence": "present",
+                    "limit.context": 200000,
+                    "limit.output": 32000
+                });
             }
             setup(
                 "seed lkg catalog",
@@ -840,8 +853,13 @@ impl Daemon {
                 "write Meta provider URL override",
                 std::fs::write(
                     &override_path,
+                    // Anthropic points at the same capture host; its family appends
+                    // `/v1/messages` itself, so it takes the host without the `/v1` suffix.
                     serde_json::to_vec(&json!({
-                        "providers": {"meta": {"base_url": base_url}}
+                        "providers": {
+                            "meta": {"base_url": base_url},
+                            "anthropic": {"base_url": base_url.trim_end_matches("/v1")}
+                        }
                     }))
                     .unwrap(),
                 )
@@ -900,7 +918,7 @@ impl Daemon {
             // cleanly and route every provider to API keys. The rig writes an isolated file
             // containing only the defaults the test intends to exercise.
             let method_defaults = if provider_base_url.is_some() {
-                json!({"defaults": {"meta": "oauth"}})
+                json!({"defaults": {"meta": "oauth", "anthropic": "oauth"}})
             } else {
                 json!({"defaults": {}})
             };
@@ -1782,6 +1800,144 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
         broca_core::ChargeBasis::SubscriptionIncluded
     );
     records.clear();
+}
+
+/// An Anthropic OAuth run admitted through the real module speaks as Claude Code: the request the
+/// module sends leads its system with the billing block (signed `cch`), carries
+/// `metadata.user_id`, goes to `?beta=true`, and has the Claude Code headers, with the session id
+/// header equal to `metadata.user_id.session_id`. This is the executor's own admission path
+/// (install id loaded at boot, persona built and frozen at admission), not a hand-built config.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anthropic_oauth_run_through_the_module_sends_the_claude_code_persona() {
+    let server = ResponsesCapture::start_replying(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_persona\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"stop_reason\":null,",
+        "\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PERSONA-OK\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    ))
+    .await;
+    let Some(daemon) = Daemon::start_with_live_vault_credential_and_provider_override(
+        "anthropic-persona",
+        "oauth:anthropic:test",
+        &server.base_url,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let project_root = daemon.dir.join("anthropic-persona-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let run = run_client(
+        &daemon,
+        &project_root,
+        "anthropic-persona",
+        &[
+            "run",
+            "--prompt",
+            "Summarise the README in two sentences.",
+            "--model",
+            "anthropic/claude-opus-4-8",
+            "--tools",
+            "[]",
+            "--auth-method",
+            "oauth",
+            "--auth-account",
+            "test",
+        ],
+    )
+    .await;
+    let captured = server.finish().await;
+    assert!(
+        run.saw("RUN_FINISHED") && run.saw("reason=Completed"),
+        "the run completed against the loopback provider: {:?}",
+        run.lines
+    );
+
+    let header_end = captured
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .expect("captured HTTP request has headers")
+        + 4;
+    let headers = String::from_utf8_lossy(&captured[..header_end]).into_owned();
+    let header = |wanted: &str| {
+        headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(wanted)
+                .then(|| value.trim().to_string())
+        })
+    };
+    assert_eq!(
+        headers.lines().next(),
+        Some("POST /v1/messages?beta=true HTTP/1.1")
+    );
+    assert_eq!(
+        header("authorization").as_deref(),
+        Some("Bearer sk-rig-only")
+    );
+    assert_eq!(
+        header("user-agent").as_deref(),
+        Some("claude-cli/2.1.280 (external, cli)")
+    );
+    assert_eq!(header("x-app").as_deref(), Some("cli"));
+    assert_eq!(
+        header("anthropic-dangerous-direct-browser-access").as_deref(),
+        Some("true")
+    );
+    assert_eq!(header("x-stainless-retry-count").as_deref(), Some("0"));
+    assert_eq!(
+        header("x-stainless-package-version").as_deref(),
+        Some("0.112.1")
+    );
+    assert!(header("x-client-request-id").is_some_and(|id| id.len() == 36));
+    let betas = header("anthropic-beta").expect("anthropic-beta header");
+    assert!(betas.starts_with("oauth-2025-04-20,"), "{betas}");
+
+    let body_text = std::str::from_utf8(&captured[header_end..]).expect("UTF-8 body");
+    assert!(
+        body_text.starts_with("{\"model\":\"claude-opus-4-8\",\"messages\":"),
+        "the body is in the persona's key order: {body_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(body_text).expect("JSON body");
+    let billing = body["system"][0]["text"].as_str().expect("system[0] text");
+    assert!(
+        billing.starts_with("x-anthropic-billing-header: cc_version=2.1.280.")
+            && billing.contains(" cc_entrypoint=cli; cch=")
+            && !billing.contains("cch=00000;"),
+        "the billing block leads the system and is signed: {billing}"
+    );
+    assert_eq!(
+        body["system"][1]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+    let user_id: serde_json::Value = serde_json::from_str(
+        body["metadata"]["user_id"]
+            .as_str()
+            .expect("metadata.user_id is a JSON string"),
+    )
+    .expect("metadata.user_id parses");
+    assert_eq!(
+        user_id["device_id"].as_str().map(str::len),
+        Some(64),
+        "{user_id}"
+    );
+    assert_eq!(
+        header("x-claude-code-session-id").as_deref(),
+        user_id["session_id"].as_str(),
+        "the session header is metadata.user_id.session_id"
+    );
 }
 
 /// Five concurrent sessions exercise three catalog-selected families: Anthropic Messages,

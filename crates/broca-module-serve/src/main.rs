@@ -2434,6 +2434,12 @@ mod executor {
         /// `broca_module_serve::claude_code_identity`). `None` admits Anthropic OAuth episodes
         /// without a persona, in the shape they had before it existed.
         claude_code_install_id: Option<String>,
+        /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
+        /// its WAL could not be read), so the WAL is read for it at most once per session.
+        cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+        /// WAL bytes read to pin `cc_version` suffixes, for tests that prove a read happens at
+        /// most once.
+        cc_suffix_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl LiveLoopExecutor {
@@ -2461,13 +2467,18 @@ mod executor {
                 opencode_auth_path: None,
                 routing: None,
                 claude_code_install_id: None,
+                cc_suffix_memo: Default::default(),
+                cc_suffix_wal_bytes: Default::default(),
             }
         }
 
         /// The `cc_version` suffix pinned for a new episode's session: the one the session's
         /// latest episode froze, or else one computed from the session's first durable user
-        /// message (read from its WAL, never a compaction view). `None` when the WAL cannot be
-        /// read, which leaves the renderer computing it from each request as before.
+        /// message, read from the WAL only as far as the record that carries it (never a
+        /// compaction view). The result is remembered per session for this process, so a session
+        /// whose latest episode recorded no suffix (it used another provider) does not read the
+        /// WAL again. `None` when the WAL cannot be read: logged once per session at WARN, and
+        /// the renderer then computes the suffix from each request as before.
         async fn session_cc_version_suffix(
             &self,
             req: &broca_core::RunRequest,
@@ -2481,35 +2492,52 @@ mod executor {
             if let Some(inherited) = inherited_cc_version_suffix(last_episode_frozen_config) {
                 return Some(inherited);
             }
+            let key = broca_core::session_addr(&req.session);
+            if let Some(remembered) = self.cc_suffix_memo.lock().unwrap().get(&key) {
+                return remembered.clone();
+            }
             // An empty WAL holds no earlier message, so the new input's is the first.
             let durable = if durable_head == 0 {
-                Vec::new()
+                None
             } else {
                 let wal_store = Arc::clone(&self.wal_store);
                 let session = req.session.clone();
-                let read = tokio::task::spawn_blocking(move || {
-                    wal_store
-                        .read_records(&session)
-                        .map_err(|error| error.to_string())
-                        .and_then(|records| {
-                            broca_core::replay_transcript(&records)
-                                .map_err(|error| error.to_string())
-                        })
-                })
+                let read = broca_diagnostics::spawn_blocking(
+                    broca_diagnostics::JobKind::WalRead,
+                    move || wal_store.first_user_message(&session),
+                )
                 .await;
                 match read {
-                    Ok(Ok(transcript)) => transcript,
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "session transcript unreadable; the cc_version suffix is not pinned");
-                        return None;
+                    Ok(Ok((message, bytes))) => {
+                        self.cc_suffix_wal_bytes
+                            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                        message
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "session transcript read failed; the cc_version suffix is not pinned");
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(
+                            session = %req.session.session,
+                            "the session's first user message could not be read; its Claude Code cc_version suffix is not pinned"
+                        );
+                        self.remember_cc_suffix(key, None);
                         return None;
                     }
                 }
             };
-            first_durable_cc_version_suffix(&durable, &req.input)
+            let suffix = first_durable_cc_version_suffix(durable.as_slice(), &req.input);
+            self.remember_cc_suffix(key, suffix.clone());
+            suffix
+        }
+
+        /// Remember a session's pinned suffix (or that its WAL could not be read) for this
+        /// process. The map is cleared when it grows past a bound, which costs at most one more
+        /// bounded read per session.
+        fn remember_cc_suffix(&self, key: String, suffix: Option<String>) {
+            const MAX_REMEMBERED_SESSIONS: usize = 16_384;
+            let mut memo = self.cc_suffix_memo.lock().unwrap();
+            if memo.len() >= MAX_REMEMBERED_SESSIONS {
+                memo.clear();
+            }
+            memo.insert(key, suffix);
         }
 
         /// Install the id the Claude Code persona's device id derives from.

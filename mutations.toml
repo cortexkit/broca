@@ -15912,3 +15912,123 @@ expect_red = ["claude_code_identity::tests::a_compaction_that_replaces_the_first
 file = "crates/broca-provider/src/families/anthropic_messages.rs"
 old = "        Some(pinned) => pinned.clone(),"
 new = "        Some(_) => persona_rules::cc_version_suffix(&persona_rules::first_user_message_text(messages), &persona.version), // NON-VACUITY BREAK: recompute from the rendered view."
+
+[[control]]
+id = "claude-persona-attempts-not-measured"
+guards = "a Claude Code persona request, sent without the thinking-binding beta, marks its attempts as not measured for input_transformations instead of reading as zero transformations"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/families/anthropic_messages/append_only_tests.rs"
+expect_red = ["families::anthropic_messages::append_only_tests::a_persona_request_is_not_measured_for_input_transformations"]
+file = "crates/broca-provider/src/families/anthropic_messages.rs"
+old = "            transformations_unmeasured: !asks_for_input_transformations(frozen),"
+new = "            transformations_unmeasured: false, // NON-VACUITY BREAK: claim every request was measured."
+
+[[control]]
+id = "input-transformations-unmeasured-not-zero"
+guards = "the input_transformations counter and warning treat an unmeasured attempt as not measured, never as a report of zero transformations"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::an_unmeasured_attempt_never_reads_as_no_transformations"]
+file = "crates/broca-core/src/run.rs"
+old = "        if attempt.input_transformations_unmeasured {"
+new = "        if false { // NON-VACUITY BREAK: read an unmeasured attempt as measured."
+
+[[control]]
+id = "cache-dump-unmeasured-transformations"
+guards = "cache_dump labels an unmeasured attempt's input transformations not_measured, never zero or a measured digest mismatch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/cache_dump.rs"
+expect_red = ["cache_dump::transformation_report_tests::an_unmeasured_call_never_reads_as_no_transformations"]
+file = "crates/broca-module-serve/src/cache_dump.rs"
+old = '        return Some(json!("not_measured"));'
+new = '        return None; // NON-VACUITY BREAK: drop the not-measured label.'
+
+[[control]]
+id = "claude-persona-suffix-read-once-per-session"
+guards = "admission reads a session's first user message from the WAL at most once per session; a later admission is answered from the recorded persona or this process's memory, reading no WAL bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+select = "expected"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::the_first_user_message_is_read_once_and_only_as_far_as_its_record"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "            if let Some(remembered) = self.cc_suffix_memo.lock().unwrap().get(&key) {"
+new = "            if let Some(remembered) = None::<&Option<String>> { // NON-VACUITY BREAK: forget the session."
+
+[[control]]
+id = "claude-persona-suffix-read-is-bounded"
+guards = "the admission read for a session's first user message stops at the record that carries it instead of decoding the whole WAL"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+select = "expected"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::the_first_user_message_is_read_once_and_only_as_far_as_its_record"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "            return broca_wal::file_wal::read_first_user_message(path, max);"
+new = "            return broca_wal::file_wal::read_first_user_message(&path, max).map(|(found, _)| (found, std::fs::metadata(&path).map_or(0, |meta| meta.len()))); // NON-VACUITY BREAK: account the whole log as read."
+
+[[control]]
+id = "claude-install-id-no-clobber"
+guards = "two processes creating the Claude Code install id converge on the one linked first; a later creator never replaces it"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/claude_code_identity.rs"
+expect_red = ["claude_code_identity::tests::a_second_creator_adopts_the_id_linked_first"]
+file = "crates/broca-module-serve/src/claude_code_identity.rs"
+old = "    let linked = written.and_then(|()| std::fs::hard_link(&temporary, path));"
+new = "    let linked = written.and_then(|()| std::fs::rename(&temporary, path)); // NON-VACUITY BREAK: clobber an existing id."
+
+[[control]]
+id = "claude-install-id-malformed-recovers"
+guards = "a malformed or unreadable install id file is set aside and replaced by a fresh id, so the persona does not switch off for good"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/claude_code_identity.rs"
+expect_red = ["claude_code_identity::tests::a_malformed_install_id_is_set_aside_and_replaced"]
+file = "crates/broca-module-serve/src/claude_code_identity.rs"
+old = "                set_aside(&path)?;"
+new = "                return Err(error); // NON-VACUITY BREAK: give up on a bad file."
+
+[[control]]
+id = "claude-persona-executor-wiring"
+platforms = ["linux", "macos"]
+guards = "the module's executor freezes the Claude Code persona into a fresh Anthropic OAuth episode, so the request it sends carries the billing block, metadata.user_id and the Claude Code headers"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/single_turn_module_e2e.rs"
+expect_red = ["single_turn_module_e2e::anthropic_oauth_run_through_the_module_sends_the_claude_code_persona"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "                claude_code_persona: fresh_persona.as_ref(),"
+new = "                claude_code_persona: None, // NON-VACUITY BREAK: unwire the persona."
+
+[[control]]
+id = "stainless-retry-count-numbers-attempts"
+guards = "each in-transport retry numbers itself in x-stainless-retry-count (0, then 1, 2, ...), as the SDK the Claude Code persona speaks as does"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::retries_number_their_attempt_in_the_stainless_retry_count"]
+file = "crates/broca-provider/src/transport.rs"
+old = "        number_attempt(&mut request.headers, attempt_index);"
+new = "        let _ = (attempt_index, number_attempt as fn(&mut [(String, String)], usize)); // NON-VACUITY BREAK: never number attempts."

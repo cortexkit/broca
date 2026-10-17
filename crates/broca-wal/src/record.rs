@@ -373,6 +373,11 @@ pub enum WalRecord {
         /// is also how every record written before this field existed reads back.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_transformations: Option<Vec<InputTransformation>>,
+        /// The request did not ask for the report above, so its absence means "not measured",
+        /// not "nothing was transformed" (see `ModelAttempt::input_transformations_unmeasured`).
+        /// Omitted when false, which is also how every older record reads back.
+        #[serde(default, skip_serializing_if = "is_false")]
+        input_transformations_unmeasured: bool,
         /// Present only on an attempt sent with a token refreshed inside the step, either after
         /// the step's previous attempt got an HTTP 401 or because the held token was about to
         /// expire (its `reason` says which): the refresh request's parameters and the served
@@ -976,6 +981,7 @@ impl WalRecord {
             websocket_request,
             websocket_close_code,
             input_transformations,
+            input_transformations_unmeasured,
             credential_refresh,
             served_account_ref,
             // In-memory account evidence for the routing reports; never part of the record.
@@ -999,6 +1005,7 @@ impl WalRecord {
             websocket_request,
             websocket_close_code,
             input_transformations,
+            input_transformations_unmeasured,
             credential_refresh: credential_refresh.map(|refresh| *refresh),
             served_account_ref,
         }

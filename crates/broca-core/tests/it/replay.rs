@@ -1260,6 +1260,7 @@ fn attempt_record(step_id: StepId, attempt: u32, outcome: AttemptOutcome) -> Wal
         websocket_request: None,
         websocket_close_code: None,
         input_transformations: None,
+        input_transformations_unmeasured: false,
         credential_refresh: None,
         served_account_ref: None,
     }

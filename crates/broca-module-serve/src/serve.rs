@@ -1563,9 +1563,14 @@ async fn handle_control_request(
                     "stream_chunks": broca_provider::sse::stream_chunks(),
                     // Entries providers listed in input_transformations: for Anthropic, signed
                     // thinking blocks dropped because an earlier part of the conversation changed
-                    // between requests. Zero is healthy; anything else means a render was not
-                    // append-only, and the WARN log names the session and step.
+                    // between requests. Zero is healthy only over measured attempts; anything
+                    // else means a render was not append-only, and the WARN log names the
+                    // session and step.
                     "input_transformations": broca_core::input_transformations_reported(),
+                    // Attempts sent without asking for that report (every Claude Code persona
+                    // request has no thinking-binding beta). Their transformations are unknown,
+                    // not zero, so a zero above covers only the other attempts.
+                    "input_transformations_unmeasured_attempts": broca_core::input_transformations_unmeasured_attempts(),
                     "session_reads": broca_module::registry::session_reads(),
                     "actor_opens": broca_module::registry::actor_opens(),
             "wal_archive_polls": crate::wal_archive::wal_archive_polls(),

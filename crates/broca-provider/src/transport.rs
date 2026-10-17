@@ -223,6 +223,8 @@ struct AttemptTrace {
     /// The response's own report of how the provider altered the request, once the stream
     /// normalizer has read it.
     input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
+    /// The request did not ask for that report (see `ModelAttempt::input_transformations_unmeasured`).
+    input_transformations_unmeasured: bool,
     /// Set before the attempt is sent when it re-sends the step with a refreshed token.
     credential_refresh: Option<CredentialRefresh>,
     /// The account evidence the response carried; see [`broca_protocol::AttemptAccountObservation`].
@@ -281,6 +283,7 @@ impl AttemptTrace {
                 (code != 0).then_some(code)
             }),
             input_transformations: self.input_transformations,
+            input_transformations_unmeasured: self.input_transformations_unmeasured,
             credential_refresh: self.credential_refresh.map(Box::new),
             served_account_ref: self.served_account_ref,
             account_observation: Box::new(self.account_observation),
@@ -399,6 +402,10 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
 
     fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
         self.inner.input_transformations()
+    }
+
+    fn input_transformations_unmeasured(&self) -> bool {
+        self.inner.input_transformations_unmeasured()
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
@@ -1670,6 +1677,22 @@ fn spawn_transport_task<F: WireFamily + 'static>(
     })
 }
 
+/// The header the Stainless SDK (which the Claude Code persona speaks as) numbers its attempts
+/// in: 0 on the first send, then 1, 2, ... on each retry.
+const STAINLESS_RETRY_COUNT: &str = "x-stainless-retry-count";
+
+/// Number this attempt in a request that carries [`STAINLESS_RETRY_COUNT`], as the SDK does on
+/// its own retries. Requests without the header are left alone. A resend of the same attempt
+/// that is not a retry (an identity resend after a rejected request encoding) does not come
+/// through here and keeps the count.
+fn number_attempt(headers: &mut [(String, String)], attempt_index: usize) {
+    for (name, value) in headers.iter_mut() {
+        if name.eq_ignore_ascii_case(STAINLESS_RETRY_COUNT) {
+            *value = attempt_index.to_string();
+        }
+    }
+}
+
 // clippy::too_many_arguments counts the request digest, passed beside the request because it is
 // computed on the render worker; bundling it would only rename the same inputs.
 #[allow(clippy::too_many_arguments)]
@@ -1788,6 +1811,7 @@ where
             tx.closed().await;
             return Ok((Vec::new(), 0));
         }
+        number_attempt(&mut request.headers, attempt_index);
         step_seal.note_sent(&request.body, request_digest);
         let mut trace = AttemptTrace {
             transport: Some("https".into()),
@@ -1796,6 +1820,9 @@ where
             virtual_attempt_elapsed: retry_clock.virtual_attempt_elapsed,
             credential_refresh: credential_refresh.take(),
             served_account_ref: served_account_ref.clone(),
+            // Known before anything is sent, so even an attempt that fails before its response
+            // records that it could not have been measured.
+            input_transformations_unmeasured: normalizer.input_transformations_unmeasured(),
             ..AttemptTrace::default()
         };
         let stop = tokio::select! {
@@ -2821,6 +2848,7 @@ where
         if trace.input_transformations.is_none() {
             trace.input_transformations = normalizer.input_transformations();
         }
+        trace.input_transformations_unmeasured = normalizer.input_transformations_unmeasured();
         let next_marker = normalizer.progress_marker();
         let made_progress = next_marker != progress_marker || !events.is_empty();
         if next_marker != progress_marker {
@@ -4037,7 +4065,11 @@ mod tests {
             HttpRequest {
                 method: HttpMethod::Post,
                 url: format!("{}/retry", frozen.base_url.as_deref().unwrap()),
-                headers: vec![("content-type".into(), "application/json".into())],
+                // The Claude Code persona's attempt counter, which the transport numbers.
+                headers: vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("x-stainless-retry-count".into(), "0".into()),
+                ],
                 body,
             }
         }
@@ -4236,6 +4268,7 @@ mod tests {
     struct ScriptedServer {
         url: String,
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        heads: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -4250,13 +4283,16 @@ mod tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let heads = Arc::new(Mutex::new(Vec::new()));
             let captured = requests.clone();
+            let captured_heads = heads.clone();
             let task = tokio::spawn(async move {
                 let mut script = script.into_iter();
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    let body = read_http_request_body(&mut socket).await;
+                    let (head, body) = read_http_request(&mut socket).await;
                     captured.lock().unwrap().push(body);
+                    captured_heads.lock().unwrap().push(head);
                     match script.next().unwrap_or(ScriptResponse::Http {
                         status: 500,
                         headers: Vec::new(),
@@ -4285,6 +4321,7 @@ mod tests {
             Self {
                 url: format!("http://{address}"),
                 requests,
+                heads,
                 task,
             }
         }
@@ -4292,9 +4329,31 @@ mod tests {
         fn request_bodies(&self) -> Vec<Vec<u8>> {
             self.requests.lock().unwrap().clone()
         }
+
+        /// The value of header `name` on each request received, in order.
+        fn request_header(&self, name: &str) -> Vec<Option<String>> {
+            self.heads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|head| {
+                    head.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| value.trim().to_string())
+                    })
+                })
+                .collect()
+        }
     }
 
     async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        read_http_request(socket).await.1
+    }
+
+    /// One request's header block (as text) and body.
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let mut request = Vec::new();
         let mut chunk = [0u8; 1024];
         let header_end = loop {
@@ -4322,7 +4381,10 @@ mod tests {
             assert_ne!(read, 0, "client disconnected before request body completed");
             request.extend_from_slice(&chunk[..read]);
         }
-        request[header_end..header_end + content_length].to_vec()
+        (
+            String::from_utf8_lossy(&request[..header_end]).into_owned(),
+            request[header_end..header_end + content_length].to_vec(),
+        )
     }
 
     async fn write_http_response(
@@ -4587,6 +4649,34 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// Each retry of a step numbers itself in `x-stainless-retry-count` (0, then 1), as the SDK
+    /// the Claude Code persona speaks as does, while the body is re-sent unchanged.
+    #[tokio::test]
+    async fn retries_number_their_attempt_in_the_stainless_retry_count() {
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 503,
+                headers: Vec::new(),
+                body: br#"{"error":{"message":"retry me"}}"#,
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: Vec::new(),
+                body: b"successful-generation",
+            },
+        ])
+        .await;
+        let provider = retry_test_provider(&server, 0);
+        let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+        assert!(terminal_error_if_any(&events).is_none());
+        assert_eq!(
+            server.request_header("x-stainless-retry-count"),
+            vec![Some("0".to_string()), Some("1".to_string())]
+        );
+        let bodies = server.request_bodies();
+        assert_eq!(bodies[0], bodies[1], "the retry re-sends the same bytes");
     }
 
     #[tokio::test]

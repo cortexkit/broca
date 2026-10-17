@@ -352,6 +352,7 @@ impl WireFamily for AnthropicMessages {
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
         Box::new(AnthropicStreamNormalizer {
+            transformations_unmeasured: !asks_for_input_transformations(frozen),
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Anthropic),
             // The body renders `max_tokens` from this same field, so an output-ceiling error
             // names the cap the provider actually enforced.
@@ -378,6 +379,22 @@ impl WireFamily for AnthropicMessages {
 struct AnthropicStreamNormalizer {
     sse: SseDecoder,
     inner: AnthropicNormalizer,
+    /// The request went out without the thinking-binding beta, so the response carries no
+    /// `input_transformations` report whatever the provider did.
+    transformations_unmeasured: bool,
+}
+
+/// Whether requests rendered from `frozen` carry the thinking-binding beta, under which the
+/// response reports its input transformations. A Claude Code persona request never does: the
+/// reference client sends that beta only with an enforcing `thinking.block_binding`, which
+/// broca does not send. An api-key request carries no beta at all.
+fn asks_for_input_transformations(frozen: &FrozenRenderConfig) -> bool {
+    persona(frozen).is_none()
+        && anthropic_beta_header(frozen).is_some_and(|betas| {
+            betas
+                .split(',')
+                .any(|beta| beta.trim() == cortexkit_anthropic_policy::THINKING_BINDING_BETA)
+        })
 }
 
 impl StreamNormalizer for AnthropicStreamNormalizer {
@@ -418,6 +435,10 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 
     fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
         self.inner.input_transformations()
+    }
+
+    fn input_transformations_unmeasured(&self) -> bool {
+        self.transformations_unmeasured
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
@@ -1536,6 +1557,7 @@ mod tests {
         let mut normalizer = AnthropicStreamNormalizer {
             sse: SseDecoder::default(),
             inner: AnthropicNormalizer::new(StepId(1)),
+            transformations_unmeasured: false,
         };
         let p1 = normalizer.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n").unwrap();
         assert!(!p1.is_empty());

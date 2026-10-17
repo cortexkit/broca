@@ -301,6 +301,7 @@ impl Provider for TransformingProvider {
                     path: Some("messages.1.content.0".into()),
                     reason: Some("prefix_binding_mismatch".into()),
                 }]),
+                input_transformations_unmeasured: false,
                 credential_refresh: None,
                 served_account_ref: None,
                 account_observation: Default::default(),

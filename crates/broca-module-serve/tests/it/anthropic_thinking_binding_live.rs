@@ -1,8 +1,10 @@
 //! LIVE check of Anthropic's thinking-binding instrument (off by default).
 //!
-//! broca sends the `thinking-binding-controls-2026-08-01` beta whenever thinking is on, and never
-//! sets `thinking.block_binding.prefix_mismatch_behavior` (setting it would opt the account into
-//! enforcement). With the beta, every response lists in `message_start`'s
+//! On the pre-persona OAuth shape this suite resolves (no Claude Code persona), broca sends the
+//! `thinking-binding-controls-2026-08-01` beta whenever thinking is on, and never sets
+//! `thinking.block_binding.prefix_mismatch_behavior` (setting it would opt the account into
+//! enforcement). A Claude Code persona request does not send the beta, so it gets no report and
+//! its attempts are recorded as not measured; this suite does not cover that shape. With the beta, every response lists in `message_start`'s
 //! `input_transformations` each signed thinking block that failed the prefix-binding check.
 //!
 //! A beta the account or the OAuth path rejected would fail EVERY Anthropic request, so this test

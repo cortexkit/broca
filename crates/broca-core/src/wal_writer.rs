@@ -127,6 +127,27 @@ pub trait WalStore: Send + Sync {
         )))
     }
 
+    /// The session's first durable user message (the first user message of the first
+    /// `RunStarted` or `Steered` record that adds one), with the number of WAL bytes read to
+    /// find it. A file store reads only as far as that record; this default decodes the whole
+    /// log and reports the bytes as unknown (zero). `Ok((None, _))` when the session has no
+    /// user message yet or no log.
+    fn first_user_message(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<(Option<broca_protocol::Message>, u64), WalError> {
+        match self.read_records(session) {
+            Ok(records) => Ok((
+                records
+                    .iter()
+                    .find_map(|frame| broca_wal::file_wal::first_user_message_in(&frame.record)),
+                0,
+            )),
+            Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok((None, 0)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Read the session's current durable records WITHOUT taking the append
     /// handle — for the persister to project fsynced turns mid-run. Safe to call
     /// while the writer holds its own handle (a torn final record is discarded by
@@ -1139,6 +1160,35 @@ impl WalStore for FileWalStore {
         meta: Option<&crate::AdmissionStoreSnapshot>,
     ) -> Result<bool, WalError> {
         FileWalStore::lineage_exists(self, session, meta)
+    }
+
+    fn first_user_message(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<(Option<broca_protocol::Message>, u64), WalError> {
+        self.check_move(session, false)?;
+        // The live log is read only through the record that carries the message, the way
+        // retention classification reads only through the first `RunStarted`. The bound fits
+        // two maximal records, so a first `RunStarted` without a user message still finds the
+        // steer after it; a log needing more fails rather than loading everything.
+        if let Some(path) = self.resolve_live_path(session)? {
+            let max = 2
+                * (broca_wal::framing::MAX_PAYLOAD_LEN as u64
+                    + broca_wal::framing::HEADER_LEN as u64)
+                + 2 * broca_wal::framing::LINEAGE_FRAME_LEN as u64;
+            return broca_wal::file_wal::read_first_user_message(path, max);
+        }
+        // An archived log is immutable and read through the existing archive path.
+        match self.read_records(session) {
+            Ok(records) => Ok((
+                records
+                    .iter()
+                    .find_map(|frame| broca_wal::file_wal::first_user_message_in(&frame.record)),
+                0,
+            )),
+            Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok((None, 0)),
+            Err(error) => Err(error),
+        }
     }
 
     fn is_retention_lineage(&self, session: &BindIdentity) -> Result<bool, WalError> {
