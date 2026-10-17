@@ -450,11 +450,12 @@ accepts still comes from its catalog row; fusiform serves alias rows for several
 family's: Code Assist selects a different backend model id by tier suffix, so `high` on
 `antigravity-gemini-3.8-flash` sends `gemini-3.8-flash-high` with that tier's thinking settings,
 exactly as if the caller had spelled the tier in the id. With no variant the bare id keeps its
-default tier (`gemini-3.8-flash-medium`). A level the row defines but the route has no tier for
-(`minimal` on `antigravity-gemini-3.6-flash`) is refused with the same `variant_unsupported`
-code and detail, naming the tiers the route has in the message. `defined` still lists the
-model's variants, not the route's tiers. A
-level the row does not define is refused as above.
+default tier (`gemini-3.8-flash-medium`). A level the row defines but the live route has no tier
+for is refused with the same `variant_unsupported` code and detail, naming the tiers the route
+has in the message. For example, if a row defines `minimal` but Code Assist has only `[low, high]`
+tiers for that route, the refusal identifies that route limit rather than claiming the catalog
+lacks the variant. `defined` still lists the model's variants, not the route's tiers. A level the
+row does not define is refused as above.
 
 A variant is also refused with `variant_unsupported` if the id has no catalog row (its variants
 cannot be known), or the Code Assist route has no tiers for the model (it cannot apply the

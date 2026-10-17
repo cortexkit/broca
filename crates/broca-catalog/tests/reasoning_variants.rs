@@ -2,7 +2,7 @@
 //! rendered by its wire family.
 //!
 //! The catalog is installed from `fixtures/fusiform_reasoning_options.json`, a fusiform
-//! `catalog.get` response built from real served data, not hand-written option shapes:
+//! `catalog.get` response with a few clearly labelled Broca test rows (not Fusiform rows):
 //!
 //! - `anyapi/anthropic/claude-opus-4-6`, `anthropic/claude-sonnet-4-5`,
 //!   `nebius/Qwen/Qwen3-Next-80B-A3B-Thinking` and `synthetic/unknown-reasoning` are copied from
@@ -16,14 +16,16 @@
 //! - `sarvam/sarvam-30b` carries the shape fusiform's own test serves for it: a `null` inside
 //!   `values`, a toggle, a budget, and an entry type nobody has invented yet.
 //! - `google/gemini-3.5-flash` and `google/gemini-2.5-flash` are the vendored models.dev rows;
-//!   `google/gemini-3.6-flash-high` carries the vendored `gemini-3.6-flash` options under the
-//!   Antigravity tier id, for a variant replacing a tier spelled in the id.
+//!   `google/gemini-3.8-flash-high` is a Broca test row, not a Fusiform row, using the served
+//!   3.8-flash alias options to exercise a live tier id with an agreeing or replacing variant.
 //! - `google/antigravity-gemini-3.8-flash` is fusiform's served alias row verbatim (the
 //!   "catalog.get — a curated alias" case of `served-payloads.json` at fusiform cf99add), and
-//!   the top-level `aliased` array starts from that case's. `google/antigravity-gemini-3.6-flash`
-//!   and `google/antigravity-claude-sonnet-4-6-thinking` are the other alias rows fusiform serves
-//!   at that commit (`data/model-aliases.json`), built the same way from its embedded models.dev
-//!   seed rows for `google/gemini-3.6-flash` and `anthropic/claude-sonnet-4-6`.
+//!   the top-level `aliased` array starts from that case's. The 3.5-flash alias row and the
+//!   `antigravity-claude-opus-4-6-thinking` row are Broca test rows, not Fusiform rows: they
+//!   exercise the live 3.5 route's tier limit and a live non-Gemini Antigravity route without
+//!   tiers. `google/antigravity-gemini-3.6-flash` and
+//!   `google/antigravity-claude-sonnet-4-6-thinking` are retained from the served fixture only
+//!   for the retirement-before-variant test; both routes are now withdrawn.
 //! - The Argon row projects antigravity-auth's grouped registry definition into catalog facts:
 //!   low/medium/high effort, a 1,048,576 context window and a 65,536 output limit.
 #[cfg(not(feature = "live"))]
@@ -366,12 +368,12 @@ mod gated {
     #[test]
     fn code_assist_variant_agreeing_with_the_tier_is_applied_without_changing_bytes() {
         let plain = resolved(
-            "google/gemini-3.6-flash-high",
+            "google/gemini-3.8-flash-high",
             AuthMethod::Antigravity,
             None,
         );
         let agreeing = resolved(
-            "google/gemini-3.6-flash-high",
+            "google/gemini-3.8-flash-high",
             AuthMethod::Antigravity,
             Some("high"),
         );
@@ -382,7 +384,7 @@ mod gated {
         assert_eq!(body(&agreeing), body(&plain));
         assert_eq!(
             body(&agreeing)["request"]["generationConfig"]["thinkingConfig"],
-            json!({"includeThoughts": true, "thinkingLevel": "high"})
+            json!({"includeThoughts": true, "thinkingBudget": -1})
         );
     }
 
@@ -391,12 +393,12 @@ mod gated {
     #[test]
     fn code_assist_variant_without_a_catalog_row_is_refused_but_no_variant_is_admitted() {
         for (model, variant) in [
-            ("google/antigravity-gemini-3.5-flash", "high"),
-            ("google/antigravity-gemini-3.1-pro", "low"),
+            ("google/antigravity-gemini-3.8-flash-low", "high"),
+            ("google/antigravity-gemini-3.8-flash-medium", "low"),
             ("google/antigravity-gpt-oss-120b-medium", "high"),
-            ("google/antigravity-claude-opus-4-6-thinking", "max"),
+            ("google/antigravity-gemini-3.8-flash-medium", "max"),
             ("google/antigravity-gemini-4-argon-high", "low"),
-            ("google/antigravity-gemini-3.5-flash", "invented-level"),
+            ("google/antigravity-gemini-3.8-flash-low", "invented-level"),
         ] {
             install();
             let catalog = broca_catalog::catalog().expect("catalog installed");
@@ -484,14 +486,14 @@ mod gated {
         // A tier spelled in the id is replaced by the variant's: this case used to be tolerated
         // unapplied as a conflict with the id's fixed tier.
         let moved = resolved(
-            "google/gemini-3.6-flash-high",
+            "google/gemini-3.8-flash-high",
             AuthMethod::Antigravity,
             Some("low"),
         );
-        assert_eq!(moved.wire_model_id, "gemini-3.6-flash-low");
+        assert_eq!(moved.wire_model_id, "gemini-3.8-flash-low");
         assert_eq!(
             body(&moved)["request"]["generationConfig"]["thinkingConfig"],
-            json!({"includeThoughts": true, "thinkingLevel": "low"})
+            json!({"includeThoughts": true, "thinkingBudget": 1000})
         );
     }
 
@@ -575,7 +577,7 @@ mod gated {
                 vec!["none", "low", "medium", "high"],
             ),
             (
-                "google/antigravity-gemini-3.6-flash",
+                "google/antigravity-gemini-3.5-flash",
                 AuthMethod::Antigravity,
                 "minimal",
                 vec!["minimal", "low", "medium", "high"],
@@ -613,30 +615,30 @@ mod gated {
 
     /// A level the row defines but the route has no tier for is refused at admission, and the
     /// refusal names the tiers the route has and says the limit is the route's, not the
-    /// catalog's. gemini-3.6-flash's row (aliased) defines [minimal, low, medium, high]; Code
-    /// Assist has low, medium and high tiers for it.
+    /// catalog's. The test row for antigravity-gemini-3.5-flash defines [minimal, low, medium,
+    /// high], while Code Assist has only low and high tiers for it.
     #[test]
     fn code_assist_level_without_a_tier_is_refused_naming_the_tiers() {
         let error = refusal(
-            "google/antigravity-gemini-3.6-flash",
+            "google/antigravity-gemini-3.5-flash",
             AuthMethod::Antigravity,
             "minimal",
         );
         assert_eq!(
             error,
-            "model 'google/antigravity-gemini-3.6-flash' defines variant 'minimal', but the \
+            "model 'google/antigravity-gemini-3.5-flash' defines variant 'minimal', but the \
              Google Code Assist route cannot render it: this route sends a reasoning level as a \
-             backend tier, and its tiers for 'gemini-3.6-flash' are [low, medium, high]. This is \
+             backend tier, and its tiers for 'gemini-3.5-flash' are [low, high]. This is \
              a limit of the route, not of the catalog; request one of those tiers or send no \
              variant"
         );
         // The same row's levels that do have tiers render them.
         let high = resolved(
-            "google/antigravity-gemini-3.6-flash",
+            "google/antigravity-gemini-3.5-flash",
             AuthMethod::Antigravity,
             Some("high"),
         );
-        assert_eq!(high.wire_model_id, "gemini-3.6-flash-high");
+        assert_eq!(high.wire_model_id, "gemini-3-flash-agent");
     }
 
     /// A name the row does not define is refused on Code Assist as on every family.
@@ -657,9 +659,9 @@ mod gated {
     /// A catalog-defined effort must still be refused if Code Assist cannot render it as a tier.
     #[test]
     fn code_assist_variant_on_a_model_without_tiers_is_refused() {
-        let model = "google/antigravity-claude-sonnet-4-6-thinking";
+        let model = "google/antigravity-claude-opus-4-6-thinking";
         let plain = resolved(model, AuthMethod::Antigravity, None);
-        assert_eq!(plain.wire_model_id, "claude-sonnet-4-6-thinking");
+        assert_eq!(plain.wire_model_id, "claude-opus-4-6-thinking");
         assert!(plain.variant.is_none());
         let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("high"), None, None)
             .unwrap_err();
@@ -675,11 +677,36 @@ mod gated {
             format!(
                 "model '{model}' cannot use variant 'high': the Google Code Assist route \
                      sends a reasoning level as a backend tier id and has no tiers for \
-                     'claude-sonnet-4-6-thinking'"
+                     'claude-opus-4-6-thinking'"
             )
         );
         let error = self::refusal(model, AuthMethod::Antigravity, "xhigh");
         assert!(error.contains("does not define variant 'xhigh'"), "{error}");
+    }
+
+    #[test]
+    fn retired_code_assist_route_is_refused_before_variant_validation() {
+        let model = "google/antigravity-gemini-3.6-flash";
+        install();
+        let catalog = broca_catalog::catalog().expect("catalog installed");
+        assert!(
+            catalog
+                .model_for_serving("google", "antigravity-gemini-3.6-flash")
+                .is_some(),
+            "the fixture deliberately retains the withdrawn route's row"
+        );
+
+        let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("minimal"), None, None)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            broca_catalog::live::ResolutionError::Config(_)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "model 'google/antigravity-gemini-3.6-flash' is unservable: Google withdrew this \
+             Antigravity route; use 'google/antigravity-gemini-3.8-flash' (medium) instead"
+        );
     }
 
     /// A `null` inside `values` never becomes a variant, the toggle adds nothing on openai_chat,

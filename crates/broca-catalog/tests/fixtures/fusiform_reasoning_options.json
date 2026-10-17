@@ -7,6 +7,12 @@
       "target_provider_id": "anthropic"
     },
     {
+      "model": "google/antigravity-gemini-3.5-flash",
+      "source_ref": "broca test row (not a Fusiform row): exercise the live Antigravity 3.5-flash route's catalog-defined minimal level against its low/high backend tiers",
+      "target_model_id": "gemini-3.5-flash",
+      "target_provider_id": "google"
+    },
+    {
       "model": "google/antigravity-gemini-3.6-flash",
       "source_ref": "antigravity-auth@44eb8fa0ddd93e236942b9b36f9bb10fa2abde6d packages/core/src/model-registry.ts (GEMINI_36_FLASH_ROUTES), resolved by packages/core/src/transform/model-resolver.ts (resolveModelWithTier)",
       "target_model_id": "gemini-3.6-flash",
@@ -15,6 +21,18 @@
     {
       "model": "google/antigravity-gemini-3.8-flash",
       "source_ref": "antigravity-auth@44eb8fa0ddd93e236942b9b36f9bb10fa2abde6d packages/core/src/model-registry.ts (GEMINI_38_FLASH_ROUTES), resolved by packages/core/src/transform/model-resolver.ts (resolveModelWithTier)",
+      "target_model_id": "gemini-3.8-flash",
+      "target_provider_id": "google"
+    },
+    {
+      "model": "google/antigravity-claude-opus-4-6-thinking",
+      "source_ref": "broca test row (not a Fusiform row): exercise the live non-Gemini Antigravity Claude Opus route, which has no Code Assist backend tiers",
+      "target_model_id": "claude-opus-4-6",
+      "target_provider_id": "anthropic"
+    },
+    {
+      "model": "google/gemini-3.8-flash-high",
+      "source_ref": "broca test row (not a Fusiform row): tier-id row derived from the served Antigravity 3.8-flash alias options",
       "target_model_id": "gemini-3.8-flash",
       "target_provider_id": "google"
     }
@@ -308,6 +326,20 @@
         "units": 3750000000
       }
     },
+    "google/antigravity-gemini-3.5-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": ["minimal", "low", "medium", "high"]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536
+    },
     "google/antigravity-gemini-3.6-flash": {
       "capability.attachment": true,
       "capability.reasoning": true,
@@ -326,6 +358,20 @@
       "existence": "present",
       "limit.context": 1048576,
       "limit.output": 65536
+    },
+    "google/antigravity-claude-opus-4-6-thinking": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": ["low", "medium", "high", "max"]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000
     },
     "google/antigravity-claude-sonnet-4-6-thinking": {
       "capability.attachment": true,
@@ -349,6 +395,20 @@
       "existence": "present",
       "limit.context": 1000000,
       "limit.output": 128000
+    },
+    "google/gemini-3.8-flash-high": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": ["low", "medium", "high"]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536
     }
   },
   "resolved_at_ms": 1,
