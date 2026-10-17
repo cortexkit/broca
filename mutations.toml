@@ -15935,8 +15935,8 @@ select = "expected"
 test_file = "crates/broca-provider/tests/it/claude_oauth_wire_vectors.rs"
 expect_red = ["claude_oauth_wire_vectors::each_vector_beta_list_follows_from_its_body_model_and_host_betas", "claude_oauth_wire_vectors::broca_renders_each_vectors_persona_exactly"]
 file = "crates/broca-provider/src/claude_code_persona.rs"
-old = '''    if base_model.starts_with("claude-opus-5-5") || base_model.starts_with("claude-sonnet-5-5") {'''
-new = '''    if base_model.starts_with("claude-opus-5-5") { // NON-VACUITY BREAK: Sonnet 5.5 loses per-turn-control.'''
+old = '''        "claude-sonnet-5-5",'''
+new = '''        "claude-sonnet-5-4", // NON-VACUITY BREAK: Sonnet 5.5 loses per-turn-control.'''
 
 [[control]]
 id = "claude-persona-resume-keeps-a-recorded-absence"
@@ -16232,3 +16232,59 @@ expect_red = ["framing::tests::provider_text_state_is_must_understand_before_rec
 file = "crates/broca-wal/src/record.rs"
 old = 'let base = if self.carries_provider_text_state() {'
 new = 'let base = if self.carries_provider_text_state() && false { // NON-VACUITY BREAK: omit reader feature'
+
+[[control]]
+id = "claude-302-main-beta-display-updates"
+guards = "the 2.1.302 main list includes the measured thinking-display-updates beta while broca keeps summarized thinking"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/claude_code_persona_tests.rs"
+expect_red = ["claude_code_persona::tests::main_betas_match_the_interactive_capture_in_order"]
+file = "crates/broca-provider/src/claude_code_persona.rs"
+old = 'const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";'
+new = 'const THINKING_DISPLAY_UPDATES_BETA: &str = "missing-display-beta"; // NON-VACUITY BREAK: omit the measured display beta.'
+
+[[control]]
+id = "claude-302-interactive-lineage"
+guards = "interactive billing lineage follows cc_prompt_id and carries the frozen human ordinal in both indices"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/claude_code_persona_tests.rs"
+expect_red = ["claude_code_persona::tests::interactive_lineage_follows_prompt_id_and_reuses_the_human_ordinal"]
+file = "crates/broca-provider/src/claude_code_persona.rs"
+old = '                " cc_turn_origin=human; cc_prompt_index={index}; cc_turn_index={index};"'
+new = '                " cc_turn_origin=sdk; cc_prompt_index={index}; cc_turn_index={index};" // NON-VACUITY BREAK: claim an SDK prompt.'
+
+[[control]]
+id = "claude-302-main-request-class"
+guards = "new persona main requests identify their request class as main"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/families/anthropic_messages.rs"
+expect_red = ["families::anthropic_messages::tests::current_main_request_headers_carry_class_and_frozen_prompt_id"]
+file = "crates/broca-provider/src/families/anthropic_messages.rs"
+old = '        headers.push(("x-claude-code-request-class".into(), "main".into()));'
+new = '        headers.push(("x-claude-code-request-class".into(), "auxiliary".into())); // NON-VACUITY BREAK: misclassify a main request.'
+
+[[control]]
+id = "claude-302-gzip-resets-only-wire-cch"
+guards = "gzip sends cch=00000 but canonical attempt bytes and gzip-rejection identity resend retain the signed body"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_request_gzip_tests.rs"
+expect_red = ["transport::request_gzip_tests::persona_gzip_is_unsigned_but_rejection_resend_and_attempt_bytes_stay_signed"]
+file = "crates/broca-provider/src/transport_request_gzip.rs"
+old = '        unsigned[offset..offset + 5].copy_from_slice(b"00000");'
+new = '        unsigned[offset..offset + 5].copy_from_slice(&identity[offset..offset + 5]); // NON-VACUITY BREAK: gzip the signed cch unchanged.'

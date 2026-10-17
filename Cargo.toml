@@ -50,7 +50,7 @@ repository = "https://github.com/cortexkit/broca"
 
 [workspace.dependencies]
 broca-owner-only = { path = "crates/broca-owner-only" }
-cortexkit-anthropic-policy = "=0.1.1"
+cortexkit-anthropic-policy = "=0.1.2"
 cortexkit-chatgpt-policy = { path = "crates/cortexkit-chatgpt-policy", version = "=0.1.0" }
 serde = { version = "1", features = ["derive", "rc"] }
 # Keep shared normal-dependency features identical across package selections.

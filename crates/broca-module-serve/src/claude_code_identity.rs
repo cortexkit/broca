@@ -177,6 +177,35 @@ pub fn first_durable_cc_version_suffix(
     })
 }
 
+/// Count human prompts from durable episode inputs, including imported history. Steered
+/// records belong to the already-running prompt and compaction messages are model views,
+/// so neither opens another human prompt. Tool results are not human prompts either.
+pub fn human_prompt_ordinal<'a>(
+    records: impl IntoIterator<Item = &'a broca_wal::WalRecord>,
+    admitted_input: &[Message],
+) -> u64 {
+    fn count(messages: &[Message]) -> u64 {
+        messages
+            .iter()
+            .filter(|message| {
+                message.role == broca_protocol::Role::User
+                    && message
+                        .content
+                        .iter()
+                        .any(|block| !matches!(block, broca_protocol::ContentBlock::ToolResult(_)))
+            })
+            .count() as u64
+    }
+    records
+        .into_iter()
+        .filter_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { input, .. } => Some(count(input)),
+            _ => None,
+        })
+        .sum::<u64>()
+        + count(admitted_input)
+}
+
 /// The persona a fresh episode freezes. `account_id` is the vault's account id for the
 /// credential, `credential_id` stands in for it when the vault has none, `session` is the
 /// episode's bind triple, and `cc_version_suffix` is the session's pinned suffix (`None` leaves
@@ -187,6 +216,7 @@ pub fn fresh_persona(
     credential_id: &str,
     session: &BindIdentity,
     cc_version_suffix: Option<String>,
+    prompt_ordinal: u64,
 ) -> std::io::Result<ClaudeCodePersona> {
     let account = account_id
         .filter(|id| !id.is_empty())
@@ -205,6 +235,7 @@ pub fn fresh_persona(
         session_id: ClaudeCodePersona::derive_session_id(&session_ref),
         prompt_id: Some(uuid_v4_text(prompt)),
         cc_version_suffix,
+        prompt_ordinal: Some(prompt_ordinal),
     })
 }
 
@@ -332,6 +363,7 @@ mod tests {
             "oauth:anthropic",
             &session,
             None,
+            1,
         )
         .unwrap();
         let two = fresh_persona(
@@ -340,11 +372,15 @@ mod tests {
             "oauth:anthropic",
             &session,
             None,
+            2,
         )
         .unwrap();
         assert_eq!(one.device_id, two.device_id);
         assert_eq!(one.session_id, two.session_id);
         assert_ne!(one.prompt_id, two.prompt_id);
+        assert_eq!(one.version, "2.1.302");
+        assert_eq!(one.prompt_ordinal, Some(1));
+        assert_eq!(two.prompt_ordinal, Some(2));
         assert_eq!(one.account_uuid.as_deref(), Some(account));
 
         let other_session = BindIdentity::new("/tmp/project", "harness", "session-b");
@@ -354,6 +390,7 @@ mod tests {
             "oauth:anthropic",
             &other_session,
             None,
+            1,
         )
         .unwrap();
         assert_ne!(other.session_id, one.session_id);
@@ -365,6 +402,7 @@ mod tests {
             "oauth:anthropic",
             &session,
             None,
+            3,
         )
         .unwrap();
         assert_ne!(other_account.device_id, one.device_id);
@@ -408,7 +446,15 @@ mod tests {
         let pinned = first_durable_cc_version_suffix(&[], std::slice::from_ref(&first));
         let mut episode_one = broca_provider::families::anthropic_frozen_config("claude-opus-4-8");
         episode_one.claude_code_persona = Some(
-            fresh_persona(&install, None, "oauth:anthropic", &session, pinned.clone()).unwrap(),
+            fresh_persona(
+                &install,
+                None,
+                "oauth:anthropic",
+                &session,
+                pinned.clone(),
+                1,
+            )
+            .unwrap(),
         );
         let before = cc_version_field(
             &episode_one,
@@ -420,7 +466,7 @@ mod tests {
         assert_eq!(inherited, pinned);
         let mut episode_two = broca_provider::families::anthropic_frozen_config("claude-opus-4-8");
         episode_two.claude_code_persona =
-            Some(fresh_persona(&install, None, "oauth:anthropic", &session, inherited).unwrap());
+            Some(fresh_persona(&install, None, "oauth:anthropic", &session, inherited, 2).unwrap());
         let compacted = vec![
             text(
                 Role::User,
@@ -481,7 +527,7 @@ mod tests {
             None
         );
         assert_eq!(
-            inherited_cc_version_suffix(Some(&recorded("0.0.1", Some("abc")))),
+            inherited_cc_version_suffix(Some(&recorded("2.1.280", Some("abc")))),
             None
         );
         assert_eq!(
@@ -489,5 +535,51 @@ mod tests {
             None
         );
         assert_eq!(inherited_cc_version_suffix(None), None);
+    }
+
+    #[test]
+    fn durable_prompt_ordinal_includes_imports_but_not_steers_or_tool_results() {
+        use broca_protocol::Role;
+        use serde_json::json;
+        let config = json!({
+            "model": {"provider_module_id": "anthropic", "model_id": "claude-sonnet-5-5"},
+            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+            "response_format": {"type": "text"}, "provider_options": null, "cache_tiers": null,
+            "context_epoch": 0, "renderer_version": 1, "frozen_render_config": null
+        });
+        let started = |input: Vec<Message>| -> broca_wal::WalRecord {
+            serde_json::from_value(json!({"type": "run_started", "run_id": "r",
+                "session": BindIdentity::new("/tmp/project", "test", "session"),
+                "config": config, "input": input}))
+            .unwrap()
+        };
+        let imported = started(vec![
+            text(Role::User, "imported first"),
+            text(Role::Assistant, "answer"),
+            text(Role::User, "imported second"),
+        ]);
+        let later = started(vec![text(Role::User, "new episode")]);
+        let steer: broca_wal::WalRecord = serde_json::from_value(
+            json!({"type": "steered", "input": [text(Role::User, "steer")] }),
+        )
+        .unwrap();
+        let tool_result = Message::new(
+            Role::User,
+            vec![broca_protocol::ContentBlock::ToolResult(
+                broca_protocol::ToolResult {
+                    tool_call_id: broca_protocol::ToolCallId("toolu_1".into()),
+                    output: broca_protocol::ToolOutput::Text {
+                        text: "done".into(),
+                    },
+                    is_error: false,
+                },
+            )],
+        );
+        let records = [imported, later, steer, started(vec![tool_result])];
+        assert_eq!(
+            human_prompt_ordinal(&records, &[text(Role::User, "current prompt")]),
+            4
+        );
+        assert_eq!(human_prompt_ordinal(&records, &[]), 3);
     }
 }

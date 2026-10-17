@@ -575,7 +575,8 @@ fn thinking_requests_carry_the_binding_beta_and_never_opt_into_enforcement() {
 /// entry of unexpected shape still counts.
 /// Which requests ask for the input-transformations report: a pre-persona OAuth request with
 /// thinking does; a Claude Code persona request and an api-key request do not, so their
-/// attempts read as not measured rather than as zero transformations.
+/// attempts read as not measured rather than as zero transformations; 2.1.302 main requests
+/// carry that beta again and must be measured even though they also use a persona.
 #[test]
 fn a_persona_request_is_not_measured_for_input_transformations() {
     use crate::wire::WireFamily;
@@ -598,10 +599,17 @@ fn a_persona_request_is_not_measured_for_input_transformations() {
         session_id: "11111111-1111-4111-8111-111111111111".into(),
         prompt_id: None,
         cc_version_suffix: None,
+        prompt_ordinal: None,
     });
     assert!(
         unmeasured(&persona),
-        "a persona request does not ask for the report"
+        "a resumed 2.1.280 persona request does not ask for the report"
+    );
+
+    persona.claude_code_persona.as_mut().unwrap().version = "2.1.302".into();
+    assert!(
+        !unmeasured(&persona),
+        "2.1.302 main requests ask for the report"
     );
 
     let apikey = crate::families::anthropic_apikey_frozen_config("claude-opus-5");

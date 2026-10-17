@@ -3,11 +3,9 @@
 //!
 //! Sends one short two-step tool run on a Claude subscription credential and reports, per step,
 //! the HTTP status, Anthropic's `request-id` and the prompt-cache read and write. Step one is
-//! rendered in the OAuth shape runs had before the Claude Code persona (identity block only);
-//! step two answers its tool call in the persona shape (billing block first, signed `cch`,
-//! Claude Code headers and betas). Both share one large fixed system prefix, so step two's cache
-//! read shows whether adding the billing block in front of that prefix still reads the cache
-//! the old shape wrote.
+//! rendered with the recorded 2.1.280 persona; step two answers its tool call with the
+//! 2.1.302 persona. Both use the production transport (request gzip on) and share one large
+//! fixed system prefix, so step two's cache read measures the version transition.
 //!
 //! The credential is fetched from claustrum through the handle in broca's dev-tools handle file
 //! and is never printed: request headers are listed without `authorization`, and an error
@@ -115,121 +113,140 @@ struct Answer {
     cache_write: u64,
 }
 
-/// Rebuild the assistant message from the SSE stream (thinking with its signature, text and
-/// tool calls) and read the usage from `message_start`.
-fn read_stream(bytes: &[u8]) -> Answer {
-    let mut blocks: Vec<Value> = Vec::new();
-    let mut usage = Value::Null;
-    for line in String::from_utf8_lossy(bytes).lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        match event["type"].as_str() {
-            Some("message_start") => usage = event["message"]["usage"].clone(),
-            Some("content_block_start") => {
-                let mut block = event["content_block"].clone();
-                if block["type"] == "tool_use" {
-                    block["partial_json"] = json!("");
-                }
-                blocks.push(block);
-            }
-            Some("content_block_delta") => {
-                let Some(block) = blocks.last_mut() else {
-                    continue;
-                };
-                let delta = &event["delta"];
-                let append = |block: &mut Value, key: &str, piece: &Value| {
-                    let joined = format!(
-                        "{}{}",
-                        block[key].as_str().unwrap_or_default(),
-                        piece.as_str().unwrap_or_default()
-                    );
-                    block[key] = json!(joined);
-                };
-                match delta["type"].as_str() {
-                    Some("thinking_delta") => append(block, "thinking", &delta["thinking"]),
-                    Some("signature_delta") => append(block, "signature", &delta["signature"]),
-                    Some("text_delta") => append(block, "text", &delta["text"]),
-                    Some("input_json_delta") => {
-                        append(block, "partial_json", &delta["partial_json"])
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+/// Observe response ids without replacing the transport, encoder or Anthropic normalizer.
+struct ProbeFamily(Arc<std::sync::Mutex<Option<String>>>);
+impl WireFamily for ProbeFamily {
+    fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+        AnthropicMessages.shape(frozen, opts)
     }
-    let content = blocks
-        .into_iter()
-        .filter_map(|block| match block["type"].as_str()? {
-            "thinking" => Some(ContentBlock::Reasoning {
-                text: block["thinking"].as_str().unwrap_or_default().to_string(),
-                signature: block["signature"].as_str().map(str::to_string),
-            }),
-            "text" => Some(ContentBlock::Text {
-                text: block["text"].as_str().unwrap_or_default().to_string(),
-            }),
-            "tool_use" => Some(ContentBlock::ToolCall(ToolCall {
-                thought_signature: None,
-                tool_call_id: ToolCallId(block["id"].as_str()?.to_string()),
-                tool_name: block["name"].as_str()?.to_string(),
-                input: serde_json::from_str(block["partial_json"].as_str().unwrap_or("{}"))
-                    .unwrap_or_else(|_| json!({})),
-            })),
-            _ => None,
+    fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
+        AnthropicMessages.render(frozen, opts)
+    }
+    fn endpoint(
+        &self,
+        frozen: &FrozenRenderConfig,
+        auth: &AuthHandle,
+        body: Vec<u8>,
+    ) -> HttpRequest {
+        AnthropicMessages.endpoint(frozen, auth, body)
+    }
+    fn normalizer(
+        &self,
+        frozen: &FrozenRenderConfig,
+        step: broca_protocol::StepId,
+    ) -> Box<dyn broca_provider::wire::StreamNormalizer> {
+        Box::new(ProbeNormalizer {
+            inner: AnthropicMessages.normalizer(frozen, step),
+            request_id: self.0.clone(),
         })
-        .collect();
-    let read = |key: &str| usage[key].as_u64().unwrap_or(0);
-    Answer {
-        content,
-        input_tokens: read("input_tokens"),
-        cache_read: read("cache_read_input_tokens"),
-        cache_write: read("cache_creation_input_tokens"),
+    }
+}
+struct ProbeNormalizer {
+    inner: Box<dyn broca_provider::wire::StreamNormalizer>,
+    request_id: Arc<std::sync::Mutex<Option<String>>>,
+}
+impl broca_provider::wire::StreamNormalizer for ProbeNormalizer {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<broca_protocol::NormalizedEvent>, broca_provider::wire::NormalizeError> {
+        self.inner.push(chunk)
+    }
+    fn finish(
+        &mut self,
+    ) -> Result<Vec<broca_protocol::NormalizedEvent>, broca_provider::wire::NormalizeError> {
+        self.inner.finish()
+    }
+    fn observe_response_headers(&mut self, headers: &broca_provider::wire::ResponseHeaders) {
+        *self.request_id.lock().unwrap() = headers.get("request-id").map(str::to_owned);
+        self.inner.observe_response_headers(headers);
+    }
+    fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
+        self.inner.content_progress()
+    }
+    fn progress_marker(&self) -> u64 {
+        self.inner.progress_marker()
+    }
+    fn liveness_marker(&self) -> Option<u64> {
+        self.inner.liveness_marker()
+    }
+    fn last_event_type(&self) -> Option<&str> {
+        self.inner.last_event_type()
+    }
+    fn keepalives_after_content(&self) -> Option<u64> {
+        self.inner.keepalives_after_content()
+    }
+    fn event_type_counts(&self) -> Option<&[(String, u64)]> {
+        self.inner.event_type_counts()
+    }
+    fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
+        self.inner.input_transformations()
+    }
+    fn input_transformations_unmeasured(&self) -> bool {
+        self.inner.input_transformations_unmeasured()
     }
 }
 
 async fn send(
-    client: &broca_provider::ProviderHttpClient,
     step: u32,
     shape: &str,
-    request: HttpRequest,
+    frozen: &FrozenRenderConfig,
+    auth: &AuthHandle,
+    opts: &CallOptions,
 ) -> Result<Answer, Box<dyn std::error::Error>> {
-    // The identity client sends no accept-encoding, so the response is read as Anthropic
-    // wrote it, as the probe recorded before request gzip existed.
-    let mut builder = client
-        .without_response_decoding()
-        .post(&request.url)
-        .timeout(Duration::from_secs(180));
-    for (name, value) in &request.headers {
-        builder = builder.header(name, value);
-    }
-    let response = builder.body(request.body).send().await?;
-    let status = response.status();
-    let request_id = response
-        .headers()
-        .get("request-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
-    let bytes = response.bytes().await?;
-    if !status.is_success() {
-        let error: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        println!(
-            "step {step} ({shape}): status={status} request_id={request_id} error_type={} message={}",
-            error["error"]["type"], error["error"]["message"]
-        );
-        return Err(format!("step {step} failed with HTTP {status}").into());
-    }
-    let answer = read_stream(&bytes);
-    println!(
-        "step {step} ({shape}): status={status} request_id={request_id} input_tokens={} \
-         cache_read={} cache_write={}",
-        answer.input_tokens, answer.cache_read, answer.cache_write
+    use broca_core::Provider;
+    use broca_protocol::{NormalizedEvent, ProviderControl, StepId};
+    let request_id = Arc::new(std::sync::Mutex::new(None));
+    let provider = broca_provider::LiveProvider::new(
+        ProbeFamily(request_id.clone()),
+        frozen.clone(),
+        auth.clone(),
     );
-    Ok(answer)
+    let mut events = provider.step(StepId(u64::from(step)), opts).await;
+    let exchange = async {
+        let mut answer = Answer {
+            content: Vec::new(),
+            input_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        let mut status = None;
+        let mut finished = false;
+        while let Some(event) = events.recv().await {
+            match event {
+                NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => {
+                    status = attempt.http_status
+                }
+                NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                    answer.content = message.content
+                }
+                NormalizedEvent::Control(ProviderControl::Finished { usage, .. }) => {
+                    answer.input_tokens = usage.input_tokens.unwrap_or(0);
+                    answer.cache_read = usage.cached_input_tokens.unwrap_or(0);
+                    answer.cache_write = usage.cache_write_tokens.unwrap_or(0);
+                    finished = true;
+                }
+                NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
+                    println!(
+                        "step {step} ({shape}): status={:?} request_id={} error_class={:?}",
+                        error.status,
+                        request_id.lock().unwrap().as_deref().unwrap_or("-"),
+                        error.class
+                    );
+                    return Err(format!("step {step} failed").into());
+                }
+                _ => {}
+            }
+        }
+        if !finished {
+            return Err("stream ended without a terminal success".into());
+        }
+        println!("step {step} ({shape}): status={} request_id={} input_tokens={} cache_read={} cache_write={}",
+            status.map_or("-".into(), |status| status.to_string()), request_id.lock().unwrap().as_deref().unwrap_or("-"),
+            answer.input_tokens, answer.cache_read, answer.cache_write);
+        Ok(answer)
+    };
+    tokio::time::timeout(Duration::from_secs(180), exchange).await?
 }
 
 /// The tool result answering every tool call in `content`.
@@ -314,6 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &credential,
         &session,
         claude_code_identity::first_durable_cc_version_suffix(&[], &request_options().prompt),
+        1,
     )?;
     println!(
         "credential={credential} model={model} account_uuid={} dry_run={dry_run}",
@@ -324,18 +342,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let old_shape = frozen(&model, None);
-    let new_shape = frozen(&model, Some(persona));
     let mut opts = request_options();
+    let mut old_persona = persona.clone();
+    old_persona.version = "2.1.280".into();
+    old_persona.prompt_ordinal = None;
+    old_persona.cc_version_suffix =
+        broca_provider::families::anthropic_messages::cc_version_suffix_for_transcript(
+            &opts.prompt,
+            "2.1.280",
+        );
+    let old_shape = frozen(&model, Some(old_persona));
+    let new_shape = frozen(&model, Some(persona));
     let first = AnthropicMessages.endpoint(
         &old_shape,
         &auth,
         AnthropicMessages.render(&old_shape, &opts),
     );
-    let client = broca_provider::build_provider_http_client();
 
     let answer = if dry_run {
-        describe(1, "pre-persona", &first);
+        describe(1, "2.1.280", &first);
         Answer {
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
@@ -348,7 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_write: 0,
         }
     } else {
-        send(&client, 1, "pre-persona", first).await?
+        send(1, "2.1.280", &old_shape, &auth, &opts).await?
     };
     if !answer
         .content
@@ -367,9 +392,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AnthropicMessages.render(&new_shape, &opts),
     );
     if dry_run {
-        describe(2, "persona", &second);
+        describe(2, "2.1.302", &second);
     } else {
-        send(&client, 2, "persona", second).await?;
+        send(2, "2.1.302", &new_shape, &auth, &opts).await?;
     }
     Ok(())
 }

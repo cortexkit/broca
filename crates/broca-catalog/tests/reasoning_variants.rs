@@ -1005,6 +1005,7 @@ mod gated {
             session_id: "11111111-1111-4111-8111-111111111111".into(),
             prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
             cc_version_suffix: None,
+            prompt_ordinal: None,
         };
         let (fresh, fresh_bytes) =
             resolve_anthropic_persona(AuthMethod::Oauth, Some(&persona), EpisodePersona::Fresh);

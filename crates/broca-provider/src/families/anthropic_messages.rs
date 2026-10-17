@@ -137,6 +137,11 @@ fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Valu
         persona_rules::CCH_PLACEHOLDER,
         None,
         persona.prompt_id.as_deref(),
+        if persona.version == "2.1.280" {
+            None
+        } else {
+            persona.prompt_ordinal
+        },
     );
     Some(json!({ "type": "text", "text": text }))
 }
@@ -218,7 +223,12 @@ fn persona_endpoint(
     let base = frozen.base_url.as_deref().unwrap_or(DEFAULT_BASE);
     let url = format!("{}/v1/messages?beta=true", base.trim_end_matches('/'));
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let betas = persona_rules::select_betas(&parsed, &frozen.wire_model_id, &[]);
+    let legacy = persona.version == "2.1.280";
+    let betas = if legacy {
+        persona_rules::select_legacy_betas(&parsed, &frozen.wire_model_id, &[])
+    } else {
+        persona_rules::select_betas(&parsed, &frozen.wire_model_id, &[])
+    };
     let mut headers = vec![("accept".to_string(), "application/json".to_string())];
     attach_auth(&mut headers, auth);
     headers.extend([
@@ -237,6 +247,14 @@ fn persona_endpoint(
             ANTHROPIC_VERSION.to_string(),
         ),
         ("x-app".to_string(), "cli".to_string()),
+    ]);
+    if !legacy {
+        if let Some(prompt_id) = &persona.prompt_id {
+            headers.push(("x-claude-code-prompt-id".into(), prompt_id.clone()));
+        }
+        headers.push(("x-claude-code-request-class".into(), "main".into()));
+    }
+    headers.extend([
         (
             "x-claude-code-session-id".to_string(),
             persona.session_id.clone(),
@@ -247,7 +265,12 @@ fn persona_endpoint(
         ("x-stainless-os".to_string(), stainless_os().to_string()),
         (
             "x-stainless-package-version".to_string(),
-            STAINLESS_PACKAGE_VERSION.to_string(),
+            if legacy {
+                STAINLESS_PACKAGE_VERSION
+            } else {
+                "0.128.0"
+            }
+            .to_string(),
         ),
         ("x-stainless-retry-count".to_string(), "0".to_string()),
         ("x-stainless-runtime".to_string(), "node".to_string()),
@@ -385,16 +408,25 @@ struct AnthropicStreamNormalizer {
 }
 
 /// Whether requests rendered from `frozen` carry the thinking-binding beta, under which the
-/// response reports its input transformations. A Claude Code persona request never does: the
-/// reference client sends that beta only with an enforcing `thinking.block_binding`, which
-/// broca does not send. An api-key request carries no beta at all.
+/// response reports its input transformations. The selected beta list is authoritative,
+/// including on resumed personas whose older list did not request these reports.
 fn asks_for_input_transformations(frozen: &FrozenRenderConfig) -> bool {
-    persona(frozen).is_none()
-        && anthropic_beta_header(frozen).is_some_and(|betas| {
-            betas
-                .split(',')
-                .any(|beta| beta.trim() == cortexkit_anthropic_policy::THINKING_BINDING_BETA)
-        })
+    let betas = match persona(frozen) {
+        Some(persona) => {
+            let body = build_request_body(frozen, &CallOptions::new(Vec::new()));
+            Some(if persona.version == "2.1.280" {
+                persona_rules::select_legacy_betas(&body, &frozen.wire_model_id, &[])
+            } else {
+                persona_rules::select_betas(&body, &frozen.wire_model_id, &[])
+            })
+        }
+        None => anthropic_beta_header(frozen),
+    };
+    betas.is_some_and(|betas| {
+        betas
+            .split(',')
+            .any(|beta| beta.trim() == cortexkit_anthropic_policy::THINKING_BINDING_BETA)
+    })
 }
 
 impl StreamNormalizer for AnthropicStreamNormalizer {
@@ -1075,6 +1107,7 @@ mod tests {
             session_id: "11111111-1111-4111-8111-111111111111".into(),
             prompt_id: None,
             cc_version_suffix: None,
+            prompt_ordinal: None,
         });
         // Adaptive thinking, so the request can be warmed (a manual budget cannot).
         frozen.variant = Some(crate::variant::FrozenVariant {
@@ -1085,6 +1118,31 @@ mod tests {
             },
         });
         frozen
+    }
+
+    #[test]
+    fn current_main_request_headers_carry_class_and_frozen_prompt_id() {
+        let mut frozen = persona_frozen();
+        let persona = frozen.claude_code_persona.as_mut().unwrap();
+        persona.version = "2.1.302".into();
+        persona.prompt_id = Some("33333333-3333-4333-8333-333333333333".into());
+        persona.prompt_ordinal = Some(3);
+        let body = AnthropicMessages.render(&frozen, &opts(vec![user_message("hello")]));
+        let request = AnthropicMessages.endpoint(&frozen, &AuthHandle::None, body);
+        let header = |name| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("x-claude-code-request-class"), Some("main"));
+        assert_eq!(
+            header("x-claude-code-prompt-id"),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert_eq!(header("x-claude-code-prev-tool-durations"), None);
+        assert_eq!(header("x-stainless-package-version"), Some("0.128.0"));
     }
 
     /// A persona warm request changes the sent body, so it is re-emitted in the persona's key

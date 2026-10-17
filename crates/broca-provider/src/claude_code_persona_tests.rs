@@ -145,7 +145,7 @@ fn first_user_text_prefers_a_command_then_the_last_nonempty_text() {
 fn billing_text_writes_only_well_formed_lineage() {
     let prompt = "33333333-3333-4333-8333-333333333333";
     assert_eq!(
-        billing_header_text("2.1.280", "d7c", "00000", None, Some(prompt)),
+        billing_header_text("2.1.280", "d7c", "00000", None, Some(prompt), None),
         "x-anthropic-billing-header: cc_version=2.1.280.d7c; cc_entrypoint=cli; cch=00000; \
          cc_prompt_id=33333333-3333-4333-8333-333333333333;"
     );
@@ -155,7 +155,8 @@ fn billing_text_writes_only_well_formed_lineage() {
             "d7c",
             "00000",
             Some("req_short"),
-            Some("not-a-uuid")
+            Some("not-a-uuid"),
+            None
         ),
         "x-anthropic-billing-header: cc_version=2.1.280.d7c; cc_entrypoint=cli; cch=00000;"
     );
@@ -165,11 +166,47 @@ fn billing_text_writes_only_well_formed_lineage() {
             "d7c",
             "00000",
             Some("req_PLACEHOLDER0000000000000001"),
-            Some(prompt)
+            Some(prompt),
+            None
         ),
         "x-anthropic-billing-header: cc_version=2.1.280.d7c; cc_entrypoint=cli; cch=00000; \
          cc_prev_req=req_PLACEHOLDER0000000000000001; \
          cc_prompt_id=33333333-3333-4333-8333-333333333333;"
+    );
+}
+
+#[test]
+fn interactive_lineage_follows_prompt_id_and_reuses_the_human_ordinal() {
+    assert_eq!(billing_header_text("2.1.302", "433", "00000", None,
+        Some("33333333-3333-4333-8333-333333333333"), Some(7)),
+        "x-anthropic-billing-header: cc_version=2.1.302.433; cc_entrypoint=cli; cch=00000; cc_prompt_id=33333333-3333-4333-8333-333333333333; cc_turn_origin=human; cc_prompt_index=7; cc_turn_index=7;");
+    assert!(
+        !billing_header_text("2.1.302", "433", "00000", None, None, Some(7))
+            .contains("cc_turn_origin")
+    );
+}
+
+#[test]
+fn main_betas_match_the_interactive_capture_in_order() {
+    let expected = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+    for model in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+        assert_eq!(
+            select_betas(&serde_json::json!({}), model, &[]),
+            expected,
+            "{model}"
+        );
+    }
+    assert_eq!(
+        select_betas(&serde_json::json!({}), "claude-opus-4-8", &[]),
+        expected.replace("per-turn-control-2026-07-01,", "")
+    );
+    let haiku = expected.replacen("claude-code-20250219,", "", 1).replace(
+        "prompt-caching-scope-2026-01-05,",
+        "prompt-caching-scope-2026-01-05,claude-code-20250219,",
+    );
+    assert_eq!(
+        select_betas(&serde_json::json!({}), "claude-haiku-5-5", &[]),
+        haiku
     );
 }
 

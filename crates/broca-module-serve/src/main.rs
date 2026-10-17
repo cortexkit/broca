@@ -3402,6 +3402,43 @@ mod executor {
                             prior_snapshot.head_seq,
                         )
                         .await;
+                    let wal_store = self.wal_store.clone();
+                    let session = job.req.session.clone();
+                    let head = prior_snapshot.head_seq;
+                    let records = broca_diagnostics::spawn_blocking(
+                        broca_diagnostics::JobKind::WalRead,
+                        move || wal_store.read_records_range(&session, 0, Some(head), None),
+                    )
+                    .await
+                    .map_err(|error| {
+                        RunError::Config(format!("Claude Code prompt history read failed: {error}"))
+                    })?;
+                    let records =
+                        match records {
+                            Ok(records) => match records.into_records() {
+                                broca_wal::WalRangeRecords::Complete(records) => records,
+                                broca_wal::WalRangeRecords::Absent if head == 0 => Vec::new(),
+                                _ => return Err(RunError::Config(
+                                    "Claude Code prompt history is not a complete durable WAL read"
+                                        .into(),
+                                )),
+                            },
+                            Err(broca_wal::WalError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound && head == 0 =>
+                            {
+                                Vec::new()
+                            }
+                            Err(error) => {
+                                return Err(RunError::Config(format!(
+                                    "Claude Code prompt history read failed: {error}"
+                                )))
+                            }
+                        };
+                    let prompt_ordinal =
+                        broca_module_serve::claude_code_identity::human_prompt_ordinal(
+                            records.iter().map(|frame| &frame.record),
+                            &job.req.input,
+                        );
                     match broca_module_serve::claude_code_identity::fresh_persona(
                         install_id,
                         resolution.account_id.as_deref(),
@@ -3413,6 +3450,7 @@ mod executor {
                             }),
                         &job.req.session,
                         cc_version_suffix,
+                        prompt_ordinal,
                     ) {
                         Ok(persona) => Some(persona),
                         Err(error) => {
