@@ -6,6 +6,9 @@
 
 use crate::delivery_rig;
 
+use broca_protocol::content::{ContentBlock, Message, Role};
+use broca_protocol::RunId;
+use broca_module::ServeHandler;
 use delivery_rig::*;
 use std::time::Duration;
 
@@ -156,11 +159,115 @@ fn ordinals(page: &ReadPage) -> Vec<u64> {
     page.messages.iter().map(|m| m.ordinal).collect()
 }
 
+#[tokio::test]
+async fn reply_too_large_message_bytes_match_published_vector_through_serve() {
+    let vectors = reply_too_large_vectors();
+    let case = vectors["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "raw message exceeds the transport frame limit")
+        .unwrap();
+    let mut calibration = Rig::start("reply-too-large-calibration").await;
+    import_reply_too_large_session(&mut calibration, 9, String::new()).await;
+    let calibration_frame = calibration
+        .request(
+            9,
+            serde_json::json!({"method":"session.read","params":case["request"]}),
+        )
+        .await;
+    assert_eq!(calibration_frame.header.ty, FrameType::Response);
+    let expected_frame_bytes = case["refusal"]["detail"]["bytes"].as_u64().unwrap() as usize;
+    let calibration_frame_bytes = calibration_frame.body.len() + subc_protocol::HEADER_LEN;
+    let final_text_bytes = expected_frame_bytes - calibration_frame_bytes;
+    calibration.finish().await;
+
+    let mut rig = Rig::start("reply-too-large-vector").await;
+    import_reply_too_large_session(&mut rig, 9, "x".repeat(final_text_bytes)).await;
+    let frame = rig
+        .request(
+            9,
+            serde_json::json!({"method":"session.read","params":case["request"]}),
+        )
+        .await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let refusal = &case["refusal"];
+    let detail: cortexkit_role_llm_runner::errors::ReplyTooLargeDetail =
+        serde_json::from_value(refusal["detail"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(&detail).unwrap(), refusal["detail"]);
+    #[derive(serde::Serialize)]
+    struct ExpectedError<'a> {
+        code: &'a str,
+        message: &'a str,
+        detail: &'a cortexkit_role_llm_runner::errors::ReplyTooLargeDetail,
+    }
+    assert_eq!(
+        frame.body,
+        serde_json::to_vec(&ExpectedError {
+            code: refusal["code"].as_str().unwrap(),
+            message: refusal["message"].as_str().unwrap(),
+            detail: &detail,
+        })
+        .unwrap()
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap(),
+        *refusal
+    );
+    rig.finish().await;
+}
+
 use cortexkit_role_llm_runner::{
     describe::check_describe,
     read::{HeadMeta, ReadPage},
     run::RunResult,
 };
+
+const REPLY_TOO_LARGE_VECTOR_SESSION: &str = "ses_01J9Z8Y7X6W5V4U3T2S1R0Q9P8";
+
+async fn import_reply_too_large_session(rig: &mut Rig, channel: u16, final_text: String) {
+    let session = rig
+        .bind_session(channel, REPLY_TOO_LARGE_VECTOR_SESSION)
+        .await;
+    let mut messages: Vec<_> = (0..7)
+        .map(|ordinal| {
+            let role = if ordinal % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            Message::new(
+                role,
+                vec![ContentBlock::Text {
+                    text: format!("history {ordinal}"),
+                }],
+            )
+        })
+        .collect();
+    messages.push(Message::new(
+        Role::Assistant,
+        vec![ContentBlock::Text { text: final_text }],
+    ));
+    rig.registry()
+        .import(broca_module::serve::SessionImportRequest {
+            project_id: None,
+            principal: None,
+            session,
+            run_id: RunId("reply-too-large-import".into()),
+            messages,
+            source_ref: "fixture:reply-too-large".into(),
+        })
+        .await
+        .unwrap();
+}
+
+/// Pinned from the published commons vectors at commit 649d5f12.
+fn reply_too_large_vectors() -> serde_json::Value {
+    serde_json::from_str(include_str!(
+        "../fixtures/llm-runner-v1/reply-too-large.json"
+    ))
+    .unwrap()
+}
 
 // ---- role.describe ------------------------------------------------------------------------
 

@@ -26,6 +26,7 @@ use broca_core::{CapInstallRequest, CapMutation, SpendDeltaRequest};
 
 /// Shared refusal spelling for wire adapters of this management surface.
 pub use cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE;
+pub use cortexkit_role_llm_runner::errors::{ReplyTooLargeDetail, ReplyTooLargeSubject};
 
 /// A `session.read` request: a paged read over the durable assembled transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,16 +90,30 @@ fn cursor_bytes<T: Serialize>(name: &str, cursor: &Option<T>) -> u64 {
 /// Ranges keep their oldest messages; tails keep their newest. Late entries share the same
 /// budget, not a second budget of their own. Keep at least one message and one late entry when
 /// present: atomic oversized items or the fixed metadata can still exceed the budget.
-fn reply_frame_limit_refusal(bytes: u64, subject: ReplyTooLargeSubject) -> Option<ServeError> {
-    if bytes > broca_wire::SUBC_MAX_FRAME_BYTES {
-        Some(ServeError::ReplyTooLarge {
-            bytes,
-            limit: broca_wire::SUBC_MAX_FRAME_BYTES,
-            subject,
-        })
-    } else {
-        None
+fn reply_frame_limit_refusal(
+    bytes: u64,
+    subject: Option<ReplyTooLargeSubject>,
+) -> Option<ServeError> {
+    if bytes <= broca_wire::SUBC_MAX_FRAME_BYTES {
+        return None;
     }
+    subject.map(|subject| {
+        ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
+            bytes,
+            broca_wire::SUBC_MAX_FRAME_BYTES,
+            subject,
+        ))
+    })
+}
+
+fn model_group_reply_too_large_subject(
+    page: &broca_wire::ModelPage,
+) -> Option<ReplyTooLargeSubject> {
+    page.messages
+        .first()
+        .map(|entry| ReplyTooLargeSubject::ModelGroup {
+            source: entry.source.clone(),
+        })
 }
 
 fn cap_page_bytes(
@@ -139,18 +154,13 @@ fn cap_page_bytes(
         }
     }
     let frame_bytes = broca_wire::serialized_result_frame_bytes(page);
-    let subject = page.messages.first().map_or_else(
-        || ReplyTooLargeSubject::AtomicGroup {
-            session: session.to_owned(),
-            kind: "session_read_metadata".into(),
-            from_ordinal: 0,
-            to_ordinal: 0,
-        },
-        |message| ReplyTooLargeSubject::Message {
+    let subject = page
+        .messages
+        .first()
+        .map(|message| ReplyTooLargeSubject::Message {
             session: session.to_owned(),
             ordinal: message.ordinal,
-        },
-    );
+        });
     if let Some(error) = reply_frame_limit_refusal(frame_bytes, subject) {
         return Err(error);
     }
@@ -627,21 +637,6 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     }
 }
 
-/// The content-free identifier attached to a reply that cannot fit one transport frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReplyTooLargeSubject {
-    Message {
-        session: String,
-        ordinal: u64,
-    },
-    AtomicGroup {
-        session: String,
-        kind: String,
-        from_ordinal: u64,
-        to_ordinal: u64,
-    },
-}
-
 /// An error from the serve surface (distinct from a successful per-request outcome). Opening
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
@@ -662,11 +657,7 @@ pub enum ServeError {
     /// Opening or admission failed. The optional class is set only from a known cause.
     Open(String, Option<broca_protocol::ErrorClass>),
     /// A whole message or model-view atomic group would exceed one encoded subc frame.
-    ReplyTooLarge {
-        bytes: u64,
-        limit: u64,
-        subject: ReplyTooLargeSubject,
-    },
+    ReplyTooLarge(ReplyTooLargeDetail),
     /// The session's WAL holds a frame that requires WAL features this build does not know
     /// (`missing`): a newer broca wrote it. Nothing was written and retrying cannot help, so
     /// it answers with its own wire code rather than [`ServeError::Open`]. `reason` is the
@@ -778,25 +769,9 @@ impl std::fmt::Display for ServeError {
             ServeError::Open(s, _) | ServeError::WalNewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
-            ServeError::ReplyTooLarge {
-                bytes,
-                limit,
-                subject,
-            } => match subject {
-                ReplyTooLargeSubject::Message { session, ordinal } => write!(
-                    f,
-                    "message {session} at ordinal {ordinal} needs a {bytes}-byte frame, over the {limit}-byte limit"
-                ),
-                ReplyTooLargeSubject::AtomicGroup {
-                    session,
-                    kind,
-                    from_ordinal,
-                    to_ordinal,
-                } => write!(
-                    f,
-                    "atomic group {kind} in session {session} [{from_ordinal}, {to_ordinal}) needs a {bytes}-byte frame, over the {limit}-byte limit"
-                ),
-            },
+            ServeError::ReplyTooLarge(_) => {
+                f.write_str("the session.read reply exceeds the transport frame limit")
+            }
             ServeError::SendRetracted { submission_id } => {
                 write!(f, "submission '{submission_id}' was retracted")
             }
@@ -1224,27 +1199,13 @@ impl ServeHandler for crate::LineageRegistry {
                 requested: req.lineage_id.unwrap(),
             });
         }
-        let groups = page.atomic_groups.clone();
         let page: broca_wire::ModelPage = page.try_into().map_err(|error| {
             ServeError::Open(
                 format!("model page source: {error}"),
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
-        let subject = groups.first().map_or_else(
-            || ReplyTooLargeSubject::AtomicGroup {
-                session: req.session.session.clone(),
-                kind: "model_view_metadata".into(),
-                from_ordinal: req.from_ordinal.unwrap_or(0),
-                to_ordinal: req.from_ordinal.unwrap_or(0),
-            },
-            |group| ReplyTooLargeSubject::AtomicGroup {
-                session: req.session.session.clone(),
-                kind: group.kind.into(),
-                from_ordinal: group.from_ordinal,
-                to_ordinal: group.to_ordinal,
-            },
-        );
+        let subject = model_group_reply_too_large_subject(&page);
         if let Some(error) =
             reply_frame_limit_refusal(broca_wire::serialized_result_frame_bytes(&page), subject)
         {
@@ -1886,18 +1847,14 @@ impl ServeHandler for crate::LineageRegistry {
             error,
             final_message,
         };
-        let subject = response.final_message.as_ref().map_or_else(
-            || ReplyTooLargeSubject::AtomicGroup {
-                session: session.session.clone(),
-                kind: "run_result".into(),
-                from_ordinal: 0,
-                to_ordinal: 0,
-            },
-            |message| ReplyTooLargeSubject::Message {
-                session: session.session.clone(),
-                ordinal: message.ordinal,
-            },
-        );
+        let subject =
+            response
+                .final_message
+                .as_ref()
+                .map(|message| ReplyTooLargeSubject::Message {
+                    session: session.session.clone(),
+                    ordinal: message.ordinal,
+                });
         if let Some(error) = reply_frame_limit_refusal(
             broca_wire::serialized_result_frame_bytes(&response),
             subject,

@@ -14504,3 +14504,30 @@ expect_red = ["boundary_cancel::recovered_boundary_cancel_remains_idempotent_and
 file = "crates/broca-core/src/run.rs"
 old = "inbox.restore_boundary_cancel();"
 new = "// NON-VACUITY BREAK: leave the actor unaware of replayed cancellation."
+
+[[control]]
+id = "llm-runner-reply-too-large-detail-golden"
+guards = "served reply_too_large bytes match the published role detail vectors"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::reply_too_large_detail_bytes_match_published_vectors"]
+only = false
+file = "crates/broca-module-serve/src/serve.rs"
+old = 'message: "the session.read reply exceeds the transport frame limit",'
+new = 'message: "response exceeds the transport frame limit", // NON-VACUITY BREAK'
+
+[[control]]
+id = "agent-data-diverged-verification-reason"
+guards = "a failed held-cut verification appears as a safe reason on the unknown answer"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/agent_data.rs"
+expect_red = ["diverged_held_ref_with_a_bad_cut_is_unknown_and_logs_the_cause"]
+only = false
+file = "crates/broca-module-serve/src/agent_data.rs"
+old = 'divergence_reason = Some(cause.to_owned());'
+new = 'divergence_reason = None; // NON-VACUITY BREAK'

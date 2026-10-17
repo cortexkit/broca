@@ -545,6 +545,27 @@ impl Wire {
         )
         .await
     }
+    async fn call_bytes(&mut self, op: &str, params: Value) -> (FrameType, Vec<u8>) {
+        self.corr += 1;
+        write_frame(
+            &mut self.stream,
+            &Frame::build(
+                FrameType::Request,
+                flags(),
+                7,
+                1,
+                self.corr,
+                serde_json::to_vec(&json!({"method":format!("agent_data.{op}"),"params":params}))
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let frame = self.next().await;
+        assert_eq!(frame.header.corr, self.corr);
+        (frame.header.ty, frame.body)
+    }
 }
 fn entorhinal() -> Value {
     json!({"kind":"reserved","module_id":"entorhinal"})
@@ -2160,10 +2181,9 @@ async fn diverged_unheld_ref_is_at_cut_even_when_import_will_refuse_its_seal() {
     let (rig, params, _) = incoming_rig("unheld-corrupt-cut");
     *rig.door.digest.lock().unwrap() = Some("0".repeat(64));
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    assert_eq!(
-        wire.call("diverged", params.clone()).await.unwrap(),
-        json!({"refs":[{"state":"at_cut"}]})
-    );
+    let (frame_type, body) = wire.call_bytes("diverged", params.clone()).await;
+    assert_eq!(frame_type, FrameType::Response);
+    assert_eq!(body, br#"{"result":{"refs":[{"state":"at_cut"}]}}"#);
     assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
     assert_code(wire.call("import", params).await, "digest_mismatch");
     assert_nothing_staged(&rig);
@@ -2215,9 +2235,16 @@ async fn diverged_held_ref_with_a_bad_cut_is_unknown_and_logs_the_cause() {
         let dispatch = tracing::Dispatch::new(events.clone());
         let _guard = tracing::dispatcher::set_default(&dispatch);
         let mut wire = Wire::new(&rig, entorhinal(), true).await;
+        let (frame_type, body) = wire.call_bytes("diverged", params.clone()).await;
+        assert_eq!(frame_type, FrameType::Response);
         assert_eq!(
-            wire.call("diverged", params.clone()).await.unwrap(),
-            json!({"refs":[{"state":"unknown"}]})
+            body,
+            format!(r#"{{"result":{{"refs":[{{"reason":"{cause}","state":"unknown"}}]}}}}"#)
+                .as_bytes()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"result":{"refs":[{"state":"unknown","reason":cause}]}})
         );
         assert_eq!(rig.door.calls.load(Ordering::SeqCst), 1);
         assert_eq!(rig.bytes(&session), before);

@@ -147,3 +147,42 @@ fn oversized_atomic_items_and_fixed_metadata_are_not_truncated() {
     cap_page_bytes(&mut capped, 1, false, "test-session").unwrap();
     assert_eq!(capped, original, "unpaged tools and metadata stay whole");
 }
+
+#[test]
+fn model_reply_too_large_subject_preserves_the_entry_source() {
+    let source = serde_json::json!({
+        "kind": "replacement",
+        "compaction_id": "cmp-1",
+        "version": 4,
+        "from_ordinal": 5,
+        "to_ordinal": 10,
+    });
+    let page: broca_wire::ModelPage = serde_json::from_value(serde_json::json!({
+        "messages": [{
+            "source": source,
+            "message": {"role": "assistant", "content": []},
+        }],
+        "lineage_id": "lineage",
+        "compaction_id": "cmp-1",
+        "version": 4,
+    }))
+    .unwrap();
+    assert_eq!(
+        model_group_reply_too_large_subject(&page),
+        Some(ReplyTooLargeSubject::ModelGroup {
+            source: serde_json::from_value(serde_json::json!({
+                "kind": "replacement",
+                "compaction_id": "cmp-1",
+                "version": 4,
+                "from_ordinal": 5,
+                "to_ordinal": 10,
+            }))
+            .unwrap(),
+        })
+    );
+    let empty: broca_wire::ModelPage = serde_json::from_value(serde_json::json!({
+        "messages": [],
+    }))
+    .unwrap();
+    assert_eq!(model_group_reply_too_large_subject(&empty), None);
+}

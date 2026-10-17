@@ -2941,7 +2941,24 @@ async fn send_serve_error(
     corr: u64,
     err: &ServeError,
 ) -> Result<(), ServeIoError> {
+    if let ServeError::ReplyTooLarge(detail) = err {
+        #[derive(serde::Serialize)]
+        struct ReplyTooLargeErrorBody<'a> {
+            code: &'static str,
+            message: &'static str,
+            detail: &'a broca_module::serve::ReplyTooLargeDetail,
+        }
+
+        let body = serde_json::to_vec(&ReplyTooLargeErrorBody {
+            code: broca_wire::REPLY_TOO_LARGE,
+            message: "the session.read reply exceeds the transport frame limit",
+            detail,
+        })
+        .map_err(|e| ServeIoError(e.to_string()))?;
+        return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
+    }
     let code = match err {
+        ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())
                 .with_detail(serde_json::json!({"cutId":cut_id}));
@@ -2978,7 +2995,6 @@ async fn send_serve_error(
             );
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
-        ServeError::ReplyTooLarge { .. } => broca_wire::REPLY_TOO_LARGE,
         ServeError::SessionHeld(_) => "session_held",
         ServeError::Open(_, _) => "open_failed",
         ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
@@ -3039,33 +3055,6 @@ async fn send_serve_error(
         }
     };
     let mut body = ErrorBody::new(code, err.to_string());
-    if let ServeError::ReplyTooLarge {
-        bytes,
-        limit,
-        subject,
-    } = err
-    {
-        let mut detail = serde_json::json!({"bytes": bytes, "limit": limit});
-        match subject {
-            broca_module::serve::ReplyTooLargeSubject::Message { session, ordinal } => {
-                detail["message"] = serde_json::json!({"session": session, "ordinal": ordinal});
-            }
-            broca_module::serve::ReplyTooLargeSubject::AtomicGroup {
-                session,
-                kind,
-                from_ordinal,
-                to_ordinal,
-            } => {
-                detail["atomic_group"] = serde_json::json!({
-                    "session": session,
-                    "kind": kind,
-                    "from_ordinal": from_ordinal,
-                    "to_ordinal": to_ordinal,
-                });
-            }
-        }
-        body = body.with_detail(detail);
-    }
     if let ServeError::Open(_, Some(class)) = err {
         body = body.with_detail(serde_json::json!({"class": class.shared_class()}));
     }
@@ -4137,6 +4126,94 @@ mod tests {
             std::str::from_utf8(&frame.body).unwrap(),
             include_str!("../tests/golden/retained_session_too_large.json").trim_end()
         );
+    }
+
+    #[tokio::test]
+    async fn reply_too_large_detail_bytes_match_published_vectors() {
+        // Copied byte for byte from commons commit 649d5f12.
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/llm-runner-v1/reply-too-large.json"
+        ))
+        .unwrap();
+        #[derive(serde::Serialize)]
+        struct ExpectedError<'a> {
+            code: &'a str,
+            message: &'a str,
+            detail: &'a cortexkit_role_llm_runner::errors::ReplyTooLargeDetail,
+        }
+
+        for case in vectors["refusals"].as_array().unwrap() {
+            let refusal = &case["refusal"];
+            let detail: cortexkit_role_llm_runner::errors::ReplyTooLargeDetail =
+                serde_json::from_value(refusal["detail"].clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&detail).unwrap(),
+                refusal["detail"],
+                "{}",
+                case["name"]
+            );
+            let expected = serde_json::to_vec(&ExpectedError {
+                code: refusal["code"].as_str().unwrap(),
+                message: refusal["message"].as_str().unwrap(),
+                detail: &detail,
+            })
+            .unwrap();
+            let (writer, mut rx) = broca_diagnostics::channel(1, Arc::default());
+            send_serve_error(
+                &writer,
+                PROTOCOL_VERSION,
+                7,
+                3,
+                11,
+                &ServeError::ReplyTooLarge(detail),
+            )
+            .await
+            .unwrap();
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.header.ty, FrameType::Error);
+            assert_eq!(frame.body, expected, "{}", case["name"]);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap(),
+                *refusal,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_less_model_metadata_and_run_result_use_generic_frame_limit_error() {
+        let oversized = "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize);
+        let model_page = broca_wire::ModelPage {
+            messages: Vec::new(),
+            lineage_id: Some(oversized.clone()),
+            next_from_ordinal: None,
+            head: None,
+            compaction_id: None,
+            version: None,
+        };
+        let run_result = broca_wire::RunResultResponse {
+            run_id: "run".into(),
+            state: "active".into(),
+            reason: Some(oversized),
+            error: None,
+            final_message: None,
+        };
+        let expected =
+            br#"{"code":"response_too_large","message":"response exceeds the transport frame limit"}"#;
+        let (writer, mut rx) = broca_diagnostics::channel(2, Arc::default());
+        send_json_response(&writer, PROTOCOL_VERSION, 7, 3, 11, &model_page)
+            .await
+            .unwrap();
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        assert_eq!(frame.body, expected);
+        send_json_response(&writer, PROTOCOL_VERSION, 7, 3, 12, &run_result)
+            .await
+            .unwrap();
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        assert_eq!(frame.body, expected);
     }
 
     #[tokio::test]
