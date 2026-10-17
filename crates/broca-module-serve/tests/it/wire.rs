@@ -136,6 +136,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         variant: None,
         service_tier: None,
         secret_refresher: None,
+        structured_output: None,
         frozen_account_ref: None,
         clock: None,
     }
@@ -726,6 +727,7 @@ async fn over_cap_admission_is_typed_and_leaves_no_wal_or_run_index_row() {
         stop_when: vec![],
         context_management: None,
         inherit_frozen: Default::default(),
+        structured_output: None,
     };
     let error = registry
         .send(broca_module::serve::SendRequest {
@@ -830,6 +832,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
             stop_when: vec![],
             context_management: None,
             inherit_frozen: Default::default(),
+            structured_output: None,
         }),
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
@@ -875,6 +878,7 @@ fn budget_send(session: BindIdentity, run_id: &str) -> SendRequest {
             stop_when: vec![],
             context_management: None,
             inherit_frozen: Default::default(),
+            structured_output: None,
         }),
         skip_materialization: false,
         kind: RunKind::FreshOrResume,

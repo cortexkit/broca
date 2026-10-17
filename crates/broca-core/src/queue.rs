@@ -303,6 +303,7 @@ mod tests {
                 variant: None,
                 service_tier: None,
                 inherit_frozen: Default::default(),
+                structured_output: None,
             }),
             request_identity_digest: None,
             principal: None,

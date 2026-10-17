@@ -627,6 +627,9 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             temperature: capability_flag(entry, "temperature"),
             tool_call: capability_flag(entry, "tool_call"),
             interleaved: capability_flag(entry, "interleaved"),
+            // The models.dev spelling of fusiform's `capability.structured_output`, read like
+            // the other snapshot capability keys.
+            structured_output: capability_flag(entry, "structured_output"),
         },
         limits: map_limits(entry.get("limit")),
         cost: map_cost(entry.get("cost")),
@@ -645,9 +648,7 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             .get("status")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        overlay: Overlay {
-            structured_output: entry.get("structured_output").and_then(Value::as_bool),
-        },
+        overlay: Overlay::default(),
         raw: raw_policy.map(entry),
     }
 }
@@ -1592,6 +1593,11 @@ mod tests {
     #[test]
     fn interleaved_absent_false_and_null_are_distinct() {
         assert_capability_three_way("interleaved", |m| m.capabilities.interleaved);
+    }
+
+    #[test]
+    fn structured_output_absent_false_and_null_are_distinct() {
+        assert_capability_three_way("structured_output", |m| m.capabilities.structured_output);
     }
 
     #[test]

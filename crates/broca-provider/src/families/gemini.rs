@@ -108,6 +108,10 @@ impl WireFamily for Gemini {
 /// `cloudcode-pa` envelope's `request` field — so the inner body is byte-identical to a
 /// direct Gemini request by construction.
 pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    // A run with structured output adds its submit tool or schema instructions here; a run
+    // without renders from `opts` unchanged.
+    let prepared = crate::structured_output::prepare(frozen, opts);
+    let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
@@ -177,6 +181,11 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
     }
 
     merge_static_options(&mut body, &frozen.static_options);
+    crate::structured_output::finish(
+        frozen,
+        &mut body,
+        name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
+    );
     body
 }
 

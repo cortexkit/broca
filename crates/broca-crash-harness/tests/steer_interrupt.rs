@@ -326,6 +326,7 @@ impl Session {
             variant: None,
             service_tier: None,
             inherit_frozen_cache: false,
+            structured_output: None,
         };
         self.registry
             .send(SendRequest {

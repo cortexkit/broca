@@ -40,6 +40,7 @@ fn frozen() -> FrozenRenderConfig {
         variant: None,
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
+        structured_output: None,
     }
 }
 

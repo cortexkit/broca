@@ -1889,7 +1889,7 @@ async fn chatgpt_refresh_run(
     stop_when: vec![broca_protocol::request::StopCondition::StepCount { n: 1 }],
     submission_id: None,
     context_management: None,
-    inherit_frozen_cache: false, };
+    inherit_frozen_cache: false, structured_output: None, };
     let wal = FileWalStore::new(root.join("refresh-wal"));
     let lease = FileLeaseStore::new(root.join("refresh-lease"));
     let (tx, mut rx) = mpsc::channel(256);

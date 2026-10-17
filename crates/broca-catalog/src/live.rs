@@ -23,7 +23,7 @@ use broca_provider::families::{
 use broca_provider::policy::ReasoningPolicy;
 pub use broca_provider::policy::{CrossModelThinking, ThinkingEchoScope};
 pub use broca_provider::service_tier::ServiceTier;
-use broca_provider::spec::{AuthKind, ReasoningOptions};
+use broca_provider::spec::{AuthKind, CapabilityFlag, ReasoningOptions};
 pub use broca_provider::variant::FrozenVariant;
 use broca_provider::variant::{freeze_variant, resolve_variant};
 use broca_provider::{live_provider_with_clock_and_refresher, ProviderHttpClient};
@@ -249,6 +249,10 @@ pub struct ResolveOptions<'a> {
     pub frozen_account_ref: Option<&'a str>,
     /// The module clock shared with every live provider for this run.
     pub clock: Option<&'a broca_core::clock::Clock>,
+    /// The structured output a fresh episode asks for. Decided against the model's catalog
+    /// support, its wire family and the family's subset profile, then frozen into the render
+    /// config. A resume passes the frozen decision through `EpisodeRenderConfig` instead.
+    pub structured_output: Option<&'a broca_protocol::structured_output::StructuredOutput>,
 }
 
 /// How to obtain the runtime credential for the resolved provider.
@@ -607,6 +611,10 @@ pub struct EpisodeRenderConfig<'a> {
     /// Restore the recorded Codex effort-update choice on resume. `None` enables input
     /// configuration updates for a newly admitted episode; `Some(false)` keeps old bytes.
     pub chatgpt_effort_updates: Option<bool>,
+    /// The structured-output decision this episode froze at start, fed back on resume and
+    /// applied as recorded. It is never re-decided from the catalog, so a catalog change since
+    /// admission cannot move a resumed run's request bytes or its reported enforcement.
+    pub structured_output: Option<&'a broca_protocol::structured_output::FrozenStructuredOutput>,
 }
 
 /// The output cap used when a send sets none and the catalog cannot supply a usable one.
@@ -802,6 +810,14 @@ fn resolve_provider_inner(
             model,
             &[],
         )?;
+        // No catalog row either: support is unknown, and the family is OpenAI Chat.
+        apply_structured_output(
+            &mut frozen,
+            episode_render.structured_output,
+            opts.structured_output,
+            "openai-compatible",
+            CapabilityFlag::Absent,
+        )?;
         let refresher = secret_refresher_for(
             auth,
             opts,
@@ -864,6 +880,7 @@ fn resolve_provider_inner(
         thinking_cross_model: episode_render.thinking_cross_model,
         responses_tools_non_strict: episode_render.responses_tools_non_strict,
         chatgpt_effort_updates: episode_render.chatgpt_effort_updates,
+        structured_output: episode_render.structured_output,
     };
     if catalog.is_withdrawn(provider_id, model_id) {
         return Err(format!(
@@ -974,6 +991,18 @@ fn resolve_provider_inner(
             &format!("{provider_id}/{model_id}"),
             &catalog.priced_modes(provider_id, model_id),
         )?;
+        // Support is read from the same catalog row the variant resolves against.
+        apply_structured_output(
+            &mut frozen,
+            episode_render.structured_output,
+            opts.structured_output,
+            provider_id,
+            options_spec
+                .as_ref()
+                .map_or(CapabilityFlag::Absent, |spec| {
+                    spec.capabilities.structured_output
+                }),
+        )?;
         let frozen = episode_render.apply(frozen);
         let resolved_base_url = frozen
             .base_url
@@ -1069,6 +1098,13 @@ fn resolve_provider_inner(
         &format!("{provider_id}/{model_id}"),
         &catalog.priced_modes(provider_id, model_id),
     )?;
+    apply_structured_output(
+        &mut frozen,
+        episode_render.structured_output,
+        opts.structured_output,
+        provider_id,
+        model_spec.capabilities.structured_output,
+    )?;
     let frozen = episode_render.apply(frozen);
     let resolved_base_url = frozen
         .base_url
@@ -1095,6 +1131,34 @@ fn resolve_provider_inner(
         // The catalog model's context window (the transform's pressure ground truth).
         context_limit: model_spec.limits.context,
     })
+}
+
+/// Freeze the episode's structured-output decision into its render config. A resume applies
+/// the decision it recorded; a fresh episode decides from the model's catalog support
+/// (`capability.structured_output`), its wire family and the family's subset profile. Runs
+/// without structured output are left untouched, so their frozen config is byte-identical.
+fn apply_structured_output(
+    frozen: &mut FrozenRenderConfig,
+    restored: Option<&broca_protocol::structured_output::FrozenStructuredOutput>,
+    requested: Option<&broca_protocol::structured_output::StructuredOutput>,
+    provider_id: &str,
+    catalog: CapabilityFlag,
+) -> Result<(), ResolutionError> {
+    frozen.structured_output = match (restored, requested) {
+        (Some(restored), _) => Some(restored.clone()),
+        (None, Some(requested)) => Some(
+            broca_provider::structured_output::decide(
+                frozen.family_id,
+                provider_id,
+                frozen.base_url.as_deref(),
+                catalog,
+                requested,
+            )
+            .map_err(|field| format!("structured output refused at {field}"))?,
+        ),
+        (None, None) => None,
+    };
+    Ok(())
 }
 
 /// Freeze the episode's reasoning variant into its render config.

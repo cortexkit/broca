@@ -258,6 +258,7 @@ fn request(name: &str, mode: ExecutionMode) -> RunRequest {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 

@@ -44,6 +44,7 @@ pub fn submission_difference(
         stop_when: existing_stop_when,
         context_management: existing_context_management,
         inherit_frozen: existing_inherit_frozen,
+        structured_output: existing_structured_output,
     } = existing;
     let SubmissionRequest {
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
@@ -67,6 +68,7 @@ pub fn submission_difference(
         stop_when: requested_stop_when,
         context_management: requested_context_management,
         inherit_frozen: requested_inherit_frozen,
+        structured_output: requested_structured_output,
     } = requested;
 
     [
@@ -103,6 +105,10 @@ pub fn submission_difference(
         (
             existing_context_management != requested_context_management,
             "context_management",
+        ),
+        (
+            existing_structured_output != requested_structured_output,
+            "structured_output",
         ),
     ]
     .into_iter()
@@ -166,6 +172,10 @@ struct SubmissionIdentityDigestV1 {
     inherit_frozen: std::collections::BTreeSet<broca_protocol::request::InheritedParam>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_key: Option<String>,
+    /// Absent when the send carried no `structured_output`, so every digest stored before the
+    /// field existed, and every send without one, is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structured_output: Option<String>,
 }
 
 fn digest_json(value: serde_json::Value) -> String {
@@ -226,6 +236,7 @@ fn identity_digest_v1(
         stop_when,
         context_management,
         inherit_frozen,
+        structured_output,
     } = request;
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
@@ -259,6 +270,9 @@ fn identity_digest_v1(
             .then(|| delivery.as_str().to_owned()),
         inherit_frozen: inherit_frozen.clone(),
         conversation_key: conversation_key.map(|key| digest_json(serde_json::json!(key))),
+        structured_output: structured_output
+            .as_ref()
+            .map(|value| digest_json(serde_json::json!(value))),
     }
 }
 
@@ -328,6 +342,10 @@ pub fn send_identity_difference_with_conversation_key(
         (
             stored.context_management != requested.context_management,
             "context_management",
+        ),
+        (
+            stored.structured_output != requested.structured_output,
+            "structured_output",
         ),
     ]
     .into_iter()
@@ -871,6 +889,7 @@ impl AdmissionCheckpointV1 {
             // An informational record, skipped exactly like `Unknown`.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }
+            | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
         if let Some(episode) = self.last_episode.as_mut() {
@@ -1219,6 +1238,7 @@ mod tests {
             stop_when: Vec::new(),
             context_management: None,
             inherit_frozen: Default::default(),
+            structured_output: None,
         }
     }
 

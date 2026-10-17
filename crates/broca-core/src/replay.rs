@@ -1770,6 +1770,7 @@ fn replay_seeded_with_compaction<'a>(
             // These metadata records are omitted from prompt construction: they contain no messages.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }
+            | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
         message_runs.truncate(prompt.len());
@@ -2041,6 +2042,10 @@ pub fn latest_projection_boundary(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
+    /// On an ended run admitted with structured output: what it produced, as `run.result` and
+    /// `run.status` report it. Read from the run's durable result record when it completed;
+    /// derived as `absent` from its frozen settings when it ended any other way.
+    pub structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     /// Only the live actor fills this; WAL reconciliation never guesses an in-flight step.
     pub live_step: Option<broca_protocol::provider::InFlightStep>,
     pub state: crate::RunIndexState,
@@ -2085,6 +2090,9 @@ pub fn reconcile_run_state<'a>(
     let mut auth_selection = None;
     let mut title: Option<String> = None;
     let mut budget_detail = None;
+    // The structured-output settings the target run froze, and the result it recorded.
+    let mut frozen_structured_output = None;
+    let mut structured_output_result = None;
     // A queued send's submission id is `sub-<run id>` (see the coordinator's `queue_submission`),
     // so its `Queued` record can name this run before any `RunStarted` does.
     let queued_submission = format!("sub-{run_id}");
@@ -2100,6 +2108,10 @@ pub fn reconcile_run_state<'a>(
                 if rid.0 == run_id {
                     auth_selection = config.auth_selection.clone();
                     title = started_title.clone();
+                    frozen_structured_output =
+                        broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
+                            Some(&config.frozen_render_config),
+                        );
                 }
                 active_run = Some(rid.0.clone());
                 budget_detail = None;
@@ -2114,6 +2126,7 @@ pub fn reconcile_run_state<'a>(
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
                         budget_detail: None,
+                        structured_output: None,
                         live_step: None,
                         title: None,
                         state: RunIndexState::Active,
@@ -2129,6 +2142,10 @@ pub fn reconcile_run_state<'a>(
                 }
             }
             WalRecord::InputTokenBudgetExhausted { detail } => budget_detail = Some(detail.clone()),
+            WalRecord::StructuredOutputResult {
+                run_id: rid,
+                result,
+            } if rid.0 == run_id => structured_output_result = Some(result.clone()),
             WalRecord::ModelStepFinished {
                 usage,
                 finish_reason,
@@ -2185,8 +2202,22 @@ pub fn reconcile_run_state<'a>(
                             RunIndexState::TransformUnavailable
                         }
                     };
+                    // A completed run recorded its result in the commit that ended it. Any
+                    // other end produced no value, which the frozen settings report as absent.
+                    let structured_output = structured_output_result.clone().or_else(|| {
+                        frozen_structured_output.as_ref().map(|frozen| {
+                            broca_protocol::structured_output::result(
+                                frozen,
+                                false,
+                                None,
+                                None,
+                                Vec::new(),
+                            )
+                        })
+                    });
                     found = Some(ReconciledRunState {
                         budget_detail: budget_detail.clone(),
+                        structured_output,
                         live_step: None,
                         title: None,
                         state,
@@ -2210,6 +2241,7 @@ pub fn reconcile_run_state<'a>(
             } if rid.0 == run_id => {
                 found = Some(ReconciledRunState {
                     budget_detail: None,
+                    structured_output: None,
                     live_step: None,
                     title: None,
                     state: RunIndexState::Paused,
@@ -2236,6 +2268,7 @@ pub fn reconcile_run_state<'a>(
             } if failure.run_id.0 == run_id => {
                 found = Some(ReconciledRunState {
                     budget_detail: None,
+                    structured_output: None,
                     live_step: None,
                     title: None,
                     state: RunIndexState::Error,
@@ -2255,6 +2288,7 @@ pub fn reconcile_run_state<'a>(
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
             budget_detail: None,
+            structured_output: None,
             live_step: None,
             state: RunIndexState::Interrupted,
             undelivered_steers: Some(pending_steer_ids.clone()),

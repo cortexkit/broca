@@ -118,6 +118,7 @@ mod gated {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         };
         let resolved = if method == AuthMethod::Chatgpt {
             resolve_chatgpt_pause_provider_with_client(

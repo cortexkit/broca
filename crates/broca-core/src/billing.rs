@@ -816,6 +816,7 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
+        | WalRecord::StructuredOutputResult { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => None,
     }
 }

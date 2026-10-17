@@ -69,6 +69,7 @@ mod session_client;
 mod single_turn_module_e2e;
 mod state_root_isolation;
 mod step_transforms;
+mod structured_output;
 mod transform_route_removed;
 mod wal_known_features;
 mod wire;

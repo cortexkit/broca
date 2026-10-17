@@ -363,6 +363,11 @@ pub struct Capabilities {
     pub tool_call: CapabilityFlag,
     #[serde(default, skip_serializing_if = "CapabilityFlag::is_absent")]
     pub interleaved: CapabilityFlag,
+    /// Fusiform's `capability.structured_output`: whether the route supports schema-constrained
+    /// output. Absent and `null` both mean the catalog does not say, which a structured-output
+    /// run reports as `best_effort` with `catalog_unknown`.
+    #[serde(default, skip_serializing_if = "CapabilityFlag::is_absent")]
+    pub structured_output: CapabilityFlag,
 }
 
 /// Token limits (mirrors the catalog).
@@ -453,14 +458,10 @@ pub struct CostTier {
 }
 
 /// Local overlay fields (ours, not from the catalog). Reserved for a future
-/// routing layer; intentionally minimal for now.
+/// routing layer; intentionally empty for now. Structured-output support is a catalog
+/// capability (`Capabilities::structured_output`), not an overlay field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Overlay {
-    /// Whether the model supports structured output (the catalog doesn't model
-    /// this). `None` = unknown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structured_output: Option<bool>,
-}
+pub struct Overlay {}
 
 #[cfg(test)]
 mod tests {

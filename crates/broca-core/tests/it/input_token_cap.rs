@@ -77,6 +77,7 @@ impl Rig {
             variant: None,
             service_tier: None,
             inherit_frozen_cache: false,
+            structured_output: None,
         }
     }
     async fn send(

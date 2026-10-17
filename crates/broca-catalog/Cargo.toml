@@ -20,6 +20,9 @@ bundled-catalog = []
 live = ["broca-provider/live", "dep:broca-core", "dep:base64"]
 
 [dependencies]
+# Structured-output types: a fresh episode's request, and the decision frozen from it (how the
+# schema is sent and what enforcement is reported) using the model's catalog support.
+broca-protocol = { path = "../broca-protocol" }
 broca-owner-only.workspace = true
 # Sits ABOVE the provider framework: produces the specs the framework consumes.
 broca-provider = { path = "../broca-provider" }

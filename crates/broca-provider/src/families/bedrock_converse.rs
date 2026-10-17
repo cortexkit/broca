@@ -128,6 +128,10 @@ impl WireFamily for BedrockConverse {
 // ───────────────────────── request body ─────────────────────────
 
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    // A run with structured output adds its submit tool or schema instructions here; a run
+    // without renders from `opts` unchanged.
+    let prepared = crate::structured_output::prepare(frozen, opts);
+    let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let marker_policy = bedrock_marker_policy(frozen);

@@ -106,6 +106,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
         variant: Some("high".into()),
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 
@@ -387,6 +388,7 @@ fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 

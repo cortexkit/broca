@@ -419,6 +419,7 @@ pub fn resolve_frozen(
         variant: None,
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
+        structured_output: None,
     })
 }
 
@@ -474,6 +475,7 @@ fn frozen_from_family_defaults(
         variant: None,
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
+        structured_output: None,
     }
 }
 

@@ -72,6 +72,7 @@ mod responses_cache_write_usage;
 mod service_tier_used;
 #[cfg(feature = "live")]
 mod stream_errors_e2e;
+mod structured_output_render;
 mod synthetic_capture_replay;
 #[cfg(feature = "live")]
 mod tool_arg_errors_e2e;

@@ -342,6 +342,7 @@ async fn fixture<F: WireFamily + 'static>(
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let wal = FileWalStore::new(root.join("wal"));
     let (tx, mut rx) = mpsc::channel(4096);

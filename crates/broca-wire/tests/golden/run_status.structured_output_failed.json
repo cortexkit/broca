@@ -1,0 +1,1 @@
+{"state":"completed","final_step_finish_reason":"stop","undelivered_steers":[],"usage":{},"retries_used":0,"structured_output":{"mode":"submit_tool","enforcement":"enforced","validation":"failed","value":{"answer":42},"errors":["#/answer: 42 is not of type \"string\""],"skipped_siblings":[{"tool_call_id":"sibling-1","tool":"work"}]}}

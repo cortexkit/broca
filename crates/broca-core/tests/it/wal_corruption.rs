@@ -167,6 +167,7 @@ fn request(run: &str, dir: &Path) -> RunRequest {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 

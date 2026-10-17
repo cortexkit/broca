@@ -489,6 +489,11 @@ pub struct SubmissionRequest {
     /// other send, which costs no bytes on a queued record.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub inherit_frozen: std::collections::BTreeSet<InheritedParam>,
+    /// The schema-shaped output this run asks for, exactly as the send carried it. Per run:
+    /// a send without it starts a run with none, and a steer never takes it from the session.
+    /// Absent costs no bytes on a queued record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<crate::structured_output::StructuredOutput>,
 }
 
 /// A runner parameter a send may leave to the session's frozen value; see
@@ -715,6 +720,7 @@ mod tests {
             variant: None,
             service_tier: None,
             inherit_frozen: Default::default(),
+            structured_output: None,
         };
 
         let encoded = serde_json::to_value(&request).unwrap();
@@ -795,6 +801,7 @@ mod budget_compat_tests {
             stop_when: Vec::new(),
             context_management: None,
             inherit_frozen: Default::default(),
+            structured_output: None,
         };
         let encoded = serde_json::to_value(&request).unwrap();
         assert!(encoded.get("budget").is_none());

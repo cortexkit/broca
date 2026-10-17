@@ -3296,7 +3296,18 @@ mod executor {
                     .in_run_refresh
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
+                // Structured output is per run: only a fresh episode decides it from its own
+                // send. A resume re-applies the decision frozen in the episode (below).
+                structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
             };
+            let restored_structured_output = prior_run
+                .as_ref()
+                .filter(|_| !fresh_episode)
+                .and_then(|prior| {
+                    broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
+                        Some(&prior.config.frozen_render_config),
+                    )
+                });
             let restored_variant = prior_run
                 .as_ref()
                 .filter(|_| !fresh_episode)
@@ -3370,6 +3381,8 @@ mod executor {
                         .as_ref()
                         .filter(|_| !fresh_episode)
                         .map(|prior| frozen_responses_tools_non_strict(&prior.config)),
+                    // Restored as recorded, never re-decided from a catalog that may have moved.
+                    structured_output: restored_structured_output.as_ref(),
                 },
             ) {
                 Ok(r) => r,
@@ -4137,6 +4150,7 @@ mod executor {
                     variant: None,
                     service_tier: None,
                     secret_refresher: None,
+                    structured_output: None,
                     frozen_account_ref: None,
                     clock: None,
                 },
@@ -4291,6 +4305,7 @@ mod executor {
                 variant: None,
                 service_tier: None,
                 secret_refresher: None,
+                structured_output: None,
                 frozen_account_ref: None,
                 clock: None,
             };

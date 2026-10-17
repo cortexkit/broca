@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use broca_protocol::structured_output::FrozenStructuredOutput;
 use broca_protocol::BindIdentity;
 use broca_protocol::{
     caller::{ControlUnit, PauseReason, RunFinishReason, SharedProviderError},
@@ -169,6 +170,10 @@ pub struct RunRequest {
     /// session's earlier requests and keep hitting the provider's cache. Every other runner
     /// parameter such a send omits is already filled into this request.
     pub inherit_frozen_cache: bool,
+    /// The schema-shaped output this run asks for. The module resolves it into the frozen
+    /// render config when it resolves the provider; core reads the frozen value, never this
+    /// request field, once the run has started.
+    pub structured_output: Option<broca_protocol::structured_output::StructuredOutput>,
 }
 
 impl RunRequest {
@@ -207,6 +212,7 @@ impl RunRequest {
             } else {
                 Default::default()
             },
+            structured_output: self.structured_output.clone(),
         }
     }
 
@@ -257,6 +263,7 @@ impl RunRequest {
             inherit_frozen_cache: req
                 .inherit_frozen
                 .contains(&broca_protocol::request::InheritedParam::Cache),
+            structured_output: req.structured_output,
         }
     }
 }
@@ -3240,6 +3247,7 @@ where
                         prior_last_step_finish_reason,
                         &[],
                         control.emit_control_payloads,
+                        None,
                     )
                     .await;
                 }
@@ -3263,6 +3271,58 @@ where
                     projector.enqueue_terminal(seq);
                 }
                 return Ok(summary);
+            }
+        }
+        // A durable model step that called `submit_result` may survive a cut before the barrier
+        // that ends its run. Its calls must never be dispatched on recovery: end the run here
+        // exactly as the live path would have.
+        if !prior.run_finished_durable {
+            let frozen = FrozenStructuredOutput::from_frozen_render_config(Some(
+                &provider.render_config_blob(),
+            ));
+            if let (
+                Some(frozen),
+                ReplayResolution::Resume {
+                    pending: Some(pending),
+                },
+            ) = (frozen.as_ref(), &prior.resolution)
+            {
+                let existing: Vec<_> = pending
+                    .existing
+                    .iter()
+                    .map(|(_, result)| result.clone())
+                    .collect();
+                if let Some(submit) = counted_submit(frozen, &pending.assistant, &existing) {
+                    let calls: Vec<_> = pending.assistant.tool_calls().cloned().collect();
+                    writer.record(resume_sealing);
+                    writer.record(submitted_result_record(
+                        &resolved_run_id,
+                        frozen,
+                        &submit,
+                        &calls,
+                    ));
+                    return finalize_hard_stop(
+                        control,
+                        &resolved_run_id,
+                        pending.step_id,
+                        &calls,
+                        &existing,
+                        pending.batch_id.is_some(),
+                        DispatchOutcome::MaxSteps,
+                        RunFinishReason::Completed,
+                        writer,
+                        projector,
+                        out,
+                        prior.completed_steps,
+                        prior.usage,
+                        prior.retries_used,
+                        prior_last_step_finish_reason,
+                        &[],
+                        control.emit_control_payloads,
+                        Some(&submit.tool_call_id),
+                    )
+                    .await;
+                }
             }
         }
         // A crash cannot undo an acknowledged cancel. Repair sent calls without dispatching
@@ -3998,6 +4058,17 @@ where
         declared_markers: Vec::new(),
     });
 
+    // The structured output this run froze at admission, read back from the provider's frozen
+    // render config so a resumed run decides exactly as the run that started.
+    let structured_output =
+        FrozenStructuredOutput::from_frozen_render_config(Some(&provider.render_config_blob()));
+    // The joined text of the final message of a `final_text` run that ended because the model
+    // answered without tools. `None` for every other end, which reports the result absent.
+    // Only a `final_text` run copies the text, so other runs keep a single message graph.
+    let wants_final_text = structured_output
+        .as_ref()
+        .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText);
+    let mut natural_final_text: Option<String> = None;
     let reason = loop {
         input_budget.limit = writer.input_token_limit().or(input_budget.limit);
         // A session budget is independent of episode counters and reminder inheritance.
@@ -4546,6 +4617,9 @@ where
                             })
                             .unwrap_or(RunFinishReason::Completed)
                     };
+                    if no_tool_reason == RunFinishReason::Completed && wants_final_text {
+                        natural_final_text = Some(joined_text(&message));
+                    }
                     let message = Arc::new(message);
                     record_model_hook(
                         control.shutdown_seal.as_ref(),
@@ -4726,10 +4800,48 @@ where
                     last_step_finish_reason,
                     &[],
                     control.emit_control_payloads,
+                    None,
                 )
                 .await;
             }
             break RunFinishReason::BudgetExhausted;
+        }
+        // A `submit_tool` run ends at the step that calls `submit_result`: none of that step's
+        // calls is dispatched. The counted submit gets the runner's own result, every sibling a
+        // never-executed `skipped_after_submit` result, and the run's structured result is
+        // written with them and the terminal, in one barrier.
+        if let Some((frozen, submit)) = structured_output.as_ref().and_then(|frozen| {
+            counted_submit(frozen, &assembled, &rejected_tool_calls).map(|submit| (frozen, submit))
+        }) {
+            let pending: Vec<ToolCall> = assembled.tool_calls().cloned().collect();
+            writer.record(submitted_result_record(
+                &resolved_run_id,
+                frozen,
+                &submit,
+                &pending,
+            ));
+            control.close_steers();
+            return finalize_hard_stop(
+                control,
+                &resolved_run_id,
+                step_id,
+                &pending,
+                &rejected_tool_calls,
+                cut_resume.is_some(),
+                DispatchOutcome::MaxSteps,
+                RunFinishReason::Completed,
+                writer,
+                projector,
+                out,
+                completed_steps,
+                total_usage,
+                total_retries_used,
+                last_step_finish_reason,
+                &[],
+                control.emit_control_payloads,
+                Some(&submit.tool_call_id),
+            )
+            .await;
         }
         if finalize_turn {
             if !rejected_tool_calls.is_empty() {
@@ -4752,11 +4864,15 @@ where
                     last_step_finish_reason,
                     &[],
                     control.emit_control_payloads,
+                    None,
                 )
                 .await;
             }
             // The budget grants exactly this one tool-disabled turn. Its answer is already in the
             // WAL record; the local prompt is not read again after this terminal branch.
+            if wants_final_text && assembled.tool_calls().next().is_none() {
+                natural_final_text = Some(joined_text(&assembled));
+            }
             break RunFinishReason::Completed;
         }
         // Firings caused by this step are decided once. Every branch below either commits
@@ -4824,6 +4940,7 @@ where
                     last_step_finish_reason,
                     &budget_firings,
                     control.emit_control_payloads,
+                    None,
                 )
                 .await;
             }
@@ -4846,6 +4963,9 @@ where
                     ordinal: None,
                 });
                 continue;
+            }
+            if wants_final_text {
+                natural_final_text = Some(joined_text(&assembled));
             }
             break RunFinishReason::Completed;
         }
@@ -4990,6 +5110,21 @@ where
         }
     };
 
+    // A completed run admitted with structured output records what it produced in the same
+    // barrier as its terminal. A run that submitted returned above; reaching here, a
+    // `submit_tool` run completed without calling `submit_result`.
+    if let (Some(frozen), RunFinishReason::Completed) = (&structured_output, reason) {
+        writer.record(WalRecord::StructuredOutputResult {
+            run_id: resolved_run_id.clone(),
+            result: broca_protocol::structured_output::result(
+                frozen,
+                true,
+                None,
+                natural_final_text.as_deref(),
+                Vec::new(),
+            ),
+        });
+    }
     control.close_steers();
     let (summary, last_fsynced_seq) = finish_run(
         writer,
@@ -7205,6 +7340,7 @@ async fn finalize_hard_stop(
     final_step_finish_reason: Option<FinishReason>,
     budget_firings: &[BudgetFiring],
     emit_control_payloads: bool,
+    submitted: Option<&ToolCallId>,
 ) -> Result<RunSummary, RunError> {
     let batch_id = BatchId(format!("{}-b{}", resolved_run_id.0, step_id.0));
     let call_ids: Vec<ToolCallId> = pending.iter().map(|c| c.tool_call_id.clone()).collect();
@@ -7223,7 +7359,21 @@ async fn finalize_hard_stop(
                 .find(|result| result.tool_call_id == c.tool_call_id)
                 .cloned()
                 .unwrap_or_else(|| {
-                    if reason == RunFinishReason::BudgetExhausted {
+                    if submitted == Some(&c.tool_call_id) {
+                        ToolResult {
+                            tool_call_id: c.tool_call_id.clone(),
+                            output: ToolOutput::Text {
+                                text: broca_protocol::structured_output::SUBMIT_RESULT_RECORDED
+                                    .into(),
+                            },
+                            is_error: false,
+                        }
+                    } else if submitted.is_some() {
+                        error_result(
+                            c,
+                            broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT_MESSAGE,
+                        )
+                    } else if reason == RunFinishReason::BudgetExhausted {
                         error_result(
                             c,
                             "budget_exhausted: tool not executed; input-token cap stopped dispatch",
@@ -7243,19 +7393,24 @@ async fn finalize_hard_stop(
         {
             continue;
         }
+        let is_rejected = rejected
+            .iter()
+            .any(|result| result.tool_call_id == r.tool_call_id);
         writer.record(WalRecord::ToolResult {
             hooks: None,
             batch_id: batch_id.clone(),
             result: r.clone().into(),
-            outcome: if rejected
-                .iter()
-                .any(|result| result.tool_call_id == r.tool_call_id)
-            {
+            // The counted submit is the runner's own completed call; nothing else here ran.
+            outcome: if is_rejected || submitted == Some(&r.tool_call_id) {
                 DispatchOutcome::Completed
             } else {
                 outcome
             },
-            reason: if reason == RunFinishReason::BudgetExhausted {
+            reason: if submitted == Some(&r.tool_call_id) {
+                None
+            } else if submitted.is_some() && !is_rejected {
+                Some(broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT.into())
+            } else if reason == RunFinishReason::BudgetExhausted {
                 Some("budget_exhausted".into())
             } else {
                 rejected
@@ -7330,6 +7485,72 @@ async fn finalize_hard_stop(
         retries_used,
         final_step_finish_reason,
     })
+}
+
+/// The text parts of `message` joined exactly as `run.result` joins them: in order, with
+/// nothing inserted.
+fn joined_text(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(cortexkit_role_llm_runner::run::TEXT_SEPARATOR)
+}
+
+/// The `submit_result` call that ends a `submit_tool` run at this step: the first one the
+/// model emitted whose arguments parsed. `None` for a `final_text` run or a step without one.
+fn counted_submit(
+    frozen: &FrozenStructuredOutput,
+    message: &AssistantMessage,
+    rejected: &[ToolResult],
+) -> Option<ToolCall> {
+    if frozen.mode != broca_protocol::structured_output::Mode::SubmitTool {
+        return None;
+    }
+    message
+        .tool_calls()
+        .find(|call| {
+            call.tool_name == broca_protocol::structured_output::SUBMIT_RESULT_TOOL
+                && !rejected
+                    .iter()
+                    .any(|result| result.tool_call_id == call.tool_call_id)
+        })
+        .cloned()
+}
+
+/// The structured result of a run that ended by calling `submit_result`: the counted call's
+/// input validated against the frozen schema, and every other call of the step, in the order
+/// the model emitted them, listed as a skipped sibling.
+fn submitted_result_record(
+    run_id: &RunId,
+    frozen: &FrozenStructuredOutput,
+    submit: &ToolCall,
+    step_calls: &[ToolCall],
+) -> WalRecord {
+    let skipped = step_calls
+        .iter()
+        .filter(|call| call.tool_call_id != submit.tool_call_id)
+        .map(|call| {
+            broca_protocol::structured_output::SkippedSibling::new(
+                call.tool_call_id.0.clone(),
+                call.tool_name.clone(),
+            )
+        })
+        .collect();
+    WalRecord::StructuredOutputResult {
+        run_id: run_id.clone(),
+        result: broca_protocol::structured_output::result(
+            frozen,
+            true,
+            Some(&submit.input),
+            None,
+            skipped,
+        ),
+    }
 }
 
 /// The synthetic hard-stop terminal for one pending call.
@@ -7801,6 +8022,7 @@ mod tests {
             submission_id: None,
             context_management: None,
             inherit_frozen_cache: false,
+            structured_output: None,
         };
         // This is the cloning filter that retain replaces; comparing complete Tool values pins
         // both policy membership and the provider-visible request order.

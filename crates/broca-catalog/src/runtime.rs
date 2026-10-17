@@ -41,6 +41,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "capability.reasoning",
     "capability.reasoning_options",
     "capability.tool_call",
+    "capability.structured_output",
     "rate.input",
     "rate.output",
     "rate.cache_read",
@@ -149,7 +150,6 @@ struct DraftServingProvider {
 #[derive(Clone)]
 struct ServingModel {
     display_name: String,
-    structured_output: Option<bool>,
     cost: CostSchedule,
     context_limit: Option<u64>,
     /// The model's published maximum output, `None` when fusiform serves null (its spelling of
@@ -160,6 +160,10 @@ struct ServingModel {
     attachment: CapabilityFlag,
     reasoning: CapabilityFlag,
     tool_call: CapabilityFlag,
+    /// `capability.structured_output`. Unlike the three flags above, fusiform omits it on rows
+    /// whose upstream does not state it, and absence reads as unknown rather than refusing the
+    /// row.
+    structured_output: CapabilityFlag,
     /// `capability.reasoning_options`: null, `[]` and a populated array stay distinct. A catalog
     /// from before fusiform served the fact reads as unstated, which defines no variant.
     reasoning_options: ReasoningOptions,
@@ -174,13 +178,13 @@ impl Default for ServingModel {
     fn default() -> Self {
         Self {
             display_name: String::new(),
-            structured_output: None,
             cost: CostSchedule::default(),
             context_limit: None,
             output_limit: None,
             attachment: CapabilityFlag::Absent,
             reasoning: CapabilityFlag::Absent,
             tool_call: CapabilityFlag::Absent,
+            structured_output: CapabilityFlag::Absent,
             reasoning_options: ReasoningOptions::Unstated,
             priced_modes: Vec::new(),
             wire_family: None,
@@ -196,13 +200,13 @@ impl ServingModel {
     ) -> Self {
         Self {
             display_name: model.display_name.clone(),
-            structured_output: model.overlay.structured_output,
             cost: model.cost.clone(),
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
             attachment: model.capabilities.attachment,
             reasoning: model.capabilities.reasoning,
             tool_call: model.capabilities.tool_call,
+            structured_output: model.capabilities.structured_output,
             reasoning_options: model.reasoning_options.clone(),
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
             // that needs one.
@@ -222,6 +226,7 @@ impl ServingModel {
                 temperature: CapabilityFlag::Absent,
                 tool_call: self.tool_call,
                 interleaved: CapabilityFlag::Absent,
+                structured_output: self.structured_output,
             },
             limits: Limits {
                 context: self.context_limit,
@@ -232,9 +237,7 @@ impl ServingModel {
             reasoning_options: self.reasoning_options.clone(),
             release_date: None,
             status: None,
-            overlay: Overlay {
-                structured_output: self.structured_output,
-            },
+            overlay: Overlay::default(),
             raw: Value::Null,
         }
     }
@@ -402,13 +405,17 @@ impl ServingCatalog {
                     } else {
                         let mut model = ServingModel {
                             display_name: String::new(),
-                            structured_output: None,
                             cost: warm_cost_fact(facts),
                             context_limit: context_fact(identity, facts)?,
                             output_limit: output_fact(identity, facts)?,
                             attachment: capability_fact(identity, facts, "capability.attachment")?,
                             reasoning: capability_fact(identity, facts, "capability.reasoning")?,
                             tool_call: capability_fact(identity, facts, "capability.tool_call")?,
+                            structured_output: optional_capability_fact(
+                                identity,
+                                facts,
+                                "capability.structured_output",
+                            )?,
                             reasoning_options: reasoning_options_fact(identity, facts)?,
                             priced_modes: priced_modes_fact(identity, facts)?,
                             wire_family: None,
@@ -727,8 +734,6 @@ struct RuntimeModelOverlay {
     #[serde(default)]
     name: Patch<Option<String>>,
     #[serde(default)]
-    structured_output: Patch<Option<bool>>,
-    #[serde(default)]
     cost: Patch<Option<RuntimeCostOverlay>>,
     #[serde(default)]
     attachment: Patch<CapabilityFlag>,
@@ -736,6 +741,11 @@ struct RuntimeModelOverlay {
     reasoning: Patch<CapabilityFlag>,
     #[serde(default)]
     tool_call: Patch<CapabilityFlag>,
+    /// The overlay spells this capability as its other capability patches are spelled, the
+    /// models.dev way. It sets `capability.structured_output` for a model the overlay adds or
+    /// must correct; fusiform's fact is used for every other row.
+    #[serde(default)]
+    structured_output: Patch<CapabilityFlag>,
     #[serde(default)]
     wire_family: Patch<Option<WireFamilyId>>,
     #[serde(default)]
@@ -746,9 +756,6 @@ impl RuntimeModelOverlay {
     fn apply(&self, model: &mut ServingModel) {
         if let Patch::Set(name) = &self.name {
             model.display_name = name.clone().unwrap_or_default();
-        }
-        if let Patch::Set(value) = self.structured_output {
-            model.structured_output = value;
         }
         if let Patch::Set(cost) = &self.cost {
             let value = cost.as_ref().map(|cost| serde_json::json!(cost));
@@ -762,6 +769,9 @@ impl RuntimeModelOverlay {
         }
         if let Patch::Set(value) = self.tool_call {
             model.tool_call = value;
+        }
+        if let Patch::Set(value) = self.structured_output {
+            model.structured_output = value;
         }
         if let Patch::Set(value) = self.wire_family {
             model.wire_family = value;
@@ -883,6 +893,21 @@ fn capability_fact(
             fact: fact.to_string(),
             reason: "fact is absent".to_string(),
         }),
+    }
+}
+
+/// A capability fact fusiform may omit: absence reads as [`CapabilityFlag::Absent`] (the
+/// catalog does not say), never as a refusal of the row. A present value must still be a
+/// boolean or null.
+fn optional_capability_fact(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+    fact: &'static str,
+) -> Result<CapabilityFlag, CatalogError> {
+    if facts.contains_key(fact) {
+        capability_fact(identity, facts, fact)
+    } else {
+        Ok(CapabilityFlag::Absent)
     }
 }
 
@@ -1619,6 +1644,10 @@ fn fusiform_models_to_base(
             }
             model.insert(field.to_string(), value.clone());
         }
+        // Optional, unlike the flags above: absent means the catalog does not say.
+        if let Some(value) = facts.get("capability.structured_output") {
+            model.insert("structured_output".to_string(), value.clone());
+        }
         let context = facts
             .get("limit.context")
             .ok_or_else(|| CatalogError::FusiformFact {
@@ -1893,6 +1922,51 @@ mod tests {
             withheld: Vec::new(),
             uncertain: Vec::new(),
         }
+    }
+
+    /// Fusiform's `capability.structured_output` maps like the other capability facts, except
+    /// that an omitted fact reads as the catalog not saying rather than refusing the row.
+    #[test]
+    fn structured_output_fact_maps_to_a_three_state_capability() {
+        for (fact, expected) in [
+            (Some(serde_json::json!(true)), CapabilityFlag::Known(true)),
+            (Some(serde_json::json!(false)), CapabilityFlag::Known(false)),
+            (Some(serde_json::Value::Null), CapabilityFlag::Unknown),
+            (None, CapabilityFlag::Absent),
+        ] {
+            let mut response = response(10);
+            let facts = response
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap();
+            if let Some(fact) = fact.clone() {
+                facts.insert("capability.structured_output".into(), fact);
+            }
+            let (catalog, _) = ServingCatalog::from_fusiform_with_overlay(
+                &response.models,
+                RuntimeOverlay::default(),
+            )
+            .unwrap();
+            let (_, model) = catalog
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap();
+            assert_eq!(model.capabilities.structured_output, expected, "{fact:?}");
+        }
+        let mut response = response(10);
+        response
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert(
+                "capability.structured_output".into(),
+                serde_json::json!("yes"),
+            );
+        assert!(ServingCatalog::from_fusiform_with_overlay(
+            &response.models,
+            RuntimeOverlay::default()
+        )
+        .is_err());
+        assert!(FUSIFORM_FACT_PREFIXES.contains(&"capability.structured_output"));
     }
 
     #[test]
@@ -2265,7 +2339,10 @@ mod tests {
             .unwrap();
         assert_eq!(model.cost, *cost);
         assert_eq!(model.display_name, "Authored name");
-        assert_eq!(model.overlay.structured_output, Some(true));
+        assert_eq!(
+            model.capabilities.structured_output,
+            CapabilityFlag::Known(true)
+        );
     }
 
     #[test]

@@ -188,6 +188,9 @@ struct Shared {
     /// Live snapshots of runs that stayed non-terminal for [`evidence::STALL_POLLS`] polls in a
     /// row, taken while the daemon still answers. Printed only when a suite case fails.
     stalls: Mutex<Vec<String>>,
+    /// What each structured-output session's scripted route reports about schema-constrained
+    /// output, as a catalog row would: `Some(true)`, `Some(false)` or `None` (not stated).
+    structured_output_support: Mutex<HashMap<String, Option<bool>>>,
 }
 
 /// One held call's two edges: the tool provider has received it, and the suite has released it.
@@ -256,6 +259,89 @@ async fn start_model(shared: Arc<Shared>) -> String {
         }
     });
     format!("http://{address}/v1")
+}
+
+/// The catalog provider of the structured-output sessions' models. Its overlay pins the OpenAI
+/// Chat wire family, so their requests reach the scripted model unchanged.
+const STRUCTURED_OUTPUT_PROVIDER: &str = "xai";
+
+/// The catalog model a structured-output session resolves against, by what its route reports.
+fn structured_output_model(support: Option<bool>) -> &'static str {
+    match support {
+        Some(true) => "so-supported",
+        Some(false) => "so-unsupported",
+        None => "so-unstated",
+    }
+}
+
+/// Write the catalog the structured-output sessions resolve against into broca's state root,
+/// as its last-known-good fusiform answer: one row per route support, differing only in
+/// `capability.structured_output` (true, false, and not stated). broca reaches these rows at
+/// the scripted model's address, because `BROCA_PROVIDER_BASE_URL` overrides the endpoint of
+/// a catalog model. Kept across restarts of the same root.
+fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
+    let dir = state_root.join("catalog");
+    let path = dir.join("fusiform-lkg.json");
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    let row = |support: Option<bool>| {
+        let mut row = json!({
+            "capability.attachment": false,
+            "capability.reasoning": false,
+            "capability.tool_call": true,
+            "existence": "present",
+            "limit.context": 128000
+        });
+        if let Some(support) = support {
+            row["capability.structured_output"] = json!(support);
+        }
+        row
+    };
+    let mut models = Map::new();
+    for support in [Some(true), Some(false), None] {
+        models.insert(
+            format!(
+                "{STRUCTURED_OUTPUT_PROVIDER}/{}",
+                structured_output_model(support)
+            ),
+            row(support),
+        );
+    }
+    let lkg = json!({
+        "catalog_version": 1,
+        "models": models,
+        "resolved_at_ms": 1,
+        "source": "models.dev"
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&lkg).unwrap())
+}
+
+/// What one OpenAI Chat request carried, as the scripted model received it: the offered tool
+/// names in order, the final-text schema (`response_format.json_schema.schema`), and the
+/// `submit_result` tool's parameters.
+fn observe_model_request(
+    request: &Value,
+) -> cortexkit_role_llm_runner_conformance::ModelRequestObservation {
+    let tools = request["tools"].as_array().cloned().unwrap_or_default();
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    let mut observation =
+        cortexkit_role_llm_runner_conformance::ModelRequestObservation::new(names);
+    if request["response_format"]["type"] == "json_schema" {
+        observation = observation
+            .with_final_text_schema(request["response_format"]["json_schema"]["schema"].clone());
+    }
+    if let Some(submit) = tools.iter().find(|tool| {
+        tool["function"]["name"] == broca_protocol::structured_output::SUBMIT_RESULT_TOOL
+    }) {
+        observation =
+            observation.with_submit_result_schema(submit["function"]["parameters"].clone());
+    }
+    observation
 }
 
 async fn serve_model_request(
@@ -715,6 +801,7 @@ impl BrocaSubject {
         let home = root.join("home");
         std::fs::create_dir_all(&home).map_err(|e| fail(e.to_string()))?;
         let state_root = root.join("broca-state");
+        seed_structured_output_catalog(&state_root).map_err(|e| fail(e.to_string()))?;
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
@@ -1403,6 +1490,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::TranscriptReads,
             Capability::RunOps,
             Capability::InputTokenCap,
+            Capability::StructuredOutput,
             Capability::RunStatus,
             Capability::RunCancel,
             Capability::Retract,
@@ -1499,6 +1587,83 @@ impl LlmRunnerSubject for BrocaSubject {
         TOOL_MODULE.into()
     }
 
+    fn send_fields_with_tools(
+        &self,
+        session: &str,
+        first: bool,
+        tools: &[&str],
+    ) -> Option<Map<String, Value>> {
+        let mut fields = self.send_fields(session, first);
+        fields.insert(
+            "tools".into(),
+            Value::Array(
+                tools
+                    .iter()
+                    .map(|name| {
+                        json!({
+                            "name": name,
+                            "description": "Answers each call with its scripted result.",
+                            "input_schema": {"type": "object"},
+                            "module": TOOL_MODULE,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        // The session's route support picks the catalog row its model resolves against: the
+        // rows `seed_structured_output_catalog` writes under the `xai` provider, whose wire
+        // family is OpenAI Chat, the protocol the scripted model speaks.
+        if let Some(support) = self
+            .shared
+            .structured_output_support
+            .lock()
+            .unwrap()
+            .get(session)
+        {
+            fields.insert(
+                "model".into(),
+                json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": structured_output_model(*support)}),
+            );
+        }
+        Some(fields)
+    }
+
+    async fn set_structured_output_support(
+        &self,
+        session: &str,
+        supported: Option<bool>,
+    ) -> Result<(), HarnessError> {
+        self.shared
+            .structured_output_support
+            .lock()
+            .unwrap()
+            .insert(session.to_owned(), supported);
+        Ok(())
+    }
+
+    async fn model_requests(
+        &self,
+        session: &str,
+    ) -> Result<Vec<cortexkit_role_llm_runner_conformance::ModelRequestObservation>, HarnessError>
+    {
+        let bodies = self
+            .shared
+            .raw_bodies
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .unwrap_or_default();
+        bodies
+            .iter()
+            .map(|body| {
+                let request: Value = serde_json::from_slice(body)
+                    .map_err(|e| HarnessError::new(format!("a model request is not JSON: {e}")))?;
+                Ok(observe_model_request(&request))
+            })
+            .collect()
+    }
+
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
         let mut results = self.shared.results.lock().unwrap();
         let mut holds = self.shared.holds.lock().unwrap();
@@ -1550,6 +1715,18 @@ impl LlmRunnerSubject for BrocaSubject {
                         cortexkit_role_llm_runner_conformance::ToolResultObservation::new(
                             false,
                             cortexkit_role_llm_runner::run::RUN_STATE_BUDGET_EXHAUSTED,
+                        ),
+                    )
+                }
+                broca_protocol::ToolOutput::Error { message }
+                    if result.is_error
+                        && message
+                            == broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT_MESSAGE =>
+                {
+                    Some(
+                        cortexkit_role_llm_runner_conformance::ToolResultObservation::new(
+                            false,
+                            broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT,
                         ),
                     )
                 }
@@ -1989,6 +2166,16 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "input_token_cap_raise_refused",
         "input_token_cap_closed_members",
         "input_token_cap_usage_unreported",
+        "structured_output_final_text_enforced_passed",
+        "structured_output_final_text_with_tools_refused",
+        "structured_output_submit_tool_ends_run",
+        "structured_output_reserved_name_refused",
+        "structured_output_absent_without_submit",
+        "structured_output_failed_validation_completes",
+        "structured_output_frozen_across_restart",
+        "structured_output_not_inherited",
+        "structured_output_external_ref_refused",
+        "structured_output_sibling_never_dispatched",
     ] {
         let case = report
             .cases
@@ -2019,6 +2206,24 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "Shared input-token-cap cases: {} ran, {} passed",
         cap_cases.len(),
         cap_cases.len()
+    );
+    let structured_cases: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.case.starts_with("structured_output_"))
+        .collect();
+    assert_eq!(
+        structured_cases.len(),
+        10,
+        "all ten shared structured-output cases must be present"
+    );
+    assert!(structured_cases
+        .iter()
+        .all(|case| case.outcome == CaseOutcome::Passed));
+    println!(
+        "Shared structured-output cases: {} ran, {} passed, 0 skipped",
+        structured_cases.len(),
+        structured_cases.len()
     );
     assert!(
         report

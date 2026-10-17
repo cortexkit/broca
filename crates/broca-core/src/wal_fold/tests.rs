@@ -1335,6 +1335,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let (out, _rx) = tokio::sync::mpsc::channel(100);
     crate::run_loop_append_episode(

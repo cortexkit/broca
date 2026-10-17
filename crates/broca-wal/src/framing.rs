@@ -177,6 +177,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     SESSION_CLASS_FEATURE,
     STEER_QUEUE_FEATURE,
     STEP_TRANSFORMS_FEATURE,
+    STRUCTURED_OUTPUT_FEATURE,
 ];
 
 /// Compaction's issued fence, applied view and other answers. Missing it must refuse the
@@ -219,6 +220,11 @@ pub const SESSION_CLASS_FEATURE: &str = "session-class/v1";
 
 /// Ignoring a session input cap would authorize paid model steps the caller forbade.
 pub const INPUT_TOKEN_CAP_FEATURE: &str = "input-token-cap/v1";
+
+/// A run frozen with structured output renders its schema into every request and ends when the
+/// model calls `submit_result`. A reader that skipped the frozen settings would resume the run
+/// without the schema or the submit tool, and would dispatch the calls a submit skipped.
+pub const STRUCTURED_OUTPUT_FEATURE: &str = "structured-output/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -852,6 +858,7 @@ mod tests {
                 SESSION_CLASS_FEATURE,
                 STEER_QUEUE_FEATURE,
                 STEP_TRANSFORMS_FEATURE,
+                STRUCTURED_OUTPUT_FEATURE,
             ]
         );
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
@@ -866,6 +873,7 @@ mod tests {
         assert_eq!(INPUT_TOKEN_CAP_FEATURE, "input-token-cap/v1");
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
+        assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
     }
 
     /// Neither the request fence, an applied view, another answer nor a wait exit can be
