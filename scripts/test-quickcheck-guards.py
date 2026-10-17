@@ -164,6 +164,9 @@ class QuickcheckGuards(unittest.TestCase):
         scripts.mkdir()
         for name in ("quickcheck.sh", "quickcheck-guards.list", "quickcheck-feature-tests.list"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
+        # quickcheck runs every cargo step through the watchdog, so the fixture needs it too.
+        (scripts / "lib").mkdir()
+        shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", scripts / "lib" / "cargo-watchdog.py")
         for name in ("verify-mutation-platforms.py", "verify-windows-mutations.py"):
             (scripts / name).write_text("print('fixture platform check')\n")
         for name in ("test-portable-test-selection.py", "check-portable-test-selection.py"):
