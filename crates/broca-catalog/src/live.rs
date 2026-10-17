@@ -628,6 +628,12 @@ pub struct EpisodeRenderConfig<'a> {
     /// Restore the recorded Codex effort-update choice on resume. `None` enables input
     /// configuration updates for a newly admitted episode; `Some(false)` keeps old bytes.
     pub chatgpt_effort_updates: Option<bool>,
+    /// Restore the recorded `reasoning_content_required` choice on resume (OpenAI-Chat only).
+    /// `None`, a newly admitted episode, keeps what the catalog resolved: on for DeepSeek, off
+    /// elsewhere. A DeepSeek episode admitted before DeepSeek was opted in recorded no field,
+    /// which reads back as `Some(false)`: it resumes with the bytes it was sending, and the
+    /// frozen-config drift guard does not refuse it for a catalog quirk that moved since.
+    pub reasoning_content_required: Option<bool>,
     /// The structured-output decision this episode froze at start, fed back on resume and
     /// applied as recorded. It is never re-decided from the catalog, so a catalog change since
     /// admission cannot move a resumed run's request bytes or its reported enforcement.
@@ -709,6 +715,11 @@ impl EpisodeRenderConfig<'_> {
         }
         if config.family_id == WireFamilyId::OpenAiResponsesChatgpt {
             config.chatgpt_effort_updates = self.chatgpt_effort_updates.unwrap_or(true);
+        }
+        if let (Some(recorded), WireFamilyId::OpenAiChat) =
+            (self.reasoning_content_required, config.family_id)
+        {
+            config.reasoning_content_required = recorded;
         }
         config
     }
@@ -800,6 +811,11 @@ fn resolve_provider_inner(
         // Mode 1: explicit base_url override — OpenAI-Chat, model id verbatim.
         let mut frozen = openai_chat_frozen_config(model);
         frozen.base_url = Some(base_url.to_string());
+        // The same DeepSeek detection the catalog applies, by host, so an explicit DeepSeek
+        // endpoint echoes reasoning too; a resume keeps what its episode recorded.
+        frozen.reasoning_content_required = episode_render
+            .reasoning_content_required
+            .unwrap_or_else(|| crate::is_deepseek_route("", base_url));
         frozen.max_output_tokens = max_tokens;
         frozen.cache = opts.cache_policy.clone();
         frozen.prompt_cache_key = opts
@@ -901,6 +917,7 @@ fn resolve_provider_inner(
         thinking_cross_model: episode_render.thinking_cross_model,
         responses_tools_non_strict: episode_render.responses_tools_non_strict,
         chatgpt_effort_updates: episode_render.chatgpt_effort_updates,
+        reasoning_content_required: episode_render.reasoning_content_required,
         structured_output: episode_render.structured_output,
         claude_code_persona: episode_render.claude_code_persona,
     };

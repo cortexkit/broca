@@ -638,11 +638,11 @@ fn serving_provider_spec(
     ProviderSpec {
         id: provider_id.to_string(),
         wire_family: family,
-        base_url,
         auth_kind: crate::default_auth_kind(family),
         static_headers: Default::default(),
         static_options: Value::Null,
-        quirks: crate::provider_quirks(provider_id, family),
+        quirks: crate::provider_quirks(provider_id, family, &base_url),
+        base_url,
         raw: Value::Null,
     }
 }

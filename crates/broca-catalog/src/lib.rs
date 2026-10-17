@@ -541,7 +541,7 @@ const PROVIDER_QUIRK_OVERRIDES: &[ProviderQuirkOverride] = &[
 /// override. `resolve_frozen` copies the selected policies into `FrozenRenderConfig` once at run
 /// start, so resumed runs keep the behavior they already froze while new runs receive their
 /// provider's current policies.
-fn provider_quirks(provider_id: &str, family: WireFamilyId) -> Quirks {
+fn provider_quirks(provider_id: &str, family: WireFamilyId, base_url: &str) -> Quirks {
     let mut quirks = broca_provider::families::default_quirks(family);
     if let Some(override_) = PROVIDER_QUIRK_OVERRIDES
         .iter()
@@ -557,7 +557,39 @@ fn provider_quirks(provider_id: &str, family: WireFamilyId) -> Quirks {
             quirks.tool_call_content_empty_string = true;
         }
     }
+    if family == WireFamilyId::OpenAiChat && is_deepseek_route(provider_id, base_url) {
+        quirks.reasoning_content_required = true;
+    }
     quirks
+}
+
+/// Whether a route is served by DeepSeek's own API: the `deepseek` provider, or any provider
+/// whose base URL host is `deepseek.com` or one of its subdomains (a renamed or user-added
+/// provider pointing at `https://api.deepseek.com`). DeepSeek's thinking mode needs every
+/// earlier assistant turn's reasoning sent back as `reasoning_content`; without it the model
+/// loses its earlier reasoning at each turn boundary, and a request whose tool-call ids DeepSeek
+/// no longer recognises is refused 400. The OpenAI-Chat renderer adds that field when
+/// `reasoning_content_required` is set. Other providers that merely serve a DeepSeek model
+/// (ollama-cloud, OpenRouter, ...) are not matched: their APIs are not DeepSeek's.
+fn is_deepseek_route(provider_id: &str, base_url: &str) -> bool {
+    provider_id == "deepseek"
+        || url_host(base_url)
+            .is_some_and(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
+}
+
+/// The lower-cased host of an `http(s)://host[:port][/path]` URL, or `None` when the string has
+/// no `scheme://` prefix or an empty host. Userinfo (`user@`) is skipped, so a URL such as
+/// `https://deepseek.com@evil.example` yields `evil.example`, never `deepseek.com`.
+fn url_host(url: &str) -> Option<String> {
+    let (_scheme, rest) = url.trim().split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = host_port
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 #[derive(Clone, Copy)]
@@ -583,22 +615,23 @@ fn map_provider(
     family: WireFamilyId,
     raw_policy: RawPolicy,
 ) -> ProviderSpec {
+    let base_url = entry
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     ProviderSpec {
         id: provider_id.to_string(),
         wire_family: family,
-        // The overlay owns provider endpoints; absent/empty means the family default.
-        base_url: entry
-            .get("base_url")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
         auth_kind: default_auth_kind(family),
         static_headers: Default::default(),
         static_options: Value::Null,
         // Quirks start from the family's correct request shape, then layer any provider-specific
         // override from the catalog bridge. This keeps the OpenAI provider fix out of the shared
         // OpenAI-Chat family default while leaving the hand-built family helpers unchanged.
-        quirks: provider_quirks(provider_id, family),
+        quirks: provider_quirks(provider_id, family, &base_url),
+        // The overlay owns provider endpoints; absent/empty means the family default.
+        base_url,
         raw: raw_policy.map(entry),
     }
 }
@@ -1985,6 +2018,99 @@ mod tests {
         assert!(
             !deepseek.quirks.tool_call_content_empty_string,
             "deepseek must not inherit ollama's content quirk"
+        );
+    }
+
+    /// DeepSeek's own API is the only route opted into the reasoning echo: the `deepseek`
+    /// provider and the frozen config resolved from it. Other OpenAI-Chat providers, including
+    /// ollama-cloud serving a DeepSeek model, stay off and keep their rendered bytes.
+    #[cfg(feature = "bundled-catalog")]
+    #[test]
+    fn bundled_deepseek_alone_is_opted_into_the_reasoning_echo() {
+        let (deepseek, model) = catalog()
+            .model("deepseek", "deepseek-v4-flash")
+            .expect("deepseek/deepseek-v4-flash resolves from the bundled snapshot");
+        assert!(deepseek.quirks.reasoning_content_required);
+        let frozen = broca_provider::families::resolve_frozen(&deepseek, &model, 2048, 1)
+            .expect("deepseek freezes");
+        assert!(frozen.reasoning_content_required);
+
+        for (provider_id, model_id) in [
+            ("ollama-cloud", "deepseek-v4-pro"),
+            ("openai", "gpt-4o"),
+            ("xai", "grok-4"),
+        ] {
+            let Some((provider, _)) = catalog().model(provider_id, model_id) else {
+                continue;
+            };
+            assert!(
+                !provider.quirks.reasoning_content_required,
+                "{provider_id} must not echo reasoning_content"
+            );
+        }
+        let opted_in = catalog()
+            .provider_ids()
+            .filter_map(|id| catalog().provider(id))
+            .filter(|provider| provider.quirks.reasoning_content_required)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+        assert_eq!(opted_in, vec!["deepseek".to_string()]);
+    }
+
+    #[test]
+    fn deepseek_route_detection_matches_the_provider_or_a_deepseek_host() {
+        for (provider_id, base_url) in [
+            ("deepseek", ""),
+            ("deepseek", "http://127.0.0.1:4010/v1"),
+            ("my-deepseek", "https://api.deepseek.com"),
+            ("my-deepseek", "https://API.DeepSeek.com/v1"),
+            ("my-deepseek", "https://deepseek.com:443/v1?x=1"),
+            ("my-deepseek", "https://api.deepseek.com./v1"),
+        ] {
+            assert!(
+                is_deepseek_route(provider_id, base_url),
+                "{provider_id} {base_url}"
+            );
+        }
+        for (provider_id, base_url) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("ollama-cloud", "https://ollama.com/v1"),
+            ("x", "https://notdeepseek.com/v1"),
+            ("x", "https://api.deepseek.com.evil.example/v1"),
+            ("x", "https://deepseek.com@evil.example/v1"),
+            ("x", "https://evil.example/deepseek.com"),
+            ("x", "api.deepseek.com"),
+            ("x", ""),
+        ] {
+            assert!(
+                !is_deepseek_route(provider_id, base_url),
+                "{provider_id} {base_url}"
+            );
+        }
+    }
+
+    /// The quirk is OpenAI-Chat only: no other family reads it, and setting it there would only
+    /// move that family's frozen blob.
+    #[test]
+    fn deepseek_reasoning_echo_is_set_only_for_the_openai_chat_family() {
+        assert!(
+            provider_quirks("deepseek", WireFamilyId::OpenAiChat, "").reasoning_content_required
+        );
+        assert!(
+            !provider_quirks(
+                "deepseek",
+                WireFamilyId::AnthropicMessages,
+                "https://api.deepseek.com/anthropic"
+            )
+            .reasoning_content_required
+        );
+        assert!(
+            !provider_quirks(
+                "openai",
+                WireFamilyId::OpenAiChat,
+                "https://api.openai.com/v1"
+            )
+            .reasoning_content_required
         );
     }
 }

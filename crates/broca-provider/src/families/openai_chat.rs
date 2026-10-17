@@ -240,13 +240,32 @@ fn convert_messages(
 }
 
 /// An assistant turn: text content (or null) + any tool calls. Reasoning blocks are
-/// dropped for the default OpenAI-Chat shape. When `reasoning_content_required` is set, stored
-/// reasoning is echoed verbatim on a tool-call assistant turn; a turn without stored reasoning
-/// keeps the legacy empty `""` fallback. No shipped provider sets it: DeepSeek's v4 models accept
-/// a continuation with the field absent, empty, or echoed (all verified 200 on the live API), so
-/// enabling it would move rendered bytes for no gain. It stays for a backend that truly demands
-/// the echo. When
-/// `tool_call_content_empty_string` is set (ollama OpenAI-compat), a tool-call-only turn uses
+/// dropped for the default OpenAI-Chat shape. When `reasoning_content_required` is set (DeepSeek),
+/// EVERY assistant turn carries `reasoning_content`: the stored reasoning text verbatim, or `""`
+/// when the turn has none -- with tool calls or without.
+///
+/// DeepSeek's thinking-mode guide says a request with `tools` must pass `reasoning_content` back
+/// for all previous assistant turns, including turns without a tool call. Leaving it out does not
+/// fail immediately, which is why this was once believed optional, but measured on a production
+/// DeepSeek session it costs the model its reasoning:
+///  - a recorded request with no `reasoning_content` counted about 37k more prompt tokens than
+///    its bytes hold, with the prompt cache warm and with the first byte changed (cache cold)
+///    alike: DeepSeek restored each turn's thinking from its own store;
+///  - the same request with every tool-call id renamed was refused HTTP 400 "The
+///    `reasoning_content` in the thinking mode must be passed back to the API.": the store is
+///    keyed by DeepSeek's own tool-call ids, and without a match the request is invalid;
+///  - the step after a new user message counted fewer tokens than a smaller earlier body: the
+///    thinking from before that message was no longer restored.
+///
+/// So without the echo every turn boundary drops the model's earlier reasoning, and a run resumed
+/// after DeepSeek's store expires is refused. Sending the text ourselves makes the request
+/// complete on its own.
+///
+/// No renderer_version bump: until DeepSeek was opted in no provider set the quirk, so no
+/// recorded run renders differently, and a run admitted without it froze `false` and resumes
+/// with its recorded bytes.
+///
+/// When `tool_call_content_empty_string` is set (ollama OpenAI-compat), a text-less turn uses
 /// `"content": ""` instead of `null`.
 fn convert_assistant(
     m: &Message,
@@ -272,8 +291,8 @@ fn convert_assistant(
                     "arguments": serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".into()),
                 },
             })),
-            // Reasoning remains default-off; redacted/tool-result blocks are never part of an
-            // OpenAI assistant turn.
+            // Reasoning is dropped unless the provider requires it back; redacted/tool-result
+            // blocks are never part of an OpenAI assistant turn.
             _ => {}
         }
     }
@@ -305,12 +324,12 @@ fn convert_assistant(
     };
     if !tool_calls.is_empty() {
         msg["tool_calls"] = Value::Array(tool_calls);
-        // These reasoning-required backends need the exact reasoning returned with the tool
-        // call. An absent block keeps the existing empty fallback. The quirk is default-off, so
-        // current catalog renders remain byte-identical until a provider is deliberately opted in.
-        if reasoning_content_required {
-            msg["reasoning_content"] = Value::String(reasoning);
-        }
+    }
+    // On every assistant turn, not only tool-call turns (see the doc comment above). A turn
+    // with no stored reasoning sends `""`, so the field is never absent for these providers.
+    // Providers without the quirk render exactly as before: no field at all.
+    if reasoning_content_required {
+        msg["reasoning_content"] = Value::String(reasoning);
     }
     msg
 }

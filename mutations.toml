@@ -16097,3 +16097,42 @@ expect_red = ["structured_output_render::responses_final_text_is_strict_inside_o
 file = "crates/broca-provider/src/structured_output.rs"
 old = "pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = false;"
 new = "pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = true; // NON-VACUITY BREAK: send the schema as text.format again."
+[[control]]
+id = "deepseek-reasoning-echo-every-assistant-turn"
+guards = "with reasoning_content_required, every OpenAI-Chat assistant turn (text turns too, not only tool-call turns) carries reasoning_content"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+test_file = "crates/broca-provider/tests/it/reasoning_content_required.rs"
+expect_red = ["reasoning_content_required::deepseek_tool_loop_echoes_reasoning_on_every_assistant_turn_golden", "reasoning_content_required::enabled_echoes_reasoning_on_every_assistant_turn"]
+file = "crates/broca-provider/src/families/openai_chat.rs"
+old = '''        msg["reasoning_content"] = Value::String(reasoning);'''
+new = '''        if msg.get("tool_calls").is_some() { msg["reasoning_content"] = Value::String(reasoning); } // NON-VACUITY BREAK: tool-call turns only'''
+
+[[control]]
+id = "deepseek-reasoning-echo-host-detection"
+guards = "a provider whose base URL host is deepseek.com or a subdomain is opted into the DeepSeek reasoning echo, not only the provider named deepseek"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-catalog/src/lib.rs"
+expect_red = ["tests::deepseek_route_detection_matches_the_provider_or_a_deepseek_host"]
+file = "crates/broca-catalog/src/lib.rs"
+old = '''    provider_id == "deepseek"
+        || url_host(base_url)'''
+new = '''    provider_id == "deepseek" // NON-VACUITY BREAK: match the provider id only
+        || false && url_host(base_url)'''
+
+[[control]]
+id = "deepseek-reasoning-echo-resume-restores-recorded"
+guards = "a DeepSeek episode admitted before the reasoning echo resumes with its recorded reasoning_content_required, so its config equals the recorded blob and its bytes do not move"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes"]
+file = "crates/broca-catalog/src/live.rs"
+old = '''            config.reasoning_content_required = recorded;'''
+new = '''            let _ = recorded; // NON-VACUITY BREAK: ignore the recorded choice'''

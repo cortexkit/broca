@@ -25,6 +25,9 @@
 //! one). `--system-file` renders a file's text as a system message before the user turn, which
 //! gives a fixed prompt-cache prefix. `--billing-block` inserts a text block as the body's first
 //! `system` block, the place Claude Code puts its `x-anthropic-billing-header: ...` text.
+//! `--replay-step N` (with `--wal`, optionally `--replay-run <run id>`) renders the request the
+//! session made at step N, through broca's offline WAL replay, instead of a fresh turn;
+//! `--reasoning-content-required` renders with the DeepSeek reasoning echo switched on.
 //!
 //! WIRE OPTIONS, all opt-in and applied after rendering, so `request-body.json` always holds
 //! the identity (uncompressed) body: `--header name=value` replaces a header (the name matches
@@ -108,6 +111,19 @@ struct Args {
     /// Send this file's bytes as the body instead of rendering one.
     #[arg(long)]
     body_file: Option<PathBuf>,
+    /// Render the request the `--wal` session made at this step instead of a fresh one-turn
+    /// request: the WAL is replayed up to the step's start and rendered with the run's frozen
+    /// config, the same offline path `broca-session cache-dump` checks against the recorded
+    /// request digests. The endpoint is built from that run's frozen config too.
+    #[arg(long, requires = "wal", conflicts_with = "body_file")]
+    replay_step: Option<u64>,
+    /// The run whose step `--replay-step` renders (default: the WAL's last run).
+    #[arg(long, requires = "replay_step")]
+    replay_run: Option<String>,
+    /// Render with `reasoning_content_required` set, as a newly admitted DeepSeek episode is:
+    /// every assistant turn carries its stored reasoning as `reasoning_content`.
+    #[arg(long, conflicts_with = "body_file")]
+    reasoning_content_required: bool,
     /// Appended (comma-joined) to the Anthropic `anthropic-beta` header.
     #[arg(long)]
     extra_beta: Vec<String>,
@@ -206,6 +222,63 @@ fn load_source(
         }
         (None, None) => Err("pass --wal or --frozen".into()),
     }
+}
+
+/// The frozen config and rendered request body of `step` in the WAL's run `run_id` (default:
+/// the last run), rendered through broca's own offline replay. With
+/// `reasoning_content_required`, the run's recorded frozen config is rendered with that quirk
+/// set, so the body is what the same conversation sends under the reasoning echo.
+fn replay_step_body(
+    wal: &Path,
+    run_id: Option<&str>,
+    step: u64,
+    reasoning_content_required: bool,
+) -> Result<(FrozenRenderConfig, Vec<u8>), String> {
+    let records: Vec<WalRecord> = broca_wal::replay_file(wal, broca_wal::DEFAULT_MAX_READ_BYTES)
+        .map_err(|e| format!("read WAL {}: {e}", wal.display()))?
+        .into_iter()
+        .map(|framed| framed.record)
+        .collect();
+    let starts: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| matches!(record, WalRecord::RunStarted { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    let start = match run_id {
+        Some(wanted) => starts.iter().copied().find(|&index| {
+            matches!(&records[index], WalRecord::RunStarted { run_id, .. } if run_id.0 == wanted)
+        }),
+        None => starts.last().copied(),
+    }
+    .ok_or("the WAL has no matching run_started record")?;
+    let end = starts
+        .iter()
+        .copied()
+        .find(|&index| index > start)
+        .unwrap_or(records.len());
+    // A retried step starts more than once; the last start is the request that was sent.
+    let boundary = records[start..end]
+        .iter()
+        .rposition(
+            |record| matches!(record, WalRecord::StepStarted { step_id } if step_id.0 == step),
+        )
+        .map(|offset| start + offset)
+        .ok_or_else(|| format!("the run has no step {step}"))?;
+    let WalRecord::RunStarted { run_id, config, .. } = &records[start] else {
+        unreachable!("start indexes a run_started record")
+    };
+    let mut config = (**config).clone();
+    if reasoning_content_required {
+        config.frozen_render_config["reasoning_content_required"] = json!(true);
+    }
+    let (frozen, _, body) = broca_module_serve::wal_render::render_step(
+        &records[..=boundary],
+        &config,
+        &run_id.0,
+        step,
+    )?;
+    Ok((frozen, body))
 }
 
 /// Header names the wire options may not touch: the credential stays exactly what the family's
@@ -459,6 +532,22 @@ async fn run(args: Args) -> Result<(), String> {
         refuse_credential_header(name, "--drop-header")?;
     }
     let (mut frozen, mut model, wal_credential, generation) = load_source(&args)?;
+    let replayed = match (args.replay_step, &args.wal) {
+        (Some(step), Some(wal)) => {
+            let (replay_frozen, body) = replay_step_body(
+                wal,
+                args.replay_run.as_deref(),
+                step,
+                args.reasoning_content_required,
+            )?;
+            frozen = replay_frozen;
+            Some(body)
+        }
+        _ => None,
+    };
+    if args.reasoning_content_required {
+        frozen.reasoning_content_required = true;
+    }
     if let Some(wire_model) = &args.wire_model {
         frozen.wire_model_id = wire_model.clone();
         model = broca_protocol::ModelHandle::new(model.provider_module_id.clone(), wire_model);
@@ -478,34 +567,39 @@ async fn run(args: Args) -> Result<(), String> {
     let body: Vec<u8> = match &args.body_file {
         Some(path) => std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?,
         None => {
-            let mut prompt = Vec::new();
-            if let Some(path) = &args.system_file {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|e| format!("read {}: {e}", path.display()))?;
-                prompt.push(Message {
-                    cache_prefix_blocks: None,
-                    origin: None,
-                    ordinal: None,
-                    role: Role::System,
-                    content: vec![ContentBlock::Text { text }],
-                });
-            }
-            prompt.push(Message {
-                cache_prefix_blocks: None,
-                origin: None,
-                ordinal: None,
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: args.query.clone(),
-                }],
-            });
-            let mut opts = CallOptions::new(prompt);
-            opts.step_context = Some(StepContext {
-                run_id: "native-search-probe".into(),
-                step_index: 1,
-            });
-            opts.target_model = Some(model);
-            let rendered = family.render(&frozen, &opts);
+            let rendered = match replayed {
+                Some(body) => body,
+                None => {
+                    let mut prompt = Vec::new();
+                    if let Some(path) = &args.system_file {
+                        let text = std::fs::read_to_string(path)
+                            .map_err(|e| format!("read {}: {e}", path.display()))?;
+                        prompt.push(Message {
+                            cache_prefix_blocks: None,
+                            origin: None,
+                            ordinal: None,
+                            role: Role::System,
+                            content: vec![ContentBlock::Text { text }],
+                        });
+                    }
+                    prompt.push(Message {
+                        cache_prefix_blocks: None,
+                        origin: None,
+                        ordinal: None,
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: args.query.clone(),
+                        }],
+                    });
+                    let mut opts = CallOptions::new(prompt);
+                    opts.step_context = Some(StepContext {
+                        run_id: "native-search-probe".into(),
+                        step_index: 1,
+                    });
+                    opts.target_model = Some(model);
+                    family.render(&frozen, &opts)
+                }
+            };
             if args.inject_tool.is_empty() && args.merge.is_none() && args.billing_block.is_none() {
                 // Unmodified: send the family's rendered bytes exactly as broca would.
                 rendered

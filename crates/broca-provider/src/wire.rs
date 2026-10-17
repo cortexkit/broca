@@ -184,11 +184,11 @@ pub struct FrozenRenderConfig {
     /// and reported as a refusal of this tier. `None` (no tier requested) is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier_request: Option<crate::service_tier::ServiceTierRequest>,
-    /// Whether the provider requires a non-empty `reasoning_content` on a tool-call
-    /// assistant message (the OpenAI-compatible DeepSeek-reasoner/Kimi/Moonshot subset).
-    /// When set, the OpenAI-Chat render supplies `""` where it is missing. Frozen from the
-    /// provider's quirks at run start. DEFAULT FALSE — no provider is opted in, so this
-    /// changes no current render.
+    /// Whether the provider needs each earlier assistant turn's reasoning sent back as
+    /// `reasoning_content` (DeepSeek). When set, the OpenAI-Chat render puts it on every
+    /// assistant message, `""` where none is stored. Frozen from the provider's quirks at run
+    /// start; a config recorded without the field reads back as false, so a run admitted before
+    /// DeepSeek was opted in resumes with the bytes it was sending.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reasoning_content_required: bool,
     /// Whether the provider requires a string `content` (not JSON null) on tool-call-only
