@@ -5431,16 +5431,17 @@ mod state_directory_tests {
     use super::create_state_directories;
     use std::path::PathBuf;
 
+    // broca's owner-only scratch root, not the system temp directory: on Windows the owner-only
+    // checks refuse state under a shared temp folder.
     fn fresh_root(tag: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock after Unix epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        broca_test_support::scratch_root().join(format!(
             "broca-state-directory-{tag}-{}-{nonce}",
             std::process::id()
-        ));
-        root
+        ))
     }
 
     #[test]
