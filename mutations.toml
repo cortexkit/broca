@@ -11477,6 +11477,20 @@ old = 'let session_key_providers = BTreeSet::from(["meta".to_string()]);'
 new = 'let session_key_providers = BTreeSet::new(); // NON-VACUITY BREAK: drop the Meta session key'
 
 [[control]]
+id = "one-shot-caller-cache-key-shared-prefix"
+platforms = ["linux", "macos"]
+guards = "one-shot sends freeze caller cache.key values and render them as prompt_cache_key while preserving identical request prefixes across sessions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/cache_shared_prefix_render.rs"
+select = "expected"
+expect_red = ["cache_shared_prefix_render::same_caller_key_freezes_shared_prefix_across_one_shot_routes"]
+file = "crates/broca-module-serve/src/cache_routing.rs"
+old = 'resolve_caller_cache_key(request).or_else(|| {'
+new = 'None.or_else(|| { // NON-VACUITY BREAK: ignore caller cache key'
+
+[[control]]
 id = "consent-fixtures-mapping-exactly-once"
 guards = "vendored README maps each of the eighteen HeldCallRequest fields exactly once"
 runner = "command"
