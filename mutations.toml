@@ -324,144 +324,202 @@ old = '''let executable = broca_test_support::ckdev_binary(
         );'''
 new = "let executable = std::env::current_exe().unwrap(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a scoped session accepts only its owner under the frozen
+# scope.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-frozen-owner"
 guards = "a scoped session accepts only its owner under the frozen scope"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::a_scoped_session_accepts_only_its_owner_under_the_frozen_scope"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "&& principal == Some(&frozen.owner);"
 new = "&& true; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: only the owner may freeze an ordinary stamped scope.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-new-owner"
 guards = "only the owner may freeze an ordinary stamped scope"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::a_new_session_freezes_the_stamp_only_for_its_owner"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "principal != Some(&stamped.owner) && !admitted_flow_sender && !admitted_run_sender"
 new = "false && principal != Some(&stamped.owner) && !admitted_flow_sender && !admitted_run_sender /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: adoption requires every recorded episode's principal to
+# match the owner.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-adoption-recorded-owner"
 guards = "adoption requires every recorded episode's principal to match the owner"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::adoption_needs_the_owner_on_every_earlier_episode"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = ".find(|recorded| **recorded != stamped.owner)"
 new = ".find(|recorded| false && **recorded != stamped.owner) // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: unrecorded principals cannot authorize scope adoption.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-adoption-unrecorded-owner"
 guards = "unrecorded principals cannot authorize scope adoption"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::adoption_needs_the_owner_on_every_earlier_episode"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if ownership.any_unrecorded_principal {"
 new = "if false && ownership.any_unrecorded_principal { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: flow scopes require fresh history rather than adopting a
+# session.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "flow-never-adopts-history"
 guards = "flow scopes require fresh history rather than adopting a session"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::flow_scope_needs_an_attested_opener_and_never_adopts_history"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if stamped.flow_id.is_some() {\n            return Err(ScopeRefusal::AdoptionRefused(AdoptionRefusal::FlowScope));"
 new = "if false && stamped.flow_id.is_some() { // NON-VACUITY BREAK\n            return Err(ScopeRefusal::AdoptionRefused(AdoptionRefusal::FlowScope));"
 
+# This proof checks the following behavior: flow id drift has a typed flow refusal rather than a generic
+# owner mismatch.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "flow-frozen-id"
 guards = "flow id drift has a typed flow refusal rather than a generic owner mismatch"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::flow_carrier_freezes_sender_and_flow_id_and_refuses_changes"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if stamped.and_then(|scope| scope.flow_id.as_ref()) != frozen.flow_id.as_ref() {"
 new = "if false && stamped.and_then(|scope| scope.flow_id.as_ref()) != frozen.flow_id.as_ref() { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: flow sender drift has a typed sender refusal rather than a
+# generic owner mismatch.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "flow-frozen-sender"
 guards = "flow sender drift has a typed sender refusal rather than a generic owner mismatch"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::flow_carrier_freezes_sender_and_flow_id_and_refuses_changes"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if principal != frozen.sender.as_ref()\n                || stamped.and_then(|scope| scope.sender.as_ref()) != frozen.sender.as_ref()"
 new = "if false && (principal != frozen.sender.as_ref()\n                || stamped.and_then(|scope| scope.sender.as_ref()) != frozen.sender.as_ref()) // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: Basal cannot start work on an unscoped or ordinary scoped
+# route.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "basal-requires-flow-scope"
 guards = "Basal cannot start work on an unscoped or ordinary scoped route"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::basal_requires_a_flow_scope"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if is_flow_only(principal)\n        && !matches!(send, SendScope::Internal)"
 new = "if false && is_flow_only(principal) // NON-VACUITY BREAK\n        && !matches!(send, SendScope::Internal)"
 
+# This proof checks the following behavior: Basal reads and effects cannot cross another sender's
+# session.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "basal-requires-frozen-sender"
 guards = "Basal reads and effects cannot cross another sender's session"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::basal_access_requires_its_frozen_sender"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if is_flow_only(principal) && first_sender.is_some_and(|sender| sender != principal) {"
 new = "if false && is_flow_only(principal) && first_sender.is_some_and(|sender| sender != principal) { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a send repeating the frozen scope epoch stays an ordinary
+# frozen send and is never taken for a reopen.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-reopen-equal-epoch"
 guards = "a send repeating the frozen scope epoch stays an ordinary frozen send and is never taken for a reopen"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::a_later_epoch_of_the_same_scope_reopens_the_session", "scope_admission::tests::a_scoped_session_accepts_only_its_owner_under_the_frozen_scope"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "let later_epoch = stamped.scope_epoch > frozen.scope_epoch;"
 new = "let later_epoch = stamped.scope_epoch >= frozen.scope_epoch; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: an earlier epoch of the frozen scope never reopens a
+# session.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-reopen-lower-epoch"
 guards = "an earlier epoch of the frozen scope never reopens a session"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::an_equal_or_lower_epoch_or_another_identity_is_still_refused", "scope_admission::tests::a_scoped_session_accepts_only_its_owner_under_the_frozen_scope"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "let later_epoch = stamped.scope_epoch > frozen.scope_epoch;"
 new = "let later_epoch = stamped.scope_epoch != frozen.scope_epoch; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a later epoch reopens only under the frozen flow identifier,
+# and an added one is refused.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scope-reopen-flow-id"
 guards = "a later epoch reopens only under the frozen flow identifier, and an added one is refused"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::tests::an_equal_or_lower_epoch_or_another_identity_is_still_refused"]
 file = "crates/broca-core/src/scope_admission.rs"
@@ -483,36 +541,51 @@ file = "crates/broca-module/src/actor.rs"
 old = "            if joins_a_run || unfinished == *run_id {"
 new = "            if joins_a_run {\n                return None; // NON-VACUITY BREAK\n            }\n            if unfinished == *run_id {"
 
+# This proof checks the following behavior: unknown required WAL features refuse as NewerWriter, never
+# silently decode.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-unknown-required-feature"
 guards = "unknown required WAL features refuse as NewerWriter, never silently decode"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/framing.rs"
 expect_red = ["framing::tests::an_unknown_feature_is_refused_as_newer_writer_not_corruption"]
 file = "crates/broca-wal/src/framing.rs"
 old = "if !missing.is_empty() {\n            missing.sort_unstable();"
 new = "if false && !missing.is_empty() { // NON-VACUITY BREAK\n            missing.sort_unstable();"
 
+# This proof checks the following behavior: required features are checked before interpreting a newer
+# record payload.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-feature-before-record-parse"
 guards = "required features are checked before interpreting a newer record payload"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/framing.rs"
 expect_red = ["framing::tests::requirements_are_checked_before_the_record_is_parsed"]
 file = "crates/broca-wal/src/framing.rs"
 old = "let requires = match serde_json::from_slice::<GatedRequires>(payload) {"
 new = "let _ = serde_json::from_slice::<GatedRecord>(payload).map_err(|e| e).unwrap(); // NON-VACUITY BREAK\n        let requires = match serde_json::from_slice::<GatedRequires>(payload) {"
 
+# This proof checks the following behavior: a reader leaves the concurrent writer's torn tail byte-
+# identical.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-reader-never-truncates"
 guards = "a reader leaves the concurrent writer's torn tail byte-identical"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::tests::replay_file_reader_never_truncates_a_torn_tail"]
 expect_message = "MUST NOT truncate"
@@ -520,12 +593,17 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "    replay_path(path.as_ref(), max_bytes)\n}"
 new = "    let _ = FileWal::open(path.as_ref())?; // NON-VACUITY BREAK\n    replay_path(path.as_ref(), max_bytes)\n}"
 
+# This proof checks the following behavior: a newly partial WAL range cannot silently inherit complete-
+# range consumers.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scan-wal-partial-producer"
 guards = "a newly partial WAL range cannot silently inherit complete-range consumers"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::tests::partial_has_no_producer_and_making_one_must_revisit_every_consumer"]
 expect_message = "a WalRangeRecords::Partial producer appeared"
@@ -533,12 +611,16 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "Some(true) => WalRangeRecords::Complete(self.records),"
 new = "Some(true) => WalRangeRecords::Partial(self.records), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: corrupt archive payload bytes are never served.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "archive-member-digest"
 guards = "corrupt archive payload bytes are never served"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/archive/tests.rs"
 expect_red = ["archive::tests::corrupt_payload_is_never_served_even_without_index"]
 file = "crates/broca-wal/src/archive.rs"
@@ -717,12 +799,17 @@ file = "crates/broca-wire/src/lib.rs"
 old = "    Finished {\n        run_id: String,\n        reason: broca_protocol::RunFinishReason,"
 new = "    #[serde(rename = \"done\")] // NON-VACUITY BREAK\n    Finished {\n        run_id: String,\n        reason: broca_protocol::RunFinishReason,"
 
+# This proof checks the following behavior: projection failure diagnostics increment their counter in
+# production, not just tests.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "scan-projection-warning-production"
 guards = "projection failure diagnostics increment their counter in production, not just tests"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::projection_warning_mutations_are_not_test_gated"]
 expect_message = "projection warning counter mutation is test-gated"
@@ -885,12 +972,17 @@ file = "crates/broca-wire/src/lib.rs"
 old = "pub enum SendResult {\n    Paused {"
 new = "pub enum SendResult {\n    #[serde(rename = \"restart_paused\")] // NON-VACUITY BREAK\n    Paused {"
 
+# This proof checks the following behavior: terminal reconciliation reports durable steers that never
+# reached a model step.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "undelivered-steers-not-erased"
 guards = "terminal reconciliation reports durable steers that never reached a model step"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/replay/steer_tests.rs"
 expect_red = ["replay::steer_tests::terminal_status_tracks_only_steers_not_rendered_in_the_episode"]
 file = "crates/broca-core/src/replay.rs"
@@ -951,60 +1043,85 @@ file = "crates/broca-module-serve/src/main.rs"
 old = "            let prior_snapshot = &job.prior_snapshot;"
 new = "            let _ = self.wal_store.read_records(&job.req.session); // NON-VACUITY BREAK\n            let prior_snapshot = &job.prior_snapshot;"
 
+# This proof checks the following behavior: RunStarted hook output requires step-transforms/v1, even
+# without a manifest.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-run-started-hook-feature"
 guards = "RunStarted hook output requires step-transforms/v1, even without a manifest"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/record/step_transform_tests.rs"
 expect_red = ["record::step_transform_tests::run_started_requires_transforms_for_hooks_or_nonempty_declarations_in_sorted_order"]
 file = "crates/broca-wal/src/record.rs"
 old = "let transforms = hooks.is_some()"
 new = "let transforms = false && hooks.is_some() // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: Nonempty frozen declarations require step-transforms/v1
+# independently of hooks.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-frozen-declaration-feature"
 guards = "Nonempty frozen declarations require step-transforms/v1 independently of hooks"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/record/step_transform_tests.rs"
 expect_red = ["record::step_transform_tests::run_started_requires_transforms_for_hooks_or_nonempty_declarations_in_sorted_order"]
 file = "crates/broca-wal/src/record.rs"
 old = ".is_some_and(|manifest| !manifest.declarations.is_empty());"
 new = ".is_some_and(|manifest| false && !manifest.declarations.is_empty()); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: A hooked steer requires step-transforms/v1 as well as steer-
+# queue/v1.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-steered-hook-feature"
 guards = "A hooked steer requires step-transforms/v1 as well as steer-queue/v1"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/record/step_transform_tests.rs"
 expect_red = ["record::step_transform_tests::every_hooks_member_requires_transforms_even_without_ops"]
 file = "crates/broca-wal/src/record.rs"
 old = "(false, true) => &[STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE],"
 new = "(false, true) => &[STEER_QUEUE_FEATURE], // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: A hooked dispatch intent requires step-transforms/v1
+# independently of dispatch-module/v1.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-dispatch-intent-hook-feature"
 guards = "A hooked dispatch intent requires step-transforms/v1 independently of dispatch-module/v1"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/record/step_transform_tests.rs"
 expect_red = ["record::step_transform_tests::every_hooks_member_requires_transforms_even_without_ops"]
 file = "crates/broca-wal/src/record.rs"
 old = "                module_id.is_some() || schema_pin.is_some(),\n                hooks.is_some(),\n            ) {"
 new = "                module_id.is_some() || schema_pin.is_some(),\n                false && hooks.is_some(), // NON-VACUITY BREAK\n            ) {"
 
+# This proof checks the following behavior: Queued and step/tool terminal records require step-
+# transforms/v1 whenever hooks is present.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-terminal-and-queued-hook-feature"
 guards = "Queued and step/tool terminal records require step-transforms/v1 whenever hooks is present"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/record/step_transform_tests.rs"
 expect_red = ["record::step_transform_tests::every_hooks_member_requires_transforms_even_without_ops"]
 file = "crates/broca-wal/src/record.rs"
@@ -1037,60 +1154,85 @@ file = "crates/broca-provider/src/transport.rs"
 old = '&& matches!(trace.transport.as_deref(), None | Some("https"))'
 new = '&& true // NON-VACUITY BREAK: apply the HTTPS deadline to sockets'
 
+# This proof checks the following behavior: replaying a run keeps Deferred and Approved calls separate
+# and does not check them again.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-prepared-never-redispatches"
 guards = "Deferred and Approved calls are retained separately and never re-gated"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/replay.rs"
 expect_red = ["replay::deferred_tests::prepared_and_approved_are_never_redispatchable"]
 file = "crates/broca-core/src/replay.rs"
 old = ".filter(|(position, _)| self.call_state(*position) == OpenCallState::NotSent)"
 new = ".filter(|(position, _)| self.terminals[*position].is_none() && !self.has_intent(*position)) // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: sealing a replay closes every Deferred and Approved call,
+# regardless of the replay outcome.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-seal-closes-prepared"
 guards = "sealing closes Deferred and Approved calls whatever the replay resolution"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/resume.rs"
 expect_red = ["resume::tests::seal_closes_prepared_calls_whatever_the_resolution"]
 file = "crates/broca-core/src/resume.rs"
 old = "if !matches!(prior.resolution, ReplayResolution::Interrupted { .. })\n        && !batch"
 new = "if !matches!(prior.resolution, ReplayResolution::Interrupted { .. })\n        || false && !batch // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a recorded approval decision never leaves a question-
+# withdrawal notice waiting to be acknowledged.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-withdrawal-has-no-approval"
 guards = "no approval_recorded of any decision may owe a question withdrawal"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::withdrawal_debt_excludes_every_recorded_approval_decision"]
 file = "crates/broca-core/src/replay.rs"
 old = "if call.decision.is_none() && call.withdrawal_terminal && !call.withdrawal_acknowledged"
 new = "if call.withdrawal_terminal && !call.withdrawal_acknowledged // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: late result records do not change the prompt rebuilt for a
+# turn that has already finished.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-late-records-not-in-prompts"
 guards = "late result records never change the finished turn's reconstructed prompt"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/replay.rs"
 expect_red = ["replay::deferred_tests::late_records_leave_finished_prompt_byte_identical"]
 file = "crates/broca-core/src/replay.rs"
 old = "WalRecord::LateApprovalRecorded { .. }\n            | WalRecord::LateDispatchIntent { .. }\n            | WalRecord::LateResult { .. } => {}"
 new = "WalRecord::LateApprovalRecorded { .. } | WalRecord::LateDispatchIntent { .. } => {}\n            WalRecord::LateResult { result, .. } => { // NON-VACUITY BREAK\n                prompt.push(Message { cache_prefix_blocks: None, role: Role::Tool, content: vec![ContentBlock::ToolResult(result.as_ref().clone())], origin: None, ordinal: None });\n            }"
 
+# This proof checks the following behavior: before making another model call, the reader refuses a
+# Prepared batch paused by a restart.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-refuses-prepared-restart-resume"
 guards = "the reader refuses a restart-paused Prepared batch before any model call"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/resume.rs"
 expect_red = ["resume::tests::reader_core_resume_refuses_restart_paused_prepared_batch"]
 file = "crates/broca-core/src/run.rs"
@@ -1116,24 +1258,34 @@ old = '''if self.late_allowed(call)
 new = '''if false && self.late_allowed(call)
                 && call.decision == Some(DeferredDecision::Expired) // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: reading and folding WAL records leaves a late execution
+# pending if the intent record has no result record.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-fold-keeps-late-execution"
 guards = "fold leaves a pending late execution, including an intent without result, in the live WAL"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_skips_late_execute_until_every_terminal_outcome"]
 file = "crates/broca-core/src/replay.rs"
 old = ") && call.late_result.is_none()"
 new = ") && false && call.late_result.is_none() // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: reading and folding WAL records keeps question-withdrawal
+# notices awaiting acknowledgment in the live log.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "reader-fold-keeps-withdrawals"
 guards = "fold leaves owed question withdrawals in the live WAL until acknowledged"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_skips_reader_and_writer_withdrawals_until_acknowledged"]
 file = "crates/broca-core/src/replay.rs"
@@ -1493,12 +1645,17 @@ file = "crates/broca-core/src/keep_warm_wait.rs"
 old = "Ok(costs) if costs.allows_next(spent) => {"
 new = "Ok(costs) if true || costs.allows_next(spent) => { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the cache-cost estimate stops before warming would
+# invalidate a cached result and add another miss.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "keep-warm-bust-boundary"
 guards = "rent-or-buy stops before the warm that would make the wait cost one cache bust"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/keep_warm.rs"
 expect_red = ["keep_warm::tests::rent_or_buy_stops_exactly_at_boundary_including_fractional_rounding"]
 file = "crates/broca-core/src/keep_warm.rs"
@@ -1558,12 +1715,17 @@ file = "crates/broca-module-serve/src/serve.rs"
 old = "&& params.keep_warm == Some(broca_protocol::request::KeepWarm::Auto)"
 new = "&& false && params.keep_warm == Some(broca_protocol::request::KeepWarm::Auto) // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the expiry fence refuses a warm with less than its margin of
+# cache lifetime left.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "warm-expiry-margin"
 guards = "the expiry fence refuses a warm with less than its margin of cache lifetime left"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/cache_warm.rs"
 expect_red = ["cache_warm::tests::the_expiry_fence_refuses_under_five_seconds_and_unknown_clocks"]
 file = "crates/broca-core/src/cache_warm.rs"
@@ -1908,144 +2070,203 @@ old = "pending.drain_required = true;"
 new = "pending.drain_required = false; // NON-VACUITY BREAK"
 
 # Write-time hook-plane guards (cortexkit-mutate 0.8.0).
+# This proof checks the following behavior: the end-to-end hook deadline cannot exceed the engine
+# ceiling.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-budget-cap"
 guards = "the end-to-end hook deadline cannot exceed the engine ceiling"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::end_to_end_budget_is_capped_even_when_plan_budget_is_larger"]
 file = "crates/broca-core/src/hooks.rs"
 old = "sub.budget_ms.min(STEP_TRANSFORM_HOOK_CAP)"
 new = "sub.budget_ms /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: a frozen transform run cannot advance without its hook
+# plane.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-plane-required-on-resume"
 guards = "a frozen transform run cannot advance without its hook plane"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::frozen_transform_resume_without_plane_neither_dispatches_nor_writes"]
 file = "crates/broca-core/src/run.rs"
 old = "if hook_plan.is_some() && control.hook_plane.is_none() {"
 new = "if false && hook_plan.is_some() && control.hook_plane.is_none() { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: every frozen transform item has exactly one frozen
+# declaration.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-frozen-declaration-count"
 guards = "every frozen transform item has exactly one frozen declaration"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::frozen_declarations_must_match_item_count_and_provider_identity"]
 file = "crates/broca-core/src/hooks.rs"
 old = "if items.len() != manifest.declarations.len() {"
 new = "if false && items.len() != manifest.declarations.len() { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a frozen declaration cannot be attributed to a different
+# provider.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-frozen-declaration-provider"
 guards = "a frozen declaration cannot be attributed to a different provider"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::frozen_declarations_must_match_item_count_and_provider_identity"]
 file = "crates/broca-core/src/hooks.rs"
 old = "if item.provider != frozen.provider {"
 new = "if false && item.provider != frozen.provider { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: hook answers remain bounded by the admission-time
+# declaration.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-frozen-declaration-bound"
 guards = "hook answers remain bounded by the admission-time declaration"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::answers_are_checked_against_frozen_declaration_without_redeclaration"]
 file = "crates/broca-core/src/hooks.rs"
 old = "declaration.bound(sub).is_ok()"
 new = "(declaration.bound(sub).is_ok() || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: post_assistant replacement cannot run without a reduction
+# owner.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-reduction-owner"
 guards = "post_assistant replacement cannot run without a reduction owner"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_assistant_replace_without_reduction_owner_is_unavailable"]
 file = "crates/broca-core/src/hooks.rs"
 old = "check_reduction(sub, &item.provider, self.plan.reduction_owner.as_deref())\n                        .is_ok()"
 new = "(check_reduction(sub, &item.provider, self.plan.reduction_owner.as_deref())\n                        .is_ok() || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: a post_tool operation cannot put the final text over the
+# full result ceiling.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-final-post-tool-ceiling"
 guards = "a post_tool operation cannot put the final text over the full result ceiling"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::final_post_tool_text_above_full_ceiling_is_unavailable"]
 file = "crates/broca-core/src/hooks.rs"
 old = "<= crate::run::TOOL_RESULT_MAX_BYTES"
 new = "<= usize::MAX /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: a post-tool result can be replaced only if the tool catalog
+# grants the required permission.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-frozen-result-permission"
 guards = "an absent frozen catalog permission cannot authorize a post_tool replace"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_tool_replace_requires_both_frozen_catalog_permission_and_user_grant"]
 file = "crates/broca-core/src/hooks.rs"
 old = "&[Op::Prepend, Op::Append]"
 new = "&[Op::Prepend, Op::Append, Op::Replace] /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: an explicitly empty list of result operations prevents any
+# result operation from being applied.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-explicit-result-ops"
 guards = "an explicit empty catalog result_ops permits no operation"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::catalog_result_ops_disallowed_append_is_unavailable"]
 file = "crates/broca-core/src/hooks.rs"
 old = ".and_then(|tool| self.plan.result_ops.get(tool))"
 new = ".and_then(|tool| self.plan.result_ops.get(tool).filter(|ops| !ops.is_empty())) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: an all-pass chain emits no hooks member.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-all-pass-keeps-old-bytes"
 guards = "an all-pass chain emits no hooks member"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_assistant_record_control_next_prompt_and_display_all_use_final_message"]
 file = "crates/broca-core/src/hooks.rs"
 old = "if self.ops.is_empty() && self.unavailable.is_empty() {"
 new = "if false && self.ops.is_empty() && self.unavailable.is_empty() { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: JSON results are excluded from the text-conversion path
+# before the size limit is applied.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-json-is-not-a-subject"
 guards = "JSON eligibility is excluded before headroom capping can turn it into text"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::json_between_limits_stays_structured_with_zero_post_tool_calls"]
 file = "crates/broca-core/src/run/hook_dispatch.rs"
 old = "&& !matches!(resolution.result.output, ToolOutput::Json { .. })"
 new = "&& (true || !matches!(resolution.result.output, ToolOutput::Json { .. })) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: the post-tool hook is skipped for a completed call whose
+# result was not sent.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-only-plane-results"
 guards = "post_tool never runs on a completed not-sent closure"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::no_post_tool_for_not_sent"]
 only = false
@@ -2053,72 +2274,102 @@ file = "crates/broca-core/src/run/hook_dispatch.rs"
 old = "let subscribed = resolution.plane_subject"
 new = "let subscribed = (resolution.plane_subject || resolution.outcome == Some(DispatchOutcome::Completed)) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: space for the post-tool hook is reserved only for text
+# results whose subject has a subscription.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-post-tool-headroom"
 guards = "only subscribed text subjects reserve the named post_tool headroom"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::headroom_subject_is_capped_once_before_hook_and_final_append_is_not_recapped"]
 file = "crates/broca-core/src/run.rs"
 old = "TOOL_RESULT_MAX_BYTES - POST_TOOL_HEADROOM"
 new = "TOOL_RESULT_MAX_BYTES /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: leaving the post-assistant message unchanged avoids
+# resetting the display.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-display-reset-only-on-change"
 guards = "an unchanged post_assistant message emits no display reset"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_assistant_record_control_next_prompt_and_display_all_use_final_message"]
 file = "crates/broca-core/src/run.rs"
 old = "is_some_and(|original| &message != original)"
 new = "is_some_and(|original| &message != original || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: replacing a post-tool result requires permission granted to
+# the user tier.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-user-tier-grant"
 guards = "post_tool replacement requires the frozen user-tier grant"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_tool_replace_requires_both_frozen_catalog_permission_and_user_grant"]
 file = "crates/broca-core/src/hooks.rs"
 old = "&self.plan.grants,"
 new = "&[UserGrant::new(&item.provider, Hook::PostTool, vec![output.subject.tool().unwrap_or_default().into()])], // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: an unused provider cannot widen the selected tool's catalog
+# permissions.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-catalog-owner"
 guards = "an unused provider cannot widen the selected tool's catalog permissions"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::catalog_permissions_are_scoped_to_the_selected_tool_owner"]
 file = "crates/broca-core/src/hooks.rs"
 old = "if tool_owners.get(name.as_str()).copied().flatten()"
 new = "if false && tool_owners.get(name.as_str()).copied().flatten() /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: resume rejects a frozen approve subscription that passes on
+# unavailability.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-frozen-approve-fail-closed"
 guards = "resume rejects a frozen approve subscription that passes on unavailability"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::frozen_approve_admits_refuse_and_rejects_pass_on_resume"]
 file = "crates/broca-core/src/hooks.rs"
 old = "sub.phase == Some(Phase::Approve) && sub.on_unavailable == OnUnavailable::Pass"
 new = "false && sub.phase == Some(Phase::Approve) && sub.on_unavailable == OnUnavailable::Pass /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: the text accessor never exposes signed reasoning as a text
+# part.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-text-only-splice"
 guards = "the text accessor never exposes signed reasoning as a text part"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::text_splicing_counts_only_text_and_preserves_signed_non_text_bytes"]
 only = false
@@ -2126,12 +2377,17 @@ file = "crates/broca-core/src/hooks.rs"
 old = "broca_protocol::ContentBlock::Text { text } => Some(text),"
 new = "broca_protocol::ContentBlock::Text { text } | broca_protocol::ContentBlock::Reasoning { text, .. } => Some(text), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: providers apply in the frozen order rather than reversed
+# order.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-provider-order"
 guards = "providers apply in the frozen order rather than reversed order"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::providers_apply_in_frozen_order_not_lexical_order"]
 only = false
@@ -2139,12 +2395,16 @@ file = "crates/broca-core/src/hooks.rs"
 old = "hook_order(&providers)"
 new = "{ let mut order = hook_order(&providers); order.reverse(); order } /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: a subscription for a different hook is never called.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-matching-kind"
 guards = "a subscription for a different hook is never called"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_tool_subscriber_is_not_called_for_other_subjects"]
 only = false
@@ -2152,12 +2412,16 @@ file = "crates/broca-core/src/hooks.rs"
 old = "sub.hook == subject.hook()"
 new = "(sub.hook == subject.hook() || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: mutate and validate subscriptions are not interchanged.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-matching-phase"
 guards = "mutate and validate subscriptions are not interchanged"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::matching_tool_coverage_and_phase_call_only_the_selected_subscription"]
 only = false
@@ -2165,24 +2429,33 @@ file = "crates/broca-core/src/hooks.rs"
 old = "sub.phase == subject.phase()"
 new = "(sub.phase == subject.phase() || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: only tools covered by a subscription receive its hook.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-matching-tools"
 guards = "only tools covered by a subscription receive its hook"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::matching_tool_coverage_and_phase_call_only_the_selected_subscription"]
 file = "crates/broca-core/src/hooks.rs"
 old = "tools.iter().any(|t| t == tool)"
 new = "tools.iter().any(|t| t == tool || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: a caller cancellation interrupts the in-flight hook rather
+# than becoming a timeout.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-caller-cancel"
 guards = "a caller cancellation interrupts the in-flight hook rather than becoming a timeout"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_batch"]
 only = false
@@ -2190,12 +2463,17 @@ file = "crates/broca-core/src/hooks.rs"
 old = "_ = cancelled(self.cancel) => HookCompletion::Cancelled(HookCancellation::CallerCancel),"
 new = "_ = std::future::pending::<()>() => HookCompletion::Cancelled(HookCancellation::CallerCancel), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a stop interrupts the in-flight hook and writes no dispatch
+# intent.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-stop-cancel"
 guards = "a stop interrupts the in-flight hook and writes no dispatch intent"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::pre_tool_stop_during_hook_writes_no_intent_and_finishes_batch"]
 only = false
@@ -2203,48 +2481,67 @@ file = "crates/broca-core/src/hooks.rs"
 old = "_ = cancelled(self.stop) => HookCompletion::Cancelled(HookCancellation::StopRequested),"
 new = "_ = std::future::pending::<()>() => HookCompletion::Cancelled(HookCancellation::StopRequested), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a seal cancels the pending hook before its budget expires.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-seal-cancel"
 guards = "a seal cancels the pending hook before its budget expires"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::seal_cancels_pending_hook_immediately_and_parks_without_an_input_slot"]
 file = "crates/broca-core/src/hooks.rs"
 old = "_ = async { match self.seal { Some(seal) => seal.tripped().await, None => std::future::pending().await } } => HookCompletion::Cancelled(HookCancellation::ShutdownSeal),"
 new = "_ = std::future::pending::<()>() => HookCompletion::Cancelled(HookCancellation::ShutdownSeal), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the sealed input hook never returns control to a writing
+# gate.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-input-seal-parks"
 guards = "the sealed input hook never returns control to a writing gate"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::seal_cancels_pending_hook_immediately_and_parks_without_an_input_slot"]
 file = "crates/broca-core/src/hooks.rs"
 old = "if self.seal.is_some_and(crate::ShutdownSeal::is_tripped)"
 new = "if false && self.seal.is_some_and(crate::ShutdownSeal::is_tripped) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: a sealed send returns a discardable cancellation instead of
+# parking its actor.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-pre-user-seal-does-not-park"
 guards = "a sealed send returns a discardable cancellation instead of parking its actor"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::pre_user_seal_cancellation_returns_discardable_output_instead_of_parking"]
 file = "crates/broca-core/src/hooks.rs"
 old = "&& output.subject.hook() != Hook::PreUser"
 new = "&& (output.subject.hook() != Hook::PreUser || true) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: pre_tool cancellation never applies an unavailable-refuse
+# policy.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-input-cancel-not-unavailable"
 guards = "pre_tool cancellation never applies an unavailable-refuse policy"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::input_hook_cancel_is_not_unavailability_and_never_applies_refuse_policy"]
 only = false
@@ -2252,12 +2549,17 @@ file = "crates/broca-core/src/hooks.rs"
 old = "if matches!(output.subject.hook(), Hook::PreUser | Hook::PreTool) {"
 new = "if false && matches!(output.subject.hook(), Hook::PreUser | Hook::PreTool) { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: an unavailable-refuse input hook is a terminal and never
+# dispatches.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-unavailable-refuse"
 guards = "an unavailable-refuse input hook is a terminal and never dispatches"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::pre_tool_unavailable_refuse_is_a_single_completed_intentless_result"]
 only = false
@@ -2267,12 +2569,17 @@ old = '''None if sub.on_unavailable == OnUnavailable::Refuse
 new = '''None if false && sub.on_unavailable == OnUnavailable::Refuse
                     || output.subject.phase() == Some(Phase::Approve) => // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: a cancelled pass-then-refuse chain is withheld by the
+# unanswered refuse provider.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-whole-chain-refuse"
 guards = "a cancelled pass-then-refuse chain is withheld by the unanswered refuse provider"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::post_tool_cancel_applies_remaining_refuse_policy_without_calling_later_provider"]
 only = false
@@ -2280,48 +2587,66 @@ file = "crates/broca-core/src/hooks.rs"
 old = "if sub.on_unavailable == OnUnavailable::Refuse {"
 new = "if false && sub.on_unavailable == OnUnavailable::Refuse { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the first pre_user call has no lineage member before any
+# record exists.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-first-pre-user-lineage"
 guards = "the first pre_user call has no lineage member before any record exists"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::first_pre_user_omits_lineage_then_recorded_session_supplies_it"]
 file = "crates/broca-core/src/hooks.rs"
 old = "if self.writer.next_record_seq() > 1 {"
 new = "if false && self.writer.next_record_seq() > 1 { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a caller-cancelled pre_tool gate ends the run Cancelled.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-caller-terminal-cause"
 guards = "a caller-cancelled pre_tool gate ends the run Cancelled"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::caller_cancel_during_pre_tool_finishes_cancelled"]
 file = "crates/broca-core/src/run.rs"
 old = "Some(BatchInterruption::CallerCancel) => Some(RunFinishReason::Cancelled),"
 new = "Some(BatchInterruption::CallerCancel) => Some(RunFinishReason::Interrupted), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a stop-requested pre_tool gate ends the run Interrupted.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-stop-terminal-cause"
 guards = "a stop-requested pre_tool gate ends the run Interrupted"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::stop_during_pre_tool_finishes_interrupted"]
 file = "crates/broca-core/src/run.rs"
 old = "Some(BatchInterruption::StopRequested) => Some(RunFinishReason::Interrupted),"
 new = "Some(BatchInterruption::StopRequested) => Some(RunFinishReason::Cancelled), // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: mutated inputs cross the existing membership and size
+# validation gate before validate hooks.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-mutated-input-revalidated"
 guards = "mutated inputs cross the existing membership and size validation gate before validate hooks"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::mutated_input_is_revalidated_before_validate_and_terminal_is_not_rehooked"]
 file = "crates/broca-core/src/run.rs"
@@ -2340,12 +2665,17 @@ new = '''if let Err(v) = if false { manifest.validate_call(&call) } else { Ok(()
                 },
                 hooks: trace.metadata(original, call.input.clone(), true),'''
 
+# This proof checks the following behavior: a cancellation during call k clears every earlier Dispatch
+# plan before barrier one.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-cancel-clears-planned-dispatches"
 guards = "a cancellation during call k clears every earlier Dispatch plan before barrier one"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_batch"]
 file = "crates/broca-core/src/run.rs"
@@ -2354,12 +2684,17 @@ old = '''if gating_stop.is_some() {
 new = '''if false && gating_stop.is_some() { // NON-VACUITY BREAK
         for entry in &mut plan {'''
 
+# This proof checks the following behavior: a hook terminal durable at barrier one cannot get a second
+# result at barrier two.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-intentless-terminal-once"
 guards = "a hook terminal durable at barrier one cannot get a second result at barrier two"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::validate_sees_approved_narrowed_args_and_denial_is_one_intentless_barrier_one_terminal"]
 file = "crates/broca-core/src/run.rs"
@@ -2368,12 +2703,17 @@ old = '''CallPlan::HookTerminal { result, .. } => {
 new = '''CallPlan::HookTerminal { result, .. } => {
             CallResolution::plain(Arc::unwrap_or_clone(result), Some(DispatchOutcome::Completed)) // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: disallowed answer kinds operations and block indexes become
+# unavailability.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-answer-rules"
 guards = "disallowed answer kinds operations and block indexes become unavailability"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::answers_must_obey_the_subscription_operation_and_subject_kind"]
 only = false
@@ -2403,12 +2743,17 @@ new = '''&& (check_answer(
                     )
                     .is_ok() || true) // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: a hook fallback can never be deposited after the seal takes
+# ownership.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-sealed-deposit"
 guards = "a hook fallback can never be deposited after the seal takes ownership"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::seal_linearization_keeps_answered_slots_until_handover_and_orders_parallel_fallbacks"]
 file = "crates/broca-core/src/shutdown_seal.rs"
@@ -2419,12 +2764,17 @@ new = '''pub fn deposit_hook_records(&self, stage: HookStage, records: Vec<WalRe
         let mut state = self.inner.state.lock().unwrap();
         if false && state.sealed { // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: a hook record cannot be enqueued by the loop after the seal
+# takes its slot.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-sealed-handover"
 guards = "a hook record cannot be enqueued by the loop after the seal takes its slot"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::seal_linearization_keeps_answered_slots_until_handover_and_orders_parallel_fallbacks"]
 only = false
@@ -2438,12 +2788,17 @@ new = '''records: Vec<WalRecord>,
         let mut state = self.inner.state.lock().unwrap();
         if false && state.sealed { // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: the run pauses before another tool batch or call if a hook
+# result cannot return to the run loop.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-lost-handover-parks"
 guards = "a lost hook handover never returns to batch turn or dispatch writers"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::lost_post_tool_handover_parks_before_batch_or_turn_markers"]
 only = false
@@ -2451,12 +2806,17 @@ file = "crates/broca-core/src/run/hook_dispatch.rs"
 old = "std::future::pending::<()>().await;"
 new = "// NON-VACUITY BREAK: allow the losing loop to advance"
 
+# This proof checks the following behavior: parallel post_tool slots are collected in batch source order
+# not tool id order.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-hook-slot-source-order"
 guards = "parallel post_tool slots are collected in batch source order not tool id order"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::parallel_post_tool_seal_writes_two_fallbacks_in_source_order"]
 only = false
@@ -2466,12 +2826,17 @@ old = '''source_index: usize,
 new = '''tool_call_id: String, // NON-VACUITY BREAK: derived Ord compares ids first
         source_index: usize,'''
 
+# This proof checks the following behavior: recovery from the write-ahead log rebuilds the run’s
+# terminal state when writing the run index fails.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-rederivation-upserts-missing-run"
 guards = "live WAL repair reconstructs a terminal run whose admission index write failed"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention.rs"
 expect_red = ["retention::tests::upsert_reconstructs_missing_retention_runs_without_content"]
 file = "crates/broca-store/src/retention.rs"
@@ -2485,24 +2850,34 @@ for (row, usage_json, finish_reason_json, state_changed_ms) in prepared {
             }
 """
 
+# This proof checks the following behavior: when a run expires, the database replaces stale active or
+# paused states with terminal states from the write-ahead log.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-kept-run-terminal-state"
 guards = "expiry row update replaces stale active and paused states with WAL terminals"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention.rs"
 expect_red = ["retention::tests::expiry_replaces_stale_active_and_paused_with_wal_terminals"]
 file = "crates/broca-store/src/retention.rs"
 old = "state=excluded.state, usage_json=excluded.usage_json,"
 new = "-- NON-VACUITY BREAK: preserve stale lifecycle state during expiry.\n                    state=run_index.state, usage_json=excluded.usage_json,"
 
+# This proof checks the following behavior: boot catch-up never requests export replay from deleted
+# retention WALs.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-boot-export-skips-expired-run"
 guards = "boot catch-up never requests export replay from deleted retention WALs"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention.rs"
 expect_red = ["retention::tests::boot_export_catch_up_skips_expired_runs_and_keeps_stored_facts"]
 file = "crates/broca-store/src/export_index.rs"
@@ -2583,24 +2958,34 @@ old = "**guard = lease.route.take();"
 new = "lease.route.take(); // NON-VACUITY BREAK"
 
 # Deferred-call reader projection proofs.
+# This proof checks the following behavior: the store does not send a question-closed notice after its
+# approval answer has already been recorded or used to continue the call.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "store-withdrawal-no-approval"
 guards = "answered or consumed approvals are never owed withdrawals"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["tests::withdrawal_projection_excludes_answered_calls"]
 file = "crates/broca-core/src/replay.rs"
 old = "if call.decision.is_none() && call.withdrawal_terminal && !call.withdrawal_acknowledged"
 new = "if call.withdrawal_terminal && !call.withdrawal_acknowledged // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: projection commits set withdrawal discovery debt before the
+# terminal index write.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "store-projection-sets-withdrawal-flag"
 guards = "projection commits set withdrawal discovery debt before the terminal index write"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["tests::deferred_projection_matches_replay_golden", "tests::withdrawal_projection_flag_survives_restart"]
 only = false
@@ -2608,12 +2993,17 @@ file = "crates/broca-store/src/lib.rs"
 old = "for run_id in prepared.withdrawals_owed_runs {"
 new = "for run_id in prepared.withdrawals_owed_runs.into_iter().take(0) { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: full-WAL re-projection never reflags an acknowledged
+# withdrawal.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "store-projection-acknowledgements-prevent-reflag"
 guards = "full-WAL re-projection never reflags an acknowledged withdrawal"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["tests::deferred_projection_matches_replay_golden"]
 file = "crates/broca-core/src/replay.rs"
@@ -2632,60 +3022,85 @@ file = "crates/broca-wal/src/lib.rs"
 old = "pub mod archive;"
 new = "pub mod archive;\nfn planted() -> WalRecord { WalRecord::LateDispatchIntent { call_key: String::new(), approval_digest: String::new(), batch_id: broca_protocol::BatchId(String::new()) } } // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a drained input renders its durable Queued.hooks.final
+# instead of the original payload.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-input-hooks-final"
 guards = "a drained input renders its durable Queued.hooks.final instead of the original payload"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::actor_input_hooks_are_rendered_and_recorded_without_final_metadata"]
 file = "crates/broca-core/src/run.rs"
 old = ".and_then(|hooks| hooks.final_value.as_ref())"
 new = ".filter(|_| false) /* NON-VACUITY BREAK */ .and_then(|hooks| hooks.final_value.as_ref())"
 
+# This proof checks the following behavior: RunStarted retains original operations and unavailable input
+# providers.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-input-hooks-recorded"
 guards = "RunStarted retains original operations and unavailable input providers"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::actor_input_hooks_are_rendered_and_recorded_without_final_metadata"]
 file = "crates/broca-core/src/run.rs"
 old = "hooks: control.input_hooks.clone().map(|mut hooks| {"
 new = "hooks: control.input_hooks.clone().filter(|_| false).map(|mut hooks| { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a refused first input is durably admitted then ends error
+# without calling the model.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-input-refusal-terminal"
 guards = "a refused first input is durably admitted then ends error without calling the model"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::actor_input_refusal_is_durable_before_any_provider_request"]
 file = "crates/broca-core/src/run.rs"
 old = "if let Some(error) = control.pre_user_error.clone() {"
 new = "if let Some(error) = control.pre_user_error.clone().filter(|_| false) { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the queue authority preserves pre_user output while
+# retaining the caller request.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-queued-input-hooks-replay"
 guards = "the queue authority preserves pre_user output while retaining the caller request"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/queue.rs"
 expect_red = ["queue::tests::queued_input_hooks_survive_replay_and_checkpoint_roundtrip"]
 file = "crates/broca-core/src/queue.rs"
 old = "hooks: hooks.clone(),"
 new = "hooks: None, // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: an admission checkpoint cannot drop a pending input
+# transform across a restart.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-queued-input-hooks-checkpoint"
 guards = "an admission checkpoint cannot drop a pending input transform across a restart"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/queue.rs"
 expect_red = ["queue::tests::queued_input_hooks_survive_replay_and_checkpoint_roundtrip"]
 file = "crates/broca-core/src/admission.rs"
@@ -2842,12 +3257,17 @@ file = "crates/broca-fetch-plan/src/admit.rs"
 old = 'answer: OpaqueJson::from_json_text(answer.to_string()).expect("JSON"),'
 new = 'answer: OpaqueJson::from_json_text(serde_json::to_string(&declaration).unwrap()).expect("JSON"), // NON-VACUITY BREAK'
 
+# This proof checks the following behavior: future catalog operation strings grant no permission to this
+# runner.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "unknown-catalog-op-is-ungranted"
 guards = "future catalog operation strings grant no permission to this runner"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/hooks.rs"
 expect_red = ["hooks::permission_tests::unknown_catalog_result_ops_grant_only_known_permissions"]
 file = "crates/broca-core/src/hooks.rs"
@@ -2870,12 +3290,17 @@ new = "pub(super) fn is_cfg_test_module_file(path: &Path) -> bool { if path.exis
 
 
 # Retained approval projection: the six controls proved alongside the metadata-only plan.
+# This proof checks the following behavior: for a retained approval, the store saves only that a
+# question was withdrawn; it never saves messages, checkpoint bodies, titles, or deferred-call text.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-approval-content-fence"
 guards = "retained approval plans persist only withdrawal discovery and never messages, checkpoint bodies, titles or deferred-call text"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retained_deferred_plan_keeps_only_content_free_withdrawal_flags"]
 expect_message = "retained debt must remain discoverable"
@@ -2885,12 +3310,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 new = "    // NON-VACUITY BREAK: route private approval content through ordinary projection.\n    if false && matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 
+# This proof checks the following behavior: retained withdrawal metadata failures increment their
+# warning counter in production rather than only in test builds.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-approval-warning-production"
 guards = "retained withdrawal metadata failures increment their warning counter in production rather than only in test builds"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::projection_warning_mutations_are_not_test_gated"]
 expect_message = "projection warning counter mutation is test-gated"
@@ -2900,12 +3330,17 @@ new = '''            tracing::warn!(target: "store", "retention withdrawal metad
             // NON-VACUITY BREAK: hide the retained metadata counter from release builds.
             #[cfg(test)]'''
 
+# This proof checks the following behavior: retained Prepared calls are refused when they lack the WAL
+# identity needed to link their approval metadata to the run.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-approval-lineage-proof"
 guards = "retained Prepared calls without a WAL lineage identity are refused instead of silently losing their approval metadata"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retained_prepared_call_without_lineage_is_refused"]
 expect_message = "Prepared call projection requires a WAL lineage identity"
@@ -2913,12 +3348,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if view.is_none()\n        && records"
 new = "    // NON-VACUITY BREAK: accept Prepared calls without a lineage proof.\n    if false && view.is_none()\n        && records"
 
+# This proof checks the following behavior: a SQLite commit that updates only metadata still preserves
+# the markers needed to find withdrawals for retained runs, without copying their message content.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-approval-sqlite-withdrawal-flag"
 guards = "SQLite metadata-only commits preserve withdrawal discovery for retained runs without projecting their content"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["tests::retained_deferred_projection_keeps_only_withdrawal_flags_and_no_disk_marker"]
 expect_message = "withdrawals_owed"
@@ -2927,12 +3367,17 @@ old = '                "UPDATE run_index SET withdrawals_owed=1 WHERE run_id=?1 
 new = '''                // NON-VACUITY BREAK: lose retained withdrawal discovery.
                 "UPDATE run_index SET withdrawals_owed=0 WHERE run_id=?1 AND session=?2'''
 
+# This proof checks the following behavior: the scanner detects approval content accidentally written to
+# the SQLite database or its live write-ahead log files.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-approval-sqlite-marker-scan"
 guards = "the retained approval marker scan detects content leaked into a real SQLite database or its live WAL sidecars"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["tests::retained_deferred_projection_keeps_only_withdrawal_flags_and_no_disk_marker"]
 expect_message = "retained approval text leaked into"
@@ -3053,12 +3498,17 @@ file = "crates/broca-module-serve/src/stall.rs"
 old = "!matches!(phase, Phase::AwaitFrame | Phase::Idle) && reader_age > self.stale_ms;"
 new = "!matches!(phase, Phase::AwaitFrame | Phase::Idle) && false && reader_age > self.stale_ms; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: long-lived WAL writer tasks leave Tokio’s blocking thread
+# pool available for short jobs and DNS resolution.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "idle-wal-writers-do-not-starve-blocking-pool"
 guards = "started resident WAL writers leave Tokio's blocking pool available for finite work and DNS"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer.rs"
 expect_red = ["wal_writer::tests::idle_writers_leave_tiny_blocking_pool_available_for_jobs_and_dns"]
 expect_message = "idle WAL writers starved a finite blocking job"
@@ -3651,24 +4101,34 @@ new = "        if let Some(reply) = reply.filter(|_| false) { // NON-VACUITY BRE
 # rows need the macOS rigs (SUBC_CORE_BIN, FAKE_AFT_STUB_BIN, BROCA_REQUIRE_SUBC=1) and the
 # test-clock feature, which moves the daemon's clock through its control file.
 
+# This proof checks the following behavior: a session key that identifies active write-ahead log files
+# in both wal/ and wal-ephemeral/ produces an error naming both paths.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-dual-live-wal-error"
 guards = "a session key resolving to a live WAL in both wal/ and wal-ephemeral/ is an error naming both paths"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
 expect_red = ["wal_writer::retention_tests::dual_live_wals_are_an_error_naming_both_paths"]
 file = "crates/broca-core/src/wal_writer.rs"
 old = "        if portable_live && ephemeral_live {"
 new = "        if false && portable_live && ephemeral_live { // NON-VACUITY BREAK: pick one of two live lineages"
 
+# This proof checks the following behavior: per-turn and final retention updates never save the run’s
+# message content.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-gate-persister-projection"
 guards = "per-turn and terminal projection of a retention lineage makes no content Persister call"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::retention_projection_skips_per_turn_and_terminal_persister_calls"]
 # Other retained-projection tests in the core library also reach this gate.
@@ -3683,12 +4143,17 @@ new = "    // NON-VACUITY BREAK: send retention turns through ordinary projectio
 # that drives its own path to that fence; only = false because the shared fence protects the
 # other retained projection cases in this target too.
 
+# This proof checks the following behavior: the first checkpoint saved when a run enters retention
+# contains no conversation body.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-gate-admission-checkpoint"
 guards = "a retention lineage's admission checkpoint write carries no checkpoint body"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retention_checkpoint_tail_has_no_content_body"]
 only = false
@@ -3696,12 +4161,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 new = "    // NON-VACUITY BREAK: write the retention checkpoint body.\n    if false && matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 
+# This proof checks the following behavior: queued or steered sends in retained data never save a
+# message title.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-gate-last-title"
 guards = "last_title from a retention lineage's Queued and Steered sends is never written"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retention_last_title_tail_has_no_title"]
 only = false
@@ -3709,12 +4179,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 new = "    // NON-VACUITY BREAK: index a retention send's title.\n    if false && matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 
+# This proof checks the following behavior: rebuilding retained metadata from a run’s saved WAL position
+# never resets existing metadata or writes stale metadata rows.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-gate-lineage-reproject"
 guards = "the read-path lineage reproject of a retention address writes no stale meta or content"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retention_lineage_reproject_never_resets_or_writes_stale_meta"]
 only = false
@@ -3722,12 +4197,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 new = "    // NON-VACUITY BREAK: reproject a retention lineage's content on a lineage mismatch.\n    if false && matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 
+# This proof checks the following behavior: importing a run into retention does not copy message content
+# into the store.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-gate-import"
 guards = "importing into a retention lineage projects no content rows"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retention_import_projection_has_no_content_rows"]
 only = false
@@ -3735,12 +4215,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 new = "    // NON-VACUITY BREAK: project imported retention content.\n    if false && matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 
+# This proof checks the following behavior: rebuilding retained data from an operator-supplied WAL
+# position creates no rows containing message content.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-gate-operator-reproject"
 guards = "an operator reproject from a watermark projects no content rows for a retention lineage"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/retention/tests.rs"
 expect_red = ["retention::tests::retention_operator_reproject_from_watermark_has_no_content_rows"]
 only = false
@@ -3748,12 +4233,17 @@ file = "crates/broca-core/src/projection_plan.rs"
 old = "    if matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 new = "    // NON-VACUITY BREAK: let an operator reproject write retention content.\n    if false && matches!(policy, Some(crate::LineageRetention::Retained { .. })) {"
 
+# This proof checks the following behavior: cold startup reads only wal/ and never treats an ephemeral
+# session under wal-ephemeral/ as an archived session.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-fold-skips-ephemeral"
 guards = "the cold-WAL fold enumerates only wal/ and never archives a wal-ephemeral/ session"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_never_enumerates_ephemeral_wals_even_when_cold"]
 # The break also fails every fold test whose state root has no wal-ephemeral/ directory.
@@ -3786,12 +4276,17 @@ file = "crates/broca-module/src/retention.rs"
 old = "                Some(s.lineage_id.as_str())\n                    == read.lineage_id"
 new = "                // NON-VACUITY BREAK: let any tombstone shadow the live WAL.\n                true || Some(s.lineage_id.as_str())\n                    == read.lineage_id"
 
+# This proof checks the following behavior: a metadata row means the address is still in use unless the
+# tombstone records removal from that same session history.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-meta-row-supersedes-tombstone"
 guards = "a meta row claims the address unless a tombstone names its own lineage"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
 expect_red = ["wal_writer::retention_tests::admission_existence_counts_meta_unless_its_own_lineage_is_tombstoned"]
 file = "crates/broca-core/src/wal_writer.rs"
@@ -4835,12 +5330,17 @@ file = "crates/broca-core/src/run.rs"
 old = "let seq = writer.record(prepared.clone()).into_result()?;"
 new = "let seq = writer.next_record_seq(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the first validation hook runs before the call is saved as
+# Prepared or filed as an approval question.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-first-validation-before-prepared"
 guards = "the first validate hook runs before Prepared and any filing"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::first_validation_refuses_before_prepared_and_filing"]
@@ -4850,12 +5350,17 @@ old = '''cortexkit_role_step_transform_provider::subscription::Phase::Approve,
 new = '''cortexkit_role_step_transform_provider::subscription::Phase::Approve,
                 // NON-VACUITY BREAK: omit first validation'''
 
+# This proof checks the following behavior: each retry files the same approval request key instead of
+# creating a new request identity.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-one-prepared-filing-key"
 guards = "every retry files under the same Prepared key rather than a new request identity"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::narrowed_input_is_frozen_as_jcs_and_filed_once_after_sync"]
@@ -4864,12 +5369,17 @@ old = "let filing_ctx = held.ctx(ctx);"
 new = '''let filing_ctx = held.ctx(ctx);
                         let held = Held { key: format!("retry-{timestamp}:{}", held.key), ..held }; // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: a refusal during the second validation ends the call and can
+# never authorize dispatch.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-second-validation-consumes-refusal"
 guards = "a second validation refusal becomes a terminal, never a dispatch authorization"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::second_validation_consumes_unavailability_even_when_subscription_passes"]
@@ -4877,12 +5387,17 @@ file = "crates/broca-core/src/run.rs"
 old = "if let Some(mut result) = result {"
 new = "if let Some(mut result) = None::<CallResolution> { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: validate subscriptions that pass on unavailability still
+# refuse during second validation.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-second-validation-unavailable-refuses"
 guards = "validate subscriptions that pass on unavailability still refuse during second validation"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::second_validation_consumes_unavailability_even_when_subscription_passes"]
@@ -4890,12 +5405,17 @@ file = "crates/broca-core/src/hooks.rs"
 old = "sub.on_unavailable = OnUnavailable::Refuse;"
 new = "sub.on_unavailable = OnUnavailable::Pass; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a completed sibling is synced before the wait continues
+# polling answers.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-sibling-result-sync"
 guards = "a completed sibling is synced before the wait continues polling answers"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::sibling_result_is_synced_while_approval_waits_and_expiry_uses_brocas_clock"]
@@ -4919,12 +5439,16 @@ file = "crates/broca-core/src/run.rs"
 old = "Slot::Held(call) if !call.approved => Some(broca_wal::AwaitingApprovalEntry {"
 new = "Slot::Held(call) if false && !call.approved => Some(broca_wal::AwaitingApprovalEntry { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a restart pause cannot drop an in-flight sibling dispatch.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-stop-drains-dispatch"
 guards = "a restart pause cannot drop an in-flight sibling dispatch"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::in_wait_stop_drains_a_dispatched_sibling_before_restart_pause"]
@@ -4932,12 +5456,17 @@ file = "crates/broca-core/src/run.rs"
 old = "if stopping && dispatched.is_empty() && active.is_empty() {"
 new = "if stopping { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a restarted wait charges usage from CacheWarmed records in
+# its own batch.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-resume-warm-spend"
 guards = "a restarted wait charges usage from CacheWarmed records in its own batch"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::restart_wait_spend_uses_batch_cache_warmed_usage_and_starts_no_extra_warm"]
@@ -4959,12 +5488,17 @@ file = "crates/broca-core/src/consent.rs"
 old = '''Err(error) if error.code == "cursor_incarnation_changed" && !reset => {'''
 new = '''Err(error) if false && error.code == "cursor_incarnation_changed" && !reset => { // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: an expired ordinary terminal remains eligible for its one
+# late answer.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-classify-late-before-dedup"
 guards = "an expired ordinary terminal remains eligible for its one late answer"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::answer_read_after_broca_expiry_is_classified_late_before_terminal_deduplication"]
@@ -4990,12 +5524,17 @@ file = "crates/broca-core/src/run.rs"
 old = "crate::consent::answer(&question.record, &key, &held.prepared)"
 new = '''crate::consent::answer(&question.record, &key, &held.prepared).map(|answer| answer.or_else(|| Some(crate::consent::ConsentAnswer { id: id.clone(), decision: crate::consent::ConsentDecision::None, record: question.record.clone() }))) // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: an isolated late dispatch with an intent but no result
+# resumes unknown and is never resent.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-late-at-most-once"
 guards = "an isolated late dispatch with an intent but no result resumes unknown and is never resent"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_every_cut"]
@@ -5003,12 +5542,17 @@ file = "crates/broca-core/src/run.rs"
 old = "if dispatch_exists {"
 new = "if false && dispatch_exists { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a missing elicitation adapter closes approve calls before
+# any deferred-call record is emitted.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-no-adapter-no-prepared"
 guards = "a missing elicitation adapter closes approve calls before any deferred-call record is emitted"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::absent_elicitation_adapter_closes_before_prepared_and_installed_plane_prepares"]
@@ -5016,12 +5560,17 @@ file = "crates/broca-core/src/run.rs"
 old = "if !elicitation_installed {"
 new = "if false && !elicitation_installed { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: late execution rechecks pending cancellation and shutdown
+# after successful scope validation.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-late-post-validation-cancel"
 guards = "late execution rechecks pending cancellation and shutdown after successful scope validation"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::late_cancel_at_successful_scope_recheck_starts_no_dispatch"]
@@ -5033,12 +5582,17 @@ old = '''// A successful recheck can trip either token in its final poll.
             }'''
 new = '''// NON-VACUITY BREAK: ignore cancellation after successful validation'''
 
+# This proof checks the following behavior: recorded running and late approvals never execute without an
+# installed elicitation adapter.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-existing-work-requires-adapter"
 guards = "recorded running and late approvals never execute without an installed elicitation adapter"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::running_approved_resume_without_elicitation_plane_never_dispatches", "run::approval_tests::recorded_late_approval_without_elicitation_plane_never_dispatches"]
@@ -5081,12 +5635,17 @@ new = '''let mut state = self.state.lock().unwrap();
         if matches!(state.pending.last().map(|frame| &frame.record), Some(WalRecord::ApprovalRecorded { .. })) { return Ok(()); } // NON-VACUITY BREAK: skip the approval's own barrier.
         state.synced = state.pending.clone();'''
 
+# This proof checks the following behavior: approval logic uses the sync-aware memory WAL by default
+# rather than timing filesystem fsync.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-logic-defaults-to-memory-wal"
 guards = "approval logic uses the sync-aware memory WAL by default rather than timing filesystem fsync"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::unreadable_answer_does_not_advance_cursor", "run::approval_tests::store_resume_open_batch_pause_preserves_next_request_bytes"]
@@ -5107,12 +5666,17 @@ file = "crates/broca-subc/src/consent.rs"
 old = "ConsentError::AcceptedFilingReplyUnreadable(message)"
 new = "ConsentError::Protocol(message) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: caller cancellation racing restart pause seals Cancelled in
+# the summary and durable RunFinished.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-approval-cancel-wins-restart-pause"
 guards = "caller cancellation racing restart pause seals Cancelled in the summary and durable RunFinished"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::cancel_racing_restart_pause_withdraws_deferred_questions"]
@@ -5128,12 +5692,17 @@ new = '''&run_id,
             usage,
             retries_used,'''
 
+# This proof checks the following behavior: both ordinary and approval-gated calls apply policy to
+# validated mutated input before approve validation or freeze.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-pre-tool-policy-after-mutate"
 guards = "both ordinary and approval-gated calls apply policy to validated mutated input before approve validation or freeze"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::approval_gated_mutated_input_denied_before_ask_never_prepares_or_files"]
@@ -5578,12 +6147,17 @@ file = "crates/broca-module/src/actor.rs"
 old = "self.executor.elicitation_plane().is_none()"
 new = "false /* NON-VACUITY BREAK: retry refused reader resumes */"
 
+# This proof checks the following behavior: store maintenance sets WAL-derived reader debt when
+# reconciling an Active row to terminal.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "approval-audit-maintenance-terminal-debt"
 guards = "store maintenance sets WAL-derived reader debt when reconciling an Active row to terminal"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/withdrawal_writer_tests.rs"
 expect_red = ["withdrawal_writer_tests::maintenance_terminal_reconciliation_preserves_unprojected_reader_debt"]
 file = "crates/broca-store/src/lib.rs"
@@ -5603,12 +6177,17 @@ file = "crates/broca-module/src/retention.rs"
 old = "metadata.withdrawals_owed_runs.contains(&run_id.0)"
 new = "false /* NON-VACUITY BREAK: omit retained run debt */"
 
+# This proof checks the following behavior: retention upsert persists supplied WAL-derived discovery on
+# reconstructed terminal rows.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "approval-audit-retention-upsert-debt"
 guards = "retention upsert persists supplied WAL-derived discovery on reconstructed terminal rows"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention.rs"
 expect_red = ["retention::tests::retention_terminal_upsert_preserves_withdrawal_discovery"]
 file = "crates/broca-store/src/retention.rs"
@@ -5720,12 +6299,16 @@ file = "crates/broca-module/src/registry.rs"
 old = 'reason: "incomplete_tail".into(),'
 new = 'reason: "none".into(), // NON-VACUITY BREAK: erase incomplete-tail reason'
 
+# This proof checks the following behavior: setting withdrawal discovery for a missing row fails loudly.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "approval-audit-missing-index-row"
 guards = "setting withdrawal discovery for a missing row fails loudly"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/withdrawal_writer_tests.rs"
 expect_red = ["withdrawal_writer_tests::setting_withdrawal_debt_for_a_missing_run_fails_loudly"]
 file = "crates/broca-store/src/lib.rs"
@@ -5749,24 +6332,34 @@ file = "crates/broca-module/src/actor.rs"
 old = "flagged.map(|flagged| debt || flagged)"
 new = "flagged.map(|_flagged| debt) // NON-VACUITY BREAK: ignore completed discovery debt"
 
+# This proof checks the following behavior: a borrowed metadata tap does not observe unsynced appends,
+# even without subscribers.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "approval-audit-durable-tap-sync"
 guards = "a borrowed metadata tap does not observe unsynced appends, even without subscribers"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer.rs"
 expect_red = ["wal_writer::tests::durable_tap_ignores_unsynced_appends_without_subscribers"]
 file = "crates/broca-core/src/wal_writer.rs"
 old = "pending_observed.push((assigned, record));"
 new = "if let Some(obs) = &observer { obs.observe_tap(assigned, fence, wal.lineage_id(), &record); } pending_observed.push((assigned, record)); // NON-VACUITY BREAK: publish before sync"
 
+# This proof checks the following behavior: a panicking metadata tap marks its state unknown without
+# poisoning the writer.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "approval-audit-tap-panic-unknown"
 guards = "a panicking metadata tap marks its state unknown without poisoning the writer"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer.rs"
 expect_red = ["wal_writer::tests::panicking_durable_tap_marks_unknown_without_poisoning_writer"]
 file = "crates/broca-core/src/wal_writer.rs"
@@ -5877,24 +6470,34 @@ file = "crates/broca-store/src/retention_withdrawals.rs"
 old = "BindPrincipal::Unknown(_) => None,"
 new = "BindPrincipal::Unknown(value) => Some(Self::Reserved { module_id: value.to_string() }), // NON-VACUITY BREAK: retain unknown principal payload as identity"
 
+# This proof checks the following behavior: the writer freezes stamped agent-run scopes and advances
+# frozen ones, including internal resumes.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-run-writer-enabled"
 guards = "the writer freezes stamped agent-run scopes and advances frozen ones, including internal resumes"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::agent_run_tests::writer_freezes_and_advances_agent_run_scopes", "run::tests::direct_core_writer_freezes_agent_run_scope"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "pub const AGENT_RUN_SCOPES_WRITER_ENABLED: bool = true;"
 new = "pub const AGENT_RUN_SCOPES_WRITER_ENABLED: bool = false; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: agent-run scope identity is preserved by the WAL reader and
+# gated away from old readers.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-run-wal-must-understand"
 guards = "agent-run scope identity is preserved by the WAL reader and gated away from old readers"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/framing.rs"
 expect_red = ["framing::tests::agent_run_scope_round_trips_and_old_readers_refuse_its_identity"]
 file = "crates/broca-wal/src/record.rs"
@@ -5927,12 +6530,17 @@ file = "crates/broca-core/src/scope_admission.rs"
 old = "if stamped.and_then(|scope| scope.agent_id.as_ref()) != frozen.agent_id.as_ref() {"
 new = "if false && stamped.and_then(|scope| scope.agent_id.as_ref()) != frozen.agent_id.as_ref() { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: export facts copy the stamped agent run without replacing
+# broca run_id or changing ordinary bytes and fact_id.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-run-export-attribution"
 guards = "export facts copy the stamped agent run without replacing broca run_id or changing ordinary bytes and fact_id"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/billing.rs"
 expect_red = ["billing::tests::agent_run_export_attribution_preserves_ordinary_bytes_and_fact_identity"]
 file = "crates/broca-core/src/billing.rs"
@@ -5992,12 +6600,17 @@ file = "crates/broca-module-serve/src/serve.rs"
 old = "let run_id = stamp.attributes.run_id.clone();"
 new = "let run_id = stamp.attributes.run_id.clone();\n    let _delegates = stamp.attributes.delegates; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: direct public core calls admit and freeze agent-run scopes
+# with the writer enabled.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-run-direct-core-writer-fence"
 guards = "direct public core calls admit and freeze agent-run scopes with the writer enabled"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::direct_core_writer_freezes_agent_run_scope"]
 file = "crates/broca-core/src/run.rs"
@@ -6067,24 +6680,34 @@ new = '''self.elicitation_plane
                 .filter(|_| false) // NON-VACUITY BREAK: production has no question plane
                 .map(|plane| plane.clone() as Arc<dyn broca_core::tool_plane::ElicitationPlane>)'''
 
+# This proof checks the following behavior: content-retention-expired sessions are serviced only from
+# retention's content-free withdrawal ledger.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "store-boot-debt-excludes-expired-content"
 guards = "content-retention-expired sessions are serviced only from retention's content-free withdrawal ledger"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["tests::boot_withdrawal_discovery_excludes_retention_expired_runs"]
 file = "crates/broca-store/src/lib.rs"
 old = 'SELECT run_id, session FROM run_index WHERE withdrawals_owed=1 AND expired_at_ms IS NULL ORDER BY run_id ASC'
 new = 'SELECT run_id, session FROM run_index WHERE withdrawals_owed=1 ORDER BY run_id ASC /* NON-VACUITY BREAK: reopen expired content */'
 
+# This proof checks the following behavior: store-assisted resume excludes the pending model step from
+# committed prompt history for every open-batch pause and preserves next-request bytes.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-paused-open-batch-history-boundary"
 guards = "store-assisted resume excludes the pending model step from committed prompt history for every open-batch pause and preserves next-request bytes"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 features = ["test-clock"]
 test_file = "crates/broca-core/src/run/approval_tests.rs"
 expect_red = ["run::approval_tests::store_resume_open_batch_pause_preserves_next_request_bytes"]
@@ -7168,36 +7791,50 @@ file = "crates/broca-module/src/actor.rs"
 old = "if !steer_auth_pin_matches(pin, frozen.auth_selection.as_ref()) {"
 new = "if false && !steer_auth_pin_matches(pin, frozen.auth_selection.as_ref()) { // NON-VACUITY BREAK: drop the auth comparison"
 
+# This proof checks the following behavior: cancel and retract refuse a foreign reserved principal and
+# name the accepted owner.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "session-owner-cancel-retract-foreign"
 guards = "cancel and retract refuse a foreign reserved principal and name the accepted owner"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::owner_access_tests::foreign_principal_is_refused_with_accepted_identity"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if is_owner {"
 new = "if is_owner || (ownership.scope.is_some() && matches!(principal, Some(BindPrincipal::Reserved { .. }))) { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: the frozen scope owner can cancel and retract on unscoped
+# routes after its epoch ends.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "session-owner-cancel-retract-unscoped-cleanup"
 guards = "the frozen scope owner can cancel and retract on unscoped routes after its epoch ends"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::owner_access_tests::scope_owner_is_admitted_on_unscoped_route_and_any_epoch"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = ".is_some_and(|scope| principal == Some(&scope.owner)));"
 new = ".is_some_and(|scope| matches!(send, SendScope::Stamped(_)) && principal == Some(&scope.owner))); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: direct key holders are never owners of a protected session.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "session-owner-cancel-retract-direct"
 guards = "direct key holders are never owners of a protected session"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/scope_admission.rs"
 expect_red = ["scope_admission::owner_access_tests::direct_is_never_an_owner_of_a_protected_session"]
 file = "crates/broca-core/src/scope_admission.rs"
@@ -7555,12 +8192,16 @@ file = "scripts/lib/liveness.py"
 old = "    return state_root.default_state_root(env, platform=platform)"
 new = "    return state_root.default_state_root({key: value.split()[0] for key, value in env.items() if value}, platform=platform)  # NON-VACUITY BREAK: whitespace tokens"
 
+# This proof checks the following behavior: WAL creation supplies a protected account+SYSTEM ACL.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-wal-create-owner-only"
 guards = "WAL creation supplies a protected account+SYSTEM ACL"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::windows_acl_tests::windows_wal_manifest_and_archive_creation_is_private"]
 platforms = ["windows"]
@@ -7568,12 +8209,17 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "let mut create_opts = OpenOptions::new();"
 new = "let mut create_opts = std::fs::OpenOptions::new(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: diagnostic WAL manifest creation does not inherit a broad
+# ACL.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-wal-manifest-create-owner-only"
 guards = "diagnostic WAL manifest creation does not inherit a broad ACL"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::windows_acl_tests::windows_wal_manifest_and_archive_creation_is_private"]
 platforms = ["windows"]
@@ -7581,12 +8227,16 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "let mut options = OpenOptions::new();"
 new = "let mut options = std::fs::OpenOptions::new(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: new WAL directories have protected private ACLs.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-wal-directory-owner-only"
 guards = "new WAL directories have protected private ACLs"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::windows_acl_tests::windows_wal_manifest_and_archive_creation_is_private"]
 platforms = ["windows"]
@@ -7594,12 +8244,17 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "broca_owner_only::create_dir_all(dir)"
 new = "std::fs::create_dir_all(dir) /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: both WAL open APIs refuse before reading, replaying or
+# truncating a non-private WAL.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-wal-check-before-replay"
 guards = "both WAL open APIs refuse before reading, replaying or truncating a non-private WAL"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::windows_acl_tests::windows_existing_wal_refused_before_replay", "file_wal::windows_acl_tests::windows_manifest_wal_refused_before_replay"]
 platforms = ["windows"]
@@ -7612,12 +8267,17 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "            replay_path_with_valid_end(&path, DEFAULT_MAX_READ_BYTES)?;"
 new = "            replay_path_with_valid_end(&path, DEFAULT_MAX_READ_BYTES)?;\n        broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: manifest-enabled WAL opens reach the same pre-replay ACL
+# check.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-wal-check-shared-open-boundary"
 guards = "manifest-enabled WAL opens reach the same pre-replay ACL check"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::windows_acl_tests::windows_manifest_wal_refused_before_replay"]
 platforms = ["windows"]
@@ -7630,12 +8290,16 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "        Self::open_inner(path.into(), None, None)"
 new = "        let path = path.into();\n        broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?;\n        Self::open_inner(path, None, None) // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: archive containers are private at creation.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-archive-create-owner-only"
 guards = "archive containers are private at creation"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::windows_acl_tests::windows_wal_manifest_and_archive_creation_is_private"]
 platforms = ["windows"]
@@ -7643,12 +8307,17 @@ file = "crates/broca-wal/src/archive.rs"
 old = "let mut options = OpenOptions::new();"
 new = "let mut options = std::fs::OpenOptions::new(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: feature floor temporary and replacement files are private
+# before publication.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-floor-temp-owner-only"
 guards = "feature floor temporary and replacement files are private before publication"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/floor.rs"
 expect_red = ["floor::windows_acl_tests::windows_floor_temporary_and_replacement_are_private"]
 platforms = ["windows"]
@@ -7658,12 +8327,16 @@ old = '''let mut options = broca_owner_only::OpenOptions::new();
 new = '''let mut options = std::fs::OpenOptions::new(); // NON-VACUITY BREAK
         options.write(true).create_new(true);'''
 
+# This proof checks the following behavior: feature-floor publication creates private directories.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-floor-directory-owner-only"
 guards = "feature-floor publication creates private directories"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/floor.rs"
 expect_red = ["floor::windows_acl_tests::windows_floor_temporary_and_replacement_are_private"]
 platforms = ["windows"]
@@ -7671,12 +8344,17 @@ file = "crates/broca-wal/src/floor.rs"
 old = "broca_owner_only::create_dir_all(dir)?;"
 new = "std::fs::create_dir_all(dir)?; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: SqliteStore refuses database and sidecar ACLs before SQLite
+# opens or initialises them.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-sqlite-check-before-init"
 guards = "SqliteStore refuses database and sidecar ACLs before SQLite opens or initialises them"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["windows_acl_tests::windows_sqlite_refuses_acl_before_initialisation"]
 platforms = ["windows"]
@@ -7684,12 +8362,17 @@ file = "crates/broca-store/src/lib.rs"
 old = "        prepare_private_sqlite(path).map_err(|source| StoreError::PrivateAccess {"
 new = "        Ok::<(), std::io::Error>(()).map_err(|source| StoreError::PrivateAccess { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: existing SQLite WAL, SHM and journal ACLs are checked before
+# SQLite initialisation.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-sqlite-sidecar-acl-check"
 guards = "existing SQLite WAL, SHM and journal ACLs are checked before SQLite initialisation"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["windows_acl_tests::windows_sqlite_refuses_acl_before_initialisation"]
 platforms = ["windows"]
@@ -7697,12 +8380,17 @@ file = "crates/broca-store/src/lib.rs"
 old = "        broca_owner_only::validate_if_exists(std::path::PathBuf::from(sidecar))?;"
 new = "        let _ = sidecar; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: SQLite may create sidecars only under an inspectable private
+# inheritable parent.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-sqlite-parent-inheritance-check"
 guards = "SQLite may create sidecars only under an inspectable private inheritable parent"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["windows_acl_tests::windows_sqlite_refuses_acl_before_initialisation"]
 platforms = ["windows"]
@@ -7710,12 +8398,17 @@ file = "crates/broca-store/src/lib.rs"
 old = "    broca_owner_only::validate_inheritable_directory(parent)?;"
 new = "    let _ = parent; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: new SQLite databases get protected ACLs before SQLite
+# initialises them.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-sqlite-create-owner-only"
 guards = "new SQLite databases get protected ACLs before SQLite initialises them"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["windows_acl_tests::windows_sqlite_creation_and_recreated_sidecars_are_private"]
 platforms = ["windows"]
@@ -7723,12 +8416,17 @@ file = "crates/broca-store/src/lib.rs"
 old = "    match broca_owner_only::OpenOptions::new()"
 new = "    match std::fs::OpenOptions::new() /* NON-VACUITY BREAK */"
 
+# This proof checks the following behavior: caps database uses the same pre-initialisation ACL boundary
+# as the run index.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-caps-check-before-init"
 guards = "caps database uses the same pre-initialisation ACL boundary as the run index"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["windows_acl_tests::windows_sqlite_refuses_acl_before_initialisation"]
 platforms = ["windows"]
@@ -7862,12 +8560,17 @@ file = "crates/broca-catalog/src/runtime.rs"
 old = "let create_parent = broca_owner_only::create_dir_all(parent);"
 new = "let create_parent = fs::create_dir_all(parent); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: archive extraction temporary files are private before
+# publication.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-extraction-file-owner-only"
 guards = "archive extraction temporary files are private before publication"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/extraction.rs"
 expect_red = ["wal_writer::extraction::windows_acl_tests::windows_extraction_temporary_and_replacement_are_private"]
 platforms = ["windows"]
@@ -7875,12 +8578,17 @@ file = "crates/broca-core/src/wal_writer/extraction.rs"
 old = "let mut options = OpenOptions::new();"
 new = "let mut options = std::fs::OpenOptions::new(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: archive extraction creates private directories without
+# changing existing ancestors.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-extraction-directory-owner-only"
 guards = "archive extraction creates private directories without changing existing ancestors"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/extraction.rs"
 expect_red = ["wal_writer::extraction::windows_acl_tests::windows_extraction_temporary_and_replacement_are_private"]
 platforms = ["windows"]
@@ -7888,12 +8596,16 @@ file = "crates/broca-core/src/wal_writer/extraction.rs"
 old = "broca_owner_only::create_dir_all(parent)?;"
 new = "std::fs::create_dir_all(parent)?; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: fold journal creation supplies protected private security.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-fold-journal-owner-only"
 guards = "fold journal creation supplies protected private security"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold.rs"
 expect_red = ["wal_fold::windows_acl_tests::windows_fold_journal_archive_and_unfold_temp_are_private"]
 platforms = ["windows"]
@@ -7901,12 +8613,16 @@ file = "crates/broca-core/src/wal_fold.rs"
 old = "let mut opts = OpenOptions::new();"
 new = "let mut opts = std::fs::OpenOptions::new(); // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: archive fold directories are private at creation.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-fold-directory-owner-only"
 guards = "archive fold directories are private at creation"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold.rs"
 expect_red = ["wal_fold::windows_acl_tests::windows_fold_journal_archive_and_unfold_temp_are_private"]
 platforms = ["windows"]
@@ -7914,12 +8630,17 @@ file = "crates/broca-core/src/wal_fold.rs"
 old = "broca_owner_only::create_dir_all(&dir)?;"
 new = "fs::create_dir_all(&dir)?; // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: unfold replacement files are private before cleanup and
+# publication.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-unfold-temp-owner-only"
 guards = "unfold replacement files are private before cleanup and publication"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold.rs"
 expect_red = ["wal_fold::windows_acl_tests::windows_fold_journal_archive_and_unfold_temp_are_private"]
 platforms = ["windows"]
@@ -8031,12 +8752,17 @@ file = "crates/broca-module-serve/src/vault_config.rs"
 old = "    broca_owner_only::validate(path).map_err(|source| VaultHandlesError::Inspect {"
 new = "    Ok::<(), std::io::Error>(()).map_err(|source| VaultHandlesError::Inspect { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: SQLite sidecar creation inherits only private full-access
+# account+SYSTEM entries.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "windows-directory-private-inheritance"
 guards = "SQLite sidecar creation inherits only private full-access account+SYSTEM entries"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/lib.rs"
 expect_red = ["windows_acl_tests::windows_sqlite_creation_and_recreated_sidecars_are_private"]
 platforms = ["windows"]
@@ -8575,24 +9301,34 @@ file = "scripts/lib/archive_read.py"
 old = '            if refuse_sidecars:'
 new = '            if False:  # NON-VACUITY BREAK: allow repair of hidden addresses'
 
+# This proof checks the following behavior: a failed activation must not suppress an unfinished episode
+# already in the local WAL.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "billing-floor-incoming-minus-local"
 guards = "a failed activation must not suppress an unfinished episode already in the local WAL"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/billing.rs"
 expect_red = ["billing::tests::imported_run_floor_is_incoming_minus_local_started_ids"]
 file = "crates/broca-core/src/billing.rs"
 old = '.difference(&started_ids(local))'
 new = '.union(&started_ids(local)) // NON-VACUITY BREAK: suppress local episodes too'
 
+# This proof checks the following behavior: SQLite direct and retention emission cannot mint facts for
+# imported runs after projection reset and reopen.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "billing-floor-sqlite-emission"
 guards = "SQLite direct and retention emission cannot mint facts for imported runs after projection reset and reopen"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::billing_floor_blocks_imported_emission_after_reopen_and_projection_drop"]
 expect_message = "imported runs minted facts"
@@ -8600,12 +9336,17 @@ file = "crates/broca-store/src/export_index.rs"
 old = '            if imported {'
 new = '            if imported && false { // NON-VACUITY BREAK: ignore imported billing floor'
 
+# This proof checks the following behavior: SQLite backfill outbox excludes imported terminal runs even
+# though they have no local facts.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "billing-floor-sqlite-outbox"
 guards = "SQLite backfill outbox excludes imported terminal runs even though they have no local facts"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::billing_floor_excludes_imported_runs_from_backfill_and_retention"]
 expect_message = "imported run remained in backfill outbox"
@@ -8613,12 +9354,17 @@ file = "crates/broca-store/src/export_index.rs"
 old = 'WHERE imported.session = runs.session AND imported.run_id = runs.run_id'
 new = 'WHERE imported.session = runs.session AND imported.run_id = runs.run_id AND 0=1 -- NON-VACUITY BREAK'
 
+# This proof checks the following behavior: SQLite billing-floor repeats succeed without replacing or
+# removing existing imported ids.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "billing-floor-sqlite-idempotent"
 guards = "SQLite billing-floor repeats succeed without replacing or removing existing imported ids"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::billing_floor_blocks_imported_emission_after_reopen_and_projection_drop"]
 expect_message = "UNIQUE constraint failed"
@@ -8846,36 +9592,48 @@ old = '''            broca/target/rig-survivors/*.txt'''
 new = '''            broca/target/rig-survivors-disabled/*.txt # NON-VACUITY BREAK: omit the survivor dump directory'''
 
 # Session-move reader and cut-authority guards.
+# This proof checks the following behavior: a second cut cannot replace an existing session freeze.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-freeze-exclusive"
 guards = "a second cut cannot replace an existing session freeze"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::freeze_is_exclusive_and_abort_never_removes_another_cuts_owner"]
 file = "crates/broca-wal/src/migration.rs"
 old = 'fs::hard_link(temp, destination)'
 new = 'fs::rename(temp, destination) /* NON-VACUITY BREAK: replace a late freeze owner */'
 
+# This proof checks the following behavior: abort unlinks only its own freeze and never another cut's.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-abort-owner"
 guards = "abort unlinks only its own freeze and never another cut's"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::freeze_is_exclusive_and_abort_never_removes_another_cuts_owner"]
 file = "crates/broca-wal/src/migration.rs"
 old = 'if owner.cut_id == cut_id {'
 new = 'if true { // NON-VACUITY BREAK: abort another owner'
 
+# This proof checks the following behavior: release cannot convert another cut's freeze to a tombstone.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-release-owner"
 guards = "release cannot convert another cut's freeze to a tombstone"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::release_publishes_tombstone_before_unlink_and_repeats_clean_its_own_freeze"]
 file = "crates/broca-wal/src/migration.rs"
@@ -8884,24 +9642,34 @@ old = '''.ok_or_else(|| invalid("release has no owned freeze"))?;
 new = '''.ok_or_else(|| invalid("release has no owned freeze"))?;
     if false && owner.cut_id != cut_id { // NON-VACUITY BREAK'''
 
+# This proof checks the following behavior: a reader release freezes a first-time installation with no
+# sidecar.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-activation-intent-reader"
 guards = "a reader release freezes a first-time installation with no sidecar"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::intent_fence_is_ref_scoped_read_only_and_survives_reader_downgrade"]
 file = "crates/broca-wal/src/migration.rs"
 old = '!matches!(op, "release" | "activate")'
 new = '!matches!(op, "release") /* NON-VACUITY BREAK: ignore activation intents */'
 
+# This proof checks the following behavior: pending intents freeze only the refs they name, not
+# unrelated workers.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-fence-ref-scope"
 guards = "pending intents freeze only the refs they name, not unrelated workers"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::intent_fence_is_ref_scoped_read_only_and_survives_reader_downgrade"]
 file = "crates/broca-wal/src/migration.rs"
@@ -8967,36 +9735,48 @@ new = '''        // NON-VACUITY BREAK: disclose the move fence before checking t
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);'''
 
+# This proof checks the following behavior: already-open writers refuse every append after a freeze.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-existing-writer-freeze"
 guards = "already-open writers refuse every append after a freeze"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::existing_writer_rechecks_freeze_before_every_append"]
 file = "crates/broca-wal/src/file_wal.rs"
 old = 'crate::migration::guard(&self.path, &self.session_ref, true)?;'
 new = '// NON-VACUITY BREAK: append without rechecking move authority'
 
+# This proof checks the following behavior: staging never becomes a live writer or session population.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-staging-reader-open"
 guards = "staging never becomes a live writer or session population"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::staging_digest_and_population_are_not_live_session_inputs"]
 file = "crates/broca-wal/src/file_wal.rs"
 old = 'crate::migration::guard(&path, "", true)?;'
 new = '// NON-VACUITY BREAK: open an unpublished staged WAL'
 
+# This proof checks the following behavior: a digest mismatch publishes no staging file.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-staging-digest"
 guards = "a digest mismatch publishes no staging file"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::staging_digest_and_population_are_not_live_session_inputs"]
 file = "crates/broca-wal/src/migration.rs"
@@ -9177,24 +9957,34 @@ file = "crates/broca-core/src/wal_writer.rs"
 old = 'self.check_move(session, true)?;'
 new = '// NON-VACUITY BREAK: open without the ref-scoped intent fence'
 
+# This proof checks the following behavior: a tombstone hides archived bytes without restoring the
+# archived WAL.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-core-archived-read"
 guards = "a tombstone hides archived bytes without restoring the archived WAL"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::moved_sidecar_hides_archived_session_without_restoring_it"]
 file = "crates/broca-core/src/wal_writer.rs"
 old = 'broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;'
 new = '// NON-VACUITY BREAK: expose the archived old copy'
 
+# This proof checks the following behavior: folds never archive or unlink a WAL held by a pending move
+# intent.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "move-fold-intent-fence"
 guards = "folds never archive or unlink a WAL held by a pending move intent"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::fold_fences_only_refs_named_by_pending_activation"]
 file = "crates/broca-core/src/wal_fold.rs"
@@ -10355,24 +11145,34 @@ file = "crates/broca-module/src/cache.rs"
 old = 'const EVICTION_SCAN_LIMIT: usize = 256;'
 new = 'const EVICTION_SCAN_LIMIT: usize = 0; // NON-VACUITY BREAK: never reclaim inactive entries.'
 
+# This proof checks the following behavior: Recovery discards damaged final logical records, including
+# trailing lineage metadata.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-full-length-corrupt-tail"
 guards = "Recovery discards damaged final logical records, including trailing lineage metadata"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::tests::full_length_unsynced_tail_recovers_verified_prefix"]
 file = "crates/broca-wal/src/file_wal.rs"
 old = 'if !crate::framing::digest_verifies(&bytes[offset..])'
 new = 'if false && !crate::framing::digest_verifies(&bytes[offset..]) /* NON-VACUITY BREAK */'
 
+# This proof checks the following behavior: A verified newer-writer record following corruption prevents
+# tail repair.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "wal-corruption-before-newer-writer"
 guards = "A verified newer-writer record following corruption prevents tail repair"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::tests::corrupt_record_before_newer_writer_is_not_discarded"]
 file = "crates/broca-wal/src/file_wal.rs"
@@ -10642,12 +11442,17 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = 'expected_lineage = Some(found);'
 new = 'let _ = found; // NON-VACUITY BREAK: forget the first verified identity'
 
+# This proof checks the following behavior: a successful read-side flush without a stable file identity
+# does not reopen a WAL racing retention deletion.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "identityless-retention-flush-no-reopen"
 guards = "a successful read-side flush without a stable file identity does not reopen a WAL racing retention deletion"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/retention_tests.rs"
 expect_red = ["wal_writer::retention_tests::absent_file_identity_flush_does_not_reopen_a_deleting_wal"]
 file = "crates/broca-core/src/wal_writer.rs"
@@ -13394,12 +14199,17 @@ file = "crates/broca-module-serve/tests/agent_data/real_daemon.rs"
 old = 'std::env::var_os("BROCA_REQUIRE_SUBC").is_none()'
 new = 'true /* NON-VACUITY BREAK: allow a required lane to skip */'
 
+# This proof checks the following behavior: dropping a moved session projection never deletes machine-
+# local billing facts.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-keeps-facts"
 guards = "dropping a moved session projection never deletes machine-local billing facts"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
 only = false
@@ -13408,12 +14218,17 @@ old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
 new = '''tx.execute("DELETE FROM export_facts", []).map_err(|e| e.to_string())?; // NON-VACUITY BREAK
         tx.execute("DELETE FROM message WHERE session=?1", [&key])'''
 
+# This proof checks the following behavior: projection deletion preserves imported-run exclusions so
+# foreign runs are never billed again.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-keeps-billing-floor"
 guards = "projection deletion preserves imported-run exclusions so foreign runs are never billed again"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
 only = false
@@ -13422,12 +14237,17 @@ old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
 new = '''tx.execute("DELETE FROM export_imported_runs", []).map_err(|e| e.to_string())?; // NON-VACUITY BREAK
         tx.execute("DELETE FROM message WHERE session=?1", [&key])'''
 
+# This proof checks the following behavior: a metadata-delete failure rolls the message deletion back in
+# the same transaction.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-drop-atomic"
 guards = "a metadata-delete failure rolls the message deletion back in the same transaction"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_failure_rolls_back_messages_and_meta"]
 only = false
@@ -13439,12 +14259,17 @@ new = '''tx.commit().map_err(|e| e.to_string())?; // NON-VACUITY BREAK: publish 
         conn.execute("DELETE FROM meta WHERE session=?1", [&key])
             .map(|_| ()).map_err(|e| e.to_string())'''
 
+# This proof checks the following behavior: dropping one projection leaves every other session's message
+# rows byte-identical.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-message-scope"
 guards = "dropping one projection leaves every other session's message rows byte-identical"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_changes_only_the_named_session"]
 only = false
@@ -13452,12 +14277,17 @@ file = "crates/broca-store/src/lib.rs"
 old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
 new = 'tx.execute("DELETE FROM message WHERE ?1 IS NOT NULL", [&key]) /* NON-VACUITY BREAK */'
 
+# This proof checks the following behavior: dropping one projection leaves every other session's
+# metadata and WAL watermark intact.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-meta-scope"
 guards = "dropping one projection leaves every other session's metadata and WAL watermark intact"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_changes_only_the_named_session"]
 only = false
@@ -13465,12 +14295,17 @@ file = "crates/broca-store/src/lib.rs"
 old = 'tx.execute("DELETE FROM meta WHERE session=?1", [&key])'
 new = 'tx.execute("DELETE FROM meta WHERE ?1 IS NOT NULL", [&key]) /* NON-VACUITY BREAK */'
 
+# This proof checks the following behavior: activation discards stale derived messages so they rebuild
+# from the installed WAL.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-clears-messages"
 guards = "activation discards stale derived messages so they rebuild from the installed WAL"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
 only = false
@@ -13478,12 +14313,17 @@ file = "crates/broca-store/src/lib.rs"
 old = 'tx.execute("DELETE FROM message WHERE session=?1", [&key])'
 new = 'tx.execute("DELETE FROM message WHERE session=?1 AND 0=1", [&key]) /* NON-VACUITY BREAK */'
 
+# This proof checks the following behavior: activation discards the old projection watermark and
+# checkpoint with its messages.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-projection-clears-meta"
 guards = "activation discards the old projection watermark and checkpoint with its messages"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/export_index.rs"
 expect_red = ["export_index::tests::drop_projection_preserves_facts_floors_and_rebuild_bytes"]
 only = false
@@ -13556,12 +14396,17 @@ old = '''sync_file(&file)?;
 new = '''// NON-VACUITY BREAK: publish an unsynced inode
         // A same-directory hard link'''
 
+# This proof checks the following behavior: unsupported hard links fail closed instead of publishing via
+# replacing rename.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-freeze-no-replacing-fallback"
 guards = "unsupported hard links fail closed instead of publishing via replacing rename"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::unsupported_freeze_publication_fails_closed_without_a_rename_fallback"]
 only = false
@@ -13821,12 +14666,17 @@ old = 'let mut target = std::path::absolute(path)?;'
 new = '''if path.is_dir() { return Ok(()); } // NON-VACUITY BREAK: trust a cached directory
     let mut target = std::path::absolute(path)?;'''
 
+# This proof checks the following behavior: directory establishment refuses targets outside its explicit
+# pre-existing state root.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-directory-state-root-boundary"
 guards = "directory establishment refuses targets outside its explicit pre-existing state root"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::directory_establishment_requires_an_existing_root_and_rejects_escape"]
 file = "crates/broca-wal/src/migration.rs"
@@ -13842,12 +14692,16 @@ new = '''let relative = match target.strip_prefix(&root) {
         Err(_) => return Ok(()), // NON-VACUITY BREAK: acknowledge an outside target
     };'''
 
+# This proof checks the following behavior: directory helpers never create a missing state root.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
+# target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-directory-root-precondition"
 guards = "directory helpers never create a missing state root"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-wal/src/migration/tests.rs"
 expect_red = ["migration::tests::directory_establishment_requires_an_existing_root_and_rejects_escape"]
 file = "crates/broca-wal/src/migration.rs"
@@ -14042,12 +14896,17 @@ old = '''        if !state.finished {
 new = '''        if false { // NON-VACUITY BREAK: claim a still-building inventory is complete.
 '''
 
+# This proof checks the following behavior: empty or expired-only retention inventory cannot scan the
+# ordinary run index.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-discovery-live-lineages-before-runs"
 guards = "empty or expired-only retention inventory cannot scan the ordinary run index"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention_withdrawals.rs"
 expect_red = ["retention_withdrawals::tests::discovery_without_live_retention_does_not_scan_runs", "retention_withdrawals::tests::discovery_with_live_retention_uses_partial_covering_index"]
 only = false
@@ -14098,12 +14957,17 @@ file = "crates/broca-store/src/lib.rs"
 old = '"CREATE INDEX IF NOT EXISTS run_index_lineage_session_idx ON run_index(lineage_id, session)",'
 new = '"DROP INDEX IF EXISTS run_index_lineage_session_idx", // NON-VACUITY BREAK: remove the general lineage lookup index.'
 
+# This proof checks the following behavior: live-lineage withdrawal discovery uses its partial covering
+# index rather than automatic indexes or full run rows.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-discovery-covering-lineage-index"
 guards = "live-lineage withdrawal discovery uses its partial covering index rather than automatic indexes or full run rows"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention_withdrawals.rs"
 expect_red = ["retention_withdrawals::tests::discovery_with_live_retention_uses_partial_covering_index"]
 only = false
@@ -14111,12 +14975,17 @@ file = "crates/broca-store/src/lib.rs"
 old = '"CREATE INDEX IF NOT EXISTS run_index_discovery_lineage_idx ON run_index(lineage_id, session) WHERE withdrawals_owed=1",'
 new = '"DROP INDEX IF EXISTS run_index_discovery_lineage_idx", // NON-VACUITY BREAK: remove the covering withdrawal lookup index.'
 
+# This proof checks the following behavior: retained session enumeration starts at the small retention
+# inventory while still including expired sessions.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "retention-sessions-lineages-before-runs"
 guards = "retained session enumeration starts at the small retention inventory while still including expired sessions"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-store/src/retention.rs"
 expect_red = ["retention::tests::retained_sessions_cost_is_bounded_by_retention_inventory"]
 only = false
@@ -14152,12 +15021,17 @@ old = '''        self.publishing(record);
 new = '''        if sync { self.publishing(record); } // NON-VACUITY BREAK
         self.wal.append(fence, record, sync)'''
 
+# This proof checks the following behavior: panic and cancellation finish the one-shot build incomplete
+# and wake waiters.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-interrupted-inventory-finishes"
 guards = "panic and cancellation finish the one-shot build incomplete and wake waiters"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/tests.rs"
 expect_red = ["wal_writer::move_inventory::tests::panic_finishes_inventory_incomplete", "wal_writer::move_inventory::tests::cancellation_finishes_inventory_incomplete", "wal_writer::move_inventory::tests::panic_while_inventory_locked_finishes_incomplete"]
 file = "crates/broca-core/src/wal_writer/move_inventory.rs"
@@ -14192,12 +15066,17 @@ file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "if a == b && (l.is_some() || x.file_id.is_some()) && x.file_id == y.file_id && l == r)"
 new = "if a == b && l.is_some() && x.file_id == y.file_id && l == r) // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: a copy-then-delete fold between live and archive listings
+# cannot hide an address.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-inventory-live-before-archive"
 guards = "a copy-then-delete fold between live and archive listings cannot hide an address"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::fold_between_listings_keeps_the_address"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
@@ -14209,24 +15088,34 @@ new = '''    // NON-VACUITY BREAK: enumerate archives before the live listing.
     after_live();
     let (live, ambiguous) = live_locations(store, cancel, unreadable)?;'''
 
+# This proof checks the following behavior: a live source moved into an archive is re-resolved at scan
+# time.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-inventory-vanished-live-fallback"
 guards = "a live source moved into an archive is re-resolved at scan time"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::vanished_live_path_falls_back_to_archived_member", "wal_writer::move_inventory::persistent::tests::deleted_address_is_dropped_after_a_complete_reresolution"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {"
 new = "Err(WalError::Io(error)) if false && error.kind() == io::ErrorKind::NotFound => { // NON-VACUITY BREAK"
 
+# This proof checks the following behavior: an unsealed archive is not silently treated as an empty
+# complete container.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-inventory-unsealed-is-unknown"
 guards = "an unsealed archive is not silently treated as an empty complete container"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::unsealed_archive_cannot_prove_absence"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
@@ -14259,24 +15148,34 @@ file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "if anchor.is_some_and(|anchor| anchor.byte_end > stamp.len) {"
 new = "if false { // NON-VACUITY BREAK: cache beyond the stamped prefix."
 
+# This proof checks the following behavior: a changed archive address is re-resolved a bounded number of
+# times.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-inventory-retries-changed-addresses"
 guards = "a changed archive address is re-resolved a bounded number of times"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::changed_archive_stamp_is_reresolved_before_giving_up"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "|| attempt == 2"
 new = "|| attempt == 0 // NON-VACUITY BREAK: never retry a changed address.\n"
 
+# This proof checks the following behavior: transient failures get a final census and scan after other
+# boot work.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-inventory-final-failure-pass"
 guards = "transient failures get a final census and scan after other boot work"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::final_pass_recovers_a_transiently_unreadable_address"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
@@ -14366,12 +15265,17 @@ file = "crates/broca-module-serve/src/serve.rs"
 old = "tokio::spawn(operation).await.map_err(|e| ServeIoError(e.to_string()))??"
 new = "operation.await? // NON-VACUITY BREAK: remove the independent operation owner."
 
+# This proof checks the following behavior: load removes stale generated cache temporaries while
+# preserving fresh and unrelated paths.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-cache-sweeps-stale-temporaries"
 guards = "load removes stale generated cache temporaries while preserving fresh and unrelated paths"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::load_sweeps_only_stale_regular_cache_temporaries"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
@@ -14405,12 +15309,17 @@ file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
 old = "&& old.committed_end == stamp.len"
 new = "&& true // NON-VACUITY BREAK: reuse a stale committed end.\n"
 
+# This proof checks the following behavior: identities published after the boot census survive final
+# inventory publication.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "agent-data-inventory-merges-concurrent-publications"
 guards = "identities published after the boot census survive final inventory publication"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/wal_writer/move_inventory/persistent/tests.rs"
 expect_red = ["wal_writer::move_inventory::persistent::tests::build_merges_identities_published_after_its_census"]
 file = "crates/broca-core/src/wal_writer/move_inventory/persistent.rs"
@@ -14444,12 +15353,17 @@ old = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
     ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),'''
 new = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
     // NON-VACUITY BREAK: forget the retired bare 3.7 route.'''
+# This proof checks the following behavior: a step-boundary cancellation is synced before its
+# acknowledgement can complete.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-boundary-cancel-durable-before-ack"
 guards = "a step-boundary cancellation is synced before its acknowledgement can complete"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/boundary_cancel_tests.rs"
 expect_red = ["run::boundary_cancel_tests::boundary_cancel_ack_waits_for_durable_marker"]
 file = "crates/broca-core/src/steer.rs"
@@ -14458,12 +15372,17 @@ old = '''        writer.sync().await?;
 new = '''        // NON-VACUITY BREAK: acknowledge without the cancellation barrier.
         Ok(())'''
 
+# This proof checks the following behavior: neither the boundary check nor atomic step admission permits
+# a StepStarted after cancellation.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
 [[control]]
 id = "core-boundary-cancel-no-next-step"
 guards = "neither the boundary check nor atomic step admission permits a StepStarted after cancellation"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
+select = "expected"
 test_file = "crates/broca-core/src/run/boundary_cancel_tests.rs"
 expect_red = ["run::boundary_cancel_tests::boundary_cancel_finishes_model_and_entire_tool_batch"]
 [[control.edits]]
