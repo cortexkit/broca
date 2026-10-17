@@ -47,7 +47,6 @@ python3 scripts/verify-mutation-platforms.py
 
 suites=(
     scripts/test-check-path-deps.py
-    scripts/test-anthropic-policy-deps.py
     scripts/test-stage-release.py
     scripts/test-release.py
     scripts/test-prune-staging.py

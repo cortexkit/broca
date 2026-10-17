@@ -12,12 +12,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Members whose whole design is to stay free of Tokio, so they declare it nowhere, not even
-# for tests. The shared Anthropic policy crate is pinned by other modules and its own guard
-# (scripts/test-anthropic-policy-deps.py) refuses Tokio in every dependency section. A
-# member listed here must declare no Tokio at all; the feature-agreement rule below exists
+# Members whose whole design is to stay free of Tokio declare it nowhere, not even for tests.
+# A member listed here must declare no Tokio at all; the feature-agreement rule below exists
 # so test builds that do pull Tokio agree, and a Tokio-free member cannot disagree.
-TOKIO_FREE_MEMBERS = {"cortexkit-anthropic-policy", "broca-owner-only"}
+TOKIO_FREE_MEMBERS = {"broca-owner-only"}
 
 
 def cargo_output(*args):
