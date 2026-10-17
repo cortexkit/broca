@@ -44,6 +44,11 @@ struct Script {
     model_requests: Mutex<Vec<Vec<u8>>>,
     answer: Mutex<Option<&'static str>>,
     withdraw_enabled: Mutex<bool>,
+    /// While set, a consent route opened after the card was filed waits in `on_bind`.
+    /// Broca opens one route per consent operation, so this parks the run's first
+    /// `consent.await` before Cingulate sees it. A test uses it to land a restart
+    /// between filing the card and waiting on it.
+    hold_question_binds: Mutex<bool>,
     expiry_ms: u64,
     created_at_ms: u128,
 }
@@ -56,7 +61,13 @@ impl Script {
             event["event"].as_str(),
             Some("consent.answers" | "question_bind")
         ) {
-            println!("APPROVAL EVENT {event}");
+            // Wall-clock milliseconds line these events up with the timestamps in the
+            // daemon and broca logs that the rig prints when a test fails.
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            println!("APPROVAL EVENT at_ms={at_ms} {event}");
         }
         self.logs.lock().unwrap().push(event);
     }
@@ -196,6 +207,13 @@ impl ModuleHandler for Consent {
         assert_eq!(scope["owner"], json!({"kind":"reserved","module_id":OWNER}));
         assert_eq!(scope["ref"], "approval-head");
         self.0.log(json!({"event":"question_bind", "scope":scope}));
+        let filed = !self.0.filings.lock().unwrap().is_empty();
+        if filed && *self.0.hold_question_binds.lock().unwrap() {
+            self.0.log(json!({"event":"question_bind_held"}));
+            while *self.0.hold_question_binds.lock().unwrap() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
         subc_client_rs::BindDecision::accept()
     }
     async fn handle(&self, _: subc_client_rs::RequestCtx, body: Vec<u8>) -> HandlerOutcome {
@@ -426,6 +444,7 @@ impl Rig {
             model_requests: Mutex::new(vec![]),
             answer: Mutex::new(None),
             withdraw_enabled: Mutex::new(true),
+            hold_question_binds: Mutex::new(false),
             created_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -706,6 +725,43 @@ impl Rig {
             output.status.success(),
             "real module restart failed: {output:?}"
         );
+    }
+    /// Position of the next scripted event, so a later check can count only what follows.
+    fn mark(&self) -> usize {
+        self.script.logs.lock().unwrap().len()
+    }
+    fn events_since(&self, mark: usize, name: &str) -> usize {
+        self.script.logs.lock().unwrap()[mark..]
+            .iter()
+            .filter(|entry| entry["event"] == name)
+            .count()
+    }
+    async fn paused(&self) {
+        wait("run paused for restart", || {
+            self.records().iter().any(|record| {
+                matches!(
+                    record,
+                    WalRecord::RunPaused {
+                        reason: broca_protocol::PauseReason::Restart,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    }
+    /// `ck module restart` returns once the daemon accepts the request. The daemon then
+    /// drains the old process, which can take its whole 30 s drain deadline, before it
+    /// launches a new one. Waiting for the resume separately keeps a later wait timing
+    /// the resumed run rather than the drain, and names which half stalled.
+    async fn resumed(&self) {
+        self.paused().await;
+        wait("restarted broca resumed the paused run", || {
+            self.records()
+                .iter()
+                .any(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+        })
+        .await;
     }
 }
 
@@ -1028,15 +1084,20 @@ async fn graceful_restart_keeps_question_open_and_resumes_same_wait() {
         rig.send(true).await.unwrap();
         rig.filed(1).await;
         let first = rig.pending().await;
+        // This scenario restarts while a wait is open. Run status publishes the card as
+        // soon as its id is durable, before broca sends its first consent.await, so a
+        // restart issued on that signal alone can land before any wait exists. The
+        // restart-before-await test covers that ordering.
+        wait("first consent.await reached Cingulate", || {
+            rig.events_since(0, "consent.await") >= 1
+        })
+        .await;
+        let mark = rig.mark();
         rig.restart().await;
+        rig.resumed().await;
         wait("recorded card read back on resume", || {
-            let logs = rig.script.logs.lock().unwrap();
-            logs.iter().any(|entry| entry["event"] == "consent.get")
-                && logs
-                    .iter()
-                    .filter(|entry| entry["event"] == "consent.await")
-                    .count()
-                    >= 2
+            rig.events_since(mark, "consent.get") >= 1
+                && rig.events_since(mark, "consent.await") >= 1
         })
         .await;
         let resumed = rig.pending().await;
@@ -1107,6 +1168,56 @@ async fn graceful_restart_keeps_question_open_and_resumes_same_wait() {
     })
     .await
     .expect("bounded real daemon restart scenario");
+}
+
+/// A restart can land after the card's id is durable but before broca's first
+/// `consent.await` reaches Cingulate. The resumed run must still read the recorded card
+/// back and wait on it, without filing a second card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_before_first_await_reads_recorded_card_back() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let Some(rig) = Rig::start("restart-before-await", true).await else {
+            return;
+        };
+        *rig.script.hold_question_binds.lock().unwrap() = true;
+        rig.send(true).await.unwrap();
+        rig.filed(1).await;
+        let first = rig.pending().await;
+        wait("post-filing consent route parked", || {
+            rig.events_since(0, "question_bind_held") >= 1
+        })
+        .await;
+        let mark = rig.mark();
+        rig.restart().await;
+        rig.paused().await;
+        assert_eq!(
+            rig.events_since(0, "consent.await"),
+            0,
+            "the restart must land before the first wait reaches Cingulate"
+        );
+        *rig.script.hold_question_binds.lock().unwrap() = false;
+        rig.resumed().await;
+        wait("recorded card read back on resume", || {
+            rig.events_since(mark, "consent.get") >= 1
+                && rig.events_since(mark, "consent.await") >= 1
+        })
+        .await;
+        let resumed = rig.pending().await;
+        assert_eq!(
+            first["awaiting_approval"], resumed["awaiting_approval"],
+            "restart resumes the same question and deadline"
+        );
+        assert_eq!(rig.events_since(0, "consent.withdraw"), 0);
+        *rig.script.answer.lock().unwrap() = Some("approve");
+        approved(&rig, &rig.finished().await);
+        assert_eq!(
+            rig.script.filings.lock().unwrap().len(),
+            1,
+            "resume must use the recorded card rather than file a second one"
+        );
+    })
+    .await
+    .expect("bounded real daemon restart-before-await scenario");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
