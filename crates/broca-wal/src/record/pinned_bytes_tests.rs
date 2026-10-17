@@ -633,3 +633,47 @@ fn pre_agent_run_scopes_keep_their_bytes_and_frame_requirements() {
         assert_eq!(&frame[HEADER_LEN..], payload.as_bytes());
     }
 }
+
+/// Records that structured output extends, as this build writes them when a run has no
+/// structured output: a run start whose frozen render config is populated, queued requests, a
+/// hard-stop tool result, a re-frozen render config and a completed run end. Each is pinned with
+/// its exact bytes and the exact frame requirements it carries. Structured output adds members
+/// and a must-understand feature only to records that use it, so these must keep both unchanged:
+/// a WAL with no structured output stays readable by builds that predate it.
+const PRE_STRUCTURED_OUTPUT_PINNED: &[(&str, &[&str])] = &[
+    (
+        r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"edit","description":"edit a file","input_schema":{"type":"object"},"module":"aft","execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"family_id":"openai_responses","responses_tools_non_strict":true}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        &[],
+    ),
+    (PINNED[1], &[]),
+    (PINNED[39], &[]),
+    (PINNED[40], &[]),
+    (PINNED[41], &[]),
+    (
+        r#"{"type":"tool_result","batch_id":"r-b1","result":{"tool_call_id":"t2","output":{"kind":"error","message":"tool not run: max steps reached before dispatch"},"is_error":true},"outcome":"max_steps"}"#,
+        &[],
+    ),
+    (
+        r#"{"type":"run_config_refrozen","renderer_version":2,"frozen_render_config":{"family_id":"anthropic_messages"}}"#,
+        &[],
+    ),
+    (
+        r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
+        &[],
+    ),
+];
+
+#[test]
+fn records_without_structured_output_keep_their_bytes_and_requirements() {
+    for (pinned, requires) in PRE_STRUCTURED_OUTPUT_PINNED {
+        let decoded: WalRecord = serde_json::from_str(pinned)
+            .unwrap_or_else(|error| panic!("pinned record must decode: {error}\n{pinned}"));
+        assert_ne!(decoded, WalRecord::Unknown, "{pinned}");
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&decoded).unwrap()).unwrap(),
+            *pinned,
+            "a pinned record must re-encode to exactly the bytes it was read from"
+        );
+        assert_eq!(decoded.required_features(), *requires, "{pinned}");
+    }
+}
