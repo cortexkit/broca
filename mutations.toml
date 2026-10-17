@@ -15425,15 +15425,27 @@ old = "inbox.restore_boundary_cancel();"
 new = "// NON-VACUITY BREAK: leave the actor unaware of replayed cancellation."
 [[control]]
 id = "session-class-freezes-first-send"
-guards = "session_class cannot change after the first send, including an unclassed first send"
+guards = "a labelled session refuses a different label on a later send"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/session_class.rs"
-expect_red = ["session_class::tests::class_freezes_at_first_send_including_absence"]
+expect_red = ["session_class::tests::class_freezes_at_first_send"]
 file = "crates/broca-module/src/session_class.rs"
-old = "        if frozen.is_some_and(|current| current != Some(class)) {"
-new = "        if false && frozen.is_some_and(|current| current != Some(class)) { // NON-VACUITY BREAK: allow relabelling"
+old = "            Some(Some(current)) if current != class => {"
+new = "            Some(Some(current)) if false && current != class => { // NON-VACUITY BREAK: allow relabelling"
+
+[[control]]
+id = "session-class-late-label-ignored-on-unlabelled"
+guards = "a label sent to a session created unlabelled is accepted and ignored, never refused and never applied"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/session_class.rs"
+expect_red = ["session_class::tests::a_label_on_an_unlabelled_session_is_accepted_and_ignored"]
+file = "crates/broca-module/src/session_class.rs"
+old = "            Some(None) => return Ok(Admitted::IgnoredOnUnlabelled(class.to_owned())),"
+new = "            Some(None) => {} // NON-VACUITY BREAK: treat a late label on an unlabelled session as its class"
 
 [[control]]
 id = "session-class-retention-beats-durable"

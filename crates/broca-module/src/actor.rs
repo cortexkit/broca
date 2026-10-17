@@ -2390,7 +2390,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .as_ref()
                 .map(|_| checkpoint.session_class.as_deref());
             self.admitting_session_class = match crate::session_class::admit(Some(class), frozen) {
-                Ok(class) => class,
+                Ok(crate::session_class::Admitted::Class(class)) => class,
+                Ok(crate::session_class::Admitted::IgnoredOnUnlabelled(label)) => {
+                    tracing::info!(
+                        target: "broca.session_class",
+                        session = %self.key.session,
+                        label = %label,
+                        "session_class ignored: the session was created unlabelled, so its placement stays where it was created"
+                    );
+                    None
+                }
                 Err(message) => return SendOutcome::SessionClassInvalid(message),
             };
         }
