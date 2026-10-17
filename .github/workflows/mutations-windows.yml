@@ -76,11 +76,18 @@ jobs:
       CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum.exe
       CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth.exe
       CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
+      CARGO_TARGET_DIR: D:\broca-target
+      TMP: D:\broca-temp
+      TEMP: D:\broca-temp
     defaults:
       run:
         working-directory: broca
         shell: bash
     steps:
+      - name: Prepare Windows build and temporary directories
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path $env:CARGO_TARGET_DIR, $env:TEMP -Force | Out-Null
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
@@ -98,6 +105,8 @@ jobs:
         id: cargo-cache
         with:
           workspaces: broca -> target
+          cache-targets: 'false'
+          cache-directories: D:\broca-target
           shared-key: mutations
           cache-on-failure: 'true'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -173,6 +182,14 @@ jobs:
           BASE: ${{ steps.windows-selection.outputs.base }}
         run: |
           set -euo pipefail
+          report_free_space() {
+            echo "Free space $1 replay:"
+            # Keep PowerShell's $_ expressions literal; Bash passes this command to PowerShell.
+            # shellcheck disable=SC2016
+            powershell.exe -NoProfile -Command 'Get-PSDrive -Name C,D | ForEach-Object { "{0}: {1:N2} GiB free" -f $_.Name, ($_.Free / 1GB) }'
+          }
+          trap 'status=$?; trap - EXIT; report_free_space after; exit "$status"' EXIT
+          report_free_space before
           if [[ "$MODE" == all ]]; then
             ckdev-mutate run --all --shard "$SHARD/$SHARDS" --report target/mutations/windows-replay.json
           else
