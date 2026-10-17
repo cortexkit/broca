@@ -242,9 +242,12 @@ async fn cold_run_result_reuses_status_snapshot() {
         .run_result(&key, RunId("second".into()))
         .await
         .unwrap();
+    // A repeat reuses the cached read proof, which is keyed on file identity. Live WALs have a
+    // file identity only on Unix, so off Unix the repeat pays the proof read again.
+    let repeat_reads = if cfg!(unix) { 1 } else { 2 };
     assert_eq!(counting.full.load(Ordering::SeqCst), 0);
-    assert_eq!(counting.from_zero.load(Ordering::SeqCst), 1);
-    assert_eq!(counting.full_history.load(Ordering::SeqCst), 1);
+    assert_eq!(counting.from_zero.load(Ordering::SeqCst), repeat_reads);
+    assert_eq!(counting.full_history.load(Ordering::SeqCst), repeat_reads);
 }
 
 #[tokio::test]

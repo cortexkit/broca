@@ -119,12 +119,27 @@ async fn boundary_cancel_during_tool_then_send_is_provider_valid_and_byte_stable
     let mut fields = subject.send_fields(session, false);
     fields.insert("prompt".into(), json!("continue"));
     fields.insert("send_id".into(), json!("boundary-second"));
-    let second = response(
-        route
-            .request("session.send", Value::Object(fields))
-            .await
-            .unwrap(),
-    );
+    // `run.result` reports the first run cancelled once its terminal is durable, which can be
+    // just before the actor releases it. A send in that window is queued and answers
+    // "pending" without a run id, which is correct. Resend the same keyed send until it
+    // names its run; the send id keeps it to one episode.
+    let second = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let reply = response(
+                route
+                    .request("session.send", Value::Object(fields.clone()))
+                    .await
+                    .unwrap(),
+            );
+            if reply["run_id"].is_string() {
+                break reply;
+            }
+            assert_eq!(reply["state"], "pending", "unexpected send reply: {reply}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the second send must start its run once the first is released");
     terminal(&route, &second["run_id"], "completed").await;
     assert_eq!(subject.tool_invocations(&call.arguments).await, 1);
     let records = subject.records(&live, session);
