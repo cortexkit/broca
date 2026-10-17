@@ -34,6 +34,7 @@ fn resolve_runtime_override(
         &broca_catalog::live::ResolveOptions::default(),
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: match frozen {
                 Some(recorded) => recorded.get("base_url").and_then(serde_json::Value::as_str),
                 None => overrides.base_url("deepseek"),
@@ -92,6 +93,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some(&base_url),
             max_output_tokens: None,
             variant: None,
@@ -422,6 +424,7 @@ fn resolve_drift_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some(
                 recorded
                     .and_then(|config| config.frozen_render_config["base_url"].as_str())
@@ -760,6 +763,7 @@ fn resolve_tier_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some("http://host-a.example"),
             max_output_tokens: recorded.and_then(frozen_max_output_tokens),
             variant: None,
@@ -874,6 +878,7 @@ fn resolve_variant_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: Some("http://host-a.example"),
             max_output_tokens: recorded.and_then(frozen_max_output_tokens),
             variant: restored.as_ref(),
@@ -971,6 +976,31 @@ fn resume_reads_the_recorded_thinking_echo_scope() {
     assert_eq!(frozen_thinking_echo_scope(&recorded), None);
 }
 
+/// A resume restores the Claude Code persona from the recorded blob. A blob written before the
+/// persona existed has no `claude_code_persona` key and reads back as `None`, which the resolver
+/// keeps (`EpisodePersona::Recorded(None)`), so that episode resumes with its old bytes.
+#[test]
+fn resume_reads_the_recorded_claude_code_persona() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-persona-restore-{}", std::process::id()));
+    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
+    let mut recorded = drift_run_config(&drift_request(&root), &started);
+    recorded.frozen_render_config = serde_json::json!({ "family_id": "anthropic_messages" });
+    assert_eq!(frozen_claude_code_persona(&recorded), None);
+
+    let persona = serde_json::json!({
+        "version": "2.1.280",
+        "device_id": "0".repeat(64),
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "prompt_id": "33333333-3333-4333-8333-333333333333"
+    });
+    recorded.frozen_render_config = serde_json::json!({
+        "family_id": "anthropic_messages", "claude_code_persona": persona
+    });
+    let restored = frozen_claude_code_persona(&recorded).expect("the recorded persona restores");
+    assert_eq!(serde_json::to_value(&restored).unwrap(), persona);
+}
+
 #[test]
 fn resume_reads_the_recorded_responses_tool_strictness() {
     let root = broca_test_support::scratch_root()
@@ -983,4 +1013,151 @@ fn resume_reads_the_recorded_responses_tool_strictness() {
     assert!(frozen_responses_tools_non_strict(&recorded));
     recorded.frozen_render_config = serde_json::json!({"responses_tools_non_strict": false});
     assert!(!frozen_responses_tools_non_strict(&recorded));
+}
+
+/// An executor whose tool plane is a stand-in subc connection that authenticates and then idles:
+/// enough for admission-side methods, with no daemon, vault or provider.
+async fn stand_in_executor(root: &std::path::Path) -> (LiveLoopExecutor, tokio::task::JoinHandle<()>) {
+    use subc_transport::connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let key = vec![0x5d; 32];
+    let connection_file = root.join("connection.json");
+    subc_transport::connection_file::write_atomic(
+        &connection_file,
+        &ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".into(),
+                port,
+            }],
+            key: key.clone(),
+            daemon_id: [0xd5; 16],
+            pid: std::process::id(),
+            daemon_ver: "test".into(),
+        },
+    )
+    .unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        subc_transport::authenticate_server(
+            &mut stream,
+            &key,
+            &[0xd5; 16],
+            "test",
+            broca_test_support::STAND_IN_AUTH_DEADLINE,
+        )
+        .await
+        .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let connection = broca_subc::SubcConnection::connect(&connection_file)
+        .await
+        .unwrap();
+    let executor = LiveLoopExecutor::new(
+        Arc::new(FileWalStore::new(root.join("wal"))),
+        Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()),
+        Arc::new(SubcToolPlane::new(connection, "unused")),
+        None,
+    );
+    (executor, server)
+}
+
+/// A `RunStarted` record for `session` whose input is one user message of `text`.
+fn run_started_with_user_text(
+    session: &broca_protocol::BindIdentity,
+    run_id: &str,
+    text: &str,
+) -> broca_wal::WalRecord {
+    serde_json::from_value(serde_json::json!({
+        "type": "run_started", "run_id": run_id, "session": session,
+        "config": {
+            "model": {"provider_module_id": "anthropic", "model_id": "claude-opus-4-8"},
+            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+            "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 2
+        },
+        "input": [{"role": "user", "content": [{"type": "text", "text": text}]}],
+        "origin": {"kind": "fresh"}
+    }))
+    .unwrap()
+}
+
+/// The session's first user message is read once, and only as far as the record carrying it:
+/// a large later record is never read, and a second admission of the same session reads no WAL
+/// at all, whether it inherits the suffix from the latest episode's recorded persona or (when
+/// that episode recorded none) from this process's memory of the session.
+#[tokio::test]
+async fn the_first_user_message_is_read_once_and_only_as_far_as_its_record() {
+    use broca_core::WalStore as _;
+    use std::sync::atomic::Ordering;
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-suffix-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (executor, server) = stand_in_executor(&root).await;
+
+    let mut req = drift_request(&root);
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "Now list the files to change.".into(),
+        }],
+    )];
+    let store = FileWalStore::new(root.join("wal"));
+    let mut wal = store.open(&req.session).unwrap();
+    let first = "Summarise the README in two sentences.";
+    wal.append(1, &run_started_with_user_text(&req.session, "r1", first), true)
+        .unwrap();
+    wal.append(
+        1,
+        &run_started_with_user_text(&req.session, "r2", &"x".repeat(1 << 20)),
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let wal_len = std::fs::metadata(store.wal_path(&req.session)).unwrap().len();
+
+    let expected = broca_module_serve::claude_code_identity::first_durable_cc_version_suffix(
+        &[broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text: first.into() }],
+        )],
+        &[],
+    );
+    let pinned = executor.session_cc_version_suffix(&req, None, 2).await;
+    assert_eq!(pinned, expected, "pinned from the session's first durable user message");
+    let read = executor.cc_suffix_wal_bytes.load(Ordering::Relaxed);
+    assert!(read > 0, "the first admission reads the WAL prefix");
+    assert!(
+        read < wal_len / 2,
+        "only the first record is read ({read} of {wal_len} bytes)"
+    );
+
+    // The next episode inherits the suffix its predecessor recorded and reads nothing.
+    let recorded = serde_json::json!({
+        "claude_code_persona": {
+            "version": broca_provider::wire::ClaudeCodePersona::CURRENT_VERSION,
+            "device_id": "0", "session_id": "s", "cc_version_suffix": pinned.clone().unwrap()
+        }
+    });
+    assert_eq!(
+        executor.session_cc_version_suffix(&req, Some(&recorded), 2).await,
+        pinned
+    );
+    // An episode after one that recorded no persona (another provider) is answered from memory.
+    assert_eq!(
+        executor.session_cc_version_suffix(&req, Some(&serde_json::json!({})), 2).await,
+        pinned
+    );
+    assert_eq!(
+        executor.cc_suffix_wal_bytes.load(Ordering::Relaxed),
+        read,
+        "a second admission reads no WAL bytes"
+    );
+    assert!(store.first_user_message(&req.session).unwrap().0.is_some());
+
+    drop(executor);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -12,6 +12,7 @@
 mod cache_hints;
 pub mod cache_markers;
 pub mod cache_warm;
+pub mod claude_code_persona;
 pub mod conformance;
 pub mod credential_refresh;
 pub mod families;

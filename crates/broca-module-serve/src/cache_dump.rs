@@ -407,6 +407,7 @@ fn export_records_since(
                 request_body_sha256,
                 ts_ms,
                 input_transformations,
+                input_transformations_unmeasured,
                 ..
             } = selected
             else {
@@ -430,6 +431,12 @@ fn export_records_since(
                 .ok_or("attempt timestamp out of range")?
                 .to_rfc3339_opts(SecondsFormat::Millis, true);
             let mut meta = json!({"session": session.session, "createdAt": created, "files": {}, "run_id": run_id.0, "step": step, "attempt": attempt, "wire_family": config.frozen_render_config.get("family_id"), "model": config.model.model_id, "verified": false});
+            if let Some(report) = transformations_meta(
+                input_transformations.as_deref(),
+                *input_transformations_unmeasured,
+            ) {
+                meta["input_transformations"] = report;
+            }
             let rendered = boundaries.get(&step).and_then(|boundary| {
                 crate::wal_render::render_step(&records[..=*boundary], config, &run_id.0, step).ok()
             });
@@ -445,11 +452,10 @@ fn export_records_since(
                 let response = usage.and_then(|u| wire_usage(frozen.family_id, u));
                 if !verified {
                     summary.digest_mismatches += 1;
-                    let reason = if input_transformations.is_some() {
-                        "transformed_request"
-                    } else {
-                        "digest_mismatch"
-                    };
+                    let reason = mismatch_reason(
+                        input_transformations.as_deref(),
+                        *input_transformations_unmeasured,
+                    );
                     meta["reason"] = json!(reason);
                     meta["recorded_sha256"] = json!(request_body_sha256);
                     meta["rendered_sha256"] = json!(actual);
@@ -520,5 +526,57 @@ mod windows_acl_tests {
             broca_owner_only::repair(&dir).unwrap();
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         }
+    }
+}
+
+/// How a dumped call's input-transformation report reads in its metadata: `"not_measured"` when
+/// the request did not ask for the report (a Claude Code persona request), the number of
+/// reported transformations when the response carried the report, and nothing when neither is
+/// known (a response without the report, or a record written before the report existed). A
+/// persona call is therefore never shown as zero transformations.
+fn transformations_meta(
+    report: Option<&[broca_protocol::InputTransformation]>,
+    unmeasured: bool,
+) -> Option<Value> {
+    if unmeasured {
+        return Some(json!("not_measured"));
+    }
+    report.map(|entries| json!(entries.len()))
+}
+
+/// Why a re-rendered body did not match the recorded digest, as far as the record can tell.
+fn mismatch_reason(
+    report: Option<&[broca_protocol::InputTransformation]>,
+    unmeasured: bool,
+) -> &'static str {
+    if report.is_some() {
+        "transformed_request"
+    } else if unmeasured {
+        "digest_mismatch_transformations_not_measured"
+    } else {
+        "digest_mismatch"
+    }
+}
+
+#[cfg(test)]
+mod transformation_report_tests {
+    use super::*;
+
+    /// A call whose request did not ask for the report reads as not measured, never as zero
+    /// transformations and never as a measured mismatch.
+    #[test]
+    fn an_unmeasured_call_never_reads_as_no_transformations() {
+        assert_eq!(
+            transformations_meta(None, true),
+            Some(json!("not_measured"))
+        );
+        assert_eq!(transformations_meta(Some(&[]), false), Some(json!(0)));
+        assert_eq!(transformations_meta(None, false), None);
+        assert_eq!(
+            mismatch_reason(None, true),
+            "digest_mismatch_transformations_not_measured"
+        );
+        assert_eq!(mismatch_reason(None, false), "digest_mismatch");
+        assert_eq!(mismatch_reason(Some(&[]), false), "transformed_request");
     }
 }

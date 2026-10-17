@@ -13,7 +13,7 @@ description = "broca provider module: owns one provider's SSE transport + auth, 
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
 # The live Anthropic provider (LiveAnthropicProvider): a real HTTP/SSE front for
 # Provider::step. OFF by default so the pure normalize path stays reqwest-free.
-live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:sha2", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
+live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
 
 [dependencies]
 broca-owner-only.workspace = true
@@ -52,7 +52,13 @@ httpdate = { version = "1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 rand = { version = "0.9", optional = true }
 tokio-util = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+# SHA-256 for the Claude Code persona's `cc_version` suffix (see `claude_code_persona`). Pure
+# computation; the persona module is kept liftable into cortexkit-anthropic-policy, which has
+# agreed to take exactly this dependency.
+sha2.workspace = true
+# xxHash64 for the persona's `cch` body signature, the only hash it needs, so only the `xxh64`
+# feature is compiled. Pure computation, agreed for the same later move as `sha2`.
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 # Codex's Responses socket client, including its permessage-deflate support; rustls only.
 tungstenite = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
@@ -61,6 +67,8 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+# The shared Claude OAuth wire vectors (`vectors::VECTORS_JSON`) the persona tests are pinned to.
+cortexkit-anthropic-policy = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }

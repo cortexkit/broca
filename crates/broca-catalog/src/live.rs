@@ -20,8 +20,8 @@ use broca_provider::families::{
     apply_anthropic_apikey_quirks, frozen_config_for_family, openai_chat_frozen_config,
     renderer_version_for, resolve_frozen,
 };
-use broca_provider::policy::ReasoningPolicy;
 pub use broca_provider::policy::{CrossModelThinking, ThinkingEchoScope};
+use broca_provider::policy::{ReasoningPolicy, SystemPromptPolicy};
 pub use broca_provider::service_tier::ServiceTier;
 use broca_provider::spec::{AuthKind, CapabilityFlag, ReasoningOptions};
 pub use broca_provider::variant::FrozenVariant;
@@ -32,7 +32,8 @@ use broca_provider::{live_provider_with_clock_and_refresher, ProviderHttpClient}
 pub use broca_provider::spec::WireFamilyId;
 use broca_provider::wire::AuthHandle;
 pub use broca_provider::wire::{
-    CacheClass, CachePolicy, CacheTail, CacheTtl, FrozenRenderConfig, MarkerSyntax,
+    CacheClass, CachePolicy, CacheTail, CacheTtl, ClaudeCodePersona, FrozenRenderConfig,
+    MarkerSyntax,
 };
 
 /// How a provider authenticates for a run. The stable token is also the first segment of the
@@ -253,6 +254,22 @@ pub struct ResolveOptions<'a> {
     /// support, its wire family and the family's subset profile, then frozen into the render
     /// config. A resume passes the frozen decision through `EpisodeRenderConfig` instead.
     pub structured_output: Option<&'a broca_protocol::structured_output::StructuredOutput>,
+    /// The Claude Code persona a fresh episode freezes when it resolves to the Anthropic OAuth
+    /// (identity-lead) shape: the identity values its requests carry. `None` admits the episode
+    /// without a persona, the shape OAuth runs had before it existed. A resume passes the
+    /// recorded persona through `EpisodeRenderConfig` instead.
+    pub claude_code_persona: Option<&'a ClaudeCodePersona>,
+}
+
+/// The Claude Code persona an episode renders with, as the code starting it knows it.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub enum EpisodePersona<'a> {
+    /// A new episode: it takes `ResolveOptions::claude_code_persona`.
+    #[default]
+    Fresh,
+    /// A resumed episode: exactly what its frozen render config recorded, including `None`
+    /// for an episode admitted before the persona existed, which keeps its old bytes.
+    Recorded(Option<&'a ClaudeCodePersona>),
 }
 
 /// How to obtain the runtime credential for the resolved provider.
@@ -615,6 +632,10 @@ pub struct EpisodeRenderConfig<'a> {
     /// applied as recorded. It is never re-decided from the catalog, so a catalog change since
     /// admission cannot move a resumed run's request bytes or its reported enforcement.
     pub structured_output: Option<&'a broca_protocol::structured_output::FrozenStructuredOutput>,
+    /// The Claude Code persona: fresh for a new episode, as recorded for a resume. A recorded
+    /// absence is kept, so an OAuth episode admitted before the persona existed resumes with
+    /// its old bytes rather than being re-admitted into the new shape.
+    pub claude_code_persona: EpisodePersona<'a>,
 }
 
 /// The output cap used when a send sets none and the catalog cannot supply a usable one.
@@ -881,6 +902,7 @@ fn resolve_provider_inner(
         responses_tools_non_strict: episode_render.responses_tools_non_strict,
         chatgpt_effort_updates: episode_render.chatgpt_effort_updates,
         structured_output: episode_render.structured_output,
+        claude_code_persona: episode_render.claude_code_persona,
     };
     if catalog.is_withdrawn(provider_id, model_id) {
         return Err(format!(
@@ -1105,6 +1127,11 @@ fn resolve_provider_inner(
         provider_id,
         model_spec.capabilities.structured_output,
     )?;
+    apply_claude_code_persona(
+        &mut frozen,
+        episode_render.claude_code_persona,
+        opts.claude_code_persona,
+    );
     let frozen = episode_render.apply(frozen);
     let resolved_base_url = frozen
         .base_url
@@ -1131,6 +1158,26 @@ fn resolve_provider_inner(
         // The catalog model's context window (the transform's pressure ground truth).
         context_limit: model_spec.limits.context,
     })
+}
+
+/// Freeze the episode's Claude Code persona into its render config. Only the Anthropic OAuth
+/// shape (a required identity lead) speaks as Claude Code; every other config is left without
+/// one. A resume restores what it recorded, a fresh episode takes the persona offered for it.
+fn apply_claude_code_persona(
+    frozen: &mut FrozenRenderConfig,
+    episode: EpisodePersona<'_>,
+    fresh: Option<&ClaudeCodePersona>,
+) {
+    let identity_lead = frozen.family_id == WireFamilyId::AnthropicMessages
+        && matches!(
+            frozen.system_prompt,
+            SystemPromptPolicy::RequiredIdentityLead { .. }
+        );
+    frozen.claude_code_persona = match episode {
+        _ if !identity_lead => None,
+        EpisodePersona::Fresh => fresh.cloned(),
+        EpisodePersona::Recorded(recorded) => recorded.cloned(),
+    };
 }
 
 /// Freeze the episode's structured-output decision into its render config. A resume applies

@@ -42,6 +42,7 @@ mod bedrock_tool_id_alias;
 mod cache_marker_render_view;
 mod cache_policy_serde;
 mod cache_warm_e2e;
+mod claude_oauth_wire_vectors;
 mod conformance_report_is_not_vacuous;
 mod empty_assistant_turn_content;
 mod empty_text_drop;

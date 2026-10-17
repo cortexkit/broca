@@ -15,13 +15,14 @@ use serde_json::{json, Value};
 use crate::cache_markers::{
     plan_markers, DeclaredMarker, MarkerPlan, MarkerTarget, MarkerViewMessage,
 };
+use crate::claude_code_persona as persona_rules;
 use crate::families::apply_generation_controls;
 use crate::normalize::AnthropicNormalizer;
 use crate::policy::{ReasoningPolicy, SystemPromptPolicy, ThinkingEchoScope};
 use crate::sse::SseDecoder;
 use crate::wire::{
-    AuthHandle, CacheClass, CacheTail, CacheTtl, FrozenRenderConfig, HttpMethod, HttpRequest,
-    MarkerSyntax, NormalizeError, StreamNormalizer, WireFamily,
+    AuthHandle, CacheClass, CacheTail, CacheTtl, ClaudeCodePersona, FrozenRenderConfig, HttpMethod,
+    HttpRequest, MarkerSyntax, NormalizeError, StreamNormalizer, WireFamily,
 };
 
 /// The default API base (no `base_url` override). The family's `/v1/messages` path
@@ -102,6 +103,190 @@ fn anthropic_beta_header(frozen: &FrozenRenderConfig) -> Option<String> {
     anthropic_header_policy(frozen).beta
 }
 
+/// The frozen Claude Code persona, when this run speaks as one: an OAuth identity-lead run
+/// admitted with a persona. A run recorded without one, and every api-key run, renders the
+/// shape it always had.
+fn persona(frozen: &FrozenRenderConfig) -> Option<&ClaudeCodePersona> {
+    match frozen.system_prompt {
+        SystemPromptPolicy::RequiredIdentityLead { .. } => frozen.claude_code_persona.as_ref(),
+        _ => None,
+    }
+}
+
+/// The unsigned billing block for `messages`, or `None` when they hold no user message (the
+/// reference client adds the block only then). Its text depends only on the frozen persona
+/// (with the session's pinned `cc_version` suffix) and, for a persona recorded before the
+/// suffix was pinned, the first user message, so it is the same on every step of a run.
+fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Value> {
+    if !messages
+        .iter()
+        .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        return None;
+    }
+    let suffix = match &persona.cc_version_suffix {
+        Some(pinned) => pinned.clone(),
+        None => persona_rules::cc_version_suffix(
+            &persona_rules::first_user_message_text(messages),
+            &persona.version,
+        ),
+    };
+    let text = persona_rules::billing_header_text(
+        &persona.version,
+        &suffix,
+        persona_rules::CCH_PLACEHOLDER,
+        None,
+        persona.prompt_id.as_deref(),
+    );
+    Some(json!({ "type": "text", "text": text }))
+}
+
+/// The `cc_version` suffix for a transcript under client `version`: computed from its first user
+/// message exactly as the renderer reads that message off the wire, or `None` when the
+/// transcript holds no user message. Admission uses it to pin a session's suffix from the
+/// session's first durable user message.
+pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> Option<String> {
+    let first_user = messages.iter().find(|message| message.role == Role::User)?;
+    let single = std::slice::from_ref(first_user);
+    let id_map = crate::tool_id_alias::ToolIdMap::build(single, &id_grammar());
+    let name_map = crate::tool_name_alias::ToolNameMap::build(&[], single);
+    let wire = convert_message(first_user, false, &id_map, &name_map);
+    Some(persona_rules::cc_version_suffix(
+        &persona_rules::first_user_message_text(std::slice::from_ref(&wire)),
+        version,
+    ))
+}
+
+/// A persona body's bytes: written in the persona's key order, then signed (`cch`). These are
+/// the bytes the run records, retries and dumps, so every copy carries the same signature.
+fn persona_bytes(body: &Value) -> Vec<u8> {
+    persona_rules::sign_body(&persona_rules::to_persona_json(body)).into_bytes()
+}
+
+/// The fixed Claude Code client headers that describe the SDK and runtime the reference client
+/// runs on. Only the OS and architecture come from this machine.
+const STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
+const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
+
+fn stainless_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "MacOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "freebsd" => "FreeBSD",
+        _ => "Unknown",
+    }
+}
+
+fn stainless_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        "x86" => "x32",
+        other => other,
+    }
+}
+
+/// A fresh v4 UUID for `x-client-request-id`, a per-request correlation id. It is drawn from
+/// the standard library's randomly keyed SipHash over a process counter: unpredictable enough
+/// for a correlation id, which guards nothing, and available without the `live` feature.
+fn client_request_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let state = std::collections::hash_map::RandomState::new();
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0u8; 16];
+    for (half, chunk) in bytes.chunks_mut(8).enumerate() {
+        let mut hasher = state.build_hasher();
+        hasher.write_u64(count);
+        hasher.write_usize(half);
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    crate::wire::uuid_v4_text(bytes)
+}
+
+/// The request a persona run sends: the reference client's URL (`?beta=true`) and headers,
+/// in the order its runtime writes them to the wire, with the beta list chosen from the final
+/// signed body.
+fn persona_endpoint(
+    frozen: &FrozenRenderConfig,
+    persona: &ClaudeCodePersona,
+    auth: &AuthHandle,
+    body: Vec<u8>,
+) -> HttpRequest {
+    let base = frozen.base_url.as_deref().unwrap_or(DEFAULT_BASE);
+    let url = format!("{}/v1/messages?beta=true", base.trim_end_matches('/'));
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let betas = persona_rules::select_betas(&parsed, &frozen.wire_model_id, &[]);
+    let mut headers = vec![("accept".to_string(), "application/json".to_string())];
+    attach_auth(&mut headers, auth);
+    headers.extend([
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            "user-agent".to_string(),
+            format!("claude-cli/{} (external, cli)", persona.version),
+        ),
+        ("anthropic-beta".to_string(), betas),
+        (
+            "anthropic-dangerous-direct-browser-access".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string(),
+        ),
+        ("x-app".to_string(), "cli".to_string()),
+        (
+            "x-claude-code-session-id".to_string(),
+            persona.session_id.clone(),
+        ),
+        ("x-client-request-id".to_string(), client_request_id()),
+        ("x-stainless-arch".to_string(), stainless_arch().to_string()),
+        ("x-stainless-lang".to_string(), "js".to_string()),
+        ("x-stainless-os".to_string(), stainless_os().to_string()),
+        (
+            "x-stainless-package-version".to_string(),
+            STAINLESS_PACKAGE_VERSION.to_string(),
+        ),
+        ("x-stainless-retry-count".to_string(), "0".to_string()),
+        ("x-stainless-runtime".to_string(), "node".to_string()),
+        (
+            "x-stainless-runtime-version".to_string(),
+            STAINLESS_RUNTIME_VERSION.to_string(),
+        ),
+        ("x-stainless-timeout".to_string(), "600".to_string()),
+    ]);
+    HttpRequest {
+        method: HttpMethod::Post,
+        url,
+        headers,
+        body,
+    }
+}
+
+/// Attach the credential. Auth attaches after render and never enters the rendered bytes.
+fn attach_auth(headers: &mut Vec<(String, String)>, auth: &AuthHandle) {
+    match auth {
+        AuthHandle::Bearer(token) => {
+            let credential = credential_header(AuthKind::OAuth);
+            headers.push((
+                credential.name.to_string(),
+                format!("{}{token}", credential.prefix),
+            ));
+        }
+        AuthHandle::ApiKeyHeader { header, value } => {
+            // AuthHandle also supports compatible hosts with nonstandard key headers.
+            headers.push((header.clone(), value.clone()));
+        }
+        AuthHandle::SigV4 { signed_headers, .. } => {
+            headers.extend(signed_headers.iter().cloned());
+        }
+        AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
+        AuthHandle::None => {}
+    }
+}
+
 /// The Anthropic Messages family. Stateless — all per-run config is in the frozen
 /// render config passed to each method.
 pub struct AnthropicMessages;
@@ -111,12 +296,26 @@ impl WireFamily for AnthropicMessages {
         build_request_body(frozen, opts)
     }
 
+    /// A persona run's bytes are the persona's key order with the `cch` signature written in;
+    /// every other run keeps the canonical JSON of its shape.
+    fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
+        let body = build_request_body(frozen, opts);
+        if persona(frozen).is_some() {
+            persona_bytes(&body)
+        } else {
+            broca_protocol::canonical_json_bytes(&body)
+        }
+    }
+
     fn endpoint(
         &self,
         frozen: &FrozenRenderConfig,
         auth: &AuthHandle,
         body: Vec<u8>,
     ) -> HttpRequest {
+        if let Some(persona) = persona(frozen) {
+            return persona_endpoint(frozen, persona, auth, body);
+        }
         let base = frozen.base_url.as_deref().unwrap_or(DEFAULT_BASE);
         let url = format!("{}/v1/messages", base.trim_end_matches('/'));
         let mut headers = vec![
@@ -138,24 +337,7 @@ impl WireFamily for AnthropicMessages {
             headers.push(("anthropic-beta".to_string(), beta));
         }
         // Auth attaches HERE, after render — never on the rendered/hashed bytes.
-        match auth {
-            AuthHandle::Bearer(token) => {
-                let credential = credential_header(AuthKind::OAuth);
-                headers.push((
-                    credential.name.to_string(),
-                    format!("{}{token}", credential.prefix),
-                ));
-            }
-            AuthHandle::ApiKeyHeader { header, value } => {
-                // AuthHandle also supports compatible hosts with nonstandard key headers.
-                headers.push((header.clone(), value.clone()));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
-            }
-            AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
-            AuthHandle::None => {}
-        }
+        attach_auth(&mut headers, auth);
         HttpRequest {
             method: HttpMethod::Post,
             url,
@@ -170,6 +352,7 @@ impl WireFamily for AnthropicMessages {
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
         Box::new(AnthropicStreamNormalizer {
+            transformations_unmeasured: !asks_for_input_transformations(frozen),
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Anthropic),
             // The body renders `max_tokens` from this same field, so an output-ceiling error
             // names the cap the provider actually enforced.
@@ -178,8 +361,16 @@ impl WireFamily for AnthropicMessages {
         })
     }
 
-    fn warm_body(&self, _frozen: &FrozenRenderConfig, base: &[u8]) -> Result<Vec<u8>, String> {
-        crate::cache_warm::anthropic_warm_body(base)
+    fn warm_body(&self, frozen: &FrozenRenderConfig, base: &[u8]) -> Result<Vec<u8>, String> {
+        let warm = crate::cache_warm::anthropic_warm_body(base)?;
+        if persona(frozen).is_none() {
+            return Ok(warm);
+        }
+        // The warm body changes the sent body, so a persona warm is re-emitted in the persona's
+        // key order and signed again; its billing block is otherwise the one `base` carried.
+        let body: Value = serde_json::from_slice(&warm)
+            .map_err(|error| format!("the warm body is not JSON: {error}"))?;
+        Ok(persona_bytes(&body))
     }
 }
 
@@ -188,6 +379,22 @@ impl WireFamily for AnthropicMessages {
 struct AnthropicStreamNormalizer {
     sse: SseDecoder,
     inner: AnthropicNormalizer,
+    /// The request went out without the thinking-binding beta, so the response carries no
+    /// `input_transformations` report whatever the provider did.
+    transformations_unmeasured: bool,
+}
+
+/// Whether requests rendered from `frozen` carry the thinking-binding beta, under which the
+/// response reports its input transformations. A Claude Code persona request never does: the
+/// reference client sends that beta only with an enforcing `thinking.block_binding`, which
+/// broca does not send. An api-key request carries no beta at all.
+fn asks_for_input_transformations(frozen: &FrozenRenderConfig) -> bool {
+    persona(frozen).is_none()
+        && anthropic_beta_header(frozen).is_some_and(|betas| {
+            betas
+                .split(',')
+                .any(|beta| beta.trim() == cortexkit_anthropic_policy::THINKING_BINDING_BETA)
+        })
 }
 
 impl StreamNormalizer for AnthropicStreamNormalizer {
@@ -228,6 +435,10 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 
     fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
         self.inner.input_transformations()
+    }
+
+    fn input_transformations_unmeasured(&self) -> bool {
+        self.transformations_unmeasured
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
@@ -340,6 +551,15 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         })
         .unzip();
 
+    // A persona run leads the system with the billing block, which carries the `cc_version`
+    // suffix of the first user message and the unsigned `cch` placeholder; `render` signs it.
+    // It is added before markers are planned so the system tail is counted after it.
+    if let Some(persona) = persona(frozen) {
+        if let Some(block) = billing_block(persona, &messages) {
+            system.insert(0, block);
+        }
+    }
+
     if let Some((ttl, max_breakpoints, lookback_blocks, tail)) = marker_policy {
         // Marker positions are based on the rendered message blocks, not canonical
         // content, so stripped reasoning and empty text cannot move breakpoints.
@@ -427,6 +647,15 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
     if let Some(speed) = &frozen.speed {
         body["speed"] = Value::String(speed.clone());
     }
+    if let Some(persona) = persona(frozen) {
+        body["metadata"] = json!({
+            "user_id": persona_rules::metadata_user_id(
+                &persona.device_id,
+                persona.account_uuid.as_deref(),
+                &persona.session_id,
+            )
+        });
+    }
     crate::structured_output::finish(
         frozen,
         &mut body,
@@ -466,7 +695,7 @@ fn build_system(
 }
 
 fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
-    let tail_start = system_tail_start(frozen);
+    let tail_start = system_tail_start(frozen, system);
     if tail_start >= system.len().saturating_sub(1) {
         return;
     }
@@ -484,20 +713,28 @@ fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
     system.push(json!({ "type": "text", "text": merged }));
 }
 
-fn system_tail_start(frozen: &FrozenRenderConfig) -> usize {
-    if matches!(
+/// Where the caller's system text starts: after the required identity block and, on a
+/// persona run, after the billing block before it. Neither lead block ever carries a cache
+/// breakpoint or is merged into the caller's text.
+fn system_tail_start(frozen: &FrozenRenderConfig, system: &[Value]) -> usize {
+    if !matches!(
         frozen.system_prompt,
         SystemPromptPolicy::RequiredIdentityLead { .. }
     ) {
-        1
-    } else {
-        0
+        return 0;
     }
+    let billing_leads = persona(frozen).is_some()
+        && system
+            .first()
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with(persona_rules::BILLING_HEADER_PREFIX));
+    1 + usize::from(billing_leads)
 }
 
 fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Value]) -> usize {
     system
-        .get(system_tail_start(frozen)..)
+        .get(system_tail_start(frozen, system)..)
         .unwrap_or_default()
         .iter()
         .filter(|block| is_anthropic_cacheable_block(block))
@@ -576,7 +813,7 @@ fn apply_anthropic_marker_plan(
     plan: &MarkerPlan,
 ) {
     if plan.system_tail {
-        let tail_start = system_tail_start(frozen);
+        let tail_start = system_tail_start(frozen, system);
         if let Some(block) = system
             .get_mut(tail_start..)
             .and_then(|tail| tail.last_mut())
@@ -822,6 +1059,77 @@ mod tests {
     use super::*;
     use crate::families::{anthropic_apikey_frozen_config, anthropic_frozen_config};
     use broca_protocol::{content::ToolOutput, ToolCallId};
+
+    fn persona_frozen() -> FrozenRenderConfig {
+        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
+        frozen.claude_code_persona = Some(ClaudeCodePersona {
+            version: "2.1.280".into(),
+            device_id: "0".repeat(64),
+            account_uuid: None,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            prompt_id: None,
+            cc_version_suffix: None,
+        });
+        // Adaptive thinking, so the request can be warmed (a manual budget cannot).
+        frozen.variant = Some(crate::variant::FrozenVariant {
+            name: "adaptive".into(),
+            request: crate::variant::VariantRequest::Anthropic {
+                thinking: Some(json!({ "type": "adaptive" })),
+                effort: None,
+            },
+        });
+        frozen
+    }
+
+    /// A persona warm request changes the sent body, so it is re-emitted in the persona's key
+    /// order and signed again, keeping the billing text it was based on.
+    #[test]
+    fn persona_warm_body_is_reordered_and_signed_again() {
+        let frozen = persona_frozen();
+        let base = AnthropicMessages.render(&frozen, &opts(vec![user_message("warm me")]));
+        let warm = AnthropicMessages
+            .warm_body(&frozen, &base)
+            .expect("an adaptive persona request can be warmed");
+        let warm_text = String::from_utf8(warm).unwrap();
+        let parsed: Value = serde_json::from_str(&warm_text).unwrap();
+        assert_eq!(persona_rules::to_persona_json(&parsed), warm_text);
+        assert_eq!(persona_rules::sign_body(&warm_text), warm_text);
+        assert_eq!(parsed["max_tokens"], 0);
+        assert!(parsed.get("stream").is_none());
+        let base_parsed: Value = serde_json::from_slice(&base).unwrap();
+        let without_cch = |value: &Value| {
+            let text = value["system"][0]["text"].as_str().unwrap().to_string();
+            let at = text.find("cch=").unwrap();
+            format!("{}{}", &text[..at], &text[at + 10..])
+        };
+        assert_eq!(without_cch(&parsed), without_cch(&base_parsed));
+        assert_ne!(
+            parsed["system"][0], base_parsed["system"][0],
+            "a new body, a new cch"
+        );
+    }
+
+    /// The persona applies only to the OAuth identity-lead shape: an api-key config carrying a
+    /// persona renders and addresses exactly as it does without one.
+    #[test]
+    fn an_api_key_config_ignores_a_persona() {
+        let mut with = anthropic_apikey_frozen_config("claude-opus-4-8");
+        with.claude_code_persona = persona_frozen().claude_code_persona;
+        let without = anthropic_apikey_frozen_config("claude-opus-4-8");
+        let request = opts(vec![user_message("hello")]);
+        assert_eq!(
+            AnthropicMessages.render(&with, &request),
+            AnthropicMessages.render(&without, &request)
+        );
+        let auth = AuthHandle::ApiKeyHeader {
+            header: "x-api-key".into(),
+            value: "k".into(),
+        };
+        let with_request = AnthropicMessages.endpoint(&with, &auth, Vec::new());
+        let without_request = AnthropicMessages.endpoint(&without, &auth, Vec::new());
+        assert_eq!(with_request.url, without_request.url);
+        assert_eq!(with_request.headers, without_request.headers);
+    }
 
     fn system_message(text: &str) -> Message {
         Message {
@@ -1249,6 +1557,7 @@ mod tests {
         let mut normalizer = AnthropicStreamNormalizer {
             sse: SseDecoder::default(),
             inner: AnthropicNormalizer::new(StepId(1)),
+            transformations_unmeasured: false,
         };
         let p1 = normalizer.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n").unwrap();
         assert!(!p1.is_empty());

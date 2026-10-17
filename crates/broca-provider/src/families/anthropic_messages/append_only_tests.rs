@@ -547,8 +547,11 @@ async fn a_later_episode_cannot_add_a_second_system_message() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The thinking-binding beta rides every request that has thinking on, so each response reports
-/// the thinking blocks that failed the prefix check. The request body must NEVER set
+/// On the pre-persona OAuth shape the thinking-binding beta rides every request that has thinking
+/// on, so each response reports the thinking blocks that failed the prefix check. A Claude Code
+/// persona request does not carry it (the reference client sends it only with an enforcing
+/// `block_binding`), so its attempts are recorded as not measured: see
+/// `a_persona_request_is_not_measured_for_input_transformations`. The request body must NEVER set
 /// `prefix_mismatch_behavior`: that field opts the account into enforcement.
 #[test]
 fn thinking_requests_carry_the_binding_beta_and_never_opt_into_enforcement() {
@@ -570,6 +573,44 @@ fn thinking_requests_carry_the_binding_beta_and_never_opt_into_enforcement() {
 
 /// Every entry of `message_start.input_transformations` is kept, whatever its reason, and an
 /// entry of unexpected shape still counts.
+/// Which requests ask for the input-transformations report: a pre-persona OAuth request with
+/// thinking does; a Claude Code persona request and an api-key request do not, so their
+/// attempts read as not measured rather than as zero transformations.
+#[test]
+fn a_persona_request_is_not_measured_for_input_transformations() {
+    use crate::wire::WireFamily;
+    let unmeasured = |frozen: &crate::wire::FrozenRenderConfig| {
+        super::AnthropicMessages
+            .normalizer(frozen, broca_protocol::StepId(1))
+            .input_transformations_unmeasured()
+    };
+    let oauth = anthropic_frozen_config("claude-opus-5");
+    assert!(
+        !unmeasured(&oauth),
+        "the pre-persona OAuth shape asks for the report"
+    );
+
+    let mut persona = anthropic_frozen_config("claude-opus-5");
+    persona.claude_code_persona = Some(crate::wire::ClaudeCodePersona {
+        version: "2.1.280".into(),
+        device_id: "0".repeat(64),
+        account_uuid: None,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        prompt_id: None,
+        cc_version_suffix: None,
+    });
+    assert!(
+        unmeasured(&persona),
+        "a persona request does not ask for the report"
+    );
+
+    let apikey = crate::families::anthropic_apikey_frozen_config("claude-opus-5");
+    assert!(
+        unmeasured(&apikey),
+        "an api-key request sends no beta at all"
+    );
+}
+
 #[test]
 fn message_start_input_transformations_are_read_verbatim() {
     use crate::wire::WireFamily;

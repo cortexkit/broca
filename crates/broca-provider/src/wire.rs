@@ -217,6 +217,86 @@ pub struct FrozenRenderConfig {
     /// without structured output) is omitted, keeping every such render byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<broca_protocol::structured_output::FrozenStructuredOutput>,
+    /// The Claude Code persona an Anthropic OAuth (identity-lead) run speaks as: the billing
+    /// block, `metadata.user_id`, the persona key order and `cch` signature in the body, and the
+    /// Claude Code headers and betas (see `crate::claude_code_persona`). Frozen at admission so
+    /// every step and every resume sends the same identity. `None` is the shape OAuth runs had
+    /// before the persona existed (identity block only, canonical key order); a run recorded
+    /// that way keeps rendering it, and blobs recorded without the field read back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_persona: Option<ClaudeCodePersona>,
+}
+
+/// The frozen identity of a Claude Code persona run. Every value here is either in the request
+/// body or must agree with it, so it is fixed at admission rather than re-derived per step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeCodePersona {
+    /// The Claude Code version spoken: `cc_version` in the billing block and the version in
+    /// the user-agent. Frozen so a later version bump leaves admitted runs' bytes alone.
+    pub version: String,
+    /// `metadata.user_id.device_id`: 64 lowercase hex digits, stable per account and machine.
+    pub device_id: String,
+    /// `metadata.user_id.account_uuid`, the Anthropic account the credential belongs to. Absent
+    /// when unknown, and then omitted from `user_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+    /// `metadata.user_id.session_id` and the `x-claude-code-session-id` header: one UUID per
+    /// broca session.
+    pub session_id: String,
+    /// `cc_prompt_id` in the billing block: one UUID per episode, shared by all its steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    /// The 3-hex `cc_version` suffix, pinned for the whole session: computed once from the
+    /// session's first durable user message and inherited by its later episodes, so a
+    /// compaction that rewrites that message does not change the billing text. Absent (a
+    /// persona recorded before the suffix was pinned) means the renderer computes it from the
+    /// first user message of the request it renders, as such an episode always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_version_suffix: Option<String>,
+}
+
+impl ClaudeCodePersona {
+    /// The persona version new runs are admitted with.
+    pub const CURRENT_VERSION: &'static str = crate::claude_code_persona::CLAUDE_CODE_VERSION;
+
+    /// A device id stable per account and per broca installation: SHA-256 over a domain string,
+    /// the installation's persisted id and the account, as 64 lowercase hex digits. Deriving it
+    /// (rather than drawing one at random per process) keeps a restart from looking like a new
+    /// device.
+    pub fn derive_device_id(install_id: &str, account: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(
+            format!("broca-claude-code-device-id-v1\0{install_id}\0{account}").as_bytes(),
+        );
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// A session id for a broca session, derived from its session reference so every episode
+    /// of the session, before and after a restart, sends the same id. UUID-shaped (version 4,
+    /// RFC variant) because the reference client sends a random UUID there.
+    pub fn derive_session_id(session_ref: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest =
+            Sha256::digest(format!("broca-claude-code-session-id-v1\0{session_ref}").as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        uuid_v4_text(bytes)
+    }
+}
+
+/// Format 16 bytes as a version-4, RFC-variant UUID (the version and variant bits are set).
+pub fn uuid_v4_text(mut bytes: [u8; 16]) -> String {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// One HTTP request the family wants sent: method, full URL, headers, body bytes.
@@ -440,6 +520,13 @@ pub trait StreamNormalizer: Send {
     /// forward this to the one it wraps.
     fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
         None
+    }
+
+    /// Whether the request this stream answers did NOT ask the provider to report input
+    /// transformations, so a missing report means "not measured" rather than "none". False for
+    /// grammars without the report. A wrapping normalizer must forward this too.
+    fn input_transformations_unmeasured(&self) -> bool {
+        false
     }
 }
 

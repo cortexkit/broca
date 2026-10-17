@@ -110,6 +110,7 @@ mod gated {
             ..ResolveOptions::default()
         };
         let render = EpisodeRenderConfig {
+            claude_code_persona: Default::default(),
             base_url: None,
             max_output_tokens: None,
             variant: restored,
@@ -954,5 +955,91 @@ mod gated {
         let with_variant = resume_anthropic_oauth_with(None, Some(recorded_rule), Some(&variant));
         assert!(with_variant["reasoning"].get("cross_model").is_none());
         assert!(with_variant.get("variant").is_some());
+    }
+
+    /// Resolve an Anthropic episode with `method`, offering `fresh` as a new episode's persona
+    /// and restoring `episode` as a resume would. Returns the frozen blob and step-one bytes.
+    fn resolve_anthropic_persona(
+        method: AuthMethod,
+        fresh: Option<&broca_catalog::live::ClaudeCodePersona>,
+        episode: broca_catalog::live::EpisodePersona<'_>,
+    ) -> (Value, String) {
+        install();
+        let options = ResolveOptions {
+            auth_method: Some(method),
+            claude_code_persona: fresh,
+            ..ResolveOptions::default()
+        };
+        let resolved = broca_catalog::live::resolve_catalog_episode_with_client(
+            "anthropic/claude-sonnet-4-5",
+            None,
+            &AuthMode::Secret("test-key".into()),
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                claude_code_persona: episode,
+                ..EpisodeRenderConfig::default()
+            },
+        )
+        .expect("anthropic resolves");
+        let opts = CallOptions::new(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: "hi".into() }],
+        )]);
+        let bytes = String::from_utf8(resolved.provider.render_request(&opts)).unwrap();
+        (resolved.provider.render_config_blob(), bytes)
+    }
+
+    /// A fresh OAuth episode freezes the persona it is offered and renders the billing block. A
+    /// resume restores what its episode recorded: an episode recorded without a persona keeps
+    /// rendering without one even when a persona is on offer, and a recorded persona comes back
+    /// unchanged. An api-key episode never takes one.
+    #[test]
+    fn the_persona_is_frozen_for_fresh_oauth_episodes_and_restored_as_recorded() {
+        use broca_catalog::live::{ClaudeCodePersona, EpisodePersona};
+        let persona = ClaudeCodePersona {
+            version: "2.1.280".into(),
+            device_id: "0".repeat(64),
+            account_uuid: Some("00000000-0000-4000-8000-000000000000".into()),
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
+            cc_version_suffix: None,
+        };
+        let (fresh, fresh_bytes) =
+            resolve_anthropic_persona(AuthMethod::Oauth, Some(&persona), EpisodePersona::Fresh);
+        assert_eq!(
+            fresh["claude_code_persona"],
+            serde_json::to_value(&persona).unwrap()
+        );
+        assert!(fresh_bytes.contains("x-anthropic-billing-header: cc_version=2.1.280."));
+
+        let (recorded_without, old_bytes) = resolve_anthropic_persona(
+            AuthMethod::Oauth,
+            Some(&persona),
+            EpisodePersona::Recorded(None),
+        );
+        let mut expected_old = fresh.clone();
+        expected_old
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_code_persona");
+        assert_eq!(recorded_without, expected_old);
+        assert!(!old_bytes.contains("x-anthropic-billing-header"));
+        let (no_offer, no_offer_bytes) =
+            resolve_anthropic_persona(AuthMethod::Oauth, None, EpisodePersona::Fresh);
+        assert_eq!(no_offer, expected_old);
+        assert_eq!(no_offer_bytes, old_bytes);
+
+        let (recorded_with, recorded_bytes) = resolve_anthropic_persona(
+            AuthMethod::Oauth,
+            None,
+            EpisodePersona::Recorded(Some(&persona)),
+        );
+        assert_eq!(recorded_with, fresh);
+        assert_eq!(recorded_bytes, fresh_bytes);
+
+        let (api_key, _) =
+            resolve_anthropic_persona(AuthMethod::ApiKey, Some(&persona), EpisodePersona::Fresh);
+        assert!(api_key.get("claude_code_persona").is_none());
     }
 }

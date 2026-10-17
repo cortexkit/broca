@@ -551,6 +551,103 @@ mod gated {
         );
     }
 
+    /// The Claude Code persona the persona goldens render with, every value fixed.
+    fn golden_persona() -> broca_provider::wire::ClaudeCodePersona {
+        broca_provider::wire::ClaudeCodePersona {
+            version: "2.1.280".into(),
+            device_id: "0".repeat(64),
+            account_uuid: Some("00000000-0000-4000-8000-000000000000".into()),
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
+            cc_version_suffix: None,
+        }
+    }
+
+    const PERSONA_GOLDEN: &str = include_str!("../fixtures/anthropic_persona_render_golden.json");
+    const PERSONA_GOLDEN_VERSION: &str =
+        include_str!("../fixtures/anthropic_persona_render_golden.json.version");
+
+    /// The request of `anthropic_render_matches_golden` from a run admitted with the Claude Code
+    /// persona: the billing block leads the system, `metadata.user_id` is set, the keys are in
+    /// the persona's order and `cch` is signed into the bytes. The golden without the persona
+    /// stays as it was, because runs admitted before the persona still render it.
+    #[test]
+    fn anthropic_persona_render_matches_golden() {
+        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
+        frozen.claude_code_persona = Some(golden_persona());
+        let bytes = AnthropicMessages.render(&frozen, &fixed_request());
+        let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
+
+        if render_golden_support::update_if_requested(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/anthropic_persona_render_golden.json"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/anthropic_persona_render_golden.json.version"
+            ),
+            rendered.as_bytes(),
+            PERSONA_GOLDEN.as_bytes(),
+            PERSONA_GOLDEN_VERSION,
+            ANTHROPIC_RENDERER_VERSION,
+            "Anthropic persona",
+        ) {
+            return;
+        }
+
+        render_golden_support::assert_matches_or_requires_bump(
+            rendered.as_bytes(),
+            PERSONA_GOLDEN.as_bytes(),
+            PERSONA_GOLDEN_VERSION,
+            ANTHROPIC_RENDERER_VERSION,
+            "Anthropic persona",
+        );
+    }
+
+    const PERSONA_TOOL_LOOP_GOLDEN: &str =
+        include_str!("../fixtures/anthropic_persona_tool_loop_render_golden.json");
+    const PERSONA_TOOL_LOOP_GOLDEN_VERSION: &str =
+        include_str!("../fixtures/anthropic_persona_tool_loop_render_golden.json.version");
+
+    /// The tool loop of `anthropic_tool_loop_render_matches_golden` under the persona, with
+    /// cache markers: the system breakpoint lands on the caller's text, after the billing and
+    /// identity blocks, which never carry one.
+    #[test]
+    fn anthropic_persona_tool_loop_render_matches_golden() {
+        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
+        frozen.cache = Some(anthropic_cache_policy());
+        frozen.claude_code_persona = Some(golden_persona());
+        let bytes = AnthropicMessages.render(&frozen, &tool_loop_request());
+        let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
+
+        if render_golden_support::update_if_requested(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/anthropic_persona_tool_loop_render_golden.json"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/anthropic_persona_tool_loop_render_golden.json.version"
+            ),
+            rendered.as_bytes(),
+            PERSONA_TOOL_LOOP_GOLDEN.as_bytes(),
+            PERSONA_TOOL_LOOP_GOLDEN_VERSION,
+            ANTHROPIC_RENDERER_VERSION,
+            "Anthropic persona tool loop",
+        ) {
+            return;
+        }
+
+        render_golden_support::assert_matches_or_requires_bump(
+            rendered.as_bytes(),
+            PERSONA_TOOL_LOOP_GOLDEN.as_bytes(),
+            PERSONA_TOOL_LOOP_GOLDEN_VERSION,
+            ANTHROPIC_RENDERER_VERSION,
+            "Anthropic persona tool loop",
+        );
+    }
+
     /// A render config exactly as a run admitted with the keep-all echo scope recorded it, before
     /// the rule for echoing thinking across Anthropic models was part of the frozen config. A
     /// resumed run renders from this blob, so its bytes must never move: the golden below pins

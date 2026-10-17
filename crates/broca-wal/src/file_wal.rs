@@ -989,9 +989,57 @@ pub fn read_first_run_started(
 }
 
 fn read_first_run_started_from(
-    mut file: impl Read,
+    file: impl Read,
     max_bytes: u64,
 ) -> Result<Option<FramedRecord>, WalError> {
+    read_prefix_until_from(file, max_bytes, |framed| {
+        if matches!(framed.record, WalRecord::RunStarted { .. }) {
+            return Some(framed.clone());
+        }
+        None
+    })
+    .map(|(found, _)| found)
+}
+
+/// The session's first durable user message: the first `Role::User` message in the first
+/// `RunStarted` or `Steered` record that carries one, read only as far as that record. Returns
+/// it with the number of bytes read; `None` when the log holds none (or is absent). Like
+/// [`read_first_run_started`], a read that would pass `max_bytes` fails with
+/// [`WalError::TooLarge`] instead of loading the rest of the log, and a torn tail ends the read.
+pub fn read_first_user_message(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+) -> Result<(Option<broca_protocol::Message>, u64), WalError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, 0)),
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    read_prefix_until_from(file, max_bytes, |framed| {
+        first_user_message_in(&framed.record)
+    })
+}
+
+/// The first user message a record adds to the conversation, if it adds one.
+pub fn first_user_message_in(record: &WalRecord) -> Option<broca_protocol::Message> {
+    let input = match record {
+        WalRecord::RunStarted { input, .. } | WalRecord::Steered { input, .. } => input,
+        _ => return None,
+    };
+    input
+        .iter()
+        .find(|message| message.role == broca_protocol::Role::User)
+        .cloned()
+}
+
+/// Decode frames from the start of a log until `found` returns a value, never reading past
+/// `max_bytes`. Returns that value (or `None` at the end of the log or a torn tail) with the
+/// number of bytes read.
+fn read_prefix_until_from<T>(
+    mut file: impl Read,
+    max_bytes: u64,
+    mut found: impl FnMut(&FramedRecord) -> Option<T>,
+) -> Result<(Option<T>, u64), WalError> {
     let mut offset = 0usize;
     let mut previous = None;
     let mut lineage = None;
@@ -999,7 +1047,9 @@ fn read_first_run_started_from(
         let mut header = [0; crate::framing::HEADER_LEN];
         match file.read_exact(&mut header) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok((None, offset as u64))
+            }
             Err(error) => return Err(WalError::Io(error)),
         }
         let len = u32::from_le_bytes(header[..4].try_into().unwrap());
@@ -1021,15 +1071,17 @@ fn read_first_run_started_from(
         frame.resize(size, 0);
         match file.read_exact(&mut frame[header.len()..]) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok((None, (offset + size) as u64))
+            }
             Err(error) => return Err(WalError::Io(error)),
         }
         match crate::framing::decode_next(&frame) {
             crate::framing::DecodeStep::Record { framed, .. } => {
                 validate_contiguous_sequence(previous, 1, framed.seq)?;
                 previous = Some(framed.seq);
-                if matches!(framed.record, WalRecord::RunStarted { .. }) {
-                    return Ok(Some(*framed));
+                if let Some(value) = found(&framed) {
+                    return Ok((Some(value), (offset + size) as u64));
                 }
             }
             crate::framing::DecodeStep::Lineage { lineage_id, .. } => {
@@ -1045,7 +1097,7 @@ fn read_first_run_started_from(
                     missing,
                 })
             }
-            crate::framing::DecodeStep::TornTail => return Ok(None),
+            crate::framing::DecodeStep::TornTail => return Ok((None, (offset + size) as u64)),
         }
         offset += size;
     }

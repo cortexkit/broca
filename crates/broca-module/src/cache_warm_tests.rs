@@ -850,6 +850,7 @@ impl Fixture {
                 websocket_request: None,
                 websocket_close_code: None,
                 input_transformations: None,
+                input_transformations_unmeasured: false,
                 credential_refresh: None,
                 served_account_ref: None,
             },

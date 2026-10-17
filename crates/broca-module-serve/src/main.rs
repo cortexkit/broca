@@ -332,7 +332,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::RouteOpenRetry::default_patience(),
     )))
     .with_methods(auth_methods.clone())
-    .with_provider_overrides(provider_overrides);
+    .with_provider_overrides(provider_overrides)
+    .with_claude_code_install_id(
+        match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {
+            Ok(install_id) => Some(install_id),
+            Err(error) => {
+                // Without an install id there is no stable device id, so OAuth episodes are
+                // admitted without the Claude Code persona rather than with an unstable one.
+                tracing::warn!(%error, "Claude Code install id unavailable; OAuth runs omit the persona");
+                None
+            }
+        },
+    );
     let cache_table =
         broca_module_serve::CacheTtlTable::load_default_path().map_err(ServeIoError)?;
     executor_impl = executor_impl.with_cache_table(cache_table);
@@ -2102,6 +2113,18 @@ mod executor {
         }
     }
 
+    /// The Claude Code persona the episode froze at start, re-applied on resume. A blob recorded
+    /// before the persona existed has no `claude_code_persona` key and reads back as `None`,
+    /// the shape that episode rendered with.
+    fn frozen_claude_code_persona(
+        config: &broca_wal::RunConfig,
+    ) -> Option<broca_catalog::live::ClaudeCodePersona> {
+        config
+            .frozen_render_config
+            .get("claude_code_persona")
+            .and_then(|persona| serde_json::from_value(persona.clone()).ok())
+    }
+
     fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool {
         config
             .frozen_render_config
@@ -2407,6 +2430,16 @@ mod executor {
         /// The routing module broca asks which provider account a new run uses, and reports
         /// each run's account evidence to. `None` without the vault credential source.
         routing: Option<Arc<RoutingClient>>,
+        /// This installation's id, the root of the Claude Code persona's device id (see
+        /// `broca_module_serve::claude_code_identity`). `None` admits Anthropic OAuth episodes
+        /// without a persona, in the shape they had before it existed.
+        claude_code_install_id: Option<String>,
+        /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
+        /// its WAL could not be read), so the WAL is read for it at most once per session.
+        cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+        /// WAL bytes read to pin `cc_version` suffixes, for tests that prove a read happens at
+        /// most once.
+        cc_suffix_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl LiveLoopExecutor {
@@ -2433,7 +2466,84 @@ mod executor {
                 cache_table: CacheTtlTable::shipped_defaults(),
                 opencode_auth_path: None,
                 routing: None,
+                claude_code_install_id: None,
+                cc_suffix_memo: Default::default(),
+                cc_suffix_wal_bytes: Default::default(),
             }
+        }
+
+        /// The `cc_version` suffix pinned for a new episode's session: the one the session's
+        /// latest episode froze, or else one computed from the session's first durable user
+        /// message, read from the WAL only as far as the record that carries it (never a
+        /// compaction view). The result is remembered per session for this process, so a session
+        /// whose latest episode recorded no suffix (it used another provider) does not read the
+        /// WAL again. `None` when the WAL cannot be read: logged once per session at WARN, and
+        /// the renderer then computes the suffix from each request as before.
+        async fn session_cc_version_suffix(
+            &self,
+            req: &broca_core::RunRequest,
+            last_episode_frozen_config: Option<&serde_json::Value>,
+            durable_head: u64,
+        ) -> Option<String> {
+            use broca_core::WalStore as _;
+            use broca_module_serve::claude_code_identity::{
+                first_durable_cc_version_suffix, inherited_cc_version_suffix,
+            };
+            if let Some(inherited) = inherited_cc_version_suffix(last_episode_frozen_config) {
+                return Some(inherited);
+            }
+            let key = broca_core::session_addr(&req.session);
+            if let Some(remembered) = self.cc_suffix_memo.lock().unwrap().get(&key) {
+                return remembered.clone();
+            }
+            // An empty WAL holds no earlier message, so the new input's is the first.
+            let durable = if durable_head == 0 {
+                None
+            } else {
+                let wal_store = Arc::clone(&self.wal_store);
+                let session = req.session.clone();
+                let read = broca_diagnostics::spawn_blocking(
+                    broca_diagnostics::JobKind::WalRead,
+                    move || wal_store.first_user_message(&session),
+                )
+                .await;
+                match read {
+                    Ok(Ok((message, bytes))) => {
+                        self.cc_suffix_wal_bytes
+                            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                        message
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(
+                            session = %req.session.session,
+                            "the session's first user message could not be read; its Claude Code cc_version suffix is not pinned"
+                        );
+                        self.remember_cc_suffix(key, None);
+                        return None;
+                    }
+                }
+            };
+            let suffix = first_durable_cc_version_suffix(durable.as_slice(), &req.input);
+            self.remember_cc_suffix(key, suffix.clone());
+            suffix
+        }
+
+        /// Remember a session's pinned suffix (or that its WAL could not be read) for this
+        /// process. The map is cleared when it grows past a bound, which costs at most one more
+        /// bounded read per session.
+        fn remember_cc_suffix(&self, key: String, suffix: Option<String>) {
+            const MAX_REMEMBERED_SESSIONS: usize = 16_384;
+            let mut memo = self.cc_suffix_memo.lock().unwrap();
+            if memo.len() >= MAX_REMEMBERED_SESSIONS {
+                memo.clear();
+            }
+            memo.insert(key, suffix);
+        }
+
+        /// Install the id the Claude Code persona's device id derives from.
+        pub fn with_claude_code_install_id(mut self, install_id: Option<String>) -> Self {
+            self.claude_code_install_id = install_id;
+            self
         }
 
         pub fn with_hook_plane(mut self, hooks: Arc<broca_subc::SubcHookPlane>) -> Self {
@@ -3263,7 +3373,51 @@ mod executor {
                     .as_ref()
                     .and_then(|prior| frozen_prompt_cache_key(&prior.config))
             };
+            // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
+            // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
+            // its episode recorded, or its recorded absence, below.
+            let speaks_as_claude_code = job.req.model.provider_module_id.as_str() == "anthropic"
+                && resolution.method != Some(AuthMethod::ApiKey);
+            let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
+                (Some(install_id), true) if speaks_as_claude_code => {
+                    let cc_version_suffix = self
+                        .session_cc_version_suffix(
+                            &job.req,
+                            prior_snapshot
+                                .checkpoint_at_head
+                                .last_episode
+                                .as_ref()
+                                .map(|episode| &episode.config.frozen_render_config),
+                            prior_snapshot.head_seq,
+                        )
+                        .await;
+                    match broca_module_serve::claude_code_identity::fresh_persona(
+                        install_id,
+                        resolution.account_id.as_deref(),
+                        resolution
+                            .selection
+                            .as_ref()
+                            .map_or(job.req.model.provider_module_id.as_str(), |selection| {
+                                selection.credential_id.as_str()
+                            }),
+                        &job.req.session,
+                        cc_version_suffix,
+                    ) {
+                        Ok(persona) => Some(persona),
+                        Err(error) => {
+                            tracing::warn!(%error, "Claude Code persona unavailable for this episode");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let restored_persona = prior_run
+                .as_ref()
+                .filter(|_| !fresh_episode)
+                .and_then(|prior| frozen_claude_code_persona(&prior.config));
             let resolve_options = broca_catalog::live::ResolveOptions {
+                claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
                 family_override,
                 project_id: resolution.project_id.as_deref(),
@@ -3383,6 +3537,13 @@ mod executor {
                         .map(|prior| frozen_responses_tools_non_strict(&prior.config)),
                     // Restored as recorded, never re-decided from a catalog that may have moved.
                     structured_output: restored_structured_output.as_ref(),
+                    // Restored as recorded, including a recorded absence: an OAuth episode
+                    // admitted before the persona existed resumes with its old bytes.
+                    claude_code_persona: if fresh_episode {
+                        broca_catalog::live::EpisodePersona::Fresh
+                    } else {
+                        broca_catalog::live::EpisodePersona::Recorded(restored_persona.as_ref())
+                    },
                 },
             ) {
                 Ok(r) => r,
@@ -4140,6 +4301,7 @@ mod executor {
                         .into(),
                 ),
                 &broca_catalog::live::ResolveOptions {
+                    claude_code_persona: None,
                     auth_method: method,
                     family_override,
                     project_id: None,
@@ -4295,6 +4457,7 @@ mod executor {
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
+                claude_code_persona: None,
                 auth_method: Some(AuthMethod::Chatgpt),
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                 project_id: None,
