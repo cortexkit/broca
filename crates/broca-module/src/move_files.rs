@@ -33,6 +33,8 @@ pub struct PlannedSession {
     pub local_archive: Option<Vec<u8>>,
     /// Read-only verdict from the same local snapshot used during planning.
     pub divergence: Option<LocalDivergence>,
+    /// Safe reason a cut could not be verified for an unknown divergence answer.
+    pub divergence_reason: Option<String>,
 }
 
 #[derive(Clone, Copy)]

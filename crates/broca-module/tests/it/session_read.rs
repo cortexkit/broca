@@ -4384,18 +4384,17 @@ async fn imported_message_over_frame_limit_is_refused_with_identity() {
         .read(SessionReadRequest::new(key.clone(), Some(0), Some(100)))
         .await
         .unwrap_err();
-    match error {
-        broca_module::serve::ServeError::ReplyTooLarge {
-            bytes,
-            limit,
-            subject: broca_module::serve::ReplyTooLargeSubject::Message { session, ordinal },
-        } => {
-            assert!(bytes > limit);
-            assert_eq!(limit, broca_wire::SUBC_MAX_FRAME_BYTES);
-            assert_eq!(session, key.session);
-            assert_eq!(ordinal, 0);
-        }
-        other => panic!("expected a frame-size refusal naming the message, got {other:?}"),
-    }
+    let broca_module::serve::ServeError::ReplyTooLarge(detail) = error else {
+        panic!("expected a frame-size refusal naming the message, got {error:?}");
+    };
+    assert!(detail.bytes > detail.limit);
+    assert_eq!(detail.limit, broca_wire::SUBC_MAX_FRAME_BYTES);
+    assert!(matches!(
+        detail.subject,
+        cortexkit_role_llm_runner::errors::ReplyTooLargeSubject::Message {
+            session,
+            ordinal: 0
+        } if session == key.session
+    ));
     drop(rig);
 }

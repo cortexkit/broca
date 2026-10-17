@@ -551,6 +551,7 @@ impl MoveDriver for Driver {
             }
             let mut sealed = receiver;
             let mut divergence = None;
+            let mut divergence_reason = None;
             let bytes = if op == Op::Diverged {
                 let local = local_probe.expect("held divergence ref has local bytes");
                 match broca_module::move_files::retained_move_copy_from_bytes(
@@ -580,12 +581,13 @@ impl MoveDriver for Driver {
                             Err(error) => match error.verification_cause {
                                 Some(cause) => {
                                     // Divergence entries carry only a state, not a
-                                    // per-ref message. Keep the cause in ERROR logs
-                                    // without adding fields or logging WAL content.
+                                    // per-ref message. Preserve the safe cause for the
+                                    // answer without logging WAL content.
                                     tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
                                     sealed = false;
                                     divergence =
                                         Some(broca_module::move_files::LocalDivergence::Unknown);
+                                    divergence_reason = Some(cause.to_owned());
                                     local
                                 }
                                 None => return Err(error.refusal),
@@ -661,6 +663,7 @@ impl MoveDriver for Driver {
                 lineage_id,
                 local_archive,
                 divergence,
+                divergence_reason,
             });
         }
         Ok(MovePlans {
@@ -728,10 +731,35 @@ impl MoveDriver for Driver {
                     Err(_) => json!({"state":"unknown"}),
                 }
             }).collect::<Vec<_>>()}),
-            Op::Diverged => json!({"refs":plans.iter().map(|p| {
-                let state = p.divergence.unwrap_or(broca_module::move_files::LocalDivergence::Unknown).as_str();
-                json!({"state":state})
-            }).collect::<Vec<_>>()}),
+            Op::Diverged => {
+                use contract::diverged::{DivergedEntry, DivergedReply, DivergedState};
+
+                let refs = plans
+                    .iter()
+                    .map(|plan| {
+                        let state = match plan
+                            .divergence
+                            .unwrap_or(broca_module::move_files::LocalDivergence::Unknown)
+                        {
+                            broca_module::move_files::LocalDivergence::AtCut => {
+                                DivergedState::AtCut
+                            }
+                            broca_module::move_files::LocalDivergence::Advanced => {
+                                DivergedState::Advanced
+                            }
+                            broca_module::move_files::LocalDivergence::Unknown => {
+                                DivergedState::Unknown
+                            }
+                        };
+                        match &plan.divergence_reason {
+                            Some(reason) => DivergedEntry::with_reason(state, reason.clone())
+                                .map_err(unavailable),
+                            None => Ok(DivergedEntry::new(state)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                serde_json::to_value(DivergedReply::new(refs)).map_err(unavailable)?
+            }
             Op::Describe => {
                 serde_json::to_value(contract::describe_reply()).map_err(unavailable)?
             }

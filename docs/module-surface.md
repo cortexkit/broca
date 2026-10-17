@@ -156,10 +156,13 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   that maximum. Messages and late approvals share the budget, including tools, attribution,
   head fields and continuation cursors. A single message and a late entry remain whole when they
   exceed the page target, but a complete encoded frame that exceeds the transport limit is refused
-  as `reply_too_large`, with its frame byte count and message identity; message content is not
-  included in the refusal. Model-view pages use the same target and keep replacement groups and
-  insertion/anchor groups whole. An atomic group that cannot fit one complete frame is refused with
-  its group identity rather than being split or truncated.
+  as `reply_too_large` with the role detail `{bytes, limit, subject}`. A raw page names its
+  indivisible message as `subject: {kind: "message", session, ordinal}`; a model-view page names the
+  source entry as `subject: {kind: "model_group", source}`, where `source` is the published
+  `EntrySource` (`message` or `replacement`). Message content is never included. Model-view pages
+  use the same target and keep replacement groups and insertion/anchor groups whole. Source-less
+  metadata overflow uses the adapter's generic `response_too_large` refusal because there is no
+  message or model entry to name.
 - `tool_calls[].call_key` is `<lineage_id>:<wal_seq>` of the call's own `tool_dispatch_intent`,
   derived on read and never stored. `dispatched_to` is that intent's `module_id`, absent on an
   intent written before broca recorded it. Sending `call_key` to providers waits until each
@@ -171,7 +174,8 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   nothing inserted, leaving reasoning out; a completed run with no text answers `""`.
   It is not paged and is not subject to `session.read.max_bytes`; when its complete encoded frame
   exceeds the transport limit, broca refuses `reply_too_large` and names the final message by
-  session and ordinal without including its content.
+  session and ordinal without including its content. A run result without a final message uses
+  the generic `response_too_large` refusal if its metadata alone cannot fit.
 - `session.baseline` and the admitting send's `baseline`: sessions are admitted without a fetch
   plan, so `items` is empty and `composition_digest` absent; `tool_names` are the first
   episode's tools; both generations are 0. The send reply carries it only when the session's
