@@ -59,6 +59,7 @@ pub use content::{
     AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
     ToolCall, ToolOutput, ToolResult,
 };
+pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;
 pub use diagnostic::diag;
 pub use display::DisplayEvent;
 pub use error::{ErrorClass, ProviderError, ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED};

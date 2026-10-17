@@ -12,6 +12,7 @@
 mod append_only_render;
 mod cancel_watchdog;
 mod graceful_stop;
+mod input_token_cap;
 mod lineage_replay;
 mod pause_continue;
 mod projection;

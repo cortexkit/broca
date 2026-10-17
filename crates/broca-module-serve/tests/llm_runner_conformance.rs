@@ -453,10 +453,16 @@ async fn serve_model_request(
         json!({}),
         Some(if calls > 0 { "tool_calls" } else { "stop" }),
     ));
-    events.push(
-        json!({"id": id, "object": "chat.completion.chunk", "choices": [],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
-    );
+    if let Some(usage) = &turn.usage {
+        let prompt = usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens);
+        events.push(json!({"id": id, "object": "chat.completion.chunk", "choices": [],
+            "usage": {"prompt_tokens": prompt, "completion_tokens": usage.output_tokens,
+                "total_tokens": prompt.saturating_add(usage.output_tokens),
+                "prompt_tokens_details": {"cached_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens}}}));
+    }
     let mut body = String::new();
     for event in events {
         body.push_str(&format!("data: {event}\n\n"));
@@ -1396,6 +1402,7 @@ impl LlmRunnerSubject for BrocaSubject {
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
             Capability::RunOps,
+            Capability::InputTokenCap,
             Capability::RunStatus,
             Capability::RunCancel,
             Capability::Retract,
@@ -1519,6 +1526,36 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .copied()
             .unwrap_or(0)
+    }
+
+    fn not_executed_tool_result(
+        &self,
+        message: &Value,
+        tool_call_id: &str,
+    ) -> Option<cortexkit_role_llm_runner_conformance::ToolResultObservation> {
+        if message["role"] != "tool" {
+            return None;
+        }
+        message["content"].as_array()?.iter().find_map(|part| {
+            if part["type"] != "tool_result" || part["tool_call_id"] != tool_call_id {
+                return None;
+            }
+            let result: broca_protocol::ToolResult = serde_json::from_value(part.clone()).ok()?;
+            match result.output {
+                broca_protocol::ToolOutput::Error { message }
+                    if result.is_error
+                        && message.starts_with("budget_exhausted: tool not executed;") =>
+                {
+                    Some(
+                        cortexkit_role_llm_runner_conformance::ToolResultObservation::new(
+                            false,
+                            cortexkit_role_llm_runner::run::RUN_STATE_BUDGET_EXHAUSTED,
+                        ),
+                    )
+                }
+                _ => None,
+            }
+        })
     }
 
     async fn await_tool_call(&self, arguments: &Value) -> Result<(), HarnessError> {
@@ -1946,6 +1983,12 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "compaction_late_or_stale_answers_discarded",
         "compaction_step_timeout_uses_last_view",
         "compaction_one_view_per_step",
+        "input_token_cap_at_limit",
+        "input_token_cap_crossing_tools",
+        "input_token_cap_restart_between_episodes",
+        "input_token_cap_raise_refused",
+        "input_token_cap_closed_members",
+        "input_token_cap_usage_unreported",
     ] {
         let case = report
             .cases
@@ -1959,6 +2002,24 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
+    let cap_cases: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.case.starts_with("input_token_cap_"))
+        .collect();
+    assert_eq!(
+        cap_cases.len(),
+        6,
+        "all shared input-cap cases must be present"
+    );
+    assert!(cap_cases
+        .iter()
+        .all(|case| case.outcome == CaseOutcome::Passed));
+    println!(
+        "Shared input-token-cap cases: {} ran, {} passed",
+        cap_cases.len(),
+        cap_cases.len()
+    );
     assert!(
         report
             .kills
@@ -2012,7 +2073,11 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
         result: json!({"marker": "step-cut-result"}),
         hold: false,
     };
-    let turn = |parts| ScriptedTurn { parts };
+    let turn = |parts| {
+        ScriptedTurn::new(parts).with_usage(
+            cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+        )
+    };
     subject
         .install_script(
             session,
@@ -2172,8 +2237,10 @@ async fn an_interrupt_naming_only_role_members_renders_the_frozen_request() {
     let root = scratch.join("root");
     std::fs::create_dir_all(&root).unwrap();
     let session = "inherit-frozen";
-    let turn = |text: &str| ScriptedTurn {
-        parts: vec![ScriptedPart::Text(text.into())],
+    let turn = |text: &str| {
+        ScriptedTurn::new(vec![ScriptedPart::Text(text.into())]).with_usage(
+            cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+        )
     };
     subject
         .install_script(
@@ -2308,12 +2375,12 @@ async fn held_provider_call_is_indeterminate_until_its_result() {
             session,
             Script {
                 turns: vec![
-                    ScriptedTurn {
-                        parts: vec![ScriptedPart::ToolCall(call.clone())],
-                    },
-                    ScriptedTurn {
-                        parts: vec![ScriptedPart::Text("done".into())],
-                    },
+                    ScriptedTurn::new(vec![ScriptedPart::ToolCall(call.clone())]).with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
+                    ScriptedTurn::new(vec![ScriptedPart::Text("done".into())]).with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
                 ],
             },
         )
@@ -2678,9 +2745,10 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
         .install_script(
             session,
             Script {
-                turns: vec![ScriptedTurn {
-                    parts: vec![ScriptedPart::Text("answer".into())],
-                }],
+                turns: vec![ScriptedTurn::new(vec![ScriptedPart::Text("answer".into())])
+                    .with_usage(cortexkit_role_llm_runner_conformance::ScriptedUsage::new(
+                        1, 0, 0, 1,
+                    ))],
             },
         )
         .await
@@ -2699,6 +2767,7 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../broca-wire/tests/golden/role_describe.json");
     if std::env::var_os("BROCA_REGENERATE_ROLE_DESCRIBE_GOLDEN").is_some() {
         std::fs::write(&golden, &served).unwrap();
+        println!("role_describe.json: {}", String::from_utf8_lossy(&served));
     }
     assert_eq!(
         served,
@@ -2891,20 +2960,21 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
             session,
             Script {
                 turns: vec![
-                    ScriptedTurn {
-                        parts: vec![
-                            ScriptedPart::Text("assistant".into()),
-                            call("good"),
-                            call("denied"),
-                            call("invalid"),
-                        ],
-                    },
-                    ScriptedTurn {
-                        parts: vec![ScriptedPart::Text("done".into())],
-                    },
-                    ScriptedTurn {
-                        parts: vec![ScriptedPart::Text("queued done".into())],
-                    },
+                    ScriptedTurn::new(vec![
+                        ScriptedPart::Text("assistant".into()),
+                        call("good"),
+                        call("denied"),
+                        call("invalid"),
+                    ])
+                    .with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
+                    ScriptedTurn::new(vec![ScriptedPart::Text("done".into())]).with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
+                    ScriptedTurn::new(vec![ScriptedPart::Text("queued done".into())]).with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
                 ],
             },
         )

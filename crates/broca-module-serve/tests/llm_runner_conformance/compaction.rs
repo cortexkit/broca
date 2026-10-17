@@ -867,9 +867,14 @@ async fn compaction_model_ids_route_only_to_the_exact_installed_session() {
             .install_script(
                 session,
                 Script {
-                    turns: vec![cortexkit_role_llm_runner_conformance::ScriptedTurn {
-                        parts: vec![ScriptedPart::Text("done".into())],
-                    }],
+                    turns: vec![
+                        cortexkit_role_llm_runner_conformance::ScriptedTurn::new(vec![
+                            ScriptedPart::Text("done".into()),
+                        ])
+                        .with_usage(
+                            cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                        ),
+                    ],
                 },
             )
             .await
@@ -982,9 +987,14 @@ async fn recorded_setup_survives_sender_driven_recovery_without_repeating_setup(
         .install_script(
             session,
             Script {
-                turns: vec![cortexkit_role_llm_runner_conformance::ScriptedTurn {
-                    parts: vec![ScriptedPart::Text("recovered".into())],
-                }],
+                turns: vec![
+                    cortexkit_role_llm_runner_conformance::ScriptedTurn::new(vec![
+                        ScriptedPart::Text("recovered".into()),
+                    ])
+                    .with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
+                ],
             },
         )
         .await

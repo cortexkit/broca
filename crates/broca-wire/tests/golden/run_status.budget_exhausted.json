@@ -1,0 +1,1 @@
+{"state":"budget_exhausted","detail":{"limit":10,"spent":10,"cause":"limit_reached"},"final_step_finish_reason":"tool_calls","undelivered_steers":[],"usage":{"input_tokens":5,"cached_input_tokens":2,"cache_write_tokens":3,"output_tokens":99},"retries_used":0}

@@ -537,7 +537,9 @@ fn project_control_record<S: ControlProjectionSink>(
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => {}
         // An informational record, skipped exactly like `Unknown`.
-        WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+        WalRecord::InputTokenCapFrozen { .. }
+        | WalRecord::InputTokenBudgetExhausted { .. }
+        | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
     }
 }
 

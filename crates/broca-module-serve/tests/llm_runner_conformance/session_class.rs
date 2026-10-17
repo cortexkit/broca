@@ -82,8 +82,12 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
                 session,
                 Script {
                     turns: (0..3)
-                        .map(|_| ScriptedTurn {
-                            parts: vec![ScriptedPart::Text("answer".into())],
+                        .map(|_| {
+                            ScriptedTurn::new(vec![ScriptedPart::Text("answer".into())]).with_usage(
+                                cortexkit_role_llm_runner_conformance::ScriptedUsage::new(
+                                    1, 0, 0, 1,
+                                ),
+                            )
                         })
                         .collect(),
                 },
@@ -248,9 +252,10 @@ async fn released_03205_refuses_session_class_by_feature_and_reads_unclassed() {
             .install_script(
                 session,
                 Script {
-                    turns: vec![ScriptedTurn {
-                        parts: vec![ScriptedPart::Text("answer".into())],
-                    }],
+                    turns: vec![ScriptedTurn::new(vec![ScriptedPart::Text("answer".into())])
+                        .with_usage(cortexkit_role_llm_runner_conformance::ScriptedUsage::new(
+                            1, 0, 0, 1,
+                        ))],
                 },
             )
             .await

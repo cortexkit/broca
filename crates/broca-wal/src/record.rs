@@ -503,6 +503,14 @@ pub enum WalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_text: Option<String>,
     },
+    /// Session policy, frozen at admission even when the session was previously unlimited.
+    InputTokenCapFrozen {
+        limit: u64,
+    },
+    /// Written in the terminal barrier, including any never-dispatched tool results.
+    InputTokenBudgetExhausted {
+        detail: broca_protocol::BudgetExhaustedDetail,
+    },
     /// Episode close — synced BEFORE terminal success + lease release. Marks THIS
     /// episode terminal; it does NOT seal the lineage (a later `RunStarted` may open
     /// the next episode). `error` is populated only when `reason == Error`.
@@ -1034,7 +1042,7 @@ impl WalRecord {
         } else {
             base
         };
-        if matches!(
+        let base = if matches!(
             self,
             WalRecord::RunStarted {
                 session_class: Some(_),
@@ -1042,6 +1050,33 @@ impl WalRecord {
             }
         ) {
             session_class_features(base)
+        } else {
+            base
+        };
+        let capped = match self {
+            WalRecord::RunStarted { config, .. } => config
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.max_input_tokens.is_some()),
+            WalRecord::Queued { request, .. } => request
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.max_input_tokens.is_some()),
+            WalRecord::InputTokenCapFrozen { .. } | WalRecord::InputTokenBudgetExhausted { .. } => {
+                true
+            }
+            WalRecord::RunFinished {
+                reason: RunFinishReason::BudgetExhausted,
+                ..
+            } => true,
+            WalRecord::ToolResult {
+                reason: Some(reason),
+                ..
+            } if reason == "budget_exhausted" => true,
+            _ => false,
+        };
+        if capped {
+            input_cap_features(base)
         } else {
             base
         }
@@ -1356,6 +1391,58 @@ fn session_class_features(base: &[&str]) -> &'static [&'static str] {
         mask | (1 << bit)
     });
     let set = &CLASS_FEATURE_SETS[mask];
+    &set.names[..set.len]
+}
+
+// Precompute sorted feature unions: capped records can also carry scope, hooks or retention.
+const INPUT_CAP_BASE_FEATURES: [&str; 8] = [
+    crate::framing::AGENT_RUN_SCOPE_FEATURE,
+    crate::framing::DEFERRED_CALL_FEATURE,
+    crate::framing::FLOW_SCOPE_FEATURE,
+    crate::framing::PLAN_MANIFEST_FEATURE,
+    crate::framing::RETENTION_FEATURE,
+    crate::framing::SCOPE_FEATURE,
+    crate::framing::SESSION_CLASS_FEATURE,
+    crate::framing::STEP_TRANSFORMS_FEATURE,
+];
+struct InputCapFeatures {
+    names: [&'static str; 9],
+    len: usize,
+}
+static INPUT_CAP_FEATURE_SETS: [InputCapFeatures; 256] = {
+    let mut sets = [const {
+        InputCapFeatures {
+            names: [""; 9],
+            len: 0,
+        }
+    }; 256];
+    let mut mask = 0;
+    while mask < sets.len() {
+        let mut bit = 0;
+        while bit < INPUT_CAP_BASE_FEATURES.len() {
+            if bit == 3 {
+                sets[mask].names[sets[mask].len] = crate::framing::INPUT_TOKEN_CAP_FEATURE;
+                sets[mask].len += 1;
+            }
+            if mask & (1 << bit) != 0 {
+                sets[mask].names[sets[mask].len] = INPUT_CAP_BASE_FEATURES[bit];
+                sets[mask].len += 1;
+            }
+            bit += 1;
+        }
+        mask += 1;
+    }
+    sets
+};
+fn input_cap_features(base: &[&str]) -> &'static [&'static str] {
+    let mask = base.iter().fold(0, |mask, name| {
+        let bit = INPUT_CAP_BASE_FEATURES
+            .iter()
+            .position(|known| known == name)
+            .expect("input cap's existing features must be listed");
+        mask | (1 << bit)
+    });
+    let set = &INPUT_CAP_FEATURE_SETS[mask];
     &set.names[..set.len]
 }
 
@@ -3411,6 +3498,7 @@ mod schema_tests {
     fn run_config_budget_round_trips() {
         let mut config = *min_config();
         config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![broca_protocol::BudgetNudge {
                 at_tool_calls: 20,
                 text: "slow down".into(),

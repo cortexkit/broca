@@ -723,6 +723,7 @@ async fn active_send_retry_is_idempotent() {
 
     let mut changed_active_budget = req(&key, "r1");
     changed_active_budget.budget = Some(broca_protocol::request::BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 8,
         finalize_text: "finish now".into(),
@@ -837,6 +838,7 @@ async fn pending_send_retry_is_idempotent() {
 
     let mut changed_pending_budget = req(&key, "r2");
     changed_pending_budget.budget = Some(broca_protocol::request::BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 8,
         finalize_text: "finish now".into(),

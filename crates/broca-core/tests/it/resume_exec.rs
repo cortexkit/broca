@@ -704,6 +704,7 @@ async fn finalize_answer_is_committed_to_durable_history() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut request = request("r", &dir);
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: Vec::new(),
         finalize_at_tool_calls: 2,
         finalize_text: "Give the final answer now.".into(),

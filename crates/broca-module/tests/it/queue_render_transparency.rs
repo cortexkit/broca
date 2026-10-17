@@ -92,6 +92,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
         stop_when: vec![StopCondition::StepCount { n: 7 }],
         submission_id: None,
         budget: Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![BudgetNudge {
                 at_tool_calls: 20,
                 text: "budget nudge".into(),

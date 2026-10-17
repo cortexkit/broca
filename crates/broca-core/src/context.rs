@@ -329,6 +329,7 @@ pub enum RunIndexState {
     Interrupted,
     Completed,
     MaxSteps,
+    BudgetExhausted,
     Cancelled,
     Error,
     /// The prompt-reduction transform was unreachable, so the turn could not render. A
@@ -350,6 +351,7 @@ impl RunIndexState {
             RunIndexState::Interrupted => "interrupted",
             RunIndexState::Completed => "completed",
             RunIndexState::MaxSteps => "max_steps",
+            RunIndexState::BudgetExhausted => "budget_exhausted",
             RunIndexState::Cancelled => "cancelled",
             RunIndexState::Error => "error",
             RunIndexState::TransformUnavailable => "transform_unavailable",
@@ -364,6 +366,7 @@ impl RunIndexState {
             "interrupted" => RunIndexState::Interrupted,
             "completed" => RunIndexState::Completed,
             "max_steps" => RunIndexState::MaxSteps,
+            "budget_exhausted" => RunIndexState::BudgetExhausted,
             "cancelled" => RunIndexState::Cancelled,
             "error" => RunIndexState::Error,
             "transform_unavailable" => RunIndexState::TransformUnavailable,
@@ -634,6 +637,7 @@ pub enum SessionReadStateKind {
     Interrupted,
     Completed,
     MaxSteps,
+    BudgetExhausted,
     Cancelled,
     Error,
     TransformUnavailable,
@@ -648,6 +652,7 @@ impl SessionReadStateKind {
             SessionReadStateKind::Interrupted => "interrupted",
             SessionReadStateKind::Completed => "completed",
             SessionReadStateKind::MaxSteps => "max_steps",
+            SessionReadStateKind::BudgetExhausted => "budget_exhausted",
             SessionReadStateKind::Cancelled => "cancelled",
             SessionReadStateKind::Error => "error",
             SessionReadStateKind::TransformUnavailable => "transform_unavailable",
@@ -667,6 +672,7 @@ impl SessionReadReason {
         match self {
             SessionReadReason::Terminal(RunFinishReason::Completed) => "completed",
             SessionReadReason::Terminal(RunFinishReason::MaxSteps) => "max_steps",
+            SessionReadReason::Terminal(RunFinishReason::BudgetExhausted) => "budget_exhausted",
             SessionReadReason::Terminal(RunFinishReason::Cancelled) => "cancelled",
             SessionReadReason::Terminal(RunFinishReason::Interrupted) => "interrupted",
             SessionReadReason::Terminal(RunFinishReason::Error) => "error",
@@ -1301,6 +1307,7 @@ pub fn resume_state_from_store(
         )
     };
     Ok(crate::ReplayState {
+        input_budget: tail_state.input_budget,
         cancel_at: tail_state.cancel_at,
         // This prefix supplies model input rather than transcript reads, so it carries no run metadata.
         message_runs: vec![None; prompt.len()],
@@ -1442,6 +1449,7 @@ fn state_for_terminal(reason: RunFinishReason) -> SessionReadStateKind {
     match reason {
         RunFinishReason::Completed => SessionReadStateKind::Completed,
         RunFinishReason::MaxSteps => SessionReadStateKind::MaxSteps,
+        RunFinishReason::BudgetExhausted => SessionReadStateKind::BudgetExhausted,
         RunFinishReason::Cancelled => SessionReadStateKind::Cancelled,
         RunFinishReason::Interrupted => SessionReadStateKind::Interrupted,
         RunFinishReason::Error => SessionReadStateKind::Error,

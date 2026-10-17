@@ -544,6 +544,10 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    /// Session input-token sum, frozen cap and missing-usage flag, independent of episode count.
+    /// Checkpoints without this field must be rebuilt from the complete WAL before admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_budget: Option<crate::input_budget::InputTokenBudget>,
     /// The session_class label recorded by the session's first send. Absence also
     /// represents checkpoints created before WALs recorded session classes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -593,6 +597,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            input_budget: Some(crate::input_budget::InputTokenBudget::default()),
             session_class: None,
             at_seq: 0,
             last_episode: None,
@@ -642,6 +647,18 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        if let Some(budget) = &mut self.input_budget {
+            budget
+                .fold(record)
+                .map_err(|reason| ReplayError::CorruptLineage {
+                    episode_run_id: self
+                        .last_episode
+                        .as_ref()
+                        .map(|episode| episode.run_id.clone())
+                        .unwrap_or_else(|| RunId(String::new())),
+                    reason,
+                })?;
+        }
         match record {
             WalRecord::RunStarted {
                 session_class,
@@ -852,7 +869,9 @@ impl AdmissionCheckpointV1 {
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
             // An informational record, skipped exactly like `Unknown`.
-            WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            WalRecord::InputTokenCapFrozen { .. }
+            | WalRecord::InputTokenBudgetExhausted { .. }
+            | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
         if let Some(episode) = self.last_episode.as_mut() {
             if let Some(facts) = episode.budget_replay_state.as_mut() {
@@ -903,10 +922,11 @@ impl AdmissionCheckpointV1 {
                 .is_some_and(|manifest| crate::compaction::has_compaction(manifest)),
         }
     }
-    /// Whether first-plan tracking and reasoning-effort history cover the entire session.
+    /// Whether admission metadata, including input accounting, covers the entire session.
     /// Older checkpoints need a complete WAL fold to recover these facts before incremental reuse.
     pub fn ownership_complete(&self) -> bool {
         self.effort_history.is_some()
+            && self.input_budget.is_some()
             && self.lineage_retention.is_some()
             && self
                 .ownership
@@ -1416,6 +1436,7 @@ mod tests {
             unreachable!()
         };
         config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![BudgetNudge {
                 at_tool_calls: 2,
                 text: "nudge".into(),
@@ -1913,6 +1934,7 @@ mod tests {
             unreachable!("fixture starts an episode");
         };
         config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![
                 BudgetNudge {
                     at_tool_calls: 1,
@@ -1991,6 +2013,7 @@ mod tests {
     fn durable_finalize_response_spends_admission_pending_allowance() {
         let mut start = started(1, "budget", None);
         let budget = BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![],
             finalize_at_tool_calls: 1,
             finalize_text: "finalize".into(),
@@ -2116,6 +2139,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            input_budget: None,
             session_class: None,
             lineage_retention: None,
             compaction: None,

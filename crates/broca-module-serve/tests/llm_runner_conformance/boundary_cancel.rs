@@ -61,12 +61,12 @@ async fn boundary_cancel_during_tool_then_send_is_provider_valid_and_byte_stable
             session,
             Script {
                 turns: vec![
-                    ScriptedTurn {
-                        parts: vec![ScriptedPart::ToolCall(call.clone())],
-                    },
-                    ScriptedTurn {
-                        parts: vec![ScriptedPart::Text("continued".into())],
-                    },
+                    ScriptedTurn::new(vec![ScriptedPart::ToolCall(call.clone())]).with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
+                    ScriptedTurn::new(vec![ScriptedPart::Text("continued".into())]).with_usage(
+                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+                    ),
                 ],
             },
         )

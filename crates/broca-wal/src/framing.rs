@@ -168,6 +168,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     DEFERRED_CALL_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
+    INPUT_TOKEN_CAP_FEATURE,
     PLAN_MANIFEST_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
@@ -215,6 +216,9 @@ pub const RUN_CANCEL_AT_FEATURE: &str = "run-cancel-at/v1";
 
 /// Labels fixed on the first send govern later admission and backup placement.
 pub const SESSION_CLASS_FEATURE: &str = "session-class/v1";
+
+/// Ignoring a session input cap would authorize paid model steps the caller forbade.
+pub const INPUT_TOKEN_CAP_FEATURE: &str = "input-token-cap/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -839,6 +843,7 @@ mod tests {
                 DEFERRED_CALL_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
+                INPUT_TOKEN_CAP_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
@@ -858,6 +863,7 @@ mod tests {
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
         assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");
+        assert_eq!(INPUT_TOKEN_CAP_FEATURE, "input-token-cap/v1");
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
     }

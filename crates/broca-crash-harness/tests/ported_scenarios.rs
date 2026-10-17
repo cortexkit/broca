@@ -18,6 +18,40 @@ use broca_wal::WalRecord;
 broca_crash_harness::crash_harness_child!(scenarios::by_name);
 
 #[tokio::test]
+async fn input_token_sum_matches_uninterrupted_at_every_usage_record_cut() {
+    let handle = RunnerHandle::new(scenarios::INPUT_TOKEN_CAP).await;
+    let expected = broca_core::replay(&handle.reference.log.records())
+        .unwrap()
+        .input_budget;
+    assert_eq!((expected.limit, expected.spent), (Some(150), 150));
+    let reference_records = handle.reference.log.records();
+    for point in handle.record_boundaries(true).into_iter().filter(|point| {
+        let KillPoint::RecordBoundary { records, .. } = point else {
+            return false;
+        };
+        // Cuts around usage, not inside a physical dispatch: an unanswered intent legitimately
+        // interrupts before the second model step and therefore has a smaller consumed sum.
+        reference_records
+            .get(*records)
+            .is_some_and(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+            || records
+                .checked_sub(1)
+                .and_then(|index| reference_records.get(index))
+                .is_some_and(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+    }) {
+        let (kill, resumed) = handle.kill_resume_check(point, KillTrigger::Truncate).await;
+        let observed = broca_core::replay(&resumed.log.records())
+            .unwrap()
+            .input_budget;
+        assert_eq!(observed, expected, "{}", kill.label());
+        assert_eq!(
+            resumed.reason,
+            broca_protocol::RunFinishReason::BudgetExhausted
+        );
+    }
+}
+
+#[tokio::test]
 async fn ported_crash_cut_scenarios_hold_every_invariant_at_every_boundary() {
     let mut suite = Suite::new("ported crash-cut scenarios");
     let mut truncations = 0;

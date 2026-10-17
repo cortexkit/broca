@@ -37,6 +37,11 @@ use tokio::sync::{mpsc, Notify};
 /// One scripted model step.
 #[derive(Clone)]
 pub enum Step {
+    /// Canonical provider-reported measurements, including explicit zero or absent input.
+    Usage {
+        content: Vec<ContentBlock>,
+        usage: Usage,
+    },
     /// A final answer with no tool calls.
     Text(&'static str),
     /// One call of the `work` tool.
@@ -67,13 +72,16 @@ impl Step {
             }],
             Step::Call(id) => vec![call(id)],
             Step::Calls(ids) => ids.iter().map(|id| call(id)).collect(),
-            Step::Blocks(blocks) | Step::Stream(blocks) | Step::StreamEmpty(blocks) => {
-                blocks.clone()
+            Step::Usage {
+                content: blocks, ..
             }
+            | Step::Blocks(blocks)
+            | Step::Stream(blocks)
+            | Step::StreamEmpty(blocks) => blocks.clone(),
         };
         let finish_reason = match self {
             Step::Text(_) | Step::Blocks(_) => FinishReason::Stop,
-            Step::Stream(_) | Step::StreamEmpty(_) => {
+            Step::Usage { .. } | Step::Stream(_) | Step::StreamEmpty(_) => {
                 if content
                     .iter()
                     .any(|b| matches!(b, ContentBlock::ToolCall(_)))
@@ -115,7 +123,10 @@ impl Step {
                 },
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
-                usage: Usage::default(),
+                usage: match self {
+                    Step::Usage { usage, .. } => *usage,
+                    _ => Usage::default(),
+                },
                 finish_reason,
                 retries_used: 0,
             }),

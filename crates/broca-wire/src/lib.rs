@@ -211,7 +211,11 @@ pub struct SendParams {
     /// Admission-only prompt-cache preferences.
     #[serde(default)]
     pub cache: Option<CacheParams>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_budget"
+    )]
     pub budget: Option<BudgetConfig>,
     /// A caller-scoped credential selection resolved once at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,6 +284,39 @@ pub struct SendParams {
     /// run identity.
     #[serde(default)]
     pub append_episode: bool,
+}
+
+fn deserialize_budget<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BudgetConfig>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let budget = checked_role_budget(value).map_err(serde::de::Error::custom)?;
+    let Some(budget) = budget else {
+        return Ok(None);
+    };
+    let request = cortexkit_role_llm_runner::send::SendRequest::new("", "").with_budget(budget);
+    serde_json::from_value(request.runner_params["budget"].clone())
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+fn checked_role_budget(
+    value: serde_json::Value,
+) -> Result<Option<cortexkit_role_llm_runner::send::Budget>, String> {
+    use cortexkit_role_llm_runner::send::SendRequest;
+    let mut request = SendRequest::new("", "");
+    request.runner_params.insert("budget".into(), value);
+    let budget = request.budget()?;
+    if let Some(budget) = &budget {
+        budget.check(true, None)?;
+    }
+    Ok(budget)
+}
+
+/// Serde identifies the enclosing `budget` field; preserve the role contract's exact
+/// offending member path in the serving adapter's `invalid_params.detail.field` instead.
+pub fn send_budget_refusal_field(params: &serde_json::Value) -> Option<String> {
+    checked_role_budget(params.get("budget")?.clone()).err()
 }
 
 fn deserialize_conversation_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -1143,6 +1180,19 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    BudgetExhausted {
+        detail: broca_protocol::BudgetExhaustedDetail,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undelivered_steers: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(default)]
+        retries_used: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     Cancelled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_step_finish_reason: Option<FinishReason>,
@@ -1210,6 +1260,7 @@ impl RunStatusResponse {
             | Self::Interrupted { title, .. }
             | Self::Completed { title, .. }
             | Self::MaxSteps { title, .. }
+            | Self::BudgetExhausted { title, .. }
             | Self::Cancelled { title, .. }
             | Self::Error { title, .. }
             | Self::TransformUnavailable { title, .. } => title.as_deref(),
@@ -2086,6 +2137,35 @@ mod account_selection_refused_golden {
 #[cfg(test)]
 mod status_params_strictness {
     use super::*;
+
+    #[test]
+    fn input_cap_budget_and_nudges_are_closed_and_cap_is_positive() {
+        for (budget, field) in [
+            (
+                serde_json::json!({"max_input_tokens":0}),
+                "budget.max_input_tokens",
+            ),
+            (
+                serde_json::json!({"max_input_tokens":1,"extra":true}),
+                "budget.extra",
+            ),
+            (
+                serde_json::json!({"nudges":[{"at_tool_calls":1,"text":"stop","extra":true}]}),
+                "budget.nudges[0].extra",
+            ),
+        ] {
+            let error = serde_json::from_value::<SendParams>(
+                serde_json::json!({"input":[],"budget":budget}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(field), "{error}");
+        }
+        let send: SendParams =
+            serde_json::from_value(serde_json::json!({"input":[],"budget":{"max_input_tokens":1}}))
+                .unwrap();
+        assert_eq!(send.budget.unwrap().max_input_tokens, Some(1));
+    }
 
     /// A misspelled `run_id` must REFUSE rather than answer a different question.
     ///

@@ -2702,6 +2702,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let key = rig.key("budget-tail");
     let mut config = min_config();
     config.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 1,
             text: "Please finish soon.".into(),
@@ -3113,6 +3114,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
 
     let mut config = min_config();
     config.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 1,
             text: "Please finish soon.".into(),

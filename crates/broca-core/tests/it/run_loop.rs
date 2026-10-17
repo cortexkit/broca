@@ -3718,6 +3718,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         tail: Vec::new(),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            input_budget: None,
             session_class: None,
             lineage_retention: None,
             compaction: None,
@@ -3892,6 +3893,7 @@ async fn parallel_tool_call_jump_fires_nudge_once_before_next_step() {
         vec![],
     );
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 2,
             text: "Use the remaining calls carefully.\nKeep going verbatim.".into(),
@@ -3940,6 +3942,7 @@ async fn parallel_tool_call_jump_fires_nudge_once_before_next_step() {
         vec![],
     );
     record_request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 2,
             text: "Use the remaining calls carefully.\nKeep going verbatim.".into(),
@@ -3995,6 +3998,7 @@ async fn finalize_turn_keeps_tools_disables_calls_and_preserves_final_text() {
         vec![],
     );
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 1,
         finalize_text: "Answer now without using tools.".into(),
@@ -4038,6 +4042,7 @@ async fn finalize_turn_tool_calls_are_not_dispatched() {
         vec![],
     );
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 1,
         finalize_text: "Finalize even if tempted to call a tool.".into(),
@@ -4138,6 +4143,7 @@ async fn all_denied_threshold_firing_is_durable_before_replay_sees_it() {
         vec![],
     );
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![BudgetNudge {
             at_tool_calls: 1,
             text: "threshold reached".into(),
@@ -4179,6 +4185,7 @@ async fn budgeted_live_prompt_and_replay_preserve_literal_firing_order() {
         vec![],
     );
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![
             BudgetNudge {
                 at_tool_calls: 2,
@@ -5410,6 +5417,7 @@ async fn trailing_garbage_finalize_turn_preserves_call_and_exact_error() {
         vec![],
     );
     request.budget = Some(BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 1,
         finalize_text: "Finish without tools".into(),

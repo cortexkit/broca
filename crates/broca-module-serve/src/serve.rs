@@ -2094,7 +2094,8 @@ where
             let mut params: SendParams = match serde_json::from_value(req.params.clone()) {
                 Ok(p) => p,
                 Err(e) => {
-                    let field = broca_wire::failing_field::<SendParams>(&req.params, &e);
+                    let field = broca_wire::send_budget_refusal_field(&req.params)
+                        .or_else(|| broca_wire::failing_field::<SendParams>(&req.params, &e));
                     return send_invalid_params(
                         writer,
                         ver,
@@ -4199,6 +4200,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            detail: None,
             run_id: "run".into(),
             state: "active".into(),
             reason: Some(oversized),

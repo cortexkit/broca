@@ -613,6 +613,16 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             retries_used,
             title,
         },
+        State::BudgetExhausted => RunStatusResponse::BudgetExhausted {
+            detail: state
+                .budget_detail
+                .expect("budget terminal retains its durable detail"),
+            final_step_finish_reason,
+            undelivered_steers,
+            usage,
+            retries_used,
+            title,
+        },
         State::Cancelled => RunStatusResponse::Cancelled {
             final_step_finish_reason,
             undelivered_steers,
@@ -1368,6 +1378,10 @@ impl ServeHandler for crate::LineageRegistry {
                 field: "session_class".into(),
                 message,
             }),
+            SendOutcome::InputTokenBudgetInvalid(message) => Err(ServeError::InvalidParams {
+                field: "budget.max_input_tokens".into(),
+                message,
+            }),
             SendOutcome::Finished {
                 run_id,
                 reason,
@@ -1820,6 +1834,7 @@ impl ServeHandler for crate::LineageRegistry {
         let (state, mut records) = self
             .route_run_state_with_wal(session, run_id.clone())
             .await?;
+        let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
         let status = run_status_response(state);
         let (mut state, reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
@@ -1828,6 +1843,11 @@ impl ServeHandler for crate::LineageRegistry {
             RunStatusResponse::Interrupted { .. } => ("interrupted".to_owned(), None, None),
             RunStatusResponse::Completed { .. } => ("completed".to_owned(), None, None),
             RunStatusResponse::MaxSteps { .. } => ("max_steps".to_owned(), None, None),
+            RunStatusResponse::BudgetExhausted { .. } => (
+                cortexkit_role_llm_runner::run::RUN_STATE_BUDGET_EXHAUSTED.to_owned(),
+                None,
+                None,
+            ),
             RunStatusResponse::Cancelled { .. } => ("cancelled".to_owned(), None, None),
             RunStatusResponse::Error { error, .. } => ("error".to_owned(), None, error),
             RunStatusResponse::TransformUnavailable { .. } => {
@@ -1844,6 +1864,11 @@ impl ServeHandler for crate::LineageRegistry {
                 None => self.read_durable_wal(session).await?.0,
             };
             if let Some((reason, terminal_error)) = durable_terminal(&read, &run_id) {
+                detail = broca_core::reconcile_run_state(
+                    read.iter().map(|frame| &frame.record),
+                    &run_id.0,
+                )
+                .and_then(|state| state.budget_detail.clone());
                 state = serde_json::to_value(reason)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
@@ -1862,6 +1887,7 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         let response = broca_wire::RunResultResponse {
+            detail,
             run_id: run_id.0,
             state,
             reason,
@@ -2010,6 +2036,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    budget_detail: None,
                     live_step: None,
                     title: None,
                     state: broca_core::RunIndexState::Paused,

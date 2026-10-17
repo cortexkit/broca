@@ -162,6 +162,8 @@ pub struct FinalMessage {
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub run_id: String,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +238,7 @@ pub fn broca_role_describe_with_writers(
         "plans",
         "fetch-plan-optional-tools/v1",
         "session_class",
+        cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
     ]
     .map(String::from)
     .to_vec();
@@ -693,7 +696,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "ffd9603ce87bb07816d71b2359a3166e595c797f13919209c9599a2260872d1e",
+            "c586c4b338888443db9ef6ca18114018412745bb8eaca41acd3c0cb3f26e3867",
         );
     }
 
@@ -850,7 +853,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "87c18d1685787756a4819f0ac2feb3708af64d91857578b90291ce1cec15ee2c";
+        "b02c1aeba85bfc1ad3a6dde615ba049c047e1f5f2ced66f90043c4fe34a5b0a2";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

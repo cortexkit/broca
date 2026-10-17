@@ -177,6 +177,7 @@ async fn budget_finalize_args_cut_closes_steer_inbox_before_terminal() {
     let inbox = crate::SteerInbox::new();
     let mut req = request();
     req.budget = Some(broca_protocol::request::BudgetConfig {
+        max_input_tokens: None,
         nudges: vec![],
         finalize_at_tool_calls: 1,
         finalize_text: "Finish without tools".into(),

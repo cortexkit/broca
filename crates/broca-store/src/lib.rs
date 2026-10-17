@@ -707,6 +707,7 @@ impl SqliteStore {
             let state = match reason {
                 RunFinishReason::Completed => RunIndexState::Completed,
                 RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
+                RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
                 RunFinishReason::Cancelled => RunIndexState::Cancelled,
                 RunFinishReason::Interrupted => RunIndexState::Interrupted,
                 RunFinishReason::Error => RunIndexState::Error,
@@ -3764,6 +3765,7 @@ mod tests {
             unreachable!("base records begin with RunStarted");
         };
         config.budget = Some(BudgetConfig {
+            max_input_tokens: None,
             nudges: vec![BudgetNudge {
                 at_tool_calls: 99,
                 text: "not due".into(),
