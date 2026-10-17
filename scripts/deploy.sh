@@ -99,8 +99,12 @@ print("   sessions live at restart: " + (", ".join(report["sessions_at_restart"]
 print("   sessions sealed at restart (WAL readback): " + (", ".join(report["sessions_sealed"]) or "none"))
 if report["sessions_unconfirmed"]:
     print("   WARNING seal not confirmed: " + ", ".join(report["sessions_unconfirmed"]))
+if report.get("sessions_cancelled"):
+    print("   FAILURE shutdown drain cancelled run: " + ", ".join(report["sessions_cancelled"]))
 if report["seal_error"]:
     print("   WARNING seal readback: " + report["seal_error"])
+if report.get("sessions_cancelled"):
+    sys.exit(1)
 PY
 echo "   acceptance PASS (live tool dispatch, result, completed turn)"
 rollback_command
