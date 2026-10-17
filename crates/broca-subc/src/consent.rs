@@ -190,11 +190,7 @@ impl ConsentClient {
             .route_open_management_scoped_within(
                 CONSENT_MODULE,
                 identity,
-                ScopeSelector {
-                    owner,
-                    scope_ref: scope.scope_ref.clone(),
-                    scope_epoch: Some(scope.scope_epoch),
-                },
+                ScopeSelector::new(owner, scope.scope_ref.clone(), Some(scope.scope_epoch)),
                 retry,
             )
             .await?;

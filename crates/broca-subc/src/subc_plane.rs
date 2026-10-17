@@ -1392,13 +1392,13 @@ impl SubcToolPlane {
                 detail,
             })
         })?;
-        Ok(ScopeSelector {
+        // Always the frozen epoch, so a call can never be carried into a newer session that
+        // reused the ref.
+        Ok(ScopeSelector::new(
             owner,
-            scope_ref: scope.scope_ref.clone(),
-            // Always the frozen epoch, so a call can never be carried into a newer session that
-            // reused the ref.
-            scope_epoch: Some(scope.scope_epoch),
-        })
+            scope.scope_ref.clone(),
+            Some(scope.scope_epoch),
+        ))
     }
 
     fn remove_batch_call_route(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) {
@@ -2263,11 +2263,11 @@ impl ToolPlane for SubcToolPlane {
             .route_open(
                 &module,
                 &ctx.bind,
-                Some(&ScopeSelector {
+                Some(&ScopeSelector::new(
                     owner,
-                    scope_ref: scope.scope_ref.clone(),
-                    scope_epoch: Some(scope.scope_epoch),
-                }),
+                    scope.scope_ref.clone(),
+                    Some(scope.scope_epoch),
+                )),
             )
             .await
             .map_err(|error| {
@@ -5173,13 +5173,13 @@ mod tests {
         }
 
         fn selector(scope_ref: &str, epoch: u64) -> ScopeSelector {
-            ScopeSelector {
-                owner: Principal::Reserved {
+            ScopeSelector::new(
+                Principal::Reserved {
                     module_id: OWNER.into(),
                 },
-                scope_ref: scope_ref.into(),
-                scope_epoch: Some(epoch),
-            }
+                scope_ref,
+                Some(epoch),
+            )
         }
 
         /// The stamp attributes named `name` in the fixture file. They live in a JSON fixture

@@ -59,7 +59,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -70,7 +70,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -619,9 +619,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-agent-data"
-version = "0.1.3"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82fc70e9b76c31dd139951f0d670721239cfe6171023fc85d1298f4940276562"
+checksum = "97450b3a980d7799c0625d60f985ca45636f9ba6f0ca9d405e5fb6a8e1d46158"
 dependencies = [
  "serde",
  "serde_json",
@@ -629,9 +629,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-compaction-provider"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b7853183defc73283fb364a236fee470f0a30254222411706b53634533c7493"
+checksum = "5db9382941be0ca060d0316fc09c2883bd983b77411cd6ce9907ca764a062721"
 dependencies = [
  "cortexkit-role-llm-runner",
  "cortexkit-role-step-transform-provider",
@@ -651,9 +651,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7cbef6c1c2720af98b4f484627abcd383094e0873c1a539b5a826be476c818c"
+checksum = "89c849bffa362ef390b27eb7314d29c786c54171d656d5393feadc14253e588a"
 dependencies = [
  "serde",
  "serde_json",
@@ -662,9 +662,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.2.2"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b7342c604055d1b11fca9f93c29a9c7c9e542af1a75470395589fd38d762662"
+checksum = "545489fefda5573a2666fc29399511689c856c01b496d1e86d0a3bdb41cc6bf9"
 dependencies = [
  "async-trait",
  "cortexkit-role-compaction-provider",
@@ -679,9 +679,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-step-transform-provider"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42cdf3e774bca740d13101de87bdc07d941e2f81bc7f1064926ed7cc89a65c70"
+checksum = "a87d9da52af3ec005218e43fd3acd4ed121489ca870b124c9e1025226c7f3cee"
 dependencies = [
  "cortexkit-role-llm-runner",
  "serde",
@@ -690,9 +690,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.7.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1cc69e0427ddf9d0aac6857601993404d5b9f8f97fd19a957b49c2ea2750d46"
+checksum = "24660c324c47ccf78b101e03b555850f9fc78fd04718683e9d09a914408f991f"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -703,9 +703,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20d31ccc5eb0d9b6f80b7d18a24c497d57ea987ed7b019963ac0ea089fb53b97"
+checksum = "934da6effe205c9c619c03d7b6e36905248681f7996baaf45fce7f2f167830a9"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
@@ -778,7 +778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1318,7 +1318,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1600,7 +1600,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1798,7 +1798,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1815,13 +1815,14 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-client-rs"
-version = "0.28.0"
+version = "0.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a289dc82f587c0e33ef36835b4ae20aabdac96689a854caff187315bc366bab4"
+checksum = "4d8244d45a29719b2bb9d6f9f22831efdeb0e285e629388382c9083a93d78ce2"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "sha2",
  "subc-control",
  "subc-os",
  "subc-protocol",
@@ -1833,9 +1834,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.30.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85053ab416524b6736ce128d3ff5ad4c32bf88e869f28bb2a0c649b5dbabad7c"
+checksum = "b2b017b243c6247349195d24385b70b627f81136e1b95ca371b592138d4348fe"
 dependencies = [
  "serde",
  "serde_json",
@@ -1855,9 +1856,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.31.0"
+version = "0.32.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6252f827f7763153d01487298f9163d26a58432c5a5d6acba7303ad2390dc2"
+checksum = "53b464124236ea21cb154d41fde47cb712b29b1ea50e5c8cadc933fa9e5ea1b2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1865,9 +1866,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c174608340d9619c9db01ee322a791d7533da98a5655c6aa0d31735a5c89c03c"
+checksum = "98020b7d99b519f36d47c12ba9c73eb488c4de65b2bf49d2a91589694d5f26d7"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",

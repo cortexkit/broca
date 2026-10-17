@@ -115,13 +115,13 @@ async fn placed_aft_requires_a_scoped_preset_and_worker_read_bash_watch_succeed(
     }
     let scope = rig.scope().await;
     let session = rig.session("placed-worker");
-    let selector = subc_protocol::scope::ScopeSelector {
-        owner: subc_protocol::Principal::Reserved {
+    let selector = subc_protocol::scope::ScopeSelector::new(
+        subc_protocol::Principal::Reserved {
             module_id: "preset-owner".into(),
         },
-        scope_ref: scope.scope_ref.clone(),
-        scope_epoch: Some(scope.scope_epoch),
-    };
+        scope.scope_ref.clone(),
+        Some(scope.scope_epoch),
+    );
     let route = conn
         .route_open_tool_provider_v1("aft", &session, Some(selector))
         .await

@@ -928,7 +928,7 @@ impl CutArtifacts for FileCutArtifacts {
                             .position(|plan| plan.reference == reference.r#ref)
                             .map_or_else(
                                 || DivergedEntry::new(DivergedState::AtCut),
-                                |i| held.refs[i],
+                                |i| held.refs[i].clone(),
                             )
                     })
                     .collect(),

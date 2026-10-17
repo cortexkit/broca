@@ -64,21 +64,21 @@ sha2 = "0.10"
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", default-features = false, features = ["deflate"] }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["handshake", "connect", "rustls-tls-webpki-roots"] }
 # Exact released versions keep the benchmark and production on the same envelope.
-subc-protocol = "=0.31.0"
-subc-transport = "=0.12.0"
-subc-control = "=0.30.0"
-subc-client-rs = "=0.28.0"
+subc-protocol = "=0.32.4"
+subc-transport = "=0.13.0"
+subc-control = "=0.31.0"
+subc-client-rs = "=0.29.3"
 subc-os = "=0.1.14"
 cortexkit-lease = "=0.1.2"
 cortexkit-log = "=0.3.5"
 cortexkit-role-harness = "=0.1.0"
-cortexkit-role-tool-provider = "=0.7.1"
-cortexkit-role-tool-provider-conformance = "=0.7.1"
-cortexkit-role-llm-runner = "=0.2.2"
-cortexkit-role-llm-runner-conformance = "=0.2.2"
-cortexkit-role-agent-data = "=0.1.3"
-cortexkit-role-step-transform-provider = "=0.2.0"
-cortexkit-role-compaction-provider = "=0.2.0"
+cortexkit-role-tool-provider = "=0.8.1"
+cortexkit-role-tool-provider-conformance = "=0.8.0"
+cortexkit-role-llm-runner = "=0.2.3"
+cortexkit-role-llm-runner-conformance = "=0.3.1"
+cortexkit-role-agent-data = "=0.2.0"
+cortexkit-role-step-transform-provider = "=0.2.3"
+cortexkit-role-compaction-provider = "=0.2.4"
 
 # The logging facade every crate here emits through. The records are formatted and
 # written by cortexkit-log, which the daemon binary installs as the process-global

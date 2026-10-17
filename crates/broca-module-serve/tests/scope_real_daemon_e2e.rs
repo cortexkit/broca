@@ -432,13 +432,13 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn selector() -> ScopeSelector {
-    ScopeSelector {
-        owner: Principal::Reserved {
+    ScopeSelector::new(
+        Principal::Reserved {
             module_id: OWNER.into(),
         },
-        scope_ref: SCOPE_REF.into(),
-        scope_epoch: Some(SCOPE_EPOCH),
-    }
+        SCOPE_REF,
+        Some(SCOPE_EPOCH),
+    )
 }
 
 /// Open broca's management surface under the synced scope, retrying while broca is still

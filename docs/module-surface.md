@@ -98,7 +98,7 @@ A consumer can be both. The surface is **session-centric**: consumers address
 
 Unary reply frames larger than **4,194,304 bytes including the fixed 21-byte frame header** are
 never sent: broca answers that correlated request with an error and keeps the connection open.
-The 21-byte header is `subc-protocol` 0.31.0's `HEADER_LEN` (`src/lib.rs:417`), encoded by
+The 21-byte header is `subc-protocol` 0.32.4's `HEADER_LEN` (`src/lib.rs:417`), encoded by
 `EnvelopeHeader::encode` (`src/lib.rs:714-725`). `session.read` and `run.result` use the typed
 `reply_too_large` refusal when an indivisible message or group would cross that limit; other
 unary replies use the transport adapter's generic oversize refusal. The codec's larger
