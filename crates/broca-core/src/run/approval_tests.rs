@@ -106,6 +106,7 @@ struct Questions {
     keys: Mutex<Vec<String>>,
     attempts: AtomicUsize,
     polls: AtomicUsize,
+    answer_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     settlement_pages: AtomicUsize,
     awaits: AtomicUsize,
     gets: AtomicUsize,
@@ -343,6 +344,10 @@ impl ElicitationPlane for Questions {
             );
         }
         let n = self.polls.fetch_add(1, Ordering::SeqCst);
+        let gate = self.answer_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let _permit = gate.acquire().await.unwrap();
+        }
         if answer == "overdue" {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -901,6 +906,7 @@ impl Rig {
             keys: Mutex::new(Vec::new()),
             attempts: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
+            answer_gate: Mutex::new(None),
             settlement_pages: AtomicUsize::new(0),
             awaits: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
@@ -1644,24 +1650,71 @@ async fn late_execute_uses_originating_plan_is_isolated_and_at_most_once_at_ever
     )
     .unwrap();
     let mut history = approval_gate::History::new(&rig.writer, before.clone()).unwrap();
-    approval_gate::admission(
-        &mut history,
-        &rig.writer,
-        &rig.bind,
-        &rig.control,
-        &rig.tools,
+    // Admission budgets the whole reconciliation, including the feed and WAL sync.
+    // Budget expiry leaves intake eligible for retry, not necessarily dispatched.
+    // Hold the feed across two budgets to force that schedule without runner load.
+    let answer_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *rig.questions.answer_gate.lock().unwrap() = Some(answer_gate.clone());
+    let polls = rig.questions.polls.load(Ordering::SeqCst);
+    let gets = rig.questions.gets.load(Ordering::SeqCst);
+    broca_test_support::event_timeout(
+        "late approved call to finish",
+        async {
+            for _ in 0..2 {
+                approval_gate::admission(
+                    &mut history,
+                    &rig.writer,
+                    &rig.bind,
+                    &rig.control,
+                    &rig.tools,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(rig.questions.polls.load(Ordering::SeqCst), polls + 2);
+            assert_eq!(rig.questions.gets.load(Ordering::SeqCst), gets);
+            assert!(rig.tools.sent.lock().unwrap().is_empty());
+            assert!(!rig
+                .frames()
+                .iter()
+                .any(|frame| matches!(frame.record, WalRecord::LateApprovalRecorded { .. })));
+            answer_gate.add_permits(1);
+            // A completed admission can defer intake again. Wait for the durable
+            // effect, with one hang guard for the whole sequence of attempts.
+            loop {
+                approval_gate::admission(
+                    &mut history,
+                    &rig.writer,
+                    &rig.bind,
+                    &rig.control,
+                    &rig.tools,
+                )
+                .await
+                .unwrap();
+                if rig
+                    .frames()
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::LateResult { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Retry after success as well, so waiting cannot hide a second send.
+            approval_gate::admission(
+                &mut history,
+                &rig.writer,
+                &rig.bind,
+                &rig.control,
+                &rig.tools,
+            )
+            .await
+            .unwrap();
+        },
+        || broca_test_support::record_kinds(rig.frames()),
     )
     .await
-    .unwrap();
-    approval_gate::admission(
-        &mut history,
-        &rig.writer,
-        &rig.bind,
-        &rig.control,
-        &rig.tools,
-    )
-    .await
-    .unwrap();
+    .expect("late approved call must finish after the feed is released");
     let after = rig.frames();
     assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
     assert!(rig.tools.sent.lock().unwrap()[0].2 .0.starts_with("late:"));

@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
-// Scan test source for common short sleep/yield polling loops. This checks written
-// constants, not whether a poll reaches disk at runtime. Each exception names its
-// file, function and reason so a new helper cannot inherit a whole crate's
+// Scan test source for short timeouts around joined futures and sleep/yield
+// polling loops. Standalone non-joined timeouts are not covered yet. This checks
+// written constants, not whether a wait reaches disk at runtime. Each exception
+// names its file, function and reason so a new helper cannot inherit a whole crate's
 // exemption. Bounds are measured in milliseconds.
 const EXCEPTIONS: &[(&str, &str, &str)] = &[
     ("crates/broca-core/src/compaction/tests.rs", "concurrent_clock_refresh_cannot_move_wait_cap_into_real_time", "Memory WAL and injected compaction clock; no disk barrier"),
@@ -212,6 +213,53 @@ fn short_polls(source: &str) -> Vec<(String, usize, u64)> {
             continue;
         };
         for l in open + 1..end {
+            if matches!(ts[l].text, "timeout" | "timeout_at")
+                && ts.get(l + 1).is_some_and(|t| t.text == "(")
+            {
+                // Inspect only the deadline argument, not durations in the future
+                // being awaited. Joined event waits need no polling loop.
+                let mut depth = 0;
+                let argument_end = (l + 2..end).find(|i| match ts[*i].text {
+                    "(" | "[" | "{" => {
+                        depth += 1;
+                        false
+                    }
+                    ")" | "]" | "}" if depth > 0 => {
+                        depth -= 1;
+                        false
+                    }
+                    "," | ")" => depth == 0,
+                    _ => false,
+                });
+                if let Some(stop) = argument_end {
+                    let mut depth = 1;
+                    let future_end = (stop + 1..end).find(|i| match ts[*i].text {
+                        "(" => {
+                            depth += 1;
+                            false
+                        }
+                        ")" => {
+                            depth -= 1;
+                            depth == 0
+                        }
+                        _ => false,
+                    });
+                    let joined = future_end.is_some_and(|close| {
+                        ts[stop + 1..close]
+                            .windows(2)
+                            .any(|w| matches!(w[0].text, "join" | "try_join") && w[1].text == "!")
+                    });
+                    if let Some(bound) =
+                        duration(&ts[l + 2..stop]).filter(|ms| joined && *ms < 30_000)
+                    {
+                        found.push((
+                            name.to_owned(),
+                            source[..ts[l].offset].lines().count(),
+                            bound,
+                        ));
+                    }
+                }
+            }
             if !matches!(ts[l].text, "for" | "while" | "loop") {
                 continue;
             }
@@ -309,14 +357,14 @@ fn short_real_time_polls_are_classified() {
                 .iter()
                 .any(|(p, n, reason)| *p == relative && *n == name && !reason.is_empty())
             {
-                violations.push(format!("{relative}:{line} {name}: {bound} ms poll; use broca_test_support::wait_until or document a timing/memory-only exception"));
+                violations.push(format!("{relative}:{line} {name}: {bound} ms wait; use broca_test_support::event_timeout/wait_until or document a timing/memory-only exception"));
             }
         }
     }
     violations.sort();
     assert!(
         violations.is_empty(),
-        "short real-time test polls need classification:\n{}",
+        "short real-time test waits need classification:\n{}",
         violations.join("\n")
     );
 }
@@ -333,6 +381,19 @@ fn scanner_recognises_literal_counts_and_deadlines() {
         "async fn poll() { for _ in 0..3000 { sleep(Duration::from_millis(20)).await; } }"
     )
     .is_empty());
+}
+
+#[test]
+fn scanner_recognises_timeouts_around_joined_futures() {
+    let join = "async fn ordinary() { let result = tokio::time::timeout(std::time::Duration::from_secs(3), async { tokio::join!(batch, interrupt) }).await; }";
+    assert_eq!(short_polls(join), vec![("ordinary".into(), 1, 3000)]);
+    let event = "async fn wait() { timeout(Duration::from_millis(2500), async { futures::join!(left, right); }).await; }";
+    assert_eq!(short_polls(event), vec![("wait".into(), 1, 2500)]);
+    let deadline = "async fn wait() { timeout_at(Instant::now() + Duration::from_secs(4), async { tokio::try_join!(left, right) }).await; }";
+    assert_eq!(short_polls(deadline), vec![("wait".into(), 1, 4000)]);
+    assert!(short_polls("async fn wait() { timeout(HANG_GUARD, async { tokio::join!(event, sleep(Duration::from_millis(5))); }).await; }").is_empty());
+    assert!(short_polls("async fn wait() { timeout(Duration::from_secs(60), async { tokio::join!(left, right) }).await; }").is_empty());
+    assert!(short_polls("async fn wait() { timeout(Duration::from_secs(3), event).await; tokio::join!(left, right); }").is_empty());
 }
 
 #[test]

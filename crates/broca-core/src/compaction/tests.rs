@@ -2284,7 +2284,7 @@ async fn late_receipt_during_model_wait_is_durable_without_resending_and_crash_r
             tokio::task::yield_now().await;
         }
     };
-    let (summary, cut) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (summary, cut) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(run, observe)
     })
     .await
@@ -2375,7 +2375,7 @@ async fn boundary_cancel_during_compaction_wait_exits_cancelled_without_recall()
             .unwrap();
     };
     let raw = raw();
-    let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let (result, _) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(
             runtime.step(&mut state, status(), &raw, Some(10), None),
             driver

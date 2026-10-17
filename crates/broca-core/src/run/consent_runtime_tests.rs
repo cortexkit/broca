@@ -61,7 +61,7 @@ async fn pending_restart_pause_gets_then_awaits_the_same_durable_card() {
     };
     // Preparing and syncing a pause is not the one-second transport-close bound.
     // The separate route-drop test measures that bound after cancellation.
-    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (paused, ()) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(batch, stop)
     })
     .await
@@ -313,7 +313,7 @@ async fn branch_c_two_sessions_keep_owner_feed_answers_without_ack() {
         );
         feed.release.notify_one();
     };
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(held, other)
     })
     .await
@@ -551,6 +551,7 @@ async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_r
             keys: Mutex::new(Vec::new()),
             attempts: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
+            answer_gate: Mutex::new(None),
             settlement_pages: AtomicUsize::new(0),
             awaits: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
@@ -773,7 +774,7 @@ async fn awaiting_marker_names_deferred_call_before_lookup_or_filing_finishes() 
         lookup.0.notified().await;
         stop.cancel();
     };
-    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    let (paused, ()) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(batch, interrupt)
     })
     .await

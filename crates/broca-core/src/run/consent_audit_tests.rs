@@ -128,7 +128,7 @@ async fn provisional_id_resume_reconciles_conflicting_settlements_before_get() {
         cards.entered.notified().await;
         stop.cancel();
     };
-    let (paused, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (paused, ()) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(batch, interrupt)
     })
     .await
@@ -510,6 +510,7 @@ async fn copied_pending_late_episode(stopped: bool) -> Rig {
         keys: Mutex::new(keys),
         attempts: AtomicUsize::new(0),
         polls: AtomicUsize::new(0),
+        answer_gate: Mutex::new(None),
         settlement_pages: AtomicUsize::new(0),
         awaits: AtomicUsize::new(0),
         gets: AtomicUsize::new(0),
@@ -680,7 +681,7 @@ async fn stopped_expired_sibling(cancel: bool) -> Rig {
         while !rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::ApprovalRecorded { call_id, decision: broca_wal::DeferredDecision::Expired, .. } if call_id.0 == "c")) { tick.tick().await; }
         token.cancel();
     };
-    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (result, ()) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(run, interrupt)
     })
     .await
@@ -1313,7 +1314,7 @@ async fn live_cursor_probe(unreadable: bool) {
             tick.tick().await;
         }
     };
-    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (result, ()) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         tokio::join!(batch, monitor)
     })
     .await
@@ -1388,9 +1389,11 @@ async fn ordinary_approved_cancel_during_intent_sync_is_not_sent() {
         cancel.cancel();
         gate.release();
     };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(batch, interrupt)
-    })
+    let result = broca_test_support::event_timeout(
+        "ordinary intent gate to release",
+        async { tokio::join!(batch, interrupt) },
+        || broca_test_support::record_kinds(rig.frames()),
+    )
     .await;
     gate.release();
     let (_result, ()) = result.expect("ordinary intent gate must release");
