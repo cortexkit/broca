@@ -271,6 +271,7 @@ pub fn classify_tier_refusal(
         return error;
     };
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
         message: format!(
@@ -543,6 +544,7 @@ mod tests {
         body: &str,
     ) -> ProviderError {
         let original = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
             message: format!("{status}: {body}"),
@@ -654,6 +656,7 @@ mod tests {
     fn anthropic_fast_mode_without_credits_is_a_tier_refusal_but_a_busy_429_is_not() {
         const CAPTURED: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode."},"request_id":"req_011CfQqPwHCYLA9161tYEBSn"}"#;
         let busy = |body: &str| ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
             message: format!("429: {body}"),
@@ -739,6 +742,7 @@ mod tests {
             assert_eq!(error.provider_code, None, "{body}");
         }
         let untouched = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
             message: "403".into(),

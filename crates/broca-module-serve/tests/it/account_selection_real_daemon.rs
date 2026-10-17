@@ -231,6 +231,8 @@ struct Vault {
     relisted: std::sync::atomic::AtomicBool,
     /// Once set, the listing also carries the labelled Anthropic API key `apikey:anthropic:work`.
     anthropic_apikey_listed: std::sync::atomic::AtomicBool,
+    /// Once set, the listing also carries the OpenAI API key `apikey:openai`.
+    openai_apikey_listed: std::sync::atomic::AtomicBool,
 }
 
 impl Vault {
@@ -326,6 +328,20 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                     }),
                 ];
                 if self
+                    .openai_apikey_listed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    rows.push(json!({
+                        "id": "apikey:openai",
+                        "categories": ["llm-provider"],
+                        "type": "apikey",
+                        "serves": ["openai"],
+                        "state": "active",
+                        "record_version": 1,
+                        "operations": ["read"],
+                    }));
+                }
+                if self
                     .anthropic_apikey_listed
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
@@ -420,6 +436,13 @@ const UPSTREAM_HEADERS: &[(&str, &str)] = &[
 /// Anthropic's out-of-credit refusal for an API key. ASSUMED, NOT CAPTURED: built from Anthropic's
 /// public error shape because no real refusal has been recorded yet. Replace it, and regenerate
 /// `run_status.billing_exhausted_anthropic_apikey.json`, from the first real refusal.
+/// OpenAI's refusal of a structured-output schema. RECONSTRUCTED, NOT CAPTURED: production
+/// recorded the HTTP 400 with `error.type` `invalid_request_error`, `error.code`
+/// `invalid_json_schema` and `error.param` `text.format.schema`; the message text is written for
+/// the test in OpenAI's usual wording. Replace it, and regenerate
+/// `run_status.request_invalid_openai.json`, from a captured body.
+const OPENAI_INVALID_SCHEMA_BODY: &str = r#"{"error":{"message":"Invalid schema for response_format 'result': In context=(), 'required' is required to be supplied and to be an array including every key in properties. Missing 'reason'.","type":"invalid_request_error","param":"text.format.schema","code":"invalid_json_schema"}}"#;
+
 const ANTHROPIC_CREDIT_BALANCE_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
 
 fn reported_headers() -> Value {
@@ -477,6 +500,8 @@ struct Upstream {
     account_limit_exhausted_code_assist: std::sync::atomic::AtomicBool,
     /// Answer Anthropic's out-of-credit 400 (its public shape; no real refusal is captured).
     credit_exhausted_anthropic: std::sync::atomic::AtomicBool,
+    /// Answer OpenAI's request-validation 400 for a rejected structured-output schema.
+    request_invalid_openai: std::sync::atomic::AtomicBool,
     /// Answer an ordinary Anthropic rate-limit 429 with `retry-after: 0`, so the transport spends
     /// its whole in-step attempt budget without waiting.
     rate_limited_anthropic: std::sync::atomic::AtomicBool,
@@ -490,6 +515,7 @@ const CREDENTIALS: &[&str] = &[
     "apikey:xai",
     "antigravity:google",
     "apikey:anthropic:work",
+    "apikey:openai",
 ];
 
 async fn serve_upstream(upstream: Arc<Upstream>) -> String {
@@ -601,6 +627,17 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     let body = ANTHROPIC_CREDIT_BALANCE_BODY.as_bytes();
+                    let reply = format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    return;
+                }
+                if upstream
+                    .request_invalid_openai
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let body = OPENAI_INVALID_SCHEMA_BODY.as_bytes();
                     let reply = format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
                     socket.write_all(reply.as_bytes()).await.unwrap();
                     socket.write_all(body).await.unwrap();
@@ -778,6 +815,14 @@ impl Rig {
                         "limit.context": 131072,
                         "limit.output": 4096,
                     },
+                    "openai/gpt-5.5": {
+                        "capability.attachment": false,
+                        "capability.reasoning": false,
+                        "capability.tool_call": true,
+                        "existence": "present",
+                        "limit.context": 400000,
+                        "limit.output": 8192,
+                    },
                     "google/gemini-3.8-flash-high": {
                         "capability.attachment": false,
                         "capability.reasoning": true,
@@ -803,6 +848,7 @@ impl Rig {
                     "anthropic": { "base_url": upstream_url },
                     "xai": { "base_url": upstream_url },
                     "google": { "base_url": upstream_url },
+                    "openai": { "base_url": upstream_url },
                 }
             })
             .to_string(),
@@ -811,7 +857,7 @@ impl Rig {
         let methods = root.join("auth-methods.json");
         std::fs::write(
             &methods,
-            br#"{"defaults":{"anthropic":"oauth","xai":"apikey","google":"antigravity"}}"#,
+            br#"{"defaults":{"anthropic":"oauth","xai":"apikey","google":"antigravity","openai":"apikey"}}"#,
         )
         .unwrap();
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
@@ -877,6 +923,7 @@ impl Rig {
             account_ids: Mutex::new(std::collections::HashMap::new()),
             relisted: Default::default(),
             anthropic_apikey_listed: Default::default(),
+            openai_apikey_listed: Default::default(),
         });
         let routing_task = register(
             &connection_file,
@@ -2255,6 +2302,74 @@ async fn billing_exhausted_xai_status_matches_golden_through_real_serve() {
     }
     let golden = std::fs::read(&path)
         .expect("generate the billing-exhausted golden through the real serve path");
+    assert_eq!(bytes, golden);
+}
+
+/// The fake OpenAI upstream answers [`OPENAI_INVALID_SCHEMA_BODY`], a RECONSTRUCTED body: the
+/// status, `error.type`, `error.code` and `error.param` of a production refusal, with message
+/// text written for the test. Regenerate only from the daemon's real reply with
+/// BROCA_UPDATE_GOLDEN=1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_invalid_openai_status_matches_golden_through_real_serve() {
+    let rig = Rig::start()
+        .await
+        .expect("the request-invalid golden requires the real daemon");
+    rig.vault
+        .openai_apikey_listed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.upstream
+        .request_invalid_openai
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = rig.client("request-invalid-openai").await;
+    let mut openai_spec = spec("send-request-invalid-openai", None);
+    openai_spec.provider = "openai";
+    openai_spec.model = "gpt-5.5";
+    let run_id = match client.send(openai_spec).await.expect("send") {
+        SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. } => run_id,
+        other => panic!("unexpected send outcome {other:?}"),
+    };
+    let frames = rig.finished("request-invalid-openai").await;
+    // One provider call: a request the provider refused as invalid is never re-sent.
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        rig.upstream.authorized_as.lock().unwrap().as_slice(),
+        ["apikey:openai"]
+    );
+    let status = broca_test_support::wait_until(
+        "request_invalid_openai_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["state"], "error");
+    assert_eq!(value["error"]["class"], "permanent");
+    assert_eq!(value["error"]["provider_code"], "request_invalid");
+    assert_eq!(value["error"]["provider_subcode"], "invalid_json_schema");
+    assert_eq!(value["error"]["status"], 400);
+    // Not a credential's fault, so the run names no credential.
+    assert!(value["error"].get("credential_id").is_none());
+    assert_eq!(value["retries_used"], 0);
+    let bytes = serde_json::to_vec(&status).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/run_status.request_invalid_openai.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    let golden = std::fs::read(&path)
+        .expect("generate the request-invalid golden through the real serve path");
     assert_eq!(bytes, golden);
 }
 

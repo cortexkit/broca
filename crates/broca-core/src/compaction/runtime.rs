@@ -248,6 +248,10 @@ pub(crate) struct Runtime<'a> {
     pub control: &'a crate::RunControl,
     pub replies: &'a CompactionReplies,
 }
+// A step's result is returned once and destructured at once, never stored or collected, so the
+// size of the terminal error it carries costs one move. Boxing it would only add an allocation
+// and an unbox at every caller.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum StepResult {
     Continue,
     Terminal(RunFinishReason, Option<ProviderError>),
@@ -267,6 +271,7 @@ pub(crate) fn error(
     retryable: bool,
 ) -> ProviderError {
     ProviderError {
+        provider_subcode: None,
         refusal,
         class: if retryable {
             ErrorClass::Transient

@@ -3008,6 +3008,7 @@ mod schema_tests {
     #[test]
     fn every_v2_record_round_trips() {
         let provider_err = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
             message: "needs reauth".into(),
@@ -3150,6 +3151,7 @@ mod schema_tests {
                 failure: Some(QueuedAdmissionFailure {
                     run_id: RunId("r3".into()),
                     error: ProviderError {
+                        provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
                         message: "unknown model".into(),
@@ -3184,6 +3186,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
                 message: "429: rate limited".into(),
@@ -3203,6 +3206,7 @@ mod schema_tests {
             ts_ms: Some(1_790_000_000_001),
             reason: PauseReason::AuthRequired,
             error: Some(ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
                 message: "needs reauth".into(),
@@ -3235,6 +3239,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
                 message: r#"429: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CfRDPYNrfveajQccKCJ7o"}"#.into(),
@@ -3269,6 +3274,7 @@ mod schema_tests {
                      retry_after_secs,
                      code: Option<&str>,
                      account: Option<&str>| ProviderError {
+            provider_subcode: None,
             refusal: None,
             class,
             message: message.into(),
@@ -3366,6 +3372,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::ProviderUnavailable,
                 message: "provider stream disconnected".into(),

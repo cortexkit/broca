@@ -1082,6 +1082,7 @@ mod gated {
         let (tx, mut rx) = mpsc::channel(256);
         let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let pause = broca_protocol::ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: broca_protocol::ErrorClass::Auth,
             message: "credential needs reauthentication".into(),

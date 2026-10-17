@@ -70,6 +70,20 @@ Replace it, the rig's `ANTHROPIC_CREDIT_BALANCE_BODY` and the transport tests' b
 the first real refusal. `run_status.transient_rate_limited_credential.json` answers a
 rate-limit 429 the rig made up for the test, which is the ordinary Anthropic error shape.
 
+## Request-validation refusals and their fixture
+
+A provider's HTTP 400 that rejects the request itself (OpenAI's and Anthropic's
+`invalid_request_error`, Google's `INVALID_ARGUMENT`) ends `permanent` with
+`provider_code: "request_invalid"` when no more specific code (context overflow, billing)
+applies. It means the request shape was wrong, not that the provider is failing. The
+provider's own short code, when it sent one, rides in `error.provider_subcode` (for example
+`invalid_json_schema`); it is limited to `[a-z0-9_]{1,64}` and is diagnostic only.
+
+`run_status.request_invalid_openai.json` is RECONSTRUCTED, NOT CAPTURED: production recorded
+an HTTP 400 with `error.type` `invalid_request_error`, `error.code` `invalid_json_schema` and
+`error.param` `text.format.schema`, and the rig's `OPENAI_INVALID_SCHEMA_BODY` adds message
+text written for the test. Regenerate it from the first captured body.
+
 ## Retention expiry while approval withdrawals are owed
 
 A retained session becomes expired at its retention deadline for reads and status,

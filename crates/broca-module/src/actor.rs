@@ -2261,6 +2261,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(error) => {
                     let refusal = ProviderError {
+                        provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
                         message: error.to_string(),
@@ -5313,6 +5314,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         error: RunError,
     ) -> Result<(), String> {
         let terminal = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
             message: error.to_string(),
@@ -5851,6 +5853,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Use the terminal's existing diagnostic field without changing its Interrupted reason.
         // Recovery knows the old process left this run unsealed, not how that process ended.
         let error = (cause == SealCause::CrashOrphan).then(|| ProviderError {
+            provider_subcode: None,
             class: broca_protocol::ErrorClass::Transient,
             message: "the previous broca process ended without sealing this run: host crash, kill, or power loss".into(),
             provider_code: Some("previous_process_ended_unsealed".into()),

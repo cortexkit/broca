@@ -1641,6 +1641,7 @@ mod executor {
         match result {
             Ok(token) => AuthDecision::Proceed(AuthMode::Secret(token.token)),
             Err(VaultError::NeedsReauth) => AuthDecision::PauseForReauth(ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
                 message: "credential needs re-authentication (vault: refresh token expired \
@@ -4475,6 +4476,7 @@ mod executor {
             let paused = AuthResolution {
                 mode: AuthMode::None,
                 pause: Some(ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Auth,
                     message: "needs reauth".into(),
@@ -4642,6 +4644,7 @@ mod executor {
             );
             // A pre-loop pause means no provider call — no report identity.
             let pause = Some(ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
                 message: "needs reauth".into(),
@@ -5123,6 +5126,7 @@ mod executor {
 
         fn err_with_status(status: Option<u16>) -> ProviderError {
             ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
                 message: "x".into(),
@@ -5271,6 +5275,7 @@ mod executor {
         #[test]
         fn an_account_limit_refusal_is_never_reported_to_the_vault() {
             let exhausted = ProviderError {
+                provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
                 message: "429: account limit".into(),
@@ -5535,6 +5540,7 @@ mod executor {
             assert_eq!(wire_auth_status(&err_with_status(Some(403))), Some(403));
             assert_eq!(
                 wire_auth_status(&ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
                     message: "forbidden".into(),

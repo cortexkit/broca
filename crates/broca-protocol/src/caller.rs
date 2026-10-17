@@ -255,6 +255,7 @@ mod tests {
 
     fn unavailable_error() -> ProviderError {
         ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
             message: "provider stream disconnected".into(),
@@ -330,6 +331,7 @@ mod tests {
         ] {
             for raw in [
                 ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class,
                     message: "same JSON shape".into(),
@@ -343,6 +345,7 @@ mod tests {
                     credential_id: None,
                 },
                 ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class,
                     message: "optional fields omitted".into(),

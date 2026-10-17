@@ -1234,6 +1234,7 @@ mod tests {
             failure: Some(QueuedAdmissionFailure {
                 run_id: RunId("r2".into()),
                 error: ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
                     message: "unknown model".into(),

@@ -847,6 +847,7 @@ async fn send_warm(
     let identity = Bytes::from(request.body);
     let failed = |message: String| {
         broca_core::WarmFailure::Provider(ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
             message,
@@ -1732,6 +1733,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 // the blocking handle. Keep that failure on the typed provider-error path instead
                 // of closing the receiver as an unexplained missing assistant message.
                 let error = ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
                     message: format!("provider request render task failed: {join_error}"),
@@ -2299,6 +2301,7 @@ fn account_changed_error(frozen: Option<&str>, served: Option<&str>) -> Option<P
         return None;
     }
     Some(ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Auth,
         message: format!("credential account changed: frozen account {frozen}, served account {served}; re-admission required"),
@@ -3235,6 +3238,7 @@ fn tool_args_cut(events: &[NormalizedEvent]) -> bool {
 
 fn stream_timeout_error(activity: &str) -> ProviderError {
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
         message: format!("provider stream idle: {activity} for 300s"),
@@ -3251,6 +3255,7 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
 
 fn content_timeout_error() -> ProviderError {
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
         message: format!(
@@ -3288,6 +3293,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
         _ => format!("normalize response: {e}"),
     };
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class,
         message,
@@ -3310,6 +3316,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
 /// the shared boundary anyway and says less.
 fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> ProviderError {
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
         message: format!(
@@ -3331,6 +3338,7 @@ fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> Pro
 
 fn transport_error(message: &str) -> ProviderError {
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::ProviderUnavailable,
         message: message.to_owned(),
@@ -3347,6 +3355,7 @@ fn transport_error(message: &str) -> ProviderError {
 
 fn stream_limit_error(message: &str) -> ProviderError {
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
         message: message.to_owned(),
@@ -3522,6 +3531,7 @@ fn classify_chatgpt_upstream_key_rejection(
         return error;
     }
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
         message: format!(
@@ -3943,7 +3953,8 @@ fn http_error_in_family(
         classify_error_with_status_defaults(provider_code.as_deref(), Some(code))
     };
     let provider_code = overflow_code.map(str::to_owned).or(provider_code);
-    ProviderError {
+    let error = ProviderError {
+        provider_subcode: None,
         refusal: None,
         class,
         message: http_error_message(code, truncate_error_body(text), class),
@@ -3955,7 +3966,13 @@ fn http_error_in_family(
         limit_window: None,
         account_ref: None,
         credential_id: None,
-    }
+    };
+    // Run after the context-overflow and billing classification above, so a 400 those give a
+    // more specific code keeps it.
+    crate::request_invalid::classify_request_invalid(
+        error,
+        body.as_ref().and_then(|body| body.get("error")),
+    )
 }
 
 fn truncate_error_body(text: &str) -> &str {
@@ -3981,7 +3998,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED};
+    use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, REQUEST_INVALID};
     use broca_protocol::{
         content::{AssistantMessage, ContentBlock, Role, ToolCall},
         display::DisplayEvent,
@@ -4031,6 +4048,10 @@ mod tests {
 
     mod gemini_errors {
         include!("transport_gemini_error_tests.rs");
+    }
+
+    mod request_invalid {
+        include!("transport_request_invalid_tests.rs");
     }
 
     async fn assert_offloaded_render_matches_direct<F>(
@@ -4428,6 +4449,7 @@ mod tests {
         fn push(&mut self, _chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
             Ok(vec![NormalizedEvent::Control(ProviderControl::Error {
                 error: ProviderError {
+                    provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Transient,
                     message: "overloaded".into(),
@@ -5804,6 +5826,7 @@ mod tests {
     #[test]
     fn in_band_retry_after_without_http_status_sets_the_delay_floor() {
         let error = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
             message: "rate limited".into(),
@@ -5822,6 +5845,7 @@ mod tests {
     #[test]
     fn retry_after_delay_is_capped_at_one_hundred_twenty_seconds() {
         let error = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
             message: "rate limited".into(),
@@ -5840,6 +5864,7 @@ mod tests {
     #[test]
     fn computed_backoff_doubles_from_two_seconds_to_a_thirty_second_cap() {
         let error = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
             message: "connection reset".into(),
@@ -6157,6 +6182,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_790_387_965);
         let headers = crate::wire::ResponseHeaders::new(CAPTURED_EXHAUSTED_HEADERS.iter().copied());
         let tier_refusal = ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
             message: "429: provider 'anthropic' refused service_tier \"priority\" for this account: Usage credits are required for fast mode.".into(),
@@ -6436,6 +6462,7 @@ mod tests {
                         retry_after_secs: Option<f64>,
                         provider_code: Option<&str>,
                         resets: Option<(u64, &str)>| ProviderError {
+            provider_subcode: None,
             refusal: None,
             class,
             message,
@@ -6879,6 +6906,7 @@ mod tests {
             assert_eq!(error.status, Some(status));
 
             let raw_error = ProviderError {
+                provider_subcode: None,
                 class: ErrorClass::Permanent,
                 message: "403: forbidden".into(),
                 status: Some(status),
@@ -6945,17 +6973,15 @@ mod tests {
         let family = Some(WireFamilyId::AnthropicMessages);
         let error = super::classify_http_error_in_family(400, generic, None, None, family, None);
         assert_eq!(error.class, ErrorClass::Permanent);
-        assert_eq!(
-            error.provider_code.as_deref(),
-            Some("invalid_request_error")
-        );
+        // Not an overflow or a billing refusal, so it gets the typed request-validation code.
+        assert_eq!(error.provider_code.as_deref(), Some(REQUEST_INVALID));
         let error = super::classify_http_error_in_family(400, overflow, None, None, family, None);
         assert_eq!(error.class, ErrorClass::ContextOverflow);
         assert_eq!(
             error.provider_code.as_deref(),
             Some("context_length_exceeded")
         );
-        // The phrase is an Anthropic rule only: another family's invalid request stays itself.
+        // The phrase is an Anthropic rule only: another family's invalid request is not billing.
         let foreign = r#"{"error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}"#;
         let error = super::classify_http_error_in_family(
             400,
@@ -6966,10 +6992,7 @@ mod tests {
             None,
         );
         assert_eq!(error.class, ErrorClass::Permanent);
-        assert_eq!(
-            error.provider_code.as_deref(),
-            Some("invalid_request_error")
-        );
+        assert_eq!(error.provider_code.as_deref(), Some(REQUEST_INVALID));
     }
 
     #[tokio::test]

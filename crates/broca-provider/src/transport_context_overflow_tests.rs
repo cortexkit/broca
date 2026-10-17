@@ -38,9 +38,10 @@ fn anthropic_other_invalid_request_stays_permanent() {
     let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: roles must alternate between user and assistant"}}"#;
     let error = classify_http_error(400, body, None, None);
     assert_eq!(error.class, ErrorClass::Permanent);
+    // Not an overflow, so it is the typed request-validation refusal rather than the raw type.
     assert_eq!(
         error.provider_code.as_deref(),
-        Some("invalid_request_error")
+        Some(broca_protocol::error::REQUEST_INVALID)
     );
 }
 

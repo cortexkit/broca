@@ -3905,6 +3905,7 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
         reason: RunFinishReason::Interrupted,
         usage: Usage::default(),
         error: Some(ProviderError {
+            provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
             message: "resume refused: the provider renderer version differs from the version recorded at run start".into(),

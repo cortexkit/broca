@@ -1317,6 +1317,7 @@ fn bedrock_error(event_type: &str, payload: &Value, header_message: Option<&str>
         .unwrap_or(event_type)
         .to_owned();
     ProviderError {
+        provider_subcode: None,
         refusal: None,
         class: if crate::normalize::context_overflow_code(
             crate::spec::WireFamilyId::BedrockConverse,
