@@ -62,6 +62,7 @@ fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 
@@ -150,6 +151,7 @@ fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 

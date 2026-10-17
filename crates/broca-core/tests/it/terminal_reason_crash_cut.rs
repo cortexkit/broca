@@ -59,6 +59,7 @@ async fn replay_before_run_finished_preserves_live_max_steps_reason_for_text_onl
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let provider = StubProvider::new(vec![vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {

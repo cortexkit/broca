@@ -511,6 +511,14 @@ pub enum WalRecord {
     InputTokenBudgetExhausted {
         detail: broca_protocol::BudgetExhaustedDetail,
     },
+    /// What a completed run admitted with structured output produced, as `run.result` and
+    /// `run.status` report it (the role crate's `StructuredOutputResult`). Written in the same
+    /// commit as the run's `RunFinished`, so the value, its validation and the skipped siblings
+    /// are decided once, when the run ends, and never recomputed on read.
+    StructuredOutputResult {
+        run_id: RunId,
+        result: broca_protocol::structured_output::StructuredOutputResult,
+    },
     /// Episode close — synced BEFORE terminal success + lease release. Marks THIS
     /// episode terminal; it does NOT seal the lineage (a later `RunStarted` may open
     /// the next episode). `error` is populated only when `reason == Error`.
@@ -1075,10 +1083,39 @@ impl WalRecord {
             } if reason == "budget_exhausted" => true,
             _ => false,
         };
-        if capped {
+        let base = if capped {
             input_cap_features(base)
         } else {
             base
+        };
+        if self.carries_structured_output() {
+            with_feature(base, crate::framing::STRUCTURED_OUTPUT_FEATURE)
+        } else {
+            base
+        }
+    }
+
+    /// Whether this record holds structured-output state a reader must understand: a run start
+    /// or refreeze whose frozen render config carries the run's frozen schema, a queued send
+    /// that asks for one, the result of such a run, or a call skipped because `submit_result`
+    /// ended its run.
+    fn carries_structured_output(&self) -> bool {
+        let frozen = |config: Option<&Value>| {
+            config.is_some_and(|config| config.get("structured_output").is_some())
+        };
+        match self {
+            WalRecord::RunStarted { config, .. } => frozen(Some(&config.frozen_render_config)),
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen(Some(frozen_render_config)),
+            WalRecord::Queued { request, .. } => request.structured_output.is_some(),
+            WalRecord::StructuredOutputResult { .. } => true,
+            WalRecord::ToolResult {
+                reason: Some(reason),
+                ..
+            } => reason == broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT,
+            _ => false,
         }
     }
 
@@ -1444,6 +1481,30 @@ fn input_cap_features(base: &[&str]) -> &'static [&'static str] {
     });
     let set = &INPUT_CAP_FEATURE_SETS[mask];
     &set.names[..set.len]
+}
+
+/// `base` with `feature` added in sorted position. The feature sets a record can require are a
+/// small fixed family, so each distinct union is built once and kept for the process lifetime;
+/// the cache is keyed by the address of `base`, which is always a static slice.
+fn with_feature(base: &'static [&'static str], feature: &'static str) -> &'static [&'static str] {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Unions = HashMap<(usize, usize, &'static str), &'static [&'static str]>;
+    static UNIONS: OnceLock<Mutex<Unions>> = OnceLock::new();
+    if base.contains(&feature) {
+        return base;
+    }
+    let key = (base.as_ptr() as usize, base.len(), feature);
+    let mut unions = UNIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    unions.entry(key).or_insert_with(|| {
+        let mut names = base.to_vec();
+        let at = names.partition_point(|name| *name < feature);
+        names.insert(at, feature);
+        Box::leak(names.into_boxed_slice())
+    })
 }
 
 /// The schema a tool call was dispatched against: the tool's `schema_digest` and `semantics`
@@ -3068,6 +3129,7 @@ mod schema_tests {
                     stop_when: vec![],
                     context_management: None,
                     inherit_frozen: Default::default(),
+                    structured_output: None,
                 }),
                 request_identity_digest: None,
                 principal: None,

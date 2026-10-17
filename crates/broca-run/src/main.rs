@@ -369,6 +369,7 @@ async fn run(args: Args) -> Result<i32, String> {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
 
     // 6. Drive the loop, printing greppable per-turn markers as events arrive (so a

@@ -47,6 +47,7 @@ fn resolve_runtime_override(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         },
     )
     .unwrap_or_else(|error| panic!("runtime resolution: {error}"))
@@ -99,6 +100,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         },
     )
     .ok()?;
@@ -264,7 +266,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         stop_when: vec![],
         submission_id: None,
         context_management: None,
-        inherit_frozen_cache: false, };
+        inherit_frozen_cache: false, structured_output: None, };
     assert!(executor
         .cache_policy_for_episode(true, None, &req, None)
         .unwrap()
@@ -432,6 +434,7 @@ fn resolve_drift_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         },
     )
     .unwrap_or_else(|error| panic!("catalog resolution: {error}"))
@@ -462,7 +465,7 @@ fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
         stop_when: vec![],
         submission_id: None,
         context_management: None,
-        inherit_frozen_cache: false, }
+        inherit_frozen_cache: false, structured_output: None, }
 }
 
 /// The RunConfig a run started with `started` would have written into RunStarted.
@@ -765,6 +768,7 @@ fn resolve_tier_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         },
     )
 }
@@ -878,6 +882,7 @@ fn resolve_variant_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         },
     )
 }

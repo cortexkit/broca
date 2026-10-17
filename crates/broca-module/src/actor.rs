@@ -271,6 +271,11 @@ pub enum SendOutcome {
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
     InputTokenBudgetInvalid(String),
+    /// The send's `structured_output` was refused before anything was written; `field` is the
+    /// offending member path the role contract names.
+    StructuredOutputInvalid {
+        field: String,
+    },
     VariantUnsupported(broca_core::run::VariantRefusal),
     /// The run started immediately (the lineage was idle).
     Active {
@@ -595,6 +600,44 @@ fn deliver_terminal(
     };
     // A closed lane means the actor is already gone; there is nothing left to notify.
     let _ = tx.send(cmd);
+}
+
+/// Admission checks of a send's `structured_output` that depend on the session, after the
+/// serve layer has checked the value itself. Returns the field of the `invalid_params` refusal.
+///
+/// A steer joining the active run runs under that run's frozen request, so it may only repeat
+/// it exactly. Any other send starts a run: its admitted tool set (the plan's frozen tools, the
+/// send's own, or the tools it inherits by omitting them) must not include `submit_result`, and
+/// must be empty for `final_text`.
+fn check_structured_output(
+    structured_output: &broca_protocol::structured_output::StructuredOutput,
+    request: &SubmissionRequest,
+    plan: Option<&SendPlan>,
+    latest: Option<&broca_wal::RunConfig>,
+    joins_active_run: bool,
+) -> Result<(), String> {
+    use broca_protocol::structured_output::{FrozenStructuredOutput, FIELD};
+    if joins_active_run {
+        let frozen = latest.and_then(|config| {
+            FrozenStructuredOutput::from_frozen_render_config(Some(&config.frozen_render_config))
+        });
+        return match frozen {
+            Some(frozen) if frozen.matches(structured_output) => Ok(()),
+            _ => Err(FIELD.to_owned()),
+        };
+    }
+    let tools: Vec<String> = match (plan.and_then(|plan| plan.manifest.as_ref()), &request.tools) {
+        (Some(manifest), _) => manifest
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect(),
+        (None, Some(tools)) => tools.iter().map(|tool| tool.name.clone()).collect(),
+        (None, None) => latest
+            .map(|config| config.tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default(),
+    };
+    structured_output.check(true, &tools)
 }
 
 /// Fill each runner parameter `request` left to the session (`inherit_frozen`) from `frozen`, the
@@ -1002,6 +1045,7 @@ fn submission_from_config(
         stop_when: config.stop_when,
         context_management: config.context_management,
         inherit_frozen: Default::default(),
+        structured_output: None,
     }
 }
 
@@ -2429,6 +2473,26 @@ impl<W: WalStore + 'static> LineageActor<W> {
             };
             if let Err(message) = budget.admit(Some(limit)) {
                 return SendOutcome::InputTokenBudgetInvalid(message);
+            }
+        }
+        if let Some(structured_output) = &request.structured_output {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            let joins_active_run = delivery == broca_protocol::Delivery::Steer
+                && matches!(self.state, RunState::Active { .. });
+            if let Err(field) = check_structured_output(
+                structured_output,
+                &request,
+                plan.as_ref(),
+                checkpoint
+                    .last_episode
+                    .as_ref()
+                    .map(|episode| &episode.config),
+                joins_active_run,
+            ) {
+                return SendOutcome::StructuredOutputInvalid { field };
             }
         }
 
@@ -4800,6 +4864,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let title = self.live_run_title(run_id).await?;
                 return Ok(Some(ReconciledRunState {
                     budget_detail: None,
+                    structured_output: None,
                     live_step,
                     state: RunIndexState::Active,
                     undelivered_steers: None,
@@ -4849,6 +4914,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     let budget_detail = reconciled
                         .as_ref()
                         .and_then(|state| state.budget_detail.clone());
+                    let structured_output = reconciled
+                        .as_ref()
+                        .and_then(|state| state.structured_output.clone());
                     let error = if row.state == RunIndexState::Error {
                         reconciled.and_then(|state| state.error)
                     } else {
@@ -4856,6 +4924,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     };
                     return Ok(Some(ReconciledRunState {
                         budget_detail,
+                        structured_output,
                         live_step: None,
                         state: row.state,
                         undelivered_steers,
@@ -4886,6 +4955,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     budget_detail: reconciled
                         .as_ref()
                         .and_then(|state| state.budget_detail.clone()),
+                    structured_output: reconciled
+                        .as_ref()
+                        .and_then(|state| state.structured_output.clone()),
                     live_step: None,
                     state: row.state,
                     undelivered_steers: reconciled
@@ -6723,6 +6795,7 @@ mod tests {
             variant: None,
             service_tier: None,
             inherit_frozen_cache: false,
+            structured_output: None,
         }
     }
 

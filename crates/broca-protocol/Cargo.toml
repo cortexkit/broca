@@ -10,6 +10,9 @@ description = "broca canonical types: provider<->runner stream-parts, runner<->c
 [dependencies]
 cortexkit-anthropic-policy.workspace = true
 cortexkit-role-llm-runner.workspace = true
+# Draft 2020-12 validation of structured-output schemas and values, with no remote retriever.
+jsonschema.workspace = true
+serde_jcs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

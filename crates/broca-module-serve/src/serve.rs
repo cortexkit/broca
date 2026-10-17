@@ -2095,6 +2095,7 @@ where
                 Ok(p) => p,
                 Err(e) => {
                     let field = broca_wire::send_budget_refusal_field(&req.params)
+                        .or_else(|| broca_wire::send_structured_output_refusal_field(&req.params))
                         .or_else(|| broca_wire::failing_field::<SendParams>(&req.params, &e));
                     return send_invalid_params(
                         writer,
@@ -4206,6 +4207,7 @@ mod tests {
             reason: Some(oversized),
             error: None,
             final_message: None,
+            structured_output: None,
         };
         let expected =
             br#"{"code":"response_too_large","message":"response exceeds the transport frame limit"}"#;

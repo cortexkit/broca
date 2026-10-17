@@ -287,6 +287,7 @@ mod gated {
                     thinking_cross_model: None,
                     responses_tools_non_strict: None,
                     chatgpt_effort_updates: None,
+                    structured_output: None,
                 },
             )
             .unwrap_or_else(|error| panic!("episode resolves: {error}"))

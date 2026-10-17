@@ -584,6 +584,7 @@ async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy()
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let snapshot = Arc::new(TerminalAssistantAllocationSnapshot::default());
     let run_snapshot = Arc::clone(&snapshot);
@@ -693,6 +694,7 @@ async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let snapshot = Arc::new(TerminalAssistantAllocationSnapshot::default());
     let run_snapshot = Arc::clone(&snapshot);
@@ -808,6 +810,7 @@ async fn admitted_turn_does_not_retain_a_second_input_copy() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let provider = AllocationProbeProvider;
     let tool_plane = StubToolPlane::default();
@@ -922,6 +925,7 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let provider = AllocationProbeProvider;
     let tool_plane = StubToolPlane::default();
@@ -1018,6 +1022,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let provider = DispatchAllocationProbeProvider;
     let tool_plane = Arc::new(DispatchAllocationProbePlane::default());
@@ -1148,6 +1153,7 @@ async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
     let provider = DispatchAllocationProbeProvider;
     let snapshot = Arc::new(ToolResultAllocationSnapshot::default());

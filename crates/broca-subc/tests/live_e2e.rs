@@ -164,6 +164,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
 
     let (tx, mut rx) = mpsc::channel(2048);
@@ -280,7 +281,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
     // Bound the live run so a misbehaving model can't loop.
     cache: None,
     context_management: None,
-    stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None, budget: None, context_limit: None, work_class: None, variant: None, service_tier: None, inherit_frozen_cache: false, };
+    stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None, budget: None, context_limit: None, work_class: None, variant: None, service_tier: None, inherit_frozen_cache: false, structured_output: None, };
 
     let (tx, mut rx) = mpsc::channel(2048);
     let collector = tokio::spawn(async move {
@@ -429,6 +430,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
 
     let (tx, mut rx) = mpsc::channel(2048);

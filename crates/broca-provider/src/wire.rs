@@ -211,6 +211,12 @@ pub struct FrozenRenderConfig {
     /// the episode starts. Old frozen blobs lack this field and keep request-level effort.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chatgpt_effort_updates: bool,
+    /// The run's structured-output settings, decided at admission (see
+    /// `crate::structured_output::decide`) and rendered into every request of the run: the
+    /// submit tool, the family's schema encoding, or schema instructions. `None` (a run
+    /// without structured output) is omitted, keeping every such render byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<broca_protocol::structured_output::FrozenStructuredOutput>,
 }
 
 /// One HTTP request the family wants sent: method, full URL, headers, body bytes.

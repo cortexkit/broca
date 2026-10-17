@@ -67,6 +67,7 @@ mod gated {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            structured_output: None,
         };
         let resolved = broca_catalog::live::resolve_catalog_episode_with_client(
             MODEL,

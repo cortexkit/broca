@@ -928,6 +928,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         variant: None,
         service_tier: None,
         inherit_frozen: Default::default(),
+        structured_output: None,
     };
     let records = vec![
         started("r-all"),

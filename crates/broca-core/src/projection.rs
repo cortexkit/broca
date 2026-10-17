@@ -539,6 +539,7 @@ fn project_control_record<S: ControlProjectionSink>(
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
+        | WalRecord::StructuredOutputResult { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
     }
 }

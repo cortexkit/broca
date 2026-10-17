@@ -545,6 +545,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     let usage = state.usage;
     let retries_used = state.retries_used;
     let title = state.title;
+    let structured_output = state.structured_output;
     // Carried as `session.read` carries them: the error verbatim through the caller-facing
     // wrapper, the pause reason through the same spelling function, so both surfaces
     // report one run's cause identically.
@@ -598,6 +599,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             usage,
             retries_used,
             title,
+            structured_output: structured_output.clone(),
         },
         State::Completed => RunStatusResponse::Completed {
             final_step_finish_reason,
@@ -605,6 +607,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             usage,
             retries_used,
             title,
+            structured_output: structured_output.clone(),
         },
         State::MaxSteps => RunStatusResponse::MaxSteps {
             final_step_finish_reason,
@@ -612,6 +615,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             usage,
             retries_used,
             title,
+            structured_output: structured_output.clone(),
         },
         State::BudgetExhausted => RunStatusResponse::BudgetExhausted {
             detail: state
@@ -622,6 +626,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             usage,
             retries_used,
             title,
+            structured_output: structured_output.clone(),
         },
         State::Cancelled => RunStatusResponse::Cancelled {
             final_step_finish_reason,
@@ -629,6 +634,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             usage,
             retries_used,
             title,
+            structured_output: structured_output.clone(),
         },
         State::Error => RunStatusResponse::Error {
             final_step_finish_reason,
@@ -637,6 +643,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             retries_used,
             error,
             title,
+            structured_output: structured_output.clone(),
         },
         State::TransformUnavailable => RunStatusResponse::TransformUnavailable {
             final_step_finish_reason,
@@ -644,6 +651,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             usage,
             retries_used,
             title,
+            structured_output: structured_output.clone(),
         },
     }
 }
@@ -1382,6 +1390,10 @@ impl ServeHandler for crate::LineageRegistry {
                 field: "budget.max_input_tokens".into(),
                 message,
             }),
+            SendOutcome::StructuredOutputInvalid { field } => Err(ServeError::InvalidParams {
+                message: format!("{field} is not admissible for this send"),
+                field,
+            }),
             SendOutcome::Finished {
                 run_id,
                 reason,
@@ -1835,6 +1847,9 @@ impl ServeHandler for crate::LineageRegistry {
             .route_run_state_with_wal(session, run_id.clone())
             .await?;
         let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
+        let mut structured_output = state
+            .as_ref()
+            .and_then(|state| state.structured_output.clone());
         let status = run_status_response(state);
         let (mut state, reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
@@ -1864,11 +1879,14 @@ impl ServeHandler for crate::LineageRegistry {
                 None => self.read_durable_wal(session).await?.0,
             };
             if let Some((reason, terminal_error)) = durable_terminal(&read, &run_id) {
-                detail = broca_core::reconcile_run_state(
+                let reconciled = broca_core::reconcile_run_state(
                     read.iter().map(|frame| &frame.record),
                     &run_id.0,
-                )
-                .and_then(|state| state.budget_detail.clone());
+                );
+                detail = reconciled
+                    .as_ref()
+                    .and_then(|state| state.budget_detail.clone());
+                structured_output = reconciled.and_then(|state| state.structured_output);
                 state = serde_json::to_value(reason)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
@@ -1893,15 +1911,27 @@ impl ServeHandler for crate::LineageRegistry {
             reason,
             error,
             final_message,
+            structured_output,
         };
-        let subject =
+        // A structured-output value is never cut short, so an answer it makes too large is
+        // refused naming the run; otherwise the final message is the subject.
+        let subject = if response
+            .structured_output
+            .as_ref()
+            .is_some_and(|output| output.value.is_some())
+        {
+            Some(ReplyTooLargeSubject::Run {
+                run_id: response.run_id.clone(),
+            })
+        } else {
             response
                 .final_message
                 .as_ref()
                 .map(|message| ReplyTooLargeSubject::Message {
                     session: session.session.clone(),
                     ordinal: message.ordinal,
-                });
+                })
+        };
         if let Some(error) = reply_frame_limit_refusal(
             broca_wire::serialized_result_frame_bytes(&response),
             subject,
@@ -2009,6 +2039,19 @@ impl ServeHandler for crate::LineageRegistry {
         {
             *awaiting_approval = self.cached_awaiting_approval(session, &run_id);
         }
+        // The same frame rule as `run.result`: a structured-output value is never cut short,
+        // so an answer it makes too large is refused naming the run.
+        let carries_value = serde_json::to_value(&response)
+            .ok()
+            .is_some_and(|value| value.pointer("/structured_output/value").is_some());
+        if let Some(error) = reply_frame_limit_refusal(
+            broca_wire::serialized_result_frame_bytes(&response),
+            carries_value.then(|| ReplyTooLargeSubject::Run {
+                run_id: run_id.0.clone(),
+            }),
+        ) {
+            return Err(error);
+        }
         Ok(response)
     }
 }
@@ -2037,6 +2080,7 @@ mod paused_auth_tests {
             ] {
                 let state = broca_core::ReconciledRunState {
                     budget_detail: None,
+                    structured_output: None,
                     live_step: None,
                     title: None,
                     state: broca_core::RunIndexState::Paused,

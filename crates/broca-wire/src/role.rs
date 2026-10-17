@@ -172,6 +172,11 @@ pub struct RunResultResponse {
     pub error: Option<SharedProviderError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<FinalMessage>,
+    /// On an ended run admitted with structured output: its mode, enforcement, what it
+    /// produced and whether that validated against the run's frozen schema (the shared role
+    /// crate's `StructuredOutputResult`). Absent on a run admitted without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
 }
 
 /// `role.describe`: what this build serves of the `llm-runner/v1` role. It describes the build,
@@ -239,6 +244,7 @@ pub fn broca_role_describe_with_writers(
         "fetch-plan-optional-tools/v1",
         "session_class",
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
+        cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
     ]
     .map(String::from)
     .to_vec();
@@ -696,7 +702,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "c586c4b338888443db9ef6ca18114018412745bb8eaca41acd3c0cb3f26e3867",
+            "be8550d469403072f2ca4c0aae65aca39fa625b2143b99955421a2eeaacc1207",
         );
     }
 
@@ -853,7 +859,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "b02c1aeba85bfc1ad3a6dde615ba049c047e1f5f2ced66f90043c4fe34a5b0a2";
+        "c70f69130228f30d9f18dc7c39b007dd4c8bbc52c92ee5090ff5aebe311cd7e6";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

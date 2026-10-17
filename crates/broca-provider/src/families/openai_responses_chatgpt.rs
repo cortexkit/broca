@@ -156,7 +156,10 @@ impl WireFamily for OpenAiResponsesChatgpt {
             }
             reasoning["effort"] = serde_json::Value::String(effort.clone());
         }
-        if let Some((anchor, _)) = effort_plan(frozen, opts) {
+        // The shared builder plans effort over the request as structured output prepares it,
+        // so the anchor is computed over the same prompt positions here.
+        let prepared = crate::structured_output::prepare(frozen, opts);
+        if let Some((anchor, _)) = effort_plan(frozen, prepared.as_ref()) {
             body["reasoning"]["effort"] = serde_json::json!(anchor);
         }
         if let Some(service_tier) = &frozen.service_tier {

@@ -171,6 +171,13 @@ pub struct Script {
     /// When set, each run executes with this auth selection, so a fresh run freezes it into
     /// its `RunStarted` the way a run resolved through the vault does. Unset, runs freeze none.
     pub auth_selection: Mutex<Option<broca_wal::AuthSelection>>,
+    /// What the rig's route reports about schema-constrained output, as a catalog row would.
+    /// A run admitted with `structured_output` freezes the decision `decide` makes from this
+    /// for an xAI OpenAI Chat route, the same decision a resolved provider freezes.
+    pub structured_output_support: Mutex<broca_provider::spec::CapabilityFlag>,
+    /// Each model step's request as the OpenAI Chat family renders it from the run's frozen
+    /// structured-output decision, in call order.
+    pub rendered: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Script {
@@ -191,11 +198,39 @@ impl Script {
     }
 }
 
-struct ScriptedProvider(Arc<Script>);
+struct ScriptedProvider(
+    Arc<Script>,
+    Option<broca_protocol::structured_output::FrozenStructuredOutput>,
+);
+
+impl ScriptedProvider {
+    /// The OpenAI Chat render config this provider's requests are rendered with.
+    fn frozen(&self) -> broca_provider::wire::FrozenRenderConfig {
+        let mut frozen = broca_provider::families::openai_chat_frozen_config("fake");
+        frozen.structured_output = self.1.clone();
+        frozen
+    }
+}
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn render_config_blob(&self) -> serde_json::Value {
+        match &self.1 {
+            None => serde_json::json!({ "render_config": "stateless" }),
+            Some(frozen) => serde_json::json!({
+                "render_config": "stateless",
+                "structured_output": frozen,
+            }),
+        }
+    }
+
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        use broca_provider::wire::WireFamily;
+        self.0
+            .rendered
+            .lock()
+            .unwrap()
+            .push(broca_provider::families::OpenAiChat.render(&self.frozen(), opts));
         self.0.prompts.lock().unwrap().push(opts.prompt.clone());
         self.0
             .offered_tools
@@ -371,11 +406,36 @@ impl RunExecutor for CoreExec {
                 credential_id: None,
             });
         }
+        // A resume keeps the decision its episode froze; a fresh episode decides from its send,
+        // as the module's provider resolution does.
+        let structured_output = job
+            .prior_snapshot
+            .checkpoint_at_head
+            .last_episode
+            .as_ref()
+            .filter(|episode| episode.run_id == job.req.run_id)
+            .map(|episode| {
+                broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
+                    Some(&episode.config.frozen_render_config),
+                )
+            })
+            .unwrap_or_else(|| {
+                job.req.structured_output.as_ref().map(|request| {
+                    broca_provider::structured_output::decide(
+                        broca_provider::spec::WireFamilyId::OpenAiChat,
+                        "xai",
+                        None,
+                        *self.script.structured_output_support.lock().unwrap(),
+                        request,
+                    )
+                    .unwrap()
+                })
+            });
         run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
             mode,
-            &ScriptedProvider(self.script.clone()),
+            &ScriptedProvider(self.script.clone(), structured_output),
             &ScriptedTools(self.script.clone()),
             &ScriptedApproval(self.script.clone()),
             self.wal_store.as_ref(),

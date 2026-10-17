@@ -96,6 +96,7 @@ impl SendParamsExt for SendParams {
             stop_when,
             cache,
             budget,
+            structured_output,
             auth,
             context_limit,
             work_class,
@@ -203,6 +204,7 @@ impl SendParamsExt for SendParams {
             stop_when,
             context_management,
             inherit_frozen: Default::default(),
+            structured_output,
         };
         Ok(SendRequest {
             session_class,
@@ -369,6 +371,7 @@ mod tests {
             stop_when: vec![],
             cache: None,
             budget: None,
+            structured_output: None,
             auth: None,
             context_limit: None,
             work_class: None,

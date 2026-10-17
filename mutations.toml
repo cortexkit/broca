@@ -15744,3 +15744,89 @@ expect_red = ["families::openai_responses::tests::chatgpt_stream_failure_codes_k
 file = "crates/broca-provider/src/families/openai_responses.rs"
 old = "    if matches!(\n        cortexkit_chatgpt_policy::classify_stream_failure(event),"
 new = "    if false && matches!( // NON-VACUITY BREAK: ignore the shared stream classes\n        cortexkit_chatgpt_policy::classify_stream_failure(event),"
+[[control]]
+id = "structured-output-schema-must-compile"
+guards = "a structured-output schema broca cannot compile is refused at admission naming structured_output.schema"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/structured_output.rs"
+expect_red = ["structured_output::tests::schemas_that_do_not_compile_or_leave_the_document_are_refused_by_field"]
+file = "crates/broca-protocol/src/structured_output.rs"
+old = "    SchemaValidator::compile(&request.schema)\n        .map(|_| ())"
+new = "    SchemaValidator::compile(&serde_json::json!({})) // NON-VACUITY BREAK: never refuse a schema that does not compile.\n        .map(|_| ())"
+
+[[control]]
+id = "structured-output-admitted-tool-set"
+guards = "a send whose admitted tool set names submit_result, or that asks final_text with tools, is refused and writes nothing"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/structured_output.rs"
+expect_red = ["structured_output::admission_refuses_by_field_and_writes_nothing"]
+file = "crates/broca-module/src/actor.rs"
+old = "    structured_output.check(true, &tools)"
+new = "    let _ = tools; Ok(()) // NON-VACUITY BREAK: skip the admitted tool-set checks."
+
+[[control]]
+id = "structured-output-profile-decides-enforcement"
+guards = "a schema outside the route's subset profile is reported best_effort schema_outside_subset and never sent strict"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::enforcement_needs_catalog_support_an_encoding_and_a_fitting_schema"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "            CapabilityFlag::Known(true) if !fits => ("
+new = "            CapabilityFlag::Known(true) if false && !fits => ( // NON-VACUITY BREAK: ignore the profile."
+
+[[control]]
+id = "structured-output-submit-skips-siblings"
+guards = "a step that calls submit_result dispatches none of its calls and ends the run with each sibling skipped"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/structured_output.rs"
+expect_red = ["structured_output::submit_result_ends_the_run_and_skips_its_sibling_through_serve"]
+file = "crates/broca-core/src/run.rs"
+old = "            call.tool_name == broca_protocol::structured_output::SUBMIT_RESULT_TOOL"
+new = "            false && call.tool_name == broca_protocol::structured_output::SUBMIT_RESULT_TOOL // NON-VACUITY BREAK: never count a submit."
+
+[[control]]
+id = "structured-output-validates-the-value"
+guards = "a submitted value is validated against the frozen schema and a failing one reports failed with pointer-named errors"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/structured_output.rs"
+expect_red = ["structured_output::tests::a_conforming_value_passes_and_a_wrong_one_names_its_pointer"]
+file = "crates/broca-protocol/src/structured_output.rs"
+old = "    if errors.is_empty() {"
+new = "    if true || errors.is_empty() { // NON-VACUITY BREAK: report every value as passed."
+
+[[control]]
+id = "structured-output-catalog-fact-mapping"
+guards = "fusiform's capability.structured_output maps to the three-state capability that decides enforcement"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::structured_output_fact_maps_to_a_three_state_capability"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '''                                "capability.structured_output",'''
+new = '''                                "capability.structured_outputs", // NON-VACUITY BREAK: read the wrong fact.'''
+
+[[control]]
+id = "structured-output-anthropic-never-forces"
+guards = "a submit_tool run never sends a forcing tool_choice to the Anthropic family, which refuses it with an HTTP 400"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/structured_output_render.rs"
+expect_red = ["structured_output_render::anthropic_submit_tool_never_forces_a_tool"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "                    if forcing {"
+new = "                    if false && forcing { // NON-VACUITY BREAK: pass a forcing tool_choice through."

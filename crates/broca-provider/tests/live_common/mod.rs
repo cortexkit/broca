@@ -359,6 +359,7 @@ pub async fn run_live<F: WireFamily + 'static>(
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
 
     let (tx, mut rx) = mpsc::channel::<OutputEvent>(4096);

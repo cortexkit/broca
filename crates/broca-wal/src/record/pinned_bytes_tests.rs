@@ -98,6 +98,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::QuestionWithdrawalAcknowledged { .. } => "question_withdrawal_acknowledged",
         WalRecord::InputTokenCapFrozen { .. } => "input_token_cap_frozen",
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
+        WalRecord::StructuredOutputResult { .. } => "structured_output_result",
         WalRecord::Unknown => "unknown",
     }
 }
@@ -311,6 +312,7 @@ fn every_record_kind_keeps_its_pinned_bytes() {
         .chain(DEFERRED_CALL_PINNED)
         .chain(CANCEL_AT_PINNED)
         .chain(INPUT_CAP_PINNED)
+        .chain(STRUCTURED_OUTPUT_PINNED)
     {
         let decoded: WalRecord = serde_json::from_str(pinned)
             .unwrap_or_else(|error| panic!("pinned record must decode: {error}\n{pinned}"));
@@ -364,6 +366,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(DEFERRED_CALL_PINNED.iter().copied())
         .chain(CANCEL_AT_PINNED.iter().copied())
         .chain(INPUT_CAP_PINNED.iter().copied())
+        .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -386,6 +389,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "run_cancel_requested",
         "input_token_cap_frozen",
         "input_token_budget_exhausted",
+        "structured_output_result",
         "run_paused",
         "run_config_refrozen",
         "run_auth_refrozen",
@@ -631,5 +635,100 @@ fn pre_agent_run_scopes_keep_their_bytes_and_frame_requirements() {
             serde_json::to_string(features).unwrap()
         );
         assert_eq!(&frame[HEADER_LEN..], payload.as_bytes());
+    }
+}
+
+/// Records that structured output extends, as this build writes them when a run has no
+/// structured output: a run start whose frozen render config is populated, queued requests, a
+/// hard-stop tool result, a re-frozen render config and a completed run end. Each is pinned with
+/// its exact bytes and the exact frame requirements it carries. Structured output adds members
+/// and a must-understand feature only to records that use it, so these must keep both unchanged:
+/// a WAL with no structured output stays readable by builds that predate it.
+const PRE_STRUCTURED_OUTPUT_PINNED: &[(&str, &[&str])] = &[
+    (
+        r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"edit","description":"edit a file","input_schema":{"type":"object"},"module":"aft","execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"family_id":"openai_responses","responses_tools_non_strict":true}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        &[],
+    ),
+    (PINNED[1], &[]),
+    (PINNED[39], &[]),
+    (PINNED[40], &[]),
+    (PINNED[41], &[]),
+    (
+        r#"{"type":"tool_result","batch_id":"r-b1","result":{"tool_call_id":"t2","output":{"kind":"error","message":"tool not run: max steps reached before dispatch"},"is_error":true},"outcome":"max_steps"}"#,
+        &[],
+    ),
+    (
+        r#"{"type":"run_config_refrozen","renderer_version":2,"frozen_render_config":{"family_id":"anthropic_messages"}}"#,
+        &[],
+    ),
+    (
+        r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
+        &[],
+    ),
+];
+
+#[test]
+fn records_without_structured_output_keep_their_bytes_and_requirements() {
+    for (pinned, requires) in PRE_STRUCTURED_OUTPUT_PINNED {
+        let decoded: WalRecord = serde_json::from_str(pinned)
+            .unwrap_or_else(|error| panic!("pinned record must decode: {error}\n{pinned}"));
+        assert_ne!(decoded, WalRecord::Unknown, "{pinned}");
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&decoded).unwrap()).unwrap(),
+            *pinned,
+            "a pinned record must re-encode to exactly the bytes it was read from"
+        );
+        assert_eq!(decoded.required_features(), *requires, "{pinned}");
+    }
+}
+
+/// Records that carry structured-output state: a run start whose frozen render config holds the
+/// run's frozen schema, a queued send asking for one, a completed run's result and a call
+/// skipped because `submit_result` ended its run. Each requires `structured-output/v1`, so a
+/// build that predates structured output refuses the session by name instead of resuming it
+/// without its schema.
+const STRUCTURED_OUTPUT_PINNED: &[&str] = &[
+    r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"family_id":"openai_chat","structured_output":{"delivery":"strict","enforcement":"enforced","mode":"submit_tool","name":"result","profile":"xai","schema_jcs":"{\"type\":\"object\"}"}}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+    r#"{"type":"queued","submission_id":"sub-run-8","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[],"structured_output":{"mode":"final_text","schema":{"type":"object"}}}}"#,
+    r#"{"type":"structured_output_result","run_id":"run-7","result":{"mode":"submit_tool","enforcement":"enforced","validation":"passed","value":{"answer":"x"},"skipped_siblings":[{"tool_call_id":"t2","tool":"read"}]}}"#,
+    r#"{"type":"tool_result","batch_id":"r-b1","result":{"tool_call_id":"t2","output":{"kind":"error","message":"skipped_after_submit: tool not executed; submit_result ended the run in the same step"},"is_error":true},"outcome":"max_steps","reason":"skipped_after_submit"}"#,
+];
+
+#[test]
+fn structured_output_records_are_must_understand_and_round_trip() {
+    use crate::framing::{decode_next, encode, DecodeStep, STRUCTURED_OUTPUT_FEATURE};
+    for bytes in STRUCTURED_OUTPUT_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+        assert_eq!(
+            record.required_features(),
+            &[STRUCTURED_OUTPUT_FEATURE],
+            "{bytes}"
+        );
+        let DecodeStep::Record { framed, .. } = decode_next(&encode(7, 3, &record).unwrap()) else {
+            panic!("structured-output record must decode")
+        };
+        assert_eq!(framed.record, record);
+    }
+    // A run start that is also scoped requires both features, in sorted order.
+    let scoped = format!(
+        "{},\"scope\":{{\"owner\":{{\"kind\":\"reserved\",\"module_id\":\"m\"}},\"ref\":\"h\",\"scope_epoch\":1}}}}",
+        &STRUCTURED_OUTPUT_PINNED[0][..STRUCTURED_OUTPUT_PINNED[0].len() - 1]
+    );
+    let scoped: WalRecord = serde_json::from_str(&scoped).unwrap();
+    assert_eq!(
+        scoped.required_features(),
+        &[crate::framing::SCOPE_FEATURE, STRUCTURED_OUTPUT_FEATURE]
+    );
+    if let Some(path) = std::env::var_os("BROCA_STRUCTURED_OUTPUT_WAL_FIXTURE") {
+        let structured: WalRecord = serde_json::from_str(STRUCTURED_OUTPUT_PINNED[0]).unwrap();
+        let result: WalRecord = serde_json::from_str(STRUCTURED_OUTPUT_PINNED[2]).unwrap();
+        let mut bytes = encode(1, 3, &structured).unwrap();
+        bytes.extend(encode(2, 3, &result).unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        let plain: WalRecord = serde_json::from_str(PINNED[1]).unwrap();
+        let mut plain_path = path;
+        plain_path.push(".plain");
+        std::fs::write(plain_path, encode(1, 3, &plain).unwrap()).unwrap();
     }
 }

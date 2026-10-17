@@ -25,6 +25,7 @@ mod safe_provider_code;
 pub mod service_tier;
 pub mod spec;
 pub mod sse;
+pub mod structured_output;
 pub mod tool_id_alias;
 pub mod tool_name_alias;
 pub mod variant;

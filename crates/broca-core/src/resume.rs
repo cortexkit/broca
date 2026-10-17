@@ -424,6 +424,7 @@ mod tests {
                 variant: None,
                 service_tier: None,
                 inherit_frozen_cache: false,
+                structured_output: None,
             };
             let provider = StubProvider::new(vec![]);
             let plane = StubToolPlane::new()

@@ -248,6 +248,10 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 /// Build the Anthropic Messages request body from the frozen config + this step's
 /// `CallOptions`. A pure function of its inputs.
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    // A run with structured output adds its submit tool or schema instructions here; a run
+    // without renders from `opts` unchanged.
+    let prepared = crate::structured_output::prepare(frozen, opts);
+    let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let marker_policy = anthropic_marker_policy(frozen);
@@ -423,6 +427,11 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
     if let Some(speed) = &frozen.speed {
         body["speed"] = Value::String(speed.clone());
     }
+    crate::structured_output::finish(
+        frozen,
+        &mut body,
+        name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
+    );
     body
 }
 

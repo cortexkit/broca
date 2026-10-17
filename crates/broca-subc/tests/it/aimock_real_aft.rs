@@ -164,6 +164,7 @@ async fn loop_drives_aimock_through_real_aft() {
         variant: None,
         service_tier: None,
         inherit_frozen_cache: false,
+        structured_output: None,
     };
 
     let (tx, mut rx) = mpsc::channel(2048);

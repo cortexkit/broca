@@ -217,6 +217,17 @@ pub struct SendParams {
         deserialize_with = "deserialize_budget"
     )]
     pub budget: Option<BudgetConfig>,
+    /// Schema-shaped output for this send's run: `{mode, schema, name?}`, where `mode` is
+    /// `final_text` (shape the final answer) or `submit_tool` (offer a `submit_result` tool
+    /// whose call ends the run). Strict: every member rule of the shared role crate
+    /// (`cortexkit_role_llm_runner::structured_output`) is checked as the send is decoded, and a
+    /// schema broca cannot compile is refused there too, naming the member's path.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_structured_output"
+    )]
+    pub structured_output: Option<broca_protocol::structured_output::StructuredOutput>,
     /// A caller-scoped credential selection resolved once at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthParams>,
@@ -317,6 +328,37 @@ fn checked_role_budget(
 /// offending member path in the serving adapter's `invalid_params.detail.field` instead.
 pub fn send_budget_refusal_field(params: &serde_json::Value) -> Option<String> {
     checked_role_budget(params.get("budget")?.clone()).err()
+}
+
+fn deserialize_structured_output<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<broca_protocol::structured_output::StructuredOutput>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    checked_structured_output(value).map_err(serde::de::Error::custom)
+}
+
+/// The role crate's member, reference, dialect and size checks, then broca's own compile
+/// check. Returns the offending field path.
+fn checked_structured_output(
+    value: serde_json::Value,
+) -> Result<Option<broca_protocol::structured_output::StructuredOutput>, String> {
+    use cortexkit_role_llm_runner::send::SendRequest;
+    let mut request = SendRequest::new("", "");
+    request
+        .runner_params
+        .insert(broca_protocol::structured_output::FIELD.into(), value);
+    let structured_output = request.structured_output()?;
+    if let Some(structured_output) = &structured_output {
+        broca_protocol::structured_output::check_compiles(structured_output)?;
+    }
+    Ok(structured_output)
+}
+
+/// Serde identifies the enclosing `structured_output` field; report the role contract's exact
+/// offending member path (`structured_output.schema`, `structured_output.mode`, ...) in the
+/// serving adapter's `invalid_params.detail.field` instead.
+pub fn send_structured_output_refusal_field(params: &serde_json::Value) -> Option<String> {
+    checked_structured_output(params.get("structured_output")?.clone()).err()
 }
 
 fn deserialize_conversation_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -1145,6 +1187,10 @@ pub enum RunStatusResponse {
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1162,6 +1208,10 @@ pub enum RunStatusResponse {
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     MaxSteps {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1179,6 +1229,10 @@ pub enum RunStatusResponse {
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     BudgetExhausted {
         detail: broca_protocol::BudgetExhaustedDetail,
@@ -1192,6 +1246,10 @@ pub enum RunStatusResponse {
         retries_used: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Cancelled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1209,6 +1267,10 @@ pub enum RunStatusResponse {
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1230,6 +1292,10 @@ pub enum RunStatusResponse {
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     TransformUnavailable {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1247,6 +1313,10 @@ pub enum RunStatusResponse {
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// On a run admitted with structured output: the same structured-output result the
+        /// `run.result` answer for this run carries (`RunResultResponse::structured_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Unknown,
 }
@@ -2431,6 +2501,7 @@ mod tests {
                 "stop_when",
                 "cache",
                 "budget",
+                "structured_output",
                 "auth",
                 "context_limit",
                 "work_class",
@@ -2870,6 +2941,7 @@ mod tests {
                 usage: None,
                 retries_used: 2,
                 error: None,
+                structured_output: None,
             }
         );
         assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy_error);
@@ -3376,6 +3448,7 @@ mod title_wire_tests {
                 usage: Some(Usage::default()),
                 retries_used: 0,
                 title: Some("Fix the login bug".into()),
+                structured_output: None,
             }
         );
         assert_eq!(status.title(), Some("Fix the login bug"));
