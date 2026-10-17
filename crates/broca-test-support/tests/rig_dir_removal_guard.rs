@@ -247,10 +247,14 @@ fn real_daemon_rigs_report_rig_directory_removal_failures() {
     rust_files(&workspace.join("crates"), &mut files);
     let daemon_files = daemon_files(&files);
     let relative = |file: &Path| {
+        // Join components with `/` so the expected paths below match on Windows too, where
+        // `display()` would separate them with `\`.
         file.strip_prefix(&workspace)
             .unwrap_or(file)
-            .display()
-            .to_string()
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     };
     let scanned: Vec<String> = daemon_files
         .iter()
