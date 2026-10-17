@@ -284,6 +284,7 @@ dependencies = [
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
+ "flate2",
  "libc",
  "rusqlite",
  "serde",

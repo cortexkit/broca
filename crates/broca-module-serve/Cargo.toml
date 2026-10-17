@@ -96,6 +96,10 @@ cortexkit-role-tool-provider = { workspace = true }
 cortexkit-role-llm-runner-conformance = { workspace = true }
 cortexkit-role-harness = { workspace = true }
 subc-client-rs = { workspace = true }
+# The native-search-probe example gzips a request body the way Claude Code 2.1.302 does, and
+# decodes a gzip or deflate response. Same backend tungstenite already builds, so the lockfile
+# gains no new crate.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 # The launch-nonce tests fstat descriptor 3 to tell whether the nonce pipe is still there. Going
 # through /dev/fd does not work for this: on macOS a stat of /dev/fd/N reports a different inode
