@@ -2260,15 +2260,12 @@ where
 }
 
 /// Whether a failed attempt means the provider rejected the token itself: an Auth-class HTTP
-/// 401, or a ChatGPT socket upgrade's explicit 401/403 auth refusal. An ordinary HTTP 403
-/// is an entitlement refusal, and a ChatGPT
-/// backend 401 about its own upstream API key is classified Transient before it gets here, so
-/// neither qualifies.
+/// 401, including a ChatGPT socket upgrade refused with 401. A 403, on HTTPS or on a socket
+/// upgrade, is not: an HTTPS 403 is an entitlement refusal, and a refused upgrade 403 is sent
+/// again over HTTPS before it is classified. A ChatGPT backend 401 about its own upstream API key
+/// is classified Transient before it gets here, so it does not qualify either.
 fn is_rejected_token(error: &ProviderError) -> bool {
-    error.class == ErrorClass::Auth
-        && (error.status == Some(401)
-            || (error.status == Some(403)
-                && error.provider_code.as_deref() == Some("websocket_auth_rejected")))
+    error.class == ErrorClass::Auth && error.status == Some(401)
 }
 
 fn chatgpt_account(auth: &AuthHandle) -> Option<&str> {

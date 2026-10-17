@@ -50,11 +50,21 @@ request metadata. Optional beta-feature headers already present in auth headers 
 preserved. Attestation, routing hints and timing instrumentation are not
 synthesized without their corresponding sources.
 
-A failed connection/upgrade (including timeout and HTTP refusal other than 401/403)
+A failed connection/upgrade (including timeout and HTTP refusal other than 401)
 falls back to HTTPS **before any response.create was sent**, within that same model attempt.
-Upgrade 401/403 instead enters the existing token re-read/retry/pause path: an unavailable
-or unchanged token pauses, while a fresh same-account token gets one recovery attempt.
-No stale-token HTTPS fallback is made on an auth refusal. Socket
+The fallback is not an extra attempt. Upgrade 401 instead enters the existing token
+re-read/retry/pause path: an unavailable or unchanged token pauses, while a fresh same-account
+token gets one recovery attempt. No stale-token HTTPS fallback is made on a 401.
+
+An upgrade 403 is not treated as a token rejection: freshly refreshed tokens have been seen to
+get the same 403. It triggers no credential re-read; the same attempt is sent over HTTPS and
+classified there like any HTTPS answer (a `usage_limit_reached` 429 is
+`account_limit_exhausted`, an entitlement 403 is permanent, a 401 enters the credential path),
+and the rest of that run uses HTTPS. When the first 512 bytes of a refused upgrade's body
+already classify as a ChatGPT usage limit, that refusal is reported directly without the HTTPS
+round trip. Every HTTP upgrade refusal logs one WARN with its status, the next step, and only
+the `cf-ray`, `x-request-id`, `request-id`, `server`, `content-type` and `x-codex-*` headers;
+the body is never logged or stored. Socket
 failures accumulate within a run; after six failures the remainder of that run uses HTTPS. A failure after sending
 is never immediately re-sent over HTTPS: it goes through the existing attempt retry
 schedule and wall budget. The threshold is retained across steps because an upgrade

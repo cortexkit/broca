@@ -55,6 +55,16 @@ struct Mock {
     shutdown: CancellationToken,
     changed: Arc<tokio::sync::Notify>,
     cut_gates: Arc<tokio::sync::Semaphore>,
+    /// When set, every upgrade is refused with this status, headers and body.
+    upgrade_refusal: Arc<Mutex<Option<UpgradeRefusal>>>,
+    /// When set, every HTTPS request is answered with this error status and JSON body.
+    http_error: Arc<Mutex<Option<(u16, String)>>>,
+}
+#[derive(Clone)]
+struct UpgradeRefusal {
+    status: u16,
+    headers: Vec<(&'static str, &'static str)>,
+    body: String,
 }
 impl Drop for Mock {
     fn drop(&mut self) {
@@ -87,6 +97,9 @@ impl Mock {
         let rejected = Arc::new(AtomicBool::new(false));
         let cut_gates = Arc::new(tokio::sync::Semaphore::new(0));
         let gates = Arc::clone(&cut_gates);
+        let upgrade_refusal = Arc::new(Mutex::new(None::<UpgradeRefusal>));
+        let http_error = Arc::new(Mutex::new(None::<(u16, String)>));
+        let (refusals, http_errors) = (Arc::clone(&upgrade_refusal), Arc::clone(&http_error));
         tokio::spawn(async move {
             let mut clients = tokio::task::JoinSet::new();
             loop {
@@ -99,6 +112,8 @@ impl Mock {
                         let notify = Arc::clone(&notify);
                         let rejected = Arc::clone(&rejected);
                         let gates = Arc::clone(&gates);
+                        let refusal = refusals.lock().unwrap().clone();
+                        let http_error = http_errors.lock().unwrap().clone();
                         clients.spawn(async move {
                             let mut prefix = [0; 4];
                             tcp.peek(&mut prefix).await.unwrap();
@@ -112,6 +127,10 @@ impl Mock {
                                 let mut body = vec![0; length];
                                 tcp.read_exact(&mut body).await.unwrap();
                                 seen.lock().unwrap().http_bodies.push(body);
+                                if let Some((status, body)) = http_error {
+                                    tcp.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                                    return;
+                                }
                                 let events = queue.lock().unwrap().pop_front().unwrap_or_else(text_events);
                                 let sse: String = events.iter().map(|event| format!("data: {event}\n\n")).collect();
                                 tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).as_bytes()).await.unwrap();
@@ -127,6 +146,13 @@ impl Mock {
                                 observed.headers.push(headers);
                                 if reject {
                                     return Err(tungstenite::http::Response::builder().status(503).body(Some("upgrade refused".into())).unwrap());
+                                }
+                                if let Some(refusal) = &refusal {
+                                    let mut response = tungstenite::http::Response::builder().status(refusal.status);
+                                    for (name, value) in &refusal.headers {
+                                        response = response.header(*name, *value);
+                                    }
+                                    return Err(response.body(Some(refusal.body.clone())).unwrap());
                                 }
                                 if let Some(status) = auth_refusal.filter(|_| !rejected.swap(true, Ordering::SeqCst)) {
                                     return Err(tungstenite::http::Response::builder().status(status).body(Some("PRIVATE-UPGRADE-BODY Bearer mock-token".into())).unwrap());
@@ -173,6 +199,8 @@ impl Mock {
             shutdown,
             changed,
             cut_gates,
+            upgrade_refusal,
+            http_error,
         }
     }
     async fn wait_closes(&self, n: usize) {
@@ -1062,7 +1090,10 @@ async fn websocket_token_refresh_between_steps_reauthenticates_before_sending() 
 
 #[tokio::test]
 async fn websocket_upgrade_auth_refusal_rereads_and_recovers_without_https() {
-    for status in [401, 403] {
+    // Only a 401 upgrade is a token rejection. A 403 upgrade falls back to HTTPS instead; see
+    // `websocket_upgrade_403_falls_back_to_https_without_a_credential_reread`.
+    {
+        let status = 401;
         let mock =
             Mock::start_internal(vec![text_events()], false, false, Some(status), false).await;
         let refresh = Arc::new(RefreshScript {
@@ -1206,6 +1237,168 @@ async fn websocket_upgrade_auth_refusal_without_a_fresh_token_pauses() {
     assert_eq!(seen.handshakes, 1);
     assert!(seen.requests.is_empty());
     assert!(seen.http_bodies.is_empty());
+}
+
+const UPGRADE_SECRET_BODY: &str = "PRIVATE-UPGRADE-BODY Bearer mock-token";
+
+fn upgrade_refusal(status: u16, body: &str) -> UpgradeRefusal {
+    UpgradeRefusal {
+        status,
+        headers: vec![
+            ("cf-ray", "8f00aa11bb22cc33-FRA"),
+            ("x-request-id", "req-upgrade-1"),
+            ("server", "cloudflare"),
+            ("x-codex-plan-type", "pro"),
+            ("content-type", "application/json"),
+            ("set-cookie", "__cf_bm=PRIVATE-COOKIE"),
+            ("x-private-echo", "Bearer mock-token"),
+        ],
+        body: body.into(),
+    }
+}
+
+fn rejected_token_refresher() -> Arc<RefreshScript> {
+    Arc::new(RefreshScript {
+        expiring: Mutex::new(Default::default()),
+        rejected: Mutex::new(Some(fresh_credential("fresh-token", "account", "rejected"))),
+        rereads: AtomicUsize::new(0),
+    })
+}
+
+#[tokio::test]
+async fn websocket_upgrade_403_falls_back_to_https_without_a_credential_reread() {
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(upgrade_refusal(403, UPGRADE_SECRET_BODY));
+    let refresh = rejected_token_refresher();
+    let provider = provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(refresh.clone());
+    let first = step(&provider, 1, &opts()).await;
+    let second = step(&provider, 2, &opts()).await;
+    for events in [&first, &second] {
+        let attempts = attempts(events);
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the HTTPS fallback is the same attempt, not a retry"
+        );
+        assert_eq!(attempts[0].transport.as_deref(), Some("https"));
+        assert_eq!(attempts[0].http_status, Some(200));
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Complete);
+        assert!(attempts[0].credential_refresh.is_none());
+    }
+    assert_eq!(
+        refresh.rereads.load(Ordering::SeqCst),
+        0,
+        "an upgrade 403 is not a token rejection"
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(
+        seen.handshakes, 1,
+        "after an upgrade 403 the rest of the run uses HTTPS"
+    );
+    assert!(seen.requests.is_empty());
+    assert_eq!(seen.http_bodies.len(), 2);
+    assert!(seen.headers[0]["authorization"] == "Bearer mock-token");
+}
+
+#[tokio::test]
+async fn websocket_upgrade_refusal_warns_once_with_only_safe_headers() {
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(upgrade_refusal(403, UPGRADE_SECRET_BODY));
+    let provider = provider(&mock);
+    let (events, logs) = logged_step(&provider).await;
+    assert_eq!(attempts(&events)[0].outcome, AttemptOutcome::Complete);
+    let warnings = logs.0.lock().unwrap();
+    let refusals: Vec<_> = warnings
+        .iter()
+        .filter(|warning| warning.contains_key("upgrade_status"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "one WARN per refused upgrade: {warnings:?}"
+    );
+    assert_eq!(refusals[0]["upgrade_status"], "403");
+    assert_eq!(refusals[0]["next"], "https");
+    let headers = &refusals[0]["headers"];
+    for safe in [
+        "cf-ray=8f00aa11bb22cc33-FRA",
+        "x-request-id=req-upgrade-1",
+        "server=cloudflare",
+        "x-codex-plan-type=pro",
+        "content-type=application/json",
+    ] {
+        assert!(headers.contains(safe), "{safe} missing from {headers}");
+    }
+    assert!(
+        !warnings.iter().any(|warning| warning
+            .get("message")
+            .is_some_and(|message| message.contains("upgrade failed; using HTTPS"))),
+        "the refusal is not reported a second time as a generic upgrade failure"
+    );
+    let logged = format!("{warnings:?}");
+    for private in ["PRIVATE-", "mock-token", "Bearer", "cookie"] {
+        assert!(
+            !logged.contains(private),
+            "upgrade WARN must omit the body, cookies and credentials"
+        );
+    }
+}
+
+const USAGE_LIMIT_BODY: &str = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}}"#;
+
+#[tokio::test]
+async fn websocket_upgrade_403_then_https_usage_limit_is_account_limit_exhausted() {
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(upgrade_refusal(403, UPGRADE_SECRET_BODY));
+    *mock.http_error.lock().unwrap() = Some((429, USAGE_LIMIT_BODY.into()));
+    let refresh = rejected_token_refresher();
+    let provider = provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(refresh.clone());
+    let events = step(&provider, 1, &opts()).await;
+    let error = terminal_error(&events);
+    assert!(error.is_account_limit_exhausted(), "{error:?}");
+    assert_eq!(error.status, Some(429));
+    assert_eq!(error.resets_at_ms, Some(1_790_021_043_000));
+    let attempts = attempts(&events);
+    assert_eq!(attempts.len(), 1, "an exhausted account is not retried");
+    assert_eq!(attempts[0].transport.as_deref(), Some("https"));
+    assert_eq!(attempts[0].http_status, Some(429));
+    assert_eq!(refresh.rereads.load(Ordering::SeqCst), 0);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1);
+    assert_eq!(seen.http_bodies.len(), 1);
+}
+
+#[tokio::test]
+async fn websocket_upgrade_usage_limit_body_is_reported_without_https() {
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(upgrade_refusal(429, USAGE_LIMIT_BODY));
+    let refresh = rejected_token_refresher();
+    let provider = provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(refresh.clone());
+    let events = step(&provider, 1, &opts()).await;
+    let error = terminal_error(&events);
+    assert!(error.is_account_limit_exhausted(), "{error:?}");
+    assert_eq!(error.resets_at_ms, Some(1_790_021_043_000));
+    assert!(
+        !error.message.contains("usage limit"),
+        "the upgrade body is classified, never carried in the message"
+    );
+    let attempts = attempts(&events);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].transport.as_deref(), Some("websocket"));
+    assert_eq!(attempts[0].http_status, Some(429));
+    assert_eq!(refresh.rereads.load(Ordering::SeqCst), 0);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1);
+    assert!(
+        seen.http_bodies.is_empty(),
+        "a usage limit stated by the upgrade needs no HTTPS round trip"
+    );
 }
 
 fn virtual_attempts(provider: &mut LiveProvider<OpenAiResponsesChatgpt>, seconds: &[u64]) {

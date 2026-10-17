@@ -1170,6 +1170,48 @@ file = "crates/broca-provider/src/transport.rs"
 old = '&& matches!(trace.transport.as_deref(), None | Some("https"))'
 new = '&& true // NON-VACUITY BREAK: apply the HTTPS deadline to sockets'
 
+[[control]]
+id = "websocket-upgrade-403-is-not-a-token-rejection"
+guards = "only a 401 socket upgrade re-reads the credential; a 403 upgrade triggers no vault refresh"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::websocket_upgrade_403_falls_back_to_https_without_a_credential_reread"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = "if status == 401 {"
+new = "if matches!(status, 401 | 403) { // NON-VACUITY BREAK: treat an upgrade 403 as a token rejection"
+
+[[control]]
+id = "websocket-upgrade-403-falls-back-to-https"
+guards = "a 403 socket upgrade sends the same attempt over HTTPS instead of failing it"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::websocket_upgrade_403_then_https_usage_limit_is_account_limit_exhausted"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = """
+                    self.fail();
+                }
+                Err(UpgradeFailure::Transport)"""
+new = """
+                    self.fail();
+                }
+                Err(UpgradeFailure::AuthRejected(status)) // NON-VACUITY BREAK: fail the attempt instead of using HTTPS"""
+
+[[control]]
+id = "websocket-upgrade-403-keeps-the-run-on-https"
+guards = "after a 403 socket upgrade the rest of the run uses HTTPS without asking for another upgrade"
+runner = "command"
+command = ["cargo", "test", "--locked", "-p", "broca-provider", "--features", "live", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::websocket_upgrade_403_falls_back_to_https_without_a_credential_reread"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = "                    self.switch_to_https();"
+new = "                    self.fail(); // NON-VACUITY BREAK: ask for another upgrade on the next step"
+
 # This proof checks the following behavior: replaying a run keeps Deferred and Approved calls separate
 # and does not check them again.
 # Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
