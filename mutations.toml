@@ -16550,7 +16550,7 @@ runner = "cargo"
 package = "broca-module-serve"
 target = "--bin ck-broca"
 test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
-expect_red = ["executor::tests::chatgpt_run_recorded_at_version_7_resumes_under_version_8"]
+expect_red = ["executor::tests::chatgpt_run_recorded_at_version_7_resumes_under_version_8", "executor::tests::every_declared_previous_version_resumes_through_the_executor_restore_path"]
 file = "crates/broca-catalog/src/live.rs"
 old = "            config.provider_text_state = recorded;"
 new = "            let _ = recorded; // NON-VACUITY BREAK: re-resolve the flag on resume"

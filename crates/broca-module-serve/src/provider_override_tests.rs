@@ -1561,3 +1561,204 @@ fn frozen_provider_text_state_reads_an_absent_field_as_false() {
         .remove("provider_text_state");
     assert!(!frozen_provider_text_state(&recorded));
 }
+
+/// The render inputs the executor restores when it resumes `recorded`, each read through the
+/// executor's own reader, as the episode admission in this file's executor builds them. The
+/// variant and structured output are left out: the recorded configs below carry neither.
+fn restored_episode_render<'a>(
+    recorded: &'a broca_wal::RunConfig,
+    codeassist_identity: Option<&'a broca_provider::wire::CodeAssistIdentity>,
+) -> broca_catalog::live::EpisodeRenderConfig<'a> {
+    broca_catalog::live::EpisodeRenderConfig {
+        codeassist_identity,
+        base_url: recorded
+            .frozen_render_config
+            .get("base_url")
+            .and_then(|value| value.as_str()),
+        max_output_tokens: frozen_max_output_tokens(recorded),
+        variant: None,
+        service_tier: frozen_service_tier(recorded),
+        thinking_echo_scope: frozen_thinking_echo_scope(recorded),
+        thinking_cross_model: frozen_thinking_cross_model(recorded),
+        chatgpt_effort_updates: Some(
+            recorded.frozen_render_config["chatgpt_effort_updates"]
+                .as_bool()
+                .unwrap_or(false),
+        ),
+        reasoning_content_required: Some(frozen_reasoning_content_required(recorded)),
+        reasoning_echo: Some(frozen_reasoning_echo(recorded)),
+        provider_text_state: Some(frozen_provider_text_state(recorded)),
+        responses_tools_non_strict: Some(frozen_responses_tools_non_strict(recorded)),
+        structured_output: None,
+        claude_code_persona: broca_catalog::live::EpisodePersona::Recorded(None),
+    }
+}
+
+/// One catalog route for each wire family that declares an earlier renderer version
+/// reproducible: the model, the auth method and the family it selects.
+struct DeclaredRoute {
+    family: WireFamilyId,
+    model: &'static str,
+    method: AuthMethod,
+    family_override: Option<WireFamilyId>,
+    project_id: Option<&'static str>,
+}
+
+fn resolve_declared_route(
+    route: &DeclaredRoute,
+    render: broca_catalog::live::EpisodeRenderConfig<'_>,
+) -> broca_catalog::live::ProviderResolution {
+    install_test_catalog();
+    let options = broca_catalog::live::ResolveOptions {
+        auth_method: Some(route.method),
+        family_override: route.family_override,
+        project_id: route.project_id,
+        session_id: Some("declared-reproduce"),
+        account_id: Some("acct-reproduce"),
+        ..Default::default()
+    };
+    let auth = AuthResolution {
+        mode: AuthMode::Secret("declared-test-token".into()),
+        pause: None,
+        selection: None,
+        method: Some(route.method),
+        project_id: route.project_id.map(str::to_owned),
+        account_id: Some("acct-reproduce".into()),
+        record_version: None,
+        in_run_refresh: None,
+    };
+    let resolved = resolve_provider_for_episode(
+        route.model,
+        None,
+        Some(2048),
+        &auth,
+        &options,
+        broca_provider::build_provider_http_client(),
+        render,
+    )
+    .unwrap_or_else(|error| panic!("{} resolution: {error}", route.model));
+    assert_eq!(resolved.family_id, route.family, "{}", route.model);
+    resolved
+}
+
+/// For every family that declares its previous renderer version reproducible, a run recorded at
+/// that version by the release before `provider_text_state` resumes through the executor's
+/// restore path and core, and completes. The recorded config is what the current code records
+/// for the same admission without the fields that release did not have: `provider_text_state`
+/// and, for Code Assist, the session identity frozen since. The blob the resumed provider states
+/// for the recorded version equals the recorded blob, so none of the frozen fields added since
+/// (Code Assist identity, the Chat reasoning-echo policy, the Claude Code persona) appears in it.
+#[tokio::test]
+async fn every_declared_previous_version_resumes_through_the_executor_restore_path() {
+    use broca_provider::families::{
+        earlier_renderer_versions, renderer_version_for, EarlierRendererVersion,
+    };
+    let routes = [
+        DeclaredRoute {
+            family: WireFamilyId::OpenAiResponses,
+            model: "openai/gpt-5.1",
+            method: AuthMethod::ApiKey,
+            family_override: None,
+            project_id: None,
+        },
+        DeclaredRoute {
+            family: WireFamilyId::OpenAiResponsesChatgpt,
+            model: "openai/gpt-5.3-codex",
+            method: AuthMethod::Chatgpt,
+            family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
+            project_id: None,
+        },
+        DeclaredRoute {
+            family: WireFamilyId::Gemini,
+            model: "google/gemini-2.5-flash",
+            method: AuthMethod::ApiKey,
+            family_override: None,
+            project_id: None,
+        },
+        DeclaredRoute {
+            family: WireFamilyId::GoogleCodeAssist,
+            model: "google/gemini-2.5-flash",
+            method: AuthMethod::Antigravity,
+            family_override: Some(WireFamilyId::GoogleCodeAssist),
+            project_id: Some("test-project"),
+        },
+    ];
+    for route in &routes {
+        let declared: Vec<u32> = earlier_renderer_versions(route.family)
+            .iter()
+            .filter(|(_, disposition)| *disposition == EarlierRendererVersion::Reproducible)
+            .map(|(version, _)| *version)
+            .collect();
+        assert_eq!(
+            declared,
+            vec![renderer_version_for(route.family) - 1],
+            "{:?}",
+            route.family
+        );
+        let previous = declared[0];
+        let root = broca_test_support::scratch_root().join(format!(
+            "broca-declared-resume-{:?}-{}",
+            route.family,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let request = drift_request(&root);
+
+        let fresh_identity =
+            broca_module_serve::codeassist_identity::for_episode(&request.session, None, 0, 0)
+                .unwrap();
+        let started = resolve_declared_route(
+            route,
+            broca_catalog::live::EpisodeRenderConfig {
+                codeassist_identity: fresh_identity.as_ref(),
+                ..Default::default()
+            },
+        );
+        let mut recorded = drift_run_config(&request, &started);
+        let blob = recorded.frozen_render_config.as_object_mut().unwrap();
+        assert_eq!(blob.remove("provider_text_state"), Some(true.into()));
+        assert_eq!(
+            blob.remove("codeassist_identity").is_some(),
+            route.family == WireFamilyId::GoogleCodeAssist,
+            "{:?}",
+            route.family
+        );
+        blob.insert("renderer_version".into(), previous.into());
+        recorded.renderer_version = previous;
+
+        let identity = broca_module_serve::codeassist_identity::for_episode(
+            &request.session,
+            Some(&recorded.frozen_render_config),
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(identity, None);
+        let resumed = resolve_declared_route(
+            route,
+            restored_episode_render(&recorded, identity.as_ref()),
+        );
+        assert!(resumed.provider.reproduces_renderer_version(previous));
+        let stated = resumed.provider.render_config_blob_for_version(previous);
+        assert_eq!(stated, recorded.frozen_render_config, "{:?}", route.family);
+        for key in [
+            "provider_text_state",
+            "codeassist_identity",
+            "reasoning_echo",
+            "claude_code_persona",
+        ] {
+            assert!(stated.get(key).is_none(), "{:?} states {key}", route.family);
+        }
+
+        let (codes, reason, calls) = resume_through_core(&root, recorded, resumed).await;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(codes, Vec::<Option<String>>::new(), "{:?}", route.family);
+        assert_eq!(
+            reason,
+            broca_protocol::caller::RunFinishReason::Completed,
+            "{:?}",
+            route.family
+        );
+        assert_eq!(calls, 1, "{:?}", route.family);
+    }
+}
