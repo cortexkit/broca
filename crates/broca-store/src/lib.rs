@@ -889,7 +889,11 @@ impl SqliteStore {
                   state TEXT NOT NULL CHECK(state IN ('ready','id_unknown','scope_unknown')),
                   PRIMARY KEY(lineage_id, call_key)
               );
-              CREATE INDEX IF NOT EXISTS retention_lineage_expires_idx
+               CREATE TABLE IF NOT EXISTS retention_deletion (
+                   lineage_id TEXT PRIMARY KEY,
+                   session TEXT NOT NULL
+               );
+               CREATE INDEX IF NOT EXISTS retention_lineage_expires_idx
                   ON retention_lineage(expires_at_ms) WHERE expires_at_ms IS NOT NULL;
               CREATE UNIQUE INDEX IF NOT EXISTS retention_lineage_live_session_idx
                   ON retention_lineage(session) WHERE expired_at_ms IS NULL;",
@@ -994,6 +998,7 @@ impl SqliteStore {
             "CREATE INDEX IF NOT EXISTS run_index_discovery_lineage_idx ON run_index(lineage_id, session) WHERE withdrawals_owed=1",
             [],
         )?;
+        retention::init_work_schema(conn)?;
         export_index::init_schema(conn).map_err(StoreError::from)
     }
 

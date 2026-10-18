@@ -31,6 +31,7 @@ use crate::lease::LeaseHandle;
 
 mod extraction;
 mod move_inventory;
+mod retention_changes;
 pub use move_inventory::{MoveInventory, MoveInventoryBuildStats};
 
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
@@ -249,6 +250,7 @@ pub struct FileWalStore {
     max_read_bytes: u64,
     move_inventory: Arc<move_inventory::InventoryState>,
     move_reads: AtomicU64,
+    retention_changes: Arc<retention_changes::Changes>,
 }
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
@@ -349,6 +351,12 @@ impl FileWalStore {
             });
         }
         Ok(Some(bytes))
+    }
+
+    /// Drain changed retained addresses and whether overflow requires a recovery walk.
+    /// These hints never establish presence, absence, policy, or a deletion deadline.
+    pub fn take_retention_changes(&self) -> (Vec<String>, bool) {
+        self.retention_changes.take()
     }
 
     pub fn root(&self) -> &Path {
@@ -510,6 +518,7 @@ impl FileWalStore {
             max_read_bytes: DEFAULT_MAX_READ_BYTES,
             move_inventory: Arc::default(),
             move_reads: AtomicU64::new(0),
+            retention_changes: Arc::default(),
         }
     }
 
@@ -780,7 +789,7 @@ impl FileWalStore {
         } else {
             wal.with_recovery_cap(self.append_cap(retained_size::SizeScope::Session)?)
         };
-        Ok(Box::new(
+        let wal: Box<dyn Wal + Send> = Box::new(
             move_inventory::IndexedWal::new(
                 wal,
                 session_addr(session),
@@ -792,7 +801,13 @@ impl FileWalStore {
                 self.durable_wal_path(session),
                 self.backup_classes.clone(),
             ),
-        ))
+        );
+        Ok(Box::new(retention_changes::ObservedWal {
+            inner: wal,
+            address: Arc::from(session_addr(session)),
+            changes: self.retention_changes.clone(),
+            retained,
+        }))
     }
 
     /// Resolve only after live absence: a live WAL is authoritative even when an archive

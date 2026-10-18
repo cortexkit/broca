@@ -4,10 +4,9 @@ use broca_protocol::{BindIdentity, BindPrincipal, SessionScope};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-// CROSS JOIN fixes the outer loop at the small live-retention inventory. An
-// ordinary JOIN can scan every run (and its large session row) even when there
-// are no retained lineages, on every sweep and clock-change notification.
-const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1";
+// The trigger-maintained inventory contains only live lineages with owed work.
+// Neither unrelated owed runs nor quiet retained lineages belong in a sweep query.
+pub(crate) const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_discovery d CROSS JOIN run_index r INDEXED BY run_index_discovery_lineage_idx ON r.lineage_id=d.lineage_id WHERE r.withdrawals_owed=1";
 
 /// BindPrincipal::Unknown preserves arbitrary JSON from later WAL writers. Retention
 /// accepts only recognized principal identity fields to avoid keeping transcript content.

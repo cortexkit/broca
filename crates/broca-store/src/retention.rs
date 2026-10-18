@@ -7,6 +7,57 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::{bind_identity_from_store_key, SqliteStore, StoreError};
 
+pub(crate) fn init_work_schema(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    let initialized: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='retention_discovery')", [], |row| row.get(0))?;
+    // Triggers cover all run-index writers, including repair and legacy admission.
+    // The inventory is a candidate hint; projection still rechecks the leased WAL.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS retention_discovery (lineage_id TEXT PRIMARY KEY);
+         CREATE TRIGGER IF NOT EXISTS retention_discovery_run_insert AFTER INSERT ON run_index
+         WHEN NEW.withdrawals_owed=1 AND NEW.lineage_id IS NOT NULL BEGIN
+             INSERT INTO retention_discovery SELECT NEW.lineage_id
+             WHERE EXISTS(SELECT 1 FROM retention_lineage WHERE lineage_id=NEW.lineage_id AND expired_at_ms IS NULL)
+             ON CONFLICT(lineage_id) DO NOTHING;
+         END;
+         CREATE TRIGGER IF NOT EXISTS retention_discovery_run_update AFTER UPDATE OF lineage_id, withdrawals_owed ON run_index BEGIN
+             DELETE FROM retention_discovery WHERE lineage_id=OLD.lineage_id AND NOT EXISTS(
+                 SELECT 1 FROM run_index WHERE lineage_id=OLD.lineage_id AND withdrawals_owed=1);
+             INSERT INTO retention_discovery SELECT NEW.lineage_id
+             WHERE NEW.withdrawals_owed=1 AND NEW.lineage_id IS NOT NULL AND EXISTS(
+                 SELECT 1 FROM retention_lineage WHERE lineage_id=NEW.lineage_id AND expired_at_ms IS NULL)
+             ON CONFLICT(lineage_id) DO NOTHING;
+         END;
+         CREATE TRIGGER IF NOT EXISTS retention_discovery_run_delete AFTER DELETE ON run_index BEGIN
+             DELETE FROM retention_discovery WHERE lineage_id=OLD.lineage_id AND NOT EXISTS(
+                 SELECT 1 FROM run_index WHERE lineage_id=OLD.lineage_id AND withdrawals_owed=1);
+         END;
+         CREATE TRIGGER IF NOT EXISTS retention_discovery_lineage_insert AFTER INSERT ON retention_lineage
+         WHEN NEW.expired_at_ms IS NULL BEGIN
+             INSERT INTO retention_discovery SELECT NEW.lineage_id WHERE EXISTS(
+                 SELECT 1 FROM run_index WHERE lineage_id=NEW.lineage_id AND withdrawals_owed=1)
+             ON CONFLICT(lineage_id) DO NOTHING;
+         END;
+         CREATE TRIGGER IF NOT EXISTS retention_discovery_lineage_update AFTER UPDATE OF expired_at_ms ON retention_lineage BEGIN
+             DELETE FROM retention_discovery WHERE lineage_id=NEW.lineage_id;
+             INSERT INTO retention_discovery SELECT NEW.lineage_id
+             WHERE NEW.expired_at_ms IS NULL AND EXISTS(
+                 SELECT 1 FROM run_index WHERE lineage_id=NEW.lineage_id AND withdrawals_owed=1)
+             ON CONFLICT(lineage_id) DO NOTHING;
+         END;
+         CREATE TRIGGER IF NOT EXISTS retention_discovery_lineage_delete AFTER DELETE ON retention_lineage BEGIN
+             DELETE FROM retention_discovery WHERE lineage_id=OLD.lineage_id;
+         END;"
+    )?;
+    // Rebuild only on introduction of the inventory; normal opens must not scan it.
+    if !initialized {
+        tx.execute_batch("INSERT OR IGNORE INTO retention_discovery SELECT l.lineage_id FROM retention_lineage l
+            CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1;")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 const RETENTION_RUN_ROWS_SQL: &str =
     "SELECT run_id, state_changed_ms FROM run_index WHERE lineage_id=?1 ORDER BY run_id";
 // Start at retention_lineage and look up only its runs, rather than scanning all
@@ -71,6 +122,48 @@ fn read_lineage(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetentionLineageRow
 }
 
 impl SqliteStore {
+    /// Boot-only inventory, keyed by the caller's WAL address before any file is opened.
+    pub fn retention_live_inventory(&self) -> Result<Vec<RetentionLineageRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT lineage_id, session, retention_s, last_activity_ms, expires_at_ms,
+                    wal_bytes, expired_at_ms FROM retention_lineage WHERE expired_at_ms IS NULL",
+        )?;
+        let rows = stmt.query_map([], read_lineage)?;
+        rows.collect::<Result<_, _>>().map_err(StoreError::from)
+    }
+
+    /// Record recovery work before publishing an incomplete tombstone. Clearing work is
+    /// safe only after the completed tombstone and its directory are durable.
+    pub fn retention_deletion_pending(
+        &self,
+        lineage: &str,
+        session: &BindIdentity,
+        pending: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        if pending {
+            conn.execute(
+                "INSERT INTO retention_deletion(lineage_id, session) VALUES (?1, ?2)
+                ON CONFLICT(lineage_id) DO UPDATE SET session=excluded.session",
+                params![lineage, serde_json::to_string(session)?],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM retention_deletion WHERE lineage_id=?1",
+                [lineage],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn retention_pending_deletions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT session FROM retention_deletion")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
     pub fn retention_run_rows(&self, lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
         let ids: Vec<(String, Option<u64>)> = {
             let conn = self.conn.lock().unwrap();
@@ -901,5 +994,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored.as_bytes(), fact.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod sweep_work_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_retained_population_does_not_expand_discovery_work() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+            INSERT INTO retention_lineage SELECT 'l-'||x, 's-'||x, 1, 0, 9000000, 20, NULL FROM n;",
+        )
+        .unwrap();
+        let sql = crate::retention_withdrawals::DISCOVERY_SQL;
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert!(stmt.query([]).unwrap().next().unwrap().is_none());
+        assert_eq!(stmt.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        assert!(stmt.get_status(rusqlite::StatementStatus::VmStep) < 100);
+    }
+
+    #[test]
+    fn discovery_inventory_tracks_repair_settlement_and_expiry() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = BindIdentity::new("/p", "h", "s");
+        let session = serde_json::to_string(&key).unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute("INSERT INTO run_index(run_id, session, state, lineage_id, withdrawals_owed) VALUES ('r', ?1, 'completed', 'l', 1)", [&session]).unwrap();
+        conn.execute(
+            "INSERT INTO retention_lineage VALUES ('l', ?1, 1, 0, 100, 20, NULL)",
+            [SqliteStore::key(&key)],
+        )
+        .unwrap();
+        let owed = || {
+            conn.query_row("SELECT COUNT(*) FROM retention_discovery", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(owed(), 1);
+        conn.execute(
+            "UPDATE run_index SET withdrawals_owed=0 WHERE run_id='r'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(owed(), 0);
+        conn.execute(
+            "UPDATE run_index SET withdrawals_owed=1 WHERE run_id='r'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(owed(), 1);
+        conn.execute("UPDATE retention_lineage SET expires_at_ms=NULL, expired_at_ms=100 WHERE lineage_id='l'", []).unwrap();
+        assert_eq!(owed(), 0);
     }
 }
