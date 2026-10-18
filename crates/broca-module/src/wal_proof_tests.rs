@@ -223,6 +223,7 @@ impl Fixture {
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
             skip_materialization_runs: HashSet::new(),
+            close_after_one_shot: false,
             pending_cancels: HashMap::new(),
             retracted_submissions: HashSet::new(),
             recorded_send_keys: HashMap::new(),

@@ -17083,3 +17083,59 @@ old = '''                WalRecord::RunFinished {
 new = '''                WalRecord::RunFinished { reason: broca_protocol::RunFinishReason::Interrupted, .. } => None, // NON-VACUITY BREAK: drop crash/shutdown seal events
                 WalRecord::RunFinished {
                     reason,'''
+
+[[control]]
+id = "core-append-prefix-moves-the-prior-conversation"
+guards = "An appended episode moves the reconstructed prior conversation into its prompt instead of keeping a second decoded copy for the whole run"
+runner = "cargo"
+package = "broca-core"
+target = "--test input_allocation"
+test_file = "crates/broca-core/tests/input_allocation.rs"
+expect_red = ["appended_episode_keeps_one_decoded_copy_of_the_prior_conversation"]
+expect_message = "the appended episode retained a second decoded prior conversation"
+file = "crates/broca-core/src/run.rs"
+old = '''        prompt = if append_episode {
+            prior.prompt
+        } else {'''
+new = '''        prompt = if append_episode {
+            prior.prompt.clone() // NON-VACUITY BREAK: keep the replayed conversation alive beside the prompt
+        } else {'''
+
+[[control]]
+id = "core-observer-queue-slot-holds-a-pointer"
+guards = "The writer-to-fan-out observer queue carries each record behind a pointer, so its 1,024 pre-allocated slots do not grow with the record enum"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer.rs"
+expect_red = ["wal_writer::tests::observer_queue_slots_hold_a_pointer_not_a_record"]
+edits = [
+  { file = "crates/broca-core/src/wal_writer.rs", old = '''pub struct ObservedRecord(Arc<broca_wal::FramedRecord>);''', new = '''pub struct ObservedRecord(broca_wal::FramedRecord); // NON-VACUITY BREAK: slots hold the record by value''' },
+  { file = "crates/broca-core/src/wal_writer.rs", old = '''        Self(Arc::new(framed))''', new = '''        Self(framed)''' },
+]
+
+[[control]]
+id = "module-one-shot-actor-closes-at-its-terminal"
+guards = "A finished one-shot run closes its session actor at the terminal instead of holding writer, fan-out and run state for the idle TTL, and the session reopens for a follow-up"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::one_shot_run_closes_its_actor_at_the_terminal_and_a_follow_up_reopens"]
+expect_message = "a finished one-shot run must close its actor without waiting for the idle TTL"
+file = "crates/broca-module/src/actor.rs"
+old = '''        self.close_after_one_shot = skip_materialization && index_state.is_terminal();'''
+new = '''        self.close_after_one_shot = false && skip_materialization && index_state.is_terminal(); // NON-VACUITY BREAK'''
+
+[[control]]
+id = "module-fanout-rings-wait-for-first-subscribe"
+guards = "An actor with no subscriber reserves neither the control nor the display broadcast ring; the first subscribe creates them"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/fanout.rs"
+expect_red = ["fanout::tests::control_and_display_rings_are_created_by_the_first_subscribe"]
+expect_message = "an actor with no subscriber must not reserve either ring"
+file = "crates/broca-module/src/fanout.rs"
+old = '''            sender: Arc::new(std::sync::OnceLock::new()),'''
+new = '''            sender: Arc::new(std::sync::OnceLock::from(broadcast::channel(capacity).0)), // NON-VACUITY BREAK: allocate at open'''

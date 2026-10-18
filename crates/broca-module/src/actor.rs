@@ -1202,6 +1202,11 @@ pub struct LineageActor<W: WalStore> {
     /// One-shot policy retained across same-process retries or pause finalization for a run.
     /// Reopen defaults to materialization because this execution hint is deliberately not durable.
     skip_materialization_runs: HashSet<RunId>,
+    /// Set when a run sent with `one_shot` reaches a durable terminal. The caller declared it will
+    /// not come back to this session, so the actor closes as soon as nothing else holds it open
+    /// instead of keeping its writer, fan-out and run state for the whole idle TTL. A later send
+    /// to the same session simply reopens it, as it does after any idle close.
+    close_after_one_shot: bool,
     // An acknowledged cancel remains work until the WAL proves a terminal, even
     // if a racing pause or a transient storage failure delays its finalizer.
     pending_cancels: HashMap<RunId, bool>,
@@ -1424,6 +1429,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
             skip_materialization_runs: HashSet::new(),
+            close_after_one_shot: false,
             pending_cancels: HashMap::new(),
             retracted_submissions: HashSet::new(),
             recorded_send_keys: HashMap::new(),
@@ -1599,6 +1605,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             self.teardown_poisoned().await;
                             return;
                         }
+                        if self.close_finished_one_shot().await {
+                            return;
+                        }
                     }
                 }
                 cmd = self.rx.recv() => {
@@ -1610,6 +1619,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     if self.writer_poisoned {
                         self.teardown_poisoned().await;
+                        return;
+                    }
+                    if self.close_finished_one_shot().await {
                         return;
                     }
                 }
@@ -5111,6 +5123,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             _ => return false,
         };
         let run_id = durable_run_id; // index the DURABLE id's terminal below
+                                     // The run task has ended, so its conversation, rendered requests and step state are
+                                     // freed. Let the idle memory hook hand those pages back to the system.
+        broca_memory_relief::note_freed();
 
         // INVARIANT: once admission has succeeded, core writes and syncs RunFinished/RunPaused
         // before returning Ok(summary). An executor-level Err (Panicked, Wal, Lease, etc.) therefore
@@ -5188,6 +5203,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.pending_capped_export = Some(run_id.clone());
         }
         self.set_idle();
+        // Only a terminal ends a one-shot's business with this session; a pause stays resumable.
+        self.close_after_one_shot = skip_materialization && index_state.is_terminal();
         if owed {
             if let Some(task) = &self.withdrawal_task {
                 task.wake();
@@ -5348,6 +5365,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
         Ok(())
     }
 
+    /// Close right after a one-shot run's terminal instead of waiting out the idle TTL. Every
+    /// condition `try_close` already enforces still applies (no active run, subscriber, warm,
+    /// owed withdrawal or pending cancel; queued work aborts the close). The checks here only
+    /// skip claiming the registry slot when the close would abort anyway. Returns true when the
+    /// actor closed and its loop must return.
+    async fn close_finished_one_shot(&mut self) -> bool {
+        if !std::mem::take(&mut self.close_after_one_shot) {
+            return false;
+        }
+        if !matches!(self.state, RunState::Idle)
+            || self.has_pending()
+            || self.fanout.has_live_subscribers()
+        {
+            return false;
+        }
+        self.try_close().await
+    }
+
     /// Attempt the synchronous close teardown. Returns true if the actor closed (caller
     /// returns), false if the close ABORTED (work raced in — keep serving).
     async fn try_close(&mut self) -> bool {
@@ -5505,6 +5540,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         .await;
         drop(self.lease.take()); // release the lease ONLY after the writer is fully down
         close_token.commit(); // registry slot → Closed; wake the re-open waiters
+                              // The writer, fan-out and run state of this session are about to drop with the actor.
+        broca_memory_relief::note_freed();
         true
     }
 
@@ -9497,6 +9534,136 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn one_shot_run_closes_its_actor_at_the_terminal_and_a_follow_up_reopens() {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-actor-one-shot-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
+        let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
+        // The idle TTL is far longer than the test, so only the one-shot rule can close the actor.
+        let opener = crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            wal_store.clone(),
+            // Writes a durable RunFinished, so the reopened actor sees an idle lineage.
+            Arc::new(RetentionDone),
+        )
+        .with_idle_ttl(Duration::from_secs(3_600));
+        let registry = LineageRegistry::new(Arc::new(opener));
+
+        let wait_closed = |registry: &LineageRegistry| {
+            let registry = registry.clone();
+            let key = key.clone();
+            async move {
+                for _ in 0..200 {
+                    if registry.slot_state(&key).is_none() {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                false
+            }
+        };
+
+        let outcome = registry
+            .route_submission_with_materialization(
+                &key,
+                RunId("one-shot".into()),
+                text_req(&key, "one-shot").to_submission(),
+                RunKind::FreshOrResume,
+                SendKey::RunId,
+                true,
+            )
+            .await
+            .expect("one-shot send routes");
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        assert!(
+            wait_closed(&registry).await,
+            "a finished one-shot run must close its actor without waiting for the idle TTL"
+        );
+
+        // The same session reopens for a follow-up, and an ordinary (materialized) run keeps the
+        // ordinary idle TTL rather than closing at its terminal.
+        let outcome = registry
+            .route_submission_with_materialization(
+                &key,
+                RunId("follow-up".into()),
+                text_req(&key, "follow-up").to_submission(),
+                RunKind::AppendEpisode,
+                SendKey::RunId,
+                false,
+            )
+            .await
+            .expect("follow-up send reopens the session");
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        for _ in 0..200 {
+            if registry.route_status(&key).await.expect("status") == LineageStatus::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            registry.slot_state(&key),
+            Some("open"),
+            "a materialized run's actor stays open for the idle TTL"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn one_shot_run_keeps_its_actor_open_for_a_live_subscriber() {
+        use crate::fanout::FromCursor;
+
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-actor-one-shot-subscribed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
+        let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
+        let opener = crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            wal_store.clone(),
+            Arc::new(RetentionDone),
+        )
+        .with_idle_ttl(Duration::from_secs(3_600));
+        let registry = LineageRegistry::new(Arc::new(opener));
+        let (sink, _deliveries) = mpsc::channel(64);
+        registry
+            .route_subscribe(&key, FromCursor::Start, sink)
+            .await
+            .expect("subscribe opens the session");
+
+        let outcome = registry
+            .route_submission_with_materialization(
+                &key,
+                RunId("one-shot".into()),
+                text_req(&key, "one-shot").to_submission(),
+                RunKind::FreshOrResume,
+                SendKey::RunId,
+                true,
+            )
+            .await
+            .expect("one-shot send routes");
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        for _ in 0..200 {
+            if registry.route_status(&key).await.expect("status") == LineageStatus::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            registry.slot_state(&key),
+            Some("open"),
+            "a subscriber still observing the session keeps a one-shot's actor open"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     include!("cancel_lifecycle_tests.rs");

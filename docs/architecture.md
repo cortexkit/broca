@@ -102,6 +102,7 @@ supervisor can respawn it.
 | `broca-ck` | CK-Message wire types for prompt-reduction transforms. |
 | `broca-owner-only` | Owner-only private-state creation and validation. |
 | `broca-diagnostics` | Blocking-job and egress instrumentation. |
+| `broca-memory-relief` | Rate-limited return of freed heap pages to the system after a peak. |
 | `cortexkit-chatgpt-policy` | Shared ChatGPT/Codex account-id, refusal and quota-header policy. |
 | `broca-store` | Materialized store, export index and store maintenance. |
 | `ck-session-import`, `ck-import` | Readers for other harnesses' logs and the import CLI. |

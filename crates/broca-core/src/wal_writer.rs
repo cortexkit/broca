@@ -1687,7 +1687,7 @@ enum WalCommand {
 /// observer channel for nobody.
 #[derive(Clone)]
 pub struct RecordObserver {
-    tx: broadcast::Sender<broca_wal::FramedRecord>,
+    tx: broadcast::Sender<ObservedRecord>,
     /// The live-or-attaching subscriber COUNT — the writer publishes only while it is
     /// nonzero. A count (not a boolean) so a detach can never race an attach into a
     /// wrongly-disabled gate: the attach's increment is visible on its own, with no
@@ -1701,11 +1701,39 @@ pub struct RecordObserver {
 pub type DurableRecordTap =
     dyn Fn(u64, u64, Option<broca_wal::WalLineageId>, &WalRecord) + Send + Sync;
 
+/// One durable record on the writer-to-observer queue, shared behind a pointer.
+///
+/// Tokio's `broadcast` channel allocates every slot of its bounded buffer when the channel is
+/// created, and each slot is as large as the message type. Carrying `FramedRecord` by value made
+/// every open session reserve 1,024 record-sized slots (about 600 KB) whether or not anything was
+/// ever published, and every new `WalRecord` variant that grew the enum grew all of them. A
+/// pointer keeps each slot small and independent of the record's size; the record itself is
+/// still cloned once per publish, exactly as before.
+#[derive(Clone, Debug)]
+pub struct ObservedRecord(Arc<broca_wal::FramedRecord>);
+
+impl ObservedRecord {
+    pub fn new(framed: broca_wal::FramedRecord) -> Self {
+        Self(Arc::new(framed))
+    }
+}
+
+impl From<broca_wal::FramedRecord> for ObservedRecord {
+    fn from(framed: broca_wal::FramedRecord) -> Self {
+        Self::new(framed)
+    }
+}
+
+impl std::ops::Deref for ObservedRecord {
+    type Target = broca_wal::FramedRecord;
+
+    fn deref(&self) -> &broca_wal::FramedRecord {
+        &self.0
+    }
+}
+
 impl RecordObserver {
-    pub fn new(
-        tx: broadcast::Sender<broca_wal::FramedRecord>,
-        subscribers: Arc<AtomicUsize>,
-    ) -> Self {
+    pub fn new(tx: broadcast::Sender<ObservedRecord>, subscribers: Arc<AtomicUsize>) -> Self {
         Self {
             tx,
             subscribers,
@@ -1731,11 +1759,11 @@ impl RecordObserver {
         // `broadcast` is bounded and non-blocking: when the projector falls behind it drops
         // the oldest queued records and reports `Lagged`, which makes every live subscriber
         // detach and recover from the WAL rather than allowing this writer-side queue to grow.
-        let _ = self.tx.send(broca_wal::FramedRecord {
+        let _ = self.tx.send(ObservedRecord::new(broca_wal::FramedRecord {
             seq,
             fence,
             record: record.clone(),
-        });
+        }));
     }
 
     fn observe_tap(
@@ -3085,6 +3113,17 @@ mod tests {
             "a panicking tap still claims known state"
         );
         assert_eq!(appended.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn observer_queue_slots_hold_a_pointer_not_a_record() {
+        // The fan-out's observer channel reserves all of its slots at actor open. A slot that
+        // held the record by value would cost every open session 1,024 record-sized slots and
+        // grow with every new WalRecord variant.
+        assert_eq!(
+            std::mem::size_of::<ObservedRecord>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     #[tokio::test]

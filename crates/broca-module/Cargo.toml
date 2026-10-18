@@ -9,6 +9,7 @@ description = "broca as a subc module: the session-lineage coordinator (one acto
 
 [dependencies]
 broca-diagnostics = { path = "../broca-diagnostics" }
+broca-memory-relief = { path = "../broca-memory-relief" }
 broca-protocol = { path = "../broca-protocol" }
 broca-wire = { path = "../broca-wire" }
 broca-core = { path = "../broca-core" }
