@@ -348,8 +348,7 @@ fn broca_frozen(case: &Value, vectors: &Value) -> FrozenRenderConfig {
 }
 
 /// Per vector: the top-level fields whose values differ between broca's request and the
-/// vector's (each a documented broca policy, see the report), the top-level keys only the
-/// vector sends, and the beta tokens only the vector sends.
+/// vector's (each a documented broca policy), and the top-level keys only the vector sends.
 struct Difference {
     id: &'static str,
     differing_fields: &'static [&'static str],
@@ -371,7 +370,7 @@ struct Difference {
 /// - `cc_prev_req` (checked in the billing test): broca does not send it.
 /// - `thinking` differing by `block_binding`: an anthropic-auth account setting broca has no
 ///   counterpart for.
-/// - `context_management` (it selects the full-agent beta list), the removal of a forced
+/// - `context_management`, the removal of a forced
 ///   `tool_choice`, and the inserted effort `role: system` message: anthropic-auth request
 ///   transforms broca's request model does not carry.
 /// - Sending no `cc_prompt_id` on a subagent's request: broca's request has no subagent marker.
