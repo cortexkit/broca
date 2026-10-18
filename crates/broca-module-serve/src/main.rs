@@ -1317,6 +1317,8 @@ mod executor {
     /// A run's in-step token refresh, plus the record_version of the token the run is using
     /// NOW. That version starts as the admission-time one and moves when a refresh serves a new
     /// token, so the terminal wire-auth report names the token the provider last rejected.
+    /// Cloning shares the same counters, so a clone taken before the run sees its moves.
+    #[derive(Clone)]
     pub struct InRunRefresh {
         pub refresher: SharedSecretRefresher,
         pub served_version: Arc<AtomicU64>,
@@ -1329,6 +1331,18 @@ mod executor {
         /// The record_version the in-step refresh already reported to the vault, if it ran.
         /// The run-end report skips that version, so one rejected token is reported once.
         pub reported_version: Arc<std::sync::Mutex<Option<u64>>>,
+        /// A rejection nothing has reported yet: the provider rejected the token the step had
+        /// already refreshed, so no in-step refresh ran for it. The run-end report sends exactly
+        /// this one, with its own status and version.
+        pub unreported_rejection: Arc<std::sync::Mutex<Option<UnreportedRejection>>>,
+    }
+
+    /// One provider rejection still owed a vault report: the HTTP status the provider answered
+    /// and the record_version of the token it rejected.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct UnreportedRejection {
+        pub status: u16,
+        pub record_version: u64,
     }
 
     /// Gets a fresh token for the ONE credential a run was admitted with, after the provider
@@ -1354,6 +1368,7 @@ mod executor {
         served_version: Arc<AtomicU64>,
         served_expires_at_ms: Arc<std::sync::Mutex<Option<i64>>>,
         reported_version: Arc<std::sync::Mutex<Option<u64>>>,
+        unreported_rejection: Arc<std::sync::Mutex<Option<UnreportedRejection>>>,
         /// Set by the first failed pre-send re-read, so a vault outage logs one warning per
         /// run rather than one per attempt.
         presend_failure_logged: std::sync::atomic::AtomicBool,
@@ -1406,15 +1421,15 @@ mod executor {
     }
 
     impl SecretRefresher for VaultTokenRefresher {
-        fn refresh_rejected_secret(&self) -> RefreshFuture<'_, RefreshedSecret> {
+        fn refresh_rejected_secret(&self, status: u16) -> RefreshFuture<'_, RefreshedSecret> {
             Box::pin(async move {
                 let rejected = self.served_version.load(Ordering::SeqCst);
-                // The provider's 401 is authoritative for the version it rejected: never let
-                // this process's cache serve it again, whatever the vault answers next.
+                // The provider's rejection is authoritative for the version it rejected: never
+                // let this process's cache serve it again, whatever the vault answers next.
                 evict_for_provider_rejection(
                     &self.vault.cache,
                     &self.credential_key,
-                    401,
+                    status,
                     rejected,
                 );
                 // Recorded before sending, so the run-end report is skipped even when this one
@@ -1428,7 +1443,7 @@ mod executor {
                     .client
                     .report_auth_failure_at(
                         broca_subc::VaultAddress::CredentialId(&self.vault_id),
-                        401,
+                        status,
                         rejected,
                     )
                     .await
@@ -1436,7 +1451,7 @@ mod executor {
                     // The re-read below still runs: a newer token may already exist.
                     tracing::warn!(
                         target: "credentials",
-                        "in-run 401 report for '{}' v{rejected} failed: {error}",
+                        "in-run {status} report for '{}' v{rejected} failed: {error}",
                         self.vault_id
                     );
                 }
@@ -1489,6 +1504,19 @@ mod executor {
                     }
                 }
             })
+        }
+
+        fn note_unrecovered_rejection(&self, status: u16) {
+            // The transport calls this only after the step already refreshed once and re-sent
+            // with the refreshed token, so the token held now is the one just rejected.
+            let record_version = self.served_version.load(Ordering::SeqCst);
+            *self
+                .unreported_rejection
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(UnreportedRejection {
+                status,
+                record_version,
+            });
         }
 
         /// A plain scoped re-read when the held token is close to expiry. The vault refreshes a
@@ -2267,15 +2295,80 @@ mod executor {
             .await
     }
 
-    /// Whether the run-end failure report for `record_version` would repeat the report the
-    /// in-step refresh already sent for that same version.
-    fn run_end_report_is_duplicate(
-        reported_version: Option<&std::sync::Mutex<Option<u64>>>,
-        record_version: u64,
-    ) -> bool {
-        reported_version.is_some_and(|reported| {
-            *reported.lock().unwrap_or_else(|poison| poison.into_inner()) == Some(record_version)
+    /// The rejection a run that ended on a wire auth error still owes the vault, if any: ONE
+    /// REPORT PER REJECTION, naming the version the provider actually rejected.
+    ///
+    /// - Without an in-step refresher (`in_run` is `None`) nothing has reported anything, and
+    ///   the run only ever held its admitted version: report that, with the terminal status.
+    /// - When the provider rejected a token the step had already refreshed, the refresher
+    ///   recorded that rejection without reporting it: report exactly that status and version.
+    ///   That is the second token's own report; the first token's was sent in-step.
+    /// - Otherwise, when the refresher already reported in-step, the rejection that ended the
+    ///   run is the one it reported (the vault had no newer token, or the refreshed token was
+    ///   never sent), so nothing is owed. The served version may have moved past the rejected
+    ///   one by then, which is why it is not compared.
+    /// - A refresher that never ran leaves the run on the version it holds now.
+    fn run_end_report_target(
+        in_run: Option<&InRunRefresh>,
+        admitted_version: u64,
+        terminal_status: u16,
+    ) -> Option<UnreportedRejection> {
+        let Some(in_run) = in_run else {
+            return Some(UnreportedRejection {
+                status: terminal_status,
+                record_version: admitted_version,
+            });
+        };
+        if let Some(unreported) = *in_run
+            .unreported_rejection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+        {
+            return Some(unreported);
+        }
+        if in_run
+            .reported_version
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            return None;
+        }
+        Some(UnreportedRejection {
+            status: terminal_status,
+            record_version: in_run.served_version.load(Ordering::SeqCst),
         })
+    }
+
+    /// After a run whose terminal is a wire auth rejection with `terminal_status`: evict the
+    /// rejected version from this process's cache and report it to the vault, unless the
+    /// in-step refresh already did (see [`run_end_report_target`]).
+    async fn report_rejection_after_run(
+        vault: &VaultAuth,
+        credential_key: &str,
+        admitted_version: u64,
+        in_run: Option<&InRunRefresh>,
+        terminal_status: u16,
+    ) {
+        let Some(rejection) = run_end_report_target(in_run, admitted_version, terminal_status)
+        else {
+            return;
+        };
+        // Provider rejection is authoritative even if the best-effort vault report cannot be
+        // delivered; never let this process serve the rejected token again.
+        evict_for_provider_rejection(
+            &vault.cache,
+            credential_key,
+            rejection.status,
+            rejection.record_version,
+        );
+        let _ = report_wire_auth_failure(
+            vault,
+            credential_key,
+            rejection.status,
+            rejection.record_version,
+        )
+        .await;
     }
 
     /// The auth method for a provider with no configured default — the openai-compatible
@@ -3090,6 +3183,7 @@ mod executor {
                 let served_version = Arc::new(AtomicU64::new(version));
                 let served_expires_at_ms = Arc::new(std::sync::Mutex::new(expires_at_ms));
                 let reported_version = Arc::new(std::sync::Mutex::new(None));
+                let unreported_rejection = Arc::new(std::sync::Mutex::new(None));
                 InRunRefresh {
                     refresher: SharedSecretRefresher(Arc::new(VaultTokenRefresher {
                         vault: Arc::clone(vault),
@@ -3098,12 +3192,14 @@ mod executor {
                         served_version: Arc::clone(&served_version),
                         served_expires_at_ms: Arc::clone(&served_expires_at_ms),
                         reported_version: Arc::clone(&reported_version),
+                        unreported_rejection: Arc::clone(&unreported_rejection),
                         presend_failure_logged: std::sync::atomic::AtomicBool::new(false),
                         no_expiry_logged: std::sync::atomic::AtomicBool::new(false),
                     })),
                     served_version,
                     served_expires_at_ms,
                     reported_version,
+                    unreported_rejection,
                 }
             });
             // A scoped not_found keeps not_found's class (a permanent admission failure) but
@@ -3813,15 +3909,8 @@ mod executor {
                 resolution.record_version,
             );
             // Read after the run: an in-step refresh may have moved the run to a newer token,
-            // and the report must name the version the provider rejected last.
-            let served_version = resolution
-                .in_run_refresh
-                .as_ref()
-                .map(|refresh| Arc::clone(&refresh.served_version));
-            let reported_version = resolution
-                .in_run_refresh
-                .as_ref()
-                .map(|refresh| Arc::clone(&refresh.reported_version));
+            // and the run-end report must name the version the provider actually rejected.
+            let in_run_refresh = resolution.in_run_refresh.clone();
             let session = job.req.session.clone();
 
             resolved
@@ -3881,23 +3970,18 @@ mod executor {
             if let (Some(vault), Some((cred_id, admitted_version))) =
                 (self.vault.as_ref(), used_credential)
             {
-                let record_version = served_version
-                    .map(|served| served.load(Ordering::SeqCst))
-                    .unwrap_or(admitted_version);
                 if let Some(status) =
                     post_run_wire_auth_status(&summary, self.wal_store.clone(), session.clone())
                         .await
                 {
-                    // Provider rejection is authoritative even if the best-effort vault report
-                    // cannot be delivered; never let this process serve the rejected token again.
-                    evict_for_provider_rejection(&vault.cache, &cred_id, status, record_version);
-                    // The in-step refresh already reported this version when it tried to
-                    // recover; that report was the refresh trigger, and a second one for the
-                    // same rejection would count one incident twice.
-                    if !run_end_report_is_duplicate(reported_version.as_deref(), record_version) {
-                        let _ =
-                            report_wire_auth_failure(vault, &cred_id, status, record_version).await;
-                    }
+                    report_rejection_after_run(
+                        vault,
+                        &cred_id,
+                        admitted_version,
+                        in_run_refresh.as_ref(),
+                        status,
+                    )
+                    .await;
                 }
             }
 

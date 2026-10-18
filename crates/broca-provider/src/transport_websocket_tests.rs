@@ -1013,6 +1013,7 @@ impl crate::credential_refresh::CredentialRefresher for RefreshScript {
     }
     fn refresh_rejected(
         &self,
+        _status: u16,
     ) -> crate::credential_refresh::RefreshFuture<'_, crate::credential_refresh::RefreshedCredential>
     {
         Box::pin(async {

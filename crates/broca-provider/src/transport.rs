@@ -2092,20 +2092,29 @@ where
             Ok(completion) => return Ok((completion, attempt_index as u32)),
             Err(failure) => {
                 if is_rejected_token(&failure.error) {
-                    // Whatever happens next, a step recovers at most once, so a second 401
-                    // (even from the refreshed token) ends the step.
-                    let Some(recovery) = auth_recovery.as_mut().filter(|_| !rejection_recovered)
-                    else {
+                    let rejected_status = failure.error.status.unwrap_or(401);
+                    let Some(recovery) = auth_recovery.as_mut() else {
                         warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
                         return Err((failure.error, attempt_index as u32));
                     };
+                    // Whatever happens next, a step recovers at most once, so a second rejection
+                    // (of the token the step just refreshed) ends the step. Nothing has reported
+                    // that token to the credential source yet, so hand it the rejection to report.
+                    if rejection_recovered {
+                        recovery
+                            .recovery
+                            .refresher
+                            .note_unrecovered_rejection(rejected_status);
+                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
+                        return Err((failure.error, attempt_index as u32));
+                    }
                     rejection_recovered = true;
                     let refresh_started = retry_clock.mark();
                     let refreshed = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                         _ = tx.closed() => return Ok((Vec::new(), 0)),
-                        refreshed = recovery.recovery.refresher.refresh_rejected() => refreshed,
+                        refreshed = recovery.recovery.refresher.refresh_rejected(rejected_status) => refreshed,
                     };
                     let Some(refreshed) = refreshed else {
                         warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
@@ -6022,6 +6031,7 @@ mod tests {
     impl super::CredentialRefresher for FixedRefresher {
         fn refresh_rejected(
             &self,
+            _status: u16,
         ) -> crate::credential_refresh::RefreshFuture<
             '_,
             crate::credential_refresh::RefreshedCredential,

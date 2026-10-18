@@ -1208,6 +1208,11 @@ struct Recovery {
 /// Admit a deepseek run against a stand-in that handles failure reports as `reports` says,
 /// then ask the run's in-step refresher for a fresh token as the transport does after a 401.
 async fn refresh_after_a_401(label: &str, reports: ReportScript) -> Recovery {
+    refresh_after_a_rejection(label, reports, 401).await
+}
+
+/// [`refresh_after_a_401`] for a rejection the provider answered with `status`.
+async fn refresh_after_a_rejection(label: &str, reports: ReportScript, status: u16) -> Recovery {
     let root = fresh_vault_root(label);
     let daemon = CapturingVaultDaemon::start_handling_reports(&root, reports).await;
     let executor = executor_with_capturing_vault(&root, &daemon).await;
@@ -1226,7 +1231,7 @@ async fn refresh_after_a_401(label: &str, reports: ReportScript) -> Recovery {
     );
 
     let (refreshed, logs) = capture_credential_logs(async {
-        refresh.refresher.0.refresh_rejected_secret().await
+        refresh.refresher.0.refresh_rejected_secret(status).await
     }).await;
     daemon.assert_healthy();
     let cached = executor
@@ -1304,6 +1309,26 @@ async fn an_applied_report_then_a_newer_token_re_sends_once() {
             "record_version": 1
         })
     );
+}
+
+/// The in-step report carries the status the provider actually answered, not a fixed 401. The
+/// transport sends only 401s here today; 403 stands in for any other rejection status so a
+/// hard-coded 401 cannot pass.
+#[tokio::test]
+async fn the_in_step_report_carries_the_rejections_own_status() {
+    let recovery =
+        refresh_after_a_rejection("in-run-status", ReportScript::MarksStale, 403).await;
+    assert_eq!(methods(&recovery.requests), REPORT_THEN_REREAD);
+    assert_eq!(
+        recovery.requests[1].1,
+        serde_json::json!({
+            "credential_id": "apikey:deepseek",
+            "provider_status": 403,
+            "reporter_source": "direct",
+            "record_version": 1
+        })
+    );
+    assert_eq!(recovery.reported, Some(1));
 }
 
 /// A report that is not applied, with the version unchanged on the re-read, means the token
@@ -1404,7 +1429,7 @@ async fn pre_send_check(label: &str, expiry: ExpiryScript, then_401: bool) -> Pr
         .map(|token| token.record_version);
     let requests = daemon.requests();
     let after_401 = if then_401 {
-        refresh.refresher.0.refresh_rejected_secret().await
+        refresh.refresher.0.refresh_rejected_secret(401).await
     } else {
         None
     };
@@ -1543,19 +1568,57 @@ async fn a_failed_pre_send_re_read_keeps_the_held_token_and_a_401_still_recovers
     assert_eq!(recovered.evidence.reason.as_deref(), Some("rejected"));
 }
 
-/// ONE REPORT PER REJECTED VERSION. The in-step report is the refresh trigger, so the run-end
-/// report skips a version the refresher already reported, and still reports any other one:
-/// the version a refreshed token was served at, or a run that never tried to recover.
+/// ONE REPORT PER REJECTION, for the version actually rejected. The in-step report is the
+/// refresh trigger, so the run-end report never repeats it, even after a refresh moved the run
+/// to a newer version that was never rejected. A rejection of the refreshed token that the
+/// step could not recover from is reported once, with its own status and version. A run that
+/// never tried to recover reports the version it held.
 #[test]
-fn the_run_end_report_skips_only_the_version_the_refresher_reported() {
-    let reported = std::sync::Mutex::new(Some(1));
-    assert!(run_end_report_is_duplicate(Some(&reported), 1));
-    assert!(!run_end_report_is_duplicate(Some(&reported), 2));
-    assert!(!run_end_report_is_duplicate(
-        Some(&std::sync::Mutex::new(None)),
-        1
-    ));
-    assert!(!run_end_report_is_duplicate(None, 1));
+fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
+    struct NeverRefreshes;
+    impl broca_provider::credential_refresh::SecretRefresher for NeverRefreshes {
+        fn refresh_rejected_secret(
+            &self,
+            _status: u16,
+        ) -> broca_provider::credential_refresh::RefreshFuture<
+            '_,
+            broca_provider::credential_refresh::RefreshedSecret,
+        > {
+            Box::pin(async { None })
+        }
+    }
+    let in_run = |served: u64, reported: Option<u64>, unreported: Option<UnreportedRejection>| {
+        InRunRefresh {
+            refresher: broca_provider::credential_refresh::SharedSecretRefresher(Arc::new(
+                NeverRefreshes,
+            )),
+            served_version: Arc::new(AtomicU64::new(served)),
+            served_expires_at_ms: Arc::new(std::sync::Mutex::new(None)),
+            reported_version: Arc::new(std::sync::Mutex::new(reported)),
+            unreported_rejection: Arc::new(std::sync::Mutex::new(unreported)),
+        }
+    };
+    let rejection = |status, record_version| UnreportedRejection {
+        status,
+        record_version,
+    };
+    // In-step refresh reported v1 and moved the run to v2, which was never rejected.
+    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), 1, 401), None);
+    // In-step refresh reported v1 and the vault had nothing newer.
+    assert_eq!(run_end_report_target(Some(&in_run(1, Some(1), None)), 1, 401), None);
+    // The refreshed v2 was rejected too: report v2 alone, with its own status.
+    assert_eq!(
+        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(401, 2)))), 1, 401),
+        Some(rejection(401, 2))
+    );
+    // A refresher that never ran: report the version the run holds now (3), with the status the
+    // run's terminal error carries.
+    assert_eq!(
+        run_end_report_target(Some(&in_run(3, None, None)), 1, 401),
+        Some(rejection(401, 3))
+    );
+    // A run with no in-step refresher reports the version admission served it (7).
+    assert_eq!(run_end_report_target(None, 7, 401), Some(rejection(401, 7)));
 }
 
 struct ChatgptRouting {
@@ -1712,7 +1775,7 @@ async fn rejected_reread_with_no_reply_is_logged_once_without_secret() {
     let executor = executor_with_capturing_vault(&root, &daemon).await;
     let auth = executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None).await.unwrap();
     let refresh = auth.in_run_refresh.unwrap();
-    let (_, logs) = capture_credential_logs(async { refresh.refresher.0.refresh_rejected_secret().await }).await;
+    let (_, logs) = capture_credential_logs(async { refresh.refresher.0.refresh_rejected_secret(401).await }).await;
     assert_eq!(logs.len(), 1);
     assert!(logs[0].contains("outcome=reread_failed") && logs[0].contains("rejected_version=1") && logs[0].contains("vault_replied=false") && logs[0].contains("error_class=Connectivity"), "{}", logs[0]);
     assert!(!logs[0].contains("stand-in-token"));
@@ -1751,8 +1814,20 @@ struct ChatgptRefreshRun {
 async fn chatgpt_refresh_run(
     label: &str,
     reports: ReportScript,
-    mut expiry: ExpiryScript,
+    expiry: ExpiryScript,
     reject_first: bool,
+) -> ChatgptRefreshRun {
+    chatgpt_refresh_run_rejecting(label, reports, expiry, usize::from(reject_first)).await
+}
+
+/// [`chatgpt_refresh_run`] whose upstream answers the first `rejections` requests with a 401.
+/// After the run it does what the executor does at run end: when the terminal is a wire auth
+/// rejection, it evicts and reports whatever rejection the in-step refresh did not report.
+async fn chatgpt_refresh_run_rejecting(
+    label: &str,
+    reports: ReportScript,
+    mut expiry: ExpiryScript,
+    rejections: usize,
 ) -> ChatgptRefreshRun {
     use broca_core::{run_loop, AllowAll, FileLeaseStore, StubToolPlane};
     use broca_protocol::content::{ContentBlock, Message, Role};
@@ -1806,13 +1881,13 @@ async fn chatgpt_refresh_run(
                 assert!(n > 0, "complete HTTP request body");
                 bytes.extend_from_slice(&buf[..n]);
             }
-            let first = {
+            let rejected = {
                 let mut sent = captured.lock().unwrap();
-                let first = sent.is_empty();
+                let rejected = sent.len() < rejections;
                 sent.push((headers, bytes[body_start..body_start + body_len].to_vec()));
-                first
+                rejected
             };
-            let (status, content_type, body) = if first && reject_first {
+            let (status, content_type, body) = if rejected {
                 (
                     "401 Unauthorized",
                     "application/json",
@@ -1912,6 +1987,20 @@ async fn chatgpt_refresh_run(
     drop(tx);
     drain.await.unwrap();
     server.abort();
+    let records = wal.read_records(&session).unwrap();
+    if let (Some(status), Some((credential_key, admitted_version))) = (
+        latest_terminal_error(&records).and_then(wire_auth_status),
+        used_credential_for_report(&auth.pause, auth.selection.clone(), auth.record_version),
+    ) {
+        report_rejection_after_run(
+            executor.vault.as_ref().unwrap(),
+            &credential_key,
+            admitted_version,
+            auth.in_run_refresh.as_ref(),
+            status,
+        )
+        .await;
+    }
     let attempts = wal
         .read_records(&session)
         .unwrap()
@@ -2058,6 +2147,68 @@ async fn chatgpt_rejected_same_version_pauses_auth_required() {
     assert_eq!(run.sent.len(), 1);
     assert_eq!(run.summary.paused, Some(PauseReason::AuthRequired));
     assert_eq!(run.attempts.len(), 1);
+}
+
+/// Every vault failure report the run sent, as (provider_status, record_version), in order.
+fn failure_reports(requests: &[(String, serde_json::Value)]) -> Vec<(u64, u64)> {
+    requests
+        .iter()
+        .filter(|(method, _)| method == "credential.report_auth_failure")
+        .map(|(_, params)| {
+            (
+                params["provider_status"].as_u64().unwrap(),
+                params["record_version"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// ONE REJECTION, ONE REPORT. The vault had no newer token, so the in-step report of v1 is the
+/// only rejection; the run-end report adds nothing.
+#[tokio::test]
+async fn chatgpt_rejected_same_version_is_reported_once() {
+    let run = chatgpt_refresh_run_rejecting(
+        "chatgpt-same-version-once",
+        ReportScript::NotApplied,
+        ExpiryScript::default(),
+        1,
+    )
+    .await;
+    assert_eq!(run.summary.paused, Some(PauseReason::AuthRequired));
+    assert_eq!(run.sent.len(), 1);
+    assert_eq!(failure_reports(&run.requests), [(401, 1)]);
+}
+
+/// The refreshed token is rejected too: v1 is reported in-step (the refresh trigger) and v2,
+/// which nothing reported, once at run end. Never v1 twice and never v2 twice.
+#[tokio::test]
+async fn chatgpt_refreshed_token_rejected_again_is_reported_once_per_version() {
+    let run = chatgpt_refresh_run_rejecting(
+        "chatgpt-rejected-twice",
+        ReportScript::MarksStale,
+        ExpiryScript::default(),
+        2,
+    )
+    .await;
+    assert_eq!(run.summary.paused, Some(PauseReason::AuthRequired));
+    assert_eq!(run.sent.len(), 2, "one in-step recovery, then the step ends");
+    assert_chatgpt_refreshed_headers(&run.sent[1].0);
+    assert_eq!(failure_reports(&run.requests), [(401, 1), (401, 2)]);
+}
+
+/// A refresh that recovers leaves nothing to report at run end: only the in-step report of v1.
+#[tokio::test]
+async fn chatgpt_recovered_rejection_sends_no_run_end_report() {
+    let run = chatgpt_refresh_run_rejecting(
+        "chatgpt-recovered-once",
+        ReportScript::MarksStale,
+        ExpiryScript::default(),
+        1,
+    )
+    .await;
+    assert_eq!(run.summary.paused, None);
+    assert_eq!(run.sent.len(), 2);
+    assert_eq!(failure_reports(&run.requests), [(401, 1)]);
 }
 
 #[tokio::test]

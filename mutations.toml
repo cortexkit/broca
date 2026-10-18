@@ -1901,6 +1901,63 @@ old = "if !held_token_is_expiring(expires_at_ms, epoch_millis()) {"
 new = "if true || !held_token_is_expiring(expires_at_ms, epoch_millis()) { // NON-VACUITY BREAK"
 
 [[control]]
+id = "vault-in-step-report-carries-the-rejection-status"
+guards = "the in-step vault failure report and cache eviction carry the provider's actual rejection status, not a fixed 401"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/vault_request_tests.rs"
+expect_red = ["executor::tests::the_in_step_report_carries_the_rejections_own_status"]
+file = "crates/broca-module-serve/src/main.rs"
+old = """
+                        broca_subc::VaultAddress::CredentialId(&self.vault_id),
+                        status,
+                        rejected,"""
+new = """
+                        broca_subc::VaultAddress::CredentialId(&self.vault_id),
+                        401, // NON-VACUITY BREAK: report every in-step rejection as a 401
+                        rejected,"""
+
+[[control]]
+id = "vault-run-end-report-skips-a-rejection-reported-in-step"
+guards = "after an in-step refresh reported the rejection, the run-end report never reports the refreshed version that was not rejected"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/vault_request_tests.rs"
+expect_red = ["executor::tests::the_run_end_report_names_only_a_rejection_nothing_has_reported"]
+file = "crates/broca-module-serve/src/main.rs"
+old = """
+            .is_some()
+        {
+            return None;
+        }
+        Some(UnreportedRejection {"""
+new = """
+            .is_some_and(|reported| reported == in_run.served_version.load(Ordering::SeqCst)) // NON-VACUITY BREAK: compare against the served version again
+        {
+            return None;
+        }
+        Some(UnreportedRejection {"""
+
+[[control]]
+id = "vault-run-end-reports-a-rejected-refreshed-token-once"
+guards = "when the token a step refreshed is rejected too, the run-end report names that second version once"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/vault_request_tests.rs"
+expect_red = ["executor::tests::chatgpt_refreshed_token_rejected_again_is_reported_once_per_version"]
+file = "crates/broca-provider/src/transport.rs"
+old = """
+                        recovery
+                            .recovery
+                            .refresher
+                            .note_unrecovered_rejection(rejected_status);"""
+new = """
+                        let _ = &recovery; // NON-VACUITY BREAK: lose the unreported rejection"""
+
+[[control]]
 id = "steer-never-between-call-and-result"
 # Only the mid-tool steer-ordering test runs; other `it` tests are skipped,
 # so failures unique to those tests will not fail this mutation proof.
