@@ -3992,3 +3992,128 @@ fn successful_export_discovery_does_not_query_fallback_before_tombstone() {
     assert!(rig.service.delete_expired(&rig.key, 1200).is_err());
     assert!(rig.service.wal.tombstone_path(&rig.key, &id).exists());
 }
+
+#[cfg(target_os = "linux")]
+#[path = "retention_bench.rs"]
+mod retention_bench;
+
+#[tokio::test]
+async fn steady_sweep_does_no_per_file_work() {
+    let rig = Rig::new();
+    rig.seed(3600, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    let registry = rig.registry(None);
+    registry.boot_retention().await.unwrap();
+    rig.service.file_work.store(0, Ordering::Relaxed);
+    let walks = rig.service.directory_walks.load(Ordering::Relaxed);
+    assert_eq!(registry.sweep_once(1000).await.unwrap(), 0);
+    assert_eq!(rig.service.file_work.load(Ordering::Relaxed), 0);
+    assert_eq!(rig.service.directory_walks.load(Ordering::Relaxed), walks);
+}
+
+#[tokio::test]
+async fn raw_writer_enrolls_without_walk_and_expires_on_deadline() {
+    let rig = Rig::new();
+    let registry = rig.registry(None);
+    registry.boot_retention().await.unwrap();
+    let walks = rig.service.directory_walks.load(Ordering::Relaxed);
+    let id = rig.seed(1, 100, Some(200));
+    assert!(rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .is_none());
+    assert_eq!(registry.sweep_once(1199).await.unwrap(), 0);
+    assert_eq!(
+        rig.store
+            .lookup_live_retention_lineage(&rig.key)
+            .unwrap()
+            .unwrap()
+            .lineage_id,
+        id
+    );
+    assert_eq!(rig.service.directory_walks.load(Ordering::Relaxed), walks);
+    assert!(rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    assert_eq!(registry.sweep_once(1200).await.unwrap(), 1);
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    assert!(rig.store.retention_pending_deletions().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn boot_recovers_rowless_wal_after_losing_writer_hints() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    fs::remove_file(
+        rig.service
+            .wal
+            .ephemeral_wal_path(&rig.key)
+            .with_extension("session"),
+    )
+    .unwrap();
+    let wal = Arc::new(FileWalStore::new(rig.root.join("wal")));
+    assert_eq!(wal.take_retention_changes(), (vec![], false));
+    let service = Arc::new(
+        RetentionService::new(
+            wal,
+            rig.store.clone(),
+            rig.leases.clone(),
+            rig.store.clone(),
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+        )
+        .unwrap(),
+    );
+    assert_eq!(service.recover_enrollment().unwrap(), 1);
+    assert!(rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .is_some());
+    let _lease = service.lease(&rig.key).unwrap();
+    assert!(service.delete_expired(&rig.key, 1200).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn boot_length_hit_skips_identity_and_move_reads() {
+    let rig = Rig::new();
+    rig.seed(3600, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    fs::remove_file(
+        rig.service
+            .wal
+            .ephemeral_wal_path(&rig.key)
+            .with_extension("session"),
+    )
+    .unwrap();
+    rig.service.file_work.store(0, Ordering::Relaxed);
+    assert_eq!(rig.service.recover_enrollment().unwrap(), 0);
+    assert_eq!(
+        rig.service.file_work.load(Ordering::Relaxed),
+        1,
+        "only the recovery directory walk"
+    );
+    assert!(!rig
+        .service
+        .wal
+        .ephemeral_wal_path(&rig.key)
+        .with_extension("session")
+        .exists());
+}
+
+#[tokio::test]
+async fn default_raw_writer_placement_also_enqueues_retention() {
+    let rig = Rig::new();
+    rig.service.recover_enrollment().unwrap();
+    let mut wal = rig.service.wal.open(&rig.key).unwrap();
+    wal.append(1, &started(&rig.key, "r1", Some(1), 100), true)
+        .unwrap();
+    wal.append(1, &finished(200), true).unwrap();
+    drop(wal);
+    let walks = rig.service.directory_walks.load(Ordering::Relaxed);
+    assert_eq!(rig.service.enroll_changes().unwrap(), 1);
+    assert_eq!(rig.service.directory_walks.load(Ordering::Relaxed), walks);
+    assert!(rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .is_some());
+}

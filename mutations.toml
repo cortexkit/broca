@@ -4489,13 +4489,13 @@ expect_red = ["retention::tests::sweep_retries_sidecarless_boot_enrollment_after
 file = "crates/broca-module/src/registry.rs"
 old = """        tokio::task::spawn_blocking({
             let service = service.clone();
-            move || service.enroll()
+            move || service.enroll_changes()
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?
         .map_err(OpenError::Open)?;
         let candidates = service.index.candidates(now_ms).map_err(OpenError::Open)?;"""
-new = """        // NON-VACUITY BREAK: omit rediscovery of WALs deferred by the boot lease.
+new = """        // NON-VACUITY BREAK: omit retries of WALs deferred by the boot lease.
         let candidates = service.index.candidates(now_ms).map_err(OpenError::Open)?;"""
 
 [[control]]
@@ -11147,7 +11147,8 @@ expect_red = ["retention::tests::deletion_recovery_isolates_persistent_bad_tombs
 file = "crates/broca-module/src/retention.rs"
 old = '''                Err(_) => {
                     tracing::warn!(target: "retention", session = %broca_core::session_addr(&key),
-                    "deletion recovery deferred")
+                    "deletion recovery deferred");
+                    recovery.1.insert(key);
                 }'''
 new = '''                Err(error) => return Err(error), // NON-VACUITY BREAK: abort all recovery on one key.'''
 
@@ -15068,8 +15069,8 @@ test_file = "crates/broca-store/src/retention_withdrawals.rs"
 expect_red = ["retention_withdrawals::tests::discovery_without_live_retention_does_not_scan_runs", "retention_withdrawals::tests::discovery_with_live_retention_uses_partial_covering_index"]
 only = false
 file = "crates/broca-store/src/retention_withdrawals.rs"
-old = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_lineage l CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1";'
-new = 'const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM run_index r JOIN retention_lineage l ON r.lineage_id=l.lineage_id WHERE r.withdrawals_owed=1 AND l.expired_at_ms IS NULL"; // NON-VACUITY BREAK: restore the run-driven sweep query.'
+old = 'pub(crate) const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM retention_discovery d CROSS JOIN run_index r INDEXED BY run_index_discovery_lineage_idx ON r.lineage_id=d.lineage_id WHERE r.withdrawals_owed=1";'
+new = 'pub(crate) const DISCOVERY_SQL: &str = "SELECT DISTINCT r.session FROM run_index r INDEXED BY run_index_discovery_lineage_idx CROSS JOIN retention_discovery d ON r.lineage_id=d.lineage_id WHERE r.withdrawals_owed=1"; // NON-VACUITY BREAK: restore the run-driven sweep query.'
 
 [[control]]
 id = "agent-data-persistent-cache-is-not-authority"
@@ -16922,3 +16923,99 @@ expect_red = ["transport::tests::schema_fallback::retries_before_schema_downgrad
 file = "crates/broca-core/src/run.rs"
 old = "schema_prior_retries = *retries_used;"
 new = "schema_prior_retries = retries_used.saturating_sub(*retries_used); // NON-VACUITY BREAK: erase spent retries."
+
+[[control]]
+id = "retention-steady-sweep-no-walk"
+guards = "steady sweeps consume writer hints instead of rediscovering unchanged WALs"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::steady_sweep_does_no_per_file_work"]
+file = "crates/broca-module/src/retention.rs"
+old = "self.enroll_work(false, false)"
+new = "self.enroll_work(true, false) // NON-VACUITY BREAK"
+
+[[control]]
+id = "retention-raw-writer-enrollment"
+guards = "raw writers enqueue changed retained addresses without requiring a directory walk"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::raw_writer_enrolls_without_walk_and_expires_on_deadline"]
+file = "crates/broca-core/src/wal_writer/retention_changes.rs"
+old = "let result = self.inner.append(fence, record, sync);\n        self.observe(record);"
+new = "let result = self.inner.append(fence, record, sync);\n        // NON-VACUITY BREAK: omit the raw writer hint."
+
+[[control]]
+id = "retention-index-deadline-on-time"
+guards = "the sweep selects indexed deadlines at the current instant"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::raw_writer_enrolls_without_walk_and_expires_on_deadline"]
+file = "crates/broca-module/src/registry.rs"
+old = "let candidates = service.index.candidates(now_ms).map_err(OpenError::Open)?;"
+new = "let candidates = service.index.candidates(0).map_err(OpenError::Open)?; // NON-VACUITY BREAK"
+
+[[control]]
+id = "retention-boot-recovers-unindexed-wal"
+guards = "boot discovers crash-written retained WALs after in-memory writer hints are lost"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::boot_recovers_rowless_wal_after_losing_writer_hints"]
+file = "crates/broca-module/src/retention.rs"
+old = "state.retry.extend(self.ephemeral_files(\"wal\")?);"
+new = "// NON-VACUITY BREAK: omit boot discovery."
+
+[[control]]
+id = "retention-boot-length-hit-before-reads"
+guards = "recovery length hits skip identity reads and move-fence checks"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::boot_length_hit_skips_identity_and_move_reads"]
+file = "crates/broca-module/src/retention.rs"
+old = "if !inspect_known && fs::metadata(&path).is_ok_and(|meta| meta.len() == *bytes) {"
+new = "if false && !inspect_known && fs::metadata(&path).is_ok_and(|meta| meta.len() == *bytes) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "retention-queue-overflow-requests-recovery"
+guards = "bounded writer hints request a recovery walk instead of silently dropping work"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/wal_writer/retention_changes.rs"
+expect_red = ["wal_writer::retention_changes::tests::overflow_requests_recovery_without_unbounded_growth"]
+file = "crates/broca-core/src/wal_writer/retention_changes.rs"
+old = "state.recovery = true;"
+new = "state.recovery = false; // NON-VACUITY BREAK"
+
+[[control]]
+id = "retention-resume-only-owed"
+guards = "routine deletion recovery never visits the entire retained population"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::steady_sweep_does_no_per_file_work"]
+file = "crates/broca-module/src/retention.rs"
+old = "Some(keys) => keys,"
+new = "Some(_keys) => self.index.retained_sessions()?, // NON-VACUITY BREAK"
+
+[[control]]
+id = "retention-discovery-only-owed"
+guards = "discovery rederivation queries do not scan quiet live retention lineages"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-store --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-store/src/retention.rs"
+expect_red = ["retention::sweep_work_tests::quiet_retained_population_does_not_expand_discovery_work"]
+file = "crates/broca-store/src/retention_withdrawals.rs"
+old = 'FROM retention_discovery d CROSS JOIN run_index r INDEXED BY run_index_discovery_lineage_idx ON r.lineage_id=d.lineage_id WHERE r.withdrawals_owed=1'
+new = 'FROM retention_lineage d CROSS JOIN run_index r INDEXED BY run_index_discovery_lineage_idx ON r.lineage_id=d.lineage_id WHERE d.expired_at_ms IS NULL AND r.withdrawals_owed=1 /* NON-VACUITY BREAK */'

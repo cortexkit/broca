@@ -26,6 +26,20 @@ pub trait RetentionIndex: Send + Sync {
     fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String>;
     fn run(&self, id: &str) -> Result<Option<RunRetention>, String>;
     fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String>;
+    fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
+        Ok(None)
+    }
+    fn pending_deletions(&self) -> Result<Option<Vec<BindIdentity>>, String> {
+        Ok(None)
+    }
+    fn deletion_pending(
+        &self,
+        _id: &str,
+        _key: &BindIdentity,
+        _pending: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
         Ok(Vec::new())
     }
@@ -54,6 +68,20 @@ pub trait RetentionIndex: Send + Sync {
 }
 
 impl RetentionIndex for SqliteStore {
+    fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
+        self.retention_live_inventory()
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+    fn pending_deletions(&self) -> Result<Option<Vec<BindIdentity>>, String> {
+        self.retention_pending_deletions()
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+    fn deletion_pending(&self, id: &str, key: &BindIdentity, pending: bool) -> Result<(), String> {
+        self.retention_deletion_pending(id, key, pending)
+            .map_err(|e| e.to_string())
+    }
     fn runs(&self, lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
         self.retention_run_rows(lineage)
     }
@@ -331,6 +359,12 @@ pub struct RetentionService {
         std::sync::OnceLock<Arc<dyn crate::retention_withdrawals::RetentionWithdrawalAdapter>>,
     pub(crate) withdrawal_wake: tokio::sync::Notify,
     unreadable: Mutex<std::collections::HashSet<String>>,
+    enrollment: Mutex<Enrollment>,
+    deletion_recovery: Mutex<(bool, std::collections::HashSet<BindIdentity>)>,
+    #[cfg(test)]
+    file_work: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    directory_walks: std::sync::atomic::AtomicUsize,
     pub wal: Arc<FileWalStore>,
     pub index: Arc<dyn RetentionIndex>,
     pub clock: Clock,
@@ -340,6 +374,12 @@ pub struct RetentionService {
     resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
     #[cfg(test)]
     before_enroll: Mutex<Option<Arc<EnrollmentHook>>>,
+}
+
+#[derive(Default)]
+struct Enrollment {
+    recovered: bool,
+    retry: std::collections::HashSet<PathBuf>,
 }
 
 #[cfg(test)]
@@ -359,6 +399,12 @@ impl RetentionService {
             withdrawal_wake: tokio::sync::Notify::new(),
             evict: std::sync::OnceLock::new(),
             unreadable: Mutex::new(std::collections::HashSet::new()),
+            enrollment: Mutex::default(),
+            deletion_recovery: Mutex::default(),
+            #[cfg(test)]
+            file_work: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            directory_walks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_enroll: Mutex::new(None),
             wal,
@@ -383,6 +429,9 @@ impl RetentionService {
     }
 
     fn tombstones(&self, key: &BindIdentity) -> Result<Vec<Tombstone>, String> {
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = self.wal.tombstone_path(key, "");
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -409,6 +458,9 @@ impl RetentionService {
     }
 
     fn write_tombstone(&self, key: &BindIdentity, stone: &Tombstone) -> Result<(), String> {
+        if stone.completed_at_ms.is_none() {
+            self.index.deletion_pending(&stone.lineage_id, key, true)?;
+        }
         let path = self.wal.tombstone_path(key, &stone.lineage_id);
         let parent = path.parent().expect("tombstone parent");
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -419,10 +471,17 @@ impl RetentionService {
         file.sync_all().map_err(|e| e.to_string())?;
         fs::rename(temp, &path).map_err(|e| e.to_string())?;
         sync_dir(parent)?;
-        sync_dir(parent.parent().expect("ephemeral root"))
+        sync_dir(parent.parent().expect("ephemeral root"))?;
+        if stone.completed_at_ms.is_some() {
+            self.index.deletion_pending(&stone.lineage_id, key, false)?;
+        }
+        Ok(())
     }
 
     fn read_path(&self, path: &Path) -> Result<broca_wal::WalRangeRead, String> {
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         broca_wal::read_records_range(path, self.wal.max_read_bytes(), 0, None, None)
             .map_err(|e| e.to_string())
     }
@@ -587,6 +646,38 @@ impl RetentionService {
             .map(|stone| stone.expired_at_ms))
     }
 
+    /// Reuse the actor's already validated durable prefix instead of decoding it twice.
+    pub(crate) fn rederive_records(
+        &self,
+        key: &BindIdentity,
+        id: broca_wal::WalLineageId,
+        records: &[FramedRecord],
+        head: u64,
+    ) -> Result<(), String> {
+        self.wal.check_move(key, true).map_err(|e| e.to_string())?;
+        let path = self
+            .wal
+            .resolve_live_path(key)
+            .map_err(|e| e.to_string())?
+            .ok_or("retention WAL disappeared before projection")?;
+        let bytes = durable_prefix_bytes(&path, head)?;
+        self.project_records(key, id, records, bytes)
+    }
+
+    fn project_records(
+        &self,
+        key: &BindIdentity,
+        id: broca_wal::WalLineageId,
+        records: &[FramedRecord],
+        bytes: u64,
+    ) -> Result<(), String> {
+        if let Some((row, runs)) = derive(key, id.to_string(), records, bytes, None) {
+            self.remember_session(key)?;
+            self.index.upsert(&row, &runs)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn rederive(&self, key: &BindIdentity) -> Result<(), String> {
         self.rederive_head(key, None)
     }
@@ -618,6 +709,10 @@ impl RetentionService {
         key: &BindIdentity,
         head: Option<u64>,
     ) -> Result<(), String> {
+        self.wal.check_move(key, true).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = self.wal.resolve_live_path(key).map_err(|e| e.to_string())?;
         let Some(path) = path else { return Ok(()) };
         let read =
@@ -630,11 +725,7 @@ impl RetentionService {
             Some(seq) => durable_prefix_bytes(&path, seq)?,
             None => fs::metadata(&path).map_err(|e| e.to_string())?.len(),
         };
-        if let Some((row, runs)) = derive(key, id.to_string(), frames(&read), bytes, None) {
-            self.remember_session(key)?;
-            self.index.upsert(&row, &runs)?;
-        }
-        Ok(())
+        self.project_records(key, id, frames(&read), bytes)
     }
 }
 
@@ -657,14 +748,59 @@ fn sync_dir(path: &Path) -> Result<(), String> {
 }
 
 impl RetentionService {
-    /// At boot and on each sweep, replay a WAL only when its live retention row is missing
-    /// or records a different byte length from the file on disk.
+    /// Explicit integrity repair also verifies identity sidecars for indexed WALs.
     pub fn enroll(&self) -> Result<usize, String> {
+        self.enroll_work(true, true)
+    }
+
+    pub(crate) fn recover_enrollment(&self) -> Result<usize, String> {
+        self.enroll_work(true, false)
+    }
+
+    pub(crate) fn enroll_changes(&self) -> Result<usize, String> {
+        self.enroll_work(false, false)
+    }
+
+    fn enroll_work(&self, force_recovery: bool, inspect_known: bool) -> Result<usize, String> {
+        let mut state = self.enrollment.lock().unwrap();
+        let (addresses, overflow) = self.wal.take_retention_changes();
+        state.retry.extend(
+            addresses
+                .into_iter()
+                .map(|address| self.wal.ephemeral_root().join(format!("{address}.wal"))),
+        );
+        if overflow || force_recovery {
+            state.recovered = false;
+        }
+        let inventory = if !state.recovered {
+            let inventory = self.index.live_inventory()?.map(|rows| {
+                rows.into_iter()
+                    .map(|row| (broca_core::session_addr(&row.session), row.wal_bytes))
+                    .collect::<HashMap<_, _>>()
+            });
+            state.retry.extend(self.ephemeral_files("wal")?);
+            state.recovered = inventory.is_some();
+            inventory
+        } else {
+            None
+        };
+        let paths = std::mem::take(&mut state.retry);
         let mut replayed = 0;
-        for path in self.ephemeral_files("wal")? {
+        for path in paths {
             #[cfg(test)]
             if let Some(hook) = self.before_enroll.lock().unwrap().as_ref() {
                 hook(&path);
+            }
+            // An inventory hit is only a recovery optimization. Missing rows still
+            // go through WAL discovery; they are never evidence of an absent log.
+            if let Some(bytes) = inventory.as_ref().and_then(|rows| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|address| rows.get(address))
+            }) {
+                if !inspect_known && fs::metadata(&path).is_ok_and(|meta| meta.len() == *bytes) {
+                    continue;
+                }
             }
             match self.enroll_path(&path) {
                 Ok(true) => replayed += 1,
@@ -672,6 +808,7 @@ impl RetentionService {
                 Err(_) => {
                     tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
                         "enrollment deferred");
+                    state.retry.insert(path);
                 }
             }
         }
@@ -679,6 +816,9 @@ impl RetentionService {
     }
 
     fn enroll_path(&self, path: &Path) -> Result<bool, String> {
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = match fs::metadata(path) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -697,7 +837,7 @@ impl RetentionService {
                 .try_exists()
                 .map_err(|e| e.to_string())?
         {
-            return Ok(false);
+            return Err("retention enrollment deferred by migration marker".into());
         }
         // The hashed address is not reversible. Writers leave a content-free identity
         // sidecar; older WALs without one need replay to discover their session.
@@ -744,6 +884,12 @@ impl RetentionService {
     }
 
     fn ephemeral_files(&self, extension: &str) -> Result<Vec<PathBuf>, String> {
+        #[cfg(test)]
+        self.directory_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entries = match fs::read_dir(self.wal.ephemeral_root()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -761,6 +907,9 @@ impl RetentionService {
     }
 
     fn read_first_session(&self, path: &Path) -> Result<(Option<BindIdentity>, bool), String> {
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A bounded range still validates the log, so discovery is cached in a content-free
         // sidecar. Once written, boot enrollment needs only a stat and indexed row lookup.
         let sidecar = path.with_extension("session");
@@ -785,10 +934,13 @@ impl RetentionService {
 
     pub(crate) fn remember_session(&self, key: &BindIdentity) -> Result<(), String> {
         let path = self.wal.ephemeral_wal_path(key).with_extension("session");
+        let bytes = serde_json::to_vec(key).map_err(|e| e.to_string())?;
+        if fs::read(&path).is_ok_and(|current| current == bytes) {
+            return Ok(());
+        }
         let temp = path.with_extension("session.tmp");
         let mut file = File::create(&temp).map_err(|e| e.to_string())?;
-        file.write_all(&serde_json::to_vec(key).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         fs::rename(temp, &path).map_err(|e| e.to_string())?;
         sync_dir(path.parent().expect("ephemeral root"))
@@ -1024,11 +1176,27 @@ impl RetentionService {
     /// Finish incomplete tombstones, retrying failed keys on later sweeps without
     /// preventing unrelated sessions from completing their deletion.
     pub fn resume_deletions(&self, now_ms: u64) -> Result<Vec<BindIdentity>, String> {
+        let mut recovery = self.deletion_recovery.lock().unwrap();
+        let pending = match self.index.pending_deletions()? {
+            Some(keys) => keys,
+            // An index without a recovery inventory cannot vouch for completed work.
+            None => self.known_sessions()?,
+        };
+        let mut keys: std::collections::HashSet<_> = pending.into_iter().collect();
+        if !recovery.0 {
+            keys.extend(self.known_sessions()?);
+            recovery.0 = true;
+        }
+        keys.extend(std::mem::take(&mut recovery.1));
         let mut completed = Vec::new();
-        for key in self.known_sessions()? {
+        for key in keys {
             let result = (|| {
                 let stones = self.tombstones(&key)?;
                 if stones.iter().all(|s| s.completed_at_ms.is_some()) {
+                    for stone in stones {
+                        self.index
+                            .deletion_pending(&stone.lineage_id, &key, false)?;
+                    }
                     return Ok(false);
                 }
                 let _lease = self.lease(&key)?;
@@ -1042,7 +1210,8 @@ impl RetentionService {
                 Ok(false) => {}
                 Err(_) => {
                     tracing::warn!(target: "retention", session = %broca_core::session_addr(&key),
-                    "deletion recovery deferred")
+                    "deletion recovery deferred");
+                    recovery.1.insert(key);
                 }
             }
         }
@@ -1051,8 +1220,13 @@ impl RetentionService {
 
     fn known_sessions(&self) -> Result<Vec<BindIdentity>, String> {
         let mut sessions = std::collections::HashSet::new();
-        for path in self.ephemeral_files("session")? {
-            let bytes = match fs::read(&path) {
+        let paths = self.ephemeral_files("expired")?;
+        let addresses: std::collections::HashSet<_> = paths
+            .iter()
+            .filter_map(|path| path.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+            .collect();
+        for path in paths {
+            let bytes = match fs::read(path.with_extension("session")) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => {
@@ -1073,7 +1247,14 @@ impl RetentionService {
         }
         // Durable identity-only rows discover interrupted tombstone completion even
         // after deletion has removed the content-free sidecar.
-        sessions.extend(self.index.retained_sessions()?);
+        if !addresses.is_empty() {
+            sessions.extend(
+                self.index
+                    .retained_sessions()?
+                    .into_iter()
+                    .filter(|key| addresses.contains(&broca_core::session_addr(key))),
+            );
+        }
         Ok(sessions.into_iter().collect())
     }
 }

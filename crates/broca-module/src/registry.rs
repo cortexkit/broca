@@ -4739,7 +4739,7 @@ impl LineageRegistry {
         for key in recovered {
             self.evict_retention_caches(&key);
         }
-        let enrolled = tokio::task::spawn_blocking(move || service.enroll())
+        let enrolled = tokio::task::spawn_blocking(move || service.recover_enrollment())
             .await
             .map_err(|e| OpenError::Open(e.to_string()))?
             .map_err(OpenError::Open)?;
@@ -4803,12 +4803,11 @@ impl LineageRegistry {
         for key in recovered {
             self.evict_retention_caches(&key);
         }
-        // Boot can leave a retained WAL with neither a sidecar nor an indexed deadline
-        // when its lease is held. Rediscover those WALs before querying sweep candidates;
-        // enrollment and deletion each acquire the session lease and confirm the live WAL.
+        // Writers nominate changed addresses. Boot, queue overflow, or an index that
+        // cannot vouch for recovery triggers a walk; lease failures retry only that path.
         tokio::task::spawn_blocking({
             let service = service.clone();
-            move || service.enroll()
+            move || service.enroll_changes()
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?
@@ -4840,7 +4839,7 @@ impl LineageRegistry {
         Ok(deleted)
     }
 
-    /// Retry WAL enrollment and poll expiry deadlines every five minutes. A clock-change
+    /// Retry changed WALs and poll indexed expiry deadlines every five minutes. A clock-change
     /// notification also runs a pass immediately, so tests can advance time rather than wait days.
     pub async fn run_retention_sweeper(&self) -> Result<(), OpenError> {
         let Some(service) = self.inner.retention.get().cloned() else {
