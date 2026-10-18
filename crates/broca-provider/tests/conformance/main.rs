@@ -1,6 +1,5 @@
-//! The wire-family conformance suites: every test file that renders through
-//! `broca_provider::conformance::check_render_determinism`. Each former `tests/<name>.rs` is the
-//! module `<name>` here.
+//! The wire-family conformance suites, including the pinned usage-normalization vectors. Each
+//! former `tests/<name>.rs` is the module `<name>` here.
 //!
 //! They are kept out of the crate's main `it` test binary because that check rewrites process-wide
 //! environment variables (TZ, LANG, LC_ALL) for the length of a render. The harness serializes the
@@ -17,3 +16,4 @@ mod openai_chat_conformance;
 mod openai_responses_chatgpt_conformance;
 mod openai_responses_conformance;
 mod responses_decode;
+mod usage_normalization_golden;
