@@ -23,6 +23,12 @@ use crate::{
 
 pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 
+#[path = "human_prompt_count.rs"]
+mod human_prompt_count;
+pub use human_prompt_count::{
+    count_human_prompts_in_bytes, read_human_prompt_count, HumanPromptCount,
+};
+
 #[cfg(test)]
 thread_local! {
     static OPEN_STAGES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };

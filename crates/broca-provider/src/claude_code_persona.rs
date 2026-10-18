@@ -1,4 +1,4 @@
-//! The Claude Code 2.1.280 OAuth persona: the pure rules behind the request shape an Anthropic
+//! The Claude Code OAuth persona: the pure rules behind the request shape an Anthropic
 //! subscription (OAuth) `/v1/messages` call sends, as anthropic-auth sends it.
 //!
 //! Everything here is a function of its arguments: no I/O, no clock, no randomness, no other
@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// The Claude Code client version this persona speaks as.
-pub const CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub const CLAUDE_CODE_VERSION: &str = "2.1.302";
 /// The `cc_entrypoint` billing field.
 pub const CC_ENTRYPOINT: &str = "cli";
 /// The literal that begins the billing block's text.
@@ -133,6 +133,7 @@ const PER_TURN_CONTROL_BETA: &str = "per-turn-control-2026-07-01";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
 const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
 
 /// The 3-hex `cc_version` suffix for `first_user_text` under client `version`.
@@ -196,6 +197,7 @@ pub fn billing_header_text(
     cch: &str,
     previous_request_id: Option<&str>,
     prompt_id: Option<&str>,
+    prompt_ordinal: Option<u64>,
 ) -> String {
     let mut text = format!(
         "{BILLING_HEADER_PREFIX}cc_version={version}.{suffix}; cc_entrypoint={CC_ENTRYPOINT}; cch={cch};"
@@ -205,6 +207,11 @@ pub fn billing_header_text(
     }
     if let Some(prompt) = prompt_id.filter(|id| is_prompt_uuid(id)) {
         text.push_str(&format!(" cc_prompt_id={prompt};"));
+        if let Some(index) = prompt_ordinal.filter(|index| *index > 0) {
+            text.push_str(&format!(
+                " cc_turn_origin=human; cc_prompt_index={index}; cc_turn_index={index};"
+            ));
+        }
     }
     text
 }
@@ -369,7 +376,7 @@ pub fn metadata_user_id(device_id: &str, account_uuid: Option<&str>, session_id:
 /// for `fallbacks: "default"`, `thinking-binding-controls` for an enforcing
 /// `thinking.block_binding`, and `mid-conversation-output-config` on Fable 5.1. Duplicates keep
 /// their first position.
-pub fn select_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
+pub fn select_legacy_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
     let is_object = |key: &str| body.get(key).is_some_and(Value::is_object);
     let full_agent = body
         .get("tools")
@@ -446,6 +453,75 @@ pub fn select_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
         }
     }
     kept.join(",")
+}
+
+/// Main-request betas measured from interactive Claude Code 2.1.302 with default flags.
+/// These apply to main requests regardless of body shape; auxiliary title/quota requests
+/// have different lists. Advisor and fallback-credit betas require features broca does not use.
+pub fn select_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
+    let mut betas = vec![
+        "oauth-2025-04-20",
+        "interleaved-thinking-2025-05-14",
+        "thinking-token-count-2026-05-13",
+        "context-management-2025-06-27",
+        "prompt-caching-scope-2026-01-05",
+    ];
+    if model.starts_with("claude-haiku-") {
+        betas.push("claude-code-20250219");
+    } else {
+        betas.insert(0, "claude-code-20250219");
+    }
+    if [
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
+        "claude-fable-5-1",
+        "claude-haiku-5-5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+    {
+        betas.push(PER_TURN_CONTROL_BETA);
+    }
+    betas.extend([
+        "mid-conversation-tool-changes-2026-07-01",
+        "advanced-tool-use-2025-11-20",
+        "mid-conversation-system-clear-at-2026-08-21",
+        "effort-2025-11-24",
+        THINKING_BINDING_BETA,
+        THINKING_DISPLAY_UPDATES_BETA,
+        "extended-cache-ttl-2025-04-11",
+        "cache-diagnosis-2026-04-07",
+    ]);
+    if body
+        .pointer("/output_config/format/type")
+        .and_then(Value::as_str)
+        == Some("json_schema")
+    {
+        betas.insert(betas.len() - 1, "structured-outputs-2025-12-15");
+    }
+    if body.get("speed").and_then(Value::as_str) == Some("fast") {
+        betas.push(FAST_MODE_BETA);
+    }
+    for listed in host_betas {
+        for beta in listed
+            .split(',')
+            .map(str::trim)
+            .filter(|beta| !beta.is_empty())
+        {
+            if beta != MID_CONVERSATION_SYSTEM_BETA
+                && beta != MID_CONVERSATION_OUTPUT_CONFIG_BETA
+                && !betas.contains(&beta)
+            {
+                betas.push(beta);
+            }
+        }
+    }
+    if body.get("fallbacks").and_then(Value::as_str) == Some("default")
+        && !betas.contains(&SERVER_SIDE_FALLBACK_BETA)
+    {
+        betas.push(SERVER_SIDE_FALLBACK_BETA);
+    }
+    betas.join(",")
 }
 
 /// Serialise a request body in the persona's key order (see [`TOP_LEVEL_KEY_ORDER`] and the

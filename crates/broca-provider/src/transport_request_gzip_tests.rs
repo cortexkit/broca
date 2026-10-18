@@ -424,6 +424,72 @@ async fn an_anthropic_400_with_a_request_id_is_not_resent() {
 }
 
 #[tokio::test]
+async fn persona_gzip_is_unsigned_but_rejection_resend_and_attempt_bytes_stay_signed() {
+    let server = Server::start(vec![
+        Reply {
+            status: 415,
+            headers: vec![],
+            body: b"unsupported".to_vec(),
+        },
+        Reply::sse(),
+    ])
+    .await;
+    let client = ProviderHttpClient::resolving_anthropic_api_to(server.address, true);
+    let mut frozen = anthropic_frozen_config("claude-sonnet-5-5");
+    frozen.base_url = Some(format!(
+        "http://api.anthropic.com:{}",
+        server.address.port()
+    ));
+    frozen.claude_code_persona = Some(crate::wire::ClaudeCodePersona {
+        version: "2.1.302".into(),
+        device_id: "0".repeat(64),
+        account_uuid: None,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
+        cc_version_suffix: Some("433".into()),
+        prompt_ordinal: Some(2),
+    });
+    let provider = LiveProvider::with_client_and_clock(
+        client,
+        AnthropicMessages,
+        frozen,
+        AuthHandle::None,
+        broca_core::clock::Clock::default(),
+    );
+    let opts = options(20_000);
+    let canonical = broca_core::Provider::render_request(&provider, &opts);
+    let text = std::str::from_utf8(&canonical).unwrap();
+    let offset = crate::claude_code_persona::cch_placeholder_offset(text).unwrap();
+    assert_ne!(&text[offset..offset + 5], "00000");
+    assert_eq!(crate::claude_code_persona::sign_body(text), text);
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_step(&provider, &opts),
+    )
+    .await
+    .unwrap();
+    assert_eq!(text_deltas(&events), "hello world");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].header("content-encoding"), Some("gzip"));
+    let decoded = gunzip(&requests[0].body);
+    let mut unsigned = canonical.clone();
+    unsigned[offset..offset + 5].copy_from_slice(b"00000");
+    assert_canonical_plus_padding(&decoded, &unsigned);
+    assert_eq!(requests[1].header("content-encoding"), None);
+    assert_eq!(requests[1].body, canonical);
+    assert_eq!(
+        requests[0].headers_without_body_framing(),
+        requests[1].headers_without_body_framing()
+    );
+    assert_eq!(
+        attempts(&events)[0].request_body_sha256,
+        sha256_hex(&canonical)
+    );
+    assert_eq!(retries_used_at_finish(&events), 0);
+}
+
+#[tokio::test]
 async fn a_compressed_sse_response_streams_through_the_normalizer() {
     let records = sse_records();
     let (head, rest) = records.split_at(3);

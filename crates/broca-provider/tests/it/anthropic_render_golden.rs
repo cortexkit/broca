@@ -560,6 +560,57 @@ mod gated {
             session_id: "11111111-1111-4111-8111-111111111111".into(),
             prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
             cc_version_suffix: None,
+            prompt_ordinal: None,
+        }
+    }
+
+    /// Separate goldens preserve the 2.1.280 request fixtures: episodes admitted under that
+    /// version must still render those recorded bytes when resumed after a client upgrade.
+    #[test]
+    fn anthropic_302_persona_and_tool_loop_match_goldens() {
+        for (opts, name, stored, pin) in [
+            (
+                fixed_request(),
+                "anthropic_302_persona_render_golden.json",
+                include_str!("../fixtures/anthropic_302_persona_render_golden.json"),
+                include_str!("../fixtures/anthropic_302_persona_render_golden.json.version"),
+            ),
+            (
+                tool_loop_request(),
+                "anthropic_302_persona_tool_loop_render_golden.json",
+                include_str!("../fixtures/anthropic_302_persona_tool_loop_render_golden.json"),
+                include_str!(
+                    "../fixtures/anthropic_302_persona_tool_loop_render_golden.json.version"
+                ),
+            ),
+        ] {
+            let mut frozen = anthropic_frozen_config("claude-opus-4-8");
+            let mut persona = golden_persona();
+            persona.version = "2.1.302".into();
+            persona.prompt_ordinal = Some(2);
+            frozen.claude_code_persona = Some(persona);
+            if name.contains("tool_loop") {
+                frozen.cache = Some(anthropic_cache_policy());
+            }
+            let bytes = AnthropicMessages.render(&frozen, &opts);
+            let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+            if !render_golden_support::update_if_requested(
+                &path,
+                &format!("{path}.version"),
+                &bytes,
+                stored.as_bytes(),
+                pin,
+                ANTHROPIC_RENDERER_VERSION,
+                name,
+            ) {
+                render_golden_support::assert_matches_or_requires_bump(
+                    &bytes,
+                    stored.as_bytes(),
+                    pin,
+                    ANTHROPIC_RENDERER_VERSION,
+                    name,
+                );
+            }
         }
     }
 

@@ -75,7 +75,16 @@ pub fn pad<R: Rng + ?Sized>(identity: &[u8], rng: &mut R) -> Vec<u8> {
 /// mtime 0, OS byte 255), the same ten bytes captures of Claude Code 2.1.302 show on an
 /// ordinary body.
 pub fn gzip_body<R: Rng + ?Sized>(identity: &[u8], rng: &mut R) -> std::io::Result<GzipBody> {
-    let padded = pad(identity, rng);
+    // Claude Code leaves gzip bodies unsigned. Reset only the located billing signature in
+    // this wire copy; the canonical signed bytes remain available for dumps and identity resend.
+    let mut unsigned = identity.to_vec();
+    if let Some(offset) = std::str::from_utf8(identity)
+        .ok()
+        .and_then(crate::claude_code_persona::cch_placeholder_offset)
+    {
+        unsigned[offset..offset + 5].copy_from_slice(b"00000");
+    }
+    let padded = pad(&unsigned, rng);
     let mut encoder =
         flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
     encoder.write_all(&padded)?;

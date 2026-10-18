@@ -277,6 +277,52 @@ thread_local! {
 pub const WAL_MANIFEST_FILENAME: &str = "wal-manifest";
 
 impl FileWalStore {
+    /// Count human prompts when an older episode has no recorded count, bounded by this
+    /// store's byte limit and admission's durable head sequence. An earlier count includes
+    /// its file identity and end offset, so only subsequently appended records need reading.
+    pub fn human_prompt_count(
+        &self,
+        session: &BindIdentity,
+        through_seq: u64,
+        base: Option<&broca_wal::file_wal::HumanPromptCount>,
+    ) -> Result<broca_wal::file_wal::HumanPromptCount, WalError> {
+        self.check_move(session, false)?;
+        if through_seq == 0 {
+            return Ok(broca_wal::file_wal::HumanPromptCount {
+                count: 0,
+                through_seq: 0,
+                bytes_read: 0,
+                anchor: None,
+                lineage_id: None,
+            });
+        }
+        if let Some(path) = self.resolve_live_path(session)? {
+            return broca_wal::file_wal::read_human_prompt_count(
+                path,
+                self.max_read_bytes,
+                through_seq,
+                base,
+            );
+        }
+        let lookup = self.archived_member(session)?;
+        if lookup.live_present {
+            return Err(WalError::Io(io::Error::other(
+                "WAL changed during human prompt history read",
+            )));
+        }
+        let member = lookup.member.ok_or_else(|| {
+            WalError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "human prompt history is absent before its durable head",
+            ))
+        })?;
+        broca_wal::file_wal::count_human_prompts_in_bytes(
+            &member.payload,
+            self.max_read_bytes,
+            through_seq,
+        )
+    }
+
     /// Participant-only byte snapshots, including the old copy hidden by a moved
     /// tombstone. Archived results are verified member payloads, never containers.
     /// The move driver must hold session exclusion or recheck the snapshot under

@@ -298,6 +298,10 @@ pub struct ClaudeCodePersona {
     /// first user message of the request it renders, as such an episode always did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cc_version_suffix: Option<String>,
+    /// One-based human-prompt ordinal from durable session history, frozen for this episode.
+    /// Tool-result follow-ups and steers share it. Absent on personas recorded before 2.1.302.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ordinal: Option<u64>,
 }
 
 impl ClaudeCodePersona {

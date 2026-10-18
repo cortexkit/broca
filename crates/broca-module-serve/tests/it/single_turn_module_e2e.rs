@@ -1889,7 +1889,7 @@ async fn anthropic_oauth_run_through_the_module_sends_the_claude_code_persona() 
     );
     assert_eq!(
         header("user-agent").as_deref(),
-        Some("claude-cli/2.1.280 (external, cli)")
+        Some("claude-cli/2.1.302 (external, cli)")
     );
     assert_eq!(header("x-app").as_deref(), Some("cli"));
     assert_eq!(
@@ -1899,11 +1899,18 @@ async fn anthropic_oauth_run_through_the_module_sends_the_claude_code_persona() 
     assert_eq!(header("x-stainless-retry-count").as_deref(), Some("0"));
     assert_eq!(
         header("x-stainless-package-version").as_deref(),
-        Some("0.112.1")
+        Some("0.128.0")
     );
     assert!(header("x-client-request-id").is_some_and(|id| id.len() == 36));
     let betas = header("anthropic-beta").expect("anthropic-beta header");
-    assert!(betas.starts_with("oauth-2025-04-20,"), "{betas}");
+    assert!(
+        betas.starts_with("claude-code-20250219,oauth-2025-04-20,"),
+        "{betas}"
+    );
+    assert_eq!(
+        header("x-claude-code-request-class").as_deref(),
+        Some("main")
+    );
 
     let body_text = std::str::from_utf8(&captured[header_end..]).expect("UTF-8 body");
     assert!(
@@ -1913,11 +1920,14 @@ async fn anthropic_oauth_run_through_the_module_sends_the_claude_code_persona() 
     let body: serde_json::Value = serde_json::from_str(body_text).expect("JSON body");
     let billing = body["system"][0]["text"].as_str().expect("system[0] text");
     assert!(
-        billing.starts_with("x-anthropic-billing-header: cc_version=2.1.280.")
+        billing.starts_with("x-anthropic-billing-header: cc_version=2.1.302.")
             && billing.contains(" cc_entrypoint=cli; cch=")
             && !billing.contains("cch=00000;"),
         "the billing block leads the system and is signed: {billing}"
     );
+    assert!(billing.ends_with("cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;"));
+    let prompt_id = header("x-claude-code-prompt-id").expect("prompt id header");
+    assert!(billing.contains(&format!("cc_prompt_id={prompt_id};")));
     assert_eq!(
         body["system"][1]["text"],
         "You are Claude Code, Anthropic's official CLI for Claude."

@@ -901,54 +901,65 @@ mod gated {
     /// pre-persona blob above keeps rendering without a billing block.
     #[tokio::test(flavor = "multi_thread")]
     async fn persona_oauth_run_resumes_with_the_same_signed_bytes() {
-        let dir = broca_test_support::scratch_root()
-            .join(format!("broca-persona-resume-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        for (version, prompt_ordinal) in [("2.1.280", None), ("2.1.302", Some(17))] {
+            let dir = broca_test_support::scratch_root().join(format!(
+                "broca-persona-resume-{version}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
 
-        let mut admitted = anthropic_frozen_config("claude-opus-4-8");
-        admitted.claude_code_persona = Some(broca_provider::wire::ClaudeCodePersona {
-            version: "2.1.280".into(),
-            device_id: "0".repeat(64),
-            account_uuid: None,
-            session_id: "11111111-1111-4111-8111-111111111111".into(),
-            prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
-            cc_version_suffix: None,
-        });
-        let ref_bytes = seed_crashed_run(&dir, &admitted).await;
-        let text = String::from_utf8(ref_bytes.clone()).expect("rendered bytes are UTF-8");
-        assert!(
-            text.contains("\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: "),
-            "a persona run leads its system with the billing block: {text}"
-        );
-        assert!(
-            !text.contains("cch=00000;"),
-            "the recorded bytes are signed"
-        );
+            let mut admitted = anthropic_frozen_config("claude-opus-4-8");
+            admitted.claude_code_persona = Some(broca_provider::wire::ClaudeCodePersona {
+                version: version.into(),
+                device_id: "0".repeat(64),
+                account_uuid: None,
+                session_id: "11111111-1111-4111-8111-111111111111".into(),
+                prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
+                cc_version_suffix: None,
+                prompt_ordinal,
+            });
+            let ref_bytes = seed_crashed_run(&dir, &admitted).await;
+            let text = String::from_utf8(ref_bytes.clone()).expect("rendered bytes are UTF-8");
+            assert!(
+                text.contains(
+                    "\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: "
+                ),
+                "a persona run leads its system with the billing block: {text}"
+            );
+            assert!(
+                !text.contains("cch=00000;"),
+                "the recorded bytes are signed"
+            );
+            assert_eq!(
+                text.contains("cc_prompt_index=17; cc_turn_index=17;"),
+                prompt_ordinal.is_some()
+            );
 
-        let wal = FileWalStore::new(dir.join("wal"));
-        let prior = read_prior_run_config(&wal, &request(&dir).session)
-            .expect("read prior config")
-            .expect("a run was started");
-        let rebuilt: FrozenRenderConfig =
-            serde_json::from_value(prior.frozen_render_config.clone())
-                .expect("recorded blob deserializes");
-        assert_eq!(rebuilt, admitted, "the persona round-trips through the WAL");
-        let provider = FrozenProvider::new(rebuilt);
-        assert_eq!(run_once(&dir, &provider).await, RunFinishReason::Completed);
-        let resumed = provider
-            .sent
-            .lock()
-            .unwrap()
-            .get(&0)
-            .cloned()
-            .expect("resume rendered step one");
-        assert_eq!(
-            resumed, ref_bytes,
-            "the resume re-sends the recorded signed bytes"
-        );
+            let wal = FileWalStore::new(dir.join("wal"));
+            let prior = read_prior_run_config(&wal, &request(&dir).session)
+                .expect("read prior config")
+                .expect("a run was started");
+            let rebuilt: FrozenRenderConfig =
+                serde_json::from_value(prior.frozen_render_config.clone())
+                    .expect("recorded blob deserializes");
+            assert_eq!(rebuilt, admitted, "the persona round-trips through the WAL");
+            let provider = FrozenProvider::new(rebuilt);
+            assert_eq!(run_once(&dir, &provider).await, RunFinishReason::Completed);
+            let resumed = provider
+                .sent
+                .lock()
+                .unwrap()
+                .get(&0)
+                .cloned()
+                .expect("resume rendered step one");
+            assert_eq!(
+                resumed, ref_bytes,
+                "the resume re-sends the recorded signed bytes"
+            );
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// First-party Anthropic's no-request default, exactly as `resolve_cache_policy` in

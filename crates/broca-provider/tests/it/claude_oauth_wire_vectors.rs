@@ -1,17 +1,14 @@
-//! The shared Claude OAuth wire vectors (Claude Code 2.1.280 persona) against broca.
+//! The shared Claude OAuth wire vectors (Claude Code 2.1.302 persona) against broca.
 //!
-//! Each vector is a request anthropic-auth's OpenCode path built and signed from fixed inputs.
-//! These tests pin broca's persona primitives to the vectors (`cc_version` suffix, `cch`
-//! canonical body and signature, beta selection, `metadata.user_id`, key order), then render
-//! broca's own request for each vector's conversation and compare it with the vector.
+//! Each vector is a request built and signed from fixed inputs by the anthropic-auth client
+//! integration for OpenCode. These tests compare broca's Claude Code headers, body fields,
+//! signature, URL and key order with those reference requests.
 //!
 //! broca matches the vectors exactly on the persona: the billing block (apart from
 //! `cc_prev_req`, which broca does not send), the `cch` rule, the URL, every Claude Code header
-//! and its value and order, `metadata.user_id`, and the top-level key order. Where broca's own
-//! request policy differs from anthropic-auth's OpenCode transforms, the difference is listed
-//! per vector in `DIFFERENCES` with its reason, and everything else is asserted.
-
-use std::collections::BTreeSet;
+//! and its value and order, `metadata.user_id`, and the top-level key order. Request-construction
+//! differences are pinned in `DIFFERENCES`. The raw vector betas are exact; the render comparison
+//! omits only OpenCode's host streaming beta and its server-side fallback feature.
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult},
@@ -138,14 +135,14 @@ fn each_vector_beta_list_follows_from_its_body_model_and_host_betas() {
     for case in cases() {
         let id = case["id"].as_str().unwrap();
         let body: Value = serde_json::from_str(output_body(&case)).unwrap();
-        let host_betas: Vec<&str> = case["input"]["host_headers"]["anthropic-beta"]
+        let host: Vec<&str> = case["input"]["host_headers"]["anthropic-beta"]
             .as_str()
             .into_iter()
             .collect();
         assert_eq!(
-            persona::select_betas(&body, case["input"]["model"].as_str().unwrap(), &host_betas),
+            persona::select_betas(&body, case["input"]["model"].as_str().unwrap(), &host),
             header(&case, "anthropic-beta").unwrap(),
-            "{id}: anthropic-beta"
+            "{id}: exact beta list"
         );
     }
 }
@@ -174,6 +171,7 @@ fn fixed_persona(vectors: &Value) -> ClaudeCodePersona {
         session_id: fixed["claudeCodeSessionId"].as_str().unwrap().to_string(),
         prompt_id: Some(fixed["promptId"].as_str().unwrap().to_string()),
         cc_version_suffix: None,
+        prompt_ordinal: None,
     }
 }
 
@@ -281,6 +279,19 @@ fn broca_frozen(case: &Value, vectors: &Value) -> FrozenRenderConfig {
     let mut frozen = anthropic_frozen_config(case["input"]["model"].as_str().unwrap());
     frozen.max_output_tokens = sent["max_tokens"].as_u64().unwrap() as u32;
     let mut persona = fixed_persona(vectors);
+    persona.prompt_ordinal = Some(
+        sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["role"] == "user"
+                    && message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| block["type"] != "tool_result")
+                    })
+            })
+            .count() as u64,
+    );
     // anthropic-auth sends no lineage on a subagent's request. broca's request carries no
     // subagent marker, so a broca episode always sends its prompt id; the vector's subagent
     // case is rendered as an episode admitted without one.
@@ -337,14 +348,11 @@ fn broca_frozen(case: &Value, vectors: &Value) -> FrozenRenderConfig {
 }
 
 /// Per vector: the top-level fields whose values differ between broca's request and the
-/// vector's (each a documented broca policy, see the report), the top-level keys only the
-/// vector sends, and the beta tokens only the vector sends.
+/// vector's (each a documented broca policy), and the top-level keys only the vector sends.
 struct Difference {
     id: &'static str,
     differing_fields: &'static [&'static str],
     vector_only_keys: &'static [&'static str],
-    vector_only_betas: &'static [&'static str],
-    broca_only_betas: &'static [&'static str],
 }
 
 /// Reasons, shared by every vector:
@@ -360,9 +368,9 @@ struct Difference {
 /// - `fine-grained-tool-streaming-2025-05-14`: a beta the OpenCode host sends, passed through;
 ///   broca has no host betas.
 /// - `cc_prev_req` (checked in the billing test): broca does not send it.
-/// - `thinking-binding-controls` beta, and `thinking` differing by `block_binding`: an
-///   anthropic-auth account setting broca has no counterpart for.
-/// - `context_management` (it selects the full-agent beta list), the removal of a forced
+/// - `thinking` differing by `block_binding`: an anthropic-auth account setting broca has no
+///   counterpart for.
+/// - `context_management`, the removal of a forced
 ///   `tool_choice`, and the inserted effort `role: system` message: anthropic-auth request
 ///   transforms broca's request model does not carry.
 /// - Sending no `cc_prompt_id` on a subagent's request: broca's request has no subagent marker.
@@ -371,72 +379,38 @@ const DIFFERENCES: [Difference; 7] = [
         id: "fable51-first-turn",
         differing_fields: &["messages", "system"],
         vector_only_keys: &["diagnostics", "fallbacks"],
-        broca_only_betas: &[],
-        vector_only_betas: &[
-            "fine-grained-tool-streaming-2025-05-14",
-            "server-side-fallback-2026-07-01",
-        ],
     },
     Difference {
         id: "opus55-continuation-replayed-thinking",
         differing_fields: &["messages", "system", "thinking"],
         vector_only_keys: &["diagnostics", "fallbacks"],
-        broca_only_betas: &[],
-        vector_only_betas: &[
-            "fine-grained-tool-streaming-2025-05-14",
-            "server-side-fallback-2026-07-01",
-            "thinking-binding-controls-2026-08-01",
-        ],
     },
     Difference {
         id: "opus55-effort-change",
         differing_fields: &["messages", "system"],
         vector_only_keys: &["diagnostics", "fallbacks"],
-        broca_only_betas: &[],
-        vector_only_betas: &[
-            "fine-grained-tool-streaming-2025-05-14",
-            "server-side-fallback-2026-07-01",
-        ],
     },
     Difference {
         id: "sonnet55-between-tools",
         differing_fields: &["system"],
         vector_only_keys: &["cache_control", "diagnostics"],
-        broca_only_betas: &[],
-        vector_only_betas: &["fine-grained-tool-streaming-2025-05-14"],
     },
     Difference {
         id: "haiku55-tools-continuation",
         differing_fields: &["messages", "system", "tools"],
         vector_only_keys: &["diagnostics"],
-        broca_only_betas: &[],
-        vector_only_betas: &["fine-grained-tool-streaming-2025-05-14"],
     },
     Difference {
         id: "sonnet55-full-agent-subagent",
         differing_fields: &["messages", "system", "tools"],
         vector_only_keys: &["context_management", "diagnostics"],
-        broca_only_betas: &[],
-        vector_only_betas: &[
-            "claude-code-20250219",
-            "mid-conversation-system-2026-04-07",
-            "effort-2025-11-24",
-            "fallback-credit-2026-06-01",
-            "fine-grained-tool-streaming-2025-05-14",
-        ],
     },
     Difference {
         id: "opus48-structured-output-fast",
         differing_fields: &["messages", "system"],
         vector_only_keys: &["diagnostics"],
-        broca_only_betas: &[],
-        vector_only_betas: &["fine-grained-tool-streaming-2025-05-14"],
     },
 ];
-
-fn tokens(list: &str) -> BTreeSet<&str> {
-    list.split(',').filter(|beta| !beta.is_empty()).collect()
-}
 
 #[test]
 fn broca_renders_each_vectors_persona_exactly() {
@@ -585,31 +559,20 @@ fn broca_renders_each_vectors_persona_exactly() {
             persona::select_betas(&ours, &frozen.wire_model_id, &[]),
             "{id}: betas follow from the sent body"
         );
-        let their_beta = header(&case, "anthropic-beta").unwrap();
-        let only_theirs: Vec<&str> = tokens(their_beta)
-            .difference(&tokens(&ours_beta))
-            .copied()
-            .collect();
-        let mut expected_only: Vec<&str> = difference.vector_only_betas.to_vec();
-        expected_only.sort_unstable();
-        table.push(format!(
-            "{id}: vector-only betas {only_theirs:?} expected {expected_only:?}"
-        ));
-        if only_theirs != expected_only {
-            mismatched = true;
-        }
-        let only_ours: Vec<&str> = tokens(&ours_beta)
-            .difference(&tokens(their_beta))
-            .copied()
-            .collect();
-        let mut expected_ours: Vec<&str> = difference.broca_only_betas.to_vec();
-        expected_ours.sort_unstable();
-        table.push(format!(
-            "{id}: broca-only betas {only_ours:?} expected {expected_ours:?}"
-        ));
-        if only_ours != expected_ours {
-            mismatched = true;
-        }
+        // OpenCode supplies a host streaming beta and enables fallbacks=default; broca has
+        // neither input. Every other beta, including JSON-schema output, must match in order.
+        let reference_betas = header(&case, "anthropic-beta")
+            .unwrap()
+            .split(',')
+            .filter(|beta| {
+                !matches!(
+                    *beta,
+                    "fine-grained-tool-streaming-2025-05-14" | "server-side-fallback-2026-07-01"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(ours_beta, reference_betas, "{id}: production beta list");
 
         // Transport-owned headers (Connection, Host, Accept-Encoding, Content-Length) are the
         // HTTP client's; the machine-dependent and per-request ones are compared by form.
@@ -674,4 +637,99 @@ fn a_persona_runs_billing_block_is_the_same_on_every_step() {
     let first = String::from_utf8(AnthropicMessages.render(&frozen, &earlier)).unwrap();
     let second = String::from_utf8(AnthropicMessages.render(&frozen, &full)).unwrap();
     assert_ne!(first, second);
+}
+
+/// Diagnosis was null on measured cache hits; empty thinking plus a signature is also a
+/// measured stream shape. The future event is synthetic: it checks forward compatibility,
+/// not an undocumented beta event name, and its fake usage must not affect accounting.
+#[test]
+fn beta_response_extensions_and_empty_thinking_preserve_usage() {
+    use broca_protocol::{NormalizedEvent, ProviderControl, StepId};
+    let mut frozen = anthropic_frozen_config("claude-sonnet-5-5");
+    frozen.claude_code_persona = Some(fixed_persona(&vectors()));
+    let mut normalizer = AnthropicMessages.normalizer(&frozen, StepId(1));
+    let bytes = include_bytes!("../fixtures/anthropic_beta_forward_compat.sse");
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(17) {
+        events.extend(normalizer.push(chunk).unwrap());
+    }
+    events.extend(normalizer.finish().unwrap());
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::StepFinished { usage, .. }) => Some(*usage),
+            _ => None,
+        })
+        .expect("step finished");
+    assert_eq!(usage.input_tokens, Some(10));
+    assert_eq!(usage.cached_input_tokens, Some(40));
+    assert_eq!(usage.cache_write_tokens, Some(6));
+    assert_eq!(usage.output_tokens, Some(7));
+    assert_eq!(normalizer.input_transformations(), Some(Vec::new()));
+    assert!(events.iter().any(|event| matches!(event,
+        NormalizedEvent::Control(ProviderControl::AssistantMessage { message })
+            if matches!(&message.content[0], ContentBlock::Reasoning { text, signature } if text.is_empty() && signature.as_deref() == Some("sig_beta"))
+    )));
+}
+
+#[test]
+fn persona_final_text_schema_selects_the_structured_output_beta() {
+    let cases = cases();
+    let case = cases
+        .iter()
+        .find(|case| case["id"] == "opus48-structured-output-fast")
+        .unwrap();
+    let mut frozen = broca_frozen(case, &vectors());
+    let opts = broca_request(case);
+    for has_schema in [true, false] {
+        if !has_schema {
+            frozen.structured_output = None;
+        }
+        let body = AnthropicMessages.render(&frozen, &opts);
+        let request = AnthropicMessages.endpoint(&frozen, &AuthHandle::None, body);
+        let betas = &request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "anthropic-beta")
+            .unwrap()
+            .1;
+        assert_eq!(
+            betas
+                .split(',')
+                .any(|beta| beta == "structured-outputs-2025-12-15"),
+            has_schema
+        );
+        if has_schema {
+            assert!(betas.contains("extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07"));
+        }
+    }
+}
+
+/// cortexkit-anthropic-policy's test-vectors/claude-oauth-wire/README.md names summarized
+/// thinking as the deliberate body difference from the CLI's thinking.display=updates.
+/// Measured updates responses contain no thinking text, so broca keeps summarized display.
+#[test]
+fn adaptive_persona_thinking_keeps_summarized_display() {
+    let mut checked = 0;
+    for case in cases() {
+        let sent: Value = serde_json::from_str(output_body(&case)).unwrap();
+        if sent.pointer("/thinking/type").and_then(Value::as_str) != Some("adaptive") {
+            continue;
+        }
+        let frozen = broca_frozen(&case, &vectors());
+        let body = AnthropicMessages.shape(&frozen, &broca_request(&case));
+        assert_eq!(
+            body.pointer("/thinking/display").and_then(Value::as_str),
+            Some("summarized")
+        );
+        assert_eq!(
+            sent.pointer("/thinking/display").and_then(Value::as_str),
+            Some("summarized")
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "the vector set exercises adaptive summarized thinking"
+    );
 }
