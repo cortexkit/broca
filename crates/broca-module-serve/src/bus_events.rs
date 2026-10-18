@@ -24,11 +24,23 @@ use tokio_util::sync::CancellationToken;
 
 static METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
 
+/// Whether this process started the publisher. With the switch off every counter reads zero,
+/// which is indistinguishable from an enabled publisher that has had nothing to send, so the
+/// health block states which of the two an operator is looking at.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn health() -> serde_json::Value {
-    METRICS
+    let mut snapshot = METRICS
         .get()
         .map(|m| m.snapshot())
-        .unwrap_or_else(|| Metrics::default().snapshot())
+        .unwrap_or_else(|| Metrics::default().snapshot());
+    if let Some(fields) = snapshot.as_object_mut() {
+        fields.insert(
+            "enabled".into(),
+            serde_json::Value::Bool(ENABLED.load(Ordering::Relaxed)),
+        );
+    }
+    snapshot
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -177,6 +189,7 @@ impl Service {
         if !config.enabled {
             return None;
         }
+        ENABLED.store(true, Ordering::Relaxed);
         Some(tokio::spawn(async move {
             let mut publisher = None;
             let mut account_known = false;

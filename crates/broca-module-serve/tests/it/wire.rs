@@ -2722,6 +2722,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // The current-state counterpart: unlike the lifetime counter, successful projection
         // removes only the recovered session's entry and leaves other sessions behind.
         "projection_behind_sessions",
+        // The ck-bus run-event publisher: off by default, so a healthy default daemon reads
+        // `enabled: false` with every counter at zero; `enabled` is what separates that from an
+        // enabled publisher that has simply had nothing to send.
+        "bus_events",
         // Process-local lifetime operation counts. The isolated operation_counters target proves
         // their zero and non-zero readings; this test keeps their presence in the total key set.
         "stream_chunks",
@@ -2817,6 +2821,17 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
     assert_eq!(metrics["projection_failures"], serde_json::json!(0));
     assert_eq!(metrics["projection_behind_sessions"], serde_json::json!(0));
+    assert_eq!(
+        metrics["bus_events"],
+        serde_json::json!({
+            "enabled": false,
+            "bus_events_published": 0,
+            "bus_outbox_depth": 0,
+            "bus_publish_failures": 0,
+            "bus_events_oversize": 0,
+            "bus_outbox_dropped": 0,
+        })
+    );
     assert!(metrics["catalog_age_ms"].as_i64().unwrap() >= 5_000);
     assert_eq!(metrics["catalog_source"], serde_json::json!("lkg"));
     assert_eq!(metrics["catalog_refusals"], serde_json::json!(0));
