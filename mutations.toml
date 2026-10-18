@@ -4410,12 +4410,17 @@ new = "                // NON-VACUITY BREAK: never match the live WAL's own tomb
 
 [[control]]
 id = "retention-different-lineage-wal-supersedes-tombstone"
-guards = "an older lineage's tombstone never makes a different-lineage live WAL at the address expired"
+guards = "the forever-lineage bypass and WAL identity comparison jointly prevent an older tombstone from shadowing a fresh forever lineage"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::expiry_timer_ends_subscriptions_releases_lease_and_fresh_send_completes_deletion"]
+[[control.edits]]
+file = "crates/broca-module/src/retention.rs"
+old = ".is_some_and(|path| *path != self.wal.ephemeral_wal_path(key))"
+new = ".is_some_and(|_| false) // NON-VACUITY BREAK: send forever lineages through the tombstone comparison"
+[[control.edits]]
 file = "crates/broca-module/src/retention.rs"
 old = "                Some(s.lineage_id.as_str())\n                    == read.lineage_id"
 new = "                // NON-VACUITY BREAK: let any tombstone shadow the live WAL.\n                true || Some(s.lineage_id.as_str())\n                    == read.lineage_id"
@@ -4450,19 +4455,24 @@ file = "crates/broca-module/src/retention.rs"
 old = "            if let Some(stone) = stones.iter().find(|s| {"
 new = "            // NON-VACUITY BREAK: consult the oldest tombstone instead of the WAL's own.\n            if let Some(stone) = stones.iter().min_by_key(|s| s.seq).filter(|s| {"
 
-# The archived-member case is defended twice: lineage_exists counts the member, and address
-# resolution reads the member's records and finds a lineage no tombstone names. Breaking only
-# the lineage_exists member check survives this test, so the row breaks the shared rule that a
-# tombstone answers only for its own lineage.
+# A fresh forever lineage is defended by both its portable/durable placement and the
+# WAL identity comparison. Neutralize the placement bypass as well as the comparison
+# so the real-daemon scenario reaches the shadowing bug. The fresh-retained proof below
+# exercises the comparison independently, without bypassing any production guard.
 [[control]]
 id = "retention-tombstone-never-shadows-fresh-lineage-real-daemon"
 platforms = ["linux", "macos"]
-guards = "an older lineage's tombstone never shadows the fresh forever lineage at its address, live or folded into the archive, on the real daemon"
+guards = "the forever-lineage bypass and WAL identity comparison jointly prevent an older tombstone from shadowing the fresh forever lineage on the real daemon"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module-serve -F broca-module-serve/test-clock --test llm_runner_conformance \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-module-serve/tests/llm_runner_conformance/retention.rs"
 expect_red = ["retention::ck_broca_a_send_waits_for_unfinished_deletion_and_the_fresh_lineage_survives_it"]
+[[control.edits]]
+file = "crates/broca-module/src/retention.rs"
+old = ".is_some_and(|path| *path != self.wal.ephemeral_wal_path(key))"
+new = ".is_some_and(|_| false) // NON-VACUITY BREAK: send forever lineages through the tombstone comparison"
+[[control.edits]]
 file = "crates/broca-module/src/retention.rs"
 old = "                Some(s.lineage_id.as_str())\n                    == read.lineage_id"
 new = "                // NON-VACUITY BREAK: let the older lineage's tombstone shadow the fresh lineage.\n                true || Some(s.lineage_id.as_str())\n                    == read.lineage_id"
@@ -16900,3 +16910,16 @@ select = "expected"
 file = "crates/broca-module/src/retention.rs"
 old = "self.index.live(key)?.filter(|row| row.wal_bytes == bytes)"
 new = "self.index.live(key)?.filter(|_| true) // NON-VACUITY BREAK: trust a stale retention deadline\n"
+
+[[control]]
+id = "retention-fresh-retained-lineage-compares-tombstone"
+guards = "a fresh retained lineage with no summary reads its own WAL identity and is not shadowed by an older lineage's tombstone"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::older_tombstone_does_not_shadow_fresh_retained_lineage"]
+file = "crates/broca-module/src/retention.rs"
+old = "                Some(s.lineage_id.as_str())\n                    == read.lineage_id"
+new = "                // NON-VACUITY BREAK: let an older tombstone shadow a fresh retained lineage.\n                true || Some(s.lineage_id.as_str())\n                    == read.lineage_id"
