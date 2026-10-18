@@ -119,9 +119,14 @@ existing file, also syncs its parent directory and the parents of directories
 created by that open. A directory-open or directory-sync error refuses the barrier;
 the pending pass is cleared only after success. Feature-floor publication likewise
 syncs the renamed floor's parent (including `.` for a bare relative path), and a
-readable floor still needs that proof before a gated append. Non-Unix directory
-sync is an explicit no-op, not a best-effort attempt to open a directory as a file.
-Feature-floor raises hold both an in-process mutex and a cross-process advisory
+readable floor still needs that proof once per process before a gated append. Only
+after a successful file and directory barrier does the process memoize the floor's
+names for that absolute path; covered appends then do no floor filesystem I/O.
+The floor only grows, including across placement and rollback: deleting it or removing
+names while a writer is alive is unsupported. A new name always takes the locked
+durable path. Non-Unix directory sync is an explicit no-op, not a best-effort
+attempt to open a directory as a file.
+Unmemoized feature-floor raises hold both an in-process mutex and a cross-process advisory
 lock on a stable sibling `wal-feature-floor.lock` throughout read, union, write,
 rename and directory sync. The lock file is never renamed or removed by writers;
 session-specific leases alone do not serialize that machine-wide union.

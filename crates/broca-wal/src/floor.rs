@@ -17,10 +17,10 @@
 //! by writing a temporary file in the same directory and renaming it over the old one, so a
 //! reader never sees a half-written floor.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// The floor's file name, in broca's state root (next to the `wal/` directory).
 pub const FEATURE_FLOOR_FILENAME: &str = "wal-feature-floor";
@@ -28,6 +28,27 @@ pub const FEATURE_FLOOR_FILENAME: &str = "wal-feature-floor";
 /// Serializes raises within this process, so two sessions writing their first gated frames at
 /// once cannot each read the old floor and have one rename drop the other's name.
 static RAISE_LOCK: Mutex<()> = Mutex::new(());
+
+// A floor only grows: deleting it or removing names while writers are alive is unsupported.
+// Placement/rollback only reads it, so a successful durability proof remains valid for this
+// process. Key by absolute path to keep distinct state roots (and relative working directories)
+// separate without opening or canonicalizing a file on the append hot path.
+static DURABLE_FLOORS: RwLock<BTreeMap<PathBuf, BTreeSet<String>>> = RwLock::new(BTreeMap::new());
+
+fn memo_covers(path: &Path, names: &[&str]) -> bool {
+    DURABLE_FLOORS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .is_some_and(|floor| names.iter().all(|name| floor.contains(*name)))
+}
+
+fn remember_durable_floor(path: PathBuf, floor: BTreeSet<String>) {
+    DURABLE_FLOORS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path, floor);
+}
 
 /// The names in the floor at `path`. A missing file is an empty floor: nothing gated has been
 /// written here yet. A file that exists but cannot be read is an error, never an empty floor.
@@ -46,25 +67,41 @@ pub fn read_floor(path: &Path) -> std::io::Result<BTreeSet<String>> {
 
 /// Make sure the floor at `path` lists every name in `names`, adding the missing ones.
 ///
-/// Returns without writing when the floor already covers them. Otherwise it writes the union
-/// to a temporary file beside the floor, syncs it, renames it over the floor and syncs the
-/// directory, so the raise is durable before the caller writes the frame that needs it.
+/// Names already proved durable by this process return without filesystem I/O. A cold call
+/// syncs even an already-covered floor; new names are written to a temporary file, synced,
+/// renamed over the floor and directory-synced before the caller writes the gated frame.
 pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
+    let memo_path = std::path::absolute(path)?;
+    if memo_covers(&memo_path, names) {
+        return Ok(());
+    }
     let _guard = RAISE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Another caller may have completed the durable raise while we waited for the slow path.
+    if memo_covers(&memo_path, names) {
+        return Ok(());
+    }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.as_os_str().is_empty() {
+        #[cfg(test)]
+        io_tests::observe(io_tests::Io::CreateDir)?;
         broca_owner_only::create_dir_all(dir)?;
     }
     // Lock a stable sibling, never the floor inode that rename replaces. Different
     // session leases do not serialize updates to this shared machine-wide file.
     let mut options = broca_owner_only::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
+    #[cfg(test)]
+    io_tests::observe(io_tests::Io::Open)?;
     let lock = options.open(lock_path(path))?;
     #[cfg(test)]
     process_tests::before_lock(&lock);
+    #[cfg(test)]
+    io_tests::observe(io_tests::Io::Lock)?;
     lock.lock()?;
+    #[cfg(test)]
+    io_tests::observe(io_tests::Io::Read)?;
     let mut floor = read_floor(path)?;
     #[cfg(test)]
     process_tests::after_read();
@@ -76,28 +113,44 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
         // Sync through a writable handle: Windows `FlushFileBuffers` refuses a read-only one
         // with "Access is denied", while unix accepts either.
         if path.try_exists()? {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)?
-                .sync_all()?;
+            #[cfg(test)]
+            io_tests::observe(io_tests::Io::Open)?;
+            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            #[cfg(test)]
+            io_tests::observe(io_tests::Io::FileSync)?;
+            file.sync_all()?;
         }
-        return crate::directory_sync::sync_dir(dir);
+        #[cfg(test)]
+        io_tests::observe(io_tests::Io::DirSync)?;
+        crate::directory_sync::sync_dir(dir)?;
+        remember_durable_floor(memo_path, floor);
+        return Ok(());
     }
     let temp = temp_path(path);
     let contents: String = floor.iter().map(|name| format!("{name}\n")).collect();
     let written = (|| {
         let mut options = broca_owner_only::OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(test)]
+        io_tests::observe(io_tests::Io::Open)?;
         let mut file = options.open(&temp)?;
         file.write_all(contents.as_bytes())?;
+        #[cfg(test)]
+        io_tests::observe(io_tests::Io::FileSync)?;
         file.sync_all()?;
+        #[cfg(test)]
+        io_tests::observe(io_tests::Io::Rename)?;
         std::fs::rename(&temp, path)
     })();
     if let Err(error) = written {
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
-    crate::directory_sync::sync_dir(dir)
+    #[cfg(test)]
+    io_tests::observe(io_tests::Io::DirSync)?;
+    crate::directory_sync::sync_dir(dir)?;
+    remember_durable_floor(memo_path, floor);
+    Ok(())
 }
 
 fn lock_path(path: &Path) -> PathBuf {
@@ -125,7 +178,7 @@ fn temp_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
+    pub(super) fn scratch(tag: &str) -> PathBuf {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-floor-{tag}-{}-{:?}",
             std::process::id(),
@@ -177,8 +230,8 @@ mod tests {
             );
         }
 
-        std::fs::write(&floor, "  zz-later/v2 \n\nplan-manifest/v1\n").unwrap();
-        raise_floor(&floor, &["scope/v1"]).unwrap();
+        std::fs::write(&floor, "  zz-later/v2 \n\nscope/v1\n").unwrap();
+        raise_floor(&floor, &["plan-manifest/v1"]).unwrap();
         assert_eq!(
             std::fs::read_to_string(&floor).unwrap(),
             "plan-manifest/v1\nscope/v1\nzz-later/v2\n"
@@ -257,3 +310,6 @@ mod windows_acl_tests {
 
 #[cfg(test)]
 mod process_tests;
+
+#[cfg(test)]
+mod io_tests;
