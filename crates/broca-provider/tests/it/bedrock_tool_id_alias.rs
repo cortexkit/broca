@@ -90,7 +90,9 @@ fn legacy_verbatim_ids(prompt: &[Message]) -> (String, String) {
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(json!({"text": text})),
+                    ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                        Some(json!({"text": text}))
+                    }
                     ContentBlock::ToolCall(call) => Some(json!({
                         "toolUse": {
                             "toolUseId": call.tool_call_id.0,

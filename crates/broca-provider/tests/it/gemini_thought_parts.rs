@@ -18,6 +18,16 @@ const MODEL: &str = "gemini-3.5-flash-low";
 const THOUGHT_SUMMARY: &str = "**Analyzing the Problem**\n\nCheck the requested calculation.";
 const SIGNED_REASONING: &str = "I should verify with tools.";
 
+fn signed_text(text: &str, signature: &str) -> ContentBlock {
+    ContentBlock::TextWithState {
+        text: text.into(),
+        provider_state: broca_protocol::content::TextProviderState {
+            format: broca_protocol::content::TextProviderFormat::Gemini,
+            data: json!({"thoughtSignature":signature}).to_string(),
+        },
+    }
+}
+
 fn normalize_response(
     family: &dyn WireFamily,
     frozen: &FrozenRenderConfig,
@@ -113,9 +123,7 @@ fn gemini_preserves_thought_answer_and_parallel_call_source_order() {
                 text: THOUGHT_SUMMARY.into(),
                 signature: None,
             },
-            ContentBlock::Text {
-                text: "Answer: 391.".into(),
-            },
+            signed_text("Answer: 391.", "discarded-answer-signature"),
             ContentBlock::Reasoning {
                 text: SIGNED_REASONING.into(),
                 signature: Some("signed-reasoning".into()),
@@ -149,7 +157,9 @@ fn gemini_preserves_thought_answer_and_parallel_call_source_order() {
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -180,7 +190,7 @@ fn gemini_preserves_thought_answer_and_parallel_call_source_order() {
 #[test]
 fn codeassist_wrapped_fixture_matches_bare_gemini_events() {
     let response = thought_parts_fixture();
-    let gemini = normalize_response(&Gemini, &gemini_frozen_config(MODEL), &response, false);
+    let mut gemini = normalize_response(&Gemini, &gemini_frozen_config(MODEL), &response, false);
     let codeassist = normalize_response(
         &GoogleCodeAssist,
         &google_codeassist_frozen_config(MODEL),
@@ -188,6 +198,21 @@ fn codeassist_wrapped_fixture_matches_bare_gemini_events() {
         true,
     );
 
+    // Both endpoints share the content codec, but their opaque state has distinct owners.
+    for event in &mut gemini {
+        if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) = event {
+            for block in &mut message.content {
+                if let ContentBlock::TextWithState { provider_state, .. } = block {
+                    assert_eq!(
+                        provider_state.format,
+                        broca_protocol::content::TextProviderFormat::Gemini
+                    );
+                    provider_state.format =
+                        broca_protocol::content::TextProviderFormat::GoogleCodeAssist;
+                }
+            }
+        }
+    }
     assert_eq!(codeassist, gemini);
     assert_eq!(assistant_message(&codeassist), assistant_message(&gemini));
 }
@@ -342,9 +367,7 @@ fn adjacent_unsigned_parts_coalesce_without_crossing_signed_boundaries() {
                 text: "after".into(),
                 signature: None,
             },
-            ContentBlock::Text {
-                text: "signed answer".into(),
-            },
+            signed_text("signed answer", "discard"),
             ContentBlock::Text {
                 text: "after answer".into(),
             },

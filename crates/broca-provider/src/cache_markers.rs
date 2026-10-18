@@ -242,7 +242,7 @@ pub fn last_cacheable_block_index(blocks: &[ContentBlock]) -> Option<usize> {
 
 fn is_cacheable_block(block: &ContentBlock) -> bool {
     match block {
-        ContentBlock::Text { text } => !text.is_empty(),
+        ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => !text.is_empty(),
         ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) => true,
         ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => false,
     }

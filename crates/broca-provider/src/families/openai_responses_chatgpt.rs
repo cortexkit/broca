@@ -206,7 +206,7 @@ impl WireFamily for OpenAiResponsesChatgpt {
 
     fn normalizer(
         &self,
-        _frozen: &FrozenRenderConfig,
+        frozen: &FrozenRenderConfig,
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
         // The codex backend streams the same Responses SSE event union → reuse the proven
@@ -215,7 +215,8 @@ impl WireFamily for OpenAiResponsesChatgpt {
             inner: OpenAiResponsesNormalizer::new_for_format(
                 step_id,
                 EncryptedReasoningFormat::OpenAiResponsesChatgpt,
-            ),
+            )
+            .with_text_state(frozen.provider_text_state),
         })
     }
 }

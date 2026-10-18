@@ -419,6 +419,7 @@ pub fn resolve_frozen(
         variant: None,
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
+        provider_text_state: text_state_family(provider.wire_family),
         structured_output: None,
         claude_code_persona: None,
     })
@@ -476,9 +477,41 @@ fn frozen_from_family_defaults(
         variant: None,
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
+        provider_text_state: text_state_family(family),
         structured_output: None,
         claude_code_persona: None,
     }
+}
+
+fn text_state_family(family: WireFamilyId) -> bool {
+    matches!(
+        family,
+        WireFamilyId::OpenAiResponses
+            | WireFamilyId::OpenAiResponsesChatgpt
+            | WireFamilyId::Gemini
+            | WireFamilyId::GoogleCodeAssist
+    )
+}
+
+pub(crate) fn text_state_is_echo_safe(
+    message: &broca_protocol::content::Message,
+    target: Option<&ModelHandle>,
+    format: broca_protocol::content::TextProviderFormat,
+    family: WireFamilyId,
+) -> bool {
+    use broca_protocol::content::TextProviderFormat as F;
+    message.origin.is_some()
+        && message.origin.as_ref() == target
+        && matches!(
+            (format, family),
+            (F::OpenAiResponses, WireFamilyId::OpenAiResponses)
+                | (
+                    F::OpenAiResponsesChatgpt,
+                    WireFamilyId::OpenAiResponsesChatgpt
+                )
+                | (F::Gemini, WireFamilyId::Gemini)
+                | (F::GoogleCodeAssist, WireFamilyId::GoogleCodeAssist)
+        )
 }
 
 /// Build the frozen render config for an Anthropic Claude-subscription model. The
@@ -580,7 +613,8 @@ pub fn bedrock_frozen_config_with_region(
 /// the captured reasoning item byte-verbatim. Old in-flight runs fail the renderer-version
 /// compatibility check rather than silently changing continuation bytes.
 /// v5: normalize model-visible tool names at the render edge.
-pub const OPENAI_RESPONSES_RENDERER_VERSION: u32 = 5;
+/// v6: echo per-item phase from format-tagged text state for newly frozen runs.
+pub const OPENAI_RESPONSES_RENDERER_VERSION: u32 = 6;
 
 /// Build the frozen render config for OpenAI `/v1/responses`: system text in
 /// `instructions`, `max_output_tokens`, flat function tools. Quirks come from
@@ -593,7 +627,8 @@ pub fn openai_responses_frozen_config(wire_model_id: impl Into<String>) -> Froze
 /// v2: render `generationConfig.temperature`, `topP`, and `stopSequences` from
 /// `CallOptions.generation`.
 /// v3: normalize model-visible tool names at the render edge.
-pub const GEMINI_RENDERER_VERSION: u32 = 3;
+/// v4: echo signed text parts, including signature-only empty text.
+pub const GEMINI_RENDERER_VERSION: u32 = 4;
 
 /// Build the frozen render config for Google AI Gemini `generateContent`. Quirks come
 /// from `default_quirks` (the same source the catalog uses).
@@ -631,7 +666,8 @@ pub fn frozen_config_for_family(
 /// output-token defaults.
 /// v4: normalize model-visible tool names at the render edge.
 /// v5: preserve an explicit caller output-token cap, clamped only to the Antigravity tier ceiling.
-pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 5;
+/// v6: retain signed text parts through the shared Gemini codec.
+pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 6;
 
 /// Build the frozen render config for Google Antigravity / Code-Assist. The inner request
 /// body follows Gemini's rendering rules; the cloud project id is not known when reading the
@@ -653,7 +689,8 @@ pub fn google_codeassist_frozen_config(wire_model_id: impl Into<String>) -> Froz
 /// compatibility check rather than silently changing continuation bytes.
 /// v6: normalize model-visible tool names at the render edge.
 /// v7: omit sampling controls that the ChatGPT codex backend rejects as unsupported.
-pub const OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION: u32 = 7;
+/// v8: preserve Responses message phase in newly frozen runs.
+pub const OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION: u32 = 8;
 
 /// Build the frozen render config for the OpenAI ChatGPT codex backend. The body starts from the
 /// OpenAI-Responses shape and applies the codex backend's stricter field set.

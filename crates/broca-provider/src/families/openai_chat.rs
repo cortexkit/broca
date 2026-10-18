@@ -278,7 +278,9 @@ fn convert_assistant(
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &m.content {
         match b {
-            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Text { text: t } | ContentBlock::TextWithState { text: t, .. } => {
+                text.push_str(t)
+            }
             ContentBlock::Reasoning { text, .. } if reasoning_content_required => {
                 reasoning.push_str(text);
             }
@@ -339,7 +341,9 @@ fn user_text_content(blocks: &[ContentBlock]) -> Value {
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -358,7 +362,7 @@ fn user_text_content(blocks: &[ContentBlock]) -> Value {
 fn text_content(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        if let ContentBlock::Text { text } = b {
+        if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
             s.push_str(text);
         }
     }

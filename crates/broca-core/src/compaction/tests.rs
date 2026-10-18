@@ -83,6 +83,24 @@ fn structural_rule_authored_signed_reasoning_is_refused() {
         ]));
     }
 }
+
+#[test]
+fn text_provider_state_can_only_be_carried_as_an_unchanged_original() {
+    let original: Message = serde_json::from_value(json!({"role":"assistant","origin":{"provider_module_id":"p","model_id":"m"},"content":[{"type":"text_with_state","text":"answer","provider_state":{"format":"gemini","data":"opaque"}}]})).unwrap();
+    let raw = vec![original.clone(), text(Role::User, "tail")];
+    let carried = CompactionMessage::new("c", 2, Range::new(0, 1), vec![encoded(&original)]);
+    assert!(validate_answer(&fence(), &answer(carried), 99, &raw).is_ok());
+    let mut forged = original.clone();
+    forged.origin = None;
+    if let ContentBlock::TextWithState { text, .. } = &mut forged.content[0] {
+        text.push_str(" rewritten");
+    }
+    let changed = CompactionMessage::new("c", 2, Range::new(0, 1), vec![encoded(&forged)]);
+    assert_eq!(
+        validate_answer(&fence(), &answer(changed), 99, &raw),
+        Err(CompactionDisposition::Structural)
+    );
+}
 #[test]
 fn structural_rule_system_is_refused() {
     rejected(compaction(vec![encoded(&text(Role::System, "head"))]));

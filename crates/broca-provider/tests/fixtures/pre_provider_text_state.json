@@ -1,0 +1,18 @@
+[
+  {
+    "body": "{\"input\":[{\"content\":\"question\",\"role\":\"user\",\"type\":\"message\"},{\"content\":\"commentaryanswer\",\"role\":\"assistant\",\"type\":\"message\"}],\"max_output_tokens\":2048,\"model\":\"model\",\"stream\":true}",
+    "frozen": {"family_id":"openai_responses","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":5,"system_prompt":{"mode":"instructions_field"},"token_limit_field":"max_output_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"model"}
+  },
+  {
+    "body": "{\"input\":[{\"content\":\"question\",\"role\":\"user\",\"type\":\"message\"},{\"content\":\"commentaryanswer\",\"role\":\"assistant\",\"type\":\"message\"}],\"model\":\"model\",\"store\":false,\"stream\":true}",
+    "frozen": {"family_id":"openai_responses_chatgpt","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":7,"system_prompt":{"mode":"instructions_field"},"token_limit_field":"max_output_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"model"}
+  },
+  {
+    "body": "{\"contents\":[{\"parts\":[{\"text\":\"question\"}],\"role\":\"user\"},{\"parts\":[{\"text\":\"commentary\"},{\"text\":\"answer\"}],\"role\":\"model\"}],\"generationConfig\":{\"maxOutputTokens\":2048}}",
+    "frozen": {"family_id":"gemini","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":3,"system_prompt":{"mode":"system_instruction_field"},"token_limit_field":"gemini_max_output_tokens","tool_id":"synthetic_index","usage":"gemini_usage_metadata","wire_model_id":"model"}
+  },
+  {
+    "body": "{\"model\":\"model\",\"project\":\"test-project\",\"request\":{\"contents\":[{\"parts\":[{\"text\":\"question\"}],\"role\":\"user\"},{\"parts\":[{\"text\":\"commentary\"},{\"text\":\"answer\"}],\"role\":\"model\"}],\"generationConfig\":{\"maxOutputTokens\":2048}},\"requestId\":\"agent/dec3c48c-96f7-7cde-670c-9be8ef9f3295/2/df4b0c50-9a6a-ea1c-ee1a-2806f075a3bb/2\",\"requestType\":\"agent\",\"userAgent\":\"antigravity\"}",
+    "frozen": {"family_id":"google_codeassist","max_output_tokens":2048,"project_id":"test-project","reasoning":{"mode":"none"},"renderer_version":5,"system_prompt":{"mode":"system_instruction_field"},"token_limit_field":"gemini_max_output_tokens","tool_id":"synthetic_index","usage":"gemini_usage_metadata","wire_model_id":"model"}
+  }
+]
