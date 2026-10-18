@@ -60,28 +60,6 @@ fn fold_separates_durable_containers_and_preserves_placement_on_restore() {
         .addresses()
         .unwrap()
         .contains(&crate::session_addr(&durable)));
-    reader.start_move_inventory(tokio_util::sync::CancellationToken::new());
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                reader.wait_move_inventory(),
-            )
-            .await
-            .unwrap();
-        });
-    let reference =
-        cortexkit_role_llm_runner::session_ref("runner", "/fold-test", &durable.session);
-    let inventory = reader.move_session_refs(std::iter::once(reference.as_str()));
-    assert!(
-        inventory.unreadable.is_empty(),
-        "{:?}",
-        inventory.unreadable
-    );
-    assert!(inventory.sessions.contains_key(&reference));
     drop(
         reader
             .open_with_class(&durable, None, Some("head"))

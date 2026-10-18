@@ -287,7 +287,7 @@ async fn connection_eof_does_not_drop_prepare_between_freeze_and_cover() {
 }
 
 #[tokio::test]
-async fn busy_one_ref_reads_only_its_wal_after_inventory_build() {
+async fn busy_one_ref_reads_only_its_wal_through_store() {
     let rig = Rig::new("inventory-cost", Arc::new(FakeDoor::default()));
     for i in 0..128 {
         rig.seed(
@@ -317,10 +317,7 @@ async fn busy_one_ref_reads_only_its_wal_after_inventory_build() {
     assert_eq!(response.header.ty, FrameType::Response);
     let health: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(health["metrics"]["agent_data_ops"]["busy"], 1);
-    assert_eq!(
-        health["metrics"]["agent_data_inventory"],
-        json!({"ready":true,"unreadable":0})
-    );
+    assert!(health["metrics"].get("agent_data_inventory").is_none());
 }
 
 #[tokio::test]
@@ -376,7 +373,7 @@ async fn empty_refs_do_not_start_or_read_inventory() {
     let rig = Rig::new("empty-inventory", Arc::new(FakeDoor::default()));
     rig.seed(&rig.session("broken"), "broken-run", true);
     unreadable_wal(&rig, &rig.session("broken"));
-    let mut wire = Wire::without_inventory(&rig, entorhinal(), true, Value::Null).await;
+    let mut wire = Wire::connect(&rig, entorhinal(), true, Value::Null).await;
     assert_eq!(
         wire.call("busy", json!({"refs":[]})).await.unwrap(),
         json!({"refs":[]})
@@ -391,29 +388,47 @@ async fn empty_refs_do_not_start_or_read_inventory() {
 }
 
 #[tokio::test]
-async fn incomplete_inventory_is_unknown_until_boot_build_finishes() {
-    let rig = Rig::new("inventory-not-ready", Arc::new(FakeDoor::default()));
-    let absent = rig.session("not-here");
-    let mut wire = Wire::without_inventory(&rig, entorhinal(), true, Value::Null).await;
-    let params = rig.params(CUT, &[absent]);
-    wire.send(0, 0, 12, FrameType::Request, json!({"op":"health.check"}))
-        .await;
-    let health: Value = serde_json::from_slice(&wire.next().await.body).unwrap();
+async fn lagging_projection_never_reports_absent() {
+    let rig = Rig::new("projection-lag", Arc::new(FakeDoor::default()));
+    let session = rig.session("just-admitted");
+    // Model a downgraded writer: its run row reaches disk without the new
+    // admission hook. The trigger must make missing refs unknown until repaired.
+    let old_writer = FileWalStore::new(rig.root.join("wal"));
+    old_writer
+        .open(&session)
+        .unwrap()
+        .append(1, &started(&session, "legacy-run"), true)
+        .unwrap();
+    let conn = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
+    conn.execute(
+        "INSERT INTO run_index(run_id,session,state) VALUES(?1,?2,'active')",
+        rusqlite::params!["legacy-run", serde_json::to_string(&session).unwrap()],
+    )
+    .unwrap();
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let params = rig.params(CUT, std::slice::from_ref(&session));
     assert_eq!(
-        health["metrics"]["agent_data_inventory"],
-        json!({"ready":false,"unreadable":0})
+        wire.call("diverged", params.clone()).await.unwrap()["refs"][0]["state"],
+        "unknown"
     );
-    let reply = wire.call("diverged", params.clone()).await.unwrap();
-    assert_eq!(reply["refs"][0]["state"], "unknown");
-    assert_eq!(rig.wal.move_read_count(), 0);
-    rig.service.wait_inventory().await;
-    let reply = wire.call("diverged", params).await.unwrap();
-    assert_eq!(reply["refs"][0]["state"], "at_cut");
-    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        wire.call("busy", json!({"refs":params["refs"]}))
+            .await
+            .unwrap()["refs"][0]["state"],
+        "unknown"
+    );
+    let repaired = rig.reopen();
+    let mut wire = Wire::new(&repaired, entorhinal(), true).await;
+    assert_eq!(
+        wire.call("busy", json!({"refs":params["refs"]}))
+            .await
+            .unwrap()["refs"][0]["state"],
+        "busy"
+    );
 }
 
 #[tokio::test]
-async fn unsynced_run_started_after_build_publishes_new_session() {
+async fn admission_is_discoverable_before_sync_and_acknowledgment() {
     let rig = Rig::new("inventory-admission", Arc::new(FakeDoor::default()));
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     let session = rig.session("new-session");
@@ -424,8 +439,9 @@ async fn unsynced_run_started_after_build_publishes_new_session() {
         .unwrap()
         .to_owned();
     assert_eq!(
-        rig.wal
-            .move_session_refs(std::iter::once(reference.as_str()))
+        rig.index
+            .session_refs(std::iter::once(reference.as_str()))
+            .unwrap()
             .sessions
             .len(),
         1
@@ -440,7 +456,7 @@ async fn unsynced_run_started_after_build_publishes_new_session() {
 }
 
 #[tokio::test]
-async fn archived_ref_survives_fold_and_extraction_after_build() {
+async fn archived_ref_survives_fold_and_extraction_through_store() {
     let rig = Rig::new("inventory-fold", Arc::new(FakeDoor::default()));
     let session = rig.session("folded");
     rig.seed(&session, "folded-run", true);
@@ -486,7 +502,7 @@ async fn rekeyed_wal_does_not_claim_its_historical_triple() {
 }
 
 #[tokio::test]
-async fn boot_inventory_finds_eligible_identity_after_historical_runs() {
+async fn restart_preserves_eligible_identity_after_historical_runs() {
     let mut rig = Rig::new("inventory-late-identity", Arc::new(FakeDoor::default()));
     let old = rig.session("old");
     let current = rig.session("current");
@@ -495,7 +511,7 @@ async fn boot_inventory_finds_eligible_identity_after_historical_runs() {
     wal.append(1, &started(&current, "current-run"), true)
         .unwrap();
     drop(wal);
-    // A new store has no append notifications from the seeding process.
+    // Reopening the WAL store must use the durable projection, not append notifications.
     rig.wal = Arc::new(FileWalStore::new(rig.root.join("wal")));
     rig.service = Arc::new(AgentDataService::new(
         rig.root.clone(),
@@ -512,10 +528,11 @@ async fn boot_inventory_finds_eligible_identity_after_historical_runs() {
         "busy"
     );
     assert_eq!(
-        rig.wal
-            .move_session_refs(std::iter::once(
+        rig.index
+            .session_refs(std::iter::once(
                 rig.params(CUT, &[old])["refs"][0]["ref"].as_str().unwrap()
             ))
+            .unwrap()
             .sessions
             .len(),
         0
@@ -523,39 +540,73 @@ async fn boot_inventory_finds_eligible_identity_after_historical_runs() {
 }
 
 #[tokio::test]
-#[ignore = "synthetic 3000-session timing experiment"]
-async fn inventory_thousands_session_timing() {
-    let rig = Rig::new("inventory-timing", Arc::new(FakeDoor::default()));
-    for i in 0..3000 {
-        rig.seed(
-            &rig.session(&format!("session-{i}")),
-            &format!("run-{i}"),
-            true,
-        );
+async fn boot_cleans_legacy_inventory_without_a_build_or_wal_reads() {
+    let rig = Rig::new("boot-no-inventory", Arc::new(FakeDoor::default()));
+    for name in [
+        "move-inventory.json",
+        "move-inventory.tmp-123-456",
+        "move-inventory.tmp-789-012",
+    ] {
+        std::fs::write(rig.root.join(name), vec![0; 8192]).unwrap();
     }
-    let start = std::time::Instant::now();
-    let (addresses, unreadable) = rig.wal.move_addresses().unwrap();
-    assert!(unreadable.is_empty());
-    let mut bytes = 0;
-    for address in addresses {
-        bytes += std::fs::metadata(rig.wal.root().join(format!("{address}.wal")))
+    rig.service.reconcile_boot().await.unwrap();
+    for entry in std::fs::read_dir(&rig.root).unwrap() {
+        assert!(!entry
             .unwrap()
-            .len();
-        // Reproduce the old plan's identity discovery without its move-only API.
-        assert!(!rig.wal.read_address_records(&address).unwrap().is_empty());
+            .file_name()
+            .to_string_lossy()
+            .starts_with("move-inventory"));
     }
-    let before_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let start = std::time::Instant::now();
-    rig.service.wait_inventory().await;
-    let build_ms = start.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(rig.wal.move_read_count(), 0);
+    assert!(
+        rig.index
+            .session_refs(std::iter::once("00000000000000000000000000000000"))
+            .unwrap()
+            .complete
+    );
+    #[cfg(target_os = "linux")]
+    {
+        for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            if let Ok(name) = std::fs::read_to_string(task.path().join("comm")) {
+                assert!(!name.starts_with("move-inventory"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn activation_registers_installed_ref_before_acknowledgment() {
+    let (rig, params, bytes) = incoming_rig("projection-activation");
+    let reference = params["refs"][0]["ref"].as_str().unwrap();
+    assert!(rig
+        .index
+        .session_refs([reference].into_iter())
+        .unwrap()
+        .sessions
+        .is_empty());
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let params = json!({"refs":rig.params(CUT, &[rig.session("session-0")])["refs"]});
-    let start = std::time::Instant::now();
-    for _ in 0..10 {
-        assert_eq!(
-            wire.call("busy", params.clone()).await.unwrap()["refs"][0]["state"],
-            "idle"
-        );
-    }
-    eprintln!("inventory benchmark: sessions=3000 bytes={bytes} old_discovery_ms={before_ms:.3} boot_build_ms={build_ms:.3} indexed_busy_ms={:.3}", start.elapsed().as_secs_f64() * 100.0);
+    wire.call("import", params.clone()).await.unwrap();
+    assert!(
+        rig.index
+            .session_refs([reference].into_iter())
+            .unwrap()
+            .sessions
+            .is_empty(),
+        "staging is not a held local session"
+    );
+    wire.call("activate", params.clone()).await.unwrap();
+    let found = rig.index.session_refs([reference].into_iter()).unwrap();
+    assert!(found.complete);
+    let session = &found.sessions[reference].1;
+    assert_eq!(rig.wal.bytes_for_move(session).unwrap().unwrap(), bytes);
+    let reopened = rig.reopen();
+    assert_eq!(
+        reopened
+            .index
+            .session_refs([reference].into_iter())
+            .unwrap()
+            .sessions[reference]
+            .1,
+        *session
+    );
 }

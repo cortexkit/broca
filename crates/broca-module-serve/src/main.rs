@@ -260,6 +260,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
             .map_err(|e| ServeIoError(format!("open run index: {e}")))?,
     );
+    wal_store.set_session_ref_index(run_index.clone());
     // Budget caps have their own durability domain. Keeping this database separate
     // prevents session WAL and run-index maintenance from changing admission state.
     let cap_store = Arc::new(

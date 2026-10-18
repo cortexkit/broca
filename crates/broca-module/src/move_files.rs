@@ -886,31 +886,34 @@ impl CutArtifacts for FileCutArtifacts {
             }
             Op::Activate => {
                 let paths = self.paths(&cut_id, &locked.plans)?;
+                // Persist discovery before rename: even an interrupted installation
+                // must not leave durable local bytes behind a missing session ref.
+                for plan in &locked.plans {
+                    let range =
+                        broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
+                            .map_err(unavailable)?;
+                    let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+                        return Err(unavailable(
+                            "incoming move WAL has incomplete identity records",
+                        ));
+                    };
+                    for frame in records {
+                        if let broca_wal::WalRecord::RunStarted { session, .. } = &frame.record {
+                            self.wal
+                                .record_session_before_install(
+                                    &broca_core::session_addr(&plan.session),
+                                    session,
+                                )
+                                .map_err(unavailable)?;
+                        }
+                    }
+                }
                 move_install::install_verified(
                     &self.state_root,
                     &cut_id,
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),
                     |session| {
-                        let plan = locked
-                            .plans
-                            .iter()
-                            .find(|plan| &plan.session == session)
-                            .ok_or_else(|| "installed session has no move plan".to_owned())?;
-                        let range = broca_wal::file_wal::read_verified_member_range(
-                            &plan.bytes,
-                            0,
-                            0,
-                            None,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
-                            return Err(
-                                "installed move WAL has incomplete identity records".to_owned()
-                            );
-                        };
-                        self.wal
-                            .publish_move_records(&broca_core::session_addr(session), records);
                         // Ownership sidecars retain the canonical wal/ address so every
                         // transcript tree shares one move refusal and one writer lease.
                         migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
@@ -918,12 +921,7 @@ impl CutArtifacts for FileCutArtifacts {
                         self.driver.drop_projection(session)
                     },
                 )
-                .map_err(|e| {
-                    self.wal.invalidate_move_inventory(format!(
-                        "cut {cut_id} installation did not complete"
-                    ));
-                    self.install_error(&cut_id, _state, &locked, e)
-                })?;
+                .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;
             }
             Op::Abort => {
                 self.rollback(request, _state).await?;

@@ -644,3 +644,38 @@ fn absent_staging_parents_still_sync_the_nearest_existing_directory() {
         Some(&Event::DirectorySync(directory))
     );
 }
+
+#[test]
+fn indexed_fences_track_intent_publication_completion_and_restart() {
+    let root =
+        broca_test_support::scratch_root().join(format!("indexed-fences-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("wal")).unwrap();
+    let reference = "0123456789abcdef0123456789abcdef";
+    let wal = root.join("wal/session.wal");
+    let cut = root.join("agent-data/cuts/cut.json");
+    let pending = serde_json::json!({"intent":{"op":"activate"},"refs":[{"ref_kind":"broca-session","ref":reference}]});
+    rebuild_fence_index(&root).unwrap();
+    assert_eq!(check(&wal, reference, true).unwrap(), Ok(()));
+    atomic_json(&root, &cut, &pending).unwrap();
+    assert!(
+        matches!(check(&wal,reference,true).unwrap(),Err(MoveRefusal::Moving { cut_id }) if cut_id=="cut")
+    );
+    assert_eq!(check(&wal, reference, false).unwrap(), Ok(()));
+    assert_eq!(
+        check(&wal, "00000000000000000000000000000000", true).unwrap(),
+        Ok(())
+    );
+    atomic_json(&root, &cut, &serde_json::json!({"intent":null})).unwrap();
+    assert_eq!(check(&wal, reference, true).unwrap(), Ok(()));
+    // An older binary updates only cut JSON. Boot must rebuild before enabling
+    // the shortcut, rather than trusting the previous process's ready marker.
+    std::fs::write(&cut, serde_json::to_vec(&pending).unwrap()).unwrap();
+    rebuild_fence_index(&root).unwrap();
+    assert!(matches!(
+        check(&wal, reference, true).unwrap(),
+        Err(MoveRefusal::Moving { .. })
+    ));
+    std::fs::write(&cut, b"not json").unwrap();
+    assert!(rebuild_fence_index(&root).is_err());
+    assert!(check(&wal, reference, true).is_err());
+}

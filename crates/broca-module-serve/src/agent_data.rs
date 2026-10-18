@@ -75,6 +75,8 @@ pub struct AgentDataService {
     cuts: CutStore,
     artifacts: FileCutArtifacts,
     wal: Arc<FileWalStore>,
+    index: Arc<broca_store::SqliteStore>,
+    projection_started: std::sync::atomic::AtomicBool,
     op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
@@ -85,6 +87,7 @@ impl AgentDataService {
         index: Arc<broca_store::SqliteStore>,
         door: Arc<dyn SessionDoor>,
     ) -> Self {
+        wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
             root: root.clone(),
             wal: wal.clone(),
@@ -93,24 +96,52 @@ impl AgentDataService {
         });
         Self {
             cuts: CutStore::new(&root),
-            artifacts: FileCutArtifacts::new(root.clone(), registry, wal.clone(), index, driver),
+            artifacts: FileCutArtifacts::new(
+                root.clone(),
+                registry,
+                wal.clone(),
+                index.clone(),
+                driver,
+            ),
+            index,
             wal,
+            projection_started: std::sync::atomic::AtomicBool::new(false),
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
-    pub fn start_inventory(&self) {
-        // The store may outlive this service and be shared with another one.
-        // A service drop must not cancel their one-shot boot inventory.
-        self.wal
-            .start_move_inventory(tokio_util::sync::CancellationToken::new());
-    }
-    pub async fn wait_inventory(&self) {
-        self.start_inventory();
-        self.wal.wait_move_inventory().await;
-    }
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
-        self.start_inventory();
-        self.cuts.reconcile_boot(&self.artifacts).await
+        broca_store::session_refs::cleanup_legacy_inventory(
+            self.wal.root().parent().unwrap_or(self.wal.root()),
+        )
+        .map_err(unavailable)?;
+        broca_wal::migration::rebuild_fence_index(
+            self.wal.root().parent().unwrap_or(self.wal.root()),
+        )
+        .map_err(unavailable)?;
+        self.cuts.reconcile_boot(&self.artifacts).await?;
+        if !self
+            .index
+            .session_refs(std::iter::empty())
+            .map_err(unavailable)?
+            .complete
+            && !self.projection_started.swap(true, Ordering::SeqCst)
+        {
+            let wal = self.wal.clone();
+            let db = wal
+                .root()
+                .parent()
+                .unwrap_or(wal.root())
+                .join("run-index.db");
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = broca_store::session_refs::migrate(
+                    &db,
+                    &broca_core::ReadOnlyWalReader::new(wal.root().parent().unwrap_or(wal.root())),
+                ) {
+                    tracing::warn!(%error, "session-ref migration incomplete; missing refs remain unknown");
+                }
+            });
+        }
+        Ok(())
     }
 }
 
@@ -143,13 +174,6 @@ pub(crate) fn health_counts(service: Option<&AgentDataService>) -> Value {
             })
             .collect(),
     )
-}
-
-pub(crate) fn inventory_health(service: Option<&AgentDataService>) -> Value {
-    service.map_or(Value::Null, |service| {
-        let (ready, unreadable) = service.wal.move_inventory_health();
-        json!({"ready": ready, "unreadable": unreadable})
-    })
 }
 
 struct OpObservation {
@@ -410,16 +434,26 @@ impl Driver {
         }
     }
     fn local_sessions(&self, refs: &Refs) -> SessionInventory {
-        let inventory = self
-            .wal
-            .move_session_refs(refs.iter().map(|r| r.r#ref.as_str()));
-        SessionInventory {
-            sessions: inventory
-                .sessions
-                .into_iter()
-                .map(|(reference, (_, session))| (reference, session))
-                .collect(),
-            unreadable: inventory.unreadable,
+        match self
+            .index
+            .session_refs(refs.iter().map(|r| r.r#ref.as_str()))
+        {
+            Ok(found) => SessionInventory {
+                sessions: found
+                    .sessions
+                    .into_iter()
+                    .map(|(reference, (_, session))| (reference, session))
+                    .collect(),
+                unreadable: if found.complete {
+                    Vec::new()
+                } else {
+                    vec!["session-ref projection is behind admissions".into()]
+                },
+            },
+            Err(error) => SessionInventory {
+                sessions: BTreeMap::new(),
+                unreadable: vec![error.to_string()],
+            },
         }
     }
 }
@@ -427,7 +461,7 @@ impl Driver {
 #[async_trait::async_trait]
 impl MoveDriver for Driver {
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
-        // Empty move probes must not depend on inventory readiness or touch WALs.
+        // Empty move probes must not depend on the projection or touch WALs.
         if refs.iter().next().is_none() {
             return Ok(MovePlans::default());
         }
@@ -495,7 +529,7 @@ impl MoveDriver for Driver {
                     )
                 } else {
                     format!(
-                        "cannot resolve ref {} while WAL addresses are unreadable: {}",
+                        "cannot resolve ref {} while session discovery is uncertain: {}",
                         reference.r#ref,
                         unreadable.join(", ")
                     )

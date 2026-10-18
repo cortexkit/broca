@@ -317,6 +317,12 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, StoreError>>()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        tx.execute("INSERT INTO agent_data_writer VALUES(1)", [])?;
+        crate::session_refs::insert(
+            &tx,
+            &broca_core::session_addr(&lineage.session),
+            &lineage.session,
+        )?;
         for question in questions {
             if question.lineage_id != lineage.lineage_id || question.session != lineage.session {
                 return Err(StoreError::InconsistentSnapshot(
@@ -397,6 +403,7 @@ impl SqliteStore {
                 ));
             }
         }
+        tx.execute("DELETE FROM agent_data_writer", [])?;
         tx.commit()?;
         Ok(())
     }

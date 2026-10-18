@@ -30,9 +30,11 @@ use tokio::sync::{broadcast, oneshot};
 use crate::lease::LeaseHandle;
 
 mod extraction;
-mod move_inventory;
 mod retention_changes;
-pub use move_inventory::{MoveInventory, MoveInventoryBuildStats};
+mod projection_reader;
+pub use projection_reader::ReadOnlyWalReader;
+mod session_index;
+pub use session_index::{agent_session_ref, SessionRefIndex};
 
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
@@ -248,7 +250,7 @@ pub struct FileWalStore {
     root: PathBuf,
     backup_classes: Vec<String>,
     max_read_bytes: u64,
-    move_inventory: Arc<move_inventory::InventoryState>,
+    session_index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
     move_reads: AtomicU64,
     retention_changes: Arc<retention_changes::Changes>,
 }
@@ -441,7 +443,7 @@ impl FileWalStore {
                         if cancelled() {
                             return Err(WalError::Io(io::Error::new(
                                 io::ErrorKind::Interrupted,
-                                "move inventory cancelled",
+                                "WAL address enumeration cancelled",
                             )));
                         }
                         let path = match entry {
@@ -466,7 +468,7 @@ impl FileWalStore {
             if cancelled() {
                 return Err(WalError::Io(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "move inventory cancelled",
+                    "WAL address enumeration cancelled",
                 )));
             }
             if let Err(error) = self.resolve_live_address(&address) {
@@ -485,7 +487,7 @@ impl FileWalStore {
             if cancelled() {
                 return Err(WalError::Io(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "move inventory cancelled",
+                    "WAL address enumeration cancelled",
                 )));
             }
             let members = broca_wal::archive::ArchiveReader::open(&path, self.max_read_bytes)
@@ -516,7 +518,7 @@ impl FileWalStore {
             root: root.into(),
             backup_classes: vec!["head".into()],
             max_read_bytes: DEFAULT_MAX_READ_BYTES,
-            move_inventory: Arc::default(),
+            session_index: Arc::default(),
             move_reads: AtomicU64::new(0),
             retention_changes: Arc::default(),
         }
@@ -737,8 +739,8 @@ impl FileWalStore {
             } else {
                 self.wal_path(session)
             };
-            // Extraction preserves the logical address and payload, so the move
-            // identity inventory remains valid without decoding the member again.
+            // Extraction preserves the logical address and payload; session-ref
+            // candidates need no location update.
             extraction::restore(&path, &member.payload).map_err(WalError::Io)?;
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
@@ -790,10 +792,10 @@ impl FileWalStore {
             wal.with_recovery_cap(self.append_cap(retained_size::SizeScope::Session)?)
         };
         let wal: Box<dyn Wal + Send> = Box::new(
-            move_inventory::IndexedWal::new(
+            session_index::AdmissionWal::new(
                 wal,
                 session_addr(session),
-                self.move_inventory.clone(),
+                self.session_index.clone(),
             )
             .with_placement(
                 self.wal_path(session),
