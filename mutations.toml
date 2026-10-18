@@ -11423,11 +11423,10 @@ select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::tests::floor_directory_eio_refuses_gated_append"]
 file = "crates/broca-wal/src/floor.rs"
-old = '''    crate::directory_sync::sync_dir(dir)
-}'''
+old = '''    crate::directory_sync::sync_dir(dir)?;
+    remember_durable_floor(memo_path, floor);'''
 new = '''    let _ = crate::directory_sync::sync_dir(dir); // NON-VACUITY BREAK
-    Ok(())
-}'''
+    remember_durable_floor(memo_path, floor);'''
 
 [[control]]
 id = "floor-readable-is-not-durable"
@@ -11440,8 +11439,37 @@ select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
 expect_red = ["file_wal::tests::floor_directory_eio_refuses_gated_append"]
 file = "crates/broca-wal/src/floor.rs"
-old = 'return crate::directory_sync::sync_dir(dir);'
-new = 'return Ok(()); // NON-VACUITY BREAK'
+old = '''        crate::directory_sync::sync_dir(dir)?;
+        remember_durable_floor(memo_path, floor);'''
+new = '''        let _ = dir; // NON-VACUITY BREAK: a readable floor is not durable
+        remember_durable_floor(memo_path, floor);'''
+
+[[control]]
+id = "floor-memo-skips-covered-io"
+guards = "A process-durable floor skips all floor filesystem I/O on later gated appends"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/floor/io_tests.rs"
+expect_red = ["floor::io_tests::covered_gated_append_has_no_floor_io"]
+file = "crates/broca-wal/src/floor.rs"
+old = '.is_some_and(|floor| names.iter().all(|name| floor.contains(*name)))'
+new = '.is_some_and(|floor| false && names.iter().all(|name| floor.contains(*name))) // NON-VACUITY BREAK: bypass the durable memo'
+
+[[control]]
+id = "floor-memo-only-after-sync"
+guards = "Failed floor publication never memoizes names or permits a gated frame on retry"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/floor/io_tests.rs"
+expect_red = ["floor::io_tests::failed_floor_sync_never_memoizes_or_writes_a_gated_frame"]
+file = "crates/broca-wal/src/floor.rs"
+old = '    floor.extend(names.iter().map(|name| (*name).to_owned()));'
+new = '''    floor.extend(names.iter().map(|name| (*name).to_owned()));
+    remember_durable_floor(memo_path.clone(), floor.clone()); // NON-VACUITY BREAK: cache before sync'''
 
 [[control]]
 id = "floor-relative-directory-barrier"
