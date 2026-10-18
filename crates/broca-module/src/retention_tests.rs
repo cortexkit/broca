@@ -959,6 +959,44 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
 }
 
 #[test]
+fn older_tombstone_does_not_shadow_fresh_retained_lineage() {
+    let rig = Rig::new();
+    let old = rig.seed(1, 100, Some(200));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    assert_eq!(
+        rig.service.delete_expired(&rig.key, 1200).unwrap(),
+        Some(old.clone())
+    );
+    drop(lease);
+    let stone = rig.service.tombstones(&rig.key).unwrap().pop().unwrap();
+    assert_eq!(stone.lineage_id, old);
+    assert!(stone.completed_at_ms.is_some());
+
+    let now = rig.service.clock.now_ms();
+    let fresh = rig.seed_run("fresh", RETAINED_SECONDS, now, Some(now));
+    assert_ne!(fresh, old);
+    assert_eq!(
+        rig.service.wal.resolve_live_path(&rig.key).unwrap(),
+        Some(rig.service.wal.ephemeral_wal_path(&rig.key))
+    );
+    // No summary exists for the fresh lineage: expiry must read its WAL and compare
+    // that lineage's identity with the older tombstone before refreshing the summary.
+    assert!(rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .is_none());
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+    let row = rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.lineage_id, fresh);
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+}
+
+#[test]
 fn unfinished_deletion_resumes_each_disk_boundary_and_never_moves_a_new_lineage() {
     for cut in 0..3 {
         let rig = Rig::new();
