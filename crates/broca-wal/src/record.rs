@@ -1100,10 +1100,58 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_openrouter_reasoning() {
+            with_feature(base, crate::framing::OPENROUTER_REASONING_FEATURE)
+        } else {
+            base
+        };
         if self.carries_structured_output() {
             with_feature(base, crate::framing::STRUCTURED_OUTPUT_FEATURE)
         } else {
             base
+        }
+    }
+
+    /// The OpenRouter format is a closed-enum addition that older content decoders reject.
+    /// The frozen `reasoning_echo` policy selects OpenRouter's continuation representation and
+    /// assistant-turn coverage. Gate that policy before any response arrives too, so rollback
+    /// refuses by feature name instead of silently ignoring the run's echo requirements.
+    fn carries_openrouter_reasoning(&self) -> bool {
+        use broca_protocol::content::{ContentBlock, EncryptedReasoningFormat};
+        let blocks = |content: &[ContentBlock]| {
+            content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::RedactedReasoning {
+                        provider_format: Some(EncryptedReasoningFormat::OpenRouter),
+                        ..
+                    }
+                )
+            })
+        };
+        let messages = |input: &[Message]| input.iter().any(|message| blocks(&message.content));
+        let frozen = |config: &Value| {
+            config
+                .get("reasoning_echo")
+                .and_then(|policy| policy.get("format"))
+                .and_then(Value::as_str)
+                == Some("open_router_details")
+        };
+        match self {
+            Self::RunStarted { config, input, .. } => {
+                frozen(&config.frozen_render_config) || messages(input)
+            }
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen(frozen_render_config),
+            Self::ModelStepFinished {
+                assistant_message, ..
+            } => blocks(&assistant_message.content),
+            Self::Queued { request, .. } => messages(&request.input),
+            Self::Steered { input, .. } => messages(input),
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
         }
     }
 

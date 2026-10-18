@@ -85,6 +85,20 @@ outbound bytes on resume. State is echoed only when its format tag names the tar
 protocol and the assistant message's recorded provider/model IDs both match the target model.
 Unknown origins fail closed; visible text remains portable.
 
+OpenRouter's `redacted_reasoning` blocks with `provider_format: "open_router"` and frozen
+`reasoning_echo.format: "open_router_details"` policies require **`openrouter-reasoning/v1`**.
+The reader and writer for this feature ship together. It is distinct from
+`provider-text-state/v1`: it protects structured reasoning arrays, encrypted entries and their
+echo policy, not text-part phases or signatures. Every record carrying that content (run input,
+queued or steered input, model output, compaction replacement) or policy (run start or refreeze)
+is gated; the feature floor is raised before the frame is appended. Older readers refuse by
+feature name before attempting to deserialize the closed `provider_format` enum. Records without
+OpenRouter state retain their previous frame requirements and bytes, including scalar reasoning
+policies for DeepSeek and Kimi. Legacy frozen configs still render their recorded bytes; this
+addition does not change a renderer version. Older binaries ignore an unknown `reasoning_echo`
+field in typed config decoding, but actual resumes refuse on recorded/current config drift
+rather than silently sending a request without the echo.
+
 ## 3. The barrier (per turn's tool batch)
 
 On Unix, the first WAL barrier after **every open**, including recovery of an

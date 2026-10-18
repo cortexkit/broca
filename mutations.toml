@@ -16328,3 +16328,16 @@ expect_red = ["reasoning_content_required::echo_policy_turn_coverage_is_frozen_d
 file = "crates/broca-provider/src/families/openai_chat.rs"
 old = "p.turns == ReasoningEchoTurns::EveryAssistant || msg.get(\"tool_calls\").is_some()"
 new = "p.turns == ReasoningEchoTurns::EveryAssistant || true // NON-VACUITY BREAK: ignore tool-only coverage\n"
+
+[[control]]
+id = "wal-openrouter-reasoning-must-understand"
+guards = "OpenRouter continuation content and frozen policy are written only in frames requiring openrouter-reasoning/v1 so older readers refuse by name before decoding"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing/openrouter_reasoning_tests.rs"
+expect_red = ["framing::openrouter_reasoning_tests::openrouter_reasoning_is_must_understand_before_record_decode"]
+file = "crates/broca-wal/src/record.rs"
+old = "let base = if self.carries_openrouter_reasoning() {"
+new = "let base = if self.carries_openrouter_reasoning() && false { // NON-VACUITY BREAK: write OpenRouter state ungated"
