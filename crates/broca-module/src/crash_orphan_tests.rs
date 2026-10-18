@@ -17,6 +17,97 @@ const ORPHAN: &str = "orphan-run";
 const CALL: &str = "orphan-call";
 const BATCH: &str = "orphan-batch";
 
+#[tokio::test]
+async fn crash_orphan_seal_projects_ended_and_claim_check_is_session_owned() {
+    use crate::serve::ServeHandler;
+    let durable = Arc::new(std::sync::Mutex::new(None));
+    let seen = durable.clone();
+    let fixture = Fixture::configured(
+        |index| index,
+        Some(Arc::new(move |_, seq, epoch| {
+            *seen.lock().unwrap() = Some((seq, epoch));
+        })),
+    );
+    fixture.index.enable_bus_events("box_test").unwrap();
+    fixture.seed(vec![run_started(&fixture.key)]);
+    let marked = fixture.sweep(Fixture::boot_after_seed()).await;
+    assert_eq!(marked.marked, 1);
+    let wal = Arc::new(fixture.wal_store());
+    let (head, observed_epoch) = durable
+        .lock()
+        .unwrap()
+        .expect("orphan writer must notify durable event projection");
+    let range = wal
+        .read_records_range(&fixture.key, 0, Some(head), None)
+        .unwrap();
+    let epoch = range.lineage_id.unwrap().to_string();
+    assert_eq!(observed_epoch.unwrap().to_string(), epoch);
+    let broca_wal::WalRangeRecords::Complete(records) = range.into_records() else {
+        panic!("sealed WAL absent")
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fixture
+        .index
+        .project_bus_events(&fixture.key, &epoch, &records, now)
+        .unwrap();
+    let started = fixture.index.pending_bus_event().unwrap().unwrap();
+    fixture
+        .index
+        .acknowledge_bus_event(
+            &started,
+            cortexkit_bus_trait::PublishReceipt::new(1, false),
+            now,
+        )
+        .unwrap();
+    let ended = fixture
+        .index
+        .pending_bus_event()
+        .unwrap()
+        .expect("crash orphan must publish run.ended");
+    assert!(ended.subject.ends_with(".run.ended.v1"));
+    let body: serde_json::Value = serde_json::from_slice(&ended.body).unwrap();
+    assert_eq!(body["terminal"], "interrupted");
+    assert_eq!(body["seq"], records.last().unwrap().seq);
+    assert!(body.get("error").is_none());
+    fixture.stop().await;
+    let opener = DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(fixture.root.join("leases"))),
+        wal.clone(),
+        fixture.executor.clone(),
+    );
+    let registry =
+        LineageRegistry::new_with_reader(Arc::new(opener), wal, Some(fixture.index.clone()));
+    let found = registry
+        .run_event_get(&fixture.key, &ended.event_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        broca_wire::RunEventGetResponse::Found {
+            event_key: ended.event_key.clone(),
+            jcs: String::from_utf8(ended.body).unwrap()
+        }
+    );
+    let other = BindIdentity::new(fixture.root.join("project"), "runner", "foreign-session");
+    assert_eq!(
+        registry
+            .run_event_get(&other, &ended.event_key)
+            .await
+            .unwrap(),
+        broca_wire::RunEventGetResponse::Absent
+    );
+    assert_eq!(
+        registry
+            .run_event_get(&fixture.key, &"0".repeat(64))
+            .await
+            .unwrap(),
+        broca_wire::RunEventGetResponse::Absent
+    );
+}
+
 /// Records every run it is asked to execute and completes it at once. A crash orphan the pass
 /// fails to seal is resumed by open-time recovery, which shows up here as its run id.
 #[derive(Default)]
@@ -129,6 +220,13 @@ impl Fixture {
     fn with_opener_index(
         wrap: impl FnOnce(Arc<broca_store::SqliteStore>) -> Arc<dyn RunIndex>,
     ) -> Self {
+        Self::configured(wrap, None)
+    }
+
+    fn configured(
+        wrap: impl FnOnce(Arc<broca_store::SqliteStore>) -> Arc<dyn RunIndex>,
+        observer: Option<Arc<broca_core::wal_writer::DurableWalObserver>>,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "broca-crash-orphan-{}-{}",
@@ -139,17 +237,18 @@ impl Fixture {
         let key = BindIdentity::new(root.join("project"), "runner", "session");
         let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
         let executor = Arc::new(Recording::default());
+        let mut wal = FileWalStore::new(root.join("wal"));
+        if let Some(observer) = observer {
+            wal = wal.with_durable_observer(observer);
+        }
+        let wal = Arc::new(wal);
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(root.join("leases"))),
-            Arc::new(FileWalStore::new(root.join("wal"))),
+            wal.clone(),
             executor.clone(),
         )
         .with_run_index(wrap(index.clone()));
-        let registry = LineageRegistry::new_with_reader(
-            Arc::new(opener),
-            Arc::new(FileWalStore::new(root.join("wal"))),
-            None,
-        );
+        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
         Self {
             root,
             key,

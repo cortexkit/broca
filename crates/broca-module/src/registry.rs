@@ -756,6 +756,48 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    pub fn active_event_sessions(&self) -> Vec<LineageKey> {
+        self.inner
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(session, entry)| match entry {
+                Entry::Open { handle, .. } if handle.run_in_flight.load(Ordering::Relaxed) != 0 => {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    pub async fn route_run_event(
+        &self,
+        session: &LineageKey,
+        event_key: &str,
+    ) -> Result<broca_wire::RunEventGetResponse, crate::serve::ServeError> {
+        let Some(store) = self.inner.reader.as_ref().and_then(|r| r.store.clone()) else {
+            return Ok(broca_wire::RunEventGetResponse::Absent);
+        };
+        let event_key = event_key.to_owned();
+        let key = event_key.clone();
+        let row =
+            broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
+                store.read_run_event(&key)
+            })
+            .await
+            .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
+            .map_err(|e| crate::serve::ServeError::Open(e, None))?;
+        match row {
+            Some((owner, bytes)) if &owner == session => {
+                Ok(broca_wire::RunEventGetResponse::Found {
+                    event_key,
+                    jcs: String::from_utf8(bytes)
+                        .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?,
+                })
+            }
+            _ => Ok(broca_wire::RunEventGetResponse::Absent),
+        }
+    }
     fn cut_gate(&self, key: &LineageKey) -> Arc<tokio::sync::Mutex<()>> {
         let reference = cortexkit_role_llm_runner::session_ref(
             &key.harness,

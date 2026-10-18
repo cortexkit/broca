@@ -25,6 +25,7 @@ pub const OP_IMPORT: &str = "session.import";
 pub const OP_RETRACT: &str = "session.retract";
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
+pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
 /// Daemon-scoped durable budget-cap mutations.
 pub const OP_CAP_INSTALL: &str = "cap.install";
@@ -336,6 +337,11 @@ pub fn manifest_configured(
                         "Point-read one run's state and terminal outcome, scoped to the owning session."
                             .to_string(),
                     ),
+                },
+                ManagementOperation {
+                    name: OP_RUN_EVENT_GET.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some("Fetch a session-owned run event's exact JCS bytes by its claim-check key (24 hour retention).".into()),
                 },
                 ManagementOperation {
                     name: OP_READ.to_string(),

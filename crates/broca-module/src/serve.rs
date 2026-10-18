@@ -999,6 +999,14 @@ pub trait ServeHandler: Send + Sync {
     /// `run.status` / `session.status` — the lineage's current state.
     async fn status(&self, session: &LineageKey) -> Result<StatusResponse, ServeError>;
 
+    async fn run_event_get(
+        &self,
+        _session: &LineageKey,
+        _event_key: &str,
+    ) -> Result<broca_wire::RunEventGetResponse, ServeError> {
+        Ok(broca_wire::RunEventGetResponse::Absent)
+    }
+
     /// `run.status{run_id}` — the lifecycle state of a SPECIFIC run, via the three-tier
     /// resolution (live actor → durable index terminal → WAL reconciliation). The wire
     /// surface of the durable run index: a consumer reaches a finished/crashed run's outcome
@@ -1191,6 +1199,13 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    async fn run_event_get(
+        &self,
+        session: &LineageKey,
+        event_key: &str,
+    ) -> Result<broca_wire::RunEventGetResponse, ServeError> {
+        self.route_run_event(session, event_key).await
+    }
     fn backup_classes(&self) -> Vec<String> {
         crate::LineageRegistry::backup_classes(self)
     }

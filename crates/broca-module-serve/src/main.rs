@@ -130,6 +130,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
+    let bus_event_config =
+        broca_module_serve::bus_events::Config::load_default_path().map_err(ServeIoError)?;
     let backup_classes = broca_module_serve::session_class::BackupClasses::load_default_path()
         .map_err(ServeIoError)?;
     let provider_overrides =
@@ -188,7 +190,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref(),
         auth_source == executor::AuthSource::Vault && !mock_provider_path,
     )
-    .with_account_selection(&account_selection);
+    .with_account_selection(&account_selection)
+    .with_bus_events(bus_event_config.enabled);
     // How long an idle lineage holds its lease before the coordinator closes it. A real
     // operational parameter: a server hosting many sessions wants a short value to free leases
     // quickly; a desktop wants longer to avoid the cost of restarting a closed session.
@@ -253,8 +256,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     create_state_directories(&state_root)?;
     let _archive_timer = archive_config.spawn(state_root.clone());
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
-    let wal_store =
-        Arc::new(FileWalStore::new(state_root.join("wal")).with_backup_classes(backup_classes.0));
+    let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
+    let mut wal_store =
+        FileWalStore::new(state_root.join("wal")).with_backup_classes(backup_classes.0);
+    if bus_event_config.enabled {
+        wal_store = wal_store.with_durable_observer(bus_hints.observer());
+    }
+    let wal_store = Arc::new(wal_store);
     let crash_orphan_wal = wal_store.clone();
     let run_index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
@@ -595,6 +603,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
+    let bus_stop = tokio_util::sync::CancellationToken::new();
+    let _bus_stop_guard = bus_stop.clone().drop_guard();
+    let _bus_events = broca_module_serve::bus_events::Service {
+        config: bus_event_config,
+        store: run_index.clone(),
+        wal: crash_orphan_wal.clone(),
+        registry: registry.as_ref().clone(),
+        connector: None,
+        hints: bus_hints,
+        stop: bus_stop,
+    }
+    .spawn();
     // Fetch-plan admission uses a consumer connection of its own, keeping its short-lived fetch
     // routes apart from the long-lived routes the model's tool calls are dispatched on.
     registry.set_plan_admitter(Arc::new(broca_subc::SubcPlanAdmitter::new(plan_conn)));

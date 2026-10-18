@@ -88,7 +88,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -99,7 +99,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -309,6 +309,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "broca-wire",
+ "cortexkit-bus-trait",
  "cortexkit-role-llm-runner",
  "futures",
  "serde",
@@ -339,6 +340,7 @@ dependencies = [
  "broca-wire",
  "chrono",
  "clap",
+ "cortexkit-bus-naming",
  "cortexkit-log",
  "cortexkit-role-agent-data",
  "cortexkit-role-harness",
@@ -377,6 +379,7 @@ name = "broca-protocol"
 version = "0.3.228"
 dependencies = [
  "cortexkit-anthropic-policy",
+ "cortexkit-bus-naming",
  "cortexkit-role-llm-runner",
  "jsonschema",
  "serde",
@@ -461,9 +464,13 @@ dependencies = [
  "broca-protocol",
  "broca-test-support",
  "broca-wal",
+ "cortexkit-bus-naming",
+ "cortexkit-bus-trait",
  "rusqlite",
  "serde",
+ "serde_jcs",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]
@@ -529,9 +536,11 @@ version = "0.3.228"
 dependencies = [
  "broca-core",
  "broca-protocol",
+ "cortexkit-bus-naming",
  "cortexkit-role-agent-data",
  "cortexkit-role-llm-runner",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "tokio",
@@ -715,6 +724,22 @@ checksum = "31db51de881b10c574d284bfd887e280bdac2c0417a3b45de8805b096b434ca4"
 dependencies = [
  "httpdate",
  "serde_json",
+]
+
+[[package]]
+name = "cortexkit-bus-naming"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f42484239fb8f3e7aa9eed12b701ee7b6da359909be908e3f6cc2369baf0ae56"
+
+[[package]]
+name = "cortexkit-bus-trait"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12bf09b0c0f60249cd95cbcf9f3e4babb3b5c1322fc90a220744a8d8e85231c2"
+dependencies = [
+ "async-trait",
+ "sha2",
 ]
 
 [[package]]
@@ -938,7 +963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1628,7 +1653,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2060,7 +2085,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2270,7 +2295,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

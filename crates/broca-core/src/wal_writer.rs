@@ -258,9 +258,15 @@ pub struct FileWalStore {
     session_index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
     move_reads: AtomicU64,
     retention_changes: Arc<retention_changes::Changes>,
+    durable_observer: Option<Arc<DurableWalObserver>>,
     #[cfg(any(test, feature = "test-clock"))]
     range_reads: AtomicU64,
 }
+
+/// Non-I/O notification of a successful WAL barrier, including raw maintenance writers.
+/// The callback must retain only the session identity and durable head, not record bodies.
+pub type DurableWalObserver =
+    dyn Fn(&BindIdentity, u64, Option<broca_wal::WalLineageId>) + Send + Sync;
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
 ///
@@ -528,6 +534,7 @@ impl FileWalStore {
             session_index: Arc::default(),
             move_reads: AtomicU64::new(0),
             retention_changes: Arc::default(),
+            durable_observer: None,
             #[cfg(any(test, feature = "test-clock"))]
             range_reads: AtomicU64::new(0),
         }
@@ -549,6 +556,11 @@ impl FileWalStore {
     /// break both, so it needs to be a decision rather than a tidy-up.
     pub fn wal_path(&self, session: &BindIdentity) -> PathBuf {
         self.root.join(format!("{}.wal", session_addr(session)))
+    }
+
+    pub fn with_durable_observer(mut self, observer: Arc<DurableWalObserver>) -> Self {
+        self.durable_observer = Some(observer);
+        self
     }
 
     /// The ordinary directory is passed to the constructor for compatibility with
@@ -819,6 +831,8 @@ impl FileWalStore {
             address: Arc::from(session_addr(session)),
             changes: self.retention_changes.clone(),
             retained,
+            session: session.clone(),
+            durable_observer: self.durable_observer.clone(),
         }))
     }
 

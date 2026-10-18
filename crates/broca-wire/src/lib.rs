@@ -3930,3 +3930,18 @@ mod caller_message_tests {
         );
     }
 }
+pub use broca_protocol::run_events;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEventGetParams {
+    pub event_key: String,
+}
+
+/// The JCS string is the exact UTF-8 byte sequence hashed by the bus notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunEventGetResponse {
+    Found { event_key: String, jcs: String },
+    Absent,
+}

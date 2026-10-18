@@ -17,6 +17,7 @@ pub mod account_routing;
 pub mod agent_data;
 pub mod auth_routing;
 pub mod billing_routing;
+pub mod bus_events;
 pub mod cache_dump;
 pub mod cache_routing;
 pub mod cache_warm;

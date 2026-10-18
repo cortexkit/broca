@@ -58,8 +58,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_CAP_INSTALL, OP_HEAD, OP_IMPORT, OP_READ, OP_RETRACT,
-    OP_ROLE_DESCRIBE, OP_RUN_RESULT, OP_SEND, OP_SPEND_DELTA, OP_STATUS, OP_SUBSCRIBE,
-    OP_VAULT_AUDIT, OP_WARM,
+    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_SEND, OP_SPEND_DELTA, OP_STATUS,
+    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, CapInstallParams, CapMutationResult, FromWireExt, ImportParams, ImportResult,
@@ -1573,6 +1573,7 @@ async fn handle_control_request(
                     "session_reads": broca_module::registry::session_reads(),
                     "actor_opens": broca_module::registry::actor_opens(),
             "wal_archive_polls": crate::wal_archive::wal_archive_polls(),
+            "bus_events": crate::bus_events::health(),
             // The subscriber fan-out's own counters. NOT related to frames_dropped_*
             // above, which count inbound frames on broca-subc's client socket -- I
             // first claimed they were this path's failure counters, and they are not.
@@ -1860,7 +1861,7 @@ where
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
-        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2515,6 +2516,38 @@ where
                         Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
                     }
                 }
+            }
+        }
+        OP_RUN_EVENT_GET => {
+            let params: broca_wire::RunEventGetParams = match decode_params(&req.params) {
+                Ok(params) => params,
+                Err((field, message)) => {
+                    return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                        .await
+                }
+            };
+            if params.event_key.len() != 64
+                || !params
+                    .event_key
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("event_key".into()),
+                    "run.event.get.event_key must be a 64-character lowercase hex key",
+                )
+                .await;
+            }
+            match handler.run_event_get(&session, &params.event_key).await {
+                Ok(response) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &response).await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
         OP_READ => {

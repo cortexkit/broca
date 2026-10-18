@@ -28,6 +28,7 @@ async-trait.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+cortexkit-bus-trait.workspace = true
 broca-wal = { path = "../broca-wal", features = ["test-io-trace"] }
 broca-store = { path = "../broca-store", features = ["test-conformance"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.

@@ -35,6 +35,7 @@ pub struct ConsumerRoutes {
     /// account evidence to. Present only on the vault path with account selection active
     /// (`account_selection.legacy_static` off): that is when the route is opened.
     pub routing_module: Option<String>,
+    pub bus_events: bool,
 }
 
 impl ConsumerRoutes {
@@ -51,6 +52,7 @@ impl ConsumerRoutes {
             tool_module: non_blank(tool_module).unwrap_or_else(|| DEFAULT_TOOL_MODULE.to_string()),
             vault_module: vault_in_use.then(|| CREDENTIALS_MODULE_ID.to_string()),
             routing_module: None,
+            bus_events: false,
         }
     }
 
@@ -74,12 +76,20 @@ impl ConsumerRoutes {
         let mut services = vec![FUSIFORM_MODULE_ID.to_string()];
         services.extend(self.vault_module.iter().cloned());
         services.extend(self.routing_module.iter().cloned());
+        if self.bus_events {
+            services.push("ckbus".into());
+        }
         vec![
             ConsumerRole::ToolClient {
                 of: vec![self.tool_module.clone()],
             },
             ConsumerRole::ServiceClient { of: services },
         ]
+    }
+
+    pub fn with_bus_events(mut self, enabled: bool) -> Self {
+        self.bus_events = enabled;
+        self
     }
 }
 

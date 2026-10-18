@@ -16923,3 +16923,57 @@ expect_red = ["retention::tests::older_tombstone_does_not_shadow_fresh_retained_
 file = "crates/broca-module/src/retention.rs"
 old = "                Some(s.lineage_id.as_str())\n                    == read.lineage_id"
 new = "                // NON-VACUITY BREAK: let an older tombstone shadow a fresh retained lineage.\n                true || Some(s.lineage_id.as_str())\n                    == read.lineage_id"
+
+[[control]]
+id = "bus-events-observe-only-after-wal-durable"
+guards = "Run lifecycle projection receives a WAL head only after the file barrier succeeds"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer/retention_changes.rs"
+expect_red = ["wal_writer::retention_changes::tests::run_events_observe_only_successful_durable_barriers"]
+file = "crates/broca-core/src/wal_writer/retention_changes.rs"
+old = '''        self.inner.sync()?;
+        self.durable();'''
+new = '''        self.durable(); // NON-VACUITY BREAK: notify before the WAL barrier
+        self.inner.sync()?;'''
+
+[[control]]
+id = "bus-events-mark-published-only-after-ack"
+guards = "Lifecycle rows remain pending through outage and are marked published only after JetStream acknowledgement"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_outbox_ack_then_mark_published_retains_claim_check"]
+file = "crates/broca-store/src/bus_events.rs"
+old = '''        match publisher.publish(&event).await {'''
+new = '''        self.conn.lock().unwrap().execute("UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1",params![event.event_key,now_ms])?; // NON-VACUITY BREAK: mark before acknowledgement
+        match publisher.publish(&event).await {'''
+
+[[control]]
+id = "bus-events-refuse-512-byte-body"
+guards = "The event byte budget is exclusive: 511 bytes fit and 512 bytes are refused"
+runner = "cargo"
+package = "broca-wire"
+target = "--test bus_events"
+test_file = "crates/broca-wire/tests/bus_events.rs"
+expect_red = ["bus_event_refuses_512_bytes_and_truncates_only_send_ids"]
+file = "crates/broca-protocol/src/run_events.rs"
+old = '''        if bytes.len() >= MAX_EVENT_BYTES {'''
+new = '''        if bytes.len() > MAX_EVENT_BYTES { // NON-VACUITY BREAK: allow a 512-byte body'''
+
+[[control]]
+id = "bus-events-crash-orphan-ended"
+guards = "The actual crash-orphan seal notifies durable projection and derives run.ended with terminal interrupted"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/crash_orphan_tests.rs"
+expect_red = ["actor::crash_orphan_tests::crash_orphan_seal_projects_ended_and_claim_check_is_session_owned"]
+file = "crates/broca-store/src/bus_events.rs"
+old = '''                WalRecord::RunFinished {
+                    reason,'''
+new = '''                WalRecord::RunFinished { reason: broca_protocol::RunFinishReason::Interrupted, .. } => None, // NON-VACUITY BREAK: drop crash/shutdown seal events
+                WalRecord::RunFinished {
+                    reason,'''
