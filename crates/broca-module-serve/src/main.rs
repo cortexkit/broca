@@ -2144,6 +2144,15 @@ mod executor {
             .unwrap_or(false)
     }
 
+    fn frozen_reasoning_echo(
+        config: &broca_wal::RunConfig,
+    ) -> Option<broca_provider::policy::ReasoningEchoPolicy> {
+        config
+            .frozen_render_config
+            .get("reasoning_echo")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
     /// The service tier the episode was admitted with, re-applied on resume from the durable
     /// `RunConfig` rather than the resuming send, and without re-checking the catalog's rates.
     fn frozen_service_tier(
@@ -3645,6 +3654,10 @@ mod executor {
                         .as_ref()
                         .filter(|_| !fresh_episode)
                         .map(|prior| frozen_reasoning_content_required(&prior.config)),
+                    reasoning_echo: prior_run
+                        .as_ref()
+                        .filter(|_| !fresh_episode)
+                        .map(|prior| frozen_reasoning_echo(&prior.config)),
                     // Older episodes omitted strict; only a fresh episode takes the new default.
                     responses_tools_non_strict: prior_run
                         .as_ref()

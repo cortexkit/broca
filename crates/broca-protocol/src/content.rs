@@ -214,6 +214,8 @@ pub fn stamp_ordinals_from(prompt: &mut [Message], start: usize) -> usize {
 pub enum EncryptedReasoningFormat {
     OpenAiResponses,
     OpenAiResponsesChatgpt,
+    /// OpenRouter's complete reasoning/reasoning_details continuation envelope.
+    OpenRouter,
 }
 
 /// The wire format that owns opaque state attached to an assistant text block.
@@ -253,10 +255,11 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
-    /// Encrypted provider reasoning with no plaintext. `data` is byte-verbatim opaque state:
+    /// Opaque provider continuation state, which may include encrypted reasoning. `data` is:
     /// the legacy Anthropic/Gemini form stores the provider blob, while OpenAI Responses stores
     /// the complete raw reasoning-item JSON so its id, summary, ciphertext, and field order
-    /// survive persistence and replay.
+    /// survive persistence and replay. OpenRouter stores its reasoning/reasoning_details JSON
+    /// envelope, including unknown fields and encrypted entries, under its own format tag.
     ///
     /// `provider_format` prevents different request formats from mixing encrypted state. Old
     /// persisted messages omit it and retain legacy behavior. New messages set it explicitly,

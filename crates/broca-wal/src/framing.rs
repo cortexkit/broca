@@ -169,6 +169,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
+    OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
@@ -183,6 +184,10 @@ pub const KNOWN_FEATURES: &[&str] = &[
 
 /// Text-part state and the frozen codec policy are required for faithful provider replay.
 pub const PROVIDER_TEXT_STATE_FEATURE: &str = "provider-text-state/v1";
+
+/// OpenRouter-tagged reasoning and its frozen echo policy cannot be read faithfully by older
+/// builds. This is distinct from text-part phase/signature state in provider-text-state/v1.
+pub const OPENROUTER_REASONING_FEATURE: &str = "openrouter-reasoning/v1";
 
 /// Compaction's issued fence, applied view and other answers. Missing it must refuse the
 /// WAL rather than lose an applied view or allow a superseded request to apply on replay.
@@ -680,6 +685,9 @@ fn lock_feature_table_for_test() -> std::sync::MutexGuard<'static, ()> {
 mod deferred_call_tests;
 
 #[cfg(test)]
+mod openrouter_reasoning_tests;
+
+#[cfg(test)]
 mod retention_tests;
 
 #[cfg(test)]
@@ -872,6 +880,7 @@ mod tests {
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
+                OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
@@ -891,6 +900,7 @@ mod tests {
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
+        assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
         assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");

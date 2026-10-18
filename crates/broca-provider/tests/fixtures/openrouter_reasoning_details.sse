@@ -1,0 +1,7 @@
+data: {"id":"or-test","choices":[{"delta":{"reasoning":"Think ","reasoning_details":[{"type":"reasoning.text","text":"Think ","format":"unknown-v2","index":0,"id":null,"vendor":{"x":[1,2]}}]},"finish_reason":null}]}
+
+data: {"id":"or-test","choices":[{"delta":{"reasoning":"carefully.","reasoning_details":[{"type":"reasoning.text","text":"carefully.","format":"unknown-v2","index":0,"id":null},{"type":"reasoning.encrypted","data":"AQID+/==","format":"google-gemini-v1","index":1,"id":"encrypted-1"},{"type":"reasoning.summary","summary":"Check the clock","format":"anthropic-claude-v1","index":2,"id":"summary-2"}]},"finish_reason":null}]}
+
+data: {"id":"or-test","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+data: [DONE]
