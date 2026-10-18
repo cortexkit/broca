@@ -16457,3 +16457,100 @@ expect_red = ["framing::openrouter_reasoning_tests::openrouter_reasoning_is_must
 file = "crates/broca-wal/src/record.rs"
 old = "let base = if self.carries_openrouter_reasoning() {"
 new = "let base = if self.carries_openrouter_reasoning() && false { // NON-VACUITY BREAK: write OpenRouter state ungated"
+
+# A deploy that bumps a wire family's renderer version must not refuse a resumable run whose
+# bytes it still reproduces, and must keep refusing every other one.
+[[control]]
+id = "renderer-version-reproducible-declaration"
+guards = "a family's declared reproducible earlier renderer version is accepted by the live provider, with the recorded blob stated for it"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/renderer_version_reproduction.rs"
+expect_red = ["renderer_version_reproduction::live::live_provider_accepts_a_declared_version_and_states_its_recorded_blob"]
+file = "crates/broca-provider/src/families/mod.rs"
+old = "            (3, Reproducible),"
+new = "            (3, NotReproducible(\"NON-VACUITY BREAK: withdraw the Gemini v3 declaration\")),"
+
+[[control]]
+id = "renderer-version-reproducible-declaration-real-daemon"
+guards = "a run recorded at a declared reproducible renderer version resumes and completes through the real daemon"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/renderer_version_resume_real_daemon.rs"
+expect_red = ["renderer_version_resume_real_daemon::a_run_admitted_at_a_reproducible_renderer_version_resumes_and_an_undeclared_one_is_refused"]
+expect_message = "reproducible version must resume and complete"
+platforms = ["macos", "linux"]
+file = "crates/broca-provider/src/families/mod.rs"
+old = "            (3, Reproducible),"
+new = "            (3, NotReproducible(\"NON-VACUITY BREAK: withdraw the Gemini v3 declaration\")),"
+
+[[control]]
+id = "renderer-version-declaration-needs-pinned-proof"
+guards = "an earlier renderer version cannot be declared reproducible without pinned old bytes the current code still renders"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/renderer_version_reproduction.rs"
+expect_red = ["renderer_version_reproduction::every_reproducible_declaration_renders_its_pinned_old_bytes"]
+expect_message = "no pinned"
+file = "crates/broca-provider/src/families/mod.rs"
+old = "NotReproducible(\"v2 drops strict: true from function tools\")"
+new = "Reproducible /* NON-VACUITY BREAK: declare v1 reproducible with no pinned proof */"
+
+[[control]]
+id = "renderer-version-bump-must-decide-old-version"
+guards = "bumping a family's renderer version fails until the version left behind is declared reproducible or not"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/renderer_version_reproduction.rs"
+expect_red = ["renderer_version_reproduction::every_renderer_version_bump_decides_whether_the_old_version_is_reproducible"]
+file = "crates/broca-provider/src/families/mod.rs"
+old = "pub const GEMINI_RENDERER_VERSION: u32 = 4;"
+new = "pub const GEMINI_RENDERER_VERSION: u32 = 5; // NON-VACUITY BREAK: bump without deciding v4"
+
+[[control]]
+id = "resume-accepts-declared-renderer-version"
+guards = "resume accepts a recorded renderer version the provider declares reproducible instead of requiring equality"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/resume_exec.rs"
+expect_red = ["resume_exec::a_declared_reproducible_renderer_version_resumes_with_identical_bytes"]
+file = "crates/broca-core/src/run.rs"
+old = "    } else if !provider.reproduces_renderer_version(recorded.renderer_version) {"
+new = "    } else if provider.renderer_version() != recorded.renderer_version { // NON-VACUITY BREAK"
+
+[[control]]
+id = "resume-compares-blob-stated-for-recorded-version"
+guards = "resume compares the recorded frozen config with the blob the provider states for the recorded version"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/resume_exec.rs"
+expect_red = ["resume_exec::a_declared_reproducible_renderer_version_resumes_with_identical_bytes"]
+file = "crates/broca-core/src/run.rs"
+old = "    } else if provider.render_config_blob_for_version(recorded.renderer_version)"
+new = "    } else if provider.render_config_blob() // NON-VACUITY BREAK"
+
+[[control]]
+id = "resume-restores-recorded-provider-text-state"
+guards = "a resumed episode keeps its recorded provider_text_state instead of re-resolving the new default"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::chatgpt_run_recorded_at_version_7_resumes_under_version_8"]
+file = "crates/broca-catalog/src/live.rs"
+old = "            config.provider_text_state = recorded;"
+new = "            let _ = recorded; // NON-VACUITY BREAK: re-resolve the flag on resume"

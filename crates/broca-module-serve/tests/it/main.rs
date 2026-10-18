@@ -59,6 +59,7 @@ mod plan_fetch_real_daemon;
 mod preset_real_daemon;
 mod prompt_blocks_render;
 mod provider_override_boot;
+mod renderer_version_resume_real_daemon;
 mod reply_deadline_real_daemon;
 mod retention_consent_wire;
 mod scope_carrier;

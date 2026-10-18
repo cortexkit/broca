@@ -2117,6 +2117,10 @@ fn first_system_message(messages: &[Message]) -> Option<&Message> {
 
 /// Validate that the provider's current renderer identity matches the state frozen at run
 /// start. Null cannot prove identity: older WALs that recorded it were never resume-safe.
+///
+/// The recorded renderer version must be one the provider declares it still reproduces
+/// byte-identically (its own version, or an earlier one it has proven), and the recorded frozen
+/// config must then equal the blob the provider would have recorded at that version, exactly.
 fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Option<ProviderError> {
     let current = provider.render_config_blob();
     let (message, provider_code) = if current.is_null() || recorded.frozen_render_config.is_null() {
@@ -2126,13 +2130,15 @@ fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Optio
              were never resume-safe and must be discarded",
             "frozen_render_config_unverifiable",
         )
-    } else if provider.renderer_version() != recorded.renderer_version {
+    } else if !provider.reproduces_renderer_version(recorded.renderer_version) {
         (
             "resume refused: the provider renderer version differs from the version recorded at \
-             run start",
+             run start, and the provider does not reproduce the recorded version's bytes",
             "renderer_version_drift",
         )
-    } else if current != recorded.frozen_render_config {
+    } else if provider.render_config_blob_for_version(recorded.renderer_version)
+        != recorded.frozen_render_config
+    {
         (
             "resume refused: the provider frozen render config differs from the config recorded \
              at run start",

@@ -776,6 +776,29 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         self.frozen.renderer_version
     }
 
+    /// The family's declared table decides, and only while this provider renders at its
+    /// family's current version: the declaration is about what the current code reproduces.
+    fn reproduces_renderer_version(&self, recorded: u32) -> bool {
+        let family = self.frozen.family_id;
+        recorded == self.frozen.renderer_version
+            || (self.frozen.renderer_version == crate::families::renderer_version_for(family)
+                && crate::families::reproduces_renderer_version(family, recorded))
+    }
+
+    /// The frozen config carries its renderer version, so a run recorded at an earlier version
+    /// this provider reproduces recorded the same config with that version in it. Every other
+    /// field must still match the recorded blob exactly.
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> Value {
+        if renderer_version == self.frozen.renderer_version
+            || !self.reproduces_renderer_version(renderer_version)
+        {
+            return self.render_config_blob();
+        }
+        let mut frozen = self.frozen.as_ref().clone();
+        frozen.renderer_version = renderer_version;
+        serde_json::to_value(&frozen).expect("frozen render config must serialize")
+    }
+
     fn render_config_blob(&self) -> Value {
         serde_json::to_value(self.frozen.as_ref()).expect("frozen render config must serialize")
     }

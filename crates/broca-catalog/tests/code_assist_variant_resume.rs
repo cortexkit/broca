@@ -71,6 +71,7 @@ mod gated {
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
             reasoning_echo: None,
+            provider_text_state: None,
             structured_output: None,
         };
         let resolved = broca_catalog::live::resolve_catalog_episode_with_client(

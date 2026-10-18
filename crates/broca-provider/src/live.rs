@@ -180,6 +180,14 @@ impl Provider for LiveAnthropicProvider {
         self.inner.renderer_version()
     }
 
+    fn reproduces_renderer_version(&self, recorded: u32) -> bool {
+        self.inner.reproduces_renderer_version(recorded)
+    }
+
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> Value {
+        self.inner.render_config_blob_for_version(renderer_version)
+    }
+
     fn render_config_blob(&self) -> Value {
         self.inner.render_config_blob()
     }

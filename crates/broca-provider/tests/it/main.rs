@@ -71,6 +71,7 @@ mod provider_state_legacy;
 mod provider_text_state;
 mod reasoning_content_required;
 mod render_golden_version_enforcement;
+mod renderer_version_reproduction;
 mod responses_cache_write_usage;
 mod service_tier_used;
 #[cfg(feature = "live")]

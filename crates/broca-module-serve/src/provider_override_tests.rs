@@ -57,6 +57,7 @@ fn resolve_runtime_override(
                     .unwrap_or(false)
             }),
             reasoning_echo: frozen.map(|recorded| recorded.get("reasoning_echo").and_then(|v| serde_json::from_value(v.clone()).ok())),
+            provider_text_state: None,
             structured_output: None,
         },
     )
@@ -114,6 +115,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
             reasoning_echo: None,
+            provider_text_state: None,
             structured_output: None,
         },
     )
@@ -452,6 +454,7 @@ fn resolve_drift_revision(
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
             reasoning_echo: None,
+            provider_text_state: None,
             structured_output: None,
         },
     )
@@ -557,6 +560,12 @@ impl broca_core::Provider for NoNetworkProvider {
     }
     fn renderer_version(&self) -> u32 {
         self.inner.renderer_version()
+    }
+    fn reproduces_renderer_version(&self, recorded: u32) -> bool {
+        self.inner.reproduces_renderer_version(recorded)
+    }
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> serde_json::Value {
+        self.inner.render_config_blob_for_version(renderer_version)
     }
     fn render_request(&self, opts: &broca_protocol::CallOptions) -> Vec<u8> {
         self.inner.render_request(opts)
@@ -790,6 +799,7 @@ fn resolve_tier_revision(
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
             reasoning_echo: None,
+            provider_text_state: None,
             structured_output: None,
         },
     )
@@ -908,6 +918,7 @@ fn resolve_variant_revision(
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
             reasoning_echo: None,
+            provider_text_state: None,
             structured_output: None,
         },
     )
@@ -1367,4 +1378,186 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
     drop(executor);
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Resolve a ChatGPT (codex) episode for `openai/gpt-5.3-codex` the way the executor does. On a
+/// resume, `recorded` is the episode's RunConfig and each restored input is read from it through
+/// the executor's own reader; `restore_text_state` turns off the provider-text-state restore so
+/// the test can show what the comparison sees without it.
+fn resolve_chatgpt_episode(
+    recorded: Option<&broca_wal::RunConfig>,
+    restore_text_state: bool,
+) -> broca_catalog::live::ProviderResolution {
+    install_test_catalog();
+    let options = broca_catalog::live::ResolveOptions {
+        auth_method: Some(AuthMethod::Chatgpt),
+        family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
+        session_id: Some("chatgpt-reproduce"),
+        account_id: Some("acct-reproduce"),
+        ..Default::default()
+    };
+    let auth = AuthResolution {
+        mode: AuthMode::Secret("chatgpt-test-token".into()),
+        pause: None,
+        selection: None,
+        method: Some(AuthMethod::Chatgpt),
+        project_id: None,
+        account_id: Some("acct-reproduce".into()),
+        record_version: None,
+        in_run_refresh: None,
+    };
+    resolve_provider_for_episode(
+        "openai/gpt-5.3-codex",
+        None,
+        Some(2048),
+        &auth,
+        &options,
+        broca_provider::build_provider_http_client(),
+        broca_catalog::live::EpisodeRenderConfig {
+            max_output_tokens: recorded.and_then(frozen_max_output_tokens),
+            responses_tools_non_strict: recorded.map(frozen_responses_tools_non_strict),
+            chatgpt_effort_updates: recorded.map(|config| {
+                config.frozen_render_config["chatgpt_effort_updates"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+            provider_text_state: recorded
+                .filter(|_| restore_text_state)
+                .map(frozen_provider_text_state),
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("ChatGPT resolution: {error}"))
+}
+
+/// The `RunConfig` that a release from before `provider_text_state` existed recorded for a
+/// ChatGPT run: the config the current code records for the same admission, with
+/// `renderer_version` set to the given earlier version and no `provider_text_state` field.
+fn chatgpt_run_recorded_before_text_state(
+    root: &std::path::Path,
+    renderer_version: u32,
+) -> broca_wal::RunConfig {
+    let started = resolve_chatgpt_episode(None, true);
+    assert_eq!(
+        started.provider.renderer_version(),
+        broca_provider::families::OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION
+    );
+    let mut recorded = drift_run_config(&drift_request(root), &started);
+    assert_eq!(recorded.frozen_render_config["provider_text_state"], true);
+    let blob = recorded.frozen_render_config.as_object_mut().unwrap();
+    blob.remove("provider_text_state");
+    blob.insert("renderer_version".into(), renderer_version.into());
+    recorded.renderer_version = renderer_version;
+    recorded
+}
+
+/// A ChatGPT run admitted at renderer version 7, before provider text state existed, resumes
+/// under the current code (version 8, which declares 7 reproducible) and completes, rendering
+/// what its recorded config renders. Without restoring the recorded absence of the flag the
+/// resolved config differs from the recorded one in exactly that flag, which would change the
+/// bytes, so the comparison must not tolerate it.
+#[tokio::test]
+async fn chatgpt_run_recorded_at_version_7_resumes_under_version_8() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-chatgpt-v7-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let recorded = chatgpt_run_recorded_before_text_state(&root, 7);
+
+    // How core's frozen-config comparison sees the version-7 recorded config. When the resume
+    // re-resolves the provider without restoring the recorded (absent) `provider_text_state`,
+    // the provider's config gains `provider_text_state: true`. Its blob for version 7
+    // (`render_config_blob_for_version(7)`) differs from the recorded blob in that field only;
+    // its plain blob (`render_config_blob()`) also carries version 8.
+    let unrestored = resolve_chatgpt_episode(Some(&recorded), false);
+    let differing = |blob: serde_json::Value| {
+        let mut blob = blob.as_object().unwrap().clone();
+        blob.retain(|key, value| recorded.frozen_render_config.get(key) != Some(&*value));
+        serde_json::Value::Object(blob)
+    };
+    assert_eq!(
+        differing(unrestored.provider.render_config_blob_for_version(7)),
+        serde_json::json!({"provider_text_state": true})
+    );
+    assert_eq!(
+        differing(unrestored.provider.render_config_blob()),
+        serde_json::json!({"provider_text_state": true, "renderer_version": 8})
+    );
+
+    let resumed = resolve_chatgpt_episode(Some(&recorded), true);
+    assert_eq!(resumed.provider.renderer_version(), 8);
+    assert!(resumed.provider.reproduces_renderer_version(7));
+    assert_eq!(
+        resumed.provider.render_config_blob_for_version(7),
+        recorded.frozen_render_config
+    );
+    // The resumed provider renders what the recorded config renders, for a prompt whose
+    // assistant text came from the run's own model.
+    let model = broca_protocol::request::ModelHandle {
+        provider_module_id: "openai".into(),
+        model_id: "gpt-5.3-codex".into(),
+    };
+    let mut opts = broca_protocol::CallOptions::new(vec![
+        broca_protocol::content::Message::new(
+            broca_protocol::content::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "question".into(),
+            }],
+        ),
+        broca_protocol::content::Message::assistant_from(
+            vec![broca_protocol::ContentBlock::Text {
+                text: "answer".into(),
+            }],
+            model.clone(),
+        ),
+    ]);
+    opts.target_model = Some(model);
+    let recorded_config: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(recorded.frozen_render_config.clone()).unwrap();
+    assert!(!recorded_config.provider_text_state);
+    assert_eq!(
+        resumed.provider.render_request(&opts),
+        broca_provider::wire::WireFamily::render(
+            &broca_provider::families::OpenAiResponsesChatgpt,
+            &recorded_config,
+            &opts
+        )
+    );
+
+    let (codes, reason, calls) = resume_through_core(&root, recorded, resumed).await;
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(codes, Vec::<Option<String>>::new());
+    assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
+    assert_eq!(calls, 1);
+}
+
+/// The ChatGPT family does not declare version 6 reproducible, so a run recorded at it is still
+/// refused with renderer_version_drift and makes no provider call.
+#[tokio::test]
+async fn chatgpt_run_recorded_at_undeclared_version_6_is_refused() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-chatgpt-v6-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let recorded = chatgpt_run_recorded_before_text_state(&root, 6);
+    let resumed = resolve_chatgpt_episode(Some(&recorded), true);
+    assert!(!resumed.provider.reproduces_renderer_version(6));
+    let (codes, reason, calls) = resume_through_core(&root, recorded, resumed).await;
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(codes, vec![Some("renderer_version_drift".to_string())]);
+    assert_eq!(reason, broca_protocol::caller::RunFinishReason::Interrupted);
+    assert_eq!(calls, 0);
+}
+
+#[test]
+fn frozen_provider_text_state_reads_an_absent_field_as_false() {
+    let mut recorded = drift_run_config(
+        &drift_request(std::path::Path::new("project")),
+        &resolve_chatgpt_episode(None, true),
+    );
+    assert!(frozen_provider_text_state(&recorded));
+    recorded
+        .frozen_render_config
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_text_state");
+    assert!(!frozen_provider_text_state(&recorded));
 }

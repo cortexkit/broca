@@ -17,7 +17,7 @@ use broca_provider::policy::ReasoningPolicy;
 use broca_provider::wire::WireFamily;
 use serde_json::json;
 
-fn fixed_request() -> CallOptions {
+pub(crate) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
             cache_prefix_blocks: None,
@@ -79,17 +79,24 @@ fn fixed_request() -> CallOptions {
     opts
 }
 
-const GOLDEN: &str = include_str!("../fixtures/openai_responses_chatgpt_render_golden.json");
-const GOLDEN_VERSION: &str =
+pub(crate) const GOLDEN: &str =
+    include_str!("../fixtures/openai_responses_chatgpt_render_golden.json");
+pub(crate) const GOLDEN_VERSION: &str =
     include_str!("../fixtures/openai_responses_chatgpt_render_golden.json.version");
 
-#[test]
-fn openai_responses_chatgpt_render_matches_golden() {
+/// The frozen config the golden bytes are rendered with.
+pub(crate) fn golden_frozen() -> broca_provider::wire::FrozenRenderConfig {
     let mut frozen = openai_responses_chatgpt_frozen_config("gpt-5-codex");
     frozen.reasoning = ReasoningPolicy::OpenAiResponsesReasoning {
         effort: "medium".into(),
         summary: None,
     };
+    frozen
+}
+
+#[test]
+fn openai_responses_chatgpt_render_matches_golden() {
+    let frozen = golden_frozen();
     let bytes = OpenAiResponsesChatgpt.render(&frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
