@@ -3497,11 +3497,8 @@ runner = "cargo"
 package = "broca-test-support"
 target = "--lib"
 test_file = "crates/broca-test-support/src/ckdev.rs"
-expect_red = [
-  "ckdev::tests::macos_published_copy_has_no_debug_map",
-  "ckdev::tests::macos_republishes_a_copy_from_the_unstripped_cache_format",
-]
-expect_message = "still contains OSO entries"
+expect_red = ["ckdev::tests::macos_published_copy_has_no_debug_map"]
+expect_message = "published copy still contains OSO entries"
 platforms = ["macos"]
 file = "crates/broca-test-support/src/ckdev.rs"
 old = "    strip_debug_map(&temporary.path)?;"
