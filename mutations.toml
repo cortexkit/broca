@@ -16113,13 +16113,13 @@ old = "pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = false;"
 new = "pub const RESPONSES_OUTSIDE_PROFILE_SENDS_SCHEMA: bool = true; // NON-VACUITY BREAK: send the schema as text.format again."
 [[control]]
 id = "deepseek-reasoning-echo-every-assistant-turn"
-guards = "with reasoning_content_required, every OpenAI-Chat assistant turn (text turns too, not only tool-call turns) carries reasoning_content"
+guards = "with the scalar echo policy or legacy flag, every OpenAI-Chat assistant turn (text turns too, not only tool-call turns) carries reasoning_content"
 runner = "cargo"
 package = "broca-provider"
 target = "--test it"
 features = ["live"]
 test_file = "crates/broca-provider/tests/it/reasoning_content_required.rs"
-expect_red = ["reasoning_content_required::deepseek_tool_loop_echoes_reasoning_on_every_assistant_turn_golden", "reasoning_content_required::enabled_echoes_reasoning_on_every_assistant_turn"]
+expect_red = ["reasoning_content_required::deepseek_tool_loop_echoes_reasoning_on_every_assistant_turn_golden", "reasoning_content_required::enabled_echoes_reasoning_on_every_assistant_turn", "reasoning_content_required::kimi_echoes_history_before_last_user_and_empty_text_turns_golden"]
 file = "crates/broca-provider/src/families/openai_chat.rs"
 old = '''        msg["reasoning_content"] = Value::String(reasoning);'''
 new = '''        if msg.get("tool_calls").is_some() { msg["reasoning_content"] = Value::String(reasoning); } // NON-VACUITY BREAK: tool-call turns only'''
@@ -16286,3 +16286,45 @@ expect_red = ["families::google_codeassist::tests::session_labels_track_the_requ
 file = "crates/broca-provider/src/families/google_codeassist.rs"
 old = '                "last_step_index": index.saturating_sub(1).to_string(),'
 new = '                "last_step_index": "0", // NON-VACUITY BREAK: lose request-step continuity.'
+
+[[control]]
+id = "kimi-reasoning-echo-route-detection"
+guards = "direct Kimi coding and Moonshot routes select the scalar history echo policy without opting in unrelated gateways"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/src/lib.rs"
+expect_red = ["tests::kimi_and_openrouter_route_detection_is_api_scoped"]
+file = "crates/broca-catalog/src/lib.rs"
+old = "        return Some(ReasoningEchoPolicy::KIMI);"
+new = "        return None; // NON-VACUITY BREAK: omit Kimi route policy."
+
+[[control]]
+id = "openrouter-reasoning-details-echo"
+guards = "OpenRouter assistant messages echo the format-tagged reasoning_details array including encrypted entries unchanged"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/reasoning_content_required.rs"
+expect_red = ["reasoning_content_required::openrouter_echoes_opaque_details_on_tool_and_text_turns_golden"]
+file = "crates/broca-provider/src/families/openai_chat.rs"
+old = '''        wire["reasoning_details"] = Value::Array(details);'''
+new = '''        let _ = details; // NON-VACUITY BREAK: discard structured continuation state.'''
+
+[[control]]
+id = "chat-reasoning-echo-policy-turn-coverage"
+guards = "frozen tool-call-only coverage does not echo scalar reasoning on non-tool assistant turns"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/reasoning_content_required.rs"
+expect_red = ["reasoning_content_required::echo_policy_turn_coverage_is_frozen_data"]
+file = "crates/broca-provider/src/families/openai_chat.rs"
+old = "p.turns == ReasoningEchoTurns::EveryAssistant || msg.get(\"tool_calls\").is_some()"
+new = "p.turns == ReasoningEchoTurns::EveryAssistant || true // NON-VACUITY BREAK: ignore tool-only coverage\n"

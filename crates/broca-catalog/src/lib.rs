@@ -557,10 +557,40 @@ fn provider_quirks(provider_id: &str, family: WireFamilyId, base_url: &str) -> Q
             quirks.tool_call_content_empty_string = true;
         }
     }
-    if family == WireFamilyId::OpenAiChat && is_deepseek_route(provider_id, base_url) {
-        quirks.reasoning_content_required = true;
+    if family == WireFamilyId::OpenAiChat {
+        quirks.reasoning_echo = reasoning_echo_for_route(provider_id, base_url);
     }
     quirks
+}
+
+fn reasoning_echo_for_route(
+    provider_id: &str,
+    base_url: &str,
+) -> Option<broca_provider::policy::ReasoningEchoPolicy> {
+    use broca_provider::policy::ReasoningEchoPolicy;
+    if is_deepseek_route(provider_id, base_url) {
+        return Some(ReasoningEchoPolicy::DEEPSEEK);
+    }
+    let host = url_host(base_url);
+    // Kimi: "retain the reasoning_content from every historical assistant message".
+    // https://platform.kimi.ai/docs/api/chat (thinking.keep); no last-user cutoff.
+    // Its applicability to api.kimi.ai/coding/v1 is inferred from the platform API rule;
+    // the renamed-tool-id live probe validates acceptance there, not retention inside the model.
+    if matches!(
+        provider_id,
+        "kimi-code-plan-global" | "kimi-code-plan-cn" | "moonshotai" | "moonshotai-cn"
+    ) || host.as_deref().is_some_and(|h| {
+        matches!(
+            h,
+            "api.kimi.ai" | "api.kimi.com" | "api.moonshot.ai" | "api.moonshot.cn"
+        )
+    }) {
+        return Some(ReasoningEchoPolicy::KIMI);
+    }
+    if provider_id == "openrouter" || host.as_deref() == Some("openrouter.ai") {
+        return Some(ReasoningEchoPolicy::OPENROUTER);
+    }
+    None
 }
 
 /// Whether a route is served by DeepSeek's own API: the `deepseek` provider, or any provider
@@ -569,7 +599,7 @@ fn provider_quirks(provider_id: &str, family: WireFamilyId, base_url: &str) -> Q
 /// earlier assistant turn's reasoning sent back as `reasoning_content`; without it the model
 /// loses its earlier reasoning at each turn boundary, and a request whose tool-call ids DeepSeek
 /// no longer recognises is refused 400. The OpenAI-Chat renderer adds that field when
-/// `reasoning_content_required` is set. Other providers that merely serve a DeepSeek model
+/// the scalar echo policy is set. Other providers that merely serve a DeepSeek model
 /// (ollama-cloud, OpenRouter, ...) are not matched: their APIs are not DeepSeek's.
 fn is_deepseek_route(provider_id: &str, base_url: &str) -> bool {
     provider_id == "deepseek"
@@ -2021,19 +2051,20 @@ mod tests {
         );
     }
 
-    /// DeepSeek's own API is the only route opted into the reasoning echo: the `deepseek`
-    /// provider and the frozen config resolved from it. Other OpenAI-Chat providers, including
-    /// ollama-cloud serving a DeepSeek model, stay off and keep their rendered bytes.
+    /// Direct APIs own their echo policies; serving a model with the same name is not opt-in.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn bundled_deepseek_alone_is_opted_into_the_reasoning_echo() {
+    fn bundled_chat_reasoning_echo_policies_are_provider_scoped() {
         let (deepseek, model) = catalog()
             .model("deepseek", "deepseek-v4-flash")
             .expect("deepseek/deepseek-v4-flash resolves from the bundled snapshot");
-        assert!(deepseek.quirks.reasoning_content_required);
+        assert_eq!(
+            deepseek.quirks.reasoning_echo,
+            Some(broca_provider::policy::ReasoningEchoPolicy::DEEPSEEK)
+        );
         let frozen = broca_provider::families::resolve_frozen(&deepseek, &model, 2048, 1)
             .expect("deepseek freezes");
-        assert!(frozen.reasoning_content_required);
+        assert_eq!(frozen.reasoning_echo, deepseek.quirks.reasoning_echo);
 
         for (provider_id, model_id) in [
             ("ollama-cloud", "deepseek-v4-pro"),
@@ -2044,17 +2075,74 @@ mod tests {
                 continue;
             };
             assert!(
-                !provider.quirks.reasoning_content_required,
+                provider.quirks.reasoning_echo.is_none(),
                 "{provider_id} must not echo reasoning_content"
             );
         }
         let opted_in = catalog()
             .provider_ids()
             .filter_map(|id| catalog().provider(id))
-            .filter(|provider| provider.quirks.reasoning_content_required)
+            .filter(|provider| {
+                provider.quirks.reasoning_echo
+                    == Some(broca_provider::policy::ReasoningEchoPolicy::DEEPSEEK)
+            })
             .map(|provider| provider.id)
             .collect::<Vec<_>>();
-        assert_eq!(opted_in, vec!["deepseek".to_string()]);
+        assert_eq!(
+            opted_in,
+            vec![
+                "deepseek",
+                "kimi-code-plan-cn",
+                "kimi-code-plan-global",
+                "moonshotai",
+                "moonshotai-cn"
+            ]
+        );
+    }
+
+    #[test]
+    fn kimi_and_openrouter_route_detection_is_api_scoped() {
+        use broca_provider::policy::ReasoningEchoPolicy as Echo;
+        for (id, url) in [
+            ("kimi-code-plan-global", ""),
+            ("kimi-code-plan-cn", ""),
+            ("moonshotai", ""),
+            ("moonshotai-cn", ""),
+            ("custom", "https://api.kimi.ai/coding/v1"),
+            ("custom", "https://api.kimi.com/coding/v1"),
+            ("custom", "https://api.moonshot.ai/v1"),
+            ("custom", "https://api.moonshot.cn/v1"),
+        ] {
+            assert_eq!(
+                provider_quirks(id, WireFamilyId::OpenAiChat, url).reasoning_echo,
+                Some(Echo::KIMI),
+                "{id} {url}"
+            );
+        }
+        for (id, url) in [
+            ("openrouter", ""),
+            ("custom", "https://openrouter.ai/api/v1"),
+        ] {
+            assert_eq!(
+                provider_quirks(id, WireFamilyId::OpenAiChat, url).reasoning_echo,
+                Some(Echo::OPENROUTER)
+            );
+        }
+        for url in [
+            "https://api.kimi.ai.evil.test/v1",
+            "https://api.kimi.ai@evil.test/v1",
+            "https://evil.test/api.moonshot.ai",
+            "https://openrouter.ai.evil.test/v1",
+        ] {
+            assert!(reasoning_echo_for_route("custom", url).is_none(), "{url}");
+        }
+        assert!(provider_quirks(
+            "kimi-code-plan-global",
+            WireFamilyId::AnthropicMessages,
+            "https://api.kimi.ai/coding"
+        )
+        .reasoning_echo
+        .is_none());
     }
 
     #[test]
@@ -2093,24 +2181,22 @@ mod tests {
     /// move that family's frozen blob.
     #[test]
     fn deepseek_reasoning_echo_is_set_only_for_the_openai_chat_family() {
-        assert!(
-            provider_quirks("deepseek", WireFamilyId::OpenAiChat, "").reasoning_content_required
-        );
-        assert!(
-            !provider_quirks(
-                "deepseek",
-                WireFamilyId::AnthropicMessages,
-                "https://api.deepseek.com/anthropic"
-            )
-            .reasoning_content_required
-        );
-        assert!(
-            !provider_quirks(
-                "openai",
-                WireFamilyId::OpenAiChat,
-                "https://api.openai.com/v1"
-            )
-            .reasoning_content_required
-        );
+        assert!(provider_quirks("deepseek", WireFamilyId::OpenAiChat, "")
+            .reasoning_echo
+            .is_some());
+        assert!(!provider_quirks(
+            "deepseek",
+            WireFamilyId::AnthropicMessages,
+            "https://api.deepseek.com/anthropic"
+        )
+        .reasoning_echo
+        .is_some());
+        assert!(!provider_quirks(
+            "openai",
+            WireFamilyId::OpenAiChat,
+            "https://api.openai.com/v1"
+        )
+        .reasoning_echo
+        .is_some());
     }
 }

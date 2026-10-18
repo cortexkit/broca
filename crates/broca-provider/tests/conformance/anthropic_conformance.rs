@@ -102,7 +102,7 @@ fn anthropic_spec() -> (ProviderSpec, ModelSpec) {
             },
             usage: UsagePolicy::AnthropicUsage,
             token_limit_field: Default::default(),
-            reasoning_content_required: false,
+            reasoning_echo: None,
             tool_call_content_empty_string: false,
         },
         raw: serde_json::Value::Null,

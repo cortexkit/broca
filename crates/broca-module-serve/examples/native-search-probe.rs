@@ -129,6 +129,14 @@ struct Args {
     /// every assistant turn carries its stored reasoning as `reasoning_content`.
     #[arg(long, conflicts_with = "body_file")]
     reasoning_content_required: bool,
+    /// Which reasoning to echo on assistant messages: kimi/deepseek scalar text, or openrouter details.
+    #[arg(long, value_parser = ["kimi", "openrouter", "deepseek"])]
+    reasoning_echo: Option<String>,
+    /// Decode a previous tool-call SSE response through the family normalizer and render the
+    /// continuation with tool result 42. Reuse the original --query and tool definition.
+    /// No network is needed for this decode/render step.
+    #[arg(long, conflicts_with_all = ["body_file", "replay_step"])]
+    continuation_response: Option<PathBuf>,
     /// Appended (comma-joined) to the Anthropic `anthropic-beta` header.
     #[arg(long)]
     extra_beta: Vec<String>,
@@ -553,6 +561,15 @@ async fn run(args: Args) -> Result<(), String> {
     if args.reasoning_content_required {
         frozen.reasoning_content_required = true;
     }
+    if let Some(policy) = args.reasoning_echo.as_deref() {
+        use broca_provider::policy::ReasoningEchoPolicy as Echo;
+        frozen.reasoning_echo = Some(match policy {
+            "kimi" => Echo::KIMI,
+            "openrouter" => Echo::OPENROUTER,
+            "deepseek" => Echo::DEEPSEEK,
+            _ => return Err("unknown reasoning echo policy".into()),
+        });
+    }
     if let Some(wire_model) = &args.wire_model {
         frozen.wire_model_id = wire_model.clone();
         model = broca_protocol::ModelHandle::new(model.provider_module_id.clone(), wire_model);
@@ -602,6 +619,15 @@ async fn run(args: Args) -> Result<(), String> {
                                 .map_err(|e| format!("read {}: {e}", path.display()))?,
                         )
                         .map_err(|e| format!("canonical prompt {}: {e}", path.display()))?;
+                    }
+                    if let Some(response) = &args.continuation_response {
+                        append_seed_continuation(
+                            &mut prompt,
+                            response,
+                            &frozen,
+                            family.as_ref(),
+                            &args.out,
+                        )?;
                     }
                     let mut opts = CallOptions::new(prompt);
                     opts.step_context = Some(StepContext {
@@ -949,6 +975,92 @@ async fn run(args: Args) -> Result<(), String> {
     if redactions > 0 {
         println!("WARNING: {redactions} output file(s) contained the credential and were redacted");
     }
+    Ok(())
+}
+
+/// Build the next request from the same canonical assistant state production would persist.
+/// A synthetic or reasoning-free seed cannot demonstrate continuation-state preservation.
+fn append_seed_continuation(
+    prompt: &mut Vec<Message>,
+    response: &Path,
+    frozen: &FrozenRenderConfig,
+    family: &dyn broca_provider::wire::WireFamily,
+    out: &Path,
+) -> Result<(), String> {
+    use broca_protocol::content::{EncryptedReasoningFormat, ToolOutput, ToolResult};
+    use broca_protocol::provider::{NormalizedEvent, ProviderControl};
+    let raw = std::fs::read(response).map_err(|e| format!("read seed response: {e}"))?;
+    let mut normalizer = family.normalizer(frozen, StepId(0));
+    let mut events = normalizer
+        .push(&raw)
+        .map_err(|e| format!("normalize seed: {e}"))?;
+    events.extend(
+        normalizer
+            .finish()
+            .map_err(|e| format!("finish seed: {e}"))?,
+    );
+    let content = events
+        .into_iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message.content)
+            }
+            _ => None,
+        })
+        .ok_or("seed produced no assembled assistant message")?;
+    let mut has_reasoning = false;
+    for block in &content {
+        match block {
+            ContentBlock::Reasoning { text, .. } => has_reasoning |= !text.is_empty(),
+            ContentBlock::RedactedReasoning {
+                data,
+                provider_format: Some(EncryptedReasoningFormat::OpenRouter),
+            } => {
+                let envelope: Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
+                has_reasoning |= envelope["reasoning_details"]
+                    .as_array()
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"] == "reasoning.encrypted"
+                                && item["data"]
+                                    .as_str()
+                                    .is_some_and(|s| !s.is_empty() && s != "[REDACTED]")
+                        })
+                    });
+            }
+            _ => {}
+        }
+    }
+    if !has_reasoning {
+        return Err(
+            "seed returned no reasoning (OpenRouter requires a non-redacted encrypted entry)"
+                .into(),
+        );
+    }
+    let results: Vec<_> = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(ContentBlock::ToolResult(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text { text: "42".into() },
+                is_error: false,
+            })),
+            _ => None,
+        })
+        .collect();
+    if results.is_empty() {
+        return Err("seed returned no tool call".into());
+    }
+    // This is an offline decode, before credentials are fetched; the seed contains no headers.
+    std::fs::write(
+        out.join("seed-content.json"),
+        broca_protocol::canonical_json_bytes(
+            &serde_json::to_value(&content).map_err(|e| e.to_string())?,
+        ),
+    )
+    .map_err(|e| format!("write seed content: {e}"))?;
+    prompt.push(Message::new(Role::Assistant, content));
+    prompt.push(Message::new(Role::Tool, results));
     Ok(())
 }
 

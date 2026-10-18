@@ -24,15 +24,10 @@ pub struct Quirks {
     pub usage: UsagePolicy,
     #[serde(default)]
     pub token_limit_field: TokenLimitField,
-    /// Whether this provider needs each earlier assistant turn's reasoning sent back as
-    /// `reasoning_content` (DeepSeek's thinking mode). When set, the OpenAI-Chat render puts
-    /// `reasoning_content` on EVERY assistant message: the stored reasoning text verbatim, or
-    /// `""` when the turn has none. DEFAULT OFF: the catalog opts in the `deepseek` provider
-    /// and any provider whose base URL host is `deepseek.com` or a subdomain of it; every other
-    /// provider renders without the field. See `ReasoningContentRequired` framing in the codec
-    /// spec (§6.3).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reasoning_content_required: bool,
+    /// Which reasoning to send back on OpenAI Chat assistant messages. Selected per API and
+    /// frozen when a run starts so resumed requests retain their original wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_echo: Option<ReasoningEchoPolicy>,
     /// Whether this provider rejects `content: null` on a tool-call-only assistant turn
     /// (ollama's OpenAI-compat endpoint 400s with "invalid message content type: <nil>").
     /// When set, the OpenAI-Chat render uses `"content": ""` instead of `null` on ANY
@@ -44,6 +39,43 @@ pub struct Quirks {
     /// OpenAI convention (`null`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tool_call_content_empty_string: bool,
+}
+
+/// Which assistant turns carry continuation state. Neither scope trims history at a user turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEchoTurns {
+    EveryAssistant,
+    ToolCalls,
+}
+
+/// The wire field also determines the representation: scalar text or opaque structured details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEchoFormat {
+    ReasoningContent,
+    OpenRouterDetails,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningEchoPolicy {
+    pub format: ReasoningEchoFormat,
+    pub turns: ReasoningEchoTurns,
+}
+
+impl ReasoningEchoPolicy {
+    pub const DEEPSEEK: Self = Self {
+        format: ReasoningEchoFormat::ReasoningContent,
+        turns: ReasoningEchoTurns::EveryAssistant,
+    };
+    pub const KIMI: Self = Self {
+        format: ReasoningEchoFormat::ReasoningContent,
+        turns: ReasoningEchoTurns::EveryAssistant,
+    };
+    pub const OPENROUTER: Self = Self {
+        format: ReasoningEchoFormat::OpenRouterDetails,
+        turns: ReasoningEchoTurns::EveryAssistant,
+    };
 }
 
 /// Which request field carries the output-token limit, and where it sits. Real

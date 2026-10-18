@@ -290,6 +290,7 @@ mod gated {
                     responses_tools_non_strict: None,
                     chatgpt_effort_updates: None,
                     reasoning_content_required: None,
+                    reasoning_echo: None,
                     structured_output: None,
                 },
             )

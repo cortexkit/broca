@@ -21,7 +21,10 @@
 //!    in-band terminal event — the assembled message is emitted on `finish()`.
 
 use broca_protocol::{
-    content::{AssistantMessage, ContentBlock, FinishReason, Message, Role, ToolCall, ToolOutput},
+    content::{
+        AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
+        ToolCall, ToolOutput,
+    },
     display::DisplayEvent,
     error::ProviderError,
     ids::{MessageId, ToolCallId},
@@ -37,7 +40,7 @@ use crate::families::{
     merge_inclusive_input_tokens_with_writes,
 };
 use crate::normalize::classify_error_with_status_defaults;
-use crate::policy::UsagePolicy;
+use crate::policy::{ReasoningEchoFormat, ReasoningEchoPolicy, ReasoningEchoTurns, UsagePolicy};
 use crate::sse::SseDecoder;
 use crate::wire::{
     AuthHandle, CacheClass, FrozenRenderConfig, HttpMethod, HttpRequest, NormalizeError,
@@ -100,6 +103,7 @@ impl WireFamily for OpenAiChat {
     ) -> Box<dyn StreamNormalizer> {
         Box::new(
             OpenAiChatNormalizer::new(step_id, frozen.usage)
+                .with_reasoning_echo(frozen.reasoning_echo)
                 // The body renders the token-limit field from this same value.
                 .with_max_output_tokens(frozen.max_output_tokens),
         )
@@ -118,7 +122,9 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
     let messages = convert_messages(
         &opts.prompt,
-        frozen.reasoning_content_required,
+        frozen.reasoning_echo.or(frozen
+            .reasoning_content_required
+            .then_some(ReasoningEchoPolicy::DEEPSEEK)),
         frozen.tool_call_content_empty_string,
         &name_map,
     );
@@ -204,7 +210,7 @@ fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
 /// requires a separate message per tool_call_id).
 fn convert_messages(
     prompt: &[Message],
-    reasoning_content_required: bool,
+    reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
 ) -> Vec<Value> {
@@ -219,7 +225,7 @@ fn convert_messages(
             }
             Role::Assistant => out.push(convert_assistant(
                 m,
-                reasoning_content_required,
+                reasoning_echo,
                 tool_call_content_empty_string,
                 name_map,
             )),
@@ -240,7 +246,7 @@ fn convert_messages(
 }
 
 /// An assistant turn: text content (or null) + any tool calls. Reasoning blocks are
-/// dropped for the default OpenAI-Chat shape. When `reasoning_content_required` is set (DeepSeek),
+/// dropped for the default OpenAI-Chat shape. Under DeepSeek's echo policy,
 /// EVERY assistant turn carries `reasoning_content`: the stored reasoning text verbatim, or `""`
 /// when the turn has none -- with tool calls or without.
 ///
@@ -261,15 +267,14 @@ fn convert_messages(
 /// after DeepSeek's store expires is refused. Sending the text ourselves makes the request
 /// complete on its own.
 ///
-/// No renderer_version bump: until DeepSeek was opted in no provider set the quirk, so no
-/// recorded run renders differently, and a run admitted without it froze `false` and resumes
-/// with its recorded bytes.
+/// No renderer_version bump: resumed runs restore their recorded policy or legacy scalar flag,
+/// including an absent flag. New provider defaults therefore cannot move old request bytes.
 ///
 /// When `tool_call_content_empty_string` is set (ollama OpenAI-compat), a text-less turn uses
 /// `"content": ""` instead of `null`.
 fn convert_assistant(
     m: &Message,
-    reasoning_content_required: bool,
+    reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
 ) -> Value {
@@ -281,7 +286,10 @@ fn convert_assistant(
             ContentBlock::Text { text: t } | ContentBlock::TextWithState { text: t, .. } => {
                 text.push_str(t)
             }
-            ContentBlock::Reasoning { text, .. } if reasoning_content_required => {
+            ContentBlock::Reasoning { text, .. }
+                if reasoning_echo
+                    .is_some_and(|p| p.format == ReasoningEchoFormat::ReasoningContent) =>
+            {
                 reasoning.push_str(text);
             }
             ContentBlock::ToolCall(tc) => tool_calls.push(json!({
@@ -293,8 +301,8 @@ fn convert_assistant(
                     "arguments": serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".into()),
                 },
             })),
-            // Reasoning is dropped unless the provider requires it back; redacted/tool-result
-            // blocks are never part of an OpenAI assistant turn.
+            // Structured continuation state is handled separately under its own format tag;
+            // tool results never belong in an assistant message.
             _ => {}
         }
     }
@@ -327,13 +335,51 @@ fn convert_assistant(
     if !tool_calls.is_empty() {
         msg["tool_calls"] = Value::Array(tool_calls);
     }
-    // On every assistant turn, not only tool-call turns (see the doc comment above). A turn
-    // with no stored reasoning sends `""`, so the field is never absent for these providers.
-    // Providers without the quirk render exactly as before: no field at all.
-    if reasoning_content_required {
-        msg["reasoning_content"] = Value::String(reasoning);
+    // Coverage belongs to the frozen policy, not the current turn's contents. Scalar APIs
+    // receive an empty string when no reasoning was stored; OpenRouter omits missing details.
+    if let Some(policy) = reasoning_echo.filter(|p| {
+        p.turns == ReasoningEchoTurns::EveryAssistant || msg.get("tool_calls").is_some()
+    }) {
+        match policy.format {
+            ReasoningEchoFormat::ReasoningContent => {
+                msg["reasoning_content"] = Value::String(reasoning);
+            }
+            ReasoningEchoFormat::OpenRouterDetails => {
+                echo_openrouter_details(m, &mut msg);
+            }
+        }
     }
     msg
+}
+
+/// OpenRouter: "pass the reasoning_details array back ... without any modifications".
+/// https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning-blocks
+/// The format tag prevents encrypted gateway state from becoming another API's signed thinking.
+fn echo_openrouter_details(message: &Message, wire: &mut Value) {
+    let mut details = Vec::new();
+    let mut reasoning = String::new();
+    for block in &message.content {
+        if let ContentBlock::RedactedReasoning {
+            data,
+            provider_format: Some(EncryptedReasoningFormat::OpenRouter),
+        } = block
+        {
+            if let Ok(envelope) = serde_json::from_str::<Value>(data) {
+                if let Some(text) = envelope.get("reasoning").and_then(Value::as_str) {
+                    reasoning.push_str(text);
+                }
+                if let Some(items) = envelope.get("reasoning_details").and_then(Value::as_array) {
+                    details.extend(items.iter().cloned());
+                }
+            }
+        }
+    }
+    if !details.is_empty() {
+        wire["reasoning_details"] = Value::Array(details);
+    } else if !reasoning.is_empty() {
+        // OpenRouter also documents the scalar field for models returning only raw strings.
+        wire["reasoning"] = Value::String(reasoning);
+    }
 }
 
 // Preserve user block boundaries without changing the legacy scalar form for one text block.
@@ -428,6 +474,8 @@ pub struct OpenAiChatNormalizer {
     sse: SseDecoder,
     message_id: Option<MessageId>,
     reasoning: String,
+    openrouter: bool,
+    reasoning_details: Vec<Value>,
     text: String,
     saw_refusal: bool,
     tool_calls: Vec<ToolCallBuf>,
@@ -454,6 +502,8 @@ impl OpenAiChatNormalizer {
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Chat),
             message_id: None,
             reasoning: String::new(),
+            openrouter: false,
+            reasoning_details: Vec::new(),
             text: String::new(),
             saw_refusal: false,
             tool_calls: Vec::new(),
@@ -472,6 +522,12 @@ impl OpenAiChatNormalizer {
     /// Record the rendered output cap so an output-ceiling error can name it.
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
         self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
+    pub fn with_reasoning_echo(mut self, policy: Option<ReasoningEchoPolicy>) -> Self {
+        self.openrouter =
+            policy.is_some_and(|p| p.format == ReasoningEchoFormat::OpenRouterDetails);
         self
     }
 
@@ -537,7 +593,17 @@ impl OpenAiChatNormalizer {
             .clone()
             .unwrap_or_else(|| MessageId(String::new()));
 
-        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+        if self.openrouter {
+            if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+                self.reasoning_details.extend(details.iter().cloned());
+            }
+        }
+        let reasoning_key = if self.openrouter {
+            "reasoning"
+        } else {
+            "reasoning_content"
+        };
+        if let Some(reasoning) = delta.get(reasoning_key).and_then(Value::as_str) {
             if !reasoning.is_empty() {
                 self.reasoning.push_str(reasoning);
                 out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
@@ -774,7 +840,16 @@ impl OpenAiChatNormalizer {
                 .terminal(&buf.id, &buf.name, &buf.arguments);
         }
         let mut content = Vec::new();
-        if !self.reasoning.is_empty() {
+        if self.openrouter && (!self.reasoning.is_empty() || !self.reasoning_details.is_empty()) {
+            content.push(ContentBlock::RedactedReasoning {
+                data: serde_json::to_string(&json!({
+                    "reasoning": std::mem::take(&mut self.reasoning),
+                    "reasoning_details": std::mem::take(&mut self.reasoning_details),
+                }))
+                .expect("reasoning envelope is JSON"),
+                provider_format: Some(EncryptedReasoningFormat::OpenRouter),
+            });
+        } else if !self.reasoning.is_empty() {
             content.push(ContentBlock::Reasoning {
                 text: std::mem::take(&mut self.reasoning),
                 signature: None,

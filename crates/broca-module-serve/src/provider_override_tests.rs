@@ -56,6 +56,7 @@ fn resolve_runtime_override(
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
             }),
+            reasoning_echo: frozen.map(|recorded| recorded.get("reasoning_echo").and_then(|v| serde_json::from_value(v.clone()).ok())),
             structured_output: None,
         },
     )
@@ -112,6 +113,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
+            reasoning_echo: None,
             structured_output: None,
         },
     )
@@ -449,6 +451,7 @@ fn resolve_drift_revision(
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
+            reasoning_echo: None,
             structured_output: None,
         },
     )
@@ -786,6 +789,7 @@ fn resolve_tier_revision(
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
+            reasoning_echo: None,
             structured_output: None,
         },
     )
@@ -903,6 +907,7 @@ fn resolve_variant_revision(
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
             reasoning_content_required: None,
+            reasoning_echo: None,
             structured_output: None,
         },
     )
@@ -1043,6 +1048,23 @@ fn resume_reads_the_recorded_reasoning_content_required() {
     assert!(frozen_reasoning_content_required(&recorded));
 }
 
+#[test]
+fn resume_reads_the_recorded_reasoning_echo_policy() {
+    use broca_provider::policy::{ReasoningEchoPolicy, ReasoningEchoTurns};
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-echo-policy-{}", std::process::id()));
+    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
+    let mut recorded = drift_run_config(&drift_request(&root), &started);
+    recorded.frozen_render_config = serde_json::json!({"reasoning_content_required": true});
+    assert_eq!(frozen_reasoning_echo(&recorded), None);
+    let policy = ReasoningEchoPolicy {
+        turns: ReasoningEchoTurns::ToolCalls,
+        ..ReasoningEchoPolicy::OPENROUTER
+    };
+    recorded.frozen_render_config["reasoning_echo"] = serde_json::to_value(policy).unwrap();
+    assert_eq!(frozen_reasoning_echo(&recorded), Some(policy));
+}
+
 /// A conversation with a reasoning-carrying tool-call turn and a plain text turn, the two
 /// assistant shapes whose rendering the DeepSeek reasoning echo changes.
 fn deepseek_history() -> broca_protocol::CallOptions {
@@ -1094,7 +1116,7 @@ fn assistant_reasoning(body: &[u8]) -> Vec<Option<serde_json::Value>> {
 fn deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes() {
     let fresh = resolve_runtime_override(&Default::default(), None);
     let fresh_blob = fresh.provider.render_config_blob();
-    assert_eq!(fresh_blob["reasoning_content_required"], true);
+    assert!(fresh_blob.get("reasoning_echo").is_some());
     assert_eq!(
         assistant_reasoning(&fresh.provider.render_request(&deepseek_history())),
         vec![
@@ -1107,7 +1129,7 @@ fn deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes() 
     recorded
         .as_object_mut()
         .unwrap()
-        .remove("reasoning_content_required");
+        .remove("reasoning_echo");
     let resumed = resolve_runtime_override(&Default::default(), Some(&recorded));
     assert_eq!(
         serde_json::to_vec(&resumed.provider.render_config_blob()).unwrap(),
@@ -1118,6 +1140,16 @@ fn deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes() 
         assistant_reasoning(&resumed.provider.render_request(&deepseek_history())),
         vec![None, None],
         "a resumed pre-echo episode renders no reasoning_content"
+    );
+
+    // The intermediate frozen shape had the scalar flag but no policy object.
+    recorded["reasoning_content_required"] = serde_json::json!(true);
+    let resumed = resolve_runtime_override(&Default::default(), Some(&recorded));
+    assert_eq!(resumed.provider.render_config_blob(), recorded);
+    assert_eq!(
+        resumed.provider.render_request(&deepseek_history()),
+        fresh.provider.render_request(&deepseek_history()),
+        "legacy true and the new DeepSeek policy render identical bytes"
     );
 }
 

@@ -4,12 +4,13 @@
 //! `reasoning_content` on EVERY assistant message, including turns without a tool call. When
 //! the provider opts in (the catalog opts in DeepSeek's own API), the OpenAI-Chat render puts
 //! the stored reasoning text there verbatim, or `""` when the turn stored none. Every other
-//! provider renders without the field, byte-identical to the legacy reasoning-dropping shape.
-//! These tests pin both sides: goldens for a multi-turn DeepSeek tool loop rendered with and
-//! without the quirk, and the field's presence on each assistant shape.
+//! provider without an echo policy renders without the field, as in the legacy shape.
+//! Goldens pin DeepSeek, Kimi and OpenRouter policies across user boundaries, text-only turns,
+//! tool calls and missing reasoning. The legacy scalar flag remains covered for resumed runs.
 
 use crate::render_golden_support;
 
+use broca_protocol::content::EncryptedReasoningFormat;
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult},
     request::{CallOptions, ModelHandle, Tool, ToolChoice},
@@ -18,6 +19,7 @@ use broca_protocol::{
 use broca_provider::families::{
     openai_chat_frozen_config, OpenAiChat, OPENAI_CHAT_RENDERER_VERSION,
 };
+use broca_provider::policy::{ReasoningEchoPolicy, ReasoningEchoTurns};
 use broca_provider::wire::{FrozenRenderConfig, WireFamily};
 use serde_json::{json, Value};
 
@@ -118,6 +120,182 @@ fn deepseek_config(reasoning_content_required: bool) -> FrozenRenderConfig {
     frozen.base_url = Some("https://api.deepseek.com".into());
     frozen.reasoning_content_required = reasoning_content_required;
     frozen
+}
+
+#[test]
+fn kimi_echoes_history_before_last_user_and_empty_text_turns_golden() {
+    let mut frozen = openai_chat_frozen_config("kimi-k3");
+    frozen.reasoning_echo = Some(ReasoningEchoPolicy::KIMI);
+    assert_golden(
+        OpenAiChat.render(&frozen, &tool_loop()),
+        include_str!("../fixtures/openai_chat_kimi_reasoning_echo_render_golden.json"),
+        include_str!("../fixtures/openai_chat_kimi_reasoning_echo_render_golden.json.version"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/openai_chat_kimi_reasoning_echo_render_golden.json"
+        ),
+        "OpenAI-Chat Kimi reasoning echo",
+    );
+    let mut legacy = deepseek_config(true);
+    let expected = OpenAiChat.render(&legacy, &tool_loop());
+    legacy.reasoning_content_required = false;
+    legacy.reasoning_echo = Some(ReasoningEchoPolicy::DEEPSEEK);
+    assert_eq!(OpenAiChat.render(&legacy, &tool_loop()), expected);
+}
+
+fn openrouter_state(reasoning: &str, details: Value) -> ContentBlock {
+    ContentBlock::RedactedReasoning {
+        data: json!({"reasoning": reasoning, "reasoning_details": details}).to_string(),
+        provider_format: Some(EncryptedReasoningFormat::OpenRouter),
+    }
+}
+
+#[test]
+fn openrouter_echoes_opaque_details_on_tool_and_text_turns_golden() {
+    let mut opts = tool_loop();
+    opts.prompt[2].content[0] = openrouter_state(
+        "Plan",
+        json!([
+            {"type":"reasoning.text","text":"Plan","format":"unknown-v2","index":0,"id":null,"extra":{"keep":true}},
+            {"type":"reasoning.encrypted","data":"opaque+/==","format":"google-gemini-v1","index":1,"id":"r1"}
+        ]),
+    );
+    opts.prompt[4].content[0] = openrouter_state(
+        "Summary",
+        json!([
+            {"type":"reasoning.summary","summary":"Summary","format":"anthropic-claude-v1","id":"r2"}
+        ]),
+    );
+    let mut frozen = openai_chat_frozen_config("google/gemini-2.5-flash");
+    frozen.reasoning_echo = Some(ReasoningEchoPolicy::OPENROUTER);
+    assert_golden(
+        OpenAiChat.render(&frozen, &opts),
+        include_str!("../fixtures/openai_chat_openrouter_reasoning_echo_render_golden.json"),
+        include_str!(
+            "../fixtures/openai_chat_openrouter_reasoning_echo_render_golden.json.version"
+        ),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/openai_chat_openrouter_reasoning_echo_render_golden.json"
+        ),
+        "OpenAI-Chat OpenRouter reasoning echo",
+    );
+    for policy in [None, Some(ReasoningEchoPolicy::KIMI)] {
+        frozen.reasoning_echo = policy;
+        let body = render(&frozen, &opts);
+        assert!(
+            !body.to_string().contains("opaque+/=="),
+            "foreign format must not leak"
+        );
+        assert!(assistant_messages(&body)
+            .iter()
+            .all(|m| m.get("reasoning_details").is_none()));
+    }
+}
+
+#[test]
+fn echo_policy_turn_coverage_is_frozen_data() {
+    let mut frozen = deepseek_config(false);
+    frozen.reasoning_echo = Some(ReasoningEchoPolicy {
+        turns: ReasoningEchoTurns::ToolCalls,
+        ..ReasoningEchoPolicy::KIMI
+    });
+    let assistants = assistant_messages(&render(&frozen, &tool_loop()));
+    assert_eq!(
+        assistants[0]["reasoning_content"],
+        "I should read main.rs first."
+    );
+    assert!(assistants[1].get("reasoning_content").is_none());
+    assert_eq!(assistants[2]["reasoning_content"], "");
+    assert!(assistants[3].get("reasoning_content").is_none());
+}
+
+#[test]
+fn openrouter_decodes_and_persists_reasoning_details_losslessly() {
+    use broca_protocol::{
+        provider::{NormalizedEvent, ProviderControl},
+        StepId,
+    };
+    let mut frozen = openai_chat_frozen_config("google/gemini-2.5-flash");
+    frozen.reasoning_echo = Some(ReasoningEchoPolicy::OPENROUTER);
+    let mut decoder = OpenAiChat.normalizer(&frozen, StepId(1));
+    let fixture = include_bytes!("../fixtures/openrouter_reasoning_details.sse");
+    let mut events = Vec::new();
+    for chunk in fixture.chunks(7) {
+        events.extend(decoder.push(chunk).unwrap());
+    }
+    events.extend(decoder.finish().unwrap());
+    let message = events
+        .into_iter()
+        .find_map(|e| match e {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .expect("fixture assembles");
+    let persisted = serde_json::to_vec(&message.content).unwrap();
+    let restored: Vec<ContentBlock> = serde_json::from_slice(&persisted).unwrap();
+    let ContentBlock::RedactedReasoning {
+        data,
+        provider_format,
+    } = &restored[0]
+    else {
+        panic!("missing opaque state")
+    };
+    assert_eq!(*provider_format, Some(EncryptedReasoningFormat::OpenRouter));
+    let envelope: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(
+        envelope,
+        json!({"reasoning":"Think carefully.", "reasoning_details":[
+            {"type":"reasoning.text","text":"Think ","format":"unknown-v2","index":0,"id":null,"vendor":{"x":[1,2]}},
+            {"type":"reasoning.text","text":"carefully.","format":"unknown-v2","index":0,"id":null},
+            {"type":"reasoning.encrypted","data":"AQID+/==","format":"google-gemini-v1","index":1,"id":"encrypted-1"},
+            {"type":"reasoning.summary","summary":"Check the clock","format":"anthropic-claude-v1","index":2,"id":"summary-2"}
+        ]})
+    );
+    let opts = CallOptions::new(vec![Message::new(Role::Assistant, restored)]);
+    let body = render(&frozen, &opts);
+    assert_eq!(
+        body["messages"][0]["reasoning_details"],
+        envelope["reasoning_details"]
+    );
+    assert!(
+        body["messages"][0].get("reasoning").is_none(),
+        "details take precedence over redundant scalar text"
+    );
+}
+
+#[test]
+fn openrouter_scalar_only_reasoning_round_trips_without_foreign_echo() {
+    use broca_protocol::{
+        provider::{NormalizedEvent, ProviderControl},
+        StepId,
+    };
+    let mut frozen = openai_chat_frozen_config("test");
+    frozen.reasoning_echo = Some(ReasoningEchoPolicy::OPENROUTER);
+    let mut decoder = OpenAiChat.normalizer(&frozen, StepId(1));
+    let mut events = decoder.push(b"data: {\"id\":\"r\",\"choices\":[{\"delta\":{\"reasoning\":\"raw reasoning\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+    events.extend(decoder.finish().unwrap());
+    let content = events
+        .into_iter()
+        .find_map(|e| match e {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message.content)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let opts = CallOptions::new(vec![Message::new(Role::Assistant, content)]);
+    assert_eq!(
+        render(&frozen, &opts)["messages"][0]["reasoning"],
+        "raw reasoning"
+    );
+    frozen.reasoning_echo = Some(ReasoningEchoPolicy::DEEPSEEK);
+    assert_eq!(
+        render(&frozen, &opts)["messages"][0]["reasoning_content"],
+        ""
+    );
 }
 
 fn render(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
