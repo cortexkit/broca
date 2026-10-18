@@ -32,6 +32,7 @@ use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
 const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+pub mod bus_events;
 pub mod caps;
 pub mod export_index;
 mod fold_identities;
@@ -178,6 +179,7 @@ pub enum StoreError {
     /// prefix). Surfaced rather than silently materializing a wrong projection.
     Replay(broca_core::ReplayError),
     InconsistentSnapshot(&'static str),
+    BusEvent(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -191,6 +193,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::Json(e) => write!(f, "json: {e}"),
             StoreError::Replay(e) => write!(f, "replay: {e}"),
+            StoreError::BusEvent(e) => write!(f, "run event: {e}"),
             StoreError::InconsistentSnapshot(message) => {
                 write!(f, "inconsistent snapshot: {message}")
             }
@@ -238,6 +241,7 @@ impl From<broca_core::ReplayError> for StoreError {
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    bus_events: bus_events::State,
     pub(crate) export_high_water: AtomicU64,
     pub(crate) export_source_instance_id: String,
     pub(crate) export_source_epoch: u64,
@@ -436,6 +440,7 @@ impl SqliteStore {
         restrict_to_owner(path);
         Ok(Self {
             conn: Mutex::new(conn),
+            bus_events: crate::bus_events::State::default(),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
             export_source_epoch: source_epoch,
@@ -448,6 +453,7 @@ impl SqliteStore {
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            bus_events: crate::bus_events::State::default(),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
             export_source_epoch: source_epoch,
@@ -1004,6 +1010,7 @@ impl SqliteStore {
         )?;
         retention::init_work_schema(conn)?;
         session_refs::init_schema(conn)?;
+        bus_events::init_schema(conn)?;
         export_index::init_schema(conn).map_err(StoreError::from)
     }
 
@@ -1526,6 +1533,9 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn read_run_event(&self, event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
+        self.get_bus_event(event_key).map_err(|e| e.to_string())
+    }
     fn read_prefix_with_watermark(&self, session: &BindIdentity) -> Result<StorePrefix, String> {
         let key = Self::key(session);
         let conn = self.conn.lock().unwrap();
@@ -3000,6 +3010,7 @@ mod tests {
         let (source_instance_id, source_epoch, high_water) =
             SqliteStore::init(&conn).expect("migrate legacy store");
         let store = SqliteStore {
+            bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
@@ -3057,6 +3068,7 @@ mod tests {
             assert_eq!(present, 1, "{table}.{column} is added");
         }
         let store = SqliteStore {
+            bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
@@ -3590,6 +3602,7 @@ mod tests {
         )
         .unwrap();
         let store = SqliteStore {
+            bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,

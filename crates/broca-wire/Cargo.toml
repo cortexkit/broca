@@ -19,6 +19,8 @@ cortexkit-role-llm-runner = { workspace = true }
 cortexkit-role-agent-data.workspace = true
 
 [dev-dependencies]
+serde_jcs.workspace = true
+cortexkit-bus-naming.workspace = true
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 tokio = { workspace = true, features = ["test-util"] }
 # Only the golden-bytes tests use it, to print and pin each golden file's digest.

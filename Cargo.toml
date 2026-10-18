@@ -76,6 +76,9 @@ cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.8.1"
 cortexkit-role-tool-provider-conformance = "=0.8.0"
 cortexkit-role-llm-runner = "=0.2.5"
+cortexkit-bus-naming = "=0.2.3"
+cortexkit-bus-trait = "=0.3.0"
+cortexkit-bus-nats = "=0.3.0"
 cortexkit-role-llm-runner-conformance = "=0.5.0"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
@@ -94,6 +97,11 @@ tracing = "0.1"
 # Codex's client fork references tungstenite over SSH; resolve the same immutable source via HTTPS.
 [patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[patch.crates-io]
+# JetStream's retry dependency must not enable Tokio's production test clock.
+# See commons third_party/tryhard/CORTEXKIT.md; remove once upstream drops test-util.
+tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db48975f43cb892b71a9952db4eb86" }
 
 # Cargo already defaults to unwinding; pinning it makes that a decision rather
 # than an inherited property. broca serves each run on its own task, so an

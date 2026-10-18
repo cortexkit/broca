@@ -193,6 +193,10 @@ impl From<&str> for StorePageReadError {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Claim-check events are session-owned data, even though the broker carries only routing metadata.
+    fn read_run_event(&self, _event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
+        Ok(None)
+    }
     /// Paged reads with a typed migration signal. Legacy implementations keep their existing
     /// errors; only a backend that knows its attribution is uncomputed may classify it stale.
     fn read_page_with_attribution(
