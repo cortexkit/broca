@@ -253,6 +253,7 @@ fn auth_error_step() -> Vec<NormalizedEvent> {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         },
         retries_used: 0,
     })]
@@ -878,6 +879,7 @@ async fn pause_for_auth_at_start_admits_then_pauses_then_continues() {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         }),
         auth_selection: Some(AuthSelection {
             credential_id: "chatgpt:openai".into(),
@@ -1070,6 +1072,7 @@ async fn auth_resume_with_the_same_selection_is_silent_and_keeps_one_segment() {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             auth_selection: Some(selection.clone()),
             ..Default::default()
@@ -1146,6 +1149,7 @@ async fn pause_before_first_call_refreezes_project_on_auth_resume() {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         }),
         ..Default::default()
     };
@@ -1294,6 +1298,7 @@ async fn auth_resume_refreezes_use_run_clock() {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             ..Default::default()
         },
@@ -1580,6 +1585,7 @@ async fn null_blob_cannot_refreeze_an_at_start_auth_pause() {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         }),
         ..Default::default()
     };

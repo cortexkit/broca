@@ -245,7 +245,7 @@ the next one). Synced before the caller sees the terminal.
 `ProviderError`: `class` (`transient`, `permanent`, `auth_required` (older records may say
 `auth`), `context_overflow`, `provider_unavailable`), `message`, and absent-when-unset
 `status` (u16), `retry_after_secs` (float), `provider_code`, `provider_subcode`, `resets_at_ms`
-(u64), `limit_window`, `account_ref`, `credential_id`.
+(u64), `limit_window`, `account_ref`, `credential_id`, `affordable_max_tokens` (u32).
 
 `provider_code: "request_invalid"` marks a provider's HTTP 400 that rejected the request itself
 (`invalid_request_error`, or Google's `INVALID_ARGUMENT`) when no more specific code applies;
@@ -253,9 +253,15 @@ class `permanent`, never re-sent. `provider_subcode` carries the provider's own 
 beneath it (for example `invalid_json_schema`), only when it matches `[a-z0-9_]{1,64}`; it is
 an open, diagnostic-only vocabulary and is absent on every other error.
 
+`affordable_max_tokens` is set only on a `credit_insufficient` terminal (a permanent refusal of a
+request the credential's remaining credit cannot pay for now, such as OpenRouter's HTTP 402 with
+`error.metadata.limit_source` `openrouter_credits`), and only when the provider stated the number:
+the largest request `max_tokens` the remaining credit covers. `credit_insufficient` is distinct
+from `billing_exhausted`, which says the balance itself is gone.
+
 `credential_id` is the full credential id the run froze in `auth_selection.credential_id`
 (with shape `<method>:<provider>:<account>`), stamped by the run on exactly the credential-scoped
-terminals: `billing_exhausted`, `account_limit_exhausted`, and a transient rate limit (HTTP 429,
+terminals: `billing_exhausted`, `credit_insufficient`, `account_limit_exhausted`, and a transient rate limit (HTTP 429,
 or an in-band `rate_limit_error`/`rate_limit_exceeded`). A rate-limit terminal also carries
 `provider_code: "rate_limited"` in place of the provider's own code; WALs written before it
 hold the raw code. Absent on every other error, on runs that froze no selection, and on records

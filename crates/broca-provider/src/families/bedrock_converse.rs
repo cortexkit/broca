@@ -1348,6 +1348,7 @@ fn bedrock_error(event_type: &str, payload: &Value, header_message: Option<&str>
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 

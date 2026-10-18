@@ -2273,6 +2273,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         limit_window: None,
                         account_ref: None,
                         credential_id: None,
+                        affordable_max_tokens: None,
                     };
                     let sealed = async {
                         self.write_interrupted_seal_with_error(
@@ -5326,6 +5327,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let writer = self.writer.as_ref().expect("writer live while open");
         writer.record(WalRecord::Retracted {
@@ -5865,6 +5867,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         });
         self.write_interrupted_seal_with_error(sealed_attempt, cause, error)
             .await

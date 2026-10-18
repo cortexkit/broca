@@ -625,6 +625,7 @@ fn paused_run_projects_pause_as_terminal() {
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                 }),
             },
         ),
@@ -676,6 +677,7 @@ fn error_terminal_surfaces_error_then_finished() {
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                 }),
                 retries_used: 0,
             },
@@ -703,6 +705,7 @@ fn failed_queued_admission_projects_atomic_terminal() {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     };
     let projected = project_control(&[framed(
         7,
@@ -829,6 +832,7 @@ fn every_loop_emitted_control_unit_is_projectable() {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }
             .into(),
         },
@@ -991,6 +995,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             }),
             retries_used: 0,
         },

@@ -456,6 +456,7 @@ fn error_value(message: &str) -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -1048,6 +1049,7 @@ async fn run_status_reports_an_exhausted_account_with_its_reset_window_and_accou
         limit_window: Some("seven_day".into()),
         account_ref: Some("d4bc9dbc".into()),
         credential_id: None,
+        affordable_max_tokens: None,
     };
     append_seed(
         &rig.wal_store,

@@ -49,8 +49,17 @@ pub struct RefreshedCredential {
 /// admitted with. Implementations must never substitute a different credential: the auth
 /// selection frozen at admission is part of what the run is.
 pub trait SecretRefresher: Send + Sync {
-    /// Called after the provider rejected the most recently served token with a 401.
-    fn refresh_rejected_secret(&self) -> RefreshFuture<'_, RefreshedSecret>;
+    /// Called after the provider rejected the most recently served token. `status` is the HTTP
+    /// status of that rejection, so a report or cache eviction names what the provider said.
+    fn refresh_rejected_secret(&self, status: u16) -> RefreshFuture<'_, RefreshedSecret>;
+
+    /// Called when the provider rejected a token this step had already refreshed once, so no
+    /// further refresh is tried and the rejection ends the step. `status` is that rejection's
+    /// HTTP status. Nothing has reported this rejection to the source yet; an implementation
+    /// that reports rejections at run end records it here so it can report exactly this token.
+    ///
+    /// The default does nothing.
+    fn note_unrecovered_rejection(&self, _status: u16) {}
 
     /// Called before every attempt. Returns a fresh token only when the one served last is
     /// about to expire and the source could serve a newer one; `None` otherwise, including
@@ -66,7 +75,11 @@ pub trait SecretRefresher: Send + Sync {
 /// What the transport calls after an HTTP 401: a fresh credential shaped for this provider's
 /// auth header, or `None` to let the rejection stand.
 pub trait CredentialRefresher: Send + Sync {
-    fn refresh_rejected(&self) -> RefreshFuture<'_, RefreshedCredential>;
+    /// See [`SecretRefresher::refresh_rejected_secret`].
+    fn refresh_rejected(&self, status: u16) -> RefreshFuture<'_, RefreshedCredential>;
+
+    /// See [`SecretRefresher::note_unrecovered_rejection`]. The default does nothing.
+    fn note_unrecovered_rejection(&self, _status: u16) {}
 
     /// What the transport calls before each attempt: a fresh credential when the held one is
     /// about to expire, or `None` to send with the held one (see
@@ -116,11 +129,15 @@ impl<S> CredentialRefresher for ShapedSecretRefresher<S>
 where
     S: Fn(String) -> AuthHandle + Send + Sync,
 {
-    fn refresh_rejected(&self) -> RefreshFuture<'_, RefreshedCredential> {
+    fn refresh_rejected(&self, status: u16) -> RefreshFuture<'_, RefreshedCredential> {
         Box::pin(async move {
-            let refreshed = self.source.refresh_rejected_secret().await?;
+            let refreshed = self.source.refresh_rejected_secret(status).await?;
             Some(self.shaped(refreshed))
         })
+    }
+
+    fn note_unrecovered_rejection(&self, status: u16) {
+        self.source.note_unrecovered_rejection(status);
     }
 
     fn refresh_expiring(&self) -> RefreshFuture<'_, RefreshedCredential> {

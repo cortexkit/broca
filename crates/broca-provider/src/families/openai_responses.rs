@@ -1368,6 +1368,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 

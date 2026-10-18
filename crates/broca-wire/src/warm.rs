@@ -319,6 +319,7 @@ mod golden {
                         limit_window: None,
                         account_ref: None,
                         credential_id: None,
+                        affordable_max_tokens: None,
                     }
                     .into(),
                 }),

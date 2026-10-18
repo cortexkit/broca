@@ -299,6 +299,7 @@ fn auth_required_pause_is_resumable_not_sealed() {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         }),
     });
 

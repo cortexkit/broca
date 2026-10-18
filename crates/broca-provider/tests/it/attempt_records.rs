@@ -890,7 +890,7 @@ mod gated {
     }
 
     impl CredentialRefresher for ScriptedRefresher {
-        fn refresh_rejected(&self) -> RefreshFuture<'_, RefreshedCredential> {
+        fn refresh_rejected(&self, _status: u16) -> RefreshFuture<'_, RefreshedCredential> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let next = self.replies.lock().unwrap().pop_front().flatten();
             Box::pin(async move {
@@ -1094,6 +1094,7 @@ mod gated {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let admitted = run_loop_with_control(
             request(&dir),

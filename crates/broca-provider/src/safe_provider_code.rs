@@ -12,6 +12,7 @@ pub fn safe_provider_code(code: &str) -> bool {
             | "context_length_exceeded"
             | "context_window_exceeded"
             | "billing_exhausted"
+            | "credit_insufficient"
             | "credit_balance_exhausted"
             | "organization_spend_limit_exceeded"
             | "project_spend_limit_exceeded"
@@ -53,6 +54,7 @@ mod tests {
             "context_length_exceeded",
             "context_window_exceeded",
             "billing_exhausted",
+            "credit_insufficient",
             "output_ceiling",
             "previous_process_ended_unsealed",
             "websocket_auth_rejected",

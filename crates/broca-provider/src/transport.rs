@@ -40,7 +40,9 @@ use broca_core::ShutdownSeal;
 use broca_core::{clock::Clock, provider::Provider};
 use broca_protocol::{
     display::DisplayEvent,
-    error::{ErrorClass, ProviderError, ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED},
+    error::{
+        ErrorClass, ProviderError, ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, CREDIT_INSUFFICIENT,
+    },
     AttemptOutcome, CallOptions, CredentialRefresh, GenerationConfig, ModelAttempt,
     NormalizedEvent, ProviderControl, StepId, ToolChoice,
 };
@@ -859,6 +861,7 @@ async fn send_warm(
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         })
     };
     let exchange = async {
@@ -1745,6 +1748,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                 };
                 tokio::select! {
                     biased;
@@ -2088,20 +2092,29 @@ where
             Ok(completion) => return Ok((completion, attempt_index as u32)),
             Err(failure) => {
                 if is_rejected_token(&failure.error) {
-                    // Whatever happens next, a step recovers at most once, so a second 401
-                    // (even from the refreshed token) ends the step.
-                    let Some(recovery) = auth_recovery.as_mut().filter(|_| !rejection_recovered)
-                    else {
+                    let rejected_status = failure.error.status.unwrap_or(401);
+                    let Some(recovery) = auth_recovery.as_mut() else {
                         warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
                         return Err((failure.error, attempt_index as u32));
                     };
+                    // Whatever happens next, a step recovers at most once, so a second rejection
+                    // (of the token the step just refreshed) ends the step. Nothing has reported
+                    // that token to the credential source yet, so hand it the rejection to report.
+                    if rejection_recovered {
+                        recovery
+                            .recovery
+                            .refresher
+                            .note_unrecovered_rejection(rejected_status);
+                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
+                        return Err((failure.error, attempt_index as u32));
+                    }
                     rejection_recovered = true;
                     let refresh_started = retry_clock.mark();
                     let refreshed = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                         _ = tx.closed() => return Ok((Vec::new(), 0)),
-                        refreshed = recovery.recovery.refresher.refresh_rejected() => refreshed,
+                        refreshed = recovery.recovery.refresher.refresh_rejected(rejected_status) => refreshed,
                     };
                     let Some(refreshed) = refreshed else {
                         warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
@@ -2260,15 +2273,12 @@ where
 }
 
 /// Whether a failed attempt means the provider rejected the token itself: an Auth-class HTTP
-/// 401, or a ChatGPT socket upgrade's explicit 401/403 auth refusal. An ordinary HTTP 403
-/// is an entitlement refusal, and a ChatGPT
-/// backend 401 about its own upstream API key is classified Transient before it gets here, so
-/// neither qualifies.
+/// 401, including a ChatGPT socket upgrade refused with 401. A 403, on HTTPS or on a socket
+/// upgrade, is not: an HTTPS 403 is an entitlement refusal, and a refused upgrade 403 is sent
+/// again over HTTPS before it is classified. A ChatGPT backend 401 about its own upstream API key
+/// is classified Transient before it gets here, so it does not qualify either.
 fn is_rejected_token(error: &ProviderError) -> bool {
-    error.class == ErrorClass::Auth
-        && (error.status == Some(401)
-            || (error.status == Some(403)
-                && error.provider_code.as_deref() == Some("websocket_auth_rejected")))
+    error.class == ErrorClass::Auth && error.status == Some(401)
 }
 
 fn chatgpt_account(auth: &AuthHandle) -> Option<&str> {
@@ -2313,6 +2323,7 @@ fn account_changed_error(frozen: Option<&str>, served: Option<&str>) -> Option<P
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     })
 }
 
@@ -2732,8 +2743,10 @@ async fn drive_attempt(
         };
         // An exhausted account refills in hours or days. Re-sending within the step cannot
         // succeed, and honoring the wait would park the run far past any step budget.
-        let retry_forbidden =
-            retry_forbidden || error.is_account_limit_exhausted() || error.is_billing_exhausted();
+        let retry_forbidden = retry_forbidden
+            || error.is_account_limit_exhausted()
+            || error.is_billing_exhausted()
+            || error.is_credit_insufficient();
         if error.is_account_limit_exhausted() {
             trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
                 resets_at_ms: error.resets_at_ms,
@@ -3250,6 +3263,7 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3270,6 +3284,7 @@ fn content_timeout_error() -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3305,6 +3320,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3333,6 +3349,7 @@ fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> Pro
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3350,6 +3367,7 @@ fn transport_error(message: &str) -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3367,6 +3385,7 @@ fn stream_limit_error(message: &str) -> ProviderError {
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3546,6 +3565,7 @@ fn classify_chatgpt_upstream_key_rejection(
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     }
 }
 
@@ -3580,6 +3600,11 @@ pub fn classify_account_limit_exhausted(
     now: SystemTime,
     error: ProviderError,
 ) -> ProviderError {
+    if status == 402 {
+        if let Some(unaffordable) = openrouter_credit_insufficient(body, &error) {
+            return unaffordable;
+        }
+    }
     if matches!(
         family,
         crate::spec::WireFamilyId::OpenAiChat | crate::spec::WireFamilyId::OpenAiResponses
@@ -3688,8 +3713,52 @@ fn chatgpt_usage_limit_reached(
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
         ..error
     }
+}
+
+/// OpenRouter's refusal of a request its credential's remaining credit cannot pay for: HTTP 402
+/// whose `error.metadata.limit_source` is `openrouter_credits`. The structured field decides,
+/// never the message wording. A production refusal read: `{"error":{"message":"This request
+/// requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only
+/// afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more
+/// credits","code":402,"metadata":{"limit_source":"openrouter_credits", ...}}}`.
+///
+/// It becomes a permanent `credit_insufficient`, not `billing_exhausted`: the balance is not
+/// gone, this request is just too expensive for it, and the same request re-sent within the run
+/// cannot succeed. The affordable `max_tokens` is read from the message only to fill the
+/// optional `affordable_max_tokens`; a message without the number leaves it absent.
+fn openrouter_credit_insufficient(body: &str, error: &ProviderError) -> Option<ProviderError> {
+    let detail = parse_http_error_body(body)?.get("error")?.clone();
+    if detail
+        .pointer("/metadata/limit_source")
+        .and_then(Value::as_str)
+        != Some("openrouter_credits")
+    {
+        return None;
+    }
+    let affordable_max_tokens = detail
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(|message| message.split_once("can only afford "))
+        .and_then(|(_, rest)| {
+            let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+            digits.parse::<u32>().ok()
+        });
+    Some(ProviderError {
+        refusal: None,
+        class: ErrorClass::Permanent,
+        provider_code: Some(CREDIT_INSUFFICIENT.to_string()),
+        retry_after_secs: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens,
+        ..error.clone()
+    })
 }
 
 /// xAI's spending limit refusal: HTTP 402 or 403 with code `personal-team-blocked:spending-limit`.
@@ -3716,6 +3785,7 @@ fn xai_spending_limit_reached(
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
             ..error.clone()
         })
     } else {
@@ -3749,6 +3819,7 @@ fn kimi_weekly_usage_limit_reached(body: &str, error: ProviderError) -> Provider
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
         ..error
     }
 }
@@ -3815,6 +3886,7 @@ fn google_quota_exhausted(body: &str, now: SystemTime, error: ProviderError) -> 
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
         ..error
     }
 }
@@ -3974,6 +4046,7 @@ fn http_error_in_family(
         limit_window: None,
         account_ref: None,
         credential_id: None,
+        affordable_max_tokens: None,
     };
     // Run after the context-overflow and billing classification above, so a 400 those give a
     // more specific code keeps it.
@@ -4006,7 +4079,9 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, REQUEST_INVALID};
+    use broca_protocol::error::{
+        ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, CREDIT_INSUFFICIENT, REQUEST_INVALID,
+    };
     use broca_protocol::{
         content::{AssistantMessage, ContentBlock, Role, ToolCall},
         display::DisplayEvent,
@@ -4469,6 +4544,7 @@ mod tests {
                     limit_window: None,
                     account_ref: None,
                     credential_id: None,
+                    affordable_max_tokens: None,
                 },
                 retries_used: 0,
             })])
@@ -5846,6 +5922,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         assert_eq!(retry_delay(&error, 0), Duration::from_millis(2_500));
     }
@@ -5865,6 +5942,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         assert_eq!(retry_delay(&error, 0), Duration::from_secs(120));
     }
@@ -5884,6 +5962,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         for (failed_attempt_index, nominal_secs) in [
             (0, 2.0),
@@ -5952,6 +6031,7 @@ mod tests {
     impl super::CredentialRefresher for FixedRefresher {
         fn refresh_rejected(
             &self,
+            _status: u16,
         ) -> crate::credential_refresh::RefreshFuture<
             '_,
             crate::credential_refresh::RefreshedCredential,
@@ -6202,6 +6282,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let error = classify_account_limit_exhausted(
             WireFamilyId::AnthropicMessages,
@@ -6482,6 +6563,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
+            affordable_max_tokens: None,
         };
         let usage_no_reset = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#;
         let usage_string_reset = r#"{"error":{"type":"usage_limit_reached","resets_at":"1790021043","resets_in_seconds":60}}"#;
@@ -6948,6 +7030,7 @@ mod tests {
                 limit_window: None,
                 account_ref: None,
                 credential_id: None,
+                affordable_max_tokens: None,
             };
             let classified = classify_account_limit_exhausted(
                 WireFamilyId::OpenAiChat,
@@ -6961,6 +7044,76 @@ mod tests {
             assert!(classified.is_billing_exhausted());
             assert_eq!(classified.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
             assert_eq!(classified.resets_at_ms, None);
+        }
+    }
+
+    /// OpenRouter's 402 for a request its credit cannot pay for. RECONSTRUCTED from a production
+    /// refusal: the message is verbatim, but the production `metadata` held more fields than the
+    /// one kept here, and those were not recorded.
+    const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
+
+    fn classify_openrouter(status: u16, body: &str) -> ProviderError {
+        let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+        let error = super::classify_http_error_in_family(
+            status,
+            body,
+            None,
+            None,
+            Some(WireFamilyId::OpenAiChat),
+            None,
+        );
+        classify_account_limit_exhausted(
+            WireFamilyId::OpenAiChat,
+            status,
+            &headers,
+            body,
+            UNIX_EPOCH,
+            error,
+        )
+    }
+
+    #[test]
+    fn openrouter_credit_402_is_credit_insufficient_with_the_affordable_max_tokens() {
+        // Today's code before this classification: a plain permanent with no provider code.
+        let unclassified = classify_http_error(402, OPENROUTER_CREDIT_402_BODY, None, None);
+        assert_eq!(unclassified.provider_code, None);
+        let error = classify_openrouter(402, OPENROUTER_CREDIT_402_BODY);
+        assert_eq!(error.class, ErrorClass::Permanent);
+        assert!(error.is_credit_insufficient());
+        assert_eq!(error.provider_code.as_deref(), Some(CREDIT_INSUFFICIENT));
+        assert!(
+            !error.is_billing_exhausted(),
+            "an unaffordable request is not an exhausted balance"
+        );
+        assert!(error.is_credential_scoped());
+        assert_eq!(error.affordable_max_tokens, Some(97_335));
+        assert_eq!(error.status, Some(402));
+        assert_eq!(error.resets_at_ms, None);
+        assert_eq!(error.retry_after_secs, None);
+        assert!(crate::safe_provider_code(CREDIT_INSUFFICIENT));
+
+        // The number is optional: a refusal whose message does not state it keeps the code.
+        let unnumbered = OPENROUTER_CREDIT_402_BODY.replace("can only afford 97335", "cannot");
+        let error = classify_openrouter(402, &unnumbered);
+        assert!(error.is_credit_insufficient());
+        assert_eq!(error.affordable_max_tokens, None);
+    }
+
+    #[test]
+    fn credit_insufficient_needs_status_402_and_the_openrouter_credit_source() {
+        let other_source = OPENROUTER_CREDIT_402_BODY.replace("openrouter_credits", "key_limit");
+        let no_source = OPENROUTER_CREDIT_402_BODY
+            .replace(r#","metadata":{"limit_source":"openrouter_credits"}"#, "");
+        for (status, body) in [
+            (403, OPENROUTER_CREDIT_402_BODY),
+            (429, OPENROUTER_CREDIT_402_BODY),
+            (402, other_source.as_str()),
+            // The message alone, however telling, does not decide.
+            (402, no_source.as_str()),
+        ] {
+            let error = classify_openrouter(status, body);
+            assert!(!error.is_credit_insufficient(), "{status} {body}");
+            assert_eq!(error.affordable_max_tokens, None);
         }
     }
 

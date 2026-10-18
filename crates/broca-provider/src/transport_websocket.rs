@@ -22,9 +22,17 @@ const FAILURE_LIMIT: usize = 6;
 // Retire before the backend's 60-minute connection lifetime, not in the middle of a response.
 const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
 const BETA: &str = "responses_websockets=2026-02-06";
+// Only the first 512 bytes of a refused upgrade's body are read, and only to recognise a ChatGPT
+// usage-limit refusal (whose body is about 200 bytes). The body is never logged or stored.
+const UPGRADE_BODY_CLASSIFY_LIMIT: usize = 512;
 
 enum UpgradeFailure {
+    /// The upgrade was answered 401: the token itself was refused.
     AuthRejected(u16),
+    /// The upgrade's own body already says the account's usage limit is reached, so an HTTPS
+    /// round trip would only repeat the refusal.
+    AccountLimit(u16, Box<ProviderError>),
+    /// No socket for this attempt: send it over HTTPS instead.
     Transport,
 }
 
@@ -142,12 +150,32 @@ impl Session {
                 state.socket = Some(Arc::clone(&socket));
                 Ok((socket, false))
             }
-            Ok(Err(tungstenite::Error::Http(response)))
-                if matches!(response.status().as_u16(), 401 | 403) =>
-            {
-                // An auth refusal must reach the shared re-read/pause path, not send stale
-                // credentials again over HTTPS. Do not retain the upgrade body or headers.
-                Err(UpgradeFailure::AuthRejected(response.status().as_u16()))
+            Ok(Err(tungstenite::Error::Http(response))) => {
+                let status = response.status().as_u16();
+                if status == 401 {
+                    // Only a 401 says the token itself was refused. It must reach the shared
+                    // re-read/pause path, not send the stale token again over HTTPS.
+                    warn_upgrade_refusal(status, response.headers(), "credential_reread");
+                    return Err(UpgradeFailure::AuthRejected(status));
+                }
+                if let Some(error) =
+                    upgrade_account_limit(status, response.headers(), response.body().as_deref())
+                {
+                    warn_upgrade_refusal(status, response.headers(), "account_limit");
+                    return Err(UpgradeFailure::AccountLimit(status, Box::new(error)));
+                }
+                warn_upgrade_refusal(status, response.headers(), "https");
+                if status == 403 {
+                    // A 403 upgrade is not a verdict on the token: in production, freshly
+                    // refreshed tokens kept getting it while the same account's HTTPS requests
+                    // were answerable. Send this request over HTTPS, whose answer broca can
+                    // classify (usage limit, entitlement, or a real 401), and keep the rest of
+                    // the run there instead of asking for a refused upgrade again.
+                    self.switch_to_https();
+                } else {
+                    self.fail();
+                }
+                Err(UpgradeFailure::Transport)
             }
             _ => {
                 // Do not format the upgrade error: it can contain authentication headers.
@@ -473,6 +501,16 @@ async fn drive_socket(
             error.provider_code = Some("websocket_auth_rejected".into());
             return Err(AttemptFailure::http(error, false));
         }
+        Err(UpgradeFailure::AccountLimit(status, error)) => {
+            trace.http_status = Some(status);
+            trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+                resets_at_ms: error.resets_at_ms,
+                resets_at_source: error.resets_at_source.clone(),
+                limit_window: error.limit_window.clone(),
+            });
+            // An exhausted account refills in hours or days: no retry within the step.
+            return Err(AttemptFailure::http(*error, true));
+        }
         Err(UpgradeFailure::Transport) => {
             return drive_attempt(
                 client,
@@ -675,6 +713,64 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
             .get("x-should-retry")
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
     Some(AttemptFailure::http(error, forbidden))
+}
+
+/// Response headers of a refused upgrade that are safe to log: the request ids an operator can
+/// quote to the backend's support, the server, the content type, and the Codex backend's own
+/// `x-codex-*` headers. Every other header is left out because it may carry a cookie or
+/// credential.
+fn safe_upgrade_header(name: &str) -> bool {
+    matches!(
+        name,
+        "cf-ray" | "x-request-id" | "request-id" | "server" | "content-type"
+    ) || name.starts_with("x-codex-")
+}
+
+/// Log one WARN for a refused socket upgrade: its status, what broca does next, and only the
+/// headers [`safe_upgrade_header`] allows. The body is never logged; it can echo credentials.
+fn warn_upgrade_refusal(status: u16, headers: &reqwest::header::HeaderMap, next: &'static str) {
+    let headers = headers
+        .iter()
+        .filter(|(name, _)| safe_upgrade_header(name.as_str()))
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?;
+            // Bound each value so one oversized header cannot flood the log line.
+            let value: String = value.chars().take(128).collect();
+            Some(format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::warn!(
+        target: "provider",
+        transport = "websocket",
+        upgrade_status = status,
+        next,
+        headers = %headers,
+        "Responses websocket upgrade refused"
+    );
+}
+
+/// Return the ChatGPT account-limit error stated by a refused upgrade's body, if the body states
+/// one. Only the first [`UPGRADE_BODY_CLASSIFY_LIMIT`] bytes are classified, the same way as an
+/// HTTPS error answer. Any other body returns `None`, and the caller sends the request over HTTPS
+/// for the backend to answer there.
+fn upgrade_account_limit(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<&[u8]>,
+) -> Option<ProviderError> {
+    let body = body?;
+    let text = String::from_utf8_lossy(&body[..body.len().min(UPGRADE_BODY_CLASSIFY_LIMIT)]);
+    let error = classify_http_error(status, &text, parse_retry_after_header(headers), None);
+    let error = classify_account_limit_exhausted(
+        crate::spec::WireFamilyId::OpenAiResponsesChatgpt,
+        status,
+        &response_headers(headers),
+        &text,
+        SystemTime::now(),
+        error,
+    );
+    error.is_account_limit_exhausted().then_some(error)
 }
 
 pub(super) fn frame_record(raw: &[u8]) -> Vec<u8> {
