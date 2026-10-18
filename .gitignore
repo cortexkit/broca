@@ -72,3 +72,7 @@
 
 # Test-rig binaries staged into worker worktrees by the head (see .cortexkit/alfonso/scripts).
 /.test-rigs/
+
+# Python bytecode written when the script suites import helper modules.
+__pycache__/
+*.pyc
