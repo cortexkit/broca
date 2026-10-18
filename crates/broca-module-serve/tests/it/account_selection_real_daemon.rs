@@ -2789,7 +2789,20 @@ async fn grammar_too_large_status_and_memo_through_real_serve() {
         1
     );
     let client = rig.client("grammar-fallback").await;
-    let status = client.run_status(run).await.unwrap();
+    // The live actor can still report the run active for a moment after its terminal is
+    // durable, so wait for the status to leave `active` before pinning it.
+    let status = broca_test_support::wait_until(
+        "grammar_too_large_status_and_memo_through_real_serve: run status",
+        || async {
+            let status = client.run_status(run).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Active { .. }) {
+                Err(format!("{status:?}"))
+            } else {
+                Ok(status)
+            }
+        },
+    )
+    .await;
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["state"], "completed");
     assert_eq!(value["structured_output"]["enforcement"], "best_effort");
