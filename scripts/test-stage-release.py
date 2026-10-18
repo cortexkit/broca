@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -80,6 +81,18 @@ def strip_block():
     return block
 
 
+def dsym_block():
+    """The real Darwin dSYM extraction and strip sequence, without invoking Cargo."""
+    src = SCRIPT.read_text()
+    start = src.index("# Save line tables before stripping the Mach-O.")
+    end = src.index("# REFUSE AN UNSTRIPPED RELEASE BINARY", start)
+    block = src[start:end]
+    for required in ("dsymutil", 'strip -S "$BUILT"', 'broca_dsym_matches_binary "$BUILT" "$BUILT_DSYM"'):
+        if required not in block:
+            raise AssertionError(f"the dSYM sequence has no {required!r}")
+    return block
+
+
 # Fake `nm` behaviours, keyed by the path nm is asked to read: the script's -g control program
 # lives at `strip-control.<pid>` in the scratch area, everything else is the release binary.
 # STAB lines have the shape real macOS `nm -a` prints for debug-map entries.
@@ -99,6 +112,7 @@ def write_fake_nm(binroot, mode):
     failing = "echo 'nm: error: truncated or malformed object' >&2; " if binary_exit else ""
     (binroot / "nm").write_text(
         "#!/bin/sh\n"
+        'printf "nm|%s\\n" "$2" >> "$TOOL_LOG"\n'
         'case "$2" in\n'
         f"  *strip-control*) printf '{control}' ;;\n"
         f"  *) {failing}printf '{binary}'; exit {binary_exit} ;;\n"
@@ -115,7 +129,7 @@ def write_fake_nm(binroot, mode):
 
 def run_staging(
     tmp, *, uname, codesign, built_bytes=b"BINARY", nm=None,
-    instrument_publish=False, corrupt_copy=False,
+    instrument_publish=False, corrupt_copy=False, debug_info=False, uuid_mode="matched",
 ):
     """Run the extracted block against a scratch seam with stubbed tools.
 
@@ -133,7 +147,7 @@ def run_staging(
     # is the whole PATH, and the real tools the block needs are linked into it by name.
     binroot = tmp / "stub"
     binroot.mkdir(exist_ok=True)
-    for tool in ("mkdir", "install", "shasum", "cut", "chmod", "cp", "wc", "cmp", "mv", "basename", "rm", "cat", "awk"):
+    for tool in ("mkdir", "install", "shasum", "cut", "chmod", "cp", "wc", "cmp", "mv", "basename", "rm", "cat", "awk", "diff", "sort"):
         found = shutil.which(tool)
         if found:
             (binroot / tool).symlink_to(found)
@@ -146,29 +160,29 @@ def run_staging(
             "#!/bin/sh\n"
             'set -eu\n'
             '"$REAL_CP" "$@"\n'
-            'dest=$2\n'
+            'if [ "$1" = -R ]; then dest=$3; else dest=$2; fi\n'
+            'case "$dest" in *.incoming) ;; *) exit 0 ;; esac\n'
             'final=${dest%.incoming}\n'
             '[ ! -e "$final" ] || { echo "final exists before verified rename: $final" >&2; exit 91; }\n'
-            'case "$dest" in *.sha256.postsign.incoming) label=sidecar ;; *.incoming) label=artifact ;; *) exit 92 ;; esac\n'
+            'case "$dest" in *.sha256.postsign.incoming) label=sidecar ;; *.dSYM.incoming) label=dsym ;; *.incoming) label=artifact ;; *) exit 92 ;; esac\n'
             'printf "copy|%s\\n" "$label" >> "$PUBLISH_LOG"\n'
-            'if [ "$CORRUPT_COPY" = 1 ]; then printf corrupt >> "$dest"; fi\n'
+            'if [ "$CORRUPT_COPY" = 1 ] && [ ! -d "$dest" ]; then printf corrupt >> "$dest"; fi\n'
         )
         (binroot / "mv").write_text(
             "#!/bin/sh\n"
             'set -eu\n'
-            '[ "$1" = -f ] || exit 93\n'
-            'source=$2\n'
-            'target=$3\n'
+            'if [ "$#" = 3 ]; then [ "$1" = -f ] || exit 93; source=$2; target=$3; else source=$1; target=$2; fi\n'
             'case "$target" in\n'
             '  *.sha256.postsign) incoming="${target}.incoming"; final=$target; original="$SCRATCH/ck-broca.deadbeef.incoming.sha256.postsign"; label=sidecar ;;\n'
+            '  *.dSYM) incoming="${target}.incoming"; final=$target; original="$SCRATCH/ck-broca.deadbeef.dSYM"; label=dsym ;;\n'
             '  *) incoming="${target}.incoming"; final=$target; original="$SCRATCH/ck-broca.deadbeef.incoming"; label=artifact ;;\n'
             'esac\n'
             '[ "$source" = "$incoming" ] || exit 95\n'
-            '[ -f "$source" ] || exit 96\n'
+            '[ -e "$source" ] || exit 96\n'
             '[ ! -e "$final" ] || { echo "final exists before rename: $final" >&2; exit 97; }\n'
-            'cmp -s "$source" "$original" || { echo "incoming copy was not verified: $source" >&2; exit 98; }\n'
+            'if [ -d "$source" ]; then diff -qr "$source" "$original" >/dev/null || exit 98; else cmp -s "$source" "$original" || { echo "incoming copy was not verified: $source" >&2; exit 98; }; fi\n'
             'printf "rename|%s\\n" "$label" >> "$PUBLISH_LOG"\n'
-            'exec "$REAL_MV" "$@"\n'
+            'exec "$REAL_MV" "$source" "$target"\n'
         )
         (tmp / "publish.log").write_text("")
     if codesign == "missing":
@@ -182,27 +196,61 @@ def run_staging(
         (binroot / "codesign").write_text(f'#!/bin/sh\necho "$@" >> "{tmp / "codesign.log"}"\nexit 0\n')
     else:
         raise AssertionError(f"unknown codesign stub {codesign!r}")
+    if uname == "Darwin":
+        (binroot / "dsymutil").write_text(
+            "#!/bin/sh\n"
+            'printf "dsymutil|%s\\n" "$1" >> "$TOOL_LOG"\n'
+            'mkdir -p "$3/Contents/Resources/DWARF"\n'
+            'printf "debug symbols\\n" > "$3/Contents/Resources/DWARF/ck-broca"\n'
+        )
+        (binroot / "strip").write_text(
+            "#!/bin/sh\n"
+            'printf "strip|%s|%s\\n" "$1" "$2" >> "$TOOL_LOG"\n'
+        )
+        (binroot / "dwarfdump").write_text(
+            "#!/bin/sh\n"
+            'path=$2\n'
+            'uuid=11111111-2222-3333-4444-555555555555\n'
+            'case "$UUID_MODE:$path" in mismatch:*.dSYM*) uuid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee ;; esac\n'
+            'printf "dwarfdump|%s\\n" "$path" >> "$TOOL_LOG"\n'
+            'printf "UUID: %s (arm64) %s\\n" "$uuid" "$path"\n'
+        )
+
     # `nm` set: run the stripped-binary check ahead of the publish, as the script does. Unset:
     # the publish alone, which is what the signing arms are about.
     script = staging_block()
     if nm is not None:
         write_fake_nm(binroot, nm)
         script = strip_block() + script
+    if debug_info:
+        script = dsym_block() + script
     for f in binroot.iterdir():
         if not f.is_symlink():
             f.chmod(0o755)
 
     built = tmp / "ck-broca.built"
     built.write_bytes(built_bytes)
+    if uname == "Darwin":
+        dwarf = built.with_name(built.name + ".dSYM") / "Contents" / "Resources" / "DWARF"
+        dwarf.mkdir(parents=True)
+        (dwarf / "ck-broca").write_text("debug symbols\n")
+    tool_log = tmp / "tools.log"
+    tool_log.write_text("")
 
     prelude = f"""
 set -euo pipefail
 export HOME={tmp / "home"}
 export PATH={binroot}
+ROOT={ROOT}
+source "$ROOT/scripts/dsym.sh"
 BUILD_SCRATCH={scratch}
 BUILT={built}
+BUILT_DSYM={built}.dSYM
+STAGING_DSYM={scratch}/ck-broca.deadbeef.dSYM
 export SCRATCH={scratch}
 export PUBLISH_LOG={tmp / "publish.log"}
+export TOOL_LOG={tool_log}
+export UUID_MODE={uuid_mode}
 export REAL_CP={shutil.which("cp")}
 export REAL_MV={shutil.which("mv")}
 export CORRUPT_COPY={1 if corrupt_copy else 0}
@@ -259,13 +307,17 @@ class StagingPublishArms(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(present, [], f"the seam must be untouched, found: {present}")
 
-    def test_a_working_codesign_publishes_both_files(self):
-        """Arm 4: the happy path still works, and the sidecar verifies AT THE DESTINATION."""
+    def test_a_working_codesign_publishes_binary_sidecar_and_dsym(self):
+        """Arm 4: a working signer publishes the executable and its verification companions."""
         proc, present = run_staging(self.tmp, uname="Darwin", codesign="works")
         self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
-        self.assertEqual(present, ["ck-broca.deadbeef", "ck-broca.deadbeef.sha256.postsign"])
+        self.assertEqual(
+            present,
+            ["ck-broca.deadbeef", "ck-broca.deadbeef.dSYM", "ck-broca.deadbeef.sha256.postsign"],
+        )
 
         seam = self.tmp / "home" / ".local" / "share" / "cortexkit" / "staging"
+        self.assertTrue((seam / "ck-broca.deadbeef.dSYM/Contents/Resources/DWARF/ck-broca").is_file())
         check = subprocess.run(
             ["shasum", "-c", "ck-broca.deadbeef.sha256.postsign"],
             cwd=seam,
@@ -273,6 +325,75 @@ class StagingPublishArms(unittest.TestCase):
             text=True,
         )
         self.assertEqual(check.returncode, 0, f"the sidecar must verify: {check.stdout}{check.stderr}")
+
+    def test_dsym_is_extracted_uuid_checked_then_stripped_and_published(self):
+        proc, present = run_staging(
+            self.tmp, uname="Darwin", codesign="works", nm="stripped",
+            debug_info=True, instrument_publish=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            present,
+            ["ck-broca.deadbeef", "ck-broca.deadbeef.dSYM", "ck-broca.deadbeef.sha256.postsign"],
+        )
+        seam = self.tmp / "home" / ".local" / "share" / "cortexkit" / "staging"
+        self.assertTrue((seam / "ck-broca.deadbeef.dSYM/Contents/Resources/DWARF/ck-broca").is_file())
+        self.assertIn("0 debug-map entries", proc.stdout)
+
+        tools = (self.tmp / "tools.log").read_text().splitlines()
+        build = str(self.tmp / "ck-broca.built")
+        dsym = next(i for i, line in enumerate(tools) if line == f"dsymutil|{build}")
+        stripped = next(i for i, line in enumerate(tools) if line == f"strip|-S|{build}")
+        nm_binary = next(i for i, line in enumerate(tools) if line == f"nm|{build}")
+        self.assertLess(dsym, stripped, tools)
+        self.assertLess(stripped, nm_binary, tools)
+        self.assertIn(f"dwarfdump|{build}", tools)
+        self.assertIn(f"dwarfdump|{build}.dSYM", tools)
+        self.assertEqual(
+            (self.tmp / "publish.log").read_text().splitlines(),
+            ["copy|sidecar", "rename|sidecar", "copy|dsym", "rename|dsym", "copy|artifact", "rename|artifact"],
+        )
+        source = SCRIPT.read_text()
+        self.assertIn("CARGO_PROFILE_RELEASE_DEBUG=line-tables-only", source)
+        self.assertIn("CARGO_PROFILE_RELEASE_STRIP=none", source)
+
+    def test_a_dsym_uuid_mismatch_refuses_before_signing_or_publication(self):
+        proc, present = run_staging(
+            self.tmp, uname="Darwin", codesign="works", nm="stripped",
+            debug_info=True, uuid_mode="mismatch",
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("dwarfdump --uuid does not report matching UUIDs", proc.stderr)
+        self.assertEqual(present, [])
+        self.assertFalse((self.tmp / "codesign.log").exists())
+
+    def test_scratch_sweep_removes_old_dsym_bundles_as_directories(self):
+        source = SCRIPT.read_text()
+        sweep = next(line for line in source.splitlines() if line.startswith("swept=$(find "))
+        scratch = self.tmp / "scratch"
+        stale = scratch / "ck-broca.old.dSYM"
+        current = scratch / "ck-broca.new.dSYM"
+        for bundle in (stale, current):
+            dwarf = bundle / "Contents" / "Resources" / "DWARF"
+            dwarf.mkdir(parents=True)
+            (dwarf / "ck-broca").write_bytes(b"debug symbols")
+        old = time.time() - 10 * 24 * 60 * 60
+        os.utime(stale, (old, old))
+
+        proc = subprocess.run(
+            [
+                "bash", "-c",
+                f"set -euo pipefail; BUILD_SCRATCH='{scratch}'; KEEP_DAYS=2; {sweep}; printf '%s\\n' \"$swept\"",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "1")
+        self.assertFalse(stale.exists())
+        self.assertTrue(current.is_dir())
 
     def test_staging_prune_uses_only_the_planted_seam(self):
         """The stage integration must pass its seam and deployed paths, never production defaults."""
@@ -401,7 +522,10 @@ class StrippedBinaryArms(unittest.TestCase):
     def test_a_stripped_binary_is_staged(self):
         proc, present = run_staging(self.tmp, uname="Darwin", codesign="works", nm="stripped")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(present, ["ck-broca.deadbeef", "ck-broca.deadbeef.sha256.postsign"])
+        self.assertEqual(
+            present,
+            ["ck-broca.deadbeef", "ck-broca.deadbeef.dSYM", "ck-broca.deadbeef.sha256.postsign"],
+        )
         self.assertIn("0 debug-map entries", proc.stdout)
         self.assertIn("the -g control reads 2", proc.stdout)
 
@@ -473,6 +597,6 @@ if __name__ == "__main__":
     # A dropped or renamed arm leaves the run green with fewer tests in it, so the count is pinned.
     anchors = unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__)).countTestCases()
     print(f"stage-release suite anchors: {anchors}", flush=True)
-    if anchors != 16:
+    if anchors != 19:
         raise SystemExit("stage-release suite anchor count changed")
     unittest.main(verbosity=2)

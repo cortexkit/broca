@@ -22,6 +22,8 @@
 # --live-approved permits a restart with known live runs, logging the invoking OS user.
 # It never bypasses an unreadable gate or the new-pid/placed-inode wait.
 # --report FILE writes the rollback path, restart pid and pre-restart live WAL names as JSON.
+# On Darwin the staged binary needs an adjacent .dSYM; placement renames that bundle beside the
+# destination and saves an existing bundle beside its matching rollback binary.
 #
 # A plain placement (--staged <path> without --restart) places the staged binary at --dest
 # atomically using rename(2). Because rename preserves the running process's existing inode,
@@ -114,10 +116,27 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/signing-posture.sh"
 source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
+source "$REPO_ROOT/scripts/dsym.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
 ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
 TMP=""
-trap 'rm -f "${TMP:-}" "$GATE_LOG" "$ACTIVE_RUNS_FILE"' EXIT
+TMP_DSYM=""
+TMP_DSYM_PARENT=""
+OLD_DSYM_TEMP=""
+DSYM_SWAP_STARTED=0
+PLACEMENT_COMMITTED=0
+cleanup_place() {
+  rm -f "${TMP:-}"
+  [ -z "$TMP_DSYM_PARENT" ] || rm -rf "$TMP_DSYM_PARENT"
+  if [ "$DSYM_SWAP_STARTED" -eq 1 ] && [ "$PLACEMENT_COMMITTED" -eq 0 ]; then
+    rm -rf "${DEST}.dSYM"
+    if [ -n "$OLD_DSYM_TEMP" ] && [ -d "$OLD_DSYM_TEMP" ]; then
+      mv "$OLD_DSYM_TEMP" "${DEST}.dSYM" || echo "place-release: could not restore the previous dSYM from $OLD_DSYM_TEMP" >&2
+    fi
+  fi
+  rm -f "$GATE_LOG" "$ACTIVE_RUNS_FILE"
+}
+trap cleanup_place EXIT
 
 # The live-run gate answers "is any run live RIGHT NOW". It only refuses when this invocation
 # will restart (--restart, --restart-only), because placement alone is an atomic rename that
@@ -347,6 +366,19 @@ if [ "$staged_kind" != "$dest_kind" ]; then
   exit 1
 fi
 
+STAGED_DSYM="${STAGED}.dSYM"
+DEST_DSYM="${DEST}.dSYM"
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+  if [ ! -d "$STAGED_DSYM" ] || [ -L "$STAGED_DSYM" ]; then
+    echo "place-release: REFUSING -- the staged Mach-O has no dSYM directory: $STAGED_DSYM" >&2
+    exit 1
+  fi
+  if [ -e "$DEST_DSYM" ] && { [ ! -d "$DEST_DSYM" ] || [ -L "$DEST_DSYM" ]; }; then
+    echo "place-release: REFUSING -- the deployed dSYM path is not a directory: $DEST_DSYM" >&2
+    exit 2
+  fi
+fi
+
 # Same-directory temp is REQUIRED, not tidiness: rename(2) is only atomic within one filesystem,
 # and /tmp is frequently a different one.
 TMP="$(mktemp "${DEST}.place.XXXXXX")"
@@ -354,6 +386,15 @@ TMP="$(mktemp "${DEST}.place.XXXXXX")"
 
 cat "$STAGED" >"$TMP"
 chmod 755 "$TMP"
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+  TMP_DSYM_PARENT="$(mktemp -d "${DEST_DSYM}.place.XXXXXX")"
+  TMP_DSYM="$TMP_DSYM_PARENT/$(basename "$DEST_DSYM")"
+  mkdir "$TMP_DSYM"
+  if ! cp -R "$STAGED_DSYM/." "$TMP_DSYM/"; then
+    echo "place-release: REFUSING -- could not copy the staged dSYM beside the destination." >&2
+    exit 1
+  fi
+fi
 
 # Sign the TEMP, before it becomes reachable at the destination path. Signing after the rename
 # would mutate the live binary in place -- reintroducing exactly the partial-image window this
@@ -377,6 +418,11 @@ if ! command -v codesign >/dev/null 2>&1; then
 fi
 codesign -f -s - -o runtime --identifier ck-broca "$TMP" >/dev/null 2>&1 \
   || { echo "place-release: REFUSING -- codesign failed. file: $TMP" >&2; exit 1; }
+fi
+if [ "$BROCA_DEPLOY_HOST" = Darwin ] && ! broca_dsym_matches_binary "$TMP" "$TMP_DSYM"; then
+  echo "place-release: REFUSING -- dwarfdump --uuid does not report matching UUIDs for" >&2
+  echo "  the signed placement copy $TMP and its dSYM $TMP_DSYM." >&2
+  exit 1
 fi
 
 BEFORE_SHA="$(shasum -a 256 "$DEST" | awk '{print $1}')"
@@ -541,6 +587,17 @@ until ( set -C; : > "$BACKUP" ) 2>/dev/null; do
 done
 cp "$DEST" "$BACKUP"
 chmod 700 "$BACKUP"
+if [ "$BROCA_DEPLOY_HOST" = Darwin ] && [ -d "$DEST_DSYM" ] && [ ! -L "$DEST_DSYM" ]; then
+  ROLLBACK_DSYM="${BACKUP}.dSYM"
+  if ! cp -R "$DEST_DSYM" "$ROLLBACK_DSYM" || ! diff -qr "$DEST_DSYM" "$ROLLBACK_DSYM" >/dev/null; then
+    rm -rf "$ROLLBACK_DSYM"
+    echo "place-release: REFUSING -- could not preserve the deployed dSYM with its rollback binary." >&2
+    exit 2
+  fi
+elif [ "$BROCA_DEPLOY_HOST" = Darwin ] && [ -e "$DEST_DSYM" ]; then
+  echo "place-release: REFUSING -- the deployed dSYM path is not a directory: $DEST_DSYM" >&2
+  exit 2
+fi
 ( cd "$ROLLBACK_DIR" && shasum -a 256 "$(basename "$BACKUP")" > "$(basename "$BACKUP").sha256" )
 if ! ( cd "$ROLLBACK_DIR" && shasum -c "$(basename "$BACKUP").sha256" >/dev/null 2>&1 ); then
   echo "place-release: REFUSING -- the rollback sidecar does not verify its own snapshot." >&2
@@ -552,8 +609,39 @@ write_report
 
 BEFORE_INODE="$(broca_file_inode "$DEST")"
 
-mv -f "$TMP" "$DEST"
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+  if [ -e "$DEST_DSYM" ]; then
+    OLD_DSYM_TEMP="${DEST_DSYM}.previous.$$"
+    attempt=0
+    while [ -e "$OLD_DSYM_TEMP" ]; do
+      attempt=$((attempt + 1))
+      OLD_DSYM_TEMP="${DEST_DSYM}.previous.$$.${attempt}"
+    done
+    if ! mv "$DEST_DSYM" "$OLD_DSYM_TEMP"; then
+      echo "place-release: REFUSING -- could not move the deployed dSYM aside for atomic replacement." >&2
+      exit 2
+    fi
+  fi
+  DSYM_SWAP_STARTED=1
+  if ! mv "$TMP_DSYM" "$DEST_DSYM"; then
+    echo "place-release: REFUSING -- could not atomically place the dSYM directory: $DEST_DSYM" >&2
+    exit 2
+  fi
+  TMP_DSYM=""
+  rmdir "$TMP_DSYM_PARENT"
+  TMP_DSYM_PARENT=""
+fi
+
+if ! mv -f "$TMP" "$DEST"; then
+  echo "place-release: REFUSING -- could not atomically place the binary: $DEST" >&2
+  exit 2
+fi
+PLACEMENT_COMMITTED=1
 TMP=""
+if [ -n "$OLD_DSYM_TEMP" ]; then
+  rm -rf "$OLD_DSYM_TEMP"
+  OLD_DSYM_TEMP=""
+fi
 
 AFTER_INODE="$(broca_file_inode "$DEST")"
 AFTER_SHA="$(shasum -a 256 "$DEST" | awk '{print $1}')"
@@ -561,6 +649,10 @@ AFTER_SHA="$(shasum -a 256 "$DEST" | awk '{print $1}')"
 echo "== placed atomically"
 echo "   dest      $DEST"
 echo "   backup    $BACKUP"
+if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+  echo "   dSYM      $DEST_DSYM"
+  [ ! -d "${BACKUP}.dSYM" ] || echo "   backup dSYM ${BACKUP}.dSYM"
+fi
 echo "   sha       ${BEFORE_SHA:0:16} -> ${AFTER_SHA:0:16}"
 echo "   inode     ${BEFORE_INODE} -> ${AFTER_INODE}"
 echo "   version   ${SMOKE_LINE}"

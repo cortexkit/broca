@@ -40,6 +40,7 @@ done
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
+source "$ROOT/scripts/dsym.sh"
 # The WAL feature floor is printed on the card so the placing seat sees which feature names the
 # build must know; place-release enforces it.
 source "$ROOT/scripts/wal-floor.sh"
@@ -307,11 +308,10 @@ mkdir -p "$BUILD_SCRATCH"
 # another seat found world-readable versioned binaries in shared /tmp, dispatchable by anyone
 # who puts /tmp on PATH, and staging them under a predictable path rebuilt that exposure.
 chmod 700 "$BUILD_SCRATCH"
-# Scoped to the scratch area BY CONSTRUCTION, not by intent. An earlier revision of this edit
-# repointed STAGE_DIR at the shared seam and left this line reading the same variable, which
-# would have deleted twenty other releases on the next run -- including artifacts another seat
-# may resolve by name for a rollback. Two names, so the sweep cannot follow the seam.
-swept=$(find "$BUILD_SCRATCH" -maxdepth 1 -type f -mtime "+$KEEP_DAYS" -print -delete 2>/dev/null | wc -l | tr -d ' ')
+# Keep cleanup inside BUILD_SCRATCH. Using STAGE_DIR here could delete release artifacts from
+# the shared staging directory, including a copy another user needs for rollback. Sweep each
+# dSYM bundle as one directory so its contents are removed with the bundle.
+swept=$(find "$BUILD_SCRATCH" -maxdepth 1 \( -type f -o \( -type d -name '*.dSYM' \) \) -mtime "+$KEEP_DAYS" -print -exec rm -rf {} \; 2>/dev/null | wc -l | tr -d ' ')
 
 # Registry checksums and pinned git revisions identify linked dependency contents.
 # Refuse any external path dependency before building the release artifact.
@@ -383,6 +383,13 @@ export CK_BUILD_LOCK_DIGEST
 echo "== provenance   rev  ${CK_BUILD_REV}"
 echo "                lock ${CK_BUILD_LOCK_DIGEST}"
 
+# Keep only the line tables needed to map sampled addresses to source locations. Cargo normally
+# strips release debug info, so retain it until dsymutil has copied it into a detached bundle.
+if [[ $(uname -s) == Darwin ]]; then
+    export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+    export CARGO_PROFILE_RELEASE_STRIP=none
+fi
+
 if ! python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve --quiet; then
     cat >&2 <<'DRIFT'
 stage-release: build refused under --locked.
@@ -398,6 +405,27 @@ fi
 BUILT=target/release/ck-broca
 [[ -f $BUILT ]] || { echo "stage-release: $BUILT missing after build" >&2; exit 2; }
 refuse_test_clock "$BUILT"
+
+# Save line tables before stripping the Mach-O. The symbol table stays in the executable for
+# function names; the detached bundle supplies the file and line information for sample/Instruments.
+if [[ $(uname -s) == Darwin ]]; then
+    BUILT_DSYM="$BUILT.dSYM"
+    rm -rf "$BUILT_DSYM"
+    if ! dsymutil "$BUILT" -o "$BUILT_DSYM"; then
+        echo "stage-release: REFUSING -- dsymutil could not produce $BUILT_DSYM." >&2
+        exit 2
+    fi
+    if ! strip -S "$BUILT"; then
+        echo "stage-release: REFUSING -- strip -S could not remove debug entries from $BUILT." >&2
+        exit 2
+    fi
+    if ! broca_dsym_matches_binary "$BUILT" "$BUILT_DSYM"; then
+        echo "stage-release: REFUSING -- dwarfdump --uuid does not report matching UUIDs for" >&2
+        echo "  the stripped binary $BUILT and its dSYM $BUILT_DSYM." >&2
+        exit 2
+    fi
+    echo "== dSYM         $(basename "$BUILT_DSYM") (UUID matches stripped binary)"
+fi
 source "$ROOT/scripts/running-image.sh"
 if [ "$BROCA_DEPLOY_HOST" = Linux ] && ! broca_release_kind "$BUILT" >/dev/null; then
     echo "stage-release: REFUSING -- the Linux build is not an ELF executable: $BUILT" >&2
@@ -502,7 +530,17 @@ fi
 SEAM="$HOME/.local/share/cortexkit/staging"
 COMMIT=$(git rev-parse --short=8 HEAD)
 STAGED="$SEAM/ck-broca.$COMMIT"
+STAGED_DSYM="$STAGED.dSYM"
+STAGING_DSYM="$BUILD_SCRATCH/ck-broca.$COMMIT.dSYM"
 mkdir -p "$SEAM"
+
+if [[ $(uname -s) == Darwin ]]; then
+    rm -rf "$STAGING_DSYM"
+    if ! cp -R "$BUILT_DSYM" "$STAGING_DSYM"; then
+        echo "stage-release: REFUSING -- could not copy the dSYM into private release scratch." >&2
+        exit 2
+    fi
+fi
 
 # SIGN AND HASH PRIVATELY; THE SEAM IS TOUCHED ONLY BY THE TWO RENAMES AT THE END.
 #
@@ -550,6 +588,12 @@ if [[ $(uname -s) == Darwin ]]; then
     codesign --force --sign - -o runtime --identifier ck-broca "$STAGING_TMP"
 else
     echo "stage-release: not Darwin -- staging unsigned (code signing is a macOS concept)." >&2
+fi
+
+if [[ $(uname -s) == Darwin ]] && ! broca_dsym_matches_binary "$STAGING_TMP" "$STAGING_DSYM"; then
+    echo "stage-release: REFUSING -- dwarfdump --uuid does not report matching UUIDs for" >&2
+    echo "  the signed scratch binary $STAGING_TMP and its dSYM $STAGING_DSYM." >&2
+    exit 2
 fi
 
 # HASHED AFTER SIGNING, FROM THE BYTES THAT WILL BE MOVED. A sidecar computed from the build
@@ -601,12 +645,42 @@ publish_verified() {
     fi
 }
 
+# A directory cannot replace a non-empty dSYM bundle with one rename. Verify an incoming copy,
+# move any prior bundle aside, then atomically rename the complete new directory into its name.
+publish_verified_dsym() {
+    local source=$1 final=$2 incoming="${2}.incoming" previous="${2}.previous.$$" attempt=0
+
+    rm -rf "$incoming"
+    if ! cp -R "$source" "$incoming" || ! diff -qr "$source" "$incoming" >/dev/null; then
+        rm -rf "$incoming"
+        echo "stage-release: incoming dSYM copy failed verification: $incoming" >&2
+        return 1
+    fi
+    while [[ -e $previous ]]; do
+        attempt=$((attempt + 1))
+        previous="${2}.previous.$$.${attempt}"
+    done
+    if [[ -e $final ]] && ! mv "$final" "$previous"; then
+        rm -rf "$incoming"
+        return 1
+    fi
+    if ! mv "$incoming" "$final"; then
+        [[ -e $previous ]] && mv "$previous" "$final"
+        rm -rf "$incoming"
+        return 1
+    fi
+    [[ -e $previous ]] && rm -rf "$previous" || true
+}
+
 # ORDER IS DELIBERATE and the asymmetry is the point. A crash between the two leaves a sidecar
 # naming an artifact that is not there, which `shasum -c` refuses loudly and which no by-name
 # artifact lookup can find. The other order leaves the artifact a placer WILL find with no
 # sidecar to check it against -- which is issue #20's residue, reintroduced at a narrower width.
 # Fail toward the loud absence, never toward the quiet presence.
 publish_verified "$STAGING_TMP.sha256.postsign" "$STAGED.sha256.postsign"
+if [[ $(uname -s) == Darwin ]]; then
+    publish_verified_dsym "$STAGING_DSYM" "$STAGED_DSYM"
+fi
 publish_verified "$STAGING_TMP" "$STAGED"
 
 # PROVE IT IS CONSUMABLE HERE, rather than discovering it at the placement seat. Same class as a
@@ -619,6 +693,11 @@ publish_verified "$STAGING_TMP" "$STAGED"
 if ! ( cd "$SEAM" && shasum -c "$(basename "$STAGED").sha256.postsign" >/dev/null 2>&1 ); then
     echo "stage-release: the sidecar is not readable by 'shasum -c'. Refusing to hand over an" >&2
     echo "  artifact whose verification command would fail at the placement seat." >&2
+    exit 2
+fi
+if [[ $(uname -s) == Darwin ]] && ! broca_dsym_matches_binary "$STAGED" "$STAGED_DSYM"; then
+    echo "stage-release: REFUSING -- dwarfdump --uuid does not report matching UUIDs for" >&2
+    echo "  the staged binary $STAGED and its dSYM $STAGED_DSYM." >&2
     exit 2
 fi
 
@@ -639,6 +718,7 @@ echo "== staged"
 echo "   path    $STAGED"
 echo "   current $CURRENT"
 echo "   sidecar $STAGED.sha256.postsign"
+[[ $(uname -s) != Darwin ]] || echo "   dSYM    $STAGED_DSYM"
 echo "   sha256  $STAGED_SHA"
 echo "   floor   $(broca_wal_floor_summary "$WAL_FLOOR_FILE")   ($WAL_FLOOR_FILE)"
 echo "           place-release refuses a build whose --wal-known-features does not cover it."

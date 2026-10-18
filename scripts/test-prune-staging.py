@@ -89,6 +89,23 @@ class PruneStagingTests(unittest.TestCase):
         self.assertIn("would delete", result.stdout)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.seam.iterdir() if p.is_file()})
 
+    def test_dsym_bundles_follow_release_and_rollback_retention(self):
+        pruned_release_dsym = self.seam / (self.names[1] + ".dSYM")
+        kept_release_dsym = self.seam / (self.names[3] + ".dSYM")
+        pruned_rollback_dsym = self.seam / "ck-broca.rollback-20260102T010203Z.dSYM"
+        kept_rollback_dsym = self.seam / "ck-broca.rollback-20260105T010203Z.dSYM"
+        for bundle in (pruned_release_dsym, kept_release_dsym, pruned_rollback_dsym, kept_rollback_dsym):
+            (bundle / "Contents" / "Resources" / "DWARF").mkdir(parents=True)
+            (bundle / "Contents" / "Resources" / "DWARF" / "ck-broca").write_bytes(b"symbols")
+
+        result = self.run_pruner()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(pruned_release_dsym.exists())
+        self.assertTrue(kept_release_dsym.is_dir())
+        self.assertFalse(pruned_rollback_dsym.exists())
+        self.assertTrue(kept_rollback_dsym.is_dir())
+
     def test_missing_current_exits_two_without_deleting(self):
         (self.seam / "ck-broca.current").unlink()
         before = {p.name: p.read_bytes() for p in self.seam.iterdir() if p.is_file()}
