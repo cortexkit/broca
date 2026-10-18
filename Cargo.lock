@@ -390,6 +390,7 @@ name = "broca-provider"
 version = "0.3.223"
 dependencies = [
  "async-trait",
+ "base64",
  "broca-ck",
  "broca-core",
  "broca-diagnostics",

@@ -1,0 +1,20 @@
+[
+  ["messageStart", {"role":"assistant"}],
+  ["contentBlockDelta", {"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"Think "}}}],
+  ["contentBlockDelta", {"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"carefully.\n"}}}],
+  ["contentBlockDelta", {"contentBlockIndex":0,"delta":{"reasoningContent":{"signature":"sig-"}}}],
+  ["contentBlockDelta", {"contentBlockIndex":0,"delta":{"reasoningContent":{"signature":"opaque=="}}}],
+  ["contentBlockStop", {"contentBlockIndex":0}],
+  ["contentBlockDelta", {"contentBlockIndex":1,"delta":{"reasoningContent":{"signature":"empty-sig"}}}],
+  ["contentBlockStop", {"contentBlockIndex":1}],
+  ["contentBlockDelta", {"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AQ=="}}}],
+  ["contentBlockDelta", {"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"Av8="}}}],
+  ["contentBlockStop", {"contentBlockIndex":2}],
+  ["contentBlockStart", {"contentBlockIndex":3,"start":{"toolUse":{"toolUseId":"call_1","name":"lookup"}}}],
+  ["contentBlockDelta", {"contentBlockIndex":3,"delta":{"toolUse":{"input":"{\"key\":\"A\"}"}}}],
+  ["contentBlockStop", {"contentBlockIndex":3}],
+  ["contentBlockDelta", {"contentBlockIndex":4,"delta":{"text":"Checking."}}],
+  ["contentBlockStop", {"contentBlockIndex":4}],
+  ["messageStop", {"stopReason":"tool_use"}],
+  ["metadata", {"usage":{"inputTokens":10,"outputTokens":20}}]
+]

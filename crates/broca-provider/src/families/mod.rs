@@ -422,6 +422,7 @@ pub fn resolve_frozen(
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
         provider_text_state: text_state_family(provider.wire_family),
+        bedrock_reasoning: provider.wire_family == WireFamilyId::BedrockConverse,
         structured_output: None,
         claude_code_persona: None,
     })
@@ -482,6 +483,7 @@ fn frozen_from_family_defaults(
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
         provider_text_state: text_state_family(family),
+        bedrock_reasoning: family == WireFamilyId::BedrockConverse,
         structured_output: None,
         claude_code_persona: None,
     }
