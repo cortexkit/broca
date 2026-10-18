@@ -74,6 +74,17 @@ queued before it.
 `step_committed` is an in-memory writer ACK at the step boundary, NOT an on-disk
 record.
 
+Assistant `text_with_state` blocks retain opaque, format-tagged provider metadata in their
+original item/part order, including signature-only empty text. Records carrying these blocks
+(input, queued/steered input, completed model output, or compaction replacements), and run
+configs opting into `provider_text_state`, require `provider-text-state/v1`. This release both
+reads and writes that feature; the writer publishes it to `wal-feature-floor` before appending
+a gated frame. Older readers refuse rather than silently discard context. Frozen configs without
+the opt-in continue dropping Responses phases and Gemini text signatures, retaining their recorded
+outbound bytes on resume. State is echoed only when its format tag names the target endpoint's
+protocol and the assistant message's recorded provider/model IDs both match the target model.
+Unknown origins fail closed; visible text remains portable.
+
 ## 3. The barrier (per turn's tool batch)
 
 On Unix, the first WAL barrier after **every open**, including recovery of an

@@ -170,6 +170,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     FLOW_SCOPE_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
     PLAN_MANIFEST_FEATURE,
+    PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
     RUN_CANCEL_AT_FEATURE,
@@ -179,6 +180,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STEP_TRANSFORMS_FEATURE,
     STRUCTURED_OUTPUT_FEATURE,
 ];
+
+/// Text-part state and the frozen codec policy are required for faithful provider replay.
+pub const PROVIDER_TEXT_STATE_FEATURE: &str = "provider-text-state/v1";
 
 /// Compaction's issued fence, applied view and other answers. Missing it must refuse the
 /// WAL rather than lose an applied view or allow a superseded request to apply on replay.
@@ -851,6 +855,7 @@ mod tests {
                 FLOW_SCOPE_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
                 PLAN_MANIFEST_FEATURE,
+                PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
                 RUN_CANCEL_AT_FEATURE,
@@ -867,6 +872,7 @@ mod tests {
         assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
+        assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
         assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");
@@ -874,6 +880,49 @@ mod tests {
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
         assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
+    }
+
+    #[test]
+    fn provider_text_state_is_must_understand_before_record_decode() {
+        let block = serde_json::json!({"type":"text_with_state","text":"","provider_state":{"format":"gemini","data":"opaque+/="}});
+        let message = serde_json::json!({"role":"assistant","content":[block.clone()]});
+        let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}});
+        let mut with_input = run.clone();
+        with_input["input"] = serde_json::json!([message.clone()]);
+        let mut with_policy = run.clone();
+        with_policy["config"]["frozen_render_config"] =
+            serde_json::json!({"provider_text_state":true});
+        let mut refrozen = serde_json::json!({"type":"run_config_refrozen","renderer_version":1,"frozen_render_config":{"provider_text_state":true}});
+        let records = [
+            with_input,
+            with_policy,
+            refrozen.clone(),
+            serde_json::json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[block]},"usage":{},"retries_used":0}),
+            serde_json::json!({"type":"steered","input":[message.clone()]}),
+            serde_json::json!({"type":"queued","submission_id":"q","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[message],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}),
+        ];
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != PROVIDER_TEXT_STATE_FEATURE)
+            .collect();
+        for value in records {
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(record
+                .required_features()
+                .contains(&PROVIDER_TEXT_STATE_FEATURE));
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [PROVIDER_TEXT_STATE_FEATURE])
+            );
+        }
+        let legacy: WalRecord = serde_json::from_value(run).unwrap();
+        assert!(legacy.required_features().is_empty());
+        refrozen["frozen_render_config"]["provider_text_state"] = serde_json::json!(false);
+        let legacy: WalRecord = serde_json::from_value(refrozen).unwrap();
+        assert!(legacy.required_features().is_empty());
     }
 
     /// Neither the request fence, an applied view, another answer nor a wait exit can be

@@ -1,0 +1,3 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"unsigned prefix"},{"text":"","thoughtSignature":"sig-empty+/="},{"text":"answer one","thoughtSignature":"sig-one+/="},{"text":"answer two","thoughtSignature":"sig-two+/="},{"text":"unsigned suffix"}]},"finishReason":"STOP"}]}
+
+: end

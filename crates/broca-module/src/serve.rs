@@ -522,7 +522,10 @@ fn final_message_of(
         .content
         .iter()
         .filter_map(|block| match block {
-            broca_protocol::content::ContentBlock::Text { text } => Some(text.as_str()),
+            broca_protocol::content::ContentBlock::Text { text }
+            | broca_protocol::content::ContentBlock::TextWithState { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect();

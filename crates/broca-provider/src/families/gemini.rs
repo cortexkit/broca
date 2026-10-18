@@ -99,7 +99,7 @@ impl WireFamily for Gemini {
         frozen: &FrozenRenderConfig,
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
-        Box::new(GeminiNormalizer::new(step_id, frozen.tool_id))
+        Box::new(GeminiNormalizer::new(step_id, frozen.tool_id).with_text_state(frozen))
     }
 }
 
@@ -115,12 +115,7 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
-    let contents = convert_contents(
-        &opts.prompt,
-        frozen.tool_id,
-        opts.target_model.as_ref(),
-        &name_map,
-    );
+    let contents = convert_contents(&opts.prompt, frozen, opts.target_model.as_ref(), &name_map);
 
     let mut body = json!({ "contents": contents });
 
@@ -213,7 +208,7 @@ fn system_instruction_parts(prompt: &[Message]) -> Vec<Value> {
         for b in &m.content {
             // Drop an empty text part — Gemini rejects an empty `{text:""}` part. Defensive
             // against foreign input; the owned normalizers never emit empty text.
-            if let ContentBlock::Text { text } = b {
+            if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
                 if !text.is_empty() {
                     out.push(json!({ "text": text }));
                 }
@@ -225,7 +220,7 @@ fn system_instruction_parts(prompt: &[Message]) -> Vec<Value> {
 
 fn convert_contents(
     prompt: &[Message],
-    tool_id: ToolIdPolicy,
+    frozen: &FrozenRenderConfig,
     target_model: Option<&ModelHandle>,
     name_map: &crate::tool_name_alias::ToolNameMap,
 ) -> Vec<Value> {
@@ -253,7 +248,21 @@ fn convert_contents(
                 current_tool_call_names = tool_call_names_in_message(m, name_map);
                 let echo_safe =
                     crate::families::signed_reasoning_is_echo_safe(m.origin.as_ref(), target_model);
-                let parts = convert_model_parts(&m.content, tool_id, echo_safe, name_map);
+                let parts = convert_model_parts(
+                    &m.content,
+                    frozen.tool_id,
+                    echo_safe,
+                    name_map,
+                    |format| {
+                        frozen.provider_text_state
+                            && super::text_state_is_echo_safe(
+                                m,
+                                target_model,
+                                format,
+                                frozen.family_id,
+                            )
+                    },
+                );
                 // A foreign model's signed reasoning can be the turn's only block.
                 if !parts.is_empty() {
                     out.push(json!({
@@ -294,8 +303,14 @@ fn convert_user_parts(
         .iter()
         .filter_map(|block| match block {
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
-            ContentBlock::Text { text } if text.is_empty() => None,
-            ContentBlock::Text { text } => Some(json!({ "text": text })),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
+                if text.is_empty() =>
+            {
+                None
+            }
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(json!({ "text": text }))
+            }
             ContentBlock::ToolResult(result) => Some(convert_tool_result_part(result, id_to_name)),
             _ => None,
         })
@@ -307,6 +322,7 @@ fn convert_model_parts(
     tool_id: ToolIdPolicy,
     signed_calls_are_echo_safe: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    text_state_is_echo_safe: impl Fn(broca_protocol::content::TextProviderFormat) -> bool,
 ) -> Vec<Value> {
     use crate::reasoning::{decide_reasoning, ReasoningDecision, SerializerProfile};
 
@@ -317,6 +333,24 @@ fn convert_model_parts(
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } if text.is_empty() => {}
             ContentBlock::Text { text } => parts.push(json!({ "text": text })),
+            ContentBlock::TextWithState {
+                text,
+                provider_state,
+            } => {
+                let mut part = json!({"text":text});
+                if text_state_is_echo_safe(provider_state.format) {
+                    if let Ok(state) = serde_json::from_str::<Value>(&provider_state.data) {
+                        if let Some(signature) =
+                            state.get("thoughtSignature").and_then(Value::as_str)
+                        {
+                            part["thoughtSignature"] = json!(signature);
+                        }
+                    }
+                }
+                if !text.is_empty() || part.get("thoughtSignature").is_some() {
+                    parts.push(part);
+                }
+            }
             ContentBlock::Reasoning { text, signature } => {
                 let keep = decide_reasoning(
                     signed_calls_are_echo_safe,
@@ -593,6 +627,10 @@ struct FunctionCallBuf {
 }
 
 enum GeminiPartBuf {
+    TextWithState {
+        text: String,
+        provider_state: broca_protocol::content::TextProviderState,
+    },
     Text {
         text: String,
         coalescible: bool,
@@ -610,6 +648,7 @@ enum GeminiPartBuf {
 pub(crate) struct GeminiNormalizer {
     step_id: StepId,
     tool_id_policy: ToolIdPolicy,
+    text_state_format: Option<broca_protocol::content::TextProviderFormat>,
     sse: SseDecoder,
     parts: Vec<GeminiPartBuf>,
     next_call_index: u32,
@@ -636,6 +675,7 @@ impl GeminiNormalizer {
         Self {
             step_id,
             tool_id_policy,
+            text_state_format: None,
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Gemini),
             parts: Vec::new(),
             next_call_index: 0,
@@ -647,6 +687,17 @@ impl GeminiNormalizer {
             header_service_tier: None,
             body_service_tier: None,
         }
+    }
+
+    pub(crate) fn with_text_state(mut self, frozen: &FrozenRenderConfig) -> Self {
+        use broca_protocol::content::TextProviderFormat as F;
+        if frozen.provider_text_state {
+            self.text_state_format = Some(match frozen.family_id {
+                crate::spec::WireFamilyId::GoogleCodeAssist => F::GoogleCodeAssist,
+                _ => F::Gemini,
+            });
+        }
+        self
     }
 
     fn push_part(&mut self, part: GeminiPartBuf) {
@@ -844,16 +895,25 @@ impl GeminiNormalizer {
                 continue;
             }
 
-            if let Some(text) = text.filter(|text| !text.is_empty()) {
-                // Gemini may attach a thoughtSignature to ordinary answer text. Canonical Text
-                // has nowhere to store it, and Google treats non-function-call signatures as
-                // recommended rather than required, so discard it instead of relabeling the
-                // answer as reasoning or transferring the signature to a neighboring part.
+            if let (Some(format), Some(signature)) =
+                (self.text_state_format, thought_signature.as_ref())
+            {
+                // A signature belongs to the exact part that carried it, including empty text.
+                self.push_part(GeminiPartBuf::TextWithState {
+                    text: text.unwrap_or("").to_owned(),
+                    provider_state: broca_protocol::content::TextProviderState {
+                        format,
+                        data: json!({"thoughtSignature":signature}).to_string(),
+                    },
+                });
+            } else if let Some(text) = text.filter(|text| !text.is_empty()) {
                 let coalescible = thought_signature.is_none();
                 self.push_part(GeminiPartBuf::Text {
                     text: text.to_owned(),
                     coalescible,
                 });
+            }
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
                 out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
                     message_id: message_id.clone(),
                     tool_call_id: None,
@@ -897,6 +957,13 @@ impl GeminiNormalizer {
         let content = std::mem::take(&mut self.parts)
             .into_iter()
             .map(|part| match part {
+                GeminiPartBuf::TextWithState {
+                    text,
+                    provider_state,
+                } => ContentBlock::TextWithState {
+                    text,
+                    provider_state,
+                },
                 GeminiPartBuf::Text { text, .. } => ContentBlock::Text { text },
                 GeminiPartBuf::Reasoning { text, signature } => {
                     ContentBlock::Reasoning { text, signature }
@@ -1053,8 +1120,14 @@ mod tests {
         blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } if text.is_empty() => None,
-                ContentBlock::Text { text } => Some(json!({ "text": text })),
+                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
+                    if text.is_empty() =>
+                {
+                    None
+                }
+                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                    Some(json!({ "text": text }))
+                }
                 _ => None,
             })
             .collect()
@@ -1099,7 +1172,12 @@ mod tests {
         let prompt = vec![assistant_tool_call("call_lookup", "lookup"), mixed];
         let name_map = crate::tool_name_alias::ToolNameMap::build(&[], &prompt);
 
-        let contents = convert_contents(&prompt, ToolIdPolicy::SyntheticIndex, None, &name_map);
+        let contents = convert_contents(
+            &prompt,
+            &super::super::gemini_frozen_config("model"),
+            None,
+            &name_map,
+        );
         let legacy = legacy_convert_user_parts(&prompt[1].content);
 
         assert_eq!(legacy, vec![json!({"text": "Now summarize"})]);
@@ -1150,7 +1228,12 @@ mod tests {
         let prompt = vec![assistant_tool_call("known_call", "lookup"), mixed];
         let name_map = crate::tool_name_alias::ToolNameMap::build(&[], &prompt);
 
-        let contents = convert_contents(&prompt, ToolIdPolicy::SyntheticIndex, None, &name_map);
+        let contents = convert_contents(
+            &prompt,
+            &super::super::gemini_frozen_config("model"),
+            None,
+            &name_map,
+        );
 
         assert_eq!(
             contents[1]["parts"][0]["functionResponse"],

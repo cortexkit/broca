@@ -4496,7 +4496,8 @@ where
                             .content
                             .iter()
                             .filter_map(|part| match part {
-                                ContentBlock::Text { text } => Some(text.clone()),
+                                ContentBlock::Text { text }
+                                | ContentBlock::TextWithState { text, .. } => Some(text.clone()),
                                 _ => None,
                             })
                             .collect(),
@@ -7536,7 +7537,9 @@ fn joined_text(message: &AssistantMessage) -> String {
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()

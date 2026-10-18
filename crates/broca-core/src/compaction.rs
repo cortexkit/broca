@@ -530,6 +530,12 @@ fn native_fields(value: &Value) -> bool {
                 .iter()
                 .all(|block| match block.get("type").and_then(Value::as_str) {
                     Some("text") => keys(block, &["type", "text"]),
+                    Some("text_with_state") => {
+                        keys(block, &["type", "text", "provider_state"])
+                            && block
+                                .get("provider_state")
+                                .is_some_and(|state| keys(state, &["format", "data"]))
+                    }
                     Some("reasoning") => keys(block, &["type", "text", "signature"]),
                     Some("redacted_reasoning") => keys(block, &["type", "data", "provider_format"]),
                     Some("tool_call") => keys(
@@ -604,6 +610,7 @@ fn native_replacement(
                             signature: Some(_),
                             ..
                         } | ContentBlock::RedactedReasoning { .. }
+                            | ContentBlock::TextWithState { .. }
                     )
                 })
             {

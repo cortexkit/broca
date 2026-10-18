@@ -435,10 +435,11 @@ fn captured_codex_reasoning_sse_preserves_the_complete_item_in_output_order() {
     );
     let ciphertext = captured["encrypted_content"].as_str().unwrap();
     assert_eq!(ciphertext.len(), 1_444);
-    assert!(matches!(
-        message.content.get(1),
-        Some(ContentBlock::Text { .. })
-    ));
+    let Some(ContentBlock::TextWithState { provider_state, .. }) = message.content.get(1) else {
+        panic!("captured phase-bearing message must follow reasoning");
+    };
+    let state: Value = serde_json::from_str(&provider_state.data).unwrap();
+    assert_eq!(state["phase"], "final_answer");
 }
 
 #[test]

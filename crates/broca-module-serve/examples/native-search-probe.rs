@@ -28,6 +28,8 @@
 //! `--replay-step N` (with `--wal`, optionally `--replay-run <run id>`) renders the request the
 //! session made at step N, through broca's offline WAL replay, instead of a fresh turn;
 //! `--reasoning-content-required` renders with the DeepSeek reasoning echo switched on.
+//! `--prompt-file` renders a canonical message array instead of a fresh user turn. Completed
+//! responses also write `assistant-message.json` so a second request can replay the real codec output.
 //!
 //! WIRE OPTIONS, all opt-in and applied after rendering, so `request-body.json` always holds
 //! the identity (uncompressed) body: `--header name=value` replaces a header (the name matches
@@ -102,6 +104,9 @@ struct Args {
     /// The single user turn.
     #[arg(long, default_value = DEFAULT_QUERY)]
     query: String,
+    /// Canonical messages to render, including producing-model origins on assistant messages.
+    #[arg(long, conflicts_with_all = ["replay_step", "body_file"])]
+    prompt_file: Option<PathBuf>,
     /// A tool JSON object appended to the body's `tools` array. Repeatable.
     #[arg(long)]
     inject_tool: Vec<String>,
@@ -591,6 +596,13 @@ async fn run(args: Args) -> Result<(), String> {
                             text: args.query.clone(),
                         }],
                     });
+                    if let Some(path) = &args.prompt_file {
+                        prompt = serde_json::from_slice(
+                            &std::fs::read(path)
+                                .map_err(|e| format!("read {}: {e}", path.display()))?,
+                        )
+                        .map_err(|e| format!("canonical prompt {}: {e}", path.display()))?;
+                    }
                     let mut opts = CallOptions::new(prompt);
                     opts.step_context = Some(StepContext {
                         run_id: "native-search-probe".into(),
@@ -843,6 +855,17 @@ async fn run(args: Args) -> Result<(), String> {
                 Ok(events) => {
                     normalizer_outcome = json!({"ok": true, "events": events.len()});
                     for event in events {
+                        if let broca_protocol::provider::NormalizedEvent::Control(
+                            broca_protocol::provider::ProviderControl::AssistantMessage { message },
+                        ) = &event
+                        {
+                            write_checked(
+                                &args.out.join("assistant-message.json"),
+                                &serde_json::to_vec(message).map_err(|e| e.to_string())?,
+                                Some(&secret.token),
+                                &mut redactions,
+                            );
+                        }
                         lines.push(format!("{event:?}"));
                     }
                 }

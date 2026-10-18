@@ -1,4 +1,5 @@
-//! Byte pins for episodes admitted before text-part provider state was supported.
+//! Frozen JSON and outbound request bytes from before Responses phases and Gemini text signatures
+//! were retained. These configurations must not opt into echoing newly supported metadata on resume.
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role},

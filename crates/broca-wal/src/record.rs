@@ -1095,10 +1095,46 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_provider_text_state() {
+            with_feature(base, crate::framing::PROVIDER_TEXT_STATE_FEATURE)
+        } else {
+            base
+        };
         if self.carries_structured_output() {
             with_feature(base, crate::framing::STRUCTURED_OUTPUT_FEATURE)
         } else {
             base
+        }
+    }
+
+    fn carries_provider_text_state(&self) -> bool {
+        let blocks = |content: &[broca_protocol::content::ContentBlock]| {
+            content.iter().any(|block| {
+                matches!(
+                    block,
+                    broca_protocol::content::ContentBlock::TextWithState { .. }
+                )
+            })
+        };
+        let messages = |input: &[Message]| input.iter().any(|message| blocks(&message.content));
+        let frozen = |config: &Value| {
+            config.get("provider_text_state").and_then(Value::as_bool) == Some(true)
+        };
+        match self {
+            Self::RunStarted { config, input, .. } => {
+                frozen(&config.frozen_render_config) || messages(input)
+            }
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen(frozen_render_config),
+            Self::ModelStepFinished {
+                assistant_message, ..
+            } => blocks(&assistant_message.content),
+            Self::Queued { request, .. } => messages(&request.input),
+            Self::Steered { input, .. } => messages(input),
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
         }
     }
 

@@ -679,7 +679,7 @@ fn build_system(
                 // Drop an empty text part — Anthropic rejects a `{type:text, text:""}` block.
                 // Defensive against foreign input; this codebase's own normalizers never
                 // emit empty text, so it changes no current render.
-                if let ContentBlock::Text { text } = b {
+                if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
                     if !text.is_empty() {
                         system.push(json!({ "type": "text", "text": text }));
                     }
@@ -991,8 +991,14 @@ fn convert_content(
         .filter_map(|(idx, b)| match b {
             // Drop an empty text part (Anthropic rejects `text:""`). Defensive against
             // foreign input; the owned normalizers never produce empty text.
-            ContentBlock::Text { text } if text.is_empty() => None,
-            ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
+                if text.is_empty() =>
+            {
+                None
+            }
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(json!({ "type": "text", "text": text }))
+            }
             // The reasoning keep/clear decision routes through the SHARED decide_reasoning so
             // the reordering plugin/MITM legs inherit the §6.1.1 segmentation guard from the
             // same locus. This family's render is SOURCE-ORDER (it never reorders tool_use by

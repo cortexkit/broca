@@ -68,6 +68,7 @@ mod openai_responses_e2e;
 mod openai_responses_golden;
 mod ordinal_render_invariant;
 mod provider_state_legacy;
+mod provider_text_state;
 mod reasoning_content_required;
 mod render_golden_version_enforcement;
 mod responses_cache_write_usage;

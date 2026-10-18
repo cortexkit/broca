@@ -211,6 +211,10 @@ pub struct FrozenRenderConfig {
     /// the episode starts. Old frozen blobs lack this field and keep request-level effort.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chatgpt_effort_updates: bool,
+    /// Preserve and echo Responses message phases and Gemini text-part thought signatures.
+    /// Older frozen configs omit this flag and continue discarding those fields on resume.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provider_text_state: bool,
     /// The run's structured-output settings, decided at admission (see
     /// `crate::structured_output::decide`) and rendered into every request of the run: the
     /// submit tool, the family's schema encoding, or schema instructions. `None` (a run

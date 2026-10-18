@@ -26,11 +26,13 @@ pub(super) async fn restream_message(message: &AssistantMessage, out: &mpsc::Sen
     let _ = send(out, OutputEvent::Display(DisplayEvent::DisplayReset)).await;
     for part in &message.content {
         let event = match part {
-            ContentBlock::Text { text } => DisplayEvent::TextDelta {
-                message_id: message.message_id.clone(),
-                tool_call_id: None,
-                delta: text.clone(),
-            },
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                DisplayEvent::TextDelta {
+                    message_id: message.message_id.clone(),
+                    tool_call_id: None,
+                    delta: text.clone(),
+                }
+            }
             ContentBlock::Reasoning { text, .. } => DisplayEvent::ReasoningDelta {
                 message_id: message.message_id.clone(),
                 delta: text.clone(),

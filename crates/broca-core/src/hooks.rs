@@ -490,20 +490,33 @@ fn attribution(provider: &str, sub: &Subscription, operation: &Operation) -> Hoo
     }
 }
 
-/// Splice text-only answers in place. Commons guarantees that block count/order never
-/// changes, so signatures and tool-call inputs retain their exact original values.
+/// Splice text-only answers in place. The step-transform answer validator preserves block count
+/// and order, so tool-call inputs retain their exact original values. Editing provider-owned text
+/// removes its opaque state: a signature must never be attached to rewritten text.
 pub fn apply_message_ops(
     content: &mut [broca_protocol::ContentBlock],
     ops: &[Operation],
 ) -> Result<(), cortexkit_role_step_transform_provider::answer::AnswerProblem> {
+    let before = content.to_vec();
     cortexkit_role_step_transform_provider::answer::apply_to_parts(
         content,
         |part| match part {
-            broca_protocol::ContentBlock::Text { text } => Some(text),
+            broca_protocol::ContentBlock::Text { text }
+            | broca_protocol::ContentBlock::TextWithState { text, .. } => Some(text),
             _ => None,
         },
         ops,
-    )
+    )?;
+    for (part, original) in content.iter_mut().zip(before) {
+        if *part != original {
+            if let broca_protocol::ContentBlock::TextWithState { text, .. } = part {
+                *part = broca_protocol::ContentBlock::Text {
+                    text: std::mem::take(text),
+                };
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

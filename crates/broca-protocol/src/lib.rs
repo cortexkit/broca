@@ -58,7 +58,7 @@ pub use caller::{ControlUnit, PauseReason, RunFinishReason};
 pub use canonical::canonical_json_bytes;
 pub use content::{
     AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
-    ToolCall, ToolOutput, ToolResult,
+    TextProviderFormat, TextProviderState, ToolCall, ToolOutput, ToolResult,
 };
 pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;
 pub use diagnostic::diag;

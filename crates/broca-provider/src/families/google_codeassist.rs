@@ -149,7 +149,7 @@ impl WireFamily for GoogleCodeAssist {
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
         Box::new(CodeAssistNormalizer {
-            inner: GeminiNormalizer::new(step_id, frozen.tool_id),
+            inner: GeminiNormalizer::new(step_id, frozen.tool_id).with_text_state(frozen),
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::CodeAssist),
         })
     }

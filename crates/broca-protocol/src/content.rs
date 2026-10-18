@@ -216,11 +216,35 @@ pub enum EncryptedReasoningFormat {
     OpenAiResponsesChatgpt,
 }
 
+/// The wire format that owns opaque state attached to an assistant text block.
+/// Similar APIs remain distinct: a signature or phase from one endpoint must not leak to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextProviderFormat {
+    OpenAiResponses,
+    OpenAiResponsesChatgpt,
+    Gemini,
+    GoogleCodeAssist,
+}
+
+/// Opaque, format-owned metadata. Core and WAL retain these bytes without interpreting them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextProviderState {
+    pub format: TextProviderFormat,
+    pub data: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
+    },
+    /// Assistant text whose provider state belongs to this exact item/part, even if text is empty.
+    /// Kept separate from plain Text so existing text constructors and serialized bytes stay stable.
+    TextWithState {
+        text: String,
+        provider_state: TextProviderState,
     },
     Reasoning {
         text: String,

@@ -2390,8 +2390,8 @@ test_file = "crates/broca-core/src/run/hook_tests.rs"
 expect_red = ["run::hook_tests::text_splicing_counts_only_text_and_preserves_signed_non_text_bytes"]
 only = false
 file = "crates/broca-core/src/hooks.rs"
-old = "broca_protocol::ContentBlock::Text { text } => Some(text),"
-new = "broca_protocol::ContentBlock::Text { text } | broca_protocol::ContentBlock::Reasoning { text, .. } => Some(text), // NON-VACUITY BREAK"
+old = "| broca_protocol::ContentBlock::TextWithState { text, .. } => Some(text),"
+new = "| broca_protocol::ContentBlock::TextWithState { text, .. } | broca_protocol::ContentBlock::Reasoning { text, .. } => Some(text), // NON-VACUITY BREAK"
 
 # This proof checks the following behavior: providers apply in the frozen order rather than reversed
 # order.
@@ -16136,3 +16136,72 @@ expect_red = ["executor::tests::deepseek_episode_admitted_before_the_reasoning_e
 file = "crates/broca-catalog/src/live.rs"
 old = '''            config.reasoning_content_required = recorded;'''
 new = '''            let _ = recorded; // NON-VACUITY BREAK: ignore the recorded choice'''
+
+[[control]]
+id = "responses-text-phase-wal-roundtrip"
+guards = "Responses phases retain item identity through normalization, WAL, core replay and rendering"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/provider_text_state.rs"
+expect_red = ["provider_text_state::responses_phase_survives_wal_replay"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = '.with_text_state(frozen.provider_text_state)'
+new = '.with_text_state(false) /* NON-VACUITY BREAK: discard Responses text state */'
+
+[[control]]
+id = "chatgpt-text-phase-wal-roundtrip"
+guards = "ChatGPT uses its own format tag and echoes recorded message phases on continuation"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/provider_text_state.rs"
+expect_red = ["provider_text_state::chatgpt_phase_survives_wal_replay"]
+file = "crates/broca-provider/src/families/openai_responses_chatgpt.rs"
+old = '.with_text_state(frozen.provider_text_state)'
+new = '.with_text_state(false) /* NON-VACUITY BREAK: discard ChatGPT text state */'
+
+[[control]]
+id = "gemini-signed-text-wal-roundtrip"
+guards = "Gemini signatures stay on their exact text parts, including empty text, after durable replay"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/provider_text_state.rs"
+expect_red = ["provider_text_state::gemini_signed_text_survives_wal_replay"]
+file = "crates/broca-provider/src/families/gemini.rs"
+old = 'Box::new(GeminiNormalizer::new(step_id, frozen.tool_id).with_text_state(frozen))'
+new = 'Box::new(GeminiNormalizer::new(step_id, frozen.tool_id)) /* NON-VACUITY BREAK: discard signed text */'
+
+[[control]]
+id = "codeassist-signed-text-wal-roundtrip"
+guards = "Code Assist retains signed text through the shared content codec without changing its envelope"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/provider_text_state.rs"
+expect_red = ["provider_text_state::codeassist_signed_text_survives_wal_replay"]
+file = "crates/broca-provider/src/families/google_codeassist.rs"
+old = 'inner: GeminiNormalizer::new(step_id, frozen.tool_id).with_text_state(frozen),'
+new = 'inner: GeminiNormalizer::new(step_id, frozen.tool_id), /* NON-VACUITY BREAK: discard signed text */'
+
+[[control]]
+id = "wal-provider-text-state-must-understand"
+guards = "State-bearing content and frozen policies cannot be silently read by older WAL readers"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::provider_text_state_is_must_understand_before_record_decode"]
+file = "crates/broca-wal/src/record.rs"
+old = 'let base = if self.carries_provider_text_state() {'
+new = 'let base = if self.carries_provider_text_state() && false { // NON-VACUITY BREAK: omit reader feature'

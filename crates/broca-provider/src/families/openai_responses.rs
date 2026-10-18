@@ -106,6 +106,7 @@ impl WireFamily for OpenAiResponses {
     ) -> Box<dyn StreamNormalizer> {
         Box::new(
             OpenAiResponsesNormalizer::new(step_id)
+                .with_text_state(frozen.provider_text_state)
                 // The body renders `max_output_tokens` from this same value.
                 .with_max_output_tokens(frozen.max_output_tokens),
         )
@@ -132,6 +133,7 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
         frozen.system_prompt.clone(),
         opts.target_model.as_ref(),
         frozen.family_id,
+        frozen.provider_text_state,
         &name_map,
         &updates,
     );
@@ -248,6 +250,7 @@ fn convert_input_items(
     system_policy: SystemPromptPolicy,
     target_model: Option<&broca_protocol::ModelHandle>,
     target_family: WireFamilyId,
+    provider_text_state: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
 ) -> Vec<Value> {
@@ -282,6 +285,7 @@ fn convert_input_items(
                 message,
                 target_model,
                 target_family,
+                provider_text_state,
                 name_map,
             )),
             Role::Tool => out.extend(convert_tool_output_items(message)),
@@ -343,7 +347,9 @@ fn user_text_content(blocks: &[ContentBlock]) -> Value {
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -381,6 +387,7 @@ fn convert_assistant_items(
     message: &Message,
     target_model: Option<&broca_protocol::ModelHandle>,
     target_family: WireFamilyId,
+    provider_text_state: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
 ) -> Vec<Value> {
     fn flush_text(out: &mut Vec<Value>, text: &mut String) {
@@ -401,6 +408,33 @@ fn convert_assistant_items(
     for block in &message.content {
         match block {
             ContentBlock::Text { text: part } => text.push_str(part),
+            ContentBlock::TextWithState {
+                text: part,
+                provider_state,
+            } => {
+                if provider_text_state {
+                    flush_text(&mut out, &mut text);
+                    let mut item = json!({"type":"message", "role":"assistant", "content":part});
+                    if super::text_state_is_echo_safe(
+                        message,
+                        target_model,
+                        provider_state.format,
+                        target_family,
+                    ) {
+                        if let Ok(state) = serde_json::from_str::<Value>(&provider_state.data) {
+                            if let Some(phase) = state.get("phase") {
+                                item["phase"] = phase.clone();
+                            }
+                        }
+                    }
+                    // Each block is one output item; never merge adjacent items with equal phases.
+                    if !part.is_empty() || item.get("phase").is_some() {
+                        out.push(item);
+                    }
+                } else {
+                    text.push_str(part);
+                }
+            }
             ContentBlock::RedactedReasoning {
                 data,
                 provider_format: Some(provider_format),
@@ -446,7 +480,7 @@ fn convert_tool_output_items(m: &Message) -> Vec<Value> {
 fn text_content(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        if let ContentBlock::Text { text } = b {
+        if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
             s.push_str(text);
         }
     }
@@ -581,6 +615,8 @@ pub struct OpenAiResponsesNormalizer {
     /// display lane had already shown both -- a durable answer disagreeing with what the
     /// user watched arrive.
     text_items: BTreeMap<(u64, u64), String>,
+    provider_text_state: bool,
+    text_states: BTreeMap<u64, String>,
     refusal: String,
     refusal_output_index: Option<u64>,
     saw_refusal: bool,
@@ -622,6 +658,8 @@ impl OpenAiResponsesNormalizer {
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Responses),
             response_id: None,
             text_items: BTreeMap::new(),
+            provider_text_state: false,
+            text_states: BTreeMap::new(),
             refusal: String::new(),
             refusal_output_index: None,
             saw_refusal: false,
@@ -642,6 +680,27 @@ impl OpenAiResponsesNormalizer {
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
         self.max_output_tokens = Some(max_output_tokens);
         self
+    }
+
+    pub(crate) fn with_text_state(mut self, enabled: bool) -> Self {
+        self.provider_text_state = enabled;
+        self
+    }
+
+    fn capture_text_state(&mut self, index: u64, item: &Value) {
+        if self.provider_text_state
+            && item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("phase").is_some()
+        {
+            let mut state = serde_json::Map::new();
+            for key in ["id", "phase"] {
+                if let Some(value) = item.get(key) {
+                    state.insert(key.into(), value.clone());
+                }
+            }
+            self.text_states
+                .insert(index, Value::Object(state).to_string());
+        }
     }
 
     fn handle_event(
@@ -769,6 +828,10 @@ impl OpenAiResponsesNormalizer {
             }
             "response.output_item.added" => {
                 if let Some(item) = v.get("item") {
+                    self.capture_text_state(
+                        v.get("output_index").and_then(Value::as_u64).unwrap_or(0),
+                        item,
+                    );
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                         let buf = self.tool_calls.entry(idx).or_default();
@@ -826,6 +889,7 @@ impl OpenAiResponsesNormalizer {
                 if let Some(item) = v.get("item") {
                     let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                     self.completed_items.insert(idx);
+                    self.capture_text_state(idx, item);
                     match item.get("type").and_then(Value::as_str) {
                         Some("function_call") => {
                             let buf = self.tool_calls.entry(idx).or_default();
@@ -1044,6 +1108,9 @@ impl OpenAiResponsesNormalizer {
         // in part order, so folding consecutive equal output_index values rebuilds the message
         // text in wire order without a second sort.
         let mut parts: Vec<(u64, String)> = Vec::new();
+        for index in self.text_states.keys() {
+            self.text_items.entry((*index, 0)).or_default();
+        }
         for ((index, part), text) in std::mem::take(&mut self.text_items) {
             if self.arguments_guard.fired()
                 && !self.completed_items.contains(&index)
@@ -1057,7 +1124,18 @@ impl OpenAiResponsesNormalizer {
             }
         }
         for (index, text) in parts {
-            if !text.is_empty() {
+            if let Some(data) = self.text_states.remove(&index) {
+                ordered.push((index, 1, ContentBlock::TextWithState {
+                    text,
+                    provider_state: broca_protocol::content::TextProviderState {
+                        format: match self.reasoning_format {
+                            EncryptedReasoningFormat::OpenAiResponses => broca_protocol::content::TextProviderFormat::OpenAiResponses,
+                            EncryptedReasoningFormat::OpenAiResponsesChatgpt => broca_protocol::content::TextProviderFormat::OpenAiResponsesChatgpt,
+                        },
+                        data,
+                    },
+                }));
+            } else if !text.is_empty() {
                 ordered.push((index, 1, ContentBlock::Text { text }));
             }
         }

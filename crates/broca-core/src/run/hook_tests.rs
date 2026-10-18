@@ -2094,6 +2094,28 @@ fn text_splicing_counts_only_text_and_preserves_signed_non_text_bytes() {
     );
 }
 
+#[test]
+fn text_splicing_removes_state_only_from_rewritten_provider_text() {
+    let block: ContentBlock = serde_json::from_value(json!({"type":"text_with_state","text":"answer","provider_state":{"format":"gemini","data":"opaque"}})).unwrap();
+    let mut content = vec![block.clone(), block.clone()];
+    crate::hooks::apply_message_ops(
+        &mut content,
+        &[Operation::Append {
+            block: 0,
+            text: " edited".into(),
+            note: None,
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        content[0],
+        ContentBlock::Text {
+            text: "answer edited".into()
+        }
+    );
+    assert_eq!(content[1], block);
+}
+
 async fn pre_tool_terminal_cause(caller: bool) {
     let manifest = Arc::new(frozen(
         vec![vec![sub("pre_tool", Some("mutate"), "pass")]],

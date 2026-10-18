@@ -455,7 +455,8 @@ async fn run(args: Args) -> Result<i32, String> {
                             .content
                             .iter()
                             .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
+                                ContentBlock::Text { text }
+                                | ContentBlock::TextWithState { text, .. } => Some(text.as_str()),
                                 _ => None,
                             })
                             .collect();

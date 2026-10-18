@@ -192,7 +192,9 @@ fn convert_system(
                 // Drop an empty text part — Bedrock Converse rejects an empty `{text:""}`
                 // block. Defensive against foreign input; the owned normalizers never emit
                 // empty text.
-                if let ContentBlock::Text { text } = block {
+                if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } =
+                    block
+                {
                     if !text.is_empty() {
                         system.push(json!({ "text": text }));
                     }
@@ -462,8 +464,14 @@ fn convert_content(
         .iter()
         .filter_map(|block| match block {
             // Drop an empty text part (Bedrock rejects `text:""`). Defensive against foreign input; the owned normalizers never emit empty text.
-            ContentBlock::Text { text } if text.is_empty() => None,
-            ContentBlock::Text { text } => Some(json!({ "text": text })),
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
+                if text.is_empty() =>
+            {
+                None
+            }
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(json!({ "text": text }))
+            }
             ContentBlock::ToolCall(call) => Some(json!({
                 "toolUse": {
                     "toolUseId": id_map.wire_id(&call.tool_call_id.0),

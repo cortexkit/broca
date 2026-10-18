@@ -790,9 +790,10 @@ async fn run(args: Args) -> Result<i32, String> {
                         .content
                         .iter()
                         .filter_map(|block| match block {
-                            broca_protocol::content::ContentBlock::Text { text } => {
-                                Some(text.as_str())
-                            }
+                            broca_protocol::content::ContentBlock::Text { text }
+                            | broca_protocol::content::ContentBlock::TextWithState {
+                                text, ..
+                            } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -1207,7 +1208,10 @@ fn assistant_text(unit: &ControlUnit) -> Option<String> {
         .content
         .iter()
         .filter_map(|block| match block {
-            broca_protocol::content::ContentBlock::Text { text } => Some(text.as_str()),
+            broca_protocol::content::ContentBlock::Text { text }
+            | broca_protocol::content::ContentBlock::TextWithState { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<String>();
