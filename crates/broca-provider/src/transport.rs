@@ -6835,10 +6835,8 @@ mod tests {
     #[test]
     fn shared_chatgpt_response_vectors_agree_with_the_transport() {
         use super::CHATGPT_UPSTREAM_KEY_REJECTED;
-        let document: Value = serde_json::from_str(include_str!(
-            "../../cortexkit-chatgpt-policy/test-vectors/responses.json"
-        ))
-        .unwrap();
+        let document: Value =
+            serde_json::from_str(cortexkit_chatgpt_policy::vectors::RESPONSES_JSON).unwrap();
         let vectors = document["vectors"].as_array().unwrap();
         assert!(vectors.len() >= 7);
         for vector in vectors {
@@ -6904,10 +6902,8 @@ mod tests {
     fn the_shared_chatgpt_policy_agrees_with_the_transport_on_every_status() {
         use super::CHATGPT_UPSTREAM_KEY_REJECTED;
         use cortexkit_chatgpt_policy::Classification;
-        let document: Value = serde_json::from_str(include_str!(
-            "../../cortexkit-chatgpt-policy/test-vectors/responses.json"
-        ))
-        .unwrap();
+        let document: Value =
+            serde_json::from_str(cortexkit_chatgpt_policy::vectors::RESPONSES_JSON).unwrap();
         let now = UNIX_EPOCH + Duration::from_millis(1_789_579_322_081);
         let mut bodies: Vec<&str> = document["vectors"]
             .as_array()

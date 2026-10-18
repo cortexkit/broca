@@ -2544,10 +2544,8 @@ mod tests {
     /// resolves to the vector's account header, or fails loud without one.
     #[test]
     fn shared_chatgpt_account_id_vectors_agree_with_codex_auth() {
-        let document: serde_json::Value = serde_json::from_str(include_str!(
-            "../../cortexkit-chatgpt-policy/test-vectors/account_ids.json"
-        ))
-        .unwrap();
+        let document: serde_json::Value =
+            serde_json::from_str(cortexkit_chatgpt_policy::vectors::ACCOUNT_IDS_JSON).unwrap();
         let vectors = document["vectors"].as_array().unwrap();
         assert!(vectors.len() >= 4);
         for vector in vectors {

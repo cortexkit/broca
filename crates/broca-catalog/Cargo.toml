@@ -42,6 +42,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 broca-owner-only = { workspace = true, features = ["test-support"] }
+# Shared account-id vectors used by the Codex auth tests.
+cortexkit-chatgpt-policy = { workspace = true, features = ["test-vectors"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }
 # The catalog→live end-to-end test drives a real provider through the loop's

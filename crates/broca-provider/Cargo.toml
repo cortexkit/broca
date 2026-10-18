@@ -69,6 +69,8 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], op
 [dev-dependencies]
 # The shared Claude OAuth wire vectors (`vectors::VECTORS_JSON`) the persona tests are pinned to.
 cortexkit-anthropic-policy = { workspace = true, features = ["test-vectors"] }
+# Shared ChatGPT/Codex golden vectors used by the transport tests.
+cortexkit-chatgpt-policy = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }

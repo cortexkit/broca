@@ -11,8 +11,8 @@ Source: https://github.com/openai/codex at revision
 
 The ChatGPT Responses WebSocket transport in
 `crates/broca-provider/src/transport_websocket.rs`, the 300-second idle limit in
-`crates/broca-provider/src/transport.rs`, and the ChatGPT usage-limit classifier in
-`crates/cortexkit-chatgpt-policy/src/classify.rs` are adapted from Codex. broca
+`crates/broca-provider/src/transport.rs`, and the refusal classifier in the published
+`cortexkit-chatgpt-policy` crate are adapted from Codex. broca
 connects these to its run-local transport, shared Responses normalizer, HTTPS
 fallback and account-limit error handling.
 
@@ -43,9 +43,9 @@ from OpenCode's `packages/core/src/models-dev.ts` at revision
 instead of npm package and freezes them at admission.
 
 The ChatGPT header construction in `crates/broca-catalog/src/live.rs` and the
-account-claim extraction in `crates/cortexkit-chatgpt-policy/src/account.rs` follow
-OpenCode's `codex.ts` and `extractAccountIdFromClaims`. broca adds vault credential resolution, frozen
-session scope and non-empty claim checks.
+account-claim extraction in the published `cortexkit-chatgpt-policy` crate follow
+OpenCode's `codex.ts` and `extractAccountIdFromClaims`. broca adds vault credential
+resolution, frozen session scope and non-empty claim checks.
 
 ```text
 MIT License

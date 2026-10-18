@@ -5,7 +5,6 @@ members = [
     "crates/broca-owner-only",
     "crates/broca-ck",
     "crates/broca-provider",
-    "crates/cortexkit-chatgpt-policy",
     "crates/broca-core",
     "crates/broca-bench",
     "crates/broca-replay",
@@ -51,7 +50,7 @@ repository = "https://github.com/cortexkit/broca"
 [workspace.dependencies]
 broca-owner-only = { path = "crates/broca-owner-only" }
 cortexkit-anthropic-policy = "=0.1.3"
-cortexkit-chatgpt-policy = { path = "crates/cortexkit-chatgpt-policy", version = "=0.1.0" }
+cortexkit-chatgpt-policy = "=0.1.0"
 serde = { version = "1", features = ["derive", "rc"] }
 # Keep shared normal-dependency features identical across package selections.
 # Tokio's paused-clock support is deliberately dev-only: test-util adds clock
