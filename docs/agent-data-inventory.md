@@ -10,12 +10,15 @@ filename, payload or byte offset.
 
 ## Completeness and admission
 
-A candidate is committed **before** a `RunStarted` append can reach disk, including
-preencoded appends and provider-free imports. A projection write failure prevents
-the WAL append and its acknowledgment. Move activation records eligible identities
-from the verified incoming WAL before installing any bytes. Import staging alone
-does not claim a local copy. Only identities whose derived address matches the
-physical logical address are eligible; historical triples in re-keyed WALs do not
+Before a `RunStarted` append, ordinary and preencoded writers (including
+provider-free imports) attempt to commit the candidate. SQLite contention or a
+projection failure does **not** block the run: the writer instead creates and
+syncs the owner-only, content-free `session-ref-projection.incomplete` marker in
+the state root, then appends normally. Only failure to durably establish that
+marker prevents the append. Move activation uses the same fallback before
+installing verified bytes. Import staging alone does not claim a local copy. Only identities whose derived address matches the
+WAL filename's address (or the archive member header's address) are eligible;
+historical triples in re-keyed WALs do not
 become aliases.
 
 Writing the candidate first deliberately permits conservative extra rows after a
@@ -26,7 +29,8 @@ authority for expired, non-exportable sessions. Bound cuts use their recorded
 addresses rather than rediscovering identity.
 
 A missing ref proves absence only when the query's SQLite snapshot contains both
-migration completion markers and no pending legacy admissions. Until then it is
+migration completion markers, no pending legacy admissions, and no filesystem
+gap marker. Until then it is
 unknown, using the existing retryable response. Known candidates can still be
 verified independently. SQLite failures likewise never prove absence. Empty ref
 sets bypass discovery.
@@ -52,7 +56,19 @@ The census queue and per-address coverage commit in batches of at most 128 rows.
 After interruption, enumeration adds any new addresses but already-covered
 payloads and probes are skipped. Work yields between addresses and pauses three
 times each batch's total work duration, including decoding and SQLite commits.
-Completed migration is not repeated on normal restarts.
+Completed migration is not repeated on normal restarts. If the gap marker exists
+at boot, migration reopens census completion and revisits unrepresented addresses,
+including previously empty WALs; already-covered candidates are retained. After
+the store is writable and census succeeds, the marker is unlinked and the state
+root synced. A short per-root filesystem lease, shared across processes, prevents
+a concurrent failed projection append or installation from clearing a marker
+across the census. Each acquisition increments a persisted counter: repair records
+that counter before scanning, reacquires the lease at completion, and clears the
+marker only if the counter increased by exactly one for its own reacquisition.
+Any intervening writer or repair leaves the marker in place. No lock is held for
+the census duration and no session identities are cached in memory.
+A failed or overlapped repair leaves the marker for the next boot, not a false
+absence or a failed run.
 Downgrade-then-reupgrade is outside the projection-completeness guarantee: an older
 binary can add WAL-only sessions that the already-completed migration will not discover.
 Legacy `run_index` writers

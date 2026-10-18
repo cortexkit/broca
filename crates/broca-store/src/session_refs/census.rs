@@ -156,11 +156,47 @@ pub(super) fn run(
 /// A separate SQLite connection lets moves observe an incomplete snapshot while
 /// the one-time backfill runs, instead of holding the serving connection's mutex.
 pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCounts, StoreError> {
+    let root = db.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let incomplete = broca_core::session_projection_incomplete(root).map_err(|_| {
+        StoreError::InconsistentSnapshot("cannot inspect session-ref projection incomplete marker")
+    })?;
+    let repair = if incomplete {
+        broca_core::ProjectionRepair::begin(root).map_err(|_| {
+            StoreError::InconsistentSnapshot("cannot begin session-ref projection repair")
+        })?
+    } else {
+        None
+    };
     let mut conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let work = Instant::now();
+    if incomplete {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM agent_data_census_done", [])?;
+        // A previously empty address may have gained a RunStarted while SQLite
+        // was unavailable. Keep covered candidates, but revisit unrepresented WALs.
+        tx.execute("UPDATE agent_data_census SET covered=0 WHERE NOT EXISTS
+            (SELECT 1 FROM agent_data_session_ref WHERE agent_data_session_ref.address=agent_data_census.address)", [])?;
+        tx.commit()?;
+    }
     backfill(&conn)?;
     pace(work, true);
-    run(&mut conn, wal, None, true)
+    let mut counts = run(&mut conn, wal, None, true)?;
+    if incomplete && counts.complete {
+        counts.complete = match repair {
+            Some(repair) => repair.finish().map_err(|_| {
+                StoreError::InconsistentSnapshot(
+                    "cannot durably remove session-ref projection incomplete marker",
+                )
+            })?,
+            None => false,
+        };
+    }
+    if broca_core::session_projection_incomplete(root).map_err(|_| {
+        StoreError::InconsistentSnapshot("cannot inspect repaired session-ref projection marker")
+    })? {
+        counts.complete = false;
+    }
+    Ok(counts)
 }
 
 pub fn census(conn: &mut Connection, wal: &ReadOnlyWalReader) -> Result<CensusCounts, StoreError> {

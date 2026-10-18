@@ -886,8 +886,9 @@ impl CutArtifacts for FileCutArtifacts {
             }
             Op::Activate => {
                 let paths = self.paths(&cut_id, &locked.plans)?;
-                // Persist discovery before rename: even an interrupted installation
-                // must not leave durable local bytes behind a missing session ref.
+                let mut projection_admissions = Vec::new();
+                // Keep failed-projection guards through installation so a census
+                // cannot clear their durable marker before the WAL is published.
                 for plan in &locked.plans {
                     let range =
                         broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
@@ -899,12 +900,16 @@ impl CutArtifacts for FileCutArtifacts {
                     };
                     for frame in records {
                         if let broca_wal::WalRecord::RunStarted { session, .. } = &frame.record {
-                            self.wal
+                            if let Some(admission) = self
+                                .wal
                                 .record_session_before_install(
                                     &broca_core::session_addr(&plan.session),
                                     session,
                                 )
-                                .map_err(unavailable)?;
+                                .map_err(unavailable)?
+                            {
+                                projection_admissions.push(admission);
+                            }
                         }
                     }
                 }

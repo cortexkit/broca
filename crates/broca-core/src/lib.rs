@@ -149,6 +149,10 @@ pub use wal_writer::{
     RecordOutcome, SessionRefIndex, WalHandle, WalOpenError, WalStore, WalWriteError,
     WAL_MANIFEST_FILENAME,
 };
+pub use wal_writer::{
+    session_projection_incomplete, ProjectionAdmission, ProjectionRepair,
+    SESSION_PROJECTION_INCOMPLETE,
+};
 
 pub mod keep_warm;
 pub mod keep_warm_wait;

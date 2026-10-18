@@ -16702,8 +16702,7 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
 expect_red = ["inventory::admission_is_discoverable_before_sync_and_acknowledgment"]
 file = "crates/broca-core/src/wal_writer/session_index.rs"
-old = '''index
-                    .record_session(&self.address, session)'''
+old = 'index.record_session(address, session)'
 new = 'Ok::<(),String>(()) /* NON-VACUITY BREAK: omit admission projection write */'
 
 [[control]]
@@ -16733,8 +16732,7 @@ select = "expected"
 test_file = "crates/broca-store/src/session_refs/tests.rs"
 expect_red = ["session_refs::tests::provider_free_import_registers_ref_before_acknowledgment"]
 file = "crates/broca-core/src/wal_writer/session_index.rs"
-old = '''index
-                    .record_session(&self.address, session)'''
+old = 'index.record_session(address, session)'
 new = 'Ok::<(),String>(()) /* NON-VACUITY BREAK: omit import projection write */'
 
 [[control]]
@@ -16748,8 +16746,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
 expect_red = ["inventory::activation_registers_installed_ref_before_acknowledgment"]
 file = "crates/broca-core/src/wal_writer/session_index.rs"
-old = 'index.record_session(address, session)?;'
-new = '// NON-VACUITY BREAK: omit activation projection write'
+old = 'index.record_session(address, session)'
+new = 'Ok::<(),String>(()) /* NON-VACUITY BREAK: omit activation projection write */'
 
 [[control]]
 id = "agent-data-census-resumes-covered-addresses"
@@ -16793,3 +16791,58 @@ file = "crates/broca-wal/src/migration/fence_index.rs"
 old = 'publish(state_root, &cut_id, &state)?;'
 new = '// NON-VACUITY BREAK: omit the per-ref fence before publishing intent'
 
+
+[[control]]
+id = "agent-data-projection-failure-never-blocks-append"
+guards = "SQLite projection failure durably marks discovery incomplete without blocking the authoritative WAL append"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::locked_projection_keeps_admission_and_repair_recovers_session"]
+file = "crates/broca-core/src/wal_writer/session_index.rs"
+old = '''            let admission = ProjectionAdmission::begin(root)
+                .map_err(|marker| format!("session-ref projection failed ({error}); cannot persist incomplete marker: {marker}"))?;
+            tracing::warn!(%error, "session-ref projection unavailable; durable incomplete marker preserves WAL admission");
+            return Ok(Some(admission));'''
+new = '''            return Err(error); // NON-VACUITY BREAK: projection failure blocks append'''
+
+[[control]]
+id = "agent-data-gap-marker-prevents-false-absence"
+guards = "a missing session ref stays unknown while the filesystem gap marker exists"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::locked_projection_keeps_admission_and_repair_recovers_session"]
+file = "crates/broca-store/src/session_refs.rs"
+old = 'complete: complete && !was_incomplete && !gap()?,'
+new = 'complete, // NON-VACUITY BREAK: ignore the durable projection gap'
+
+[[control]]
+id = "agent-data-gap-repair-admission-exclusion"
+guards = "repair cannot remove an incomplete marker across an unobserved failed-projection admission or install"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::repair_cannot_clear_gap_across_an_overlapping_admission_or_installation"]
+file = "crates/broca-core/src/wal_writer/projection_gap.rs"
+old = 'if self.tenure.checked_add(1) != Some(lease.epoch()) {'
+new = 'if false { // NON-VACUITY BREAK: clear a marker despite an overlapping admission'
+
+[[control]]
+id = "agent-data-gap-repair-cross-process"
+guards = "a repair cannot clear a durable gap when another process admitted an unprojected WAL during its census"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::projection_repair_observes_other_process_writers"]
+file = "crates/broca-core/src/wal_writer/projection_gap.rs"
+old = 'if self.tenure.checked_add(1) != Some(lease.epoch()) {'
+new = 'if false { // NON-VACUITY BREAK: disregard the other process writer tenure'

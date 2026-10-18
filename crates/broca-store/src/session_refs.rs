@@ -125,8 +125,22 @@ pub(crate) fn insert(
 
 impl SessionRefIndex for SqliteStore {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        insert(&conn, address, session).map_err(|error| error.to_string())?;
+        let conn = self
+            .conn
+            .try_lock()
+            .map_err(|error| format!("session-ref store busy: {error}"))?;
+        // This optional projection must not inherit the store's retry wait while
+        // another connection owns the write lock. WAL admission has a durable
+        // filesystem gap marker for exactly this case.
+        let timeout: u64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .map_err(|error| error.to_string())?;
+        let result = insert(&conn, address, session).map_err(|error| error.to_string());
+        conn.busy_timeout(std::time::Duration::from_millis(timeout))
+            .map_err(|error| error.to_string())?;
+        result?;
         Ok(())
     }
 }
@@ -139,8 +153,25 @@ impl SqliteStore {
         refs: impl Iterator<Item = &'a str>,
     ) -> Result<SessionRefs, StoreError> {
         let mut conn = self.conn.lock().unwrap();
+        let root = conn
+            .path()
+            .map(std::path::Path::new)
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let gap = || -> Result<bool, StoreError> {
+            root.as_deref()
+                .map(broca_core::session_projection_incomplete)
+                .transpose()
+                .map(|exists| exists.unwrap_or(false))
+                .map_err(|_| {
+                    StoreError::InconsistentSnapshot(
+                        "cannot inspect session-ref projection incomplete marker",
+                    )
+                })
+        };
+        let was_incomplete = gap()?;
         let tx = conn.transaction()?;
-        let complete = tx.query_row(
+        let complete: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1 AND backfilled=1)
              AND EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
              AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)",
@@ -171,7 +202,10 @@ impl SqliteStore {
             }
         }
         tx.commit()?;
-        Ok(SessionRefs { sessions, complete })
+        Ok(SessionRefs {
+            sessions,
+            complete: complete && !was_incomplete && !gap()?,
+        })
     }
 }
 

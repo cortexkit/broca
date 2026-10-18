@@ -30,9 +30,14 @@ use tokio::sync::{broadcast, oneshot};
 use crate::lease::LeaseHandle;
 
 mod extraction;
-mod retention_changes;
 mod projection_reader;
+mod retention_changes;
 pub use projection_reader::ReadOnlyWalReader;
+mod projection_gap;
+pub use projection_gap::{
+    session_projection_incomplete, ProjectionAdmission, ProjectionRepair,
+    SESSION_PROJECTION_INCOMPLETE,
+};
 mod session_index;
 pub use session_index::{agent_session_ref, SessionRefIndex};
 
@@ -795,6 +800,7 @@ impl FileWalStore {
             session_index::AdmissionWal::new(
                 wal,
                 session_addr(session),
+                self.root.parent().unwrap_or(&self.root).to_path_buf(),
                 self.session_index.clone(),
             )
             .with_placement(

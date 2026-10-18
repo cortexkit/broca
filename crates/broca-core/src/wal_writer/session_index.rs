@@ -1,6 +1,23 @@
 //! Durable session discovery boundary; WAL bytes remain authoritative.
 use super::*;
 
+fn record_candidate(
+    index: Option<&dyn SessionRefIndex>,
+    root: &Path,
+    address: &str,
+    session: &BindIdentity,
+) -> Result<Option<ProjectionAdmission>, String> {
+    if let Some(index) = index {
+        if let Err(error) = index.record_session(address, session) {
+            let admission = ProjectionAdmission::begin(root)
+                .map_err(|marker| format!("session-ref projection failed ({error}); cannot persist incomplete marker: {marker}"))?;
+            tracing::warn!(%error, "session-ref projection unavailable; durable incomplete marker preserves WAL admission");
+            return Ok(Some(admission));
+        }
+    }
+    Ok(None)
+}
+
 pub fn agent_session_ref(session: &BindIdentity) -> String {
     cortexkit_role_llm_runner::session_ref(
         &session.harness,
@@ -9,8 +26,8 @@ pub fn agent_session_ref(session: &BindIdentity) -> String {
     )
 }
 
-/// A candidate is persisted before its WAL can become durable. Failed writes
-/// may leave extra candidates, which readers must verify against the actual WAL.
+/// Attempt discovery persistence before WAL durability; a durable gap marker
+/// preserves availability when SQLite cannot accept the conservative candidate.
 pub trait SessionRefIndex: Send + Sync {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String>;
 }
@@ -20,16 +37,19 @@ impl FileWalStore {
         *self.session_index.lock().unwrap() = Some(index);
     }
 
-    /// Installation persists candidates before publishing any incoming WAL bytes.
+    /// Keep a gap guard alive through installation if SQLite was unavailable.
     pub fn record_session_before_install(
         &self,
         address: &str,
         session: &BindIdentity,
-    ) -> Result<(), String> {
-        if let Some(index) = self.session_index.lock().unwrap().as_ref() {
-            index.record_session(address, session)?;
-        }
-        Ok(())
+    ) -> Result<Option<ProjectionAdmission>, String> {
+        let index = self.session_index.lock().unwrap().clone();
+        record_candidate(
+            index.as_deref(),
+            self.root.parent().unwrap_or(&self.root),
+            address,
+            session,
+        )
     }
 
     pub fn move_read_count(&self) -> u64 {
@@ -40,6 +60,7 @@ impl FileWalStore {
 pub(super) struct AdmissionWal {
     wal: FileWal,
     address: String,
+    state_root: PathBuf,
     index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
     placement: Option<(PathBuf, PathBuf, PathBuf, Vec<String>)>,
 }
@@ -48,11 +69,13 @@ impl AdmissionWal {
     pub(super) fn new(
         wal: FileWal,
         address: String,
+        state_root: PathBuf,
         index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
     ) -> Self {
         Self {
             wal,
             address,
+            state_root,
             index,
             placement: None,
         }
@@ -69,7 +92,11 @@ impl AdmissionWal {
         self
     }
 
-    fn before_append(&mut self, record: &WalRecord) -> Result<(), WalError> {
+    fn before_append(
+        &mut self,
+        record: &WalRecord,
+    ) -> Result<Option<ProjectionAdmission>, WalError> {
+        let mut admission = None;
         if let WalRecord::RunStarted {
             session,
             retention,
@@ -77,13 +104,10 @@ impl AdmissionWal {
             ..
         } = record
         {
-            // Persist before append, not after sync: a crash between WAL durability
-            // and a projection write must not turn a held session into an absent ref.
-            if let Some(index) = self.index.lock().unwrap().as_ref() {
-                index
-                    .record_session(&self.address, session)
+            let index = self.index.lock().unwrap().clone();
+            admission =
+                record_candidate(index.as_deref(), &self.state_root, &self.address, session)
                     .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
-            }
             if self.wal.last_seq() == 0 {
                 if let Some((ordinary, ephemeral, durable, classes)) = &self.placement {
                     let path = if retention.is_some() {
@@ -100,13 +124,13 @@ impl AdmissionWal {
                 }
             }
         }
-        Ok(())
+        Ok(admission)
     }
 }
 
 impl Wal for AdmissionWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        self.before_append(record)?;
+        let _projection_admission = self.before_append(record)?;
         self.wal.append(fence, record, sync)
     }
     fn append_preencoded(
@@ -116,7 +140,7 @@ impl Wal for AdmissionWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        self.before_append(record)?;
+        let _projection_admission = self.before_append(record)?;
         self.wal.append_preencoded(fence, record, sync, frame)
     }
     fn sync(&self) -> Result<(), WalError> {

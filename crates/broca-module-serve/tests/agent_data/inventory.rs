@@ -610,3 +610,51 @@ async fn activation_registers_installed_ref_before_acknowledgment() {
         *session
     );
 }
+
+#[tokio::test]
+async fn locked_store_admission_is_unknown_until_boot_repairs_gap() {
+    let rig = Rig::new("store-outage", Arc::new(FakeDoor::default()));
+    let session = rig.session("admitted-during-outage");
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let blocker = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    rig.seed(&session, "outage-run", false);
+    let params = rig.params(CUT, std::slice::from_ref(&session));
+    assert!(rig
+        .root
+        .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
+        .exists());
+    assert_eq!(
+        wire.call("busy", json!({"refs":params["refs"]}))
+            .await
+            .unwrap()["refs"][0]["state"],
+        "unknown"
+    );
+    assert_eq!(
+        wire.call("diverged", params.clone()).await.unwrap()["refs"][0]["state"],
+        "unknown"
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    rig.service.reconcile_boot().await.unwrap();
+    broca_test_support::wait_until(
+        "boot census to remove the projection gap marker",
+        || async {
+            if rig
+                .root
+                .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
+                .exists()
+            {
+                Err("projection gap marker still present".to_owned())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    let reply = wire
+        .call("busy", json!({"refs":params["refs"]}))
+        .await
+        .unwrap();
+    assert_eq!(reply["refs"][0]["state"], "busy");
+    assert_eq!(reply["refs"][0]["reason_code"], "run_active");
+}

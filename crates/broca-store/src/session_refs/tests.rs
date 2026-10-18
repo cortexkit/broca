@@ -193,25 +193,55 @@ fn legacy_cleanup_removes_only_inventory_artifacts() {
 }
 
 #[test]
-fn projection_failure_prevents_durable_admission() {
-    struct Failed;
-    impl SessionRefIndex for Failed {
-        fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
-            Err("projection unavailable".into())
-        }
-    }
+fn locked_projection_keeps_admission_and_repair_recovers_session() {
     let root = broca_test_support::scratch_root()
-        .join(format!("session-ref-failure-{}", std::process::id()));
+        .join(format!("session-ref-locked-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
     let wal = broca_core::FileWalStore::new(root.join("wal"));
-    wal.set_session_ref_index(Arc::new(Failed));
-    let session = BindIdentity::new("/project", "broca", "session");
+    let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
+    wal.set_session_ref_index(index.clone());
+    let session = BindIdentity::new("/project", "broca", "during-outage");
     let mut writer = wal.open(&session).unwrap();
-    assert!(writer
-        .append(1, &started(&session, false), true)
-        .unwrap_err()
-        .to_string()
-        .contains("projection unavailable"));
-    assert!(writer.replay().unwrap().is_empty());
+    migrate(&root.join("run-index.db"), &ReadOnlyWalReader::new(&root)).unwrap();
+    let reference = agent_session_ref(&session);
+    assert!(
+        index
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap()
+            .complete
+    );
+    let blocker = Connection::open(root.join("run-index.db")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        writer.append(1, &started(&session, false), true).unwrap(),
+        1
+    );
+    assert_eq!(writer.replay().unwrap().len(), 1);
+    let marker = root.join(broca_core::SESSION_PROJECTION_INCOMPLETE);
+    assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let missing = index
+        .session_refs([reference.as_str()].into_iter())
+        .unwrap();
+    assert!(!missing.complete);
+    assert!(missing.sessions.is_empty());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let counts = migrate(&root.join("run-index.db"), &ReadOnlyWalReader::new(&root)).unwrap();
+    assert!(counts.complete);
+    assert_eq!(counts.not_represented, 1);
+    assert!(!marker.exists());
+    let found = index
+        .session_refs([reference.as_str()].into_iter())
+        .unwrap();
+    assert!(found.complete);
+    assert_eq!(found.sessions[&reference].1, session);
 }
 
 #[test]
@@ -473,4 +503,119 @@ fn census_over_read_only_state_root_never_changes_logs_or_manifest() {
             .unwrap()
             .complete
     );
+}
+
+#[test]
+fn failed_gap_marker_refuses_untracked_wal_bytes() {
+    struct Failed;
+    impl SessionRefIndex for Failed {
+        fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
+            Err("projection unavailable".into())
+        }
+    }
+    let root = broca_test_support::scratch_root()
+        .join(format!("session-ref-no-marker-{}", std::process::id()));
+    std::fs::create_dir_all(root.join(broca_core::SESSION_PROJECTION_INCOMPLETE)).unwrap();
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    wal.set_session_ref_index(Arc::new(Failed));
+    let session = BindIdentity::new("/project", "broca", "no-marker");
+    let mut writer = wal.open(&session).unwrap();
+    assert!(writer
+        .append(1, &started(&session, false), true)
+        .unwrap_err()
+        .to_string()
+        .contains("cannot persist incomplete marker"));
+    assert!(writer.replay().unwrap().is_empty());
+}
+
+#[test]
+fn repair_cannot_clear_gap_across_an_overlapping_admission_or_installation() {
+    struct Failed;
+    impl SessionRefIndex for Failed {
+        fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
+            Err("projection unavailable".into())
+        }
+    }
+    let root = broca_test_support::scratch_root()
+        .join(format!("session-ref-overlap-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    wal.set_session_ref_index(Arc::new(Failed));
+    let session = BindIdentity::new("/project", "broca", "overlap");
+    let repair = broca_core::ProjectionRepair::begin(&root).unwrap().unwrap();
+    wal.open(&session)
+        .unwrap()
+        .append(1, &started(&session, false), true)
+        .unwrap();
+    assert!(!repair.finish().unwrap());
+    assert!(broca_core::session_projection_incomplete(&root).unwrap());
+    let installation = wal
+        .record_session_before_install(&session_addr(&session), &session)
+        .unwrap();
+    assert!(installation.is_some());
+    assert!(broca_core::ProjectionRepair::begin(&root)
+        .unwrap()
+        .is_none());
+    drop(installation);
+    assert!(broca_core::ProjectionRepair::begin(&root)
+        .unwrap()
+        .unwrap()
+        .finish()
+        .unwrap());
+    assert!(!broca_core::session_projection_incomplete(&root).unwrap());
+}
+
+#[test]
+fn projection_repair_observes_other_process_writers() {
+    const CHILD_ROOT: &str = "BROCA_SESSION_REF_GAP_TEST_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        struct Failed;
+        impl SessionRefIndex for Failed {
+            fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
+                Err("projection unavailable".into())
+            }
+        }
+        let root = std::path::PathBuf::from(root);
+        let wal = broca_core::FileWalStore::new(root.join("wal"));
+        wal.set_session_ref_index(Arc::new(Failed));
+        let session = BindIdentity::new("/project", "broca", "other-process");
+        wal.open(&session)
+            .unwrap()
+            .append(1, &started(&session, false), true)
+            .unwrap();
+        return;
+    }
+    let root = broca_test_support::scratch_root()
+        .join(format!("session-ref-cross-process-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let repair = broca_core::ProjectionRepair::begin(&root).unwrap().unwrap();
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Reap(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "session_refs::tests::projection_repair_observes_other_process_writers",
+                "--exact",
+            ])
+            .env(CHILD_ROOT, &root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let status = broca_test_support::wait_until_sync("projection-gap child writer", || {
+        child
+            .0
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "child writer still running".to_owned())
+    });
+    assert!(status.success());
+    assert!(!repair.finish().unwrap());
+    assert!(broca_core::session_projection_incomplete(&root).unwrap());
 }
