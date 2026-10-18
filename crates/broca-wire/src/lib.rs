@@ -758,12 +758,41 @@ pub enum SendResult {
     },
 }
 
+/// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
+/// block with the same text, and every other block is written unchanged.
+fn serialize_caller_message<S: serde::Serializer>(
+    message: &broca_protocol::Message,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use broca_protocol::ContentBlock;
+    if !message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::TextWithState { .. }))
+    {
+        return message.serialize(serializer);
+    }
+    let mut caller = message.clone();
+    for block in &mut caller.content {
+        if let ContentBlock::TextWithState { text, .. } = block {
+            *block = ContentBlock::Text {
+                text: std::mem::take(text),
+            };
+        }
+    }
+    caller.serialize(serializer)
+}
+
 /// One message in a `session.read` page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReadMessage {
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
     pub mid: String,
+    /// Written in the caller-facing vocabulary: assistant text that carries provider state
+    /// (`text_with_state`) goes out as a plain `text` block. The state is opaque bytes broca
+    /// keeps only to send back to the provider; a caller reading the transcript wants the text.
+    #[serde(serialize_with = "serialize_caller_message")]
     pub message: broca_protocol::Message,
     /// The producing run, not the page's latest run. Historical/imported messages with
     /// no recoverable producer omit this member; legacy replies without it still decode.
@@ -3794,5 +3823,64 @@ mod session_class_tests {
         for value in [json!(1), json!(true), json!([]), json!({})] {
             refusal(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod caller_message_tests {
+    use super::*;
+    use broca_protocol::content::{ContentBlock, Role, TextProviderFormat, TextProviderState};
+    use serde_json::json;
+
+    fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
+        SessionReadMessage {
+            ordinal: 3,
+            mid: "m3".into(),
+            message: broca_protocol::Message::new(Role::Assistant, content),
+            run: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// A caller reads the transcript's text, never the provider bytes kept to send back. A
+    /// worker's final reply carrying a ChatGPT phase must reach the caller as plain text, or a
+    /// parser looking for its text sees a serialized envelope instead.
+    #[test]
+    fn text_with_provider_state_reaches_callers_as_plain_text() {
+        let message = read_message(vec![
+            ContentBlock::Text {
+                text: "before ".into(),
+            },
+            ContentBlock::TextWithState {
+                text: "<result>done</result>".into(),
+                provider_state: TextProviderState {
+                    format: TextProviderFormat::OpenAiResponsesChatgpt,
+                    data: r#"{"id":"msg_1","phase":"final_answer"}"#.into(),
+                },
+            },
+        ]);
+        let wire = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            wire["message"]["content"],
+            json!([
+                {"type": "text", "text": "before "},
+                {"type": "text", "text": "<result>done</result>"},
+            ])
+        );
+        assert!(!wire.to_string().contains("provider_state"));
+        assert!(!wire.to_string().contains("final_answer"));
+    }
+
+    /// Messages without provider state serialize exactly as the canonical message does, so the
+    /// conversion never moves bytes of an ordinary page.
+    #[test]
+    fn messages_without_provider_state_are_unchanged() {
+        let message = read_message(vec![ContentBlock::Text {
+            text: "plain".into(),
+        }]);
+        assert_eq!(
+            serde_json::to_value(&message).unwrap()["message"],
+            serde_json::to_value(&message.message).unwrap()
+        );
     }
 }
