@@ -2451,6 +2451,15 @@ mod executor {
         /// WAL bytes read to pin `cc_version` suffixes, for tests that prove a read happens at
         /// most once.
         cc_suffix_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
+        /// Verified human-prompt counts and their WAL end offsets. If another provider admits
+        /// intervening episodes without recording a persona count, resume counting at that
+        /// offset instead of decoding the session's history again.
+        cc_prompt_memo: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<String, broca_wal::file_wal::HumanPromptCount>,
+            >,
+        >,
+        cc_prompt_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl LiveLoopExecutor {
@@ -2480,6 +2489,8 @@ mod executor {
                 claude_code_install_id: None,
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
+                cc_prompt_memo: Default::default(),
+                cc_prompt_wal_bytes: Default::default(),
             }
         }
 
@@ -2537,6 +2548,62 @@ mod executor {
             let suffix = first_durable_cc_version_suffix(durable.as_slice(), &req.input);
             self.remember_cc_suffix(key, suffix.clone());
             suffix
+        }
+
+        /// Reuse the human-prompt count recorded by the preceding episode without touching the
+        /// WAL. Legacy or imported sessions need one initial count of episode inputs. Remember
+        /// that count's verified file offset for later provider switches, so fallback reads
+        /// inspect only appended frames without deserializing model/tool records.
+        async fn session_prompt_ordinal(
+            &self,
+            req: &broca_core::RunRequest,
+            last_episode_frozen_config: Option<&serde_json::Value>,
+            durable_head: u64,
+        ) -> Result<u64, RunError> {
+            // A new user send opens one prompt, even if its input contains several messages.
+            let admitted = u64::from(
+                broca_module_serve::claude_code_identity::human_prompt_ordinal(
+                    std::iter::empty(),
+                    &req.input,
+                ) > 0,
+            );
+            let add_input = |count: u64| {
+                count
+                    .checked_add(admitted)
+                    .ok_or_else(|| RunError::Config("Claude Code prompt ordinal overflow".into()))
+            };
+            let recorded = last_episode_frozen_config
+                .and_then(|config| config.pointer("/claude_code_persona/prompt_ordinal"))
+                .and_then(serde_json::Value::as_u64);
+            if let Some(ordinal) = recorded {
+                return add_input(ordinal);
+            }
+            let key = broca_core::session_addr(&req.session);
+            let base = self.cc_prompt_memo.lock().unwrap().get(&key).copied();
+            if let Some(base) = base.filter(|base| base.through_seq == durable_head) {
+                return add_input(base.count);
+            }
+            let wal_store = Arc::clone(&self.wal_store);
+            let session = req.session.clone();
+            let counted =
+                broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::WalRead, move || {
+                    wal_store.human_prompt_count(&session, durable_head, base.as_ref())
+                })
+                .await
+                .map_err(|error| {
+                    RunError::Config(format!("Claude Code prompt history read failed: {error}"))
+                })?
+                .map_err(|error| {
+                    RunError::Config(format!("Claude Code prompt history read failed: {error}"))
+                })?;
+            self.cc_prompt_wal_bytes
+                .fetch_add(counted.bytes_read, std::sync::atomic::Ordering::Relaxed);
+            let mut memo = self.cc_prompt_memo.lock().unwrap();
+            if memo.len() >= 16_384 {
+                memo.clear();
+            }
+            memo.insert(key, counted);
+            add_input(counted.count)
         }
 
         /// Remember a session's pinned suffix (or that its WAL could not be read) for this
@@ -3402,43 +3469,17 @@ mod executor {
                             prior_snapshot.head_seq,
                         )
                         .await;
-                    let wal_store = self.wal_store.clone();
-                    let session = job.req.session.clone();
-                    let head = prior_snapshot.head_seq;
-                    let records = broca_diagnostics::spawn_blocking(
-                        broca_diagnostics::JobKind::WalRead,
-                        move || wal_store.read_records_range(&session, 0, Some(head), None),
-                    )
-                    .await
-                    .map_err(|error| {
-                        RunError::Config(format!("Claude Code prompt history read failed: {error}"))
-                    })?;
-                    let records =
-                        match records {
-                            Ok(records) => match records.into_records() {
-                                broca_wal::WalRangeRecords::Complete(records) => records,
-                                broca_wal::WalRangeRecords::Absent if head == 0 => Vec::new(),
-                                _ => return Err(RunError::Config(
-                                    "Claude Code prompt history is not a complete durable WAL read"
-                                        .into(),
-                                )),
-                            },
-                            Err(broca_wal::WalError::Io(error))
-                                if error.kind() == std::io::ErrorKind::NotFound && head == 0 =>
-                            {
-                                Vec::new()
-                            }
-                            Err(error) => {
-                                return Err(RunError::Config(format!(
-                                    "Claude Code prompt history read failed: {error}"
-                                )))
-                            }
-                        };
-                    let prompt_ordinal =
-                        broca_module_serve::claude_code_identity::human_prompt_ordinal(
-                            records.iter().map(|frame| &frame.record),
-                            &job.req.input,
-                        );
+                    let prompt_ordinal = self
+                        .session_prompt_ordinal(
+                            &job.req,
+                            prior_snapshot
+                                .checkpoint_at_head
+                                .last_episode
+                                .as_ref()
+                                .map(|episode| &episode.config.frozen_render_config),
+                            prior_snapshot.head_seq,
+                        )
+                        .await?;
                     match broca_module_serve::claude_code_identity::fresh_persona(
                         install_id,
                         resolution.account_id.as_deref(),

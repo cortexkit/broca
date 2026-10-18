@@ -492,6 +492,13 @@ pub fn select_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
         "extended-cache-ttl-2025-04-11",
         "cache-diagnosis-2026-04-07",
     ]);
+    if body
+        .pointer("/output_config/format/type")
+        .and_then(Value::as_str)
+        == Some("json_schema")
+    {
+        betas.insert(betas.len() - 1, "structured-outputs-2025-12-15");
+    }
     if body.get("speed").and_then(Value::as_str) == Some("fast") {
         betas.push(FAST_MODE_BETA);
     }
@@ -508,6 +515,11 @@ pub fn select_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
                 betas.push(beta);
             }
         }
+    }
+    if body.get("fallbacks").and_then(Value::as_str) == Some("default")
+        && !betas.contains(&SERVER_SIDE_FALLBACK_BETA)
+    {
+        betas.push(SERVER_SIDE_FALLBACK_BETA);
     }
     betas.join(",")
 }

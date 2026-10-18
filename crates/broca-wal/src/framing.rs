@@ -537,14 +537,11 @@ pub(crate) fn encode_lineage(lineage_id: WalLineageId) -> [u8; LINEAGE_FRAME_LEN
 }
 
 /// Outcome of decoding one frame from a byte cursor.
-pub enum DecodeStep {
+pub enum DecodeStep<T = FramedRecord> {
     /// A complete, digest-verified record + how many bytes it consumed. Boxed: the
     /// decoded record dwarfs the other variants and this is a transient return
     /// value, so indirection keeps the enum small without a cold-path penalty.
-    Record {
-        framed: Box<FramedRecord>,
-        consumed: usize,
-    },
+    Record { framed: Box<T>, consumed: usize },
     /// A complete, digest-verified lineage metadata frame.
     Lineage {
         lineage_id: WalLineageId,
@@ -578,6 +575,30 @@ pub fn decode_next(buf: &[u8]) -> DecodeStep {
 /// [`KNOWN_FEATURES`]; tests pass a table with an entry the shipped one lacks, to prove a
 /// known name decodes without putting a name in the production table.
 fn decode_next_with(buf: &[u8], known: &[&str]) -> DecodeStep {
+    decode_projected_with(buf, known, |seq, fence, ver, payload| {
+        let record = if ver == GATED_FRAMING_VERSION {
+            serde_json::from_slice::<GatedRecord>(payload).map(|envelope| envelope.record)
+        } else {
+            serde_json::from_slice::<WalRecord>(payload)
+        }?;
+        Ok(FramedRecord { seq, fence, record })
+    })
+}
+
+/// Project a verified frame without constructing a full record. Feature requirements are
+/// still checked before the projection, so an admission index cannot skip a newer writer.
+pub(crate) fn decode_projected<T>(
+    buf: &[u8],
+    project: impl FnOnce(u64, u64, u8, &[u8]) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
+    decode_projected_with(buf, KNOWN_FEATURES, project)
+}
+
+fn decode_projected_with<T>(
+    buf: &[u8],
+    known: &[&str],
+    project: impl FnOnce(u64, u64, u8, &[u8]) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
     if buf.len() < HEADER_LEN {
         return DecodeStep::TornTail; // not even a full header → torn
     }
@@ -616,7 +637,7 @@ fn decode_next_with(buf: &[u8], known: &[&str]) -> DecodeStep {
         };
     }
 
-    let record = if ver == GATED_FRAMING_VERSION {
+    if ver == GATED_FRAMING_VERSION {
         let requires = match serde_json::from_slice::<GatedRequires>(payload) {
             Ok(envelope) => envelope.requires,
             Err(e) => return DecodeStep::Corrupt(FrameError::Deserialize(e)),
@@ -633,13 +654,10 @@ fn decode_next_with(buf: &[u8], known: &[&str]) -> DecodeStep {
             missing.dedup();
             return DecodeStep::NewerWriter { ver, missing };
         }
-        serde_json::from_slice::<GatedRecord>(payload).map(|envelope| envelope.record)
-    } else {
-        serde_json::from_slice::<WalRecord>(payload)
-    };
-    match record {
+    }
+    match project(seq, fence, ver, payload) {
         Ok(record) => DecodeStep::Record {
-            framed: Box::new(FramedRecord { seq, fence, record }),
+            framed: Box::new(record),
             consumed: total,
         },
         Err(e) => DecodeStep::Corrupt(FrameError::Deserialize(e)),

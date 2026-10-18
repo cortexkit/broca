@@ -16288,3 +16288,17 @@ expect_red = ["transport::request_gzip_tests::persona_gzip_is_unsigned_but_rejec
 file = "crates/broca-provider/src/transport_request_gzip.rs"
 old = '        unsigned[offset..offset + 5].copy_from_slice(b"00000");'
 new = '        unsigned[offset..offset + 5].copy_from_slice(&identity[offset..offset + 5]); // NON-VACUITY BREAK: gzip the signed cch unchanged.'
+
+[[control]]
+id = "claude-302-later-admission-reuses-frozen-ordinal"
+guards = "a later Claude persona admission inherits the preceding episode's frozen human ordinal and reads no WAL bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes"]
+file = "crates/broca-module-serve/src/main.rs"
+old = '            if let Some(ordinal) = recorded {'
+new = '            if let Some(ordinal) = recorded.filter(|_| false) { // NON-VACUITY BREAK: scan instead of inheriting the ordinal.'

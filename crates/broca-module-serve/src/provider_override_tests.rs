@@ -1262,3 +1262,72 @@ async fn the_first_user_message_is_read_once_and_only_as_far_as_its_record() {
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A legacy/import migration is counted once. The next admitted episode carries its ordinal
+/// in the existing admission snapshot, so its next prompt reads no WAL bytes at all.
+#[tokio::test]
+async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes() {
+    use std::sync::atomic::Ordering;
+    use broca_core::WalStore as _;
+    use broca_protocol::{ContentBlock, Message, Role};
+    let root = broca_test_support::scratch_root().join(format!("broca-prompt-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (executor, server) = stand_in_executor(&root).await;
+    let mut req = drift_request(&root);
+    let user = |text: &str| Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]);
+    req.input = vec![user("new prompt")];
+    let store = FileWalStore::new(root.join("wal"));
+    let mut wal = store.open(&req.session).unwrap();
+    let mut imported = run_started_with_user_text(&req.session, "import", "first imported prompt");
+    if let broca_wal::WalRecord::RunStarted { input, origin, .. } = &mut imported {
+        *input = Arc::new(vec![user("first imported prompt"), user("second imported prompt")]);
+        *origin = serde_json::from_value(serde_json::json!({"kind": "seeded_from"})).unwrap();
+    }
+    wal.append(1, &imported, true).unwrap();
+    let tool = |n| broca_wal::WalRecord::ToolResult {
+        batch_id: broca_protocol::BatchId("batch".into()),
+        result: Arc::new(broca_protocol::ToolResult { tool_call_id: broca_protocol::ToolCallId("tool".into()),
+            output: broca_protocol::ToolOutput::Text { text: "x".repeat(n) }, is_error: false }),
+        outcome: broca_wal::DispatchOutcome::Completed, hooks: None, reason: None,
+        withdraw_elicitation: None, provider_held: None,
+    };
+    wal.append(1, &tool(1 << 20), true).unwrap();
+    let legacy = serde_json::json!({"claude_code_persona": {"version": "2.1.280"}});
+    let mut old = run_started_with_user_text(&req.session, "legacy", "third prompt");
+    if let broca_wal::WalRecord::RunStarted { config, .. } = &mut old { config.frozen_render_config = legacy.clone(); }
+    wal.append(1, &old, true).unwrap();
+    let prefix_bytes = std::fs::metadata(store.wal_path(&req.session)).unwrap().len();
+    wal.append(1, &tool(3 << 20), true).unwrap();
+    assert_eq!(executor.session_prompt_ordinal(&req, Some(&legacy), 3).await.unwrap(), 4,
+        "both imported prompts and the 2.1.280 episode count");
+    let read = executor.cc_prompt_wal_bytes.load(Ordering::Relaxed);
+    assert_eq!(read + broca_wal::framing::LINEAGE_FRAME_LEN as u64, prefix_bytes,
+        "the read stops at the durable head, before its trailing lineage stamp");
+    assert_eq!(executor.session_prompt_ordinal(&req, Some(&legacy), 3).await.unwrap(), 4);
+    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed), read, "a memoized migration reads no bytes");
+    let current = serde_json::json!({"claude_code_persona": {"version": "2.1.302", "prompt_ordinal": 4}});
+    let mut new = run_started_with_user_text(&req.session, "current", "fourth prompt");
+    if let broca_wal::WalRecord::RunStarted { config, .. } = &mut new { config.frozen_render_config = current.clone(); }
+    wal.append(1, &new, true).unwrap();
+    assert_eq!(executor.session_prompt_ordinal(&req, Some(&current), 5).await.unwrap(), 5);
+    req.input.push(user("another message in the same send"));
+    assert_eq!(executor.session_prompt_ordinal(&req, Some(&current), 5).await.unwrap(), 5);
+    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed), read,
+        "a later admission reads no WAL bytes: it inherits the durable ordinal");
+    wal.append(1, &run_started_with_user_text(&req.session, "other-provider", "fifth prompt"), true).unwrap();
+    let total = std::fs::metadata(store.wal_path(&req.session)).unwrap().len();
+    assert_eq!(executor.session_prompt_ordinal(&req, None, 6).await.unwrap(), 6);
+    #[cfg(unix)]
+    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed) - read, total - prefix_bytes,
+        "a provider switch reads only the suffix after the memoized anchor");
+    #[cfg(not(unix))]
+    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed) - read,
+        total - broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+        "platforms without file-identity anchors retain the bounded selective fallback");
+    assert!(executor.session_prompt_ordinal(&req, None, 7).await.is_err(), "an incomplete read fails closed");
+    drop(wal);
+    drop(executor);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
