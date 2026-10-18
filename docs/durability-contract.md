@@ -107,6 +107,11 @@ are unchanged. Meta Responses now freezes `store:false` and encrypted-reasoning 
 `static_options`, just like OpenAI API-key and xAI Responses. Old Meta configs keep their previous
 store/include omissions and legacy reasoning-item shape when resumed.
 
+Meta's `store:false` policy controls response persistence, not prompt-cache affinity. Its
+session-stable `prompt_cache_key` remains an independent frozen render input, retained across
+tool continuations and later user turns. Keep that key when validating stateless replay against
+production: successful encrypted-item replay alone does not establish cache reuse.
+
 ## 3. The barrier (per turn's tool batch)
 
 On Unix, the first WAL barrier after **every open**, including recovery of an
