@@ -16533,6 +16533,7 @@ expect_red = ["executor::tests::chatgpt_run_recorded_at_version_7_resumes_under_
 file = "crates/broca-catalog/src/live.rs"
 old = "            config.provider_text_state = recorded;"
 new = "            let _ = recorded; // NON-VACUITY BREAK: re-resolve the flag on resume"
+
 [[control]]
 id = "bedrock-reasoning-text-decode"
 guards = "Bedrock reasoning text fragments survive the binary stream normalizer"
@@ -16672,3 +16673,252 @@ expect_red = ["bedrock_reasoning::bedrock_does_not_echo_reasoning_without_target
 file = "crates/broca-provider/src/families/bedrock_converse.rs"
 old = '                && opts.target_model.is_some()'
 new = '                && (opts.target_model.is_some() || opts.target_model.is_none()) /* NON-VACUITY BREAK: echo reasoning without a destination */'
+[[control]]
+id = "anthropic-schema-union-budget"
+guards = "Anthropic admission refuses more than sixteen resolved union parameters"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::anthropic_over_budget_admission_sends_nothing_strict"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "self.strict_tools > 20 || self.optional > 24 || self.unions > 16"
+new = "self.strict_tools > 20 || self.optional > 24 || self.unions > 160 // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-optional-budget"
+guards = "Anthropic admission refuses more than twenty-four optional parameters"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::anthropic_over_budget_admission_sends_nothing_strict"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "self.strict_tools > 20 || self.optional > 24 || self.unions > 16"
+new = "self.strict_tools > 20 || self.optional > 240 || self.unions > 16 // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-strict-tool-budget"
+guards = "the combined strict-schema budget refuses twenty-one strict tools"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::anthropic_budget_expands_refs_per_site_and_combines_schemas"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "self.strict_tools > 20 || self.optional > 24 || self.unions > 16"
+new = "self.strict_tools > 200 || self.optional > 24 || self.unions > 16 // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-union-boundary"
+guards = "exactly sixteen union parameters remain enforced"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::exactly_sixteen_union_parameters_stay_enforced"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "self.strict_tools > 20 || self.optional > 24 || self.unions > 16"
+new = "self.strict_tools > 20 || self.optional > 24 || self.unions >= 16 // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-resolved-reference-unions"
+guards = "a union at a reference root counts once at each parameter use site"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::resolved_union_roots_count_once_per_parameter_at_each_reference_site"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "walk(root, target, active, budget, union_counted);"
+new = "let _ = target; // NON-VACUITY BREAK: skip reference expansion."
+
+[[control]]
+id = "anthropic-schema-compilation-fallback"
+guards = "the compiler refusal durably downgrades and resends without a provider retry"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::compilation_400_is_recorded_before_nonstrict_resend_and_reports_best_effort"]
+file = "crates/broca-provider/src/transport.rs"
+old = "&& crate::structured_output::grammar_rejection(error)"
+new = "&& false && crate::structured_output::grammar_rejection(error) // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-other-400-not-downgraded"
+guards = "an unrelated invalid_request_error is never downgraded"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::other_invalid_request_400_is_not_downgraded"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "message.contains(\"compiled grammar is too large\")"
+new = "true || message.contains(\"compiled grammar is too large\") // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-durable-before-resend"
+guards = "the downgrade record has its own fsync before any non-strict resend"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::compilation_400_is_recorded_before_nonstrict_resend_and_reports_best_effort"]
+file = "crates/broca-core/src/run.rs"
+old = "writer.sync().await?;\n                    provider.downgrade_structured_output();"
+new = "// NON-VACUITY BREAK: resend before syncing the downgrade.\n                    provider.downgrade_structured_output();"
+
+[[control]]
+id = "anthropic-schema-later-steps-stay-nonstrict"
+guards = "later model steps retain the recorded non-strict delivery"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::downgrade_stays_nonstrict_on_later_steps"]
+file = "crates/broca-provider/src/transport.rs"
+old = "frozen: self.effective_frozen(),"
+new = "frozen: if step_id.0 > 1 { Arc::clone(&self.frozen) } else { self.effective_frozen() }, // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-process-memo"
+guards = "the bounded memo remembers the model and schema digest pair"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::grammar_memo_keys_model_and_canonical_schema_and_is_bounded"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "remember_in(&mut memo, key);"
+new = "let _ = (&mut memo, key); // NON-VACUITY BREAK: forget compiler refusals."
+
+[[control]]
+id = "anthropic-schema-crash-resume-nonstrict"
+guards = "a record-boundary crash before resend resumes byte-identical non-strict requests"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::crash_cut_after_downgrade_resumes_with_identical_nonstrict_bytes"]
+file = "crates/broca-core/src/replay.rs"
+old = "downgrade_render_config(&mut config.frozen_render_config);"
+new = "downgrade_render_config(&mut config.frozen_render_config.clone()); // NON-VACUITY BREAK: discard the replay transition."
+
+[[control]]
+id = "anthropic-schema-admission-checkpoint-nonstrict"
+guards = "admission checkpoints retain the same downgrade as full replay"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::crash_cut_after_downgrade_resumes_with_identical_nonstrict_bytes"]
+file = "crates/broca-core/src/admission.rs"
+old = "downgrade_render_config(&mut episode.config.frozen_render_config);"
+new = "downgrade_render_config(&mut episode.config.frozen_render_config.clone()); // NON-VACUITY BREAK: lose the checkpoint transition."
+
+[[control]]
+id = "anthropic-schema-downgrade-must-understand"
+guards = "only downgrade frames require structured-output-downgrade/v1 and old readers refuse them"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::structured_output_downgrade_requires_its_own_feature"]
+file = "crates/broca-wal/src/record.rs"
+old = "&[crate::framing::STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]"
+new = "&[] // NON-VACUITY BREAK: let old readers ignore the downgrade."
+
+[[control]]
+id = "anthropic-schema-status-grammar-reason"
+guards = "the real daemon reports the durable grammar_too_large reason with pinned run.status bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/account_selection_real_daemon.rs"
+expect_red = ["account_selection_real_daemon::grammar_too_large_status_and_memo_through_real_serve"]
+file = "crates/broca-protocol/src/structured_output.rs"
+old = "self.reason = Some(\"grammar_too_large\".to_owned());"
+new = "self.reason = Some(\"schema_too_complex\".to_owned()); // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-memo-at-admission"
+guards = "a later run with the memoized model and schema sends no refused request"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/account_selection_real_daemon.rs"
+expect_red = ["account_selection_real_daemon::grammar_too_large_status_and_memo_through_real_serve"]
+file = "crates/broca-catalog/src/live.rs"
+old = "broca_provider::structured_output::apply_grammar_memo(&frozen.wire_model_id, so);"
+new = "let _ = so; // NON-VACUITY BREAK: ignore the process memo at admission."
+
+[[control]]
+id = "anthropic-schema-final-text-no-output-config"
+guards = "a downgraded final_text run removes the always-strict Anthropic output_config schema"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/account_selection_real_daemon.rs"
+expect_red = ["account_selection_real_daemon::grammar_too_large_status_and_memo_through_real_serve"]
+file = "crates/broca-protocol/src/structured_output.rs"
+old = "self.delivery = SchemaDelivery::Unconstrained;"
+new = "if self.mode == Mode::SubmitTool { self.delivery = SchemaDelivery::Unconstrained; } // NON-VACUITY BREAK"
+
+[[control]]
+id = "anthropic-schema-no-downgrade-loop"
+guards = "the non-strict resend of a compiler refusal fails normally instead of downgrading again"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::failed_nonstrict_resend_does_not_loop"]
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = "if !schema_resent && provider.structured_output_grammar_rejection(error) {"
+new = "if (!schema_resent || schema_resent) && provider.structured_output_grammar_rejection(error) { // NON-VACUITY BREAK"
+[[control.edits]]
+file = "crates/broca-provider/src/transport.rs"
+old = "&& !self.grammar_downgraded.load(Ordering::Acquire)"
+new = "&& true // NON-VACUITY BREAK: ignore the run-local downgrade latch."
+
+[[control]]
+id = "anthropic-schema-preserves-prior-provider-retries"
+guards = "schema downgrade adds no provider retry and does not erase retries already spent"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_schema_fallback_tests.rs"
+expect_red = ["transport::tests::schema_fallback::retries_before_schema_downgrade_are_preserved_without_charging_the_resend"]
+file = "crates/broca-core/src/run.rs"
+old = "schema_prior_retries = *retries_used;"
+new = "schema_prior_retries = retries_used.saturating_sub(*retries_used); // NON-VACUITY BREAK: erase spent retries."

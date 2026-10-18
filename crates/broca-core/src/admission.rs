@@ -773,6 +773,13 @@ impl AdmissionCheckpointV1 {
                     }
                 }
             }
+            WalRecord::StructuredOutputDowngraded { run_id } => {
+                if let Some(episode) = &mut self.last_episode {
+                    if &episode.run_id == run_id {
+                        broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(&mut episode.config.frozen_render_config);
+                    }
+                }
+            }
             WalRecord::RunAuthRefrozen { auth_selection, .. } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.config.auth_selection = Some(auth_selection.clone());

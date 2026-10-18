@@ -115,6 +115,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::InputTokenCapFrozen { .. } => "input_token_cap_frozen",
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::StructuredOutputResult { .. } => "structured_output_result",
+        WalRecord::StructuredOutputDowngraded { .. } => "structured_output_downgraded",
         WalRecord::Unknown => "unknown",
     }
 }

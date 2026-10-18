@@ -516,6 +516,11 @@ pub enum WalRecord {
     InputTokenBudgetExhausted {
         detail: broca_protocol::BudgetExhaustedDetail,
     },
+    /// Anthropic refused the strict schema's compiled grammar. From this barrier onward,
+    /// the run renders non-strict and reports `grammar_too_large`, including after a crash.
+    StructuredOutputDowngraded {
+        run_id: RunId,
+    },
     /// What a completed run admitted with structured output produced, as `run.result` and
     /// `run.status` report it (the role crate's `StructuredOutputResult`). Written in the same
     /// commit as the run's `RunFinished`, so the value, its validation and the skipped siblings
@@ -1217,6 +1222,9 @@ impl WalRecord {
             STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
         };
         match self {
+            WalRecord::StructuredOutputDowngraded { .. } => {
+                &[crate::framing::STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]
+            }
             WalRecord::RunCancelRequested { .. } => &[crate::framing::RUN_CANCEL_AT_FEATURE],
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }

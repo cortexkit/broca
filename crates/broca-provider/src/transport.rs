@@ -169,6 +169,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     clock: Clock,
     pub(crate) family: Arc<F>,
     pub(crate) frozen: Arc<FrozenRenderConfig>,
+    grammar_downgraded: std::sync::atomic::AtomicBool,
     /// The credential the next step is sent with. Behind a lock only so an in-step refresh can
     /// replace it: once a refreshed token has been accepted, later steps of this run must not
     /// go back to the one the provider rejected. The lock belongs to this provider instance, and
@@ -540,6 +541,16 @@ fn provider_client_builder() -> reqwest::ClientBuilder {
 }
 
 impl<F: WireFamily + 'static> LiveProvider<F> {
+    fn effective_frozen(&self) -> Arc<FrozenRenderConfig> {
+        if !self.grammar_downgraded.load(Ordering::Acquire) {
+            return Arc::clone(&self.frozen);
+        }
+        let mut frozen = (*self.frozen).clone();
+        if let Some(so) = &mut frozen.structured_output {
+            so.downgrade_grammar();
+        }
+        Arc::new(frozen)
+    }
     /// Convenience constructor for one-shot callers that do not own a shared HTTP client.
     pub fn new(family: F, frozen: FrozenRenderConfig, auth: AuthHandle) -> Self {
         Self::new_with_clock(family, frozen, auth, Clock::default())
@@ -566,6 +577,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             clock,
             family: Arc::new(family),
             frozen: Arc::new(frozen),
+            grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
             // Wrapped HERE rather than taken as an Arc, so callers keep passing an owned
             // AuthHandle and the sharing stays inside this file. Each step takes a cheap Arc
             // snapshot of the current credential rather than a deep copy of the secret; only
@@ -665,7 +677,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         }
         let render_job = RenderJob {
             family: Arc::clone(&self.family),
-            frozen: Arc::clone(&self.frozen),
+            frozen: self.effective_frozen(),
             auth: served.auth,
             opts,
             step_id,
@@ -705,6 +717,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn structured_output_grammar_rejection(&self, error: &ProviderError) -> bool {
+        self.frozen.family_id == crate::spec::WireFamilyId::AnthropicMessages
+            && !self.grammar_downgraded.load(Ordering::Acquire)
+            && self.frozen.structured_output.as_ref().is_some_and(|so| {
+                so.delivery == broca_protocol::structured_output::SchemaDelivery::Strict
+            })
+            && crate::structured_output::grammar_rejection(error)
+    }
+
+    fn downgrade_structured_output(&self) {
+        self.grammar_downgraded.store(true, Ordering::Release);
+        if let Some(so) = &self.frozen.structured_output {
+            crate::structured_output::remember_grammar_refusal(
+                &self.frozen.wire_model_id,
+                &so.schema_jcs,
+            );
+        }
+    }
     async fn step_with_runtime(
         &self,
         step_id: StepId,
@@ -771,7 +801,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
-        self.family.render(&self.frozen, opts)
+        self.family.render(&self.effective_frozen(), opts)
     }
 
     fn renderer_version(&self) -> u32 {
@@ -796,13 +826,14 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         {
             return self.render_config_blob();
         }
-        let mut frozen = self.frozen.as_ref().clone();
+        let mut frozen = self.effective_frozen().as_ref().clone();
         frozen.renderer_version = renderer_version;
         serde_json::to_value(&frozen).expect("frozen render config must serialize")
     }
 
     fn render_config_blob(&self) -> Value {
-        serde_json::to_value(self.frozen.as_ref()).expect("frozen render config must serialize")
+        serde_json::to_value(self.effective_frozen().as_ref())
+            .expect("frozen render config must serialize")
     }
 
     fn fresh_admission_config_error(
@@ -4060,7 +4091,17 @@ fn http_error_in_family(
         provider_subcode: None,
         refusal: None,
         class,
-        message: http_error_message(code, truncate_error_body(text), class),
+        // Keep the compiler refusal recognizable even if unrelated response fields exceed
+        // the diagnostic cap. Classification uses the full body, never truncated JSON.
+        message: if family == Some(WireFamilyId::AnthropicMessages)
+            && body
+                .as_ref()
+                .is_some_and(|body| crate::structured_output::grammar_rejection_body(code, body))
+        {
+            "400: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Schema is too complex for compilation\"}}".to_owned()
+        } else {
+            http_error_message(code, truncate_error_body(text), class)
+        },
         status: Some(code),
         retry_after_secs,
         provider_code,
@@ -4158,6 +4199,10 @@ mod tests {
 
     mod request_invalid {
         include!("transport_request_invalid_tests.rs");
+    }
+
+    mod schema_fallback {
+        include!("transport_schema_fallback_tests.rs");
     }
 
     async fn assert_offloaded_render_matches_direct<F>(

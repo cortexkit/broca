@@ -47,6 +47,15 @@ pub trait Provider: Send + Sync {
     /// The loop calls this even if a caller retains the provider for a later run.
     fn close_run_transport(&self) {}
 
+    /// Whether a strict schema compiler refusal permits this run's one non-strict resend.
+    fn structured_output_grammar_rejection(&self, _error: &broca_protocol::ProviderError) -> bool {
+        false
+    }
+
+    /// Apply only after the downgrade record is durable. Subsequent renders and steps must
+    /// use this decision; a resumed provider is reconstructed from replay's updated config.
+    fn downgrade_structured_output(&self) {}
+
     /// Runtime break-glass policy for the ChatGPT socket. Evaluated per attempt, off the
     /// rendering/cache domain; providers for other families ignore it.
     fn set_chatgpt_https_policy(&self, _policy: Arc<dyn Fn() -> bool + Send + Sync>) {}
@@ -193,6 +202,14 @@ impl Provider for Box<dyn Provider> {
     }
     fn close_run_transport(&self) {
         (**self).close_run_transport();
+    }
+
+    fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
+        (**self).structured_output_grammar_rejection(error)
+    }
+
+    fn downgrade_structured_output(&self) {
+        (**self).downgrade_structured_output();
     }
 
     fn set_chatgpt_https_policy(&self, policy: Arc<dyn Fn() -> bool + Send + Sync>) {
