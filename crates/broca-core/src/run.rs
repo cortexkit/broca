@@ -4068,7 +4068,7 @@ where
 
     // The structured output this run froze at admission, read back from the provider's frozen
     // render config so a resumed run decides exactly as the run that started.
-    let structured_output =
+    let mut structured_output =
         FrozenStructuredOutput::from_frozen_render_config(Some(&provider.render_config_blob()));
     // The joined text of the final message of a `final_text` run that ended because the model
     // answered without tools. `None` for every other end, which reports the result absent.
@@ -4408,21 +4408,57 @@ where
             .map(|_| provider.render_request(sent_opts).len());
         // The receipt-polling wrapper is generic over this future. Heap-own the future
         // before either await arm so the wrapper cannot duplicate its large inline frame.
-        let model_step = Box::pin(run_step_watched(
-            provider,
-            step_id,
-            sent_opts,
-            control,
-            out,
-            &record_attempt,
-        ));
-        // Keep the same pinned model future while filing delayed receipts; no receipt may
-        // cancel, restart, or change the request already being streamed by the provider.
-        let model_result = match (&compaction_runtime, &mut compaction_state) {
-            (Some(runtime), Some(state)) => runtime.with_replies(state, model_step).await??,
-            _ => model_step.await?,
+        let mut schema_resent = false;
+        let mut schema_prior_retries = 0;
+        let step = loop {
+            let model_step = Box::pin(run_step_watched(
+                provider,
+                step_id,
+                sent_opts,
+                control,
+                out,
+                &record_attempt,
+            ));
+            // Keep the same pinned model future while filing delayed receipts; no receipt may
+            // cancel, restart, or change the request already being streamed by the provider.
+            let model_result = match (&compaction_runtime, &mut compaction_state) {
+                (Some(runtime), Some(state)) => runtime.with_replies(state, model_step).await??,
+                _ => model_step.await?,
+            };
+            let mut step = match model_result {
+                Ok(step) => step,
+                Err(reason) => break Err(reason),
+            };
+            if let StepOutcome::Failed {
+                error,
+                retries_used,
+            } = &step
+            {
+                if !schema_resent && provider.structured_output_grammar_rejection(error) {
+                    // The resend is authorized only by durable state: a crash after this barrier
+                    // must reconstruct a non-strict provider, even if no resend ever reached it.
+                    writer.record(WalRecord::StructuredOutputDowngraded {
+                        run_id: resolved_run_id.clone(),
+                    });
+                    writer.sync().await?;
+                    provider.downgrade_structured_output();
+                    if let Some(so) = &mut structured_output {
+                        so.downgrade_grammar();
+                    }
+                    schema_resent = true;
+                    schema_prior_retries = *retries_used;
+                    continue;
+                }
+            }
+            match &mut step {
+                StepOutcome::Completed { retries_used, .. }
+                | StepOutcome::Failed { retries_used, .. } => {
+                    *retries_used = retries_used.saturating_add(schema_prior_retries);
+                }
+            }
+            break Ok(step);
         };
-        let step = match model_result {
+        let step = match step {
             Ok(step) => step,
             Err(reason) => break reason,
         };

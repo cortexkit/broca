@@ -119,6 +119,13 @@ impl LiveAnthropicProvider {
 
 #[async_trait]
 impl Provider for LiveAnthropicProvider {
+    fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
+        self.inner.structured_output_grammar_rejection(error)
+    }
+
+    fn downgrade_structured_output(&self) {
+        self.inner.downgrade_structured_output();
+    }
     async fn step_with_runtime(
         &self,
         step_id: StepId,

@@ -67,6 +67,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+broca-crash-harness = { path = "../broca-crash-harness" }
 # The shared Claude OAuth wire vectors (`vectors::VECTORS_JSON`) the persona tests are pinned to.
 cortexkit-anthropic-policy = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }

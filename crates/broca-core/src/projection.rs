@@ -540,6 +540,7 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
         | WalRecord::StructuredOutputResult { .. }
+        | WalRecord::StructuredOutputDowngraded { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
     }
 }

@@ -35,7 +35,8 @@ pub const SKIPPED_AFTER_SUBMIT_MESSAGE: &str =
 pub use cortexkit_role_llm_runner::errors::tool_result_reasons::SKIPPED_AFTER_SUBMIT;
 
 /// How a run's schema reaches the provider, decided at admission from the route's catalog
-/// support, its wire family and the family's subset profile, and fixed for the run.
+/// support, its wire family and the family's subset profile. A durable compiler-refusal
+/// record can downgrade it; every subsequent request, including resume, uses that decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaDelivery {
@@ -71,6 +72,22 @@ pub struct FrozenStructuredOutput {
 }
 
 impl FrozenStructuredOutput {
+    /// Anthropic's JSON output schema has no non-strict form. After a compilation refusal,
+    /// final-text runs use prompt instructions while submit-tool runs omit the strict flag.
+    pub fn downgrade_grammar(&mut self) {
+        self.enforcement = enforcement::BEST_EFFORT.to_owned();
+        self.reason = Some("grammar_too_large".to_owned());
+        self.delivery = SchemaDelivery::Unconstrained;
+    }
+
+    pub fn downgrade_render_config(config: &mut Value) {
+        if let Some(mut so) = Self::from_frozen_render_config(Some(config)) {
+            so.downgrade_grammar();
+            config["structured_output"] =
+                serde_json::to_value(so).expect("frozen schema serializes");
+        }
+    }
+
     /// The frozen schema as a JSON value. The bytes were produced from a JSON value at
     /// admission, so they always parse.
     pub fn schema(&self) -> Value {

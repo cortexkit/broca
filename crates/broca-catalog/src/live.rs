@@ -1247,6 +1247,11 @@ fn apply_structured_output(
         ),
         (None, None) => None,
     };
+    if restored.is_none() {
+        if let Some(so) = frozen.structured_output.as_mut() {
+            broca_provider::structured_output::apply_grammar_memo(&frozen.wire_model_id, so);
+        }
+    }
     Ok(())
 }
 

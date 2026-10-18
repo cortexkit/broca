@@ -1,0 +1,1 @@
+{"state":"completed","final_step_finish_reason":"stop","undelivered_steers":[],"usage":{"input_tokens":3,"output_tokens":2},"retries_used":0,"structured_output":{"mode":"final_text","enforcement":"best_effort","reason":"grammar_too_large","validation":"passed","value":{"answer":"ok"}}}

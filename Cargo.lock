@@ -392,6 +392,7 @@ dependencies = [
  "async-trait",
  "broca-ck",
  "broca-core",
+ "broca-crash-harness",
  "broca-diagnostics",
  "broca-owner-only",
  "broca-protocol",

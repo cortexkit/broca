@@ -488,3 +488,26 @@ fn anthropic_submit_tool_never_forces_a_tool() {
     let sent = body(&AnthropicMessages, &frozen, &opts);
     assert_eq!(sent["tool_choice"], json!({"type": "none"}));
 }
+
+#[test]
+fn aggregator_fixture_is_delivered_without_strict_constraints() {
+    let schema: Value =
+        serde_json::from_str(include_str!("../fixtures/aggregator-schema.json")).unwrap();
+    for mode in [Mode::SubmitTool, Mode::FinalText] {
+        let (frozen, decision) = with_structured_output(
+            anthropic_frozen_config("claude-opus-5-5"),
+            "anthropic",
+            mode,
+            schema.clone(),
+        );
+        assert_eq!(decision.reason.as_deref(), Some("schema_too_complex"));
+        let rendered = body(&AnthropicMessages, &frozen, &opts(false));
+        if mode == Mode::SubmitTool {
+            let submit = tool_named(&rendered["tools"], "submit_result", &["name"]);
+            assert!(submit.get("strict").is_none());
+            assert_eq!(submit["input_schema"], schema);
+        } else {
+            assert!(rendered.pointer("/output_config/format").is_none());
+        }
+    }
+}

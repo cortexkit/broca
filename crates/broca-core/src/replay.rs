@@ -1714,6 +1714,19 @@ fn replay_seeded_with_compaction<'a>(
                     ep.config_refrozen = true;
                 }
             }
+            WalRecord::StructuredOutputDowngraded {
+                run_id: downgraded_run,
+            } => {
+                if run_id.as_ref() != Some(downgraded_run) {
+                    return Err(ReplayError::CorruptLineage {
+                        episode_run_id: downgraded_run.clone(),
+                        reason: "structured-output downgrade names a different episode".into(),
+                    });
+                }
+                if let Some(config) = &mut run_config {
+                    broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(&mut config.frozen_render_config);
+                }
+            }
             WalRecord::RunAuthRefrozen { auth_selection, .. } => {
                 if let Some(config) = run_config.as_mut() {
                     config.auth_selection = Some(auth_selection.clone());
@@ -2142,6 +2155,11 @@ pub fn reconcile_run_state<'a>(
                 }
             }
             WalRecord::InputTokenBudgetExhausted { detail } => budget_detail = Some(detail.clone()),
+            WalRecord::StructuredOutputDowngraded { run_id: rid } if rid.0 == run_id => {
+                if let Some(so) = &mut frozen_structured_output {
+                    so.downgrade_grammar();
+                }
+            }
             WalRecord::StructuredOutputResult {
                 run_id: rid,
                 result,

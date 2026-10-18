@@ -523,6 +523,8 @@ struct Upstream {
     credit_exhausted_anthropic: std::sync::atomic::AtomicBool,
     /// Answer OpenAI's request-validation 400 for a rejected structured-output schema.
     request_invalid_openai: std::sync::atomic::AtomicBool,
+    grammar_limit_anthropic: std::sync::atomic::AtomicBool,
+    schema_requests: Mutex<Vec<Value>>,
     /// Answer OpenRouter's 402 for an unaffordable request ([`OPENROUTER_CREDIT_402_BODY`]).
     credit_insufficient_openrouter: std::sync::atomic::AtomicBool,
     /// Answer an ordinary Anthropic rate-limit 429 with `retry-after: 0`, so the transport spends
@@ -605,6 +607,32 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "unknown".into());
                 upstream.authorized_as.lock().unwrap().push(as_credential);
+                if upstream
+                    .grammar_limit_anthropic
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let body: Value =
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+                    let strict = body.pointer("/output_config/format").is_some()
+                        || body["tools"]
+                            .as_array()
+                            .is_some_and(|tools| tools.iter().any(|tool| tool["strict"] == true));
+                    upstream.schema_requests.lock().unwrap().push(body);
+                    let (status, content_type, body) = if strict {
+                        ("400 Bad Request", "application/json", br#"{"type":"error","error":{"type":"invalid_request_error","message":"The compiled grammar is too large, which would cause performance issues."}}"#.to_vec())
+                    } else {
+                        (
+                            "200 OK",
+                            "text/event-stream",
+                            anthropic_sse(r#"{"answer":"ok"}"#),
+                        )
+                    };
+                    let reply = format!("HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    return;
+                }
                 if upstream.hold.load(std::sync::atomic::Ordering::SeqCst) {
                     upstream
                         .held
@@ -835,6 +863,7 @@ impl Rig {
                 "catalog_version": 1,
                 "models": {
                     format!("anthropic/{MODEL}"): {
+                        "capability.structured_output": true,
                         "capability.attachment": false,
                         "capability.reasoning": false,
                         "capability.tool_call": true,
@@ -2732,4 +2761,64 @@ async fn paused_auth_unrouted_status_reports_the_frozen_default_path() {
         serde_json::to_value(status).unwrap()["auth"],
         json!({"credential_id": "oauth:anthropic", "path": "default"})
     );
+}
+
+/// The golden comes from a real daemon with a scripted compiler refusal, never a live API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grammar_too_large_status_and_memo_through_real_serve() {
+    let rig = Rig::start()
+        .await
+        .expect("the grammar fallback golden requires the real daemon");
+    rig.upstream
+        .grammar_limit_anthropic
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let extra = json!({"structured_output":{"mode":"final_text","schema":{
+        "type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false
+    }}});
+    let send = rig
+        .raw_send("grammar-fallback", "grammar-first", extra.clone())
+        .await
+        .unwrap();
+    let run = send["run_id"].as_str().unwrap();
+    let frames = rig.finished_run("grammar-fallback", run).await;
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| matches!(f.record, WalRecord::StructuredOutputDowngraded { .. }))
+            .count(),
+        1
+    );
+    let client = rig.client("grammar-fallback").await;
+    let status = client.run_status(run).await.unwrap();
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["state"], "completed");
+    assert_eq!(value["structured_output"]["enforcement"], "best_effort");
+    assert_eq!(value["structured_output"]["reason"], "grammar_too_large");
+    assert_eq!(value["structured_output"]["validation"], "passed");
+    assert_eq!(value["retries_used"], 0);
+    let bytes = serde_json::to_vec(&status).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/run_status.grammar_too_large.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    assert_eq!(
+        bytes,
+        std::fs::read(&path).expect("generate the grammar fallback golden through real serve")
+    );
+    let second = rig
+        .raw_send("grammar-memo", "grammar-second", extra)
+        .await
+        .unwrap();
+    let second_frames = rig
+        .finished_run("grammar-memo", second["run_id"].as_str().unwrap())
+        .await;
+    assert!(!second_frames
+        .iter()
+        .any(|f| matches!(f.record, WalRecord::StructuredOutputDowngraded { .. })));
+    let requests = rig.upstream.schema_requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "memo admission sends no refused request");
+    assert!(requests[0].pointer("/output_config/format").is_some());
+    assert!(requests[1].pointer("/output_config/format").is_none());
+    assert!(requests[2].pointer("/output_config/format").is_none());
 }

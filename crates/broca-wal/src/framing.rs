@@ -180,6 +180,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STEER_QUEUE_FEATURE,
     STEP_TRANSFORMS_FEATURE,
     STRUCTURED_OUTPUT_FEATURE,
+    STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
 ];
 
 /// Text-part state and the frozen codec policy are required for faithful provider replay.
@@ -234,6 +235,10 @@ pub const INPUT_TOKEN_CAP_FEATURE: &str = "input-token-cap/v1";
 /// model calls `submit_result`. A reader that skipped the frozen settings would resume the run
 /// without the schema or the submit tool, and would dispatch the calls a submit skipped.
 pub const STRUCTURED_OUTPUT_FEATURE: &str = "structured-output/v1";
+
+/// A schema compilation refusal changes every subsequent request. Older readers must not
+/// skip the downgrade and resume sending the strict grammar the provider already refused.
+pub const STRUCTURED_OUTPUT_DOWNGRADE_FEATURE: &str = "structured-output-downgrade/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -891,6 +896,7 @@ mod tests {
                 STEER_QUEUE_FEATURE,
                 STEP_TRANSFORMS_FEATURE,
                 STRUCTURED_OUTPUT_FEATURE,
+                STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
             ]
         );
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
@@ -908,6 +914,28 @@ mod tests {
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
         assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
+    }
+
+    #[test]
+    fn structured_output_downgrade_requires_its_own_feature() {
+        let record = WalRecord::StructuredOutputDowngraded {
+            run_id: broca_protocol::RunId("r".into()),
+        };
+        assert_eq!(
+            record.required_features(),
+            &[STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]
+        );
+        let bytes = encode(1, 1, &record).unwrap();
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+        let old: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != STRUCTURED_OUTPUT_DOWNGRADE_FEATURE)
+            .collect();
+        assert!(matches!(
+            decode_next_with(&bytes, &old),
+            DecodeStep::NewerWriter { .. }
+        ));
     }
 
     #[test]

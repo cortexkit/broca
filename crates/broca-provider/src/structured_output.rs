@@ -181,6 +181,18 @@ pub fn decide(
                 Some(reasons::SCHEMA_OUTSIDE_SUBSET),
                 outside_profile_delivery(family, request.mode),
             ),
+            // Ordinary Anthropic tools have no strict flag. The submit tool, or the
+            // final-text output schema instead, is the complete strict-schema set today.
+            CapabilityFlag::Known(true)
+                if route.profile == Some(Profile::AnthropicSo)
+                    && anthropic_budget(
+                        &[&request.schema],
+                        usize::from(request.mode == Mode::SubmitTool),
+                    )
+                    .exceeded() =>
+            {
+                (Some("schema_too_complex"), SchemaDelivery::Unconstrained)
+            }
             CapabilityFlag::Known(true) => (None, SchemaDelivery::Strict),
         }
     };
@@ -198,6 +210,166 @@ pub fn decide(
         profile: route.profile.map(|profile| profile.name().to_owned()),
         delivery,
     })
+}
+
+/// Anthropic combines these limits across strict tools and JSON output schemas. Definitions
+/// are counted only where referenced: reusing a definition compiles another grammar site.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AnthropicBudget {
+    pub strict_tools: usize,
+    pub optional: usize,
+    pub unions: usize,
+}
+
+impl AnthropicBudget {
+    pub fn exceeded(&self) -> bool {
+        self.strict_tools > 20 || self.optional > 24 || self.unions > 16
+    }
+}
+
+pub fn anthropic_budget(schemas: &[&Value], strict_tools: usize) -> AnthropicBudget {
+    fn walk(
+        root: &Value,
+        node: &Value,
+        active: &mut Vec<String>,
+        budget: &mut AnthropicBudget,
+        union_counted: bool,
+    ) {
+        // Stop once a refusal is certain, including exponentially reused definitions.
+        if budget.exceeded() {
+            return;
+        }
+        let Some(object) = node.as_object() else {
+            return;
+        };
+        let is_union =
+            object.contains_key("anyOf") || object.get("type").is_some_and(Value::is_array);
+        if is_union && !union_counted {
+            budget.unions += 1;
+        }
+        // References and composition wrappers still describe this parameter. Its nested
+        // object properties are new parameters, each with their own union allowance.
+        let union_counted = union_counted || is_union;
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            if active.iter().any(|r| r == reference) {
+                budget.unions = 17;
+                return;
+            }
+            if let Some(target) = reference.strip_prefix('#').and_then(|p| root.pointer(p)) {
+                active.push(reference.to_owned());
+                walk(root, target, active, budget, union_counted);
+                active.pop();
+            }
+        }
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            let required = object.get("required").and_then(Value::as_array);
+            for (name, property) in properties {
+                if !required.is_some_and(|r| r.iter().any(|v| v.as_str() == Some(name))) {
+                    budget.optional += 1;
+                }
+                walk(root, property, active, budget, false);
+            }
+        }
+        for key in [
+            "items",
+            "additionalProperties",
+            "not",
+            "contains",
+            "if",
+            "then",
+            "else",
+        ] {
+            if let Some(child) = object.get(key) {
+                walk(root, child, active, budget, false);
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            if let Some(children) = object.get(key).and_then(Value::as_array) {
+                for child in children {
+                    walk(root, child, active, budget, union_counted);
+                }
+            }
+        }
+    }
+    let mut budget = AnthropicBudget {
+        strict_tools,
+        ..Default::default()
+    };
+    for schema in schemas {
+        walk(schema, schema, &mut Vec::new(), &mut budget, false);
+    }
+    budget
+}
+
+type GrammarMemo = std::collections::VecDeque<(String, [u8; 32])>;
+
+fn grammar_memo() -> &'static std::sync::Mutex<GrammarMemo> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<GrammarMemo>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+fn memo_key(model: &str, schema_jcs: &str) -> (String, [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    (
+        model.to_owned(),
+        Sha256::digest(schema_jcs.as_bytes()).into(),
+    )
+}
+
+pub fn remember_grammar_refusal(model: &str, schema_jcs: &str) {
+    let key = memo_key(model, schema_jcs);
+    let mut memo = grammar_memo().lock().unwrap();
+    remember_in(&mut memo, key);
+}
+
+fn remember_in(memo: &mut GrammarMemo, key: (String, [u8; 32])) {
+    if !memo.contains(&key) {
+        if memo.len() == 128 {
+            memo.pop_front();
+        }
+        memo.push_back(key);
+    }
+}
+
+/// Only fresh admission consults the process memo. Resumes use the recorded decision even
+/// if another run in this process has since encountered the same compiler refusal.
+pub fn apply_grammar_memo(model: &str, frozen: &mut FrozenStructuredOutput) {
+    if frozen.profile.as_deref() == Some("anthropic_so")
+        && frozen.delivery == SchemaDelivery::Strict
+        && grammar_memo()
+            .lock()
+            .unwrap()
+            .contains(&memo_key(model, &frozen.schema_jcs))
+    {
+        frozen.downgrade_grammar();
+    }
+}
+
+pub fn grammar_rejection(error: &broca_protocol::ProviderError) -> bool {
+    if error.status != Some(400) {
+        return false;
+    }
+    let Some(body) = error
+        .message
+        .strip_prefix("400: ")
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    else {
+        return false;
+    };
+    grammar_rejection_body(400, &body)
+}
+
+pub(crate) fn grammar_rejection_body(status: u16, body: &Value) -> bool {
+    status == 400
+        && body.pointer("/error/type").and_then(Value::as_str) == Some("invalid_request_error")
+        && body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("compiled grammar is too large")
+                    || message.contains("schema is too complex for compilation")
+            })
 }
 
 /// How a schema outside the route's profile is sent. A family whose encoding has a
@@ -671,6 +843,173 @@ fn object_member<'a>(body: &'a mut Value, key: &str) -> &'a mut Map<String, Valu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anthropic_budget_expands_refs_per_site_and_combines_schemas() {
+        let schema = json!({"$defs":{"unused":{"type":["string","null"]}, "part":{
+            "type":"object","properties":{"x":{"anyOf":[{"type":"string"},{"type":"null"}]}},"additionalProperties":false
+        }},"type":"object", "properties":{"a":{"$ref":"#/$defs/part"},"b":{"$ref":"#/$defs/part"}},"required":["a","b"],"additionalProperties":false});
+        assert_eq!(
+            anthropic_budget(&[&schema], 1),
+            AnthropicBudget {
+                strict_tools: 1,
+                optional: 2,
+                unions: 2
+            }
+        );
+        assert_eq!(
+            anthropic_budget(&[&schema, &schema], 20),
+            AnthropicBudget {
+                strict_tools: 20,
+                optional: 4,
+                unions: 4
+            }
+        );
+        assert!(anthropic_budget(&[&schema], 21).exceeded());
+    }
+
+    #[test]
+    fn anthropic_over_budget_admission_sends_nothing_strict() {
+        for (count, optional) in [(17, false), (25, true)] {
+            let properties: serde_json::Map<String, Value> = (0..count)
+                .map(|i| {
+                    (
+                        format!("p{i}"),
+                        if optional {
+                            json!({"type":"string"})
+                        } else {
+                            json!({"type":["string","null"]})
+                        },
+                    )
+                })
+                .collect();
+            let required: Vec<_> = if optional {
+                vec![]
+            } else {
+                properties.keys().cloned().collect()
+            };
+            let request = request(
+                Mode::SubmitTool,
+                json!({"type":"object", "properties":properties,"required":required,"additionalProperties":false}),
+            );
+            let decision = decide(
+                WireFamilyId::AnthropicMessages,
+                "anthropic",
+                None,
+                CapabilityFlag::Known(true),
+                &request,
+            )
+            .unwrap();
+            assert_eq!(decision.enforcement, "best_effort");
+            assert_eq!(decision.reason.as_deref(), Some("schema_too_complex"));
+            assert_eq!(decision.delivery, SchemaDelivery::Unconstrained);
+        }
+    }
+
+    #[test]
+    fn aggregator_fixture_has_seventeen_resolved_union_parameters_and_is_best_effort() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/aggregator-schema.json")).unwrap();
+        assert_eq!(
+            anthropic_budget(&[&schema], 1),
+            AnthropicBudget {
+                strict_tools: 1,
+                optional: 0,
+                unions: 17
+            }
+        );
+        let decision = decide(
+            WireFamilyId::AnthropicMessages,
+            "anthropic",
+            None,
+            CapabilityFlag::Known(true),
+            &request(Mode::SubmitTool, schema),
+        )
+        .unwrap();
+        assert_eq!(decision.enforcement, "best_effort");
+        assert_eq!(decision.reason.as_deref(), Some("schema_too_complex"));
+        assert_eq!(decision.delivery, SchemaDelivery::Unconstrained);
+    }
+
+    #[test]
+    fn resolved_union_roots_count_once_per_parameter_at_each_reference_site() {
+        let schema = json!({"$defs":{"u":{"anyOf":[{"type":"string"},{"type":"null"}]}}, "type":"object", "properties":{
+            "a":{"$ref":"#/$defs/u"}, "b":{"$ref":"#/$defs/u"},
+            "c":{"anyOf":[{"$ref":"#/$defs/u"},{"type":"null"}]}
+        }, "required":["a","b","c"], "additionalProperties":false});
+        assert_eq!(anthropic_budget(&[&schema], 1).unions, 3);
+    }
+
+    #[test]
+    fn exactly_sixteen_union_parameters_stay_enforced() {
+        let properties: Map<String, Value> = (0..16)
+            .map(|i| (format!("p{i}"), json!({"type":["string","null"]})))
+            .collect();
+        let required: Vec<_> = properties.keys().cloned().collect();
+        let schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+        assert_eq!(anthropic_budget(&[&schema], 1).unions, 16);
+        let decision = decide(
+            WireFamilyId::AnthropicMessages,
+            "anthropic",
+            None,
+            CapabilityFlag::Known(true),
+            &request(Mode::SubmitTool, schema),
+        )
+        .unwrap();
+        assert_eq!(decision.enforcement, "enforced");
+        assert_eq!(decision.delivery, SchemaDelivery::Strict);
+    }
+
+    #[test]
+    fn grammar_memo_keys_model_and_canonical_schema_and_is_bounded() {
+        let mut frozen = decide(
+            WireFamilyId::AnthropicMessages,
+            "anthropic",
+            None,
+            CapabilityFlag::Known(true),
+            &request(Mode::SubmitTool, closed()),
+        )
+        .unwrap();
+        remember_grammar_refusal("memo-test-model", &frozen.schema_jcs);
+        apply_grammar_memo("other-model", &mut frozen);
+        assert_eq!(frozen.enforcement, "enforced");
+        apply_grammar_memo("memo-test-model", &mut frozen);
+        assert_eq!(frozen.reason.as_deref(), Some("grammar_too_large"));
+        assert_eq!(frozen.delivery, SchemaDelivery::Unconstrained);
+        let mut isolated = GrammarMemo::new();
+        for i in 0..256 {
+            remember_in(&mut isolated, memo_key("bounded-test", &format!("{i}")));
+        }
+        assert_eq!(isolated.len(), 128);
+    }
+
+    #[test]
+    fn grammar_rejection_requires_status_type_and_compilation_message() {
+        for message in [
+            "The compiled grammar is too large, which would cause performance issues.",
+            "Schema is too complex for compilation",
+        ] {
+            let body =
+                json!({"type":"error", "error":{"type":"invalid_request_error","message":message}});
+            let mut error = serde_json::from_value::<broca_protocol::ProviderError>(
+                json!({"class":"permanent","message":format!("400: {body}")}),
+            )
+            .unwrap();
+            error.status = Some(400);
+            assert!(grammar_rejection(&error));
+            error.status = Some(422);
+            assert!(!grammar_rejection(&error));
+            error.status = Some(400);
+            error.message = format!(
+                "400: {}",
+                json!({"error":{"type":"api_error","message":message}})
+            );
+            assert!(!grammar_rejection(&error));
+        }
+        let mut error = serde_json::from_value::<broca_protocol::ProviderError>(json!({"class":"permanent","message":"400: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages: field required\"}}"})).unwrap();
+        error.status = Some(400);
+        assert!(!grammar_rejection(&error));
+    }
+
     use super::*;
 
     fn closed() -> Value {

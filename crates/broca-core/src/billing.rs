@@ -817,6 +817,7 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
         | WalRecord::StructuredOutputResult { .. }
+        | WalRecord::StructuredOutputDowngraded { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => None,
     }
 }
