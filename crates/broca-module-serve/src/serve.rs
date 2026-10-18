@@ -239,6 +239,14 @@ fn projection_health_report(failures: u64, behind_sessions: u64) -> ProjectionHe
     }
 }
 
+fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
+    if details.is_empty() {
+        subc_protocol::session::HealthStatus::Ok
+    } else {
+        subc_protocol::session::HealthStatus::Degraded
+    }
+}
+
 fn now_epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1506,11 +1514,7 @@ async fn handle_control_request(
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
             }
-            let status = if details.is_empty() {
-                subc_protocol::session::HealthStatus::Ok
-            } else {
-                subc_protocol::session::HealthStatus::Degraded
-            };
+            let status = health_status(&details);
             let detail = (!details.is_empty()).then(|| details.join("; "));
             let (stale_epoch_drops, unmatched_terminal_drops) = broca_subc::FRAME_DROPS.counts();
             // EVERY FIGURE BELOW IS THIS PROCESS DESCRIBING ITSELF: in-memory counters and
@@ -3664,9 +3668,14 @@ mod tests {
         assert_eq!(recovered.failures, 1);
         assert_eq!(recovered.behind_sessions, 0);
         assert_eq!(recovered.detail, None);
+        assert_eq!(health_status(&[]), subc_protocol::session::HealthStatus::Ok);
 
         let lagging = projection_health_report(2, 1);
         let detail = lagging.detail.expect("a behind session degrades health");
+        assert_eq!(
+            health_status(std::slice::from_ref(&detail)),
+            subc_protocol::session::HealthStatus::Degraded
+        );
         assert_eq!(
             detail,
             "store projection behind on 1 session(s); their reads replay the WAL tail until a projection succeeds"
