@@ -273,7 +273,7 @@ fn recorded_bedrock_event_stream_through_message_stop() -> Vec<u8> {
     stream
 }
 
-fn event_stream_message(event_type: &str, payload: &Value) -> Vec<u8> {
+pub(super) fn event_stream_message(event_type: &str, payload: &Value) -> Vec<u8> {
     let mut headers = Vec::new();
     string_header(&mut headers, ":message-type", "event");
     string_header(&mut headers, ":event-type", event_type);

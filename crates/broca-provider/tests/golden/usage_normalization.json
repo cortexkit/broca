@@ -1,0 +1,193 @@
+[
+  {
+    "family": "anthropic_messages",
+    "case": "fresh-read-write",
+    "raw_usage": {
+      "input_tokens": 100,
+      "cache_read_input_tokens": 20,
+      "cache_creation_input_tokens": 7,
+      "output_tokens": 41
+    },
+    "normalized": {
+      "input_tokens": 100,
+      "cached_input_tokens": 20,
+      "cache_write_tokens": 7,
+      "output_tokens": 41
+    }
+  },
+  {
+    "family": "anthropic_messages",
+    "case": "cache-fields-absent",
+    "raw_usage": {
+      "input_tokens": 93,
+      "output_tokens": 22
+    },
+    "normalized": {
+      "input_tokens": 93,
+      "output_tokens": 22
+    }
+  },
+  {
+    "family": "openai_responses",
+    "case": "inclusive-input-cached-read-and-reasoning",
+    "raw_usage": {
+      "input_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens": 45,
+      "output_tokens_details": {
+        "reasoning_tokens": 9
+      }
+    },
+    "normalized": {
+      "input_tokens": 90,
+      "cached_input_tokens": 30,
+      "output_tokens": 45,
+      "reasoning_tokens": 9
+    }
+  },
+  {
+    "family": "openai_responses",
+    "case": "inclusive-input-cache-write",
+    "raw_usage": {
+      "input_tokens": 50,
+      "input_tokens_details": {
+        "cache_write_tokens": 12
+      },
+      "output_tokens": 8
+    },
+    "normalized": {
+      "input_tokens": 38,
+      "cache_write_tokens": 12,
+      "output_tokens": 8
+    }
+  },
+  {
+    "family": "chatgpt_codex",
+    "case": "cache-read-without-cache-write",
+    "raw_usage": {
+      "input_tokens": 75,
+      "input_tokens_details": {
+        "cached_tokens": 5
+      },
+      "output_tokens": 13
+    },
+    "normalized": {
+      "input_tokens": 70,
+      "cached_input_tokens": 5,
+      "output_tokens": 13
+    }
+  },
+  {
+    "family": "openai_chat_deepseek",
+    "case": "prompt-cache-hit-tokens",
+    "raw_usage": {
+      "prompt_tokens": 70,
+      "prompt_cache_hit_tokens": 18,
+      "completion_tokens": 12
+    },
+    "normalized": {
+      "input_tokens": 52,
+      "cached_input_tokens": 18,
+      "output_tokens": 12
+    }
+  },
+  {
+    "family": "openai_chat_cached_tokens",
+    "case": "openai-prompt-details-cached-tokens",
+    "raw_usage": {
+      "prompt_tokens": 88,
+      "prompt_tokens_details": {
+        "cached_tokens": 23
+      },
+      "completion_tokens": 18,
+      "completion_tokens_details": {
+        "reasoning_tokens": 6
+      }
+    },
+    "normalized": {
+      "input_tokens": 65,
+      "cached_input_tokens": 23,
+      "output_tokens": 18,
+      "reasoning_tokens": 6
+    }
+  },
+  {
+    "family": "openai_chat_reasoning_separate",
+    "case": "xai-separate-reasoning-policy",
+    "raw_usage": {
+      "prompt_tokens": 44,
+      "completion_tokens": 3,
+      "completion_tokens_details": {
+        "reasoning_tokens": 11
+      }
+    },
+    "normalized": {
+      "input_tokens": 44,
+      "output_tokens": 14,
+      "reasoning_tokens": 11
+    }
+  },
+  {
+    "family": "kimi",
+    "case": "openai-chat-token-counts",
+    "raw_usage": {
+      "prompt_tokens": 61,
+      "completion_tokens": 15
+    },
+    "normalized": {
+      "input_tokens": 61,
+      "output_tokens": 15
+    }
+  },
+  {
+    "family": "gemini",
+    "case": "cached-input-and-thoughts",
+    "raw_usage": {
+      "promptTokenCount": 104,
+      "cachedContentTokenCount": 24,
+      "candidatesTokenCount": 7,
+      "thoughtsTokenCount": 3
+    },
+    "normalized": {
+      "input_tokens": 80,
+      "cached_input_tokens": 24,
+      "output_tokens": 10,
+      "reasoning_tokens": 3
+    }
+  },
+  {
+    "family": "code_assist",
+    "case": "wrapped-gemini-usage",
+    "raw_usage": {
+      "promptTokenCount": 57,
+      "cachedContentTokenCount": 9,
+      "candidatesTokenCount": 4,
+      "thoughtsTokenCount": 2
+    },
+    "normalized": {
+      "input_tokens": 48,
+      "cached_input_tokens": 9,
+      "output_tokens": 6,
+      "reasoning_tokens": 2
+    }
+  },
+  {
+    "family": "bedrock_converse",
+    "case": "converse-metadata-as-currently-mapped",
+    "raw_usage": {
+      "inputTokens": 82,
+      "outputTokens": 20,
+      "cacheReadInputTokens": 13,
+      "cacheWriteInputTokens": 4
+    },
+    "normalized": {
+      "input_tokens": 82,
+      "cached_input_tokens": 13,
+      "cache_write_tokens": 4,
+      "output_tokens": 20
+    },
+    "provenance": "unverified-raw-semantics"
+  }
+]
