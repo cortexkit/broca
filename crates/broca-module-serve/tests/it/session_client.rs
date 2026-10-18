@@ -106,6 +106,23 @@ pub fn rig_diagnostics(data_home: &Path, state_root: &Path, session: &str) -> St
     output
 }
 
+/// The daemon's supervisor record of `module_id`, asked over a fresh control connection.
+///
+/// A module the daemon reports as `failed` may have left no log of its own: a process that
+/// never started writes neither its stderr capture nor its structured log. The supervisor's
+/// list entry (spawn generation, last exit, restart budget), retained stderr and terminal
+/// history are then the only account of why, and they are gone once the rig is torn down.
+pub async fn supervisor_diagnostics(connection_file: &Path, module_id: &str) -> String {
+    let report = match broca_subc::SubcConnection::connect(connection_file).await {
+        Ok(conn) => conn.supervisor_module_report(module_id).await,
+        Err(error) => serde_json::Value::String(format!("connect to the daemon: {error}")),
+    };
+    format!(
+        "--- daemon supervisor record: {module_id} ---\n{}\n",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|error| error.to_string())
+    )
+}
+
 pub fn append_process_status(output: &mut String, name: &str, child: &mut Child) {
     match child.try_wait() {
         Ok(Some(status)) => output.push_str(&format!("{name} process status: exited {status}\n")),

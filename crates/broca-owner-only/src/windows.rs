@@ -54,6 +54,22 @@ impl Drop for Handle {
 #[cfg(any(test, feature = "test-support"))]
 pub(super) use processes::{process_is_in_job, process_snapshot, process_wait_for_exit};
 
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`: fails when `to` exists, without opening
+/// the existing file. Test support uses it to publish an executable without disturbing a process
+/// that is opening the copy already in place.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn move_file_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (wide(from)?, wide(to)?);
+    // SAFETY: both arguments are NUL-terminated UTF-16 paths that outlive the call.
+    if unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0)
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-support"))]
 mod processes {
     use super::Handle;

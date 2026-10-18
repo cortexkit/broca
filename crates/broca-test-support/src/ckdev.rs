@@ -571,7 +571,7 @@ fn publish_copy(source: &mut Source, directory: &Path, name: &OsString) -> io::R
         drop(temporary.file.take());
         temporary
     };
-    if let Err(error) = fs::rename(&temporary.path, &destination) {
+    if let Err(error) = place_copy(&temporary.path, &destination, size) {
         // Windows may refuse to replace an executable opened by a racing rig. A complete
         // copy already published by another writer is just as usable as our own copy.
         if !has_right_size(&destination, size) {
@@ -582,6 +582,34 @@ fn publish_copy(source: &mut Source, directory: &Path, name: &OsString) -> io::R
     // content, and ad-hoc signing the same bytes gives the same size.
     fs::write(size_record(directory, name), size.to_string())?;
     Ok(destination)
+}
+
+/// Move a finished copy to its published name.
+///
+/// On Windows an existing published copy is never replaced while it is complete. A replacing
+/// rename opens the destination for deletion, and for that moment any other process opening the
+/// executable without delete sharing fails with a sharing violation. ck-subc opens a module's
+/// executable exactly that way just before CreateProcess, to hold it against rename or deletion
+/// until the child is bound, so another rig publishing the same build at that moment can make
+/// the daemon's spawn fail. The daemon then marks the module `failed` without ever starting it,
+/// which leaves no `<module>.stderr.log`. Every publisher of a directory writes the same bytes,
+/// so the copy already in place serves everyone. A copy of the wrong length is still replaced, so
+/// a damaged copy is repaired as before.
+///
+/// Unix renames replace the name without disturbing an open or running executable, so they
+/// keep the plain atomic rename.
+fn place_copy(temporary: &Path, destination: &Path, size: u64) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        match broca_owner_only::test_support::move_file_without_replacing(temporary, destination) {
+            Ok(()) => return Ok(()),
+            Err(_) if has_right_size(destination, size) => return Ok(()),
+            Err(_) => {}
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = size;
+    fs::rename(temporary, destination)
 }
 
 // Hooks run before copying and after the child copy exits, before the final rename makes the
@@ -1361,6 +1389,48 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A replacing rename briefly opens the existing copy for deletion, which makes a daemon's
+    /// launch of that copy fail with a sharing violation. A complete copy that another publisher
+    /// put in place while this one was copying must therefore be left exactly as it is.
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_keeps_a_complete_copy_a_racing_publisher_placed() {
+        let scratch = fixture("racing-publisher");
+        let built = source(
+            &scratch,
+            "target/debug/ck-probe.exe",
+            b"complete executable",
+        );
+        let marker = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        BEFORE_COPY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |destination| {
+                // The racing publisher finishes first: its copy is in place, complete, and
+                // carries a timestamp no fresh copy can have.
+                fs::write(destination, b"complete executable").unwrap();
+                File::options()
+                    .write(true)
+                    .open(destination)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(marker))
+                    .unwrap();
+            }));
+        });
+        let published = ckdev_binary(&built, &scratch);
+        BEFORE_COPY.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            fs::metadata(&published).unwrap().modified().unwrap(),
+            marker,
+            "the racing publisher's complete copy was replaced"
+        );
+        assert_eq!(fs::read(&published).unwrap(), b"complete executable");
+        let leftovers: Vec<_> = fs::read_dir(published.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary copies left: {leftovers:?}");
     }
 
     #[test]

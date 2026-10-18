@@ -135,30 +135,47 @@ pub fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Find each known session's durable WAL head after process loss or hint overflow.
+///
+/// The head is the last sequence decoded BEFORE the read-side flush: the flush proves every
+/// frame written before it, so a frame appended after the read cannot ride on that proof.
+/// `flush_for_read` returns the WAL file's identity (an inode number on Unix, always `None`
+/// elsewhere), never a sequence, so its value is deliberately ignored here.
 fn recover_heads(store: &SqliteStore, wal: &FileWalStore) -> Result<(DurableHeads, bool), String> {
     let mut found = DurableHeads::new();
     let mut incomplete = false;
+    let missing = |error: &broca_wal::WalError| match error {
+        broca_wal::WalError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    };
     for session in store.bus_event_sessions().map_err(|e| e.to_string())? {
-        let head = match wal.flush_for_read(&session) {
-            Ok(Some(head)) => head,
-            Ok(None) => continue,
-            Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                continue
-            }
+        let candidate = match wal.read_records_range(&session, 0, None, None) {
+            Ok(range) => range,
+            Err(error) if missing(&error) => continue,
             Err(_) => {
                 incomplete = true;
                 continue;
             }
         };
-        match wal.read_records_range(&session, 0, Some(head), None) {
-            Ok(range) => {
-                if let Some(epoch) = range.lineage_id {
-                    found.insert(session, (head, epoch.to_string()));
-                }
+        let head = match candidate.records() {
+            broca_wal::WalRangeRecords::Complete(records) => {
+                records.last().map_or(0, |record| record.seq)
             }
-            Err(_) => {
+            broca_wal::WalRangeRecords::Absent => continue,
+            _ => {
                 incomplete = true;
+                continue;
             }
+        };
+        let Some(epoch) = candidate.lineage_id else {
+            continue;
+        };
+        match wal.flush_for_read(&session) {
+            Ok(_identity) => {
+                found.insert(session, (head, epoch.to_string()));
+            }
+            Err(error) if missing(&error) => {}
+            Err(_) => incomplete = true,
         }
     }
     Ok((found, incomplete))
@@ -483,12 +500,24 @@ mod tests {
                 })
                 .unwrap();
         }
-        let writer = wal.open(&healthy).unwrap();
-        writer.sync().unwrap();
+        let mut writer = wal.open(&healthy).unwrap();
+        for step in 1..=2 {
+            writer
+                .append(
+                    1,
+                    &broca_wal::WalRecord::StepStarted {
+                        step_id: broca_protocol::StepId(step),
+                    },
+                    true,
+                )
+                .unwrap();
+        }
         drop(writer);
         let (heads, incomplete) = recover_heads(&store, &wal).unwrap();
         assert!(!incomplete);
-        assert!(heads.contains_key(&healthy));
+        // The recovered head is the last durable record's sequence on every platform. It must not
+        // depend on the WAL file's identity, which only Unix provides.
+        assert_eq!(heads.get(&healthy).map(|(head, _)| *head), Some(2));
         assert!(!heads.contains_key(&missing));
     }
 
