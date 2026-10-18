@@ -407,6 +407,7 @@ pub fn resolve_frozen(
         // run starts, not from the model catalog — so a config built from the catalog leaves
         // this None and the code that starts the run fills it in later.
         project_id: None,
+        codeassist_identity: None,
         // The caller cache scope is supplied at admission, so the catalog-built config leaves
         // it None. ChatGPT codex falls back to the run session id there when it is absent.
         prompt_cache_key: None,
@@ -467,6 +468,7 @@ fn frozen_from_family_defaults(
         static_options: serde_json::Value::Null,
         aws_region,
         project_id: None,
+        codeassist_identity: None,
         prompt_cache_key: None,
         reasoning_effort: None,
         service_tier: None,
@@ -666,7 +668,8 @@ pub fn frozen_config_for_family(
 /// output-token defaults.
 /// v4: normalize model-visible tool names at the render edge.
 /// v5: preserve an explicit caller output-token cap, clamped only to the Antigravity tier ceiling.
-/// v6: retain signed text parts through the shared Gemini codec.
+/// v6: retain signed text parts through the shared Gemini codec. Session identity is an opt-in
+/// frozen field within v6: its absence keeps all earlier bytes.
 pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 6;
 
 /// Build the frozen render config for Google Antigravity / Code-Assist. The inner request

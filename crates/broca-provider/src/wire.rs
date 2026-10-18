@@ -156,6 +156,10 @@ pub struct FrozenRenderConfig {
     /// endpoint), this IS in the rendered bytes, so it must be frozen, not re-resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Code Assist envelope identity, frozen at admission. Absent on older episodes: they
+    /// retain their original requestId and omit session identity on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codeassist_identity: Option<CodeAssistIdentity>,
     /// A caller-selected prompt-cache scope, emitted by OpenAI renderers. ChatGPT codex uses
     /// the run session id only when this caller scope is absent. A per-run constant, it is frozen
     /// here (reproduced from the blob on resume) rather than carried per-step like `step_context`.
@@ -229,6 +233,43 @@ pub struct FrozenRenderConfig {
     /// that way keeps rendering it, and blobs recorded without the field read back as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_persona: Option<ClaudeCodePersona>,
+}
+
+/// Conversation identity and episode-local request numbering for the Antigravity envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeAssistIdentity {
+    pub session_id: String,
+    pub agent_id: String,
+    pub trajectory_id: String,
+    /// WAL sequence at admission plus one. Together with the run-local step index this
+    /// gives increasing session-wide request steps, with gaps for non-request WAL records.
+    pub step_offset: u64,
+    /// Admission time, not render time: retries and resume must reproduce the same bytes.
+    pub admitted_at_ms: u64,
+}
+
+impl CodeAssistIdentity {
+    pub fn for_session(session_ref: &str, head_seq: u64, admitted_at_ms: u64) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = |domain: &str| {
+            Sha256::digest(format!("broca-codeassist-{domain}-v1\0{session_ref}").as_bytes())
+        };
+        let session = digest("session");
+        let mut number = [0u8; 8];
+        number.copy_from_slice(&session[..8]);
+        let uuid = |domain| {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest(domain)[..16]);
+            uuid_v4_text(bytes)
+        };
+        Self {
+            session_id: format!("-{}", u64::from_be_bytes(number) & i64::MAX as u64),
+            agent_id: uuid("agent"),
+            trajectory_id: uuid("trajectory"),
+            step_offset: head_seq.saturating_add(1),
+            admitted_at_ms,
+        }
+    }
 }
 
 /// The frozen identity of a Claude Code persona run. Every value here is either in the request
