@@ -7,6 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 
 SEAM = Path.home() / ".local/share/cortexkit/staging"
@@ -54,6 +55,10 @@ def main() -> int:
     if placed_sha is None:
         return fail("placed binary sha cannot be read")
 
+    def companion_dsym(binary: Path) -> Path | None:
+        candidate = seam / (binary.name + ".dSYM")
+        return candidate if candidate.is_dir() and not candidate.is_symlink() else None
+
     releases = []
     rollbacks = []
     try:
@@ -65,42 +70,52 @@ def main() -> int:
             if rm:
                 side = seam / (path.name + ".sha256.postsign")
                 if not side.is_symlink() and side.is_file():
-                    releases.append((path, side, path.stat().st_mtime_ns))
+                    releases.append((path, side, companion_dsym(path), path.stat().st_mtime_ns))
             elif bm:
                 side = seam / (path.name + ".sha256")
                 if not side.is_symlink() and side.is_file():
-                    rollbacks.append((path, side, path.stat().st_mtime_ns))
+                    rollbacks.append((path, side, companion_dsym(path), path.stat().st_mtime_ns))
     except OSError as exc:
         return fail(f"cannot inspect staging directory: {exc}")
 
     keep = {fields[1]}
-    for binary, sidecar, _ in sorted(releases, key=lambda item: item[2], reverse=True)[:args.keep]:
+    for binary, sidecar, dsym, _ in sorted(releases, key=lambda item: item[3], reverse=True)[:args.keep]:
         keep.add(binary.name)
     # The signed staged digest is the first token of shasum -c format.
-    for binary, sidecar, _ in releases:
+    for binary, sidecar, dsym, _ in releases:
         try:
             side_sha = sidecar.read_text().split()[0]
         except (OSError, IndexError):
             continue
         if side_sha == placed_sha:
             keep.add(binary.name)
-    newest_rollbacks = {item[0].name for item in sorted(rollbacks, key=lambda item: item[2], reverse=True)[:2]}
+    newest_rollbacks = {item[0].name for item in sorted(rollbacks, key=lambda item: item[3], reverse=True)[:2]}
 
     deletions = []
-    for binary, sidecar, _ in releases:
+    for binary, sidecar, dsym, _ in releases:
         if binary.name not in keep:
             deletions.extend((binary, sidecar))
-    for binary, sidecar, _ in rollbacks:
+            if dsym is not None:
+                deletions.append(dsym)
+    for binary, sidecar, dsym, _ in rollbacks:
         if binary.name not in newest_rollbacks:
             deletions.extend((binary, sidecar))
+            if dsym is not None:
+                deletions.append(dsym)
     total = 0
     for path in deletions:
         try:
-            size = path.lstat().st_size
+            if path.is_dir() and not path.is_symlink():
+                size = path.lstat().st_size + sum(child.lstat().st_size for child in path.rglob("*"))
+            else:
+                size = path.lstat().st_size
             total += size
             print(f"{'would delete' if args.dry_run else 'deleted'} {path.name} ({size} bytes)")
             if not args.dry_run:
-                path.unlink()
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
         except OSError as exc:
             return fail(f"cannot remove {path.name}: {exc}")
     print(f"{'would free' if args.dry_run else 'freed'} {total} bytes")

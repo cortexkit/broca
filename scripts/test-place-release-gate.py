@@ -491,6 +491,12 @@ def stub_binary(
         body += SIG_MARK + f"flags={signed} entitlements=\n".encode()
     path.write_bytes(body)
     path.chmod(0o755)
+    dsym = Path(str(path) + ".dSYM")
+    if dsym.exists():
+        shutil.rmtree(dsym)
+    dwarf = dsym / "Contents" / "Resources" / "DWARF"
+    dwarf.mkdir(parents=True)
+    (dwarf / "ck-broca").write_bytes(f"debug symbols for {path.name} {version}".encode())
 
 
 def read_flags(path: Path) -> str | None:
@@ -528,6 +534,7 @@ class GateBase(unittest.TestCase):
             ("file", '#!/bin/sh\necho "Mach-O 64-bit executable arm64"\n'),
             # These hermetic arms cover Darwin signing even on a Linux test runner.
             ("uname", '#!/bin/sh\necho Darwin\n'),
+            ("dwarfdump", '#!/bin/sh\nprintf "UUID: 11111111-2222-3333-4444-555555555555 (arm64) %s\\n" "$2"\n'),
         ):
             p = self.fake_bin / name
             p.write_text(body)
@@ -851,6 +858,40 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         self.assertEqual(len(sign_calls), 1, sign_calls)
         self.assertIn("-o runtime", sign_calls[0])
         self.assertIn("--identifier ck-broca", sign_calls[0])
+
+    def test_placement_carries_the_dsym_and_keeps_the_old_one_with_rollback(self) -> None:
+        self.deploy(signed="adhoc,runtime")
+        old_dwarf = (self.dest.parent / "ck-broca.dSYM/Contents/Resources/DWARF/ck-broca").read_bytes()
+        stub_binary(self.staged, features=[], signed="adhoc,runtime")
+        new_dwarf = Path(str(self.staged) + ".dSYM/Contents/Resources/DWARF/ck-broca").read_bytes()
+
+        result = self.place()
+
+        self.assert_placed(result)
+        self.assertIn(f"dSYM      {self.dest}.dSYM", result.stdout)
+        self.assertEqual(
+            (self.dest.parent / "ck-broca.dSYM/Contents/Resources/DWARF/ck-broca").read_bytes(),
+            new_dwarf,
+        )
+        backups = [
+            p for p in self.rollback.glob("ck-broca.rollback-*")
+            if p.is_file() and not p.name.endswith(".sha256")
+        ]
+        self.assertEqual(len(backups), 1, backups)
+        backup_dwarf = Path(str(backups[0]) + ".dSYM/Contents/Resources/DWARF/ck-broca")
+        self.assertEqual(backup_dwarf.read_bytes(), old_dwarf)
+
+    def test_darwin_placement_refuses_a_staged_binary_without_its_dsym(self) -> None:
+        self.deploy(signed="adhoc,runtime")
+        stub_binary(self.staged, features=[], signed="adhoc,runtime")
+        shutil.rmtree(Path(str(self.staged) + ".dSYM"))
+
+        result = self.place()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("staged Mach-O has no dSYM directory", result.stderr)
+        self.assertEqual(self.dest.read_bytes(), self.deployed_bytes)
+        self.assertFalse(self.rollback.exists())
 
     def test_a_covered_floor_places_and_the_card_prints_it(self) -> None:
         self.deploy(signed="adhoc,runtime")
