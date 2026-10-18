@@ -1439,6 +1439,9 @@ package = "broca-provider"
 target = "--test conformance"
 features = ["live"]
 test_file = "crates/broca-provider/tests/conformance/openai_responses_conformance.rs"
+# Only the three named error-classification cases need to run; unrelated
+# conformance cases add minutes without checking this classification.
+select = "expected"
 expect_red = ["openai_responses_conformance::unknown_response_error_code_is_transient", "openai_responses_conformance::response_failed_preserves_transient_nested_error", "openai_responses_conformance::top_level_server_error_is_transient"]
 file = "crates/broca-provider/src/families/openai_responses.rs"
 old = "Some(_) | None => ErrorClass::Transient,"
@@ -6408,6 +6411,8 @@ package = "broca-module"
 target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-module/src/approval_tests.rs"
+# The named approval test checks the byte cap; unrelated library tests add over a minute to this replay.
+select = "expected"
 expect_red = ["actor::approval_tests::late_read_pages_are_atomic_bounded_and_nonrepeating"]
 edits = [
  { file = "crates/broca-module/src/approval.rs", old = "if end > start && total.saturating_add(size.0) > cap {", new = "if false { let _ = cap; // NON-VACUITY BREAK: ignore multi-entry cap" },
@@ -6721,6 +6726,8 @@ package = "broca-module"
 target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-module/src/actor_agent_run_scope_tests.rs"
+# The named actor test checks the no-WAL refusal; unrelated library tests add nearly a minute to this replay.
+select = "expected"
 expect_red = ["actor::agent_run_scope_tests::enabled_agent_run_refusals_write_no_wal_bytes"]
 file = "crates/broca-core/src/scope_admission.rs"
 old = "if bind.scope.flow_id.is_none() && bind.scope.run_id.is_none() {"
@@ -10447,6 +10454,8 @@ runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/registry_owner_tests.rs"
+# The named owner-barrier test checks observed-head coverage; unrelated library tests add about a minute to this replay.
+select = "expected"
 expect_red = ["registry::owner_tests::owner_barrier_failure_refuses_cancel_and_retract_without_writes"]
 file = "crates/broca-module/src/registry.rs"
 old = '        if matches!(proven.records(), broca_wal::WalRangeRecords::Complete(_))'
@@ -13910,6 +13919,8 @@ package = "broca-module-serve"
 target = "--test agent_data"
 features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
+# The queued-send test proves this busy fence; the full agent-data target takes nearly a minute after mutation.
+select = "expected"
 expect_red = ["closed_session_with_a_queued_send_is_busy_before_prepare"]
 only = false
 file = "crates/broca-module/src/move_files.rs"
@@ -14866,6 +14877,8 @@ runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/move_files/tests.rs"
+# The named import-recovery test checks the staging sync; unrelated library tests add nearly a minute to this replay.
+select = "expected"
 expect_red = ["move_files::tests::import_reconciliation_syncs_staging_before_recording_imported"]
 file = "crates/broca-module/src/move_files.rs"
 old = 'migration::durable_dir(&self.state_root, staged.parent().unwrap())'
