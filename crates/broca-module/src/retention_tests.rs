@@ -5,6 +5,190 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MARKER: &str = "RETENTION-MODULE-CONTENT-SENTINEL-59137";
 
+#[cfg(any(target_os = "linux", feature = "test-clock"))]
+fn large_expiry_step() -> WalRecord {
+    WalRecord::ModelStepFinished {
+        hooks: None,
+        step_id: broca_protocol::StepId(1),
+        assistant_message: broca_protocol::AssistantMessage {
+            message_id: broca_protocol::MessageId("m".into()),
+            content: vec![broca_protocol::ContentBlock::Text {
+                text: "x".repeat(100_000),
+            }],
+        }
+        .into(),
+        usage: Default::default(),
+        finish_reason: Some(broca_protocol::FinishReason::Stop),
+        retries_used: 0,
+        service_tier_used: None,
+        speed_used: None,
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn status_poll_large_nonretained_session_does_not_read_wal() {
+    for durable in [false, true] {
+        let rig = Rig::new();
+        let mut wal = rig.service.wal.open(&rig.key).unwrap();
+        let now = rig.service.clock.now_ms();
+        wal.append(1, &started(&rig.key, "r1", None, now), false)
+            .unwrap();
+        let record = large_expiry_step();
+        for _ in 0..100 {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.append(1, &finished(now), true).unwrap();
+        drop(wal);
+        if durable {
+            fs::create_dir_all(rig.service.wal.durable_root()).unwrap();
+            fs::rename(
+                rig.service.wal.wal_path(&rig.key),
+                rig.service.wal.durable_wal_path(&rig.key),
+            )
+            .unwrap();
+        }
+        let registry = rig.registry(None);
+        registry.route_status(&rig.key).await.unwrap();
+        let before = rig.service.wal.range_reads_for_test();
+        for _ in 0..3 {
+            registry.route_status(&rig.key).await.unwrap();
+            // Include both expiry variants even when the actor already knows its status.
+            registry.check_expired(&rig.key, None).await.unwrap();
+            registry.check_expired(&rig.key, Some("r1")).await.unwrap();
+        }
+        assert_eq!(rig.service.wal.range_reads_for_test(), before);
+        assert!(registry.stop_and_seal().await);
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn retained_deadline_refuses_status_read_and_subscribe() {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    rig.seed(1, now, Some(now));
+    rig.service.rederive(&rig.key).unwrap();
+    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":2000}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    let registry = rig.registry(None);
+    let before = rig.service.wal.range_reads_for_test();
+    assert!(matches!(registry.route_status(&rig.key).await,
+        Err(crate::registry::OpenError::Expired { expired_at_ms }) if expired_at_ms == now + 1000));
+    assert!(
+        matches!(registry.route_run_state(&rig.key, RunId("r1".into())).await,
+        Err(crate::registry::OpenError::Expired { expired_at_ms }) if expired_at_ms == now + 1000)
+    );
+    assert!(matches!(registry.route_read(&rig.key, None, None).await,
+        Err(crate::registry::OpenError::Expired { expired_at_ms }) if expired_at_ms == now + 1000));
+    let (sink, _deliveries) = tokio::sync::mpsc::channel(8);
+    assert!(
+        matches!(registry.route_subscribe(&rig.key, crate::fanout::FromCursor::Start, sink).await,
+        Err(crate::registry::OpenError::Expired { expired_at_ms }) if expired_at_ms == now + 1000)
+    );
+    assert_eq!(rig.service.wal.range_reads_for_test(), before);
+}
+
+#[cfg(feature = "test-clock")]
+#[test]
+fn stale_retention_row_replays_wal_and_refreshes_summary() {
+    for initially_finished in [false, true] {
+        let rig = Rig::new();
+        let now = rig.service.clock.now_ms();
+        let id = rig.seed(1, now, initially_finished.then_some(now));
+        rig.service.rederive(&rig.key).unwrap();
+        let old_row = rig
+            .store
+            .lookup_live_retention_lineage(&rig.key)
+            .unwrap()
+            .unwrap();
+        let mut wal = rig.service.wal.open(&rig.key).unwrap();
+        if initially_finished {
+            wal.append(1, &started(&rig.key, "r2", Some(1), now + 2000), true)
+                .unwrap();
+        } else {
+            wal.append(1, &finished(now), true).unwrap();
+        }
+        drop(wal);
+        fs::write(rig.root.join("test-clock"), br#"{"offset_ms":2000}"#).unwrap();
+        rig.service.clock.refresh().unwrap();
+        let before = rig.service.wal.range_reads_for_test();
+        let expected = (!initially_finished).then_some(now + 1000);
+        assert_eq!(rig.service.expired(&rig.key, None).unwrap(), expected);
+        assert_eq!(rig.service.wal.range_reads_for_test(), before + 1);
+        let row = rig
+            .store
+            .lookup_live_retention_lineage(&rig.key)
+            .unwrap()
+            .unwrap();
+        assert!(row.wal_bytes > old_row.wal_bytes);
+        assert_eq!(row.lineage_id, id);
+        assert_eq!(row.expires_at_ms, expected);
+        assert_eq!(rig.service.expired(&rig.key, None).unwrap(), expected);
+        assert_eq!(rig.service.wal.range_reads_for_test(), before + 1);
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[test]
+fn retained_summary_does_not_include_records_past_durable_head() {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    rig.seed(1, now, Some(now));
+    rig.service.rederive(&rig.key).unwrap();
+    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":2000}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    assert_eq!(
+        rig.service.expired_head(&rig.key, None, Some(1)).unwrap(),
+        None
+    );
+    assert_eq!(
+        rig.service.expired_head(&rig.key, None, Some(2)).unwrap(),
+        Some(now + 1000)
+    );
+}
+
+#[cfg(feature = "test-clock")]
+#[test]
+fn missing_retention_summary_is_refreshed_without_rewriting_run_state() {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    rig.seed(1, now, Some(now));
+    assert!(rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .is_none());
+    let before = rig.service.wal.range_reads_for_test();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+    let row = rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.expires_at_ms, Some(now + 1000));
+    assert!(rig.store.lookup_run("r1").unwrap().is_none());
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+    assert_eq!(rig.service.wal.range_reads_for_test(), before + 1);
+}
+
+#[test]
+fn expiry_refuses_ambiguous_paths_and_corrupt_stale_retained_wals() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    let retained = rig.service.wal.ephemeral_wal_path(&rig.key);
+    fs::create_dir_all(rig.service.wal.root()).unwrap();
+    fs::copy(&retained, rig.service.wal.wal_path(&rig.key)).unwrap();
+    assert!(rig.service.expired(&rig.key, None).is_err());
+    fs::remove_file(rig.service.wal.wal_path(&rig.key)).unwrap();
+    let mut bytes = fs::read(&retained).unwrap();
+    bytes[10] ^= 1;
+    bytes.push(0);
+    fs::write(&retained, bytes).unwrap();
+    assert!(rig.service.expired(&rig.key, None).is_err());
+}
+
 #[tokio::test]
 async fn periodic_sweep_repairs_stale_discovery_without_new_wal_bytes() {
     let rig = Rig::new();

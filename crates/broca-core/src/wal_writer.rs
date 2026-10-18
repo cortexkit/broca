@@ -251,6 +251,8 @@ pub struct FileWalStore {
     move_inventory: Arc<move_inventory::InventoryState>,
     move_reads: AtomicU64,
     retention_changes: Arc<retention_changes::Changes>,
+    #[cfg(any(test, feature = "test-clock"))]
+    range_reads: AtomicU64,
 }
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
@@ -519,6 +521,8 @@ impl FileWalStore {
             move_inventory: Arc::default(),
             move_reads: AtomicU64::new(0),
             retention_changes: Arc::default(),
+            #[cfg(any(test, feature = "test-clock"))]
+            range_reads: AtomicU64::new(0),
         }
     }
 
@@ -1113,6 +1117,8 @@ impl FileWalStore {
         through_seq: Option<u64>,
         anchor: Option<&WalByteAnchor>,
     ) -> Result<WalRangeRead, WalError> {
+        #[cfg(any(test, feature = "test-clock"))]
+        self.range_reads.fetch_add(1, Ordering::Relaxed);
         let lookup = self.archived_member_at_address(address)?;
         if let Some(member) = lookup.member {
             return member_range(&member, after_seq, through_seq);
@@ -1142,6 +1148,12 @@ impl FileWalStore {
             );
         }
         Ok(range)
+    }
+
+    #[cfg(any(test, feature = "test-clock"))]
+    /// Count actual store range requests so polling tests observe accidental replays.
+    pub fn range_reads_for_test(&self) -> u64 {
+        self.range_reads.load(Ordering::Relaxed)
     }
 
     /// The WAL feature floor for this tree: `wal-feature-floor` in the state root, next to the
