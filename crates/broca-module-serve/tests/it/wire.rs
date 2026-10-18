@@ -2719,6 +2719,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // the distinction an operator needs, and a field that appears only on failure
         // cannot say "this process has projected cleanly since boot".
         "projection_failures",
+        // The current-state counterpart: unlike the lifetime counter, successful projection
+        // removes only the recovered session's entry and leaves other sessions behind.
+        "projection_behind_sessions",
         // Process-local lifetime operation counts. The isolated operation_counters target proves
         // their zero and non-zero readings; this test keeps their presence in the total key set.
         "stream_chunks",
@@ -2812,6 +2815,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["opening"], serde_json::json!(0));
     assert_eq!(metrics["closing"], serde_json::json!(0));
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
+    assert_eq!(metrics["projection_failures"], serde_json::json!(0));
+    assert_eq!(metrics["projection_behind_sessions"], serde_json::json!(0));
     assert!(metrics["catalog_age_ms"].as_i64().unwrap() >= 5_000);
     assert_eq!(metrics["catalog_source"], serde_json::json!("lkg"));
     assert_eq!(metrics["catalog_refusals"], serde_json::json!(0));

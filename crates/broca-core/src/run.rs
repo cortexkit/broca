@@ -5226,6 +5226,11 @@ pub fn projection_failures() -> u64 {
     PROJECTION_WARNING_COUNT.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
+/// Sessions whose latest projection attempt failed and have not projected successfully since.
+pub fn projection_behind_sessions() -> u64 {
+    crate::projection_health::behind_sessions()
+}
+
 pub(crate) async fn project_committed<W: WalStore>(
     wal_store: &W,
     store: Arc<dyn SessionStore>,
@@ -5291,6 +5296,7 @@ pub(crate) async fn project_committed<W: WalStore>(
                  each turn until a projection succeeds): {error}"
             );
             PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::projection_health::record_failure(session);
             return;
         }
     };
@@ -5330,6 +5336,9 @@ pub(crate) async fn project_committed<W: WalStore>(
         if result.is_err() {
             tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");
             PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::projection_health::record_failure(session);
+        } else {
+            crate::projection_health::record_success(session);
         }
         return;
     }
@@ -5359,7 +5368,7 @@ pub(crate) async fn project_committed<W: WalStore>(
         write_result
     };
     match write_result {
-        Ok(()) => {}
+        Ok(()) => crate::projection_health::record_success(session),
         Err(error) => {
             // Non-fatal to the RUN, which is why the message says so -- the WAL is authoritative
             // and nothing is lost. It is not non-consequential to READERS, and that is the part
@@ -5376,6 +5385,7 @@ pub(crate) async fn project_committed<W: WalStore>(
                  projection succeeds): {error}"
             );
             PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::projection_health::record_failure(session);
         }
     }
 }
@@ -9378,6 +9388,7 @@ mod tests {
 
         let store = Arc::new(CapturingProjectionStore::default());
         let warnings_before = projection_failures();
+        let behind_before = projection_behind_sessions();
         project_committed(
             &wal_store,
             store.clone() as Arc<dyn SessionStore>,
@@ -9394,6 +9405,16 @@ mod tests {
         );
         assert!(store.projected_seqs.lock().unwrap().is_empty());
         assert!(projection_failures() > warnings_before);
+        assert_eq!(projection_behind_sessions(), behind_before + 1);
+        project_committed(
+            &ReadableWalStore,
+            Arc::new(CapturingProjectionStore::default()) as Arc<dyn SessionStore>,
+            &session,
+            3,
+            false,
+        )
+        .await;
+        assert_eq!(projection_behind_sessions(), behind_before);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9427,24 +9448,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_failure_emits_a_warning() {
+    async fn projection_failure_then_success_clears_behind_but_keeps_lifetime_count() {
         let _counter = PROJECTION_COUNTER_LOCK.lock().await;
         PROJECTION_WARNING_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let session = BindIdentity::new("/tmp/project", "runner", "session");
+        let behind_before = projection_behind_sessions();
 
         let (projector, pending) = projection_channel();
         projector.enqueue(1);
+        let task_session = session.clone();
         let task = tokio::spawn(async move {
             projector_task(
                 &ReadableWalStore,
                 Arc::new(FailingProjectionStore) as Arc<dyn SessionStore>,
-                &session,
+                &task_session,
                 pending,
             )
             .await;
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while PROJECTION_WARNING_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            while projection_failures() == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -9453,17 +9476,85 @@ mod tests {
         projector.close();
         task.await.expect("projector task joins");
 
-        // The intentionally failing projection store calls `project_committed`, which performs
-        // the production counter mutation unconditionally; no cfg(test) branch separates that
-        // failure from the counter update. Read through the public accessor rather than the static:
-        // that is the value
-        // health.check publishes, so a change that broke the accessor while leaving the
-        // counter correct would still fail here.
+        // This retry succeeds: health no longer reports the session behind, while the lifetime
+        // projection_failures metric still records the original failed attempt.
         assert_eq!(
             super::projection_failures(),
             1,
             "a failing projection must be visible to operators"
         );
+        assert_eq!(
+            projection_behind_sessions(),
+            behind_before + 1,
+            "the failed session is still behind"
+        );
+
+        project_committed(
+            &ReadableWalStore,
+            Arc::new(CapturingProjectionStore::default()) as Arc<dyn SessionStore>,
+            &session,
+            1,
+            false,
+        )
+        .await;
+        assert_eq!(
+            projection_failures(),
+            1,
+            "recovery preserves the process-lifetime failure count"
+        );
+        assert_eq!(
+            projection_behind_sessions(),
+            behind_before,
+            "successful projection clears the session's recovery debt"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_projection_failures_with_one_recovery_leave_one_session_behind() {
+        let _counter = PROJECTION_COUNTER_LOCK.lock().await;
+        let failures_before = projection_failures();
+        let behind_before = projection_behind_sessions();
+        let first = BindIdentity::new("/tmp/project", "runner", "health-first");
+        let second = BindIdentity::new("/tmp/project", "runner", "health-second");
+
+        for session in [&first, &second] {
+            project_committed(
+                &ReadableWalStore,
+                Arc::new(FailingProjectionStore) as Arc<dyn SessionStore>,
+                session,
+                1,
+                false,
+            )
+            .await;
+        }
+        assert_eq!(projection_failures(), failures_before + 2);
+        assert_eq!(projection_behind_sessions(), behind_before + 2);
+
+        project_committed(
+            &ReadableWalStore,
+            Arc::new(CapturingProjectionStore::default()) as Arc<dyn SessionStore>,
+            &first,
+            1,
+            false,
+        )
+        .await;
+        assert_eq!(projection_failures(), failures_before + 2);
+        assert_eq!(
+            projection_behind_sessions(),
+            behind_before + 1,
+            "recovering one session leaves the other session's debt intact"
+        );
+
+        // Do not leave synthetic debt for later tests in this shared process.
+        project_committed(
+            &ReadableWalStore,
+            Arc::new(CapturingProjectionStore::default()) as Arc<dyn SessionStore>,
+            &second,
+            1,
+            false,
+        )
+        .await;
+        assert_eq!(projection_behind_sessions(), behind_before);
     }
 
     struct CancellationProbeProvider {

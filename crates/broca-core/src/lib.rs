@@ -27,6 +27,7 @@ pub mod import;
 pub mod input_budget;
 pub mod lease;
 pub mod projection;
+mod projection_health;
 pub mod projection_plan;
 #[cfg(test)]
 mod projection_plan_tests;

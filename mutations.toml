@@ -830,8 +830,8 @@ test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::projection_warning_mutations_are_not_test_gated"]
 expect_message = "projection warning counter mutation is test-gated"
 file = "crates/broca-core/src/run.rs"
-old = "PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n            return;"
-new = "#[cfg(test)] // NON-VACUITY BREAK\n            PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n            return;"
+old = "PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n            crate::projection_health::record_failure(session);\n            return;"
+new = "#[cfg(test)] // NON-VACUITY BREAK\n            PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n            crate::projection_health::record_failure(session);\n            return;"
 
 [[control]]
 id = "scan-unsourced-store-provenance"
@@ -16900,3 +16900,29 @@ select = "expected"
 file = "crates/broca-module/src/retention.rs"
 old = "self.index.live(key)?.filter(|row| row.wal_bytes == bytes)"
 new = "self.index.live(key)?.filter(|_| true) // NON-VACUITY BREAK: trust a stale retention deadline\n"
+
+[[control]]
+id = "projection-success-clears-current-debt"
+guards = "a successful projection clears the recovered session's debt without resetting lifetime failures"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::projection_failure_then_success_clears_behind_but_keeps_lifetime_count"]
+file = "crates/broca-core/src/run.rs"
+old = "Ok(()) => crate::projection_health::record_success(session),"
+new = "Ok(()) => {} // NON-VACUITY BREAK: leave the recovered session behind."
+
+[[control]]
+id = "projection-health-uses-current-debt"
+guards = "projection health degrades only while at least one session remains behind"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::projection_health_degrades_only_for_sessions_still_behind"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "let detail = (behind_sessions > 0).then(|| {"
+new = "let detail = (failures > 0).then(|| { // NON-VACUITY BREAK: lifetime failures taint recovered sessions."
