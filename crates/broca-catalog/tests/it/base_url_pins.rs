@@ -259,7 +259,10 @@ fn generated_base_url_pins_preserve_every_provider_base_url() {
         .expect("overlay.patch is an object");
 
     for (id, entry) in &providers {
-        let before = pre_migration_overlay_base_url(id)
+        // The authored OpenAI pin now sets the Responses base URL to https://api.openai.com/v1.
+        let before = (id == "openai")
+            .then_some("https://api.openai.com/v1")
+            .or_else(|| pre_migration_overlay_base_url(id))
             .or_else(|| entry.get("api").and_then(Value::as_str))
             .unwrap_or("");
         let after = mapped_base_url(id, entry, patch);
@@ -322,14 +325,15 @@ fn pre_migration_overlay_endpoints_stay_authored() {
 }
 
 #[test]
-fn provider_without_document_api_uses_the_family_default_endpoint() {
+fn provider_without_endpoint_pin_uses_the_family_default_endpoint() {
     let providers = snapshot_providers();
     assert_eq!(
         document_base_url(providers.get("openai").expect("snapshot has openai")),
         None,
         "the fallback witness must have no document api"
     );
-    let overlay = overlay_value();
+    // Exercise the no-pin fallback independently of the bundled overlay's explicit OpenAI host.
+    let overlay = json!({"patch": {}});
     let patch = overlay
         .get("patch")
         .and_then(Value::as_object)
@@ -340,7 +344,7 @@ fn provider_without_document_api_uses_the_family_default_endpoint() {
         "the fallback witness must have no overlay endpoint pin"
     );
 
-    let catalog = Catalog::from_json_str(SNAPSHOT, OVERLAY).expect("bundled catalog parses");
+    let catalog = Catalog::from_json_str(SNAPSHOT, &overlay.to_string()).expect("catalog parses");
     let (provider, model) = catalog
         .model_for_serving("openai", "gpt-4.1")
         .expect("openai/gpt-4.1 is served");

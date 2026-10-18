@@ -136,6 +136,7 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
         frozen.provider_text_state,
         &name_map,
         &updates,
+        frozen.static_options.get("store") == Some(&Value::Bool(false)),
     );
 
     let mut body = json!({
@@ -203,6 +204,13 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
         &mut body,
         name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
     );
+    // Provider-required request flags are frozen at admission, so enabling stateless reasoning
+    // for a host does not change the bytes of runs admitted before that policy existed.
+    if let Some(options) = frozen.static_options.as_object() {
+        for (key, value) in options {
+            body[key] = value.clone();
+        }
+    }
     body
 }
 
@@ -253,6 +261,7 @@ fn convert_input_items(
     provider_text_state: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
+    stateless: bool,
 ) -> Vec<Value> {
     let skip_system = matches!(system_policy, SystemPromptPolicy::InstructionsField);
     let mut out = Vec::new();
@@ -287,6 +296,7 @@ fn convert_input_items(
                 target_family,
                 provider_text_state,
                 name_map,
+                stateless,
             )),
             Role::Tool => out.extend(convert_tool_output_items(message)),
         }
@@ -321,15 +331,19 @@ fn reasoning_format_matches_family(format: EncryptedReasoningFormat, family: Wir
     )
 }
 
-/// Convert the complete response item into the continuation shape sent by the native Codex
-/// client. Response-only ids and metadata are removed; the summary and encrypted ciphertext
-/// remain byte-for-byte unchanged, and the request uses `content:null`.
-fn reasoning_request_item(raw_response_item: &str) -> Option<Value> {
+/// A frozen `store:false` request echoes the complete reasoning item, as xAI requires. Configs
+/// without that flag retain the previous shape: response ids and metadata are removed, summary
+/// and ciphertext are preserved, and `content:null` is added. Keeping that branch reproduces
+/// the input of runs recorded before stateless continuation was enabled.
+fn reasoning_request_item(raw_response_item: &str, stateless: bool) -> Option<Value> {
     let response: Value = serde_json::from_str(raw_response_item).ok()?;
     if response.get("type").and_then(Value::as_str) != Some("reasoning") {
         return None;
     }
     let encrypted_content = response.get("encrypted_content")?.as_str()?;
+    if stateless {
+        return Some(response);
+    }
     let summary = response
         .get("summary")
         .cloned()
@@ -389,6 +403,7 @@ fn convert_assistant_items(
     target_family: WireFamilyId,
     provider_text_state: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    stateless: bool,
 ) -> Vec<Value> {
     fn flush_text(out: &mut Vec<Value>, text: &mut String) {
         if text.is_empty() {
@@ -440,7 +455,7 @@ fn convert_assistant_items(
                 provider_format: Some(provider_format),
             } if echo_safe && reasoning_format_matches_family(*provider_format, target_family) => {
                 flush_text(&mut out, &mut text);
-                if let Some(item) = reasoning_request_item(data) {
+                if let Some(item) = reasoning_request_item(data, stateless) {
                     out.push(item);
                 }
             }

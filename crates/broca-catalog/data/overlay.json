@@ -773,6 +773,75 @@
       "wire_family": "openai_chat",
       "wire_family_source": "generated"
     },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "base_url_source": "authored",
+      "models": {
+        "chatgpt-image-latest": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-3.5-turbo": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4-turbo": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4.1": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4.1-mini": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4.1-nano": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-2024-05-13": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-2024-08-06": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-2024-11-20": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-mini": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-5.3-chat-latest": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-1": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-1-mini": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-1.5": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-2": {
+          "wire_family": "openai_chat"
+        },
+        "text-embedding-3-large": {
+          "wire_family": "openai_chat"
+        },
+        "text-embedding-3-small": {
+          "wire_family": "openai_chat"
+        },
+        "text-embedding-ada-002": {
+          "wire_family": "openai_chat"
+        }
+      },
+      "wire_family": "openai_responses",
+      "wire_family_reason": "OpenAI Responses preserves encrypted reasoning across tool and user turns; non-reasoning snapshot models retain Chat.",
+      "wire_family_source": "authored"
+    },
     "opencode": {
       "base_url": "https://opencode.ai/zen/v1",
       "base_url_source": "generated",
@@ -1135,6 +1204,9 @@
       "base_url": "https://api.x.ai/v1",
       "base_url_source": "authored",
       "models": {
+        "grok-4.20-0309-non-reasoning": {
+          "wire_family": "openai_chat"
+        },
         "grok-4.5": {
           "attachment": true,
           "cost": {
@@ -1182,10 +1254,21 @@
           },
           "name": "Grok Composer 2.5 Fast",
           "reasoning": false,
-          "tool_call": true
+          "tool_call": true,
+          "wire_family": "openai_chat"
+        },
+        "grok-imagine-image": {
+          "wire_family": "openai_chat"
+        },
+        "grok-imagine-video": {
+          "wire_family": "openai_chat"
+        },
+        "grok-imagine-video-1.5": {
+          "wire_family": "openai_chat"
         }
       },
-      "wire_family": "openai_chat",
+      "wire_family": "openai_responses",
+      "wire_family_reason": "xAI Responses preserves encrypted reasoning across tool and user turns; non-reasoning snapshot models retain Chat.",
       "wire_family_source": "authored"
     },
     "xiaomi": {

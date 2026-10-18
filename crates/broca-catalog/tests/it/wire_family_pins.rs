@@ -38,8 +38,11 @@ const PRE_MIGRATION_OVERLAY_PINS: &[(&str, WireFamilyId)] = &[
 
 /// Authored family choices that intentionally differ from the retired inference.
 /// Each exception has a separate reason in the provider overlay entry.
-const AUTHORED_OVERLAY_FAMILY_EXCEPTIONS: &[(&str, WireFamilyId)] =
-    &[("meta", WireFamilyId::OpenAiResponses)];
+const AUTHORED_OVERLAY_FAMILY_EXCEPTIONS: &[(&str, WireFamilyId)] = &[
+    ("meta", WireFamilyId::OpenAiResponses),
+    ("openai", WireFamilyId::OpenAiResponses),
+    ("xai", WireFamilyId::OpenAiResponses),
+];
 
 /// The npm package models.dev assigns to providers that speak the OpenAI-compatible
 /// `/chat/completions` shape — the long tail. Frozen copy of the retired rule 4.
@@ -406,7 +409,13 @@ fn pre_migration_overlay_pins_stay_authored() {
         );
         assert_eq!(
             current_overlay_family(patch, id),
-            Some(*family),
+            Some(
+                AUTHORED_OVERLAY_FAMILY_EXCEPTIONS
+                    .iter()
+                    .find(|(exception, _)| exception == id)
+                    .map(|(_, family)| *family)
+                    .unwrap_or(*family)
+            ),
             "{id} authored family must not change under generation"
         );
     }

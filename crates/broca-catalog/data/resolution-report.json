@@ -975,8 +975,8 @@
   {
     "provider_id": "openai",
     "npm": "@ai-sdk/openai",
-    "resolved_family": "openai_chat",
-    "resolution_source": "provider_id",
+    "resolved_family": "openai_responses",
+    "resolution_source": "overlay",
     "pending_reason": ""
   },
   {
@@ -1465,7 +1465,7 @@
   {
     "provider_id": "xai",
     "npm": "@ai-sdk/xai",
-    "resolved_family": "openai_chat",
+    "resolved_family": "openai_responses",
     "resolution_source": "overlay",
     "pending_reason": ""
   },

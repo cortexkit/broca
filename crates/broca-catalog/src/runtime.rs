@@ -640,7 +640,7 @@ fn serving_provider_spec(
         wire_family: family,
         auth_kind: crate::default_auth_kind(family),
         static_headers: Default::default(),
-        static_options: Value::Null,
+        static_options: crate::provider_static_options(provider_id, family),
         quirks: crate::provider_quirks(provider_id, family, &base_url),
         base_url,
         raw: Value::Null,

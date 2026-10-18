@@ -30,6 +30,9 @@
 //! `--reasoning-content-required` renders with the DeepSeek reasoning echo switched on.
 //! `--prompt-file` renders a canonical message array instead of a fresh user turn. Completed
 //! responses also write `assistant-message.json` so a second request can replay the real codec output.
+//! `--options-file` renders serialized `CallOptions` (including conversation history) through
+//! the real family, taking precedence over `--prompt-file`. `controls.json` saves the assembled
+//! control events for a follow-up turn.
 //!
 //! WIRE OPTIONS, all opt-in and applied after rendering, so `request-body.json` always holds
 //! the identity (uncompressed) body: `--header name=value` replaces a header (the name matches
@@ -116,6 +119,9 @@ struct Args {
     /// Send this file's bytes as the body instead of rendering one.
     #[arg(long)]
     body_file: Option<PathBuf>,
+    /// Render serialized CallOptions, including history, instead of a fresh user turn.
+    #[arg(long, conflicts_with_all = ["body_file", "replay_step", "system_file"])]
+    options_file: Option<PathBuf>,
     /// Render the request the `--wal` session made at this step instead of a fresh one-turn
     /// request: the WAL is replayed up to the step's start and rendered with the run's frozen
     /// config, the same offline path `broca-session cache-dump` checks against the recorded
@@ -596,14 +602,21 @@ async fn run(args: Args) -> Result<(), String> {
                             text: args.query.clone(),
                         }],
                     });
-                    if let Some(path) = &args.prompt_file {
-                        prompt = serde_json::from_slice(
-                            &std::fs::read(path)
-                                .map_err(|e| format!("read {}: {e}", path.display()))?,
-                        )
-                        .map_err(|e| format!("canonical prompt {}: {e}", path.display()))?;
-                    }
-                    let mut opts = CallOptions::new(prompt);
+                    let mut opts = if let Some(path) = &args.options_file {
+                        let bytes = std::fs::read(path)
+                            .map_err(|e| format!("read {}: {e}", path.display()))?;
+                        serde_json::from_slice::<CallOptions>(&bytes)
+                            .map_err(|e| format!("decode {}: {e}", path.display()))?
+                    } else {
+                        if let Some(path) = &args.prompt_file {
+                            prompt = serde_json::from_slice(
+                                &std::fs::read(path)
+                                    .map_err(|e| format!("read {}: {e}", path.display()))?,
+                            )
+                            .map_err(|e| format!("canonical prompt {}: {e}", path.display()))?;
+                        }
+                        CallOptions::new(prompt)
+                    };
                     opts.step_context = Some(StepContext {
                         run_id: "native-search-probe".into(),
                         step_index: 1,
@@ -844,6 +857,7 @@ async fn run(args: Args) -> Result<(), String> {
     // What broca's own stream normalizer makes of the response.
     let mut normalizer = family.normalizer(&frozen, StepId(1));
     let mut lines = Vec::new();
+    let mut controls = Vec::new();
     let mut normalizer_outcome = json!({"ok": true});
     match (&decoded, status) {
         (Some(decoded), 200) => {
@@ -855,16 +869,18 @@ async fn run(args: Args) -> Result<(), String> {
                 Ok(events) => {
                     normalizer_outcome = json!({"ok": true, "events": events.len()});
                     for event in events {
-                        if let broca_protocol::provider::NormalizedEvent::Control(
-                            broca_protocol::provider::ProviderControl::AssistantMessage { message },
-                        ) = &event
+                        if let broca_protocol::provider::NormalizedEvent::Control(control) = &event
                         {
-                            write_checked(
-                                &args.out.join("assistant-message.json"),
-                                &serde_json::to_vec(message).map_err(|e| e.to_string())?,
-                                Some(&secret.token),
-                                &mut redactions,
-                            );
+                            controls
+                                .push(serde_json::to_value(control).map_err(|e| e.to_string())?);
+                            if let broca_protocol::provider::ProviderControl::AssistantMessage { message } = control {
+                                write_checked(
+                                    &args.out.join("assistant-message.json"),
+                                    &serde_json::to_vec(message).map_err(|e| e.to_string())?,
+                                    Some(&secret.token),
+                                    &mut redactions,
+                                );
+                            }
                         }
                         lines.push(format!("{event:?}"));
                     }
@@ -880,6 +896,12 @@ async fn run(args: Args) -> Result<(), String> {
     write_checked(
         &args.out.join("normalized.jsonl"),
         lines.join("\n").as_bytes(),
+        Some(&secret.token),
+        &mut redactions,
+    );
+    write_checked(
+        &args.out.join("controls.json"),
+        &serde_json::to_vec_pretty(&controls).map_err(|e| e.to_string())?,
         Some(&secret.token),
         &mut redactions,
     );
