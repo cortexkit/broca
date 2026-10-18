@@ -26,6 +26,7 @@
 
 # Agent runtime + local tooling installs (reinstallable, not project deliverables)
 /.alfonso
+/.prefrontal
 /.opencode
 /.agents
 # CortexKit layout: internal docs, scripts and tool state stay out of git.
@@ -70,7 +71,8 @@
 # not a fact about the tree. No .log file has ever been legitimately tracked here.
 *.log
 
-# Test-rig binaries staged into worker worktrees by the head (see .cortexkit/alfonso/scripts).
+# Test-rig binaries staged into worker worktrees by the head (see .cortexkit/prefrontal/scripts,
+# formerly .cortexkit/alfonso/scripts).
 /.test-rigs/
 
 # Python bytecode written when the script suites import helper modules.
