@@ -131,12 +131,14 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
     let input = convert_input_items(
         &opts.prompt,
         frozen.system_prompt.clone(),
-        opts.target_model.as_ref(),
-        frozen.family_id,
-        frozen.provider_text_state,
         &name_map,
         &updates,
-        frozen.static_options.get("store") == Some(&Value::Bool(false)),
+        &ReplayPolicy {
+            target_model: opts.target_model.as_ref(),
+            target_family: frozen.family_id,
+            provider_text_state: frozen.provider_text_state,
+            stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
+        },
     );
 
     let mut body = json!({
@@ -253,15 +255,22 @@ fn instructions_from_policy(prompt: &[Message], policy: SystemPromptPolicy) -> O
     }
 }
 
+/// `target_model` and `target_family` fence provider-owned state to its compatible destination.
+/// The recorded `provider_text_state` switch enables assistant phase metadata; `stateless`
+/// keeps complete encrypted reasoning items instead of the legacy continuation shape.
+struct ReplayPolicy<'a> {
+    target_model: Option<&'a broca_protocol::ModelHandle>,
+    target_family: WireFamilyId,
+    provider_text_state: bool,
+    stateless: bool,
+}
+
 fn convert_input_items(
     prompt: &[Message],
     system_policy: SystemPromptPolicy,
-    target_model: Option<&broca_protocol::ModelHandle>,
-    target_family: WireFamilyId,
-    provider_text_state: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
-    stateless: bool,
+    replay: &ReplayPolicy<'_>,
 ) -> Vec<Value> {
     let skip_system = matches!(system_policy, SystemPromptPolicy::InstructionsField);
     let mut out = Vec::new();
@@ -290,14 +299,7 @@ fn convert_input_items(
         }
         match message.role {
             Role::System | Role::User => out.push(convert_easy_message(message)),
-            Role::Assistant => out.extend(convert_assistant_items(
-                message,
-                target_model,
-                target_family,
-                provider_text_state,
-                name_map,
-                stateless,
-            )),
+            Role::Assistant => out.extend(convert_assistant_items(message, name_map, replay)),
             Role::Tool => out.extend(convert_tool_output_items(message)),
         }
     }
@@ -399,11 +401,8 @@ fn convert_easy_message(m: &Message) -> Value {
 
 fn convert_assistant_items(
     message: &Message,
-    target_model: Option<&broca_protocol::ModelHandle>,
-    target_family: WireFamilyId,
-    provider_text_state: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
-    stateless: bool,
+    replay: &ReplayPolicy<'_>,
 ) -> Vec<Value> {
     fn flush_text(out: &mut Vec<Value>, text: &mut String) {
         if text.is_empty() {
@@ -416,8 +415,10 @@ fn convert_assistant_items(
         }));
     }
 
-    let echo_safe =
-        crate::families::signed_reasoning_is_echo_safe(message.origin.as_ref(), target_model);
+    let echo_safe = crate::families::signed_reasoning_is_echo_safe(
+        message.origin.as_ref(),
+        replay.target_model,
+    );
     let mut out = Vec::new();
     let mut text = String::new();
     for block in &message.content {
@@ -427,14 +428,14 @@ fn convert_assistant_items(
                 text: part,
                 provider_state,
             } => {
-                if provider_text_state {
+                if replay.provider_text_state {
                     flush_text(&mut out, &mut text);
                     let mut item = json!({"type":"message", "role":"assistant", "content":part});
                     if super::text_state_is_echo_safe(
                         message,
-                        target_model,
+                        replay.target_model,
                         provider_state.format,
-                        target_family,
+                        replay.target_family,
                     ) {
                         if let Ok(state) = serde_json::from_str::<Value>(&provider_state.data) {
                             if let Some(phase) = state.get("phase") {
@@ -453,9 +454,11 @@ fn convert_assistant_items(
             ContentBlock::RedactedReasoning {
                 data,
                 provider_format: Some(provider_format),
-            } if echo_safe && reasoning_format_matches_family(*provider_format, target_family) => {
+            } if echo_safe
+                && reasoning_format_matches_family(*provider_format, replay.target_family) =>
+            {
                 flush_text(&mut out, &mut text);
-                if let Some(item) = reasoning_request_item(data, stateless) {
+                if let Some(item) = reasoning_request_item(data, replay.stateless) {
                     out.push(item);
                 }
             }

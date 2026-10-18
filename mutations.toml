@@ -16321,3 +16321,16 @@ old = '''      "wire_family": "openai_responses",
 new = '''      "wire_family": "openai_chat",
       "wire_family_reason": "NON-VACUITY BREAK: discard OpenAI encrypted reasoning by routing to Chat.",'''
 
+
+[[control]]
+id = "xai-responses-structured-output-profile"
+guards = "Moving xAI to Responses retains enforced delivery for schemas in the xAI subset, including oneOf"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::xai_responses_retains_xai_schema_enforcement"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = 'family == WireFamilyId::OpenAiResponses && provider_id == "xai"'
+new = 'family == WireFamilyId::OpenAiResponses && provider_id == "xai" && false /* NON-VACUITY BREAK: apply the OpenAI subset to xAI Responses */'

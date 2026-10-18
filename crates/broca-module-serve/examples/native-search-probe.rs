@@ -873,7 +873,10 @@ async fn run(args: Args) -> Result<(), String> {
                         {
                             controls
                                 .push(serde_json::to_value(control).map_err(|e| e.to_string())?);
-                            if let broca_protocol::provider::ProviderControl::AssistantMessage { message } = control {
+                            if let broca_protocol::provider::ProviderControl::AssistantMessage {
+                                message,
+                            } = control
+                            {
                                 write_checked(
                                     &args.out.join("assistant-message.json"),
                                     &serde_json::to_vec(message).map_err(|e| e.to_string())?,
