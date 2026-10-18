@@ -219,6 +219,34 @@ struct VaultReading {
     serving_cached: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProjectionHealthReport {
+    failures: u64,
+    behind_sessions: u64,
+    detail: Option<String>,
+}
+
+fn projection_health_report(failures: u64, behind_sessions: u64) -> ProjectionHealthReport {
+    let detail = (behind_sessions > 0).then(|| {
+        format!(
+            "store projection behind on {behind_sessions} session(s); their reads replay the WAL tail until a projection succeeds"
+        )
+    });
+    ProjectionHealthReport {
+        failures,
+        behind_sessions,
+        detail,
+    }
+}
+
+fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
+    if details.is_empty() {
+        subc_protocol::session::HealthStatus::Ok
+    } else {
+        subc_protocol::session::HealthStatus::Degraded
+    }
+}
+
 fn now_epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1413,19 +1441,14 @@ async fn handle_control_request(
                 }
                 _ => "disconnected",
             };
-            // A count names the event and not the state it leaves, so an operator reading
-            // `projection_failures: 3` learns that something failed and not what to do about
-            // it. The consequence is what makes it actionable: the store's watermark stayed
-            // put, so affected sessions re-read a WAL tail that grows every turn and their
-            // transcript pages get slower until the next successful projection. That is the
-            // per-page latency we chased from the reader's side before connecting it to this
-            // counter. Degraded rather than Ok because reads really are degrading, even
-            // though every run completed correctly.
-            let projection_failures = broca_core::run::projection_failures();
-            if projection_failures > 0 {
-                details.push(format!(
-                    "store projection failed {projection_failures}x since boot;                      affected sessions re-read their full WAL tail per page until one succeeds"
-                ));
+            // Failure attempts remain visible in the counter after recovery; only unresolved
+            // sessions degrade health because their reads still replay the WAL tail.
+            let projection_health = projection_health_report(
+                broca_core::run::projection_failures(),
+                broca_core::run::projection_behind_sessions(),
+            );
+            if let Some(detail) = &projection_health.detail {
+                details.push(detail.clone());
             }
             let catalog_health = catalog_cache.map(|cache| cache.health(now_ms));
             if let Some(Err(error)) = &catalog_health {
@@ -1491,16 +1514,12 @@ async fn handle_control_request(
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
             }
-            let status = if details.is_empty() {
-                subc_protocol::session::HealthStatus::Ok
-            } else {
-                subc_protocol::session::HealthStatus::Degraded
-            };
+            let status = health_status(&details);
             let detail = (!details.is_empty()).then(|| details.join("; "));
             let (stale_epoch_drops, unmatched_terminal_drops) = broca_subc::FRAME_DROPS.counts();
             // EVERY FIGURE BELOW IS THIS PROCESS DESCRIBING ITSELF: in-memory counters and
-            // gauges this same process wrote. That is what makes the probe cheap and lock-free,
-            // and it bounds what a green reading can mean -- it says the process believes it is
+            // gauges this same process wrote. That is what makes the probe cheap, and it bounds what
+            // a green reading can mean -- it says the process believes it is
             // healthy, not that the work landed. The failure it structurally cannot see is one
             // where the process is wrong about its own state, and a peer lost four days to
             // exactly that: their health read green throughout because it asked the process
@@ -1551,11 +1570,10 @@ async fn handle_control_request(
                     // reverse_request_unhandled because broca fronts no person who could answer.
                     // Non-zero means some module is asking and not getting what it wants.
                     "reverse_requests_refused": broca_subc::FRAME_DROPS.reverse_requests_refused(),
-                    // Attempts this process saw fail, not a claim that the store is current: a
-                    // fresh process reads zero with an arbitrarily stale store behind it. Non-zero
-                    // means some session's reads are merging a growing WAL tail and getting slower
-                    // every turn, which previously surfaced only as one line in the shared log.
-                    "projection_failures": projection_failures,
+                    // Lifetime attempts this process saw fail; recovery clears only the separate
+                    // behind-session gauge, never this historical counter.
+                    "projection_failures": projection_health.failures,
+                    "projection_behind_sessions": projection_health.behind_sessions,
                     // Lifetime operation counts for THIS process. They reset on restart and are not
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
@@ -3643,6 +3661,30 @@ mod tests {
         CancelResponse, RetractResponse, RunStatusResponse, SendRequest, SendResponse,
         SessionReadResponse, StatusResponse,
     };
+
+    #[test]
+    fn projection_health_degrades_only_for_sessions_still_behind() {
+        let recovered = projection_health_report(1, 0);
+        assert_eq!(recovered.failures, 1);
+        assert_eq!(recovered.behind_sessions, 0);
+        assert_eq!(recovered.detail, None);
+        assert_eq!(health_status(&[]), subc_protocol::session::HealthStatus::Ok);
+
+        let lagging = projection_health_report(2, 1);
+        let detail = lagging.detail.expect("a behind session degrades health");
+        assert_eq!(
+            health_status(std::slice::from_ref(&detail)),
+            subc_protocol::session::HealthStatus::Degraded
+        );
+        assert_eq!(
+            detail,
+            "store projection behind on 1 session(s); their reads replay the WAL tail until a projection succeeds"
+        );
+        assert!(
+            !detail.contains("  "),
+            "health detail contains an accidental run of spaces: {detail:?}"
+        );
+    }
 
     #[tokio::test]
     async fn watchdog_reader_phase_gates_name_stalls() {
