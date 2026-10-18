@@ -219,6 +219,10 @@ pub struct FrozenRenderConfig {
     /// Older frozen configs omit this flag and continue discarding those fields on resume.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provider_text_state: bool,
+    /// Decode and replay Bedrock Converse reasoning blocks. Older frozen configs omit this
+    /// switch and retain their original reasoning-free requests and normalized content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bedrock_reasoning: bool,
     /// The run's structured-output settings, decided at admission (see
     /// `crate::structured_output::decide`) and rendered into every request of the run: the
     /// submit tool, the family's schema encoding, or schema instructions. `None` (a run

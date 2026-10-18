@@ -1,0 +1,1 @@
+{"include":["reasoning.encrypted_content"],"input":[{"content":"First","role":"user","type":"message"},{"encrypted_content":"opaque","id":"r1","summary":[],"type":"reasoning"},{"content":"Answer","role":"assistant","type":"message"},{"content":"Next","role":"user","type":"message"}],"max_output_tokens":1024,"model":"muse-spark-1.3","store":false,"stream":true}

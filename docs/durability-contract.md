@@ -99,6 +99,19 @@ addition does not change a renderer version. Older binaries ignore an unknown `r
 field in typed config decoding, but actual resumes refuse on recorded/current config drift
 rather than silently sending a request without the echo.
 
+Bedrock Converse's frozen `bedrock_reasoning` switch enables decode and replay of reasoning
+text/signatures and encrypted redacted content for new episodes. Missing/false retains the old
+reasoning-free normalizer and request shape. These use existing `reasoning` and untagged
+`redacted_reasoning` blocks; no new closed enum value or WAL feature is needed. Renderer versions
+are unchanged. Meta Responses now freezes `store:false` and encrypted-reasoning `include` in
+`static_options`, just like OpenAI API-key and xAI Responses. Old Meta configs keep their previous
+store/include omissions and legacy reasoning-item shape when resumed.
+
+Meta's `store:false` policy controls response persistence, not prompt-cache affinity. Its
+session-stable `prompt_cache_key` remains an independent frozen render input, retained across
+tool continuations and later user turns. Keep that key when validating stateless replay against
+production: successful encrypted-item replay alone does not establish cache reuse.
+
 ## 3. The barrier (per turn's tool batch)
 
 On Unix, the first WAL barrier after **every open**, including recovery of an

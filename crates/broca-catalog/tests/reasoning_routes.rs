@@ -9,8 +9,8 @@ use broca_catalog::{
     Catalog,
 };
 use broca_protocol::{
-    content::{ContentBlock, EncryptedReasoningFormat, Message, Role},
-    CallOptions, ModelHandle,
+    content::{ContentBlock, EncryptedReasoningFormat, Message, Role, ToolOutput, ToolResult},
+    CallOptions, ModelHandle, NormalizedEvent, ProviderControl, StepId, ToolCallId,
 };
 use broca_provider::{
     families::{renderer_version_for, resolve_frozen},
@@ -109,6 +109,171 @@ fn xai_reasoning_route_is_stateless_responses() {
 #[test]
 fn openai_api_key_reasoning_route_is_stateless_responses() {
     assert_route("openai", "gpt-5.1", "https://api.openai.com/v1");
+}
+
+#[test]
+fn meta_reasoning_route_is_stateless_responses() {
+    assert_route("meta", "muse-spark-1.3", "https://api.meta.ai/v1");
+}
+
+#[test]
+fn responses_host_inventory_limits_new_policy_to_meta() {
+    let catalog = catalog();
+    let mut hosts: Vec<_> = catalog
+        .provider_ids()
+        .filter(|id| {
+            catalog
+                .provider(id)
+                .is_some_and(|spec| spec.wire_family == WireFamilyId::OpenAiResponses)
+        })
+        .collect();
+    hosts.sort();
+    assert_eq!(hosts, ["meta", "openai", "xai"]);
+}
+
+#[test]
+fn bedrock_admission_freezes_reasoning_without_changing_renderer_version() {
+    let catalog = catalog();
+    let (spec, model) = catalog
+        .model_for_serving("amazon-bedrock", "amazon.nova-2-lite-v1:0")
+        .unwrap();
+    let frozen =
+        resolve_frozen(&spec, &model, 2048, renderer_version_for(spec.wire_family)).unwrap();
+    assert!(frozen.bedrock_reasoning);
+    assert_eq!(frozen.renderer_version, 2);
+    let recorded = serde_json::to_value(&frozen).unwrap();
+    assert_eq!(recorded["bedrock_reasoning"], true);
+}
+
+#[test]
+fn meta_replays_normalized_encrypted_reasoning_across_tool_and_user_turns() {
+    install();
+    let resolved = resolve_provider(
+        "meta/muse-spark-1.3",
+        None,
+        1024,
+        &AuthMode::Secret("not-a-real-key".into()),
+        &ResolveOptions {
+            auth_method: Some(AuthMethod::ApiKey),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let frozen: FrozenRenderConfig =
+        serde_json::from_value(resolved.provider.render_config_blob()).unwrap();
+    // Doc-derived SSE output items from Meta's "Reasoning items in multi-turn input".
+    // Ciphertext is synthetic. Completed output items must survive the actual Responses normalizer.
+    // https://dev.meta.ai/docs/protocols/responses#reasoning-items
+    let stream = include_bytes!("fixtures/meta_reasoning.sse");
+    let events = broca_provider::conformance::normalize_recorded(
+        wire_family(frozen.family_id).unwrap().as_ref(),
+        &frozen,
+        StepId(1),
+        stream,
+        7,
+    )
+    .unwrap();
+    let content = events
+        .into_iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message.content)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(
+        &content[0],
+        ContentBlock::RedactedReasoning {
+            provider_format: Some(EncryptedReasoningFormat::OpenAiResponses),
+            ..
+        }
+    ));
+    let opts = CallOptions::new(vec![
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "First".into(),
+            }],
+        ),
+        Message::assistant_from(content, ModelHandle::new("meta", "muse-spark-1.3")),
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("call_meta".into()),
+                output: ToolOutput::Text { text: "7".into() },
+                is_error: false,
+            })],
+        ),
+        Message::assistant_from(
+            vec![ContentBlock::Text {
+                text: "Answer".into(),
+            }],
+            ModelHandle::new("meta", "muse-spark-1.3"),
+        ),
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "Next".into(),
+            }],
+        ),
+    ]);
+    let bytes = resolved.provider.render_request(&opts);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["input"][1],
+        json!({"id":"rs_meta","type":"reasoning","summary":[],"encrypted_content":"synthetic-cipher"})
+    );
+    assert_eq!(body["input"][2]["call_id"], "call_meta");
+    assert_eq!(body["input"][3]["call_id"], "call_meta");
+    golden("meta-reasoning-tool-replay.json", &bytes);
+}
+
+#[test]
+fn recorded_bedrock_and_meta_configs_rebuild_without_adopting_new_policy() {
+    install();
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../broca-provider/tests/fixtures/reasoning_context_legacy.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let provider = case["provider"].as_str().unwrap();
+        let frozen: FrozenRenderConfig = serde_json::from_value(case["frozen"].clone()).unwrap();
+        let old_blob = serde_json::to_value(&frozen).unwrap();
+        let resumed = provider_for_recorded_config(
+            provider,
+            "model",
+            frozen,
+            &AuthMode::Secret("not-a-real-key".into()),
+            Some(AuthMethod::ApiKey),
+            None,
+            None,
+            broca_provider::build_provider_http_client(),
+            &broca_core::clock::Clock::default(),
+        )
+        .unwrap();
+        assert_eq!(resumed.render_config_blob(), old_blob);
+        let request = CallOptions::new(vec![
+            Message::new(Role::User, vec![ContentBlock::Text { text: "question".into() }]),
+            Message::assistant_from(vec![
+                ContentBlock::Reasoning { text: "think".into(), signature: Some("sig".into()) },
+                ContentBlock::RedactedReasoning { data: "AQID".into(), provider_format: None },
+                ContentBlock::RedactedReasoning {
+                    data: r#"{"id":"r1","type":"reasoning","summary":[],"encrypted_content":"cipher","status":"completed"}"#.into(),
+                    provider_format: Some(EncryptedReasoningFormat::OpenAiResponses),
+                },
+                ContentBlock::Text { text: "answer".into() },
+            ], ModelHandle::new(provider, "model")),
+            Message::new(Role::User, vec![ContentBlock::Text { text: "next".into() }]),
+        ]);
+        assert_eq!(
+            resumed.render_request(&request),
+            case["body"].as_str().unwrap().as_bytes()
+        );
+        let body: Value = serde_json::from_slice(&resumed.render_request(&request)).unwrap();
+        assert!(body.get("store").is_none());
+        assert!(body.get("include").is_none());
+    }
 }
 
 #[test]

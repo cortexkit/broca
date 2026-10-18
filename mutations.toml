@@ -16665,3 +16665,142 @@ expect_red = ["executor::tests::chatgpt_run_recorded_at_version_7_resumes_under_
 file = "crates/broca-catalog/src/live.rs"
 old = "            config.provider_text_state = recorded;"
 new = "            let _ = recorded; // NON-VACUITY BREAK: re-resolve the flag on resume"
+[[control]]
+id = "bedrock-reasoning-text-decode"
+guards = "Bedrock reasoning text fragments survive the binary stream normalizer"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/bedrock_reasoning.rs"
+expect_red = ["bedrock_reasoning::bedrock_reasoning_stream_preserves_text_signatures_redaction_and_order"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '                text.push_str(part);'
+new = '                text.push_str(""); // NON-VACUITY BREAK: discard reasoning text.'
+
+[[control]]
+id = "bedrock-reasoning-signature-decode"
+guards = "Bedrock reasoning signatures including signature-only blocks survive decoding"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/bedrock_reasoning.rs"
+expect_red = ["bedrock_reasoning::bedrock_reasoning_stream_preserves_text_signatures_redaction_and_order"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '                signature.get_or_insert_with(String::new).push_str(part);'
+new = '                signature.get_or_insert_with(String::new).push_str(""); // NON-VACUITY BREAK: lose signature fragments.'
+
+[[control]]
+id = "bedrock-redacted-reasoning-decode"
+guards = "Bedrock independently encoded redacted deltas retain their exact encrypted bytes"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/bedrock_reasoning.rs"
+expect_red = ["bedrock_reasoning::bedrock_reasoning_stream_preserves_text_signatures_redaction_and_order"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '            buffer.extend(bytes);'
+new = '            buffer.extend(bytes.into_iter().map(|_| 0)); // NON-VACUITY BREAK: corrupt redacted bytes.'
+
+[[control]]
+id = "bedrock-reasoning-signature-echo"
+guards = "Bedrock signed reasoning is echoed unchanged before tool calls and across user turns"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/bedrock_reasoning.rs"
+expect_red = ["bedrock_reasoning::bedrock_echoes_reasoning_on_tool_and_later_user_turns"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '                    reasoning["signature"] = json!(signature);'
+new = '                    reasoning["signature"] = json!(format!("{signature}-changed")); // NON-VACUITY BREAK: alter the signed block.'
+
+[[control]]
+id = "bedrock-redacted-reasoning-echo"
+guards = "Bedrock redacted reasoning is returned in its original block position with identical bytes"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/bedrock_reasoning.rs"
+expect_red = ["bedrock_reasoning::bedrock_echoes_reasoning_on_tool_and_later_user_turns"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '            } if echo_reasoning => Some(json!({"reasoningContent": {"redactedContent": data}})),'
+new = '            } if echo_reasoning => Some(json!({"reasoningContent": {"redactedContent": format!("{data}changed")}})), // NON-VACUITY BREAK: alter encrypted replay.'
+
+[[control]]
+id = "bedrock-reasoning-legacy-render-gate"
+guards = "Old frozen Bedrock runs retain their original reasoning-free request bytes"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/reasoning_context_legacy.rs"
+expect_red = ["reasoning_context_legacy::old_bedrock_and_meta_configs_resume_with_exact_request_bytes"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '            let echo_reasoning = frozen.bedrock_reasoning'
+new = '            let echo_reasoning = (frozen.bedrock_reasoning || !frozen.bedrock_reasoning) /* NON-VACUITY BREAK: enable echo for old configs */'
+
+[[control]]
+id = "bedrock-reasoning-admission-opt-in"
+guards = "Fresh catalog admissions freeze the Bedrock reasoning opt-in"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_routes"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/reasoning_routes.rs"
+expect_red = ["bedrock_admission_freezes_reasoning_without_changing_renderer_version"]
+file = "crates/broca-provider/src/families/mod.rs"
+old = '        bedrock_reasoning: provider.wire_family == WireFamilyId::BedrockConverse,'
+new = '        bedrock_reasoning: false, // NON-VACUITY BREAK: never enable Bedrock reasoning.'
+
+[[control]]
+id = "meta-responses-stateless-admission"
+guards = "New Meta Responses runs request encrypted reasoning without server-side storage"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_routes"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/reasoning_routes.rs"
+expect_red = ["meta_reasoning_route_is_stateless_responses"]
+file = "crates/broca-catalog/src/lib.rs"
+old = 'matches!(provider_id, "openai" | "xai" | "meta")'
+new = 'matches!(provider_id, "openai" | "xai") /* NON-VACUITY BREAK: omit Meta stateless flags */'
+
+[[control]]
+id = "meta-responses-complete-encrypted-replay"
+guards = "Meta echoes complete normalized encrypted reasoning items instead of the legacy shape"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_routes"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/reasoning_routes.rs"
+expect_red = ["meta_replays_normalized_encrypted_reasoning_across_tool_and_user_turns"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = '            stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),'
+new = '            stateless: false, // NON-VACUITY BREAK: use legacy reasoning-item replay.'
+
+[[control]]
+id = "bedrock-reasoning-target-fence"
+guards = "Bedrock reasoning is echoed only when the destination model is known and matches the origin"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/tests/it/bedrock_reasoning.rs"
+expect_red = ["bedrock_reasoning::bedrock_does_not_echo_reasoning_without_target"]
+file = "crates/broca-provider/src/families/bedrock_converse.rs"
+old = '                && opts.target_model.is_some()'
+new = '                && (opts.target_model.is_some() || opts.target_model.is_none()) /* NON-VACUITY BREAK: echo reasoning without a destination */'

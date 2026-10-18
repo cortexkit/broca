@@ -1,0 +1,9 @@
+data: {"type":"response.created","response":{"id":"resp_meta","status":"in_progress"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_meta","type":"reasoning","summary":[],"encrypted_content":"synthetic-cipher"}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_meta","name":"lookup","arguments":"{}"}}
+
+data: {"type":"response.completed","response":{"id":"resp_meta","status":"completed"}}
+
+: end of synthetic fixture

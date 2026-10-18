@@ -1,0 +1,12 @@
+[
+  {
+    "provider": "amazon-bedrock",
+    "frozen": {"family_id":"bedrock_converse","renderer_version":2,"wire_model_id":"model","max_output_tokens":2048,"reasoning":{"mode":"none"},"tool_id":"passthrough","system_prompt":{"mode":"top_level_field"},"usage":"bedrock_usage","token_limit_field":"max_tokens"},
+    "body": "{\"inferenceConfig\":{\"maxTokens\":2048},\"messages\":[{\"content\":[{\"text\":\"question\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"answer\"}],\"role\":\"assistant\"},{\"content\":[{\"text\":\"next\"}],\"role\":\"user\"}]}"
+  },
+  {
+    "provider": "meta",
+    "frozen": {"family_id":"openai_responses","renderer_version":6,"wire_model_id":"model","base_url":"https://api.meta.ai/v1","max_output_tokens":2048,"reasoning":{"mode":"none"},"tool_id":"passthrough","system_prompt":{"mode":"instructions_field"},"usage":"open_ai_usage","token_limit_field":"max_output_tokens","provider_text_state":true},
+    "body": "{\"input\":[{\"content\":\"question\",\"role\":\"user\",\"type\":\"message\"},{\"content\":null,\"encrypted_content\":\"cipher\",\"summary\":[],\"type\":\"reasoning\"},{\"content\":\"answer\",\"role\":\"assistant\",\"type\":\"message\"},{\"content\":\"next\",\"role\":\"user\",\"type\":\"message\"}],\"max_output_tokens\":2048,\"model\":\"model\",\"stream\":true}"
+  }
+]

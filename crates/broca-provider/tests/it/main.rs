@@ -38,6 +38,7 @@ mod base_url_override;
 mod bedrock_converse_golden;
 #[cfg(feature = "live")]
 mod bedrock_e2e;
+mod bedrock_reasoning;
 mod bedrock_tool_id_alias;
 mod cache_marker_render_view;
 mod cache_policy_serde;
@@ -70,6 +71,7 @@ mod ordinal_render_invariant;
 mod provider_state_legacy;
 mod provider_text_state;
 mod reasoning_content_required;
+mod reasoning_context_legacy;
 mod render_golden_version_enforcement;
 mod renderer_version_reproduction;
 mod responses_cache_write_usage;

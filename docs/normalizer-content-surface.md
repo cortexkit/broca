@@ -116,9 +116,9 @@ completed-item repeat in the stream. The message is assembled from deltas at `fi
 
 ## bedrock_converse.rs
 
-Bedrock delivers text only via `contentBlockDelta`; `contentBlockStart.start` carries only
-`toolUse` (id/name up front) or `reasoningContent`, never text. So ignoring the value of
-`start.text` (block-type detection only) is correct.
+Bedrock delivers text and reasoning fragments via `contentBlockDelta`; tool identity arrives in
+`contentBlockStart.start.toolUse`. Ignoring the value of `start.text` (block-type detection
+only) does not discard streamed text.
 
 | Event | Content carried | Status | Source |
 | --- | --- | --- | --- |
@@ -130,7 +130,9 @@ Bedrock delivers text only via `contentBlockDelta`; `contentBlockStart.start` ca
 | `messageStop` | stopReason | read | `bedrock_converse.rs:900` |
 | `metadata` | usage | read | `bedrock_converse.rs:909` |
 | `*Exception` / `*Error` frames | error (control) | n/a | `bedrock_converse.rs:886`, `:916` |
-| `contentBlockStart.start.reasoningContent`, `contentBlockDelta.delta.reasoningContent` | reasoning | **unread** | no handler |
+| `contentBlockDelta.delta.reasoningContent` | reasoning text, signature fragments, base64 redacted bytes | read when frozen `bedrock_reasoning` is true | `push_reasoning_delta` |
 
-Bedrock reasoning is not represented in `BlockBuf` and is not decoded by this
-normalizer. The other listed Bedrock content paths are handled as shown above.
+Bedrock reasoning uses distinct buffers at the original content-block indices. Signature-only
+blocks survive, and independently encoded redacted deltas are decoded before their bytes are
+concatenated. The assembled block is encoded once for replay. Older frozen configs without
+`bedrock_reasoning` retain their original reasoning-free normalized output and request bytes.

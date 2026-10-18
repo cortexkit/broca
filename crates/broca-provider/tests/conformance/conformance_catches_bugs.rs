@@ -43,6 +43,7 @@ fn frozen() -> FrozenRenderConfig {
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
         provider_text_state: false,
+        bedrock_reasoning: false,
         structured_output: None,
         claude_code_persona: None,
     }

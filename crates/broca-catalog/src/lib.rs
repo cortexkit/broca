@@ -669,7 +669,9 @@ fn map_provider(
 /// Stateless Responses continuations carry encrypted reasoning in the durable transcript rather
 /// than depending on a provider's response store. These flags become part of the frozen config.
 fn provider_static_options(provider_id: &str, family: WireFamilyId) -> Value {
-    if family == WireFamilyId::OpenAiResponses && matches!(provider_id, "openai" | "xai") {
+    // Meta's Responses protocol, "Reasoning items in multi-turn input", documents the same
+    // stateless encrypted replay contract: https://dev.meta.ai/docs/protocols/responses#reasoning-items
+    if family == WireFamilyId::OpenAiResponses && matches!(provider_id, "openai" | "xai" | "meta") {
         serde_json::json!({"store": false, "include": ["reasoning.encrypted_content"]})
     } else {
         Value::Null

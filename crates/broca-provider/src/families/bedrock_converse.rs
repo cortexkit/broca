@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine;
 use broca_protocol::{
     content::{AssistantMessage, ContentBlock, FinishReason, Message, Role, ToolCall, ToolOutput},
     display::DisplayEvent,
@@ -114,14 +115,16 @@ impl WireFamily for BedrockConverse {
 
     fn normalizer(
         &self,
-        _frozen: &FrozenRenderConfig,
+        frozen: &FrozenRenderConfig,
         step_id: StepId,
     ) -> Box<dyn StreamNormalizer> {
         // The output cap is left unknown here: the body renders `maxTokens` from the per-step
         // generation cap when one is set, which the normalizer never sees, so naming the frozen
         // default could state the wrong number. The provider's stop reason proves the cut, and
         // the metadata trailer's output-token count rides in the error beside it.
-        Box::new(BedrockStreamNormalizer::new(step_id))
+        let mut normalizer = BedrockStreamNormalizer::new(step_id);
+        normalizer.reasoning_enabled = frozen.bedrock_reasoning;
+        Box::new(normalizer)
     }
 }
 
@@ -143,7 +146,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         &crate::tool_id_alias::IdGrammar::bedrock(),
     );
     let system = convert_system(frozen, &opts.prompt, marker_policy.is_some());
-    let messages = convert_messages(&opts.prompt, &name_map, &id_map);
+    let messages = convert_messages(frozen, opts, &name_map, &id_map);
 
     if !system.is_empty() {
         body.insert("system".to_string(), Value::Array(system));
@@ -409,13 +412,23 @@ fn bedrock_cache_point(ttl: CacheTtl) -> Value {
 }
 
 fn convert_messages(
-    prompt: &[Message],
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
 ) -> Vec<Value> {
-    prompt
+    opts.prompt
         .iter()
-        .filter_map(|message| convert_message(message, name_map, id_map))
+        .filter_map(|message| {
+            let echo_reasoning = frozen.bedrock_reasoning
+                && message.role == Role::Assistant
+                && opts.target_model.is_some()
+                && super::signed_reasoning_is_echo_safe(
+                    message.origin.as_ref(),
+                    opts.target_model.as_ref(),
+                );
+            convert_message(message, name_map, id_map, echo_reasoning)
+        })
         // Bedrock rejects messages left empty after unsupported reasoning is stripped.
         .filter(|message| {
             message
@@ -430,16 +443,17 @@ fn convert_message(
     message: &Message,
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
+    echo_reasoning: bool,
 ) -> Option<Value> {
     match message.role {
         Role::System => None,
         Role::User => Some(json!({
             "role": "user",
-            "content": convert_content(&message.content, name_map, id_map),
+            "content": convert_content(&message.content, name_map, id_map, false),
         })),
         Role::Assistant => Some(json!({
             "role": "assistant",
-            "content": convert_content(&message.content, name_map, id_map),
+            "content": convert_content(&message.content, name_map, id_map, echo_reasoning),
         })),
         Role::Tool => {
             let content: Vec<Value> = message
@@ -459,6 +473,7 @@ fn convert_content(
     blocks: &[ContentBlock],
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
+    echo_reasoning: bool,
 ) -> Vec<Value> {
     blocks
         .iter()
@@ -480,6 +495,20 @@ fn convert_content(
                 }
             })),
             ContentBlock::ToolResult(result) => Some(convert_tool_result(result, id_map)),
+            // AWS ReasoningTextBlock, Contents/signature: multi-turn reasoning text and its
+            // signature must be returned unmodified. Keep empty signed blocks and source order.
+            // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ReasoningTextBlock.html
+            ContentBlock::Reasoning { text, signature } if echo_reasoning => {
+                let mut reasoning = json!({"text": text});
+                if let Some(signature) = signature {
+                    reasoning["signature"] = json!(signature);
+                }
+                Some(json!({"reasoningContent": {"reasoningText": reasoning}}))
+            }
+            ContentBlock::RedactedReasoning {
+                data,
+                provider_format: None,
+            } if echo_reasoning => Some(json!({"reasoningContent": {"redactedContent": data}})),
             ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => None,
         })
         .collect()
@@ -863,6 +892,13 @@ fn crc32(bytes: &[u8]) -> u32 {
 
 #[derive(Debug)]
 enum BlockBuf {
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
+    RedactedReasoning {
+        bytes: Vec<u8>,
+    },
     Text {
         text: String,
     },
@@ -874,6 +910,7 @@ enum BlockBuf {
 }
 
 pub struct BedrockStreamNormalizer {
+    reasoning_enabled: bool,
     arguments_guard: crate::wire::ToolArgsGuard,
     completed_blocks: std::collections::HashSet<usize>,
     step_id: StepId,
@@ -900,6 +937,7 @@ pub struct BedrockStreamNormalizer {
 impl BedrockStreamNormalizer {
     fn new(step_id: StepId) -> Self {
         Self {
+            reasoning_enabled: false,
             arguments_guard: Default::default(),
             completed_blocks: Default::default(),
             step_id,
@@ -1051,12 +1089,70 @@ impl BedrockStreamNormalizer {
         }
         let idx = block_index(event_payload);
         let delta = event_payload.get("delta").unwrap_or(event_payload);
+        if self.reasoning_enabled {
+            if let Some(reasoning) = delta.get("reasoningContent") {
+                self.push_reasoning_delta(idx, reasoning, out)?;
+            }
+        }
         if let Some(text) = string_field(delta, &["text"]) {
             self.push_text_delta(idx, text, out);
         }
         if let Some(tool_use) = delta.get("toolUse").or_else(|| delta.get("tool_use")) {
             if let Some(input) = string_field(tool_use, &["input"]) {
                 self.push_tool_input_delta(idx, input, out);
+            }
+        }
+        Ok(())
+    }
+
+    fn push_reasoning_delta(
+        &mut self,
+        idx: usize,
+        delta: &Value,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<(), NormalizeError> {
+        if let Some(encoded) = delta.get("redactedContent").and_then(Value::as_str) {
+            // Each JSON blob delta is independently base64-encoded; concatenate decoded bytes,
+            // not padded base64 strings, then encode the complete block once for replay.
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| {
+                    NormalizeError::Invalid(format!("decode Bedrock redactedContent: {error}"))
+                })?;
+            let block = self
+                .blocks
+                .entry(idx)
+                .or_insert_with(|| BlockBuf::RedactedReasoning { bytes: Vec::new() });
+            let BlockBuf::RedactedReasoning { bytes: buffer } = block else {
+                return Err(NormalizeError::Invalid(
+                    "Bedrock reasoning block changed type".into(),
+                ));
+            };
+            buffer.extend(bytes);
+        } else if delta.get("text").is_some() || delta.get("signature").is_some() {
+            let block = self
+                .blocks
+                .entry(idx)
+                .or_insert_with(|| BlockBuf::Reasoning {
+                    text: String::new(),
+                    signature: None,
+                });
+            let BlockBuf::Reasoning { text, signature } = block else {
+                return Err(NormalizeError::Invalid(
+                    "Bedrock reasoning block changed type".into(),
+                ));
+            };
+            if let Some(part) = delta.get("text").and_then(Value::as_str) {
+                text.push_str(part);
+                if !part.is_empty() {
+                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                        message_id: self.message_id.clone(),
+                        delta: part.to_owned(),
+                    }));
+                }
+            }
+            if let Some(part) = delta.get("signature").and_then(Value::as_str) {
+                signature.get_or_insert_with(String::new).push_str(part);
             }
         }
         Ok(())
@@ -1207,6 +1303,15 @@ impl BedrockStreamNormalizer {
                 continue;
             }
             match block {
+                BlockBuf::Reasoning { text, signature } => {
+                    content.push(ContentBlock::Reasoning { text, signature })
+                }
+                BlockBuf::RedactedReasoning { bytes } => {
+                    content.push(ContentBlock::RedactedReasoning {
+                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        provider_format: None,
+                    })
+                }
                 BlockBuf::Text { text } => content.push(ContentBlock::Text { text }),
                 BlockBuf::ToolUse {
                     id,

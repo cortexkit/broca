@@ -46,6 +46,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 futures = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = "1"
+# ConverseStream redacted reasoning blobs arrive as independently encoded base64 deltas.
+base64 = "0.22"
 httpdate = { version = "1", optional = true }
 # RFC 3339 parsing for the reset timestamp in Google's quota-exhausted 429 body. Already in
 # the lockfile (broca-module-serve), with the same minimal feature set.
