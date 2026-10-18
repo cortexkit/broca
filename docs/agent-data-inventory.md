@@ -52,7 +52,10 @@ The census queue and per-address coverage commit in batches of at most 128 rows.
 After interruption, enumeration adds any new addresses but already-covered
 payloads and probes are skipped. Work yields between addresses and pauses three
 times each batch's total work duration, including decoding and SQLite commits.
-Completed migration is not repeated on normal restarts. Legacy `run_index` writers
+Completed migration is not repeated on normal restarts.
+Downgrade-then-reupgrade is outside the projection-completeness guarantee: an older
+binary can add WAL-only sessions that the already-completed migration will not discover.
+Legacy `run_index` writers
 are tracked by triggers; current writers suppress those triggers only within the
 same transaction that records the candidate. Legacy gaps invalidate completeness
 and are reconciled on the next migration.
