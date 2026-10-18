@@ -1201,3 +1201,176 @@ async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
          {TOOL_RESULT_TEXT_BYTES} result text bytes"
     );
 }
+
+/// Records the tracked live bytes at the moment the run loop asks for its first model step,
+/// which is when the run's prompt, its replayed prior state and every retained record coexist.
+#[derive(Default)]
+struct StepAllocationProbeProvider {
+    live_bytes_at_step: AtomicIsize,
+    steps: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for StepAllocationProbeProvider {
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        if TRACK_ALLOCATIONS.load(Ordering::SeqCst)
+            && self.steps.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            self.live_bytes_at_step
+                .store(tracked_net_bytes(), Ordering::SeqCst);
+        }
+        assert!(
+            !opts.prompt.is_empty(),
+            "the probe must see the conversation it is measuring"
+        );
+        AllocationProbeProvider.step(step_id, opts).await
+    }
+}
+
+fn append_probe_request(run_id: &str, input: Vec<Message>) -> RunRequest {
+    RunRequest {
+        session_class: None,
+        retention: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        scope: None,
+        send_id: None,
+        request_identity_digest: None,
+        project_id: None,
+        principal: None,
+        run_id: RunId(run_id.into()),
+        session: BindIdentity {
+            project_root: "/tmp/append-prefix-allocation-probe".into(),
+            harness: "test".into(),
+            session: "append-prefix-allocation-probe".into(),
+        },
+        model: ModelHandle::new("stub", "stub-model"),
+        input,
+        tools: Vec::new(),
+        policy_allowed: HashSet::new(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        cache: None,
+        budget: None,
+        stop_when: Vec::new(),
+        submission_id: None,
+        context_limit: None,
+        work_class: None,
+        context_management: None,
+        variant: None,
+        service_tier: None,
+        inherit_frozen_cache: false,
+        structured_output: None,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn appended_episode_keeps_one_decoded_copy_of_the_prior_conversation() {
+    let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
+    const MESSAGE_COUNT: usize = 64;
+    const TEXT_BYTES: usize = 64 * 1_024;
+    const PRIOR_TEXT_BYTES: usize = MESSAGE_COUNT * TEXT_BYTES;
+
+    let dir = broca_test_support::scratch_root()
+        .join(format!("append-prefix-allocation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let wal = broca_core::FileWalStore::new(dir.join("wal"));
+    let lease = broca_core::FileLeaseStore::new(dir.join("lease"));
+    let plane = StubToolPlane::default();
+    let (out, mut events) = mpsc::channel(512);
+    let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+
+    // Episode 1 leaves a long idle lineage behind: its whole input becomes the prior
+    // conversation that the next send carries as its prefix.
+    let long_input = (0..MESSAGE_COUNT)
+        .map(|i| {
+            Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: format!("{i:04}{}", "x".repeat(TEXT_BYTES - 4)),
+                }],
+            )
+        })
+        .collect::<Vec<_>>();
+    broca_core::run_loop(
+        append_probe_request("append-prefix-seed", long_input),
+        &AllocationProbeProvider,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        &out,
+    )
+    .await
+    .expect("seed episode completes");
+    // One ordinary turn replaces the seed's long episode input in the lineage checkpoint with a
+    // short one, so the measured turn below sees the shape of a conversation many turns in
+    // rather than the extra copy of a just-written long input that resume identity checks read.
+    broca_core::run_loop_append_episode(
+        append_probe_request(
+            "append-prefix-settle",
+            vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "settle".into(),
+                }],
+            )],
+        ),
+        &AllocationProbeProvider,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        None,
+        &out,
+    )
+    .await
+    .expect("settling episode completes");
+
+    let provider = StepAllocationProbeProvider::default();
+    let follow_up = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "continue".into(),
+        }],
+    )];
+    start_tracking();
+    let result = broca_core::run_loop_append_episode(
+        append_probe_request("append-prefix-follow-up", follow_up),
+        &provider,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        None,
+        &out,
+    )
+    .await;
+    stop_tracking();
+    drop(out);
+    let _ = drain.await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    result.expect("appended episode completes");
+    assert_eq!(
+        provider.steps.load(Ordering::SeqCst),
+        1,
+        "the appended episode makes exactly one model call"
+    );
+    let live = provider.live_bytes_at_step.load(Ordering::SeqCst);
+    eprintln!(
+        "tracked live bytes at the appended episode's first step: {live}; prior text bytes: \
+         {PRIOR_TEXT_BYTES}"
+    );
+    // Without a session store the run keeps two transcript-sized owners on purpose: the WAL
+    // records it replayed (kept for late-approval checks) and the decoded conversation, which
+    // is the run's prompt. A clone of the reconstructed conversation into the episode prefix
+    // would add a third, so anything at or above two and a half copies is that duplicate.
+    assert!(
+        live < (PRIOR_TEXT_BYTES * 5 / 2) as isize,
+        "the appended episode retained a second decoded prior conversation: {live} tracked \
+         bytes for {PRIOR_TEXT_BYTES} prior text bytes"
+    );
+}

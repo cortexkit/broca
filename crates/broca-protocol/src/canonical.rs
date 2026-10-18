@@ -14,9 +14,15 @@ use serde_json::Value;
 
 /// Canonical, deterministic bytes for a JSON value: object keys sorted
 /// lexicographically at every level, compact, stable number formatting.
+///
+/// The returned buffer's capacity equals its length. The writer grows the vector by doubling,
+/// so without the final shrink up to half of a large request body's allocation would be spare
+/// capacity, and `Bytes::from(Vec)` keeps all of it alive for as long as the request can be
+/// retried. Shrinking moves no byte, so the rendered output is unchanged.
 pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     write_canonical(&mut out, value);
+    out.shrink_to_fit();
     out
 }
 
@@ -83,5 +89,21 @@ mod tests {
             canonical_json_bytes(&v),
             br#"{"args":{"dst":true,"tz":"Europe/Madrid"},"tool":"get_time"}"#.to_vec()
         );
+    }
+
+    #[test]
+    fn large_output_holds_no_spare_capacity() {
+        // A request body of a few megabytes is the case that matters: doubling growth would
+        // leave up to half of its allocation unused for the life of the retained request.
+        let blocks: Vec<Value> = (0..2_000)
+            .map(|i| json!({"type": "text", "text": format!("{i}:{}", "x".repeat(1_500))}))
+            .collect();
+        let bytes = canonical_json_bytes(&json!({"messages": blocks}));
+        assert!(
+            bytes.len() > 3_000_000,
+            "fixture renders {} bytes",
+            bytes.len()
+        );
+        assert_eq!(bytes.capacity(), bytes.len());
     }
 }

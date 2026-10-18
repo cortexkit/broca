@@ -672,9 +672,35 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             match candidates {
                 Ok(Ok(candidates)) => {
                     registry.resume_restart_pauses(wal, candidates).await;
+                    // Admitting the resumed runs decoded every one of their conversations at
+                    // once. Release what that wave freed at the next idle tick; the runs' own
+                    // terminals note their memory again as each one finishes.
+                    broca_memory_relief::note_freed();
                 }
                 error => {
                     tracing::warn!(target: "lifecycle", "restart resume: cannot list candidate runs: {error:?}")
+                }
+            }
+        })
+    };
+    // Return freed heap pages to the system after a peak. The hook wakes once per
+    // `MIN_INTERVAL` and does nothing unless a run finished or a session closed since its
+    // last release, so an idle daemon pays one timer wake a minute.
+    let _memory_relief = {
+        let stopping = registry.stopping_signal();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(broca_memory_relief::MIN_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                let released =
+                    tokio::task::spawn_blocking(broca_memory_relief::release_if_due).await;
+                if let Ok(Some(released)) = released {
+                    tracing::info!(target: "lifecycle", "returned freed heap pages: {released:?}");
                 }
             }
         })

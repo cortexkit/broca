@@ -120,12 +120,79 @@ const OBSERVER_RING_CAPACITY: usize = 1024;
 /// convenience, not durable.
 const DISPLAY_RING_CAPACITY: usize = 256;
 
+/// A broadcast ring that allocates its slot buffer when the first receiver subscribes.
+///
+/// Tokio's `broadcast::channel` allocates all of its slots up front. Most sessions never get a
+/// subscriber (a one-shot send, a background run), so creating the control and display rings at
+/// actor open cost every open actor about 40 KB for nothing. Until something subscribes there is
+/// no receiver, and a broadcast send with no receiver delivers nothing and retains nothing, so
+/// dropping those sends here is the same behavior the eager channel had. Once created, the ring
+/// lives as long as the fan-out that owns it.
+pub struct LazyRing<T> {
+    capacity: usize,
+    sender: Arc<std::sync::OnceLock<broadcast::Sender<T>>>,
+}
+
+impl<T> Clone for LazyRing<T> {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            sender: Arc::clone(&self.sender),
+        }
+    }
+}
+
+impl<T: Clone> LazyRing<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            sender: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Register a receiver, creating the ring on the first call.
+    fn subscribe(&self) -> broadcast::Receiver<T> {
+        self.sender
+            .get_or_init(|| broadcast::channel(self.capacity).0)
+            .subscribe()
+    }
+
+    /// Broadcast to the current receivers. Before the first subscribe there are none, so the
+    /// value is returned as unsent, exactly as a broadcast send with no receivers reports it.
+    pub fn send(&self, value: T) -> Result<usize, broadcast::error::SendError<T>> {
+        match self.sender.get() {
+            Some(sender) => sender.send(value),
+            None => Err(broadcast::error::SendError(value)),
+        }
+    }
+
+    /// Whether a subscriber has ever created the ring's buffer.
+    #[cfg(test)]
+    fn is_allocated(&self) -> bool {
+        self.sender.get().is_some()
+    }
+}
+
+impl<T> From<broadcast::Sender<T>> for LazyRing<T> {
+    /// Wrap a channel that already exists, for callers that build their own sender. The ring is
+    /// allocated already, so the capacity used for lazy creation is never read.
+    fn from(sender: broadcast::Sender<T>) -> Self {
+        Self {
+            capacity: 0,
+            sender: Arc::new(std::sync::OnceLock::from(sender)),
+        }
+    }
+}
+
+/// The live display stream's sender, handed to a run's output drain.
+pub type DisplaySender = LazyRing<Arc<broca_protocol::display::DisplayEvent>>;
+
 /// The fan-out: a control ring (fed by the projector from the writer's record observer)
 /// and a display ring (fed by the run's live `out` display events). Owned by the actor;
 /// subscribers attach via the actor's Subscribe command.
 pub struct Fanout<W: WalStore> {
     approvals: Arc<crate::approval_state::ApprovalState>,
-    ring: broadcast::Sender<Arc<ControlEvent>>,
+    ring: LazyRing<Arc<ControlEvent>>,
     /// Signals that the bounded writer→projector queue dropped records. Registered as part of
     /// the attach barrier so an attaching subscriber cannot miss a detach signal.
     detach_ring: broadcast::Sender<()>,
@@ -133,7 +200,7 @@ pub struct Fanout<W: WalStore> {
     /// NEVER fed control (control is sourced only from the WAL projection, so it can't
     /// double-publish). Live-only, never replayed — a fresh display subscriber gets events
     /// from attach onward, with a `DisplayGap` on lag.
-    display_ring: broadcast::Sender<Arc<broca_protocol::display::DisplayEvent>>,
+    display_ring: DisplaySender,
     wal_store: Arc<W>,
     session: BindIdentity,
     /// Tracks both active subscribers and attaches that have registered a receiver but have
@@ -311,8 +378,8 @@ impl<W: WalStore + 'static> Fanout<W> {
     /// the observer, projects each record, and broadcasts the units on the ring.
     pub fn new(wal_store: Arc<W>, session: BindIdentity) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
-        let (ring, _) = broadcast::channel(RING_CAPACITY);
-        let (display_ring, _) = broadcast::channel(DISPLAY_RING_CAPACITY);
+        let ring = LazyRing::new(RING_CAPACITY);
+        let display_ring = LazyRing::new(DISPLAY_RING_CAPACITY);
         let (detach_ring, _) = broadcast::channel(1);
         let (obs_tx, obs_rx) = broadcast::channel(OBSERVER_RING_CAPACITY);
         let (projection_seed, seed_rx) = mpsc::unbounded_channel();
@@ -362,7 +429,7 @@ impl<W: WalStore + 'static> Fanout<W> {
     /// so the drain never stalls; a full ring drops the oldest, a lagging subscriber gets a
     /// `DisplayGap`). It only ever carries display (control is projection-sourced), so no
     /// double-publish.
-    pub fn display_sender(&self) -> broadcast::Sender<Arc<broca_protocol::display::DisplayEvent>> {
+    pub fn display_sender(&self) -> DisplaySender {
         self.display_ring.clone()
     }
 
@@ -488,7 +555,7 @@ impl<W: WalStore + 'static> Fanout<W> {
 fn reset_projection_handshake(
     projection_state: &mut ControlProjectionState,
     seeded: &mut bool,
-    buffered: &mut Vec<broca_wal::FramedRecord>,
+    buffered: &mut Vec<broca_core::ObservedRecord>,
 ) {
     *projection_state = ControlProjectionState::default();
     *seeded = false;
@@ -510,9 +577,9 @@ fn reset_projection_handshake(
 /// synchronous and non-blocking. Lag detaches subscribers, which recover through WAL replay;
 /// backpressure must never reach the fsync writer.
 async fn projector_loop(
-    mut obs_rx: broadcast::Receiver<broca_wal::FramedRecord>,
+    mut obs_rx: broadcast::Receiver<broca_core::ObservedRecord>,
     mut seed_rx: mpsc::UnboundedReceiver<ProjectionSeedMessage>,
-    ring: broadcast::Sender<Arc<ControlEvent>>,
+    ring: LazyRing<Arc<ControlEvent>>,
     detach_ring: broadcast::Sender<()>,
     reseed_pending: Arc<AtomicBool>,
     gate_tenure: Arc<AtomicU64>,
@@ -523,7 +590,7 @@ async fn projector_loop(
     let mut gate_seed_required: Option<u64> = None;
     let mut deferred_gate_seed: Option<ProjectionSeed> = None;
     let mut covered_head = 0_u64;
-    let mut buffered: Vec<broca_wal::FramedRecord> = Vec::new();
+    let mut buffered: Vec<broca_core::ObservedRecord> = Vec::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -598,7 +665,7 @@ async fn projector_loop(
                 covered_head = covered_head.max(seed.head);
                 for framed in buffered.drain(..).filter(|record| record.seq > seed.head) {
                     for event in broca_core::project_control_with_state(
-                        std::slice::from_ref(&framed),
+                        std::slice::from_ref(&*framed),
                         &mut projection_state,
                     ) {
                         let _ = ring.send(Arc::new(event));
@@ -624,7 +691,7 @@ async fn projector_loop(
                             continue;
                         }
                         for event in broca_core::project_control_with_state(
-                            std::slice::from_ref(&framed),
+                            std::slice::from_ref(&*framed),
                             &mut projection_state,
                         ) {
                             // A send error means no live subscribers right now — fine, the WAL is
@@ -2165,7 +2232,7 @@ mod tests {
         let task = tokio::spawn(projector_loop(
             observer_rx,
             seed_rx,
-            ring,
+            ring.into(),
             detach_ring,
             gate.reseed_pending(),
             gate.tenure(),
@@ -2174,7 +2241,7 @@ mod tests {
 
         // The terminal arrives during the second tenure, before either replay completes. The
         // first tenure's delayed seed must not clear the pending handshake or project this record.
-        observer_tx.send(framed(3, run_finished())).unwrap();
+        observer_tx.send(framed(3, run_finished()).into()).unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(ProjectionSeed {
                 head: 2,
@@ -2239,7 +2306,7 @@ mod tests {
         let task = tokio::spawn(projector_loop(
             observer_rx,
             seed_rx,
-            ring,
+            ring.into(),
             detach_ring,
             reseed_pending,
             Arc::new(AtomicU64::new(1)),
@@ -2248,7 +2315,7 @@ mod tests {
 
         // RunFinished is newer than the attach barrier but reaches the observer before the
         // replay seed. It must wait in the existing buffer instead of using stale default state.
-        observer_tx.send(framed(3, run_finished())).unwrap();
+        observer_tx.send(framed(3, run_finished()).into()).unwrap();
         tokio::task::yield_now().await;
         assert!(matches!(
             ring_rx.try_recv(),
@@ -2328,7 +2395,7 @@ mod tests {
         let task = tokio::spawn(projector_loop(
             observer_rx,
             seed_rx,
-            ring,
+            ring.into(),
             detach_ring,
             gate.reseed_pending(),
             gate.tenure(),
@@ -2337,7 +2404,7 @@ mod tests {
 
         // The later attach (H=3) finishes replay before the gate owner (H=2). Its seed must
         // not skip seq 3 for the older attach; seq 3 stays buffered until the owner installs.
-        observer_tx.send(records[2].clone()).unwrap();
+        observer_tx.send(records[2].clone().into()).unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(ProjectionSeed {
                 head: 3,
@@ -2354,7 +2421,7 @@ mod tests {
                 gate_tenure: owner.gate_tenure,
             }))
             .unwrap();
-        observer_tx.send(records[3].clone()).unwrap();
+        observer_tx.send(records[3].clone().into()).unwrap();
 
         let mut live: Vec<Arc<ControlEvent>> = Vec::new();
         while live.last().is_none_or(|event| event.0.wal_seq < 4) {
@@ -2511,13 +2578,13 @@ mod tests {
 
         for seq in 1..=3 {
             observer_tx
-                .send(broca_wal::FramedRecord {
+                .send(broca_core::ObservedRecord::new(broca_wal::FramedRecord {
                     seq,
                     fence: 1,
                     record: broca_wal::WalRecord::StepStarted {
                         step_id: broca_protocol::StepId(seq),
                     },
-                })
+                }))
                 .unwrap();
         }
 
@@ -2525,7 +2592,7 @@ mod tests {
         let task = tokio::spawn(projector_loop(
             observer_rx,
             seed_rx,
-            ring,
+            ring.into(),
             detach_ring,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(1)),
@@ -2673,14 +2740,14 @@ mod tests {
         let task = tokio::spawn(projector_loop(
             observer_rx,
             seed_rx,
-            ring,
+            ring.into(),
             detach_ring,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(1)),
             cancel.clone(),
         ));
 
-        observer_tx.send(records[split].clone()).unwrap();
+        observer_tx.send(records[split].clone().into()).unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(ProjectionSeed {
                 head: records[split - 1].seq,
@@ -2768,6 +2835,61 @@ mod tests {
         .await
         .expect("the idle-tick reap must remove the disconnected subscriber handle");
 
+        fanout.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn control_and_display_rings_are_created_by_the_first_subscribe() {
+        let session = BindIdentity::new("/tmp/project-a", "runner", "lazy-rings");
+        let (mut fanout, _observer) = Fanout::new(Arc::new(EmptyWalStore), session);
+        assert!(
+            !fanout.ring.is_allocated() && !fanout.display_ring.is_allocated(),
+            "an actor with no subscriber must not reserve either ring"
+        );
+        // Before any subscriber exists a publish reaches nobody, as it did with an eager ring.
+        let unit = Arc::new((Cursor::new(1, 0), ControlUnit::DisplayReset));
+        assert!(fanout.ring.send(unit.clone()).is_err());
+        assert!(
+            !fanout.ring.is_allocated(),
+            "a send must not create the ring"
+        );
+
+        let (slot, rx, detach_rx) = fanout.prepare_attach();
+        assert!(
+            fanout.ring.is_allocated(),
+            "the first attach creates the control ring"
+        );
+        let (sink, mut deliveries) = mpsc::channel(4);
+        fanout.spawn_subscriber(
+            slot,
+            AttachFrom::Cursor(FromCursor::Start),
+            0,
+            rx,
+            detach_rx,
+            sink,
+            None,
+        );
+        assert!(
+            fanout.display_ring.is_allocated(),
+            "the first subscriber creates the display ring"
+        );
+        let unit = Arc::new((Cursor::new(2, 0), ControlUnit::DisplayReset));
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                // The subscriber task may still be replaying; keep publishing until it is live.
+                let _ = fanout.ring.send(unit.clone());
+                match tokio::time::timeout(std::time::Duration::from_millis(20), deliveries.recv())
+                    .await
+                {
+                    Ok(Some(Delivery::Control(event))) => break event,
+                    Ok(Some(_)) | Err(_) => continue,
+                    Ok(None) => panic!("subscriber ended before receiving a control unit"),
+                }
+            }
+        })
+        .await
+        .expect("a unit published after the lazy ring exists reaches the subscriber");
+        assert_eq!(delivered.0, Cursor::new(2, 0));
         fanout.teardown().await;
     }
 }

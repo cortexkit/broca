@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Members whose whole design is to stay free of Tokio declare it nowhere, not even for tests.
 # A member listed here must declare no Tokio at all; the feature-agreement rule below exists so
 # test builds that do pull Tokio agree, and a Tokio-free member cannot disagree.
-TOKIO_FREE_MEMBERS = {"broca-owner-only"}
+TOKIO_FREE_MEMBERS = {"broca-owner-only", "broca-memory-relief"}
 
 
 def cargo_output(*args):

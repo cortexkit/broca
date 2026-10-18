@@ -3068,23 +3068,16 @@ where
                 final_step_finish_reason: prior_last_step_finish_reason,
             });
         }
-        // The prior lineage's full conversation becomes this new episode's prefix.
-        //
-        // THE CLONE STAYS, DELIBERATELY. Measured: 56 appends in the whole corpus, five in
-        // seven days, p50 35,920 bytes -- roughly 30 KB/day, the smallest saving this file has
-        // been offered. Replacing it with a move does not compile: the resume arms below
-        // consume prior.prompt by value, and rustc cannot prove this branch and those arms are
-        // exclusive. std::mem::take WOULD compile, and that is precisely the danger -- it
-        // leaves an empty Vec behind, so if the two paths ever do meet, a resumed run silently
-        // continues with NO conversation history and nothing fails loudly.
-        //
-        // Buying 30 KB/day with a hand proof the compiler explicitly declines to make, on the
-        // path that reconstructs a conversation, is the wrong trade. Reverse this only if the
-        // control flow is restructured so the exclusivity is a compile-time fact rather than an
-        // argument -- then the move compiles on its own and needs no proof from anyone.
-        prior.prompt.clone()
+        // The prior lineage's full conversation becomes this new episode's prefix. Only borrow
+        // it here: the vector itself moves into the run's prompt in the fresh/append arm below.
+        // A clone would keep a second decoded copy of the whole transcript alive for the entire
+        // run (every send to an idle session takes this path), and std::mem::take would leave
+        // an empty Vec behind for any later reader. The move compiles only because the resume
+        // arms that also consume `prior.prompt` sit in the other branch of the same `if`, so
+        // the compiler, not an argument, proves the two never both run.
+        prior.prompt.as_slice()
     } else {
-        Vec::new()
+        &[]
     };
     let lineage_prefix_stamped_len = lineage_prefix.len();
     // The request is private to this run from here onward, so transfer its input buffer instead
@@ -3102,8 +3095,8 @@ where
         }
     }
     if append_episode && first_system_index(&episode_input).is_some() {
-        match first_system_message(&lineage_prefix) {
-            Some(_) if repeats_prefix_system_messages(&lineage_prefix, &episode_input) => {
+        match first_system_message(lineage_prefix) {
+            Some(_) if repeats_prefix_system_messages(lineage_prefix, &episode_input) => {
                 // A client naturally re-sends the session's system prompt on every turn.
                 // Strip the byte-identical repeat BEFORE it reaches the WAL so replay and
                 // resume reconstruct the same single-instruction lineage and keep later
@@ -3863,7 +3856,12 @@ where
                 .map(|i| lineage_prefix_stamped_len + i),
             frozen_config: provider.render_config_blob(),
         });
-        prompt = lineage_prefix;
+        // Fresh: the WAL holds no prior episode, so there is no prefix to carry over.
+        prompt = if append_episode {
+            prior.prompt
+        } else {
+            Vec::new()
+        };
         prompt.extend(Arc::unwrap_or_clone(episode_input));
         stamped_len = lineage_prefix_stamped_len;
         total_usage = Usage::default();

@@ -23,6 +23,7 @@ members = [
     "crates/broca-fetch-plan",
     "crates/broca-diagnostics",
     "crates/broca-heap-profile",
+    "crates/broca-memory-relief",
 ]
 
 # broca workspace.
