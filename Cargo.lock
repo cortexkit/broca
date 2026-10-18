@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "broca-heap-profile"
-version = "0.3.229"
+version = "0.3.230"
 dependencies = [
  "serde",
  "serde_json",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "broca-memory-relief"
-version = "0.3.229"
+version = "0.3.230"
 
 [[package]]
 name = "broca-module"
