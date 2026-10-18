@@ -40,12 +40,12 @@ impl Scratch {
     }
 }
 fn scratch() -> Scratch {
+    // A clock reading alone can repeat for tests starting together, so a counter keeps names unique.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = broca_test_support::scratch_root().join(format!(
-        "run-events-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "run-events-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&path).unwrap();
     Scratch(path)
@@ -110,6 +110,13 @@ fn jwt(signer: &KeyPair, subject: &str, nats: serde_json::Value) -> String {
         URL_SAFE_NO_PAD.encode(signer.sign(input.as_bytes()).unwrap())
     )
 }
+
+/// One private broker at a time. `cortexkit-bus-testkit` 0.1.1 picks a free port, releases it and
+/// hands the number to `nats-server`, so two brokers starting together can pick the same port: on
+/// 2026-10-18 two servers in this binary both tried monitor port 58739 inside the full suite, and the
+/// loser exited with `bind: address already in use`. Each test holds this guard for its whole run,
+/// including the outage test's broker restart. Drop it once the testkit binds its ports itself.
+static BROKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn fixture() -> Option<(BusServer, NatsConnection, AccountNames, String)> {
     let bus = match BusServer::start(BusOptions {
@@ -200,6 +207,7 @@ fn project(store: &SqliteStore, wal: &FileWalStore, session: &BindIdentity) {
 
 #[tokio::test]
 async fn real_bus_headers_digest_sequence_and_ack_retention() {
+    let _broker = BROKER.lock().await;
     use broca_module::serve::ServeHandler;
     let Some((_bus, conn, names, _)) = fixture().await else {
         return;
@@ -323,6 +331,7 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
 
 #[tokio::test]
 async fn real_bus_outage_queues_then_reconnect_resumes_identical_event() {
+    let _broker = BROKER.lock().await;
     let Some((broker, conn, names, account_public)) = fixture().await else {
         return;
     };
@@ -408,6 +417,7 @@ fn bus_crash_child() {
 
 #[tokio::test]
 async fn real_bus_crash_after_wal_commit_replays_after_restart() {
+    let _broker = BROKER.lock().await;
     let Some((_bus, conn, names, _)) = fixture().await else {
         return;
     };
