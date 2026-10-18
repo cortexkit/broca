@@ -610,7 +610,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         store: run_index.clone(),
         wal: crash_orphan_wal.clone(),
         registry: registry.as_ref().clone(),
-        connector: None,
+        connector: Some(Arc::new(
+            broca_module_serve::bus_events_nats::NatsConnector::new(plan_conn.clone()),
+        )),
         hints: bus_hints,
         stop: bus_stop,
     }

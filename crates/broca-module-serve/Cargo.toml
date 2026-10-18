@@ -41,6 +41,10 @@ broca-subc = { path = "../broca-subc" }
 broca-catalog = { path = "../broca-catalog", features = ["live"] }
 broca-store = { path = "../broca-store" }
 cortexkit-bus-naming.workspace = true
+cortexkit-bus-trait.workspace = true
+cortexkit-bus-nats.workspace = true
+async-nats = { version = "0.50", default-features = false, features = ["ring"] }
+base64 = "0.22"
 # The executor reads a run's terminal WAL record (its auth-error status) to report a
 # wire-auth failure back to the vault — so the WAL record types are a runtime dep, not
 # just the dev-only wire-test dep below.
@@ -74,6 +78,9 @@ clap = { version = "4", features = ["derive"] }
 signal-hook = "0.4"
 
 [dev-dependencies]
+cortexkit-bus-testkit = "=0.1.1"
+nkeys = "0.4.5"
+serde_jcs.workspace = true
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.

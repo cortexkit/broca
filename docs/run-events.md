@@ -6,15 +6,9 @@ optional acceleration of `run.status`, not a replacement for authoritative reads
 
 ## Enablement
 
-The event projection and publisher interface are available, but this build has
-no production bus connector. The NATS adapter is held separately until its
-dependency graph satisfies the production Tokio-clock policy. Enabling the
-switch without an installed connector remains idle and counts connection
-failures; it never bypasses ck-bus or reads credentials from another source.
-
 `bus_run_events_enabled` in `broca.jsonc` is a boolean, **false by default**. Leave
 it false until the subconscious daemon/bus owner (SUBC) confirms that ck-bus
-0.4.4 is installed and prefrontal-core's durable EVENT consumer has been created
+0.4.4 or later is installed and prefrontal-core's durable EVENT consumer has been created
 for this machine account. Otherwise an event could be published before its
 intended consumer exists.
 The daemon obtains its account, JWT, server URL and inbox prefix from
