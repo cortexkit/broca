@@ -153,9 +153,11 @@ pub struct ProviderError {
     /// is the field it bounds: OpenRouter prices a request by its maximum output, and its refusal
     /// reads "requires more credits, or fewer max_tokens ... can only afford N". A caller can
     /// re-send with `max_tokens` at most this value, or route elsewhere; it is not a count of
-    /// prompt tokens or of tokens left on the balance.
+    /// prompt tokens or of tokens left on the balance. A `u32` rather than a `u64`: it bounds
+    /// one request's output, and the eight bytes a `u64` adds to every error would push the enums that
+    /// hold a `ProviderError` inline past clippy's size limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub affordable_max_tokens: Option<u64>,
+    pub affordable_max_tokens: Option<u32>,
 }
 
 /// The `provider_code` of a rate-limit refusal that means ONE provider account has used up a

@@ -3735,7 +3735,7 @@ fn openrouter_credit_insufficient(body: &str, error: &ProviderError) -> Option<P
         .and_then(|message| message.split_once("can only afford "))
         .and_then(|(_, rest)| {
             let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
-            digits.parse::<u64>().ok()
+            digits.parse::<u32>().ok()
         });
     Some(ProviderError {
         refusal: None,

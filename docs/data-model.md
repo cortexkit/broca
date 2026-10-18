@@ -245,7 +245,7 @@ the next one). Synced before the caller sees the terminal.
 `ProviderError`: `class` (`transient`, `permanent`, `auth_required` (older records may say
 `auth`), `context_overflow`, `provider_unavailable`), `message`, and absent-when-unset
 `status` (u16), `retry_after_secs` (float), `provider_code`, `provider_subcode`, `resets_at_ms`
-(u64), `limit_window`, `account_ref`, `credential_id`, `affordable_max_tokens` (u64).
+(u64), `limit_window`, `account_ref`, `credential_id`, `affordable_max_tokens` (u32).
 
 `provider_code: "request_invalid"` marks a provider's HTTP 400 that rejected the request itself
 (`invalid_request_error`, or Google's `INVALID_ARGUMENT`) when no more specific code applies;
