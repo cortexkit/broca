@@ -78,7 +78,7 @@ clap = { version = "4", features = ["derive"] }
 signal-hook = "0.4"
 
 [dev-dependencies]
-cortexkit-bus-testkit = "=0.1.1"
+cortexkit-bus-testkit = "=0.1.3"
 nkeys = "0.4.5"
 serde_jcs.workspace = true
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
