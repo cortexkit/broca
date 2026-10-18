@@ -46,6 +46,11 @@ struct RecordingProvider {
     /// step index (0-based) → the canonical bytes render_request produced.
     sent: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
     renderer_version: u32,
+    /// Earlier renderer versions this provider declares it still reproduces byte-identically.
+    reproduces: Vec<u32>,
+    /// When set, the frozen render config blob carries the renderer version, the way the live
+    /// transport's frozen config does, plus this marker standing for the rest of the config.
+    versioned_blob: Option<&'static str>,
 }
 
 impl RecordingProvider {
@@ -54,6 +59,25 @@ impl RecordingProvider {
             scripts: Arc::new(scripts),
             sent: Arc::new(Mutex::new(HashMap::new())),
             renderer_version: 1,
+            reproduces: Vec::new(),
+            versioned_blob: None,
+        }
+    }
+
+    fn reproducing(mut self, earlier: &[u32]) -> Self {
+        self.reproduces = earlier.to_vec();
+        self
+    }
+
+    fn with_versioned_blob(mut self, config: &'static str) -> Self {
+        self.versioned_blob = Some(config);
+        self
+    }
+
+    fn blob_at(&self, renderer_version: u32) -> serde_json::Value {
+        match self.versioned_blob {
+            Some(config) => json!({ "config": config, "renderer_version": renderer_version }),
+            None => json!({ "render_config": "stateless" }),
         }
     }
 
@@ -83,6 +107,22 @@ impl Provider for RecordingProvider {
 
     fn renderer_version(&self) -> u32 {
         self.renderer_version
+    }
+
+    fn reproduces_renderer_version(&self, recorded: u32) -> bool {
+        recorded == self.renderer_version || self.reproduces.contains(&recorded)
+    }
+
+    fn render_config_blob(&self) -> serde_json::Value {
+        self.blob_at(self.renderer_version)
+    }
+
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> serde_json::Value {
+        if self.reproduces_renderer_version(renderer_version) {
+            self.blob_at(renderer_version)
+        } else {
+            self.render_config_blob()
+        }
     }
 }
 
@@ -471,6 +511,99 @@ async fn interrupted_recovery_closes_the_batch_seals_once_and_next_episode_pairs
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Seed a run frozen at renderer version 1 whose blob carries that version, cut after its
+/// RunStarted, then resume it under `resumed`. Returns the finish reason, the error codes it
+/// reported, and the bytes the resumed provider sent, beside the bytes the seed run sent.
+async fn resume_v1_run_under(
+    tag: &str,
+    resumed: &RecordingProvider,
+) -> (
+    RunFinishReason,
+    Vec<Option<String>>,
+    HashMap<usize, Vec<u8>>,
+    HashMap<usize, Vec<u8>>,
+) {
+    let dir = broca_test_support::scratch_root().join(format!(
+        "broca-render-reproduce-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let seed = RecordingProvider::new(scripts()).with_versioned_blob("a");
+    let plane = plane();
+    assert_eq!(
+        run_once(&dir, &seed, &plane).await,
+        RunFinishReason::Completed
+    );
+    truncate_wal(&dir, 1);
+    let recorded = read_wal(&dir);
+    assert!(matches!(
+        recorded.as_slice(),
+        [broca_wal::WalRecord::RunStarted { config, .. }]
+            if config.renderer_version == 1
+                && config.frozen_render_config == json!({"config": "a", "renderer_version": 1})
+    ));
+    let (reason, events) =
+        run_once_req_with_events(&dir, request("r", &dir), resumed, &plane).await;
+    let codes = events
+        .iter()
+        .filter_map(|event| match event {
+            OutputEvent::Control(ControlUnit::Error { error }) => Some(error.provider_code.clone()),
+            _ => None,
+        })
+        .collect();
+    let sent = resumed.sent.lock().unwrap().clone();
+    let reference = seed.sent.lock().unwrap().clone();
+    let _ = std::fs::remove_dir_all(&dir);
+    (reason, codes, sent, reference)
+}
+
+/// A provider at renderer version 2 that declares version 1 reproducible resumes a run frozen
+/// at version 1 and sends the bytes the uninterrupted run sent: a deploy that still reproduces a
+/// run's bytes does not refuse it.
+#[tokio::test]
+async fn a_declared_reproducible_renderer_version_resumes_with_identical_bytes() {
+    let resumed = RecordingProvider::new(scripts())
+        .with_renderer_version(2)
+        .reproducing(&[1])
+        .with_versioned_blob("a");
+    let (reason, codes, sent, reference) = resume_v1_run_under("declared", &resumed).await;
+    assert_eq!(codes, Vec::<Option<String>>::new());
+    assert_eq!(reason, RunFinishReason::Completed);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent, reference,
+        "the resumed run re-renders the reference bytes"
+    );
+}
+
+/// Declaring the recorded version reproducible does not loosen the frozen-config comparison:
+/// a config that differs in anything but the version still refuses the resume.
+#[tokio::test]
+async fn a_declared_version_with_a_different_frozen_config_still_refuses() {
+    let resumed = RecordingProvider::new(scripts())
+        .with_renderer_version(2)
+        .reproducing(&[1])
+        .with_versioned_blob("b");
+    let (reason, codes, sent, _) = resume_v1_run_under("config-drift", &resumed).await;
+    assert_eq!(codes, vec![Some("frozen_render_config_drift".to_string())]);
+    assert_eq!(reason, RunFinishReason::Interrupted);
+    assert!(sent.is_empty());
+}
+
+/// A recorded version the provider does not declare still refuses with renderer_version_drift,
+/// even when everything else in the frozen config matches.
+#[tokio::test]
+async fn an_undeclared_renderer_version_still_refuses_with_version_drift() {
+    let resumed = RecordingProvider::new(scripts())
+        .with_renderer_version(2)
+        .with_versioned_blob("a");
+    let (reason, codes, sent, _) = resume_v1_run_under("undeclared", &resumed).await;
+    assert_eq!(codes, vec![Some("renderer_version_drift".to_string())]);
+    assert_eq!(reason, RunFinishReason::Interrupted);
+    assert!(sent.is_empty());
 }
 
 #[tokio::test]

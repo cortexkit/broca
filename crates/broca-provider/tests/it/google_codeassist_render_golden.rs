@@ -18,7 +18,7 @@ use broca_provider::families::{
 use broca_provider::wire::WireFamily;
 use serde_json::{json, Value};
 
-fn fixed_request() -> CallOptions {
+pub(crate) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
             cache_prefix_blocks: None,
@@ -145,9 +145,16 @@ fn repeated_tool_call_id_request() -> CallOptions {
     opts
 }
 
-const GOLDEN: &str = include_str!("../fixtures/google_codeassist_render_golden.json");
-const GOLDEN_VERSION: &str =
+pub(crate) const GOLDEN: &str = include_str!("../fixtures/google_codeassist_render_golden.json");
+pub(crate) const GOLDEN_VERSION: &str =
     include_str!("../fixtures/google_codeassist_render_golden.json.version");
+
+/// The frozen config the golden bytes are rendered with.
+pub(crate) fn golden_frozen() -> broca_provider::wire::FrozenRenderConfig {
+    let mut frozen = google_codeassist_frozen_config("gemini-2.5-flash");
+    frozen.project_id = Some("encouraging-env-qwp21".into());
+    frozen
+}
 
 #[test]
 fn google_codeassist_session_envelope_matches_golden() {
@@ -176,8 +183,7 @@ fn google_codeassist_session_envelope_matches_golden() {
 
 #[test]
 fn google_codeassist_render_matches_golden() {
-    let mut frozen = google_codeassist_frozen_config("gemini-2.5-flash");
-    frozen.project_id = Some("encouraging-env-qwp21".into());
+    let frozen = golden_frozen();
     let bytes = GoogleCodeAssist.render(&frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 

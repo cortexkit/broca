@@ -15,7 +15,7 @@ const PROVIDER: &str = "google";
 const MODEL_X: &str = "gemini-3.5-flash-low";
 const MODEL_Y: &str = "gemini-3.5-flash-high";
 
-fn fixed_request() -> CallOptions {
+pub(crate) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
             cache_prefix_blocks: None,
@@ -201,8 +201,14 @@ fn tool_turn_names(contents: &Value) -> Vec<&str> {
     ]
 }
 
-const GOLDEN: &str = include_str!("../fixtures/gemini_render_golden.json");
-const GOLDEN_VERSION: &str = include_str!("../fixtures/gemini_render_golden.json.version");
+pub(crate) const GOLDEN: &str = include_str!("../fixtures/gemini_render_golden.json");
+pub(crate) const GOLDEN_VERSION: &str =
+    include_str!("../fixtures/gemini_render_golden.json.version");
+
+/// The frozen config the golden bytes are rendered with.
+pub(crate) fn golden_frozen() -> broca_provider::wire::FrozenRenderConfig {
+    gemini_frozen_config("gemini-2.0-flash")
+}
 
 fn contains_object_key(value: &Value, needle: &str) -> bool {
     match value {
@@ -219,7 +225,7 @@ fn contains_object_key(value: &Value, needle: &str) -> bool {
 
 #[test]
 fn gemini_render_matches_golden() {
-    let frozen = gemini_frozen_config("gemini-2.0-flash");
+    let frozen = golden_frozen();
     let bytes = Gemini.render(&frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 

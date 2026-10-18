@@ -640,6 +640,12 @@ pub struct EpisodeRenderConfig<'a> {
     /// A resume supplies `Some(recorded_policy)`, including `Some(None)` for pre-policy runs.
     /// New admissions use `None` to select today's catalog policy.
     pub reasoning_echo: Option<Option<broca_provider::policy::ReasoningEchoPolicy>>,
+    /// Restore the recorded `provider_text_state` choice on resume. `None`, a newly admitted
+    /// episode, keeps what the family resolved (on for the Responses and Gemini families). An
+    /// episode admitted before the flag existed recorded no field, which reads back as
+    /// `Some(false)`: it resumes without echoing message phases or text signatures, which is
+    /// what its renderer version sent, instead of being re-resolved into the new shape.
+    pub provider_text_state: Option<bool>,
     /// The structured-output decision this episode froze at start, fed back on resume and
     /// applied as recorded. It is never re-decided from the catalog, so a catalog change since
     /// admission cannot move a resumed run's request bytes or its reported enforcement.
@@ -733,6 +739,9 @@ impl EpisodeRenderConfig<'_> {
         if let (Some(recorded), WireFamilyId::OpenAiChat) = (self.reasoning_echo, config.family_id)
         {
             config.reasoning_echo = recorded;
+        }
+        if let Some(recorded) = self.provider_text_state {
+            config.provider_text_state = recorded;
         }
         config
     }
@@ -933,6 +942,7 @@ fn resolve_provider_inner(
         chatgpt_effort_updates: episode_render.chatgpt_effort_updates,
         reasoning_content_required: episode_render.reasoning_content_required,
         reasoning_echo: episode_render.reasoning_echo,
+        provider_text_state: episode_render.provider_text_state,
         structured_output: episode_render.structured_output,
         claude_code_persona: episode_render.claude_code_persona,
     };

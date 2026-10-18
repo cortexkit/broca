@@ -277,6 +277,154 @@ pub fn renderer_version_for(family: WireFamilyId) -> u32 {
     }
 }
 
+/// What the current renderer of a family does with a run frozen at one of the family's earlier
+/// renderer versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EarlierRendererVersion {
+    /// The current renderer sends byte-identical requests for every config frozen at this
+    /// version, so a resume of such a run is accepted. True only when the bump that left this
+    /// version changed behaviour gated on a frozen config field that configs from this version
+    /// do not carry. Every such entry is proven by a byte-equality test that renders a pinned
+    /// config and prompt from this version under the current code
+    /// (`tests/it/renderer_version_reproduction.rs` in this crate).
+    Reproducible,
+    /// The current renderer may send different bytes for a config frozen at this version, so a
+    /// resume of such a run is refused with `renderer_version_drift`. The text names the change.
+    NotReproducible(&'static str),
+}
+
+/// Every earlier renderer version of `family`, oldest first, with what the current renderer
+/// does with a run frozen at it. The list covers each version from 1 up to the family's current
+/// version minus one, so the next version bump must add an entry for the version it leaves
+/// behind and decide, explicitly, whether that version stays reproducible; a test fails until
+/// it does.
+pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, EarlierRendererVersion)] {
+    use EarlierRendererVersion::{NotReproducible, Reproducible};
+    match family {
+        WireFamilyId::AnthropicMessages => &[(
+            1,
+            NotReproducible(
+                "v2 renders CallOptions.generation (temperature, top_p, stop_sequences)",
+            ),
+        )],
+        WireFamilyId::OpenAiChat => &[
+            (
+                1,
+                NotReproducible("v2 renders CallOptions.generation (temperature, top_p, stop)"),
+            ),
+            (
+                2,
+                NotReproducible("v3 requests streaming usage with stream_options.include_usage"),
+            ),
+            (
+                3,
+                NotReproducible("v4 normalizes model-visible tool names at the render edge"),
+            ),
+        ],
+        WireFamilyId::BedrockConverse => &[(
+            1,
+            NotReproducible("v2 normalizes model-visible tool names at the render edge"),
+        )],
+        WireFamilyId::OpenAiResponses => &[
+            (
+                1,
+                NotReproducible("v2 drops strict: true from function tools"),
+            ),
+            (
+                2,
+                NotReproducible("v3 renders CallOptions.generation (temperature, top_p)"),
+            ),
+            (
+                3,
+                NotReproducible(
+                    "v4 asks for encrypted reasoning and echoes captured reasoning items",
+                ),
+            ),
+            (
+                4,
+                NotReproducible("v5 normalizes model-visible tool names at the render edge"),
+            ),
+            // v6 echoes message phases only under `provider_text_state`, which v5 configs lack.
+            (5, Reproducible),
+        ],
+        WireFamilyId::Gemini => &[
+            (
+                1,
+                NotReproducible("v2 renders generationConfig sampling controls"),
+            ),
+            (
+                2,
+                NotReproducible("v3 normalizes model-visible tool names at the render edge"),
+            ),
+            // v4 echoes signed text parts only under `provider_text_state`, which v3 configs lack.
+            (3, Reproducible),
+        ],
+        WireFamilyId::GoogleCodeAssist => &[
+            (
+                1,
+                NotReproducible("v2 renders generationConfig sampling controls"),
+            ),
+            (
+                2,
+                NotReproducible(
+                    "v3 selects Gemini 3 tier thinking controls and output-token defaults",
+                ),
+            ),
+            (
+                3,
+                NotReproducible("v4 normalizes model-visible tool names at the render edge"),
+            ),
+            (
+                4,
+                NotReproducible(
+                    "v5 keeps an explicit caller output-token cap, clamped to the tier",
+                ),
+            ),
+            // v6 retains signed text parts only under `provider_text_state`, which v5 configs lack.
+            (5, Reproducible),
+        ],
+        WireFamilyId::OpenAiResponsesChatgpt => &[
+            (
+                1,
+                NotReproducible("v2 adds store: false and the per-run prompt_cache_key"),
+            ),
+            (2, NotReproducible("v3 strips max_output_tokens")),
+            (
+                3,
+                NotReproducible("v4 renders CallOptions.generation (temperature, top_p)"),
+            ),
+            (
+                4,
+                NotReproducible(
+                    "v5 asks for encrypted reasoning and echoes captured reasoning items",
+                ),
+            ),
+            (
+                5,
+                NotReproducible("v6 normalizes model-visible tool names at the render edge"),
+            ),
+            (
+                6,
+                NotReproducible("v7 omits sampling controls the codex backend rejects"),
+            ),
+            // v8 preserves message phases only under `provider_text_state`, which v7 configs lack.
+            (7, Reproducible),
+        ],
+    }
+}
+
+/// Whether the current renderer of `family` reproduces the request bytes of a run that recorded
+/// `recorded` as its renderer version: the current version itself, or an earlier version listed
+/// as [`EarlierRendererVersion::Reproducible`].
+pub fn reproduces_renderer_version(family: WireFamilyId, recorded: u32) -> bool {
+    recorded == renderer_version_for(family)
+        || earlier_renderer_versions(family)
+            .iter()
+            .any(|&(version, disposition)| {
+                version == recorded && disposition == EarlierRendererVersion::Reproducible
+            })
+}
+
 /// The correct within-family quirk selections for a wire family — the SINGLE source
 /// of truth for "how does this family shape a request". Both the catalog ingestion
 /// path (`map_provider`) and the hand-written per-family `*_frozen_config` helpers

@@ -2182,6 +2182,16 @@ mod executor {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
+    /// Whether the episode froze provider text state (Responses message phases and Gemini text
+    /// signatures). A config recorded before the flag existed has no field and reads as false.
+    fn frozen_provider_text_state(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("provider_text_state")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// The service tier the episode was admitted with, re-applied on resume from the durable
     /// `RunConfig` rather than the resuming send, and without re-checking the catalog's rates.
     fn frozen_service_tier(
@@ -3755,6 +3765,15 @@ mod executor {
                         .as_ref()
                         .filter(|_| !fresh_episode)
                         .map(|prior| frozen_reasoning_echo(&prior.config)),
+                    // Restored as recorded. `provider_text_state` makes the Responses and Gemini
+                    // families echo message phases and text signatures. An episode admitted
+                    // before the flag existed has no such field in its frozen config; it reads
+                    // back as false, so the episode resumes without the echo and sends the bytes
+                    // its own renderer version sent.
+                    provider_text_state: prior_run
+                        .as_ref()
+                        .filter(|_| !fresh_episode)
+                        .map(|prior| frozen_provider_text_state(&prior.config)),
                     // Older episodes omitted strict; only a fresh episode takes the new default.
                     responses_tools_non_strict: prior_run
                         .as_ref()

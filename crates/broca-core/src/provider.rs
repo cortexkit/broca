@@ -116,6 +116,26 @@ pub trait Provider: Send + Sync {
         crate::render::CANONICAL_RENDERER_VERSION
     }
 
+    /// Whether this provider still renders the exact request bytes of a run that recorded
+    /// `recorded` as its renderer version. A resume checks this instead of plain equality, so
+    /// a deploy that bumped the version for a change gated on a frozen flag (absent from older
+    /// recorded configs) does not refuse runs whose bytes it still reproduces. The default
+    /// accepts only the provider's own version; a provider that accepts more must prove each
+    /// extra version with a byte-equality test over pinned old configs and prompts.
+    fn reproduces_renderer_version(&self, recorded: u32) -> bool {
+        recorded == self.renderer_version()
+    }
+
+    /// The frozen render config blob this provider would have recorded had the run been
+    /// admitted at `renderer_version`, a version for which [`Self::reproduces_renderer_version`]
+    /// is true. A resume compares this, not [`Self::render_config_blob`], with the recorded
+    /// blob, so a blob that carries the renderer version inside it can name the recorded one.
+    /// Nothing else may differ from `render_config_blob`. The default is `render_config_blob`
+    /// unchanged, which is right for any provider whose blob does not carry the version.
+    fn render_config_blob_for_version(&self, _renderer_version: u32) -> serde_json::Value {
+        self.render_config_blob()
+    }
+
     /// This provider's frozen render config, serialized to an OPAQUE blob for the
     /// WAL. The loop stores it verbatim and never interprets it; on resume the
     /// provider is reconstructed FROM this blob so it renders byte-identical bytes.
@@ -226,6 +246,14 @@ impl Provider for Box<dyn Provider> {
 
     fn renderer_version(&self) -> u32 {
         (**self).renderer_version()
+    }
+
+    fn reproduces_renderer_version(&self, recorded: u32) -> bool {
+        (**self).reproduces_renderer_version(recorded)
+    }
+
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> serde_json::Value {
+        (**self).render_config_blob_for_version(renderer_version)
     }
 
     fn render_config_blob(&self) -> serde_json::Value {
