@@ -3972,8 +3972,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::retention_byte_progress_uses_the_durable_prefix_not_a_concurrent_tail"]
 file = "crates/broca-module/src/retention.rs"
-old = "if framed.seq > head {\n                    return Ok(offset as u64);"
-new = "if framed.seq > head {\n                    return Ok(bytes.len() as u64); // NON-VACUITY BREAK"
+old = "if seq > head {\n            return if found {\n                Ok(offset)"
+new = "if seq > head {\n            return if found {\n                Ok(bytes) // NON-VACUITY BREAK: include the physical tail past the durable head"
 
 [[control]]
 id = "retention-nonterminal-never-expires"
@@ -16873,3 +16873,30 @@ expect_red = ["inventory::activation_outage_holds_one_gap_lease_for_all_incoming
 file = "crates/broca-module/src/move_files.rs"
 old = 'if projection_admissions.is_empty() {'
 new = 'if true { // NON-VACUITY BREAK: retry the root gap lease within its own installation'
+[[control]]
+id = "retention-expiry-portable-durable-no-read"
+guards = "status expiry checks for large forever lineages never replay portable or durable WALs"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::status_poll_large_nonretained_session_does_not_read_wal"]
+select = "expected"
+file = "crates/broca-module/src/retention.rs"
+old = ".is_some_and(|path| *path != self.wal.ephemeral_wal_path(key))"
+new = ".is_some_and(|_| false) // NON-VACUITY BREAK: replay forever WALs on expiry checks"
+
+[[control]]
+id = "retention-expiry-stale-summary-replay"
+guards = "a retention summary with stale byte length cannot override the WAL deadline and is refreshed after replay"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::stale_retention_row_replays_wal_and_refreshes_summary"]
+select = "expected"
+file = "crates/broca-module/src/retention.rs"
+old = "self.index.live(key)?.filter(|row| row.wal_bytes == bytes)"
+new = "self.index.live(key)?.filter(|_| true) // NON-VACUITY BREAK: trust a stale retention deadline\n"

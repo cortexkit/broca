@@ -4885,7 +4885,11 @@ impl LineageRegistry {
         }
     }
 
-    async fn check_expired(&self, key: &LineageKey, run: Option<&str>) -> Result<(), OpenError> {
+    pub(crate) async fn check_expired(
+        &self,
+        key: &LineageKey,
+        run: Option<&str>,
+    ) -> Result<(), OpenError> {
         self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(());

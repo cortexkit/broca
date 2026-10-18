@@ -353,7 +353,8 @@ type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;
 
 type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String> + Send + Sync;
 
-/// Shared by actors and the registry. All mutating methods require the caller's session lease.
+/// Shared by actors and the registry. Content mutations require the caller's session lease;
+/// expiry reads may refresh the content-free retention summary, but never run state.
 pub struct RetentionService {
     pub(crate) withdrawal_adapter:
         std::sync::OnceLock<Arc<dyn crate::retention_withdrawals::RetentionWithdrawalAdapter>>,
@@ -577,7 +578,9 @@ impl RetentionService {
             .join(format!("{}.{id}.deleting", broca_core::session_addr(key)))
     }
 
-    /// The row is a candidate hint only. Every read checks the actual WAL and the tombstone for that WAL's lineage.
+    /// Live WALs in the portable or durable directory cannot expire: retention is chosen
+    /// on the first send and requires the ephemeral directory. Retained summaries are usable
+    /// only at the live WAL's byte length; stale summaries are replayed and tombstones win.
     pub fn expired(&self, key: &BindIdentity, run: Option<&str>) -> Result<Option<u64>, String> {
         self.expired_head(key, run, None)
     }
@@ -588,36 +591,114 @@ impl RetentionService {
         run: Option<&str>,
         head: Option<u64>,
     ) -> Result<Option<u64>, String> {
-        if let Some(run) = run {
-            if let Some(meta) = self.index.run(run)? {
-                if meta.expired_at_ms.is_some() {
-                    return Ok(meta.expired_at_ms);
-                }
-                if let Some(id) = meta.lineage_id {
-                    if let Some(stone) = self
-                        .tombstones(key)?
-                        .into_iter()
-                        .find(|s| s.lineage_id == id)
-                    {
-                        return Ok(Some(stone.expired_at_ms));
-                    }
+        let run_meta = run.map(|run| self.index.run(run)).transpose()?.flatten();
+        if let Some(meta) = &run_meta {
+            if meta.expired_at_ms.is_some() {
+                return Ok(meta.expired_at_ms);
+            }
+            if let Some(id) = &meta.lineage_id {
+                if let Some(stone) = self
+                    .tombstones(key)?
+                    .into_iter()
+                    .find(|s| &s.lineage_id == id)
+                {
+                    return Ok(Some(stone.expired_at_ms));
                 }
             }
         }
+        self.wal.check_move(key, false).map_err(|e| e.to_string())?;
+        let path = self.wal.resolve_live_path(key).map_err(|e| e.to_string())?;
+        // Deletion may move the resolved path aside before it is opened. Let the
+        // ordinary range reader resolve absence/tombstones instead of failing the read.
+        let file = path
+            .as_ref()
+            .map(|path| open_live_wal(path))
+            .transpose()?
+            .flatten();
+        let path = path.filter(|_| file.is_some());
+        // Retention cannot be added after the first send. Retained lineages are always
+        // placed in wal-ephemeral, so portable/durable logs need no expiry replay.
+        if path
+            .as_ref()
+            .is_some_and(|path| *path != self.wal.ephemeral_wal_path(key))
+        {
+            return Ok(None);
+        }
         if head.is_none() {
             self.wal.flush_for_read(key).map_err(|e| e.to_string())?;
+        }
+        let stones = self.tombstones(key)?;
+        if let Some(file) = &file {
+            let bytes = file.metadata().map_err(|e| e.to_string())?.len();
+            if let Some(row) = self.index.live(key)?.filter(|row| row.wal_bytes == bytes) {
+                if let Some(stone) = stones
+                    .iter()
+                    .find(|stone| stone.lineage_id == row.lineage_id)
+                {
+                    return Ok(Some(stone.expired_at_ms));
+                }
+                // An actor's durable head may lag the physical tail. Never let a summary
+                // that includes that tail replace the actor's narrower read proof.
+                let covers_head = head
+                    .map(|head| {
+                        durable_prefix_bytes_from(
+                            file.try_clone().map_err(|e| e.to_string())?,
+                            head,
+                        )
+                    })
+                    .transpose()?
+                    .is_none_or(|prefix| prefix == bytes);
+                if covers_head
+                    && (run.is_none()
+                        || run_meta.as_ref().is_some_and(|meta| {
+                            meta.lineage_id.as_deref() == Some(row.lineage_id.as_str())
+                        }))
+                {
+                    return Ok(row
+                        .expires_at_ms
+                        .filter(|deadline| *deadline <= self.clock.now_ms()));
+                }
+            }
         }
         let read = self
             .wal
             .read_records_range(key, 0, head, None)
             .map_err(|e| e.to_string())?;
-        let stones = self.tombstones(key)?;
         if matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)) {
             if let Some(stone) = stones.iter().find(|s| {
                 Some(s.lineage_id.as_str())
                     == read.lineage_id.as_ref().map(|id| id.to_string()).as_deref()
             }) {
                 return Ok(Some(stone.expired_at_ms));
+            }
+            let policy = policy(frames(&read));
+            if let (Some(path), Some(id), Some((retention_s, last_activity_ms, expires_at_ms))) =
+                (&path, read.lineage_id, policy)
+            {
+                // Publish only a complete, unchanged prefix. The store serializes this
+                // summary update and refuses to revive an expired lineage. Do not project
+                // run rows here: a concurrent writer may already have advanced their state.
+                if let Some(file) = open_live_wal(path)? {
+                    let physical_bytes = file.metadata().map_err(|e| e.to_string())?.len();
+                    let bytes = durable_prefix_bytes_from(
+                        file,
+                        frames(&read).last().map_or(0, |frame| frame.seq),
+                    )?;
+                    if physical_bytes == bytes {
+                        self.index.upsert(
+                            &RetentionLineageRow {
+                                lineage_id: id.to_string(),
+                                session: key.clone(),
+                                retention_s,
+                                last_activity_ms,
+                                expires_at_ms,
+                                wal_bytes: bytes,
+                                expired_at_ms: None,
+                            },
+                            &[],
+                        )?;
+                    }
+                }
             }
             if run.is_some_and(|id| {
                 !frames(&read).iter().any(
@@ -626,7 +707,7 @@ impl RetentionService {
             }) {
                 return Ok(None);
             }
-            return Ok(policy(frames(&read))
+            return Ok(policy
                 .and_then(|(_, _, deadline)| deadline)
                 .filter(|deadline| *deadline <= self.clock.now_ms()));
         }
@@ -1274,36 +1355,62 @@ mod tests;
 
 /// Count file bytes through the actor's highest fsynced sequence, including the lineage-ID
 /// metadata between records but excluding later records appended by a concurrent run.
-/// Replay offsets locate record starts, not the full durable prefix, so they cannot prove
-/// which file length the retention row describes.
+/// Each append includes trailing lineage metadata, so the record's byte anchor alone
+/// does not describe the full durable prefix.
 fn durable_prefix_bytes(path: &Path, head: u64) -> Result<u64, String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|error| error.to_string())?
-        .take(broca_wal::DEFAULT_MAX_READ_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > broca_wal::DEFAULT_MAX_READ_BYTES {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    durable_prefix_bytes_from(file, head)
+}
+
+fn open_live_wal(path: &Path) -> Result<Option<File>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("retention live WAL is not a regular file".into());
+    }
+    Ok(Some(file))
+}
+
+fn durable_prefix_bytes_from(mut file: File, head: u64) -> Result<u64, String> {
+    use std::io::{Seek, SeekFrom};
+    let bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    if bytes > broca_wal::DEFAULT_MAX_READ_BYTES {
         return Err("retention WAL exceeds read limit".into());
     }
-    let mut offset = 0;
+    // The caller already validated these records (or an unchanged summary describes
+    // them). Locate the sequence boundary using headers, without decoding payloads again.
+    let mut offset = 0u64;
     let mut found = head == 0;
-    while offset < bytes.len() {
-        match broca_wal::framing::decode_next(&bytes[offset..]) {
-            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
-            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                if framed.seq > head {
-                    return Ok(offset as u64);
-                }
-                offset += consumed;
-                found |= framed.seq == head;
-            }
-            _ if found => return Ok(offset as u64),
-            _ => return Err("retention durable prefix cannot be decoded".into()),
+    while offset < bytes {
+        let mut header = [0; broca_wal::framing::HEADER_LEN];
+        if bytes - offset < header.len() as u64 {
+            break;
         }
+        file.read_exact(&mut header)
+            .map_err(|error| error.to_string())?;
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let seq = u64::from_le_bytes(header[5..13].try_into().unwrap());
+        let end = offset + header.len() as u64 + u64::from(len);
+        if len > broca_wal::framing::MAX_PAYLOAD_LEN || end > bytes {
+            break;
+        }
+        if seq > head {
+            return if found {
+                Ok(offset)
+            } else {
+                Err("retention durable head is absent".into())
+            };
+        }
+        found |= seq == head;
+        offset = end;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| error.to_string())?;
     }
     if found {
-        Ok(offset as u64)
+        Ok(offset)
     } else {
         Err("retention durable head is absent".into())
     }
