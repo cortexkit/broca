@@ -338,6 +338,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "broca-heap-profile"
+version = "0.3.228"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "broca-module"
 version = "0.3.230"
 dependencies = [
@@ -373,6 +382,7 @@ dependencies = [
  "broca-core",
  "broca-diagnostics",
  "broca-fetch-plan",
+ "broca-heap-profile",
  "broca-module",
  "broca-owner-only",
  "broca-protocol",

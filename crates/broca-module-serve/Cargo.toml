@@ -19,7 +19,13 @@ path = "src/main.rs"
 name = "broca-session"
 path = "src/bin/broca-session.rs"
 
+[[bin]]
+name = "memory-load-server"
+path = "src/bin/memory-load-server.rs"
+required-features = ["heap-profile"]
+
 [dependencies]
+broca-heap-profile = { path = "../broca-heap-profile", optional = true }
 broca-owner-only.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-protocol = { path = "../broca-protocol" }
@@ -118,4 +124,5 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 
 [features]
+heap-profile = ["dep:broca-heap-profile"]
 test-clock = ["broca-module/test-clock", "broca-core/test-clock"]

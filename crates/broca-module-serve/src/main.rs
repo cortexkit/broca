@@ -38,6 +38,8 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "heap-profile")]
+    broca_heap_profile::start();
     run_runtime(serve_main())?
 }
 
