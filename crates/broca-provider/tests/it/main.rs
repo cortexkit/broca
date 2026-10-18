@@ -70,6 +70,7 @@ mod ordinal_render_invariant;
 mod provider_state_legacy;
 mod provider_text_state;
 mod reasoning_content_required;
+mod reasoning_context_legacy;
 mod render_golden_version_enforcement;
 mod responses_cache_write_usage;
 mod service_tier_used;
