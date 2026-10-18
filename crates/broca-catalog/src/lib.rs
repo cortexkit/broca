@@ -625,7 +625,7 @@ fn map_provider(
         wire_family: family,
         auth_kind: default_auth_kind(family),
         static_headers: Default::default(),
-        static_options: Value::Null,
+        static_options: provider_static_options(provider_id, family),
         // Quirks start from the family's correct request shape, then layer any provider-specific
         // override from the catalog bridge. This keeps the OpenAI provider fix out of the shared
         // OpenAI-Chat family default while leaving the hand-built family helpers unchanged.
@@ -633,6 +633,16 @@ fn map_provider(
         // The overlay owns provider endpoints; absent/empty means the family default.
         base_url,
         raw: raw_policy.map(entry),
+    }
+}
+
+/// Stateless Responses continuations carry encrypted reasoning in the durable transcript rather
+/// than depending on a provider's response store. These flags become part of the frozen config.
+fn provider_static_options(provider_id: &str, family: WireFamilyId) -> Value {
+    if family == WireFamilyId::OpenAiResponses && matches!(provider_id, "openai" | "xai") {
+        serde_json::json!({"store": false, "include": ["reasoning.encrypted_content"]})
+    } else {
+        Value::Null
     }
 }
 
@@ -1253,7 +1263,7 @@ mod tests {
         // (provider, a real snapshot model id, expected base_url after overlay).
         let cases = [
             ("cerebras", "gpt-oss-120b", "https://api.cerebras.ai/v1"),
-            ("xai", "grok-4.3", "https://api.x.ai/v1"),
+            ("xai", "grok-composer-2.5-fast", "https://api.x.ai/v1"),
             // OpenRouter's base_url pin was generated from the snapshot's api value.
             (
                 "openrouter",
@@ -1341,8 +1351,8 @@ mod tests {
     /// OpenAI itself while leaving the OpenAI-compatible long tail on the family default.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn bundled_openai_models_use_max_completion_tokens_but_long_tail_keeps_max_tokens() {
-        for model_id in ["gpt-4.1", "gpt-5.1"] {
+    fn bundled_openai_chat_models_use_max_completion_tokens_but_long_tail_keeps_max_tokens() {
+        for model_id in ["gpt-4.1", "gpt-4o"] {
             let (spec, _model) = catalog().model("openai", model_id).unwrap_or_else(|| {
                 panic!("openai/{model_id} must resolve from the bundled snapshot")
             });

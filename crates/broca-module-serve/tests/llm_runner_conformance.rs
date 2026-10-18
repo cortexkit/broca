@@ -261,16 +261,17 @@ async fn start_model(shared: Arc<Shared>) -> String {
     format!("http://{address}/v1")
 }
 
-/// The catalog provider of the structured-output sessions' models. Its overlay pins the OpenAI
-/// Chat wire family, so their requests reach the scripted model unchanged.
+/// The scripted model speaks Chat, so the structured-output fixtures use xAI model identities
+/// explicitly pinned to Chat rather than inheriting xAI's Responses default. Their capability
+/// facts below are synthetic test inputs, not claims about those production models.
 const STRUCTURED_OUTPUT_PROVIDER: &str = "xai";
 
 /// The catalog model a structured-output session resolves against, by what its route reports.
 fn structured_output_model(support: Option<bool>) -> &'static str {
     match support {
-        Some(true) => "so-supported",
-        Some(false) => "so-unsupported",
-        None => "so-unstated",
+        Some(true) => "grok-composer-2.5-fast",
+        Some(false) => "grok-4.20-0309-non-reasoning",
+        None => "grok-imagine-image",
     }
 }
 
@@ -1614,8 +1615,8 @@ impl LlmRunnerSubject for BrocaSubject {
             ),
         );
         // The session's route support picks the catalog row its model resolves against: the
-        // rows `seed_structured_output_catalog` writes under the `xai` provider, whose wire
-        // family is OpenAI Chat, the protocol the scripted model speaks.
+        // rows `seed_structured_output_catalog` writes under the `xai` provider, using explicit
+        // per-model Chat pins because Chat is the protocol the scripted model speaks.
         if let Some(support) = self
             .shared
             .structured_output_support

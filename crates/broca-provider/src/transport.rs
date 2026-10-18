@@ -3580,7 +3580,11 @@ pub fn classify_account_limit_exhausted(
     now: SystemTime,
     error: ProviderError,
 ) -> ProviderError {
-    if family == crate::spec::WireFamilyId::OpenAiChat && (status == 402 || status == 403) {
+    if matches!(
+        family,
+        crate::spec::WireFamilyId::OpenAiChat | crate::spec::WireFamilyId::OpenAiResponses
+    ) && (status == 402 || status == 403)
+    {
         if let Some(exhausted) = xai_spending_limit_reached(body, status, &error) {
             return exhausted;
         }
@@ -3927,7 +3931,11 @@ fn http_error_in_family(
     let provider_code = match provider_code.as_deref() {
         Some("insufficient_quota") => Some(BILLING_EXHAUSTED.to_string()),
         Some("personal-team-blocked:spending-limit")
-            if (code == 402 || code == 403) && family == Some(WireFamilyId::OpenAiChat) =>
+            if (code == 402 || code == 403)
+                && matches!(
+                    family,
+                    Some(WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses)
+                ) =>
         {
             Some(BILLING_EXHAUSTED.to_string())
         }
@@ -6878,6 +6886,28 @@ mod tests {
     }
 
     const XAI_SPENDING_LIMIT_BODY: &str = r#"{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription..."}"#;
+
+    #[test]
+    fn xai_captured_production_403_is_billing_exhausted_on_both_routes() {
+        // Captured from production: the refusal text is abbreviated, but its code is complete.
+        let body = r#"{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription. …"}"#;
+        let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+        for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
+            let error =
+                super::classify_http_error_in_family(403, body, None, None, Some(family), None);
+            assert!(error.is_billing_exhausted());
+            assert_eq!(error.class, ErrorClass::Permanent);
+            assert!(
+                !super::is_rejected_token(&error),
+                "a spending limit must not refresh the login"
+            );
+            let classified =
+                classify_account_limit_exhausted(family, 403, &headers, body, UNIX_EPOCH, error);
+            assert!(classified.is_billing_exhausted());
+            assert_eq!(classified.status, Some(403));
+            assert!(!super::is_rejected_token(&classified));
+        }
+    }
 
     #[test]
     fn extract_provider_code_reads_top_level_code_when_error_is_string() {

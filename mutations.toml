@@ -7971,8 +7971,12 @@ target = "--lib"
 test_file = "crates/broca-catalog/src/lib.rs"
 expect_red = ["tests::meta_muse_resolves_to_first_party_openai_responses"]
 file = "crates/broca-catalog/data/overlay.json"
-old = "\"wire_family\": \"openai_responses\""
-new = "\"wire_family\": \"openai_chat\"" # NON-VACUITY BREAK: route Meta Muse back to Chat Completions
+old = '''      "base_url": "https://api.meta.ai/v1",
+      "base_url_source": "generated",
+      "wire_family": "openai_responses",'''
+new = '''      "base_url": "https://api.meta.ai/v1",
+      "base_url_source": "generated",
+      "wire_family": "openai_chat",''' # NON-VACUITY BREAK: route Meta Muse back to Chat Completions
 
 [[control]]
 id = "meta-muse-oauth-subscription-basis"
@@ -16286,6 +16290,7 @@ expect_red = ["families::google_codeassist::tests::session_labels_track_the_requ
 file = "crates/broca-provider/src/families/google_codeassist.rs"
 old = '                "last_step_index": index.saturating_sub(1).to_string(),'
 new = '                "last_step_index": "0", // NON-VACUITY BREAK: lose request-step continuity.'
+
 [[control]]
 id = "claude-302-main-beta-display-updates"
 guards = "the 2.1.302 main list includes the measured thinking-display-updates beta while broca keeps summarized thinking"
@@ -16355,3 +16360,46 @@ expect_red = ["executor::tests::later_persona_admissions_inherit_the_ordinal_wit
 file = "crates/broca-module-serve/src/main.rs"
 old = '            if let Some(ordinal) = recorded {'
 new = '            if let Some(ordinal) = recorded.filter(|_| false) { // NON-VACUITY BREAK: scan instead of inheriting the ordinal.'
+[[control]]
+id = "xai-reasoning-responses-route"
+guards = "New xAI reasoning runs use stateless Responses with encrypted reasoning rather than Chat"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_routes"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/reasoning_routes.rs"
+expect_red = ["xai_reasoning_route_is_stateless_responses"]
+file = "crates/broca-catalog/data/overlay.json"
+old = '''      "wire_family": "openai_responses",
+      "wire_family_reason": "xAI Responses preserves encrypted reasoning across tool and user turns; non-reasoning snapshot models retain Chat.",'''
+new = '''      "wire_family": "openai_chat",
+      "wire_family_reason": "NON-VACUITY BREAK: discard xAI encrypted reasoning by routing to Chat.",'''
+
+[[control]]
+id = "openai-api-key-reasoning-responses-route"
+guards = "New OpenAI API-key reasoning runs use stateless Responses with encrypted reasoning rather than Chat"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test reasoning_routes"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/reasoning_routes.rs"
+expect_red = ["openai_api_key_reasoning_route_is_stateless_responses"]
+file = "crates/broca-catalog/data/overlay.json"
+old = '''      "wire_family": "openai_responses",
+      "wire_family_reason": "OpenAI Responses preserves encrypted reasoning across tool and user turns; non-reasoning snapshot models retain Chat.",'''
+new = '''      "wire_family": "openai_chat",
+      "wire_family_reason": "NON-VACUITY BREAK: discard OpenAI encrypted reasoning by routing to Chat.",'''
+
+
+[[control]]
+id = "xai-responses-structured-output-profile"
+guards = "Moving xAI to Responses retains enforced delivery for schemas in the xAI subset, including oneOf"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/structured_output.rs"
+expect_red = ["structured_output::tests::xai_responses_retains_xai_schema_enforcement"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = 'family == WireFamilyId::OpenAiResponses && provider_id == "xai"'
+new = 'family == WireFamilyId::OpenAiResponses && provider_id == "xai" && false /* NON-VACUITY BREAK: apply the OpenAI subset to xAI Responses */'

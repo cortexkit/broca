@@ -250,6 +250,44 @@ fn anthropic_merges_the_format_into_output_config_and_marks_the_submit_tool_stri
 }
 
 #[test]
+fn xai_responses_enforces_the_xai_subset_in_both_modes() {
+    let mut xai = openai_responses_frozen_config("grok-4.5");
+    xai.base_url = Some("https://api.x.ai/v1".into());
+    xai.responses_tools_non_strict = true;
+    let (final_text, decided) =
+        with_structured_output(xai.clone(), "xai", Mode::FinalText, one_of());
+    assert_eq!(decided.enforcement, "enforced");
+    assert_eq!(decided.profile.as_deref(), Some("xai"));
+    let sent = body(&OpenAiResponses, &final_text, &opts(false));
+    assert_eq!(
+        sent["text"]["format"],
+        json!({
+            "type": "json_schema", "name": "city_report", "schema": one_of(), "strict": true
+        })
+    );
+    let (submit, decided) = with_structured_output(xai.clone(), "xai", Mode::SubmitTool, one_of());
+    assert_eq!(decided.enforcement, "enforced");
+    let sent = body(&OpenAiResponses, &submit, &opts(true));
+    let submit = tool_named(&sent["tools"], "submit_result", &["name"]);
+    assert_eq!(submit["parameters"], one_of());
+    assert_eq!(submit["strict"], true);
+    assert_eq!(sent["tool_choice"], "auto");
+    assert!(sent.get("text").is_none());
+
+    let outside = json!({"type": "object", "properties": {
+        "answer": {"type": "string", "minLength": 2049}
+    }});
+    let (frozen, decided) = with_structured_output(xai, "xai", Mode::FinalText, outside);
+    assert_eq!(decided.enforcement, "best_effort");
+    assert_eq!(decided.reason.as_deref(), Some("schema_outside_subset"));
+    let sent = body(&OpenAiResponses, &frozen, &opts(false));
+    assert!(sent["text"].get("format").is_none());
+    assert!(serde_json::to_string(&sent)
+        .unwrap()
+        .contains("city_report"));
+}
+
+#[test]
 fn xai_sends_response_format_and_kimi_gets_instructions() {
     let mut xai = openai_chat_frozen_config("grok-4.7");
     xai.base_url = Some("https://api.x.ai/v1".into());

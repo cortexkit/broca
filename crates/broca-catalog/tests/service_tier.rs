@@ -171,7 +171,7 @@ mod gated {
             AuthMethod::ApiKey,
             Some(ServiceTier::Priority),
         );
-        assert_eq!(priority.frozen.family_id, WireFamilyId::OpenAiChat);
+        assert_eq!(priority.frozen.family_id, WireFamilyId::OpenAiResponses);
         assert_eq!(body_of(&priority)["service_tier"], "priority");
         let default = resolved(
             "openai/gpt-5.6-luna",

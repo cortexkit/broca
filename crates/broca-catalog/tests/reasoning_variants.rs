@@ -52,7 +52,8 @@ mod gated {
         StepContext,
     };
     use broca_provider::families::{
-        AnthropicMessages, Gemini, GoogleCodeAssist, OpenAiChat, OpenAiResponsesChatgpt,
+        AnthropicMessages, Gemini, GoogleCodeAssist, OpenAiChat, OpenAiResponses,
+        OpenAiResponsesChatgpt,
     };
     use broca_provider::spec::ReasoningOptions;
     use broca_provider::wire::WireFamily;
@@ -186,6 +187,7 @@ mod gated {
         match frozen.family_id {
             WireFamilyId::AnthropicMessages => AnthropicMessages.shape(frozen, &opts),
             WireFamilyId::OpenAiChat => OpenAiChat.shape(frozen, &opts),
+            WireFamilyId::OpenAiResponses => OpenAiResponses.shape(frozen, &opts),
             WireFamilyId::OpenAiResponsesChatgpt => OpenAiResponsesChatgpt.shape(frozen, &opts),
             WireFamilyId::Gemini => Gemini.shape(frozen, &opts),
             WireFamilyId::GoogleCodeAssist => GoogleCodeAssist.shape(frozen, &opts),
@@ -315,9 +317,17 @@ mod gated {
             error.ends_with("its variants are [low, medium, high]"),
             "{error}"
         );
-        // A model whose own values include `none` gets it as an effort.
-        let none = variant_body("openai/gpt-5.6-luna", AuthMethod::ApiKey, "none");
-        assert_eq!(none["reasoning_effort"], json!("none"));
+    }
+
+    #[test]
+    fn openai_api_key_variants_render_responses_reasoning() {
+        for level in ["none", "high"] {
+            let body = variant_body("openai/gpt-5.6-luna", AuthMethod::ApiKey, level);
+            assert_eq!(body["reasoning"]["effort"], json!(level));
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(body["store"], false);
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     /// ChatGPT codex (Responses): `reasoning.effort` with summary `auto`, plus the encrypted

@@ -99,6 +99,8 @@ fn route(family: WireFamilyId, provider_id: &str, base_url: Option<&str>) -> Rou
         WireFamilyId::OpenAiResponses | WireFamilyId::OpenAiResponsesChatgpt => Route {
             profile: Some(if provider_id == "meta" || host.contains("meta.ai") {
                 Profile::MetaStrict
+            } else if family == WireFamilyId::OpenAiResponses && provider_id == "xai" {
+                Profile::Xai
             } else {
                 Profile::OpenAiStrict
             }),
@@ -838,6 +840,56 @@ mod tests {
                 "{family:?} {catalog:?}"
             );
             assert_eq!(decided.delivery, delivery, "{family:?} {catalog:?}");
+        }
+    }
+
+    #[test]
+    fn xai_responses_retains_xai_schema_enforcement() {
+        let schema = json!({"type": "object", "properties": {
+            "shape": {"oneOf": [{"type": "string"}, {"type": "number"}]}
+        }, "required": ["shape"], "additionalProperties": false});
+        for mode in [Mode::FinalText, Mode::SubmitTool] {
+            let request = request(mode, schema.clone());
+            for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
+                let decided = decide(
+                    family,
+                    "xai",
+                    Some("http://localhost/v1"),
+                    CapabilityFlag::Known(true),
+                    &request,
+                )
+                .unwrap();
+                assert_eq!(decided.enforcement, "enforced", "{family:?} {mode:?}");
+                assert_eq!(decided.profile.as_deref(), Some("xai"));
+                assert_eq!(decided.delivery, SchemaDelivery::Strict);
+            }
+            for (catalog, reason) in [
+                (CapabilityFlag::Known(false), "route_unsupported"),
+                (CapabilityFlag::Absent, "catalog_unknown"),
+                (CapabilityFlag::Unknown, "catalog_unknown"),
+            ] {
+                let decided = decide(
+                    WireFamilyId::OpenAiResponses,
+                    "xai",
+                    None,
+                    catalog,
+                    &request,
+                )
+                .unwrap();
+                assert_eq!(decided.enforcement, "best_effort");
+                assert_eq!(decided.reason.as_deref(), Some(reason));
+            }
+            let unrelated = decide(
+                WireFamilyId::OpenAiResponses,
+                "not-xai",
+                None,
+                CapabilityFlag::Known(true),
+                &request,
+            )
+            .unwrap();
+            assert_eq!(unrelated.enforcement, "best_effort");
+            assert_eq!(unrelated.reason.as_deref(), Some("schema_outside_subset"));
+            assert_eq!(unrelated.profile.as_deref(), Some("openai_strict"));
         }
     }
 
