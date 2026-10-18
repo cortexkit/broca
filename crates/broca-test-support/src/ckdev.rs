@@ -212,6 +212,14 @@ fn publish_binaries_with_pruning(
         }
         hash.finalize().into()
     };
+    #[cfg(target_os = "macos")]
+    let digest: [u8; 32] = {
+        // Give the stripped-copy format a new identity so old unstripped files cannot be reused.
+        let mut hash = Sha256::new();
+        hash.update(digest);
+        hash.update(b"broca-test-support-macos-strip-s-v1");
+        hash.finalize().into()
+    };
     let prefix: String = digest[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -468,16 +476,50 @@ fn fill_copy(source: &mut Source, temporary: &TemporaryCopy, destination: &Path)
 /// carries a signature made on the internal disk. Ad-hoc; skipped for files that are not Mach-O
 /// executables, as unit-test fixtures are.
 #[cfg(target_os = "macos")]
-fn sign_copy(path: &Path) -> io::Result<()> {
+fn is_mach_o(path: &Path) -> io::Result<bool> {
     let mut magic = [0u8; 4];
-    let is_mach_o = File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .is_ok()
-        && matches!(
+    let mut file = File::open(path)?;
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(matches!(
             u32::from_le_bytes(magic),
             0xfeed_facf | 0xfeed_face | 0xcafe_babe | 0xbeba_feca
-        );
-    if !is_mach_o {
+        )),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove Mach-O debug maps before signing so symbolication cannot open build-tree object files.
+#[cfg(target_os = "macos")]
+fn strip_debug_map(path: &Path) -> io::Result<()> {
+    if !is_mach_o(path)? {
+        return Ok(());
+    }
+    let output = Command::new("/usr/bin/strip")
+        .arg("-S")
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "/usr/bin/strip -S {} failed to run: {error}",
+                path.display()
+            ))
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "/usr/bin/strip -S {} failed ({}): {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sign_copy(path: &Path) -> io::Result<()> {
+    if !is_mach_o(path)? {
         return Ok(());
     }
     let output = Command::new("/usr/bin/codesign")
@@ -518,6 +560,8 @@ fn publish_copy(source: &mut Source, directory: &Path, name: &OsString) -> io::R
     }
     let temporary = unique_temp(directory)?;
     fill_copy(source, &temporary, &destination)?;
+    #[cfg(target_os = "macos")]
+    strip_debug_map(&temporary.path)?;
     #[cfg(target_os = "macos")]
     sign_copy(&temporary.path)?;
     let size = fs::metadata(&temporary.path)?.len();
@@ -841,9 +885,14 @@ mod tests {
             b"test executable bytes",
         );
         let first = ckdev_binary(&built, &scratch);
+        let expected_prefix = if cfg!(target_os = "macos") {
+            "ee2bbe0ad803bd41"
+        } else {
+            "e5c8d6e5563f01ff"
+        };
         assert_eq!(
             first,
-            exec_root(&built).join("ckdev-exec/e5c8d6e5563f01ff/ckdev-probe.exe")
+            exec_root(&built).join(format!("ckdev-exec/{expected_prefix}/ckdev-probe.exe"))
         );
         assert_eq!(fs::read(&first).unwrap(), b"test executable bytes");
         // A second copy would change this planted timestamp even if it reproduced the bytes.
@@ -947,6 +996,107 @@ mod tests {
         );
         assert_eq!(selected_root, expected_root);
         assert!(published.starts_with(expected_root.join("ckdev-exec")));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn nm_output(path: &Path) -> String {
+        let output = Command::new("/usr/bin/nm")
+            .args(["-ap"])
+            .arg(path)
+            .output()
+            .unwrap_or_else(|error| panic!("running nm -ap on {} failed: {error}", path.display()));
+        assert!(
+            output.status.success(),
+            "nm -ap {} failed ({}): {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_published_copy_has_no_debug_map() {
+        let source = std::env::current_exe().unwrap();
+        let scratch = fixture("stripped");
+        let source_nm = nm_output(&source);
+        assert!(
+            source_nm.contains("OSO"),
+            "test binary source has no OSO entries"
+        );
+
+        let published = ckdev_binary(&source, &scratch);
+        assert!(
+            !nm_output(&published).contains("OSO"),
+            "published copy still contains OSO entries"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_republishes_a_copy_from_the_unstripped_cache_format() {
+        let source = std::env::current_exe().unwrap();
+        let scratch = fixture("legacy-format");
+        let source_info = Source::open(&source).unwrap();
+        let legacy_prefix: String = source_info.digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let legacy_directory = exec_root(&source).join("ckdev-exec").join(legacy_prefix);
+        fs::create_dir_all(&legacy_directory).unwrap();
+        let name = dev_file_name(&source);
+        let legacy_copy = legacy_directory.join(&name);
+        fs::copy(&source, &legacy_copy).unwrap();
+        assert!(nm_output(&legacy_copy).contains("OSO"));
+
+        let published = ckdev_binary(&source, &scratch);
+        assert_ne!(published, legacy_copy, "pre-strip cache entry was reused");
+        assert!(published.is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[inline(never)]
+    fn named_backtrace_function() {
+        panic!("backtrace symbol check");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panic_backtrace_child() {
+        if std::env::var_os("BROCA_TEST_SUPPORT_BACKTRACE_CHILD").is_some() {
+            named_backtrace_function();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_published_copy_backtrace_keeps_function_names() {
+        let source = std::env::current_exe().unwrap();
+        let published = ckdev_binary(&source, fixture("backtrace"));
+        let output = Command::new(&published)
+            .args([
+                "--exact",
+                "ckdev::tests::panic_backtrace_child",
+                "--nocapture",
+            ])
+            .env("BROCA_TEST_SUPPORT_BACKTRACE_CHILD", "1")
+            .env("RUST_BACKTRACE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child panic test unexpectedly passed"
+        );
+        let output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.contains("named_backtrace_function"),
+            "published copy's panic backtrace omitted the function name:\n{output}"
+        );
     }
 
     #[test]
