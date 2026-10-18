@@ -658,3 +658,61 @@ async fn locked_store_admission_is_unknown_until_boot_repairs_gap() {
     assert_eq!(reply["refs"][0]["state"], "busy");
     assert_eq!(reply["refs"][0]["reason_code"], "run_active");
 }
+
+#[tokio::test]
+async fn activation_outage_holds_one_gap_lease_for_all_incoming_episodes() {
+    struct FirstWriteFails(AtomicUsize);
+    impl broca_core::SessionRefIndex for FirstWriteFails {
+        fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("projection unavailable".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let door = Arc::new(FakeDoor::default());
+    let source = Rig::new("multi-episode-outage-source", door.clone());
+    let session = source.session("multi-episode");
+    source.seed(&session, "first-run", true);
+    source.seed(&session, "second-run", true);
+    let reference = broca_core::agent_session_ref(&session);
+    let bytes = source.bytes(&session);
+    door.plant(CUT, &reference, bytes.clone());
+    let rig = Rig::new("multi-episode-outage-receiver", door);
+    let index = Arc::new(FirstWriteFails(AtomicUsize::new(0)));
+    rig.wal.set_session_ref_index(index.clone());
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let params = rig.params(CUT, std::slice::from_ref(&session));
+    wire.call("import", params.clone()).await.unwrap();
+    wire.call("activate", params).await.unwrap();
+    assert_eq!(
+        index.0.load(Ordering::SeqCst),
+        1,
+        "a batch already protected by a durable gap must not acquire another gap lease"
+    );
+    assert!(rig
+        .root
+        .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
+        .exists());
+    assert_eq!(rig.wal.bytes_for_move(&session).unwrap().unwrap(), bytes);
+    rig.service.reconcile_boot().await.unwrap();
+    broca_test_support::wait_until("multi-episode gap repair", || async {
+        if rig
+            .root
+            .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
+            .exists()
+        {
+            Err("projection gap still present".to_owned())
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    assert!(rig
+        .index
+        .session_refs([reference.as_str()].into_iter())
+        .unwrap()
+        .sessions
+        .contains_key(&reference));
+}

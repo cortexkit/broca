@@ -900,15 +900,20 @@ impl CutArtifacts for FileCutArtifacts {
                     };
                     for frame in records {
                         if let broca_wal::WalRecord::RunStarted { session, .. } = &frame.record {
-                            if let Some(admission) = self
-                                .wal
-                                .record_session_before_install(
-                                    &broca_core::session_addr(&plan.session),
-                                    session,
-                                )
-                                .map_err(unavailable)?
-                            {
-                                projection_admissions.push(admission);
+                            // One durable marker and lease protect the whole batch.
+                            // Reacquiring the same lease for later identities would
+                            // contend with the guard this installation already holds.
+                            if projection_admissions.is_empty() {
+                                if let Some(admission) = self
+                                    .wal
+                                    .record_session_before_install(
+                                        &broca_core::session_addr(&plan.session),
+                                        session,
+                                    )
+                                    .map_err(unavailable)?
+                                {
+                                    projection_admissions.push(admission);
+                                }
                             }
                         }
                     }

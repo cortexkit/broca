@@ -16846,3 +16846,17 @@ expect_red = ["session_refs::tests::projection_repair_observes_other_process_wri
 file = "crates/broca-core/src/wal_writer/projection_gap.rs"
 old = 'if self.tenure.checked_add(1) != Some(lease.epoch()) {'
 new = 'if false { // NON-VACUITY BREAK: disregard the other process writer tenure'
+
+[[control]]
+id = "agent-data-install-outage-one-gap-lease"
+guards = "a multi-episode activation reuses its existing durable gap guard rather than reacquiring the same lease"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test agent_data"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/agent_data/inventory.rs"
+expect_red = ["inventory::activation_outage_holds_one_gap_lease_for_all_incoming_episodes"]
+file = "crates/broca-module/src/move_files.rs"
+old = 'if projection_admissions.is_empty() {'
+new = 'if true { // NON-VACUITY BREAK: retry the root gap lease within its own installation'
