@@ -16900,3 +16900,85 @@ select = "expected"
 file = "crates/broca-module/src/retention.rs"
 old = "self.index.live(key)?.filter(|row| row.wal_bytes == bytes)"
 new = "self.index.live(key)?.filter(|_| true) // NON-VACUITY BREAK: trust a stale retention deadline\n"
+
+[[control]]
+id = "agent-data-ref-contention-waits-not-try-lock-failure"
+guards = "ordinary serving-connection contention waits and succeeds during census without setting a marker or rearming migration"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
+expect_red = ["session_refs::contention_tests::ref_write_waits_during_census_without_marker_or_rearming"]
+file = "crates/broca-store/src/session_refs.rs"
+old = '''if remaining.is_zero() {
+                        return Err("session-ref store busy timeout waiting for connection".into());'''
+new = '''if true { // NON-VACUITY BREAK: restore instant try_lock failure
+                        return Err("session-ref store busy timeout waiting for connection".into());'''
+
+[[control]]
+id = "agent-data-migration-write-time-budget"
+guards = "slow migration work releases the SQLite writer lock before reaching the batch row cap"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/batches.rs"
+expect_red = ["session_refs::batches::tests::migration_write_budget_yields_before_the_row_limit"]
+file = "crates/broca-store/src/session_refs/batches.rs"
+old = 'if started.elapsed() >= MAX_WRITE_WORK {'
+new = 'if false { // NON-VACUITY BREAK: hold the write lock for an over-long batch'
+
+[[control]]
+id = "agent-data-migration-write-row-budget"
+guards = "even fast migration work commits only a bounded number of items per write lock"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/batches.rs"
+expect_red = ["session_refs::batches::tests::migration_write_budget_caps_fast_rows_too"]
+file = "crates/broca-store/src/session_refs/batches.rs"
+old = 'items.iter().take(MAX_BATCH_ITEMS)'
+new = 'items.iter().take(usize::MAX) /* NON-VACUITY BREAK: unbounded transaction rows */'
+
+[[control]]
+id = "agent-data-interrupted-candidate-needs-replay"
+guards = "partial candidate publication does not certify complete coverage of an interrupted census address"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
+expect_red = ["session_refs::contention_tests::interrupted_candidate_batch_is_replayed_before_census_completion"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = 'AND NOT EXISTS(SELECT 1 FROM agent_data_census_inflight WHERE address=?1)'
+new = '/* NON-VACUITY BREAK: trust a partially inserted candidate without replay */'
+
+[[control]]
+id = "agent-data-projection-reserves-writer-before-reading"
+guards = "foreground projection waits for migration rather than failing a deferred read-to-write upgrade"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
+expect_red = ["session_refs::contention_tests::census_with_ref_projection_and_export_writers_has_no_failures_or_markers"]
+file = "crates/broca-store/src/lib.rs"
+old = '''let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_state = current_projection_state(&tx, key)?;'''
+new = '''let tx = conn.transaction()?; // NON-VACUITY BREAK: reintroduce the deferred upgrade race
+        let current_state = current_projection_state(&tx, key)?;'''
+
+[[control]]
+id = "agent-data-ref-sqlite-contention-keeps-wait-budget"
+guards = "session-ref SQLite writes retain the bounded busy wait rather than failing instantly on a contending writer"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
+expect_red = ["session_refs::contention_tests::persistent_sqlite_contention_waits_until_busy_timeout"]
+file = "crates/broca-store/src/session_refs.rs"
+old = 'remaining.min(std::time::Duration::from_millis(timeout))'
+new = 'std::time::Duration::ZERO /* NON-VACUITY BREAK: fail ordinary SQLite contention instantly */'

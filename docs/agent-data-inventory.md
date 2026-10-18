@@ -11,7 +11,10 @@ filename, payload or byte offset.
 ## Completeness and admission
 
 Before a `RunStarted` append, ordinary and preencoded writers (including
-provider-free imports) attempt to commit the candidate. SQLite contention or a
+provider-free imports) attempt to commit the candidate. The connection mutex and
+SQLite write lock share a bounded wait budget matching the store's five-second
+busy timeout, so ordinary migration contention waits rather than creating a gap.
+SQLite contention beyond that budget or a
 projection failure does **not** block the run: the writer instead creates and
 syncs the owner-only, content-free `session-ref-projection.incomplete` marker in
 the state root, then appends normally. Only failure to durably establish that
@@ -39,8 +42,10 @@ sets bypass discovery.
 
 Startup creates the additive schema, then schedules migration off the serve path
 on a separate SQLite connection. It does not hold the serving connection's mutex
-while backfilling. One transaction derives refs from distinct `run_index` triples
-and records its completion. Invalid legacy identities leave missing session refs
+while backfilling. Run-index rows are read and decoded outside write transactions,
+then committed in small keyset-paged batches with a durable run-id cursor. The
+completion marker is recorded only after the source scan finishes. Invalid legacy
+identities leave missing session refs
 unknown rather than certifying that no local copy exists.
 
 Old imports, move activations and interrupted admissions may have WALs without
@@ -52,10 +57,20 @@ writer, manifest, lease, extraction or repair API. Archive enumeration reads ind
 not represented member payloads. Unreadable or ambiguous locations prevent census
 completion, never become absence.
 
-The census queue and per-address coverage commit in batches of at most 128 rows.
-After interruption, enumeration adds any new addresses but already-covered
-payloads and probes are skipped. Work yields between addresses and pauses three
-times each batch's total work duration, including decoding and SQLite commits.
+All migration writes (schema, backfill, queueing, coverage, reset and completion)
+use at most 64 work items per transaction and check a 10 ms work budget between
+items. File reads and JSON decoding occur outside the write lock. Commit/fsync
+cannot be preempted; completion logs and the copy-only timing tool report the
+measured longest lock hold, including commit and excluding lock-acquisition wait.
+Every transaction releases the lock, yields and leaves an unlocked pacing interval
+before attempting the next batch. The migration connection does not run automatic
+checkpoints inside its commits.
+
+Census progress and in-flight addresses are durable. An interrupted address with
+partially inserted candidates is replayed rather than mistaken for a fully
+represented WAL. After interruption, enumeration adds any new addresses but
+already-covered payloads and probes are skipped. Work yields between addresses
+and pauses three times each batch's work duration, including SQLite commits.
 Completed migration is not repeated on normal restarts. If the gap marker exists
 at boot, migration reopens census completion and revisits unrepresented addresses,
 including previously empty WALs; already-covered candidates are retained. After

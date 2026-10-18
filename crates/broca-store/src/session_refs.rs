@@ -16,96 +16,71 @@ pub struct BackfillCounts {
     pub rows: u64,
     pub distinct_sessions: u64,
     pub inserted: u64,
+    pub writes: MigrationWriteStats,
 }
 
+mod backfill;
+mod batches;
 mod census;
+pub use batches::MigrationWriteStats;
 pub use census::{census, migrate, CensusCounts};
 
 pub fn init_schema(conn: &Connection) -> Result<(), StoreError> {
-    // Managed writers insert the writer token and the candidate in one transaction,
-    // then remove the token before commit. Older binaries cannot set the token;
-    // their run rows therefore invalidate completeness instead of hiding a gap.
-    conn.execute_batch(
+    init_schema_measured(conn, &mut MigrationWriteStats::default())
+}
+
+fn init_schema_measured(
+    conn: &Connection,
+    stats: &mut MigrationWriteStats,
+) -> Result<(), StoreError> {
+    // Managed writers record the candidate and writer token in one transaction.
+    // Unmanaged run writes instead retain pending identities until migration.
+    let schema = [
         "CREATE TABLE IF NOT EXISTS agent_data_session_ref (
             session_ref TEXT PRIMARY KEY CHECK(length(session_ref)=32 AND session_ref NOT GLOB '*[^0-9a-f]*'),
-            address TEXT NOT NULL,
-            project_root TEXT NOT NULL,
-            harness TEXT NOT NULL,
-            session TEXT NOT NULL
-         ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS agent_data_session_address ON agent_data_session_ref(address);
-         CREATE TABLE IF NOT EXISTS agent_data_projection (
-            id INTEGER PRIMARY KEY CHECK(id=1), backfilled INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS agent_data_census (
-            address TEXT PRIMARY KEY, covered INTEGER NOT NULL DEFAULT 0
-         ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS agent_data_census_pending ON agent_data_census(address) WHERE covered=0;
-         CREATE TABLE IF NOT EXISTS agent_data_census_done (id INTEGER PRIMARY KEY CHECK(id=1));
-         CREATE TABLE IF NOT EXISTS agent_data_pending_session (session TEXT PRIMARY KEY) WITHOUT ROWID;
-         CREATE TABLE IF NOT EXISTS agent_data_writer (id INTEGER PRIMARY KEY CHECK(id=1));
-         CREATE TRIGGER IF NOT EXISTS agent_data_run_insert AFTER INSERT ON run_index
+            address TEXT NOT NULL, project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL
+         ) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS agent_data_session_address ON agent_data_session_ref(address)",
+        "CREATE TABLE IF NOT EXISTS agent_data_projection (id INTEGER PRIMARY KEY CHECK(id=1), backfilled INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS agent_data_census (address TEXT PRIMARY KEY, covered INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS agent_data_census_pending ON agent_data_census(address) WHERE covered=0",
+        "CREATE TABLE IF NOT EXISTS agent_data_census_inflight (address TEXT PRIMARY KEY) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS agent_data_census_done (id INTEGER PRIMARY KEY CHECK(id=1))",
+        "CREATE TABLE IF NOT EXISTS agent_data_pending_session (session TEXT PRIMARY KEY) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS agent_data_writer (id INTEGER PRIMARY KEY CHECK(id=1))",
+        "CREATE TABLE IF NOT EXISTS agent_data_backfill_cursor (id INTEGER PRIMARY KEY CHECK(id=1), last_run_id TEXT, valid INTEGER NOT NULL)",
+        "CREATE TRIGGER IF NOT EXISTS agent_data_run_insert AFTER INSERT ON run_index
          WHEN NOT EXISTS(SELECT 1 FROM agent_data_writer) BEGIN
             INSERT OR IGNORE INTO agent_data_pending_session VALUES(NEW.session);
             DELETE FROM agent_data_census_done;
-         END;
-         CREATE TRIGGER IF NOT EXISTS agent_data_run_update AFTER UPDATE OF session ON run_index
+         END",
+        "CREATE TRIGGER IF NOT EXISTS agent_data_run_update AFTER UPDATE OF session ON run_index
          WHEN NOT EXISTS(SELECT 1 FROM agent_data_writer) BEGIN
             INSERT OR IGNORE INTO agent_data_pending_session VALUES(NEW.session);
             DELETE FROM agent_data_census_done;
-         END;",
-    )?;
+         END",
+    ];
+    let mut used = 0;
+    while used < schema.len() {
+        used += batches::write_batch(
+            conn,
+            &schema[used..],
+            stats,
+            true,
+            |tx, sql| {
+                tx.execute_batch(sql)?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )?;
+    }
     Ok(())
 }
 
 /// The same one-time migration used by daemon startup and the copy-only timing tool.
 /// Triggers preserve lag information even if an older binary writes run_index.
 pub fn backfill(conn: &Connection) -> Result<BackfillCounts, StoreError> {
-    init_schema(conn)?;
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-
-    let done: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1)",
-        [],
-        |row| row.get(0),
-    )?;
-    let mut counts = BackfillCounts::default();
-    if !done {
-        counts.rows = tx.query_row("SELECT count(*) FROM run_index", [], |row| row.get(0))?;
-    }
-    let mut valid = true;
-    {
-        let sql = if done {
-            "SELECT session FROM agent_data_pending_session"
-        } else {
-            "SELECT DISTINCT session FROM run_index"
-        };
-        let mut statement = tx.prepare(sql)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            counts.distinct_sessions += 1;
-            let Ok(session) = serde_json::from_str::<BindIdentity>(&row.get::<_, String>(0)?)
-            else {
-                valid = false;
-                continue;
-            };
-            counts.inserted += insert(&tx, &session_addr(&session), &session)? as u64;
-        }
-    }
-    tx.execute("DELETE FROM agent_data_pending_session", [])?;
-    if !done {
-        tx.execute(
-            "INSERT INTO agent_data_projection VALUES(1,?1)",
-            [if valid { 1 } else { 2 }],
-        )?;
-    } else if !valid {
-        tx.execute(
-            "UPDATE agent_data_projection SET backfilled=2 WHERE id=1",
-            [],
-        )?;
-    }
-    tx.commit()?;
-    Ok(counts)
+    backfill::run(conn)
 }
 
 pub(crate) fn insert(
@@ -123,19 +98,45 @@ pub(crate) fn insert(
     )?)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static REF_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 impl SessionRefIndex for SqliteStore {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
-        let conn = self
-            .conn
-            .try_lock()
-            .map_err(|error| format!("session-ref store busy: {error}"))?;
-        // This optional projection must not inherit the store's retry wait while
-        // another connection owns the write lock. WAL admission has a durable
-        // filesystem gap marker for exactly this case.
+        let deadline = std::time::Instant::now() + crate::STORE_BUSY_TIMEOUT;
+        let conn = loop {
+            match self.conn.try_lock() {
+                Ok(conn) => break conn,
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    return Err(format!("session-ref store poisoned: {error}"))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    REF_WAIT_HOOK.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() {
+                            hook();
+                        }
+                    });
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("session-ref store busy timeout waiting for connection".into());
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+                }
+            }
+        };
+        // Share one bounded budget between the connection mutex and SQLite's
+        // write lock. Routine migration contention must not create a WAL gap.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("session-ref store busy timeout before write".into());
+        }
         let timeout: u64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        conn.busy_timeout(std::time::Duration::ZERO)
+        conn.busy_timeout(remaining.min(std::time::Duration::from_millis(timeout)))
             .map_err(|error| error.to_string())?;
         let result = insert(&conn, address, session).map_err(|error| error.to_string());
         conn.busy_timeout(std::time::Duration::from_millis(timeout))
@@ -235,5 +236,7 @@ pub fn cleanup_legacy_inventory(root: &std::path::Path) -> std::io::Result<(u64,
     Ok((count, bytes))
 }
 
+#[cfg(test)]
+mod contention_tests;
 #[cfg(test)]
 mod tests;
