@@ -374,17 +374,8 @@ async fn a_run_admitted_at_a_reproducible_renderer_version_resumes_and_an_undecl
         return;
     };
     let current = broca_provider::families::GEMINI_RENDERER_VERSION;
-    let declared = broca_provider::families::earlier_renderer_versions(
-        broca_provider::spec::WireFamilyId::Gemini,
-    );
-    assert_eq!(
-        declared.last(),
-        Some(&(
-            current - 1,
-            broca_provider::families::EarlierRendererVersion::Reproducible
-        )),
-        "this test resumes a run recorded at the version Gemini declares reproducible"
-    );
+    // Gemini declares `current - 1` reproducible and `current - 2` not; the declarations
+    // themselves are checked in broca-provider. This test checks what the daemon does with them.
 
     // What the current build records for this admission.
     rig.send("template", "What time is it?").await;

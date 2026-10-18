@@ -16525,7 +16525,7 @@ package = "broca-core"
 target = "--test it"
 select = "expected"
 test_file = "crates/broca-core/tests/it/resume_exec.rs"
-expect_red = ["resume_exec::a_declared_reproducible_renderer_version_resumes_with_identical_bytes"]
+expect_red = ["resume_exec::a_declared_reproducible_renderer_version_resumes_with_identical_bytes", "resume_exec::a_declared_version_with_a_different_frozen_config_still_refuses"]
 file = "crates/broca-core/src/run.rs"
 old = "    } else if !provider.reproduces_renderer_version(recorded.renderer_version) {"
 new = "    } else if provider.renderer_version() != recorded.renderer_version { // NON-VACUITY BREAK"
