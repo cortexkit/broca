@@ -3491,6 +3491,23 @@ old = "        prune_copies(&cache, &directory, SystemTime::now());"
 new = "        // NON-VACUITY BREAK: disable executable cache pruning."
 
 [[control]]
+id = "test-rig-ckdev-skips-debug-map-strip"
+guards = "macOS test executable copies drop OSO debug-map entries before publication"
+runner = "cargo"
+package = "broca-test-support"
+target = "--lib"
+test_file = "crates/broca-test-support/src/ckdev.rs"
+expect_red = [
+  "ckdev::tests::macos_published_copy_has_no_debug_map",
+  "ckdev::tests::macos_republishes_a_copy_from_the_unstripped_cache_format",
+]
+expect_message = "still contains OSO entries"
+platforms = ["macos"]
+file = "crates/broca-test-support/src/ckdev.rs"
+old = "    strip_debug_map(&temporary.path)?;"
+new = "    let _ = &temporary.path; // NON-VACUITY BREAK: skip stripping the copied Mach-O debug map."
+
+[[control]]
 id = "stall-heartbeat-staleness"
 guards = "an OS-thread watchdog records heartbeat staleness while every Tokio worker is parked"
 runner = "cargo"
