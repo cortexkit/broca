@@ -12,6 +12,22 @@
 
 use super::*;
 
+/// Existing reasoning tags and scalar frozen flags predate the OpenRouter continuation format.
+/// Their payload bytes and ungated frame version must survive adding a reader feature.
+#[test]
+fn pre_openrouter_reasoning_records_keep_their_bytes_and_frame_requirements() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+    for pinned in include_str!("../../tests/fixtures/before_openrouter_reasoning.jsonl").lines() {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty());
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
 /// Cancellation must not change the bytes or reader requirements of existing boundaries.
 #[test]
 fn pre_cancel_at_boundaries_keep_their_bytes_and_frame_requirements() {

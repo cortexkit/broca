@@ -1131,6 +1131,7 @@ impl OpenAiResponsesNormalizer {
                         format: match self.reasoning_format {
                             EncryptedReasoningFormat::OpenAiResponses => broca_protocol::content::TextProviderFormat::OpenAiResponses,
                             EncryptedReasoningFormat::OpenAiResponsesChatgpt => broca_protocol::content::TextProviderFormat::OpenAiResponsesChatgpt,
+                            EncryptedReasoningFormat::OpenRouter => return Err(NormalizeError::Invalid("OpenRouter reasoning cannot label Responses text state".into())),
                         },
                         data,
                     },

@@ -123,6 +123,34 @@ fn deepseek_config(reasoning_content_required: bool) -> FrozenRenderConfig {
 }
 
 #[test]
+fn pre_chat_reasoning_policy_configs_and_request_bytes_are_pinned() {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/pre_chat_reasoning_policy.json")).unwrap();
+    assert_eq!(cases.len(), 4);
+    let opts = CallOptions::new(vec![
+        user("question"),
+        Message::new(
+            Role::Assistant,
+            vec![
+                reasoning("earlier thinking"),
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+        ),
+        user("again"),
+    ]);
+    for case in cases {
+        let frozen: FrozenRenderConfig = serde_json::from_value(case["frozen"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), case["frozen"]);
+        assert_eq!(
+            OpenAiChat.render(&frozen, &opts),
+            case["body"].as_str().unwrap().as_bytes()
+        );
+    }
+}
+
+#[test]
 fn kimi_echoes_history_before_last_user_and_empty_text_turns_golden() {
     let mut frozen = openai_chat_frozen_config("kimi-k3");
     frozen.reasoning_echo = Some(ReasoningEchoPolicy::KIMI);
