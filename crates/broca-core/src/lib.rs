@@ -145,8 +145,13 @@ pub use steer::SteerInbox;
 pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
 pub use wal_writer::{
-    session_addr, FileWalStore, RecordObserver, RecordOutcome, WalHandle, WalOpenError, WalStore,
-    WalWriteError, WAL_MANIFEST_FILENAME,
+    agent_session_ref, session_addr, FileWalStore, ReadOnlyWalReader, RecordObserver,
+    RecordOutcome, SessionRefIndex, WalHandle, WalOpenError, WalStore, WalWriteError,
+    WAL_MANIFEST_FILENAME,
+};
+pub use wal_writer::{
+    session_projection_incomplete, ProjectionAdmission, ProjectionRepair,
+    SESSION_PROJECTION_INCOMPLETE,
 };
 
 pub mod keep_warm;

@@ -35,6 +35,7 @@ pub mod export_index;
 mod fold_identities;
 pub mod retention;
 pub mod retention_withdrawals;
+pub mod session_refs;
 pub use fold_identities::fold_identities;
 
 pub use caps::CapsStore;
@@ -999,6 +1000,7 @@ impl SqliteStore {
             [],
         )?;
         retention::init_work_schema(conn)?;
+        session_refs::init_schema(conn)?;
         export_index::init_schema(conn).map_err(StoreError::from)
     }
 
@@ -1933,7 +1935,14 @@ impl RunIndex for SqliteStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
+        let mut connection = self.conn.lock().unwrap();
+        let conn = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        conn.execute("INSERT INTO agent_data_writer VALUES(1)", [])
+            .map_err(|error| error.to_string())?;
+        session_refs::insert(&conn, &session_addr(&row.session), &row.session)
+            .map_err(|error| error.to_string())?;
         conn.execute(
             // The first title written for a run wins: its `RunStarted` is written once, so a
             // later admission of the same run id (a resume) never holds a different one.
@@ -1961,6 +1970,9 @@ impl RunIndex for SqliteStore {
              ],
         )
         .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM agent_data_writer", [])
+            .map_err(|error| error.to_string())?;
+        conn.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 

@@ -886,31 +886,44 @@ impl CutArtifacts for FileCutArtifacts {
             }
             Op::Activate => {
                 let paths = self.paths(&cut_id, &locked.plans)?;
+                let mut projection_admissions = Vec::new();
+                // Keep failed-projection guards through installation so a census
+                // cannot clear their durable marker before the WAL is published.
+                for plan in &locked.plans {
+                    let range =
+                        broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
+                            .map_err(unavailable)?;
+                    let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+                        return Err(unavailable(
+                            "incoming move WAL has incomplete identity records",
+                        ));
+                    };
+                    for frame in records {
+                        if let broca_wal::WalRecord::RunStarted { session, .. } = &frame.record {
+                            // One durable marker and lease protect the whole batch.
+                            // Reacquiring the same lease for later identities would
+                            // contend with the guard this installation already holds.
+                            if projection_admissions.is_empty() {
+                                if let Some(admission) = self
+                                    .wal
+                                    .record_session_before_install(
+                                        &broca_core::session_addr(&plan.session),
+                                        session,
+                                    )
+                                    .map_err(unavailable)?
+                                {
+                                    projection_admissions.push(admission);
+                                }
+                            }
+                        }
+                    }
+                }
                 move_install::install_verified(
                     &self.state_root,
                     &cut_id,
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),
                     |session| {
-                        let plan = locked
-                            .plans
-                            .iter()
-                            .find(|plan| &plan.session == session)
-                            .ok_or_else(|| "installed session has no move plan".to_owned())?;
-                        let range = broca_wal::file_wal::read_verified_member_range(
-                            &plan.bytes,
-                            0,
-                            0,
-                            None,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
-                            return Err(
-                                "installed move WAL has incomplete identity records".to_owned()
-                            );
-                        };
-                        self.wal
-                            .publish_move_records(&broca_core::session_addr(session), records);
                         // Ownership sidecars retain the canonical wal/ address so every
                         // transcript tree shares one move refusal and one writer lease.
                         migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
@@ -918,12 +931,7 @@ impl CutArtifacts for FileCutArtifacts {
                         self.driver.drop_projection(session)
                     },
                 )
-                .map_err(|e| {
-                    self.wal.invalidate_move_inventory(format!(
-                        "cut {cut_id} installation did not complete"
-                    ));
-                    self.install_error(&cut_id, _state, &locked, e)
-                })?;
+                .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;
             }
             Op::Abort => {
                 self.rollback(request, _state).await?;

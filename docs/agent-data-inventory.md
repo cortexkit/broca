@@ -1,93 +1,98 @@
 # Agent-data reference discovery
 
-The move participant's process-local inventory maps a shared session ref to its
-logical WAL address and bind identity. It is derived from WAL records, never an
-authorization or busy-state cache. Bound cuts continue to use their durable
-recorded addresses, not discovery.
+Agent-data discovers shared session refs through an additive SQLite projection in
+`run-index.db`, not a process-wide identity map or a JSON cache. The
+`agent_data_session_ref` table maps the commons llm-runner `session_ref` (32 lowercase
+hex characters) to the full bind triple and logical WAL address. Its primary key
+indexes ref lookups; a compact address index supports the one-time migration.
+There is no duplicate project-root index and no cached live filename, archive
+filename, payload or byte offset.
 
-`AgentDataService::reconcile_boot` starts one dedicated background thread before
-serving. Requests never start or await that build. Until it finishes, unresolved
-refs are unknown, not absent. Unreadable files, ambiguous addresses, failed
-inventory enumeration and uncertain identity writes keep absence unknown for the
-process lifetime; restart rebuilds from durable storage. Empty ref sets bypass
-inventory altogether. Dropping the service cancels enumeration and the build
-between addresses. A route GOODBYE, replacement, or connection EOF cancels its
-in-flight agent-data handlers; the independent boot build has no caller to wait
-for and continues for other routes.
+## Completeness and admission
 
-The build inventories portable WALs, retained WALs and sealed archive members.
-It checks every current location each boot, never using the cache's address list
-as a census. Only triples whose derived address equals the physical address are
-indexed. Historical triples in re-keyed WALs do not become aliases.
+Before a `RunStarted` append, ordinary and preencoded writers (including
+provider-free imports) attempt to commit the candidate. SQLite contention or a
+projection failure does **not** block the run: the writer instead creates and
+syncs the owner-only, content-free `session-ref-projection.incomplete` marker in
+the state root, then appends normally. Only failure to durably establish that
+marker prevents the append. Move activation uses the same fallback before
+installing verified bytes. Import staging alone does not claim a local copy. Only identities whose derived address matches the
+WAL filename's address (or the archive member header's address) are eligible;
+historical triples in re-keyed WALs do not
+become aliases.
 
-## Persistent restart hints
+Writing the candidate first deliberately permits conservative extra rows after a
+failed or interrupted append/installation. Lookup never proves that bytes are held:
+the move resolves the current live/retained/archive location and verifies its actual
+WAL bytes. WALs remain the authority. Retention's durable ledger remains the
+authority for expired, non-exportable sessions. Bound cuts use their recorded
+addresses rather than rediscovering identity.
 
-`move-inventory.json` sits beside `wal/`, with owner-only permissions. It is a
-versioned, checksummed derived cache, written to a unique private temporary file,
-synced and atomically renamed. A missing, corrupt, insecure or unknown-version
-cache produces one WARN and a full rebuild, never a move-service failure. Cache
-write failure only makes the next startup slower. A changed WAL-reader feature
-set also rebuilds the cache, so a downgraded binary cannot reuse a newer reader's
-successful scan of frames it would itself refuse. The cache checksum detects
-accidental damage; it is not an authorization signature.
+A missing ref proves absence only when the query's SQLite snapshot contains both
+migration completion markers, no pending legacy admissions, and no filesystem
+gap marker. Until then it is
+unknown, using the existing retryable response. Known candidates can still be
+verified independently. SQLite failures likewise never prove absence. Empty ref
+sets bypass discovery.
 
-Per address it stores the eligible triples, logical source, lineage, last record
-sequence and verified committed end. Each live WAL is statted and its fixed-size
-lineage metadata is verified at the head and tail (at most 138 bytes). Reuse
-requires matching lineage, committed length, file identity and modification time.
-The tail probe also recognizes legacy WALs that gained lineage after their first
-records. WALs with no verifiable lineage are conservatively fully reread. A changed
-lineage, shrink or in-place same-length modification requires a full read.
+## One-time migration, not a boot inventory
 
-A matching lineage that grew is read from the cached committed end using the
-strict byte-anchor reader: it must prove the next sequence, otherwise a full read
-replaces the hint. Torn tails do not advance the saved end. Platforms without
-stable file anchors reuse unchanged files but fully read changed ones. Full and
-suffix reads retain the existing size caps, sequence checks and frame digests.
-They inspect every new record: stopping at the first RunStarted would miss a later
-eligible triple after arbitrary historical content.
+Startup creates the additive schema, then schedules migration off the serve path
+on a separate SQLite connection. It does not hold the serving connection's mutex
+while backfilling. One transaction derives refs from distinct `run_index` triples
+and records its completion. Invalid legacy identities leave missing session refs
+unknown rather than certifying that no local copy exists.
 
-Sealed archive v2 indexes prove member coverage without reading member payloads;
-older containers use header-only walks. Each member hint includes container file
-identity, length and modification time, member offset and payload length (and the
-header digest for older indexes). Unchanged members reuse triples without payload
-reads or payload SHA-256 verification. Changed members use the ordinary verified
-archive reader. Requested operations still verify their actual bytes regardless
-of whether discovery reused a hint.
+Old imports, move activations and interrupted admissions may have WALs without
+`run_index` rows. A one-time metadata census closes those gaps across `wal/`,
+`wal-ephemeral/`, `wal-durable/` and sealed `wal-archive*/` members. Represented live
+addresses get only stat and fixed head/tail lineage probes. Only uncovered
+addresses get full verified WAL reads through `ReadOnlyWalReader`, which has no
+writer, manifest, lease, extraction or repair API. Archive enumeration reads indexes/headers,
+not represented member payloads. Unreadable or ambiguous locations prevent census
+completion, never become absence.
 
-The thread handles one address at a time. This is **cooperative pacing, not OS
-priority**: after payload work it pauses three times that work's elapsed duration,
-targeting roughly 25% of one worker's CPU duty cycle. A production cold rebuild
-that took 10.5 minutes unthrottled is therefore expected to take about 42 minutes,
-leaving roughly 75% of that core free; I/O-bound work may use less CPU. Warm-cache
-metadata checks only yield and do not incur those pauses. Cancellation checks run
-between addresses and at least every 50 ms during a pacing pause.
+The census queue and per-address coverage commit in batches of at most 128 rows.
+After interruption, enumeration adds any new addresses but already-covered
+payloads and probes are skipped. Work yields between addresses and pauses three
+times each batch's total work duration, including decoding and SQLite commits.
+Completed migration is not repeated on normal restarts. If the gap marker exists
+at boot, migration reopens census completion and revisits unrepresented addresses,
+including previously empty WALs; already-covered candidates are retained. After
+the store is writable and census succeeds, the marker is unlinked and the state
+root synced. A short per-root filesystem lease, shared across processes, prevents
+a concurrent failed projection append or installation from clearing a marker
+across the census. Each acquisition increments a persisted counter: repair records
+that counter before scanning, reacquires the lease at completion, and clears the
+marker only if the counter increased by exactly one for its own reacquisition.
+Any intervening writer or repair leaves the marker in place. No lock is held for
+the census duration and no session identities are cached in memory.
+A failed or overlapped repair leaves the marker for the next boot, not a false
+absence or a failed run.
+Downgrade-then-reupgrade is outside the projection-completeness guarantee: an older
+binary can add WAL-only sessions that the already-completed migration will not discover.
+Legacy `run_index` writers
+are tracked by triggers; current writers suppress those triggers only within the
+same transaction that records the candidate. Legacy gaps invalidate completeness
+and are reconciled on the next migration.
 
-## Incremental maintenance in the running process
+At boot, obsolete `move-inventory.json` and `move-inventory.tmp-*` files in the
+state root are removed without following links or recursing. One INFO event
+reports the count and bytes freed. There is no inventory thread, JSON checkpoint,
+persistent RAM identity map or inventory-progress health metric.
 
-Every WAL opened through FileWalStore is wrapped by the inventory publisher.
-Successful synchronous appends and explicit sync barriers publish all pending
-RunStarted triples before returning, so admission's first durable RunStarted is
-visible even when the writer predates the boot scan. Updates accumulated during
-the scan are merged at publication, never overwritten. Failed identity durability
-marks the inventory incomplete rather than proving absence.
+## Read and send fencing
 
-Move activation bypasses the normal writer. Its installation callback publishes
-all eligible triples from the verified incoming WAL after durable installation
-and before session exclusion is released. A partially failed installation marks
-absence unknown. Import staging alone does not claim a local copy.
+Ordinary reads check the canonical `.moved` sidecar, which records that another
+machine owns the session and prevents exposing the old local bytes. Write checks also enforce
+`.moving` and unfinished release/activation intents. At boot a small, durable
+per-ref fence index is rebuilt from cut JSON. Cut saves publish fences before
+intent, and remove them only after completion is durable. Checks then stat the
+ready marker and open only the named ref's fence, not every cut JSON file.
+Readers without initialization (including older binaries) retain the conservative
+cut scan. Cut JSON remains the downgrade authority; this changes no WAL format.
 
-Archive folding and extraction preserve both the logical address and payload;
-the map deliberately holds no live filename, archive filename or byte offset to
-invalidate. Requested reads still resolve the current live/archive location and
-verify it. A deleted session can leave a conservative candidate in the map, but
-its bytes must still be present before it can be considered held. Retention's
-durable ledger remains the authority for non-exportable expired sessions.
-
-Each request looks up only its named refs and reads only their WALs. Busy probes
-still inspect the complete requested WAL for active runs, queued sends and
-unsettled approvals, and take the same actor/lease/move-fence observations. They
-no longer compute unused export digests, format metadata or archive snapshots.
-INFO events report op, cut id, ref count and elapsed milliseconds once, including
-cancelled calls. `health.check.metrics.agent_data_ops` reports each op's cumulative
-count since this service started, including zero.
+Busy probes inspect the requested WAL for active runs, queued sends and unsettled
+approvals, with the existing actor, lease and move-fence observations. INFO events
+report op, cut id, ref count and elapsed milliseconds, including cancelled calls.
+`health.check.metrics.agent_data_ops` reports each operation's cumulative count.

@@ -294,6 +294,11 @@ impl Rig {
         broca_wal::migration::durable_dir(&root, &root.join("wal")).unwrap();
         let wal = Arc::new(FileWalStore::new(root.join("wal")));
         let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+        broca_store::session_refs::migrate(
+            &root.join("run-index.db"),
+            &broca_core::ReadOnlyWalReader::new(&root),
+        )
+        .unwrap();
         let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
             Arc::new(NeverOpen),
             Some(wal.clone()),
@@ -441,10 +446,9 @@ impl Wire {
         Self::new_with_scope(rig, principal, internal, Value::Null).await
     }
     async fn new_with_scope(rig: &Rig, principal: Value, internal: bool, scope: Value) -> Self {
-        rig.service.wait_inventory().await;
-        Self::without_inventory(rig, principal, internal, scope).await
+        Self::connect(rig, principal, internal, scope).await
     }
-    async fn without_inventory(rig: &Rig, principal: Value, internal: bool, scope: Value) -> Self {
+    async fn connect(rig: &Rig, principal: Value, internal: bool, scope: Value) -> Self {
         let (stream, module) = tokio::io::duplex(64 * 1024);
         let (read, write) = tokio::io::split(module);
         let registry = rig.registry.clone();
@@ -1333,9 +1337,6 @@ mod real_daemon;
 
 #[path = "agent_data/inventory.rs"]
 mod inventory;
-
-#[path = "agent_data/persistent_inventory.rs"]
-mod persistent_inventory;
 
 #[tokio::test]
 async fn closed_session_with_question_withdrawal_debt_is_busy_before_prepare() {
@@ -2389,12 +2390,17 @@ async fn divergence_is_per_ref_when_one_held_wal_is_unreadable() {
 }
 
 #[tokio::test]
-async fn unresolved_ref_with_unreadable_inventory_is_unknown_not_absent() {
+async fn unresolved_ref_with_lagging_projection_is_unknown_not_absent() {
     let (rig, params, _) = incoming_rig("ambiguous-local-copy");
     let b = rig.session("unreadable");
     rig.seed(&b, "b", true);
     unreadable_wal(&rig, &b);
-    let address = broca_core::session_addr(&b);
+    let conn = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
+    conn.execute(
+        "INSERT INTO run_index(run_id,session,state) VALUES('legacy-gap',?1,'active')",
+        [serde_json::to_string(&b).unwrap()],
+    )
+    .unwrap();
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     assert_eq!(
         wire.call("diverged", params.clone()).await.unwrap(),
@@ -2403,7 +2409,7 @@ async fn unresolved_ref_with_unreadable_inventory_is_unknown_not_absent() {
     for op in ["prepare", "import"] {
         let error = assert_code(wire.call(op, params.clone()).await, "unavailable");
         assert!(
-            error["message"].as_str().unwrap().contains(&address),
+            error["message"].as_str().unwrap().contains("projection"),
             "{error}"
         );
     }

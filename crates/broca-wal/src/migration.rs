@@ -7,6 +7,8 @@
 //! the move, so downgrading cannot resume a partly installed session.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod fence_index;
+pub use fence_index::rebuild as rebuild_fence_index;
 use std::{
     fs, io,
     io::Write,
@@ -184,6 +186,7 @@ pub fn atomic_json(state_root: &Path, path: &Path, value: &impl Serialize) -> io
     durable_dir(state_root, parent)?;
     let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(value).map_err(invalid)?;
+    let publication = fence_index::before(state_root, path, &bytes)?;
     let mut file = broca_owner_only::OpenOptions::new()
         .write(true)
         .create(true)
@@ -192,7 +195,11 @@ pub fn atomic_json(state_root: &Path, path: &Path, value: &impl Serialize) -> io
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&temp, path)?;
-    sync_dir(parent)
+    sync_dir(parent)?;
+    if let Some(publication) = publication {
+        publication.finish()?;
+    }
+    Ok(())
 }
 
 pub fn unlink(path: &Path) -> io::Result<()> {
@@ -389,6 +396,9 @@ pub fn release(
 /// installed WAL before the move's completion is durably recorded.
 /// `session_ref` comes from the shared role helper, never the WAL filename hash.
 pub fn cut_fence(wal_root: &Path, session_ref: &str) -> io::Result<Option<String>> {
+    if let Some(fence) = fence_index::check(wal_root, session_ref)? {
+        return Ok(fence);
+    }
     let cuts = wal_root
         .parent()
         .unwrap_or(Path::new("."))

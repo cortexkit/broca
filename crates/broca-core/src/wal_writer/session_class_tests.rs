@@ -88,7 +88,7 @@ fn backup_classes_change_never_moves_existing_live_sessions() {
 }
 
 #[tokio::test]
-async fn durable_live_readers_and_move_inventory_find_session() {
+async fn durable_live_readers_find_session() {
     let (root, session, record) = fixture("durable-reader");
     let store = FileWalStore::new(root.join("wal"));
     store
@@ -121,21 +121,5 @@ async fn durable_live_readers_and_move_inventory_find_session() {
     assert!(
         matches!(range.records(), broca_wal::WalRangeRecords::Complete(records) if records[0].record == record)
     );
-    store.start_move_inventory(tokio_util::sync::CancellationToken::new());
-    tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        store.wait_move_inventory(),
-    )
-    .await
-    .unwrap();
-    let reference =
-        cortexkit_role_llm_runner::session_ref("runner", "/class-test", &session.session);
-    let inventory = store.move_session_refs(std::iter::once(reference.as_str()));
-    assert!(
-        inventory.unreadable.is_empty(),
-        "{:?}",
-        inventory.unreadable
-    );
-    assert!(inventory.sessions.contains_key(&reference));
     std::fs::remove_dir_all(root).unwrap();
 }
