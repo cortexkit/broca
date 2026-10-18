@@ -308,11 +308,10 @@ mkdir -p "$BUILD_SCRATCH"
 # another seat found world-readable versioned binaries in shared /tmp, dispatchable by anyone
 # who puts /tmp on PATH, and staging them under a predictable path rebuilt that exposure.
 chmod 700 "$BUILD_SCRATCH"
-# Scoped to the scratch area BY CONSTRUCTION, not by intent. An earlier revision of this edit
-# repointed STAGE_DIR at the shared seam and left this line reading the same variable, which
-# would have deleted twenty other releases on the next run -- including artifacts another seat
-# may resolve by name for a rollback. Two names, so the sweep cannot follow the seam.
-swept=$(find "$BUILD_SCRATCH" -maxdepth 1 -type f -mtime "+$KEEP_DAYS" -print -delete 2>/dev/null | wc -l | tr -d ' ')
+# Keep cleanup inside BUILD_SCRATCH. Using STAGE_DIR here could delete release artifacts from
+# the shared staging directory, including a copy another user needs for rollback. Sweep each
+# dSYM bundle as one directory so its contents are removed with the bundle.
+swept=$(find "$BUILD_SCRATCH" -maxdepth 1 \( -type f -o \( -type d -name '*.dSYM' \) \) -mtime "+$KEEP_DAYS" -print -exec rm -rf {} \; 2>/dev/null | wc -l | tr -d ' ')
 
 # Registry checksums and pinned git revisions identify linked dependency contents.
 # Refuse any external path dependency before building the release artifact.

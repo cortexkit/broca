@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -366,6 +367,34 @@ class StagingPublishArms(unittest.TestCase):
         self.assertEqual(present, [])
         self.assertFalse((self.tmp / "codesign.log").exists())
 
+    def test_scratch_sweep_removes_old_dsym_bundles_as_directories(self):
+        source = SCRIPT.read_text()
+        sweep = next(line for line in source.splitlines() if line.startswith("swept=$(find "))
+        scratch = self.tmp / "scratch"
+        stale = scratch / "ck-broca.old.dSYM"
+        current = scratch / "ck-broca.new.dSYM"
+        for bundle in (stale, current):
+            dwarf = bundle / "Contents" / "Resources" / "DWARF"
+            dwarf.mkdir(parents=True)
+            (dwarf / "ck-broca").write_bytes(b"debug symbols")
+        old = time.time() - 10 * 24 * 60 * 60
+        os.utime(stale, (old, old))
+
+        proc = subprocess.run(
+            [
+                "bash", "-c",
+                f"set -euo pipefail; BUILD_SCRATCH='{scratch}'; KEEP_DAYS=2; {sweep}; printf '%s\\n' \"$swept\"",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "1")
+        self.assertFalse(stale.exists())
+        self.assertTrue(current.is_dir())
+
     def test_staging_prune_uses_only_the_planted_seam(self):
         """The stage integration must pass its seam and deployed paths, never production defaults."""
         src = SCRIPT.read_text()
@@ -568,6 +597,6 @@ if __name__ == "__main__":
     # A dropped or renamed arm leaves the run green with fewer tests in it, so the count is pinned.
     anchors = unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__)).countTestCases()
     print(f"stage-release suite anchors: {anchors}", flush=True)
-    if anchors != 18:
+    if anchors != 19:
         raise SystemExit("stage-release suite anchor count changed")
     unittest.main(verbosity=2)
