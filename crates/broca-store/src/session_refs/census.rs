@@ -1,4 +1,4 @@
-use super::{backfill, insert};
+use super::{backfill, batches::write_batch, insert, MigrationWriteStats};
 use crate::StoreError;
 use broca_core::ReadOnlyWalReader;
 use rusqlite::Connection;
@@ -12,11 +12,18 @@ pub struct CensusCounts {
     pub bytes_read: u64,
     pub elapsed_ms: u128,
     pub complete: bool,
+    pub writes: MigrationWriteStats,
 }
 
-fn pace(started: Instant, enabled: bool) {
+enum Action {
+    Begin(String),
+    Candidate(String, broca_protocol::BindIdentity),
+    Covered(String),
+}
+
+fn pace_duration(elapsed: std::time::Duration, enabled: bool) {
     if enabled {
-        std::thread::sleep(started.elapsed().saturating_mul(3));
+        std::thread::sleep(elapsed.saturating_mul(3));
     }
     std::thread::yield_now();
 }
@@ -42,19 +49,26 @@ pub(super) fn run(
     let addresses = wal.addresses().map_err(|_| {
         StoreError::InconsistentSnapshot("cannot enumerate WAL addresses for session-ref census")
     })?;
-    // The queue is durable in small batches. Re-enumeration after a crash only
-    // adds addresses; covered payloads are never replayed again.
-    for batch in addresses.iter().collect::<Vec<_>>().chunks(128) {
-        let tx = conn.transaction()?;
-        for address in batch {
-            tx.execute(
-                "INSERT OR IGNORE INTO agent_data_census(address) VALUES(?1)",
-                [address],
-            )?;
-        }
-        tx.commit()?;
+    let discovery_work = work.elapsed();
+    let queue: Vec<_> = addresses.iter().collect();
+    let mut queued = 0;
+    while queued < queue.len() {
+        queued += write_batch(
+            conn,
+            &queue[queued..],
+            &mut counts.writes,
+            paced,
+            |tx, address| {
+                tx.execute(
+                    "INSERT OR IGNORE INTO agent_data_census(address) VALUES(?1)",
+                    [address],
+                )?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )?;
     }
-    pace(work, paced);
+    pace_duration(discovery_work, paced);
     counts.addresses = addresses.len() as u64;
     counts.resumed = conn.query_row(
         "SELECT count(*) FROM agent_data_census WHERE covered=1",
@@ -64,82 +78,119 @@ pub(super) fn run(
     let mut processed = 0;
     loop {
         let work = Instant::now();
-        let mut todo = Vec::new();
-        {
+        let todo = {
             let mut statement = conn.prepare(
                 "SELECT address FROM agent_data_census WHERE covered=0 ORDER BY address LIMIT 128",
             )?;
-            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-                todo.push(row?);
-            }
-        }
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
         if todo.is_empty() {
             break;
         }
-        let mut completed = Vec::new();
-        let mut candidates = Vec::new();
+        let mut actions = Vec::new();
         for address in todo {
             if limit.is_some_and(|limit| processed >= limit) {
                 break;
             }
-            // A completed enumeration can retire an address left in a prior
-            // attempt's queue. A disappearance after enumeration is instead an
-            // error from the reader, so that race never certifies missing refs.
-            if !addresses.contains(&address) {
-                completed.push(address);
-                processed += 1;
-                continue;
-            }
-            let represented: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1)",
-                [&address],
-                |row| row.get(0),
-            )?;
-            if represented {
-                counts.bytes_read += wal.probe(&address).map_err(|_| {
-                    StoreError::InconsistentSnapshot(
-                        "cannot probe represented WAL for session-ref census",
-                    )
-                })?;
-            } else {
-                counts.not_represented += 1;
-                let (records, bytes) = wal.records(&address).map_err(|_| {
-                    StoreError::InconsistentSnapshot(
-                        "cannot read uncovered WAL for session-ref census",
-                    )
-                })?;
-                counts.bytes_read += bytes;
-                for frame in records {
-                    if let broca_wal::WalRecord::RunStarted { session, .. } = frame.record {
-                        candidates.push((address.clone(), session));
+            if addresses.contains(&address) {
+                let represented: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1)
+                    AND NOT EXISTS(SELECT 1 FROM agent_data_census_inflight WHERE address=?1)",
+                    [&address],
+                    |row| row.get(0),
+                )?;
+                if represented {
+                    counts.bytes_read += wal.probe(&address).map_err(|_| {
+                        StoreError::InconsistentSnapshot(
+                            "cannot probe represented WAL for session-ref census",
+                        )
+                    })?;
+                } else {
+                    counts.not_represented += 1;
+                    let (records, bytes) = wal.records(&address).map_err(|_| {
+                        StoreError::InconsistentSnapshot(
+                            "cannot read uncovered WAL for session-ref census",
+                        )
+                    })?;
+                    counts.bytes_read += bytes;
+                    // Persist an in-flight row before candidate insertion. After a
+                    // crash, a partial ref row must not make resume skip the rest
+                    // of this WAL; Covered removes the row after all candidates.
+                    actions.push(Action::Begin(address.clone()));
+                    let mut candidates = std::collections::BTreeMap::new();
+                    for frame in records {
+                        if let broca_wal::WalRecord::RunStarted { session, .. } = frame.record {
+                            if broca_core::session_addr(&session) == address {
+                                candidates.insert(broca_core::agent_session_ref(&session), session);
+                            }
+                        }
                     }
+                    actions.extend(
+                        candidates
+                            .into_values()
+                            .map(|session| Action::Candidate(address.clone(), session)),
+                    );
                 }
             }
-            completed.push(address);
+            actions.push(Action::Covered(address));
             processed += 1;
             std::thread::yield_now();
         }
-        let tx = conn.transaction()?;
-        for (address, session) in candidates {
-            insert(&tx, &address, &session)?;
-        }
-        for address in &completed {
-            tx.execute(
-                "UPDATE agent_data_census SET covered=1 WHERE address=?1",
-                [address],
+        let read_work = work.elapsed();
+        let mut written = 0;
+        while written < actions.len() {
+            written += write_batch(
+                conn,
+                &actions[written..],
+                &mut counts.writes,
+                paced,
+                |tx, action| {
+                    match action {
+                        Action::Begin(address) => {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO agent_data_census_inflight VALUES(?1)",
+                                [address],
+                            )?;
+                        }
+                        Action::Candidate(address, session) => {
+                            insert(tx, address, session)?;
+                        }
+                        Action::Covered(address) => {
+                            tx.execute(
+                                "UPDATE agent_data_census SET covered=1 WHERE address=?1",
+                                [address],
+                            )?;
+                            tx.execute(
+                                "DELETE FROM agent_data_census_inflight WHERE address=?1",
+                                [address],
+                            )?;
+                        }
+                    }
+                    Ok(())
+                },
+                |_, _| Ok(()),
             )?;
         }
-        tx.commit()?;
-        // Include reads, decoding and the SQLite durability barrier in pacing.
-        pace(work, paced);
+        pace_duration(read_work, paced);
         if limit.is_some_and(|limit| processed >= limit) {
             counts.elapsed_ms = start.elapsed().as_millis();
             return Ok(counts);
         }
     }
-    let work = Instant::now();
-    conn.execute("INSERT INTO agent_data_census_done VALUES(1)", [])?;
-    pace(work, paced);
+    write_batch(
+        conn,
+        &[()],
+        &mut counts.writes,
+        paced,
+        |tx, _| {
+            tx.execute("INSERT INTO agent_data_census_done VALUES(1)", [])?;
+            Ok(())
+        },
+        |_, _| Ok(()),
+    )?;
     counts.complete = true;
     counts.elapsed_ms = start.elapsed().as_millis();
     tracing::info!(
@@ -148,6 +199,8 @@ pub(super) fn run(
         bytes_read = counts.bytes_read,
         not_represented = counts.not_represented,
         elapsed_ms = counts.elapsed_ms,
+        max_write_lock_us = counts.writes.max_lock_us,
+        write_transactions = counts.writes.transactions,
         "session-ref census complete"
     );
     Ok(counts)
@@ -168,19 +221,51 @@ pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCo
         None
     };
     let mut conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    let work = Instant::now();
+    conn.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    let mut writes = MigrationWriteStats::default();
     if incomplete {
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM agent_data_census_done", [])?;
-        // A previously empty address may have gained a RunStarted while SQLite
-        // was unavailable. Keep covered candidates, but revisit unrepresented WALs.
-        tx.execute("UPDATE agent_data_census SET covered=0 WHERE NOT EXISTS
-            (SELECT 1 FROM agent_data_session_ref WHERE agent_data_session_ref.address=agent_data_census.address)", [])?;
-        tx.commit()?;
+        write_batch(
+            &conn,
+            &[()],
+            &mut writes,
+            true,
+            |tx, _| {
+                tx.execute("DELETE FROM agent_data_census_done", [])?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )?;
+        let reset = {
+            let mut statement = conn.prepare("SELECT address FROM agent_data_census WHERE covered=1 AND NOT EXISTS
+                (SELECT 1 FROM agent_data_session_ref WHERE agent_data_session_ref.address=agent_data_census.address)")?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut used = 0;
+        while used < reset.len() {
+            used += write_batch(
+                &conn,
+                &reset[used..],
+                &mut writes,
+                true,
+                |tx, address| {
+                    tx.execute(
+                        "UPDATE agent_data_census SET covered=0 WHERE address=?1",
+                        [address],
+                    )?;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )?;
+        }
     }
-    backfill(&conn)?;
-    pace(work, true);
+    let backfilled = backfill(&conn)?;
+    writes.merge(backfilled.writes);
     let mut counts = run(&mut conn, wal, None, true)?;
+    counts.writes.merge(writes);
     if incomplete && counts.complete {
         counts.complete = match repair {
             Some(repair) => repair.finish().map_err(|_| {
@@ -196,6 +281,13 @@ pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCo
     })? {
         counts.complete = false;
     }
+    tracing::info!(
+        write_transactions = counts.writes.transactions,
+        max_write_lock_us = counts.writes.max_lock_us,
+        max_batch_items = counts.writes.max_batch_items,
+        complete = counts.complete,
+        "session-ref migration finished"
+    );
     Ok(counts)
 }
 

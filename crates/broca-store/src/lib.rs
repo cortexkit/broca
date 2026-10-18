@@ -30,6 +30,8 @@ use broca_wal::{
 };
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
+const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub mod caps;
 pub mod export_index;
 mod fold_identities;
@@ -818,6 +820,7 @@ impl SqliteStore {
     }
 
     fn init(conn: &Connection) -> Result<(String, u64, u64), StoreError> {
+        conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         // Retain WAL sidecars while broca is down so read-only readers can open the index.
         // SQLITE_FCNTL_PERSIST_WAL requires unsafe FFI, which this crate forbids; disabling
@@ -1299,7 +1302,9 @@ impl SqliteStore {
         plan: ProjectionPlan,
     ) -> Result<ProjectionCommit, StoreError> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        // A deferred read-to-write upgrade can return SQLITE_BUSY immediately,
+        // bypassing the busy timeout even for a short migration transaction.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current_state = current_projection_state(&tx, key)?;
         let conflict = {
             let expected_state = plan.expected_state();
@@ -1319,7 +1324,7 @@ impl SqliteStore {
         range: Option<&WalRangeRead>,
     ) -> Result<u64, StoreError> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
         let plan = Self::prepare_projection(snapshot, records, range)?;
         Self::commit_projection_plan(tx, key, plan)
@@ -1499,7 +1504,7 @@ impl SqliteStore {
         }
 
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let snapshot = Self::projection_snapshot_from_tx(&tx, &key)?;
         if snapshot.lineage_id.as_deref() != Some(stale_lineage_id) {
             tx.commit()?;
