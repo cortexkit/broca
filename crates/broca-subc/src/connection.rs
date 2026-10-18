@@ -911,6 +911,47 @@ impl SubcConnection {
         }
     }
 
+    /// The supervisor's own record of one module, for failure diagnostics: every module's
+    /// `supervisor.list` entry (state, spawn generation, last exit, restart budget), the
+    /// module's retained stderr (`supervisor.stderr_tail`) and its terminal exit history
+    /// (`supervisor.terminals`). This is the daemon's account of why a module reads `failed`,
+    /// and it is there even when the module wrote no log of its own; a `spawn_generation` of 0
+    /// says no process of it ever started. Each part holds the raw reply or the error text, so a
+    /// daemon that lacks one op still answers the others.
+    pub async fn supervisor_module_report(&self, module_id: &str) -> serde_json::Value {
+        let requests = [
+            ("supervisor.list", ClientControlRequest::SupervisorList {}),
+            (
+                "supervisor.stderr_tail",
+                ClientControlRequest::SupervisorStderrTail {
+                    module_id: module_id.to_string(),
+                    max_lines: Some(200),
+                    max_bytes: None,
+                },
+            ),
+            (
+                "supervisor.terminals",
+                ClientControlRequest::SupervisorTerminals {
+                    module_id: module_id.to_string(),
+                },
+            ),
+        ];
+        let mut report = serde_json::Map::new();
+        for (op, request) in requests {
+            let answer = match serde_json::to_vec(&request) {
+                Ok(body) => match self.control_rpc(body).await {
+                    Ok(frame) => serde_json::from_slice(&frame.body).unwrap_or_else(|error| {
+                        serde_json::Value::String(format!("undecodable reply: {error}"))
+                    }),
+                    Err(error) => serde_json::Value::String(error.to_string()),
+                },
+                Err(error) => serde_json::Value::String(format!("encode {op}: {error}")),
+            };
+            report.insert(op.to_string(), answer);
+        }
+        serde_json::Value::Object(report)
+    }
+
     /// `route.open` to a tool provider. Subsequent tool calls use the returned handle.
     ///
     /// Retries a temporary refusal under [`RouteOpenRetry::default_patience`]; use

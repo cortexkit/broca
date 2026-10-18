@@ -1133,18 +1133,28 @@ impl Rig {
         let conn = SubcConnection::connect(&self.connection_file)
             .await
             .expect("connect a caller");
-        SessionClient::bind_with_timeout(conn, "broca", self.session(name), Duration::from_secs(30))
-            .await
-            .unwrap_or_else(|error| {
+        match SessionClient::bind_with_timeout(
+            conn,
+            "broca",
+            self.session(name),
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => {
                 eprintln!(
-                    "{}",
+                    "{}{}",
+                    super::session_client::supervisor_diagnostics(&self.connection_file, "broca")
+                        .await,
                     super::session_client::rig_log_diagnostics(
                         &self.root.join("data-home/cortexkit"),
                         &self.state_root,
                     )
                 );
                 panic!("bind broca: {error:?}");
-            })
+            }
+        }
     }
 
     /// The records of the WAL whose `RunStarted` names session `name`, found by scanning the WAL

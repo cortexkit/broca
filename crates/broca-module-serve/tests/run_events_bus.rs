@@ -192,7 +192,14 @@ async fn provision(conn: &NatsConnection, names: &AccountNames) -> NatsPublisher
 }
 
 fn project(store: &SqliteStore, wal: &FileWalStore, session: &BindIdentity) {
-    let head = wal.flush_for_read(session).unwrap().unwrap();
+    // `flush_for_read` returns the WAL file's identity (only Unix has one), not a sequence. Take
+    // the head from the records decoded before the flush, which that flush then proves durable.
+    let candidate = wal.read_records_range(session, 0, None, None).unwrap();
+    let broca_wal::WalRangeRecords::Complete(candidate) = candidate.records() else {
+        panic!("WAL missing");
+    };
+    let head = candidate.last().map_or(0, |record| record.seq);
+    wal.flush_for_read(session).unwrap();
     let range = wal
         .read_records_range(session, 0, Some(head), None)
         .unwrap();

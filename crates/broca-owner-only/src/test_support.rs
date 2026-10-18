@@ -38,6 +38,12 @@ pub fn process_wait_for_exit(pid: u32, timeout_ms: u32) -> Result<bool, ProcessW
     crate::windows::process_wait_for_exit(pid, timeout_ms)
 }
 
+/// Rename `from` to `to` only when `to` does not exist. Unlike `std::fs::rename`, which replaces
+/// an existing `to` and so briefly opens it for deletion, this never touches an existing file.
+pub fn move_file_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    crate::windows::move_file_without_replacing(from, to)
+}
+
 fn powershell(path: &Path, script: &str) -> String {
     let quoted = path.to_string_lossy().replace('\'', "''");
     let output = Command::new("powershell.exe")
