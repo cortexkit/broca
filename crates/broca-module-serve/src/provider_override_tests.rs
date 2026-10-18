@@ -34,6 +34,7 @@ fn resolve_runtime_override(
         &broca_catalog::live::ResolveOptions::default(),
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: match frozen {
                 Some(recorded) => recorded.get("base_url").and_then(serde_json::Value::as_str),
@@ -100,6 +101,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: Some(&base_url),
             max_output_tokens: None,
@@ -432,6 +434,7 @@ fn resolve_drift_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: Some(
                 recorded
@@ -772,6 +775,7 @@ fn resolve_tier_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: Some("http://host-a.example"),
             max_output_tokens: recorded.and_then(frozen_max_output_tokens),
@@ -888,6 +892,7 @@ fn resolve_variant_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: Some("http://host-a.example"),
             max_output_tokens: recorded.and_then(frozen_max_output_tokens),

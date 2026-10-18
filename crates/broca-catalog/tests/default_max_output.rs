@@ -279,6 +279,7 @@ mod gated {
                 },
                 broca_provider::build_provider_http_client(),
                 broca_catalog::live::EpisodeRenderConfig {
+                    codeassist_identity: None,
                     claude_code_persona: Default::default(),
                     base_url: None,
                     max_output_tokens: restored,

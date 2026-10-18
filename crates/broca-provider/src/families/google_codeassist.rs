@@ -14,7 +14,11 @@
 //! in the observed wire format. The inner value is a standard Gemini response, so the
 //! normalizer unwraps `.response` then delegates to the Gemini decode unchanged.
 //!
-//! ## The determinism gate (the load-bearing difference from Gemini)
+//! New episodes freeze a signed-decimal `request.sessionId`, stable agent and trajectory
+//! UUIDs, and an admission-time request counter anchor. These are envelope metadata, not
+//! Gemini content. Episodes recorded without the identity keep the original envelope below.
+//!
+//! ## The legacy determinism gate
 //! The envelope's `requestId` is BODY-VISIBLE (in the rendered bytes, so in the cache/resume
 //! hash). The observed format is `agent/<uuid>/<timestamp>/<uuid>/2` — fresh per
 //! request. That can't be reproduced on resume, so here it is a PURE FUNCTION of the run's
@@ -81,7 +85,27 @@ impl WireFamily for GoogleCodeAssist {
                  requestId derives from run_id + step_index); it was None"
             )
         });
-        let request_id = build_request_id(step);
+        let request_id = if let Some(identity) = &frozen.codeassist_identity {
+            let index = identity.step_offset.saturating_add(step.step_index);
+            inner["sessionId"] = json!(identity.session_id);
+            inner["labels"] = json!({
+                "last_step_index": index.saturating_sub(1).to_string(),
+                "trajectory_id": identity.trajectory_id,
+                "used_claude": "false",
+                "used_claude_conservative": "false",
+            });
+            // Real clients use wall-clock millis per call. Pin the time at admission and
+            // advance it per step so rendering a retry or a resumed step never reads a clock.
+            let timestamp = identity
+                .admitted_at_ms
+                .saturating_add(step.step_index.saturating_sub(1));
+            format!(
+                "agent/{}/{timestamp}/{}/{index}",
+                identity.agent_id, identity.trajectory_id
+            )
+        } else {
+            build_request_id(step)
+        };
 
         let project = frozen.project_id.clone().unwrap_or_else(|| {
             panic!(
@@ -521,6 +545,64 @@ mod tests {
         let mut o = CallOptions::new(vec![user("hi")]);
         o.step_context = Some(step("run-1", 1));
         o
+    }
+
+    fn identity_frozen() -> FrozenRenderConfig {
+        let mut frozen = frozen();
+        frozen.codeassist_identity = Some(crate::wire::CodeAssistIdentity {
+            session_id: "-123456789".into(),
+            agent_id: "11111111-1111-4111-8111-111111111111".into(),
+            trajectory_id: "22222222-2222-4222-8222-222222222222".into(),
+            step_offset: 1,
+            admitted_at_ms: 1_700_000_000_000,
+        });
+        frozen
+    }
+
+    #[test]
+    fn session_id_is_stable_across_runs() {
+        let frozen = identity_frozen();
+        let mut opts = opts_with_step();
+        let first = GoogleCodeAssist.shape(&frozen, &opts);
+        opts.step_context = Some(step("another-run", 4));
+        let second = GoogleCodeAssist.shape(&frozen, &opts);
+        assert_eq!(first["request"]["sessionId"], json!("-123456789"));
+        assert_eq!(
+            first["request"]["sessionId"],
+            second["request"]["sessionId"]
+        );
+        assert_eq!(
+            first["requestId"].as_str().unwrap().split('/').nth(1),
+            second["requestId"].as_str().unwrap().split('/').nth(1)
+        );
+        assert_eq!(
+            first["requestId"].as_str().unwrap().split('/').nth(3),
+            second["requestId"].as_str().unwrap().split('/').nth(3)
+        );
+    }
+
+    #[test]
+    fn session_labels_track_the_request_step_and_trajectory() {
+        let frozen = identity_frozen();
+        let mut opts = opts_with_step();
+        for index in [1, 2, 10] {
+            opts.step_context = Some(step("run-1", index));
+            let body = GoogleCodeAssist.shape(&frozen, &opts);
+            assert_eq!(
+                body["request"]["labels"],
+                json!({
+                    "last_step_index": index.to_string(),
+                    "trajectory_id": "22222222-2222-4222-8222-222222222222",
+                    "used_claude": "false",
+                    "used_claude_conservative": "false",
+                })
+            );
+            assert_eq!(
+                body["requestId"].as_str().unwrap().rsplit('/').next(),
+                Some((index + 1).to_string().as_str())
+            );
+            assert!(body["request"]["labels"].get("last_execution_id").is_none());
+        }
     }
 
     #[test]

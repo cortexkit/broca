@@ -150,6 +150,31 @@ const GOLDEN_VERSION: &str =
     include_str!("../fixtures/google_codeassist_render_golden.json.version");
 
 #[test]
+fn google_codeassist_session_envelope_matches_golden() {
+    let mut frozen = google_codeassist_frozen_config("gemini-2.5-flash");
+    frozen.project_id = Some("test-project".into());
+    frozen.codeassist_identity = Some(broca_provider::wire::CodeAssistIdentity {
+        session_id: "-123456789".into(),
+        agent_id: "11111111-1111-4111-8111-111111111111".into(),
+        trajectory_id: "22222222-2222-4222-8222-222222222222".into(),
+        step_offset: 1,
+        admitted_at_ms: 1_700_000_000_000,
+    });
+    let mut opts = CallOptions::new(vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text { text: "hi".into() }],
+    )]);
+    opts.step_context = Some(StepContext {
+        run_id: "run-1".into(),
+        step_index: 1,
+    });
+    assert_eq!(
+        String::from_utf8(GoogleCodeAssist.render(&frozen, &opts)).unwrap(),
+        include_str!("../fixtures/google_codeassist_session_envelope.json").trim_end()
+    );
+}
+
+#[test]
 fn google_codeassist_render_matches_golden() {
     let mut frozen = google_codeassist_frozen_config("gemini-2.5-flash");
     frozen.project_id = Some("encouraging-env-qwp21".into());

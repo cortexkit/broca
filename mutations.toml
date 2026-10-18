@@ -16136,3 +16136,31 @@ expect_red = ["executor::tests::deepseek_episode_admitted_before_the_reasoning_e
 file = "crates/broca-catalog/src/live.rs"
 old = '''            config.reasoning_content_required = recorded;'''
 new = '''            let _ = recorded; // NON-VACUITY BREAK: ignore the recorded choice'''
+
+[[control]]
+id = "codeassist-session-id-stable-across-runs"
+guards = "Code Assist requests use the frozen conversation sessionId instead of a per-run id across user turns"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/families/google_codeassist.rs"
+expect_red = ["families::google_codeassist::tests::session_id_is_stable_across_runs"]
+file = "crates/broca-provider/src/families/google_codeassist.rs"
+old = '            inner["sessionId"] = json!(identity.session_id);'
+new = '            inner["sessionId"] = json!(uuid_shaped_digest(&step.run_id)); // NON-VACUITY BREAK: replace conversation identity per run.'
+
+[[control]]
+id = "codeassist-label-tracks-request-step"
+guards = "Code Assist last_step_index trails the monotonic requestId step, rather than resetting at every user turn"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/families/google_codeassist.rs"
+expect_red = ["families::google_codeassist::tests::session_labels_track_the_request_step_and_trajectory"]
+file = "crates/broca-provider/src/families/google_codeassist.rs"
+old = '                "last_step_index": index.saturating_sub(1).to_string(),'
+new = '                "last_step_index": "0", // NON-VACUITY BREAK: lose request-step continuity.'

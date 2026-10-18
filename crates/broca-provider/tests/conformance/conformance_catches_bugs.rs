@@ -30,6 +30,7 @@ fn frozen() -> FrozenRenderConfig {
         static_options: serde_json::Value::Null,
         aws_region: None,
         project_id: None,
+        codeassist_identity: None,
         prompt_cache_key: None,
         reasoning_effort: None,
         service_tier: None,

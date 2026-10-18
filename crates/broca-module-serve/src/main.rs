@@ -3426,6 +3426,24 @@ mod executor {
                 .as_ref()
                 .filter(|_| !fresh_episode)
                 .and_then(|prior| frozen_claude_code_persona(&prior.config));
+            let codeassist_identity = match broca_module_serve::codeassist_identity::for_episode(
+                &job.req.session,
+                prior_run
+                    .as_ref()
+                    .filter(|_| !fresh_episode)
+                    .map(|prior| &prior.config.frozen_render_config),
+                prior_snapshot.head_seq,
+                epoch_millis().max(0) as u64,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let error = format!("invalid recorded Code Assist identity: {error}");
+                    if let Some(ack) = job.on_admitted {
+                        let _ = ack.send(Err(RunError::Config(error.clone())));
+                    }
+                    return Err(RunError::Config(error));
+                }
+            };
             let resolve_options = broca_catalog::live::ResolveOptions {
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -3489,6 +3507,7 @@ mod executor {
                 &resolve_options,
                 self.provider_client.clone(),
                 broca_catalog::live::EpisodeRenderConfig {
+                    codeassist_identity: codeassist_identity.as_ref(),
                     // Only the host and the output cap are restored. Re-resolve other catalog
                     // fields so core's frozen_render_config_drift guard remains a real
                     // comparison on resume. Changing the operator override must not move an

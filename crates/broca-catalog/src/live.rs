@@ -588,6 +588,9 @@ pub fn provider_for_recorded_config(
 /// these inputs never bypass catalog identity, family, quirks or auth resolution.
 #[derive(Clone, Copy, Default)]
 pub struct EpisodeRenderConfig<'a> {
+    /// Freshly derived or restored Code Assist identity. If the episode's frozen config
+    /// recorded no identity, keep it absent so a resume reproduces the original bytes.
+    pub codeassist_identity: Option<&'a broca_provider::wire::CodeAssistIdentity>,
     pub base_url: Option<&'a str>,
     /// The output cap recorded when this episode started, fed back on resume.
     ///
@@ -694,6 +697,9 @@ pub fn default_max_output_tokens(output_limit: Option<u64>, context_limit: Optio
 
 impl EpisodeRenderConfig<'_> {
     fn apply(self, mut config: FrozenRenderConfig) -> FrozenRenderConfig {
+        if config.family_id == WireFamilyId::GoogleCodeAssist {
+            config.codeassist_identity = self.codeassist_identity.cloned();
+        }
         if let Some(base_url) = self.base_url {
             config.base_url = Some(base_url.to_string());
         }
@@ -907,6 +913,7 @@ fn resolve_provider_inner(
     // reporting an unsupported variant for a model whose options we cannot inspect.
     let catalog = crate::catalog().map_err(|error| error.to_string())?;
     let episode_render = EpisodeRenderConfig {
+        codeassist_identity: episode_render.codeassist_identity,
         base_url: episode_render
             .base_url
             .filter(|_| catalog.contains_provider(provider_id)),
