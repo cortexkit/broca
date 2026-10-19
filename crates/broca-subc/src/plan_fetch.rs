@@ -153,32 +153,46 @@ fn fetch_body(op: &str, arguments: Value) -> Result<Vec<u8>, FetchError> {
 /// A provider's answer: the op's answer object itself, or the same object as the text of a
 /// tool result for a provider that wraps every reply as one.
 fn decode_reply(reply: &[u8]) -> Result<Value, FetchError> {
-    let value: Value = serde_json::from_slice(reply).map_err(|_| invalid_answer())?;
+    let value: Value = serde_json::from_slice(reply).map_err(|error| {
+        invalid_answer(&format!(
+            "reply is not JSON ({error}): {}",
+            String::from_utf8_lossy(reply)
+        ))
+    })?;
     let wrapped = value
         .get("content")
         .and_then(Value::as_array)
         .filter(|_| value.get("catalog_digest").is_none() && value.get("subscriptions").is_none());
     match wrapped {
         Some(content) => {
-            if value.get("isError").and_then(Value::as_bool) == Some(true) {
-                return Err(invalid_answer());
-            }
             let text = content
                 .iter()
-                .find_map(|part| part.get("text").and_then(Value::as_str))
-                .ok_or_else(invalid_answer)?;
-            serde_json::from_str(text).map_err(|_| invalid_answer())
+                .find_map(|part| part.get("text").and_then(Value::as_str));
+            if value.get("isError").and_then(Value::as_bool) == Some(true) {
+                return Err(invalid_answer(&format!(
+                    "provider answered with an error result: {}",
+                    text.unwrap_or("<no text part>")
+                )));
+            }
+            let text = text.ok_or_else(|| invalid_answer("wrapped reply has no text part"))?;
+            serde_json::from_str(text).map_err(|error| {
+                invalid_answer(&format!("wrapped reply text is not JSON ({error}): {text}"))
+            })
         }
         None => Ok(value),
     }
 }
 
-fn invalid_answer() -> FetchError {
-    FetchError::Refused {
-        code: broca_fetch_plan::admit::INVALID_ANSWER.into(),
-        detail: None,
-        retryable: false,
-    }
+/// A reply broca could not read as an answer. The message says what was wrong and quotes the
+/// start of what the provider sent (capped by `provider_refused`), so the admission warning
+/// names the cause; before, every such case logged only `invalid_answer`.
+fn invalid_answer(message: &str) -> FetchError {
+    FetchError::provider_refused(
+        broca_fetch_plan::admit::INVALID_ANSWER.into(),
+        None,
+        message,
+        false,
+    )
 }
 
 /// How a refused or failed `route.open` is reported to admission.
@@ -260,6 +274,37 @@ impl Fetcher for SubcPlanFetcher {
 #[cfg(test)]
 mod preset_tests {
     use super::*;
+
+    /// A reply broca cannot read carries what was wrong, so the admission warning names the cause.
+    #[test]
+    fn unreadable_replies_carry_their_cause() {
+        let cases = [
+            (
+                br#"{"content":[{"type":"text","text":"preset worker requires a scope"}],"isError":true}"#.as_slice(),
+                "provider answered with an error result: preset worker requires a scope",
+            ),
+            (b"not json".as_slice(), "reply is not JSON"),
+            (
+                br#"{"content":[{"type":"text","text":"plain words"}]}"#.as_slice(),
+                "wrapped reply text is not JSON",
+            ),
+        ];
+        for (reply, expected) in cases {
+            match decode_reply(reply) {
+                Err(FetchError::ProviderRefused {
+                    code,
+                    message,
+                    retryable,
+                    ..
+                }) => {
+                    assert_eq!(code, broca_fetch_plan::admit::INVALID_ANSWER);
+                    assert!(!retryable);
+                    assert!(message.contains(expected), "{message}");
+                }
+                other => panic!("expected a refusal naming its cause, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn catalog_envelope_preserves_item_preset_and_composition_bytes() {

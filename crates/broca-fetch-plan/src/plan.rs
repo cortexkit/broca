@@ -80,6 +80,23 @@ pub use cortexkit_role_llm_runner::delivery_order::{
     PlanSender, Slot as SlotType, Template as PlanTemplate, PLAN_SENDERS as SENDERS_MEMBER,
 };
 
+/// The tool-provider preset that asks a provider to confine a session's tool calls (a worker's
+/// checkout fence, its remote runner). Providers key that confinement on the route's scope, so a
+/// run whose plan asks for this preset must never run unscoped: its tools would run under head
+/// defaults instead.
+pub const CONFINED_TOOL_PRESET: &str = "worker";
+
+/// Whether a plan, as JSON, asks for [`CONFINED_TOOL_PRESET`] on any tool item.
+pub fn names_confined_preset(plan: &Value) -> bool {
+    plan.get("tool_items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("preset").and_then(Value::as_str) == Some(CONFINED_TOOL_PRESET)
+            })
+        })
+}
+
 /// Decode the published sender and template shapes, including their closed-member checks.
 pub fn plan_senders(plan: &Map<String, Value>) -> Result<Vec<PlanSender>, Refusal> {
     cortexkit_role_llm_runner::delivery_order::plan_senders(plan).map_err(Refusal::invalid)

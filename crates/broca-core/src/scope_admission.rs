@@ -182,6 +182,9 @@ pub enum ScopeRefusal {
     AgentRunScopesUnsupported { scope: Box<SessionScope> },
     /// A later send changed `run_id` or `agent_id` fixed by the session's first episode.
     RunMismatch { field: RunMismatchField },
+    /// The episode would run unscoped while its plan asks a tool provider to confine its calls
+    /// (`broca_fetch_plan::CONFINED_TOOL_PRESET`); confinement is keyed on the route's scope.
+    ScopeRequired { preset: &'static str },
 }
 
 /// The frozen automation identity component that differed.

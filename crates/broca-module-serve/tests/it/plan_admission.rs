@@ -287,13 +287,60 @@ async fn plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
     (rig, admitter)
 }
 
+/// A rig whose channel 7 carries a daemon-attested scope, as Core's routes do for workers: a
+/// plan naming the worker tool preset is refused on an unscoped route.
+async fn worker_plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
+    let mut rig = Rig::start_with_scopes(tag).await;
+    rig.bind_with_scope(7, Some(scope_owner()), Some(scope_stamp(false)))
+        .await;
+    let admitter = Arc::new(CountingAdmitter::default());
+    rig.registry().set_plan_admitter(admitter.clone());
+    (rig, admitter)
+}
+
+/// An unscoped route with a worker-preset plan is refused before any fetch or WAL byte, and the
+/// same plan is admitted once the route carries a scope.
+#[tokio::test]
+async fn a_worker_preset_plan_requires_a_scoped_route() {
+    let plan = vector("plans/broca-worker.json");
+    let mut rig = Rig::start_with_scopes("worker-unscoped").await;
+    let admitter = Arc::new(CountingAdmitter::default());
+    rig.registry().set_plan_admitter(admitter.clone());
+    let frame = send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await;
+    let body = error_body(&frame);
+    assert_eq!(body["code"], "scope_required", "{body}");
+    assert_eq!(
+        body["detail"],
+        json!({"field": "plan.tool_items", "preset": "worker"})
+    );
+    assert!(
+        rig.wal_bytes().is_empty(),
+        "refusal must precede the first WAL byte"
+    );
+    assert!(
+        admitter.calls().is_empty(),
+        "refusal must precede provider fetches"
+    );
+    rig.finish().await;
+
+    let (mut rig, admitter) = worker_plan_rig("worker-scoped").await;
+    rig.script.push(&[Step::Text("worker")]);
+    result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
+    rig.wait_for_finished(1).await;
+    assert!(
+        !admitter.calls().is_empty(),
+        "a scoped worker plan is admitted"
+    );
+    rig.finish().await;
+}
+
 #[tokio::test]
 async fn invalid_reply_refuses_before_any_wal_write() {
     let vectors: Value = serde_json::from_str(include_str!(
         "../../../broca-fetch-plan/tests/fixtures/tool-provider-v1/reply-deadline.json"
     ))
     .unwrap();
-    let (mut rig, admitter) = plan_rig("invalid-reply").await;
+    let (mut rig, admitter) = worker_plan_rig("invalid-reply").await;
     let plan = vector("plans/broca-worker.json");
     let parsed =
         broca_fetch_plan::parse_plan(&plan, broca_fetch_plan::CompactionSupport::Unsupported)
@@ -775,7 +822,7 @@ async fn a_plan_is_fetched_once_frozen_and_rendered_from_the_record() {
 /// The worker plan resolves and forwards every tool named in its vector, including sidekick.
 #[tokio::test]
 async fn a_worker_plan_forwards_its_vector_tool_list() {
-    let (mut rig, admitter) = plan_rig("worker-plan-forwarded").await;
+    let (mut rig, admitter) = worker_plan_rig("worker-plan-forwarded").await;
     let plan = vector("plans/broca-worker.json");
     rig.script.push(&[Step::Text("worker")]);
     let reply = send_plan(&mut rig, 7, "worker-turn", "hi", Some(&plan), json!({})).await;
@@ -1237,7 +1284,7 @@ fn model_plan(model: Value) -> Value {
 }
 
 async fn assert_model_refused(tag: &str, model: Value, send_model: Value) {
-    let (mut rig, admitter) = plan_rig(tag).await;
+    let (mut rig, admitter) = worker_plan_rig(tag).await;
     let plan = model_plan(model.clone());
     let before = rig.wal_bytes();
     let frame = send_plan(
@@ -1319,7 +1366,7 @@ async fn plan_model_without_variant_accepts_any_send_variant() {
         // The tag becomes a directory name, so it holds no quotes or parentheses, which Windows
         // refuses in a path.
         let tag = format!("plan-model-match-{}", variant.unwrap_or("none"));
-        let (mut rig, admitter) = plan_rig(&tag).await;
+        let (mut rig, admitter) = worker_plan_rig(&tag).await;
         let plan = model_plan(json!({"provider": "fake", "id": "fake"}));
         let mut send = json!({"provider": "fake", "model": "fake"});
         if let Some(variant) = variant {
@@ -1345,7 +1392,7 @@ async fn plan_model_without_variant_accepts_any_send_variant() {
 
 #[tokio::test]
 async fn plan_model_absent_accepts_unrelated_send_model() {
-    let (mut rig, admitter) = plan_rig("plan-model-absent").await;
+    let (mut rig, admitter) = worker_plan_rig("plan-model-absent").await;
     let plan = vector("plans/broca-worker.json");
     rig.script.push(&[Step::Text("answer")]);
     result(
@@ -1374,7 +1421,7 @@ async fn plan_model_malformed_refuses_with_field_path() {
         (json!({"provider": "fake"}), ".id"),
         (json!({"provider": "fake", "id": 1}), ".id"),
     ] {
-        let (mut rig, admitter) = plan_rig("plan-model-malformed").await;
+        let (mut rig, admitter) = worker_plan_rig("plan-model-malformed").await;
         let before = rig.wal_bytes();
         let plan = model_plan(model);
         let body =
@@ -1392,7 +1439,7 @@ async fn plan_model_malformed_refuses_with_field_path() {
 
 #[tokio::test]
 async fn plan_model_later_send_mismatch_refuses_before_fetch_or_write() {
-    let (mut rig, admitter) = plan_rig("plan-model-later").await;
+    let (mut rig, admitter) = worker_plan_rig("plan-model-later").await;
     let plan = model_plan(json!({"provider": "fake", "id": "fake"}));
     rig.script.push(&[Step::Text("first")]);
     result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);

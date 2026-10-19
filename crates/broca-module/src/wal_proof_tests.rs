@@ -237,6 +237,7 @@ impl Fixture {
             admitting_manifest: None,
             admitting_order: None,
             admitting_sent_by: None,
+            immediate_ordered_drain: None,
             ordered_submissions: Default::default(),
             ended_submissions: Default::default(),
             delivered_submissions: Default::default(),

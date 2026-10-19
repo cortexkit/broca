@@ -3244,6 +3244,7 @@ async fn send_serve_error(
 enum SendPlanRefusal {
     Plan(broca_fetch_plan::Refusal),
     ApproveRequiresScope,
+    WorkerPresetRequiresScope,
 }
 
 impl From<broca_fetch_plan::Refusal> for SendPlanRefusal {
@@ -3259,8 +3260,20 @@ impl SendPlanRefusal {
                 ErrorBody::new(refusal.code(), refusal.message()).with_detail(refusal.detail())
             }
             Self::ApproveRequiresScope => approve_scope_error(),
+            Self::WorkerPresetRequiresScope => worker_scope_error(),
         }
     }
+}
+
+fn worker_scope_error() -> ErrorBody {
+    ErrorBody::new(
+        "scope_required",
+        "a plan with a worker tool preset requires a daemon-attested session scope",
+    )
+    .with_detail(serde_json::json!({
+        "field": "plan.tool_items",
+        "preset": broca_fetch_plan::CONFINED_TOOL_PRESET,
+    }))
 }
 
 fn approve_scope_error() -> ErrorBody {
@@ -3302,6 +3315,17 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         })
     {
         return Err(SendPlanRefusal::ApproveRequiresScope);
+    }
+    // A worker's tools are confined by the scope on its route. Without one, a provider would
+    // run them under head defaults, so refuse before any fetch or WAL write instead of trusting
+    // the caller never to send that combination.
+    if scope.is_none()
+        && parsed
+            .tool_items
+            .iter()
+            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET)
+    {
+        return Err(SendPlanRefusal::WorkerPresetRequiresScope);
     }
     // A reader build must not admit a plan it cannot execute, even when its WAL decoder
     // understands hook records. Refuse before fetching providers or allocating a lineage.
@@ -3506,6 +3530,10 @@ fn scope_error_bytes(err: &ServeError) -> Result<Vec<u8>, ServeIoError> {
                     scope.scope_ref
                 ),
             ))
+        }
+        // The run-start guard and the plan check refuse the same thing, so they share one body.
+        ServeError::ScopeRefused(broca_core::ScopeRefusal::ScopeRequired { .. }) => {
+            serde_json::to_vec(&worker_scope_error())
         }
         ServeError::ScopeFreezeBusy { reason, run_id } => {
             let detail = match (reason, run_id) {

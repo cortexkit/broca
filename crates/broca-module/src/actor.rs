@@ -1333,6 +1333,11 @@ pub struct LineageActor<W: WalStore> {
     /// The attested principal of the send being handled when it is a plan-named sender other
     /// than the session's owner; the send itself continues under the owner's principal.
     admitting_sent_by: Option<broca_protocol::BindPrincipal>,
+    /// The ordered send being drained into a run during its own admission, with the route scope
+    /// it arrived under. Such a send starts its run at once on an idle session, so its episode
+    /// freezes that scope exactly as a direct send would; any other drained submission waited
+    /// behind a run and carries only the scope the session already froze.
+    immediate_ordered_drain: Option<(broca_protocol::SubmissionId, broca_protocol::SendScope)>,
     /// For sends with an ordered `delivery` list: `ended_submissions` holds each one the WAL
     /// records as ended undelivered (`SendEnded`: replaced or expired) with its reason, and
     /// `delivered_submissions` each one it records as delivered into a running turn
@@ -1545,6 +1550,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             admitting_manifest: None,
             admitting_order: None,
             admitting_sent_by: None,
+            immediate_ordered_drain: None,
             ended_submissions: HashMap::new(),
             delivered_submissions: HashMap::new(),
             ordered_submissions: HashMap::new(),
@@ -3858,6 +3864,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .as_ref()
                 .and_then(|first| first.manifest.clone())
         };
+        // Every path that starts an episode passes here (a direct send, a drained queue, a
+        // queue rebuilt after a crash), so an episode whose plan asks a provider to confine its
+        // tools never starts without the scope that confinement is keyed on.
+        if episode_scope.is_none()
+            && manifest.as_ref().is_some_and(|manifest| {
+                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
+                    .is_ok_and(|plan| broca_fetch_plan::names_confined_preset(&plan))
+            })
+        {
+            return Err(StartRunFailure::Scope(
+                broca_core::ScopeRefusal::ScopeRequired {
+                    preset: broca_fetch_plan::CONFINED_TOOL_PRESET,
+                },
+            ));
+        }
         if let Some(manifest) = &manifest {
             // The session's first episode, new or re-driven: only its input holds the system
             // text, exactly as its `RunStarted` recorded it.
@@ -4659,6 +4680,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return SendOutcome::Transient("module is stopping".into());
         }
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
+        let request_scope = request.scope.clone();
         // A retry with the same `send_id` is the same send: answer what became of it.
         if let Some(existing) = self
             .pending_fifo
@@ -4870,7 +4892,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // On an idle session `idle_start` is the first possible mode of any list naming it
         // (nothing else is possible without a running turn), so the send starts its run now.
         if order.starts_runs() && matches!(self.state, RunState::Idle) {
-            if let Err(error) = self.drain_queue_one().await {
+            self.immediate_ordered_drain = Some((submission_id.clone(), request_scope));
+            let drained = self.drain_queue_one().await;
+            self.immediate_ordered_drain = None;
+            if let Err(error) = drained {
                 tracing::warn!(target: "admission", "ordered send drain deferred: {error}");
             }
             if let RunState::Active { run_id: active, .. } = &self.state {
@@ -5821,8 +5846,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let mut request = first.request;
             request.principal = first.principal;
             // The owner check ran when the send was queued; the drained episode only carries
-            // the scope the session froze (a queued send never freezes one).
-            request.scope = broca_protocol::SendScope::Internal;
+            // the scope the session froze (a queued send never freezes one). The exception is an
+            // ordered send starting its run during its own admission: it is a direct start, and
+            // its route's scope is frozen like any direct send's.
+            request.scope = match self.immediate_ordered_drain.take() {
+                Some((immediate, scope)) if immediate == submission_id => scope,
+                _ => broca_protocol::SendScope::Internal,
+            };
             match self
                 .start_run(
                     run_id.clone(),
@@ -5847,8 +5877,26 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     // Tombstone only failures intrinsic to the durable request. Export lag is an
                     // external, recoverable dependency state, so a trailing watermark must leave
                     // the queue head intact for the next drain tick.
-                    self.persist_failed_queued_admission(submission_id, run_id, error)
-                        .await?;
+                    self.persist_failed_queued_admission(
+                        submission_id,
+                        run_id,
+                        error.to_string(),
+                        "queued_admission_failed",
+                    )
+                    .await?;
+                }
+                // A queued send whose run could only start unconfined can never start: end it, so
+                // the queue behind it keeps draining and the sender sees the refusal.
+                Err(StartRunFailure::Scope(
+                    refusal @ broca_core::ScopeRefusal::ScopeRequired { .. },
+                )) => {
+                    self.persist_failed_queued_admission(
+                        submission_id,
+                        run_id,
+                        format!("scope refused: {refusal:?}"),
+                        "scope_required",
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(error.to_string()),
             }
@@ -5906,16 +5954,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
         &mut self,
         submission_id: broca_protocol::SubmissionId,
         run_id: RunId,
-        error: RunError,
+        message: String,
+        provider_code: &'static str,
     ) -> Result<(), String> {
         let terminal = ProviderError {
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
-            message: error.to_string(),
+            message,
             status: None,
             retry_after_secs: None,
-            provider_code: Some("queued_admission_failed".into()),
+            provider_code: Some(provider_code.into()),
             resets_at_ms: None,
             resets_at_source: None,
             limit_window: None,

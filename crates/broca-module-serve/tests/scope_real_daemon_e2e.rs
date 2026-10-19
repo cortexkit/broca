@@ -624,6 +624,61 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
     );
 }
 
+/// A new session's first send with an ordered `delivery` list starts its run from the queue during
+/// its own admission. That run must freeze the stamped scope exactly like a plain send's: the
+/// queue path used to drop it, so the first `RunStarted` carried no scope and the run's tools
+/// reached their providers on unscoped routes, unconfined.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordered_first_send_freezes_the_stamped_scope() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    rig.sync_scope().await;
+    let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
+    let session = rig.session("ordered");
+    let route = open_scoped(&owner, &session)
+        .await
+        .expect("the owner's scoped open to a fresh session is admitted");
+    let reply = owner
+        .route_request(
+            &route,
+            serde_json::to_vec(&serde_json::json!({"method": "session.send", "params": {
+                "prompt": "hi",
+                "send_id": "ordered-first",
+                "delivery": ["steer", "idle_start"],
+                "model": {"provider": "mock", "model": "mock-model"},
+            }}))
+            .unwrap(),
+        )
+        .await
+        .expect("the owner's ordered send");
+    assert_eq!(reply["result"]["state"], "active", "{reply}");
+    let records = broca_wal::replay_file(rig.wal_path(&session), broca_wal::DEFAULT_MAX_READ_BYTES)
+        .expect("the WAL reads");
+    let scopes: Vec<_> = records
+        .iter()
+        .filter_map(|framed| match &framed.record {
+            broca_wal::WalRecord::RunStarted { scope, .. } => Some(scope.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        scopes,
+        [Some(broca_protocol::SessionScope {
+            owner: broca_protocol::BindPrincipal::Reserved {
+                module_id: OWNER.into(),
+            },
+            scope_ref: SCOPE_REF.into(),
+            scope_epoch: SCOPE_EPOCH,
+            flow_id: None,
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        })],
+        "the ordered first send's run froze the scope the daemon stamped"
+    );
+}
+
 /// A real daemon allows a module other than the owner to send under a scope with a flow id.
 /// Broca records the scope's owner, ref and epoch, the flow id, and that sender's identity;
 /// it does not let the sender adopt the owner agent's existing session history.

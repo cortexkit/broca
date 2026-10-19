@@ -963,6 +963,33 @@ old = "if decision.scope().is_some() {\n                        return Err(Serve
 new = "if false && decision.scope().is_some() { // NON-VACUITY BREAK\n                        return Err(ServeError::PlanRefused("
 
 [[control]]
+id = "worker-preset-plan-requires-scope"
+# Only the guard's own admission test runs; other `it` tests are skipped.
+select = "expected"
+guards = "a plan asking for the confined worker tool preset is refused on an unscoped route before any fetch or WAL write"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::a_worker_preset_plan_requires_a_scoped_route"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET)"
+new = "            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET && false) // NON-VACUITY BREAK"
+
+[[control]]
+id = "ordered-first-send-freezes-route-scope"
+platforms = ["linux", "macos"]
+guards = "an ordered send that starts its run during its own admission freezes its route's stamped scope instead of running unscoped"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test scope_real_daemon_e2e"
+test_file = "crates/broca-module-serve/tests/scope_real_daemon_e2e.rs"
+expect_red = ["an_ordered_first_send_freezes_the_stamped_scope"]
+file = "crates/broca-module/src/actor.rs"
+old = "Some((immediate, scope)) if immediate == submission_id => scope,"
+new = "Some((immediate, scope)) if immediate == submission_id && false => scope, // NON-VACUITY BREAK"
+
+[[control]]
 id = "plan-model-checked-at-send"
 # Only the two plan-model mismatch tests run; other `it` tests are skipped, so
 # failures unique to those tests will not fail this mutation proof.
