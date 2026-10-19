@@ -52,6 +52,7 @@ fn order(modes: &[DeliveryMode], dedupe_key: Option<&str>) -> DeliveryOrder {
         modes: modes.to_vec(),
         dedupe_key: dedupe_key.map(str::to_owned),
         expires_at_ms: None,
+        template: None,
     }
 }
 
@@ -316,6 +317,48 @@ async fn an_expired_send_is_dropped_durably_and_never_delivered() {
     }
 }
 
+#[tokio::test]
+async fn already_expired_send_is_durable_and_never_starts() {
+    let rig = Rig::new("ordered-expired-admission", FakeExecutor::auto(), LONG_TTL);
+    let key = rig.key("s");
+    let expired = || {
+        Some(DeliveryOrder {
+            expires_at_ms: Some(1),
+            ..order(&[DeliveryMode::IdleStart], None)
+        })
+    };
+    for _ in 0..2 {
+        assert!(matches!(
+            rig.registry.send(send(&key, "late", expired())).await,
+            Err(ServeError::SendEnded {
+                outcome: "expired",
+                ..
+            })
+        ));
+    }
+    let wal = records(&rig, &key);
+    assert_eq!(
+        wal.iter()
+            .filter(|record| matches!(record, WalRecord::Queued { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        wal.iter()
+            .filter(|record| matches!(
+                record,
+                WalRecord::SendEnded {
+                    reason: SendEndReason::Expired,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(started_runs(&wal).is_empty());
+    assert_eq!(rig.exec.started_count(), 0);
+}
+
 /// A send accepted before the session's actor restarts is rebuilt from the WAL with its order
 /// and delivered exactly once, at the first step boundary of the next run.
 #[tokio::test]
@@ -397,7 +440,7 @@ async fn an_unnamed_sender_is_refused() {
         module_id: "ck-mc".into(),
     });
     match rig.registry.send(stranger).await {
-        Err(ServeError::DeliveryRefused { code, .. }) => assert_eq!(code, "sender_not_permitted"),
+        Err(ServeError::DeliveryRefused { code, .. }) => assert_eq!(code, "scope_owner_mismatch"),
         other => panic!("an unnamed sender is refused: {other:?}"),
     }
     assert_eq!(records(&rig, &key).len(), before, "nothing written");
@@ -442,6 +485,132 @@ fn reserved(module: &str) -> Option<BindPrincipal> {
     Some(BindPrincipal::Reserved {
         module_id: module.into(),
     })
+}
+
+fn template_fixture() -> (
+    broca_module::actor::SendPlan,
+    cortexkit_role_llm_runner::delivery_order::TemplateUse,
+) {
+    use cortexkit_role_llm_runner::delivery_order::{template_digest, Slot, Template, TemplateUse};
+    let template = Template::new(
+        "context",
+        "Context is {pct}% full.",
+        std::collections::BTreeMap::from([("pct".into(), Slot::Percentage)]),
+    );
+    let use_ = TemplateUse::new(
+        "context",
+        template_digest(&template),
+        serde_json::json!({"pct":82}).as_object().unwrap().clone(),
+    );
+    let mut plan = plan_naming("ck-mc", false);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["templates"] = serde_json::json!([template]);
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    (plan, use_)
+}
+
+#[tokio::test]
+async fn template_invalid_slot_is_refused_without_writes() {
+    let rig = Rig::new("ordered-template-slot", FakeExecutor::auto(), LONG_TTL);
+    let key = rig.key("s");
+    let (plan, mut template) = template_fixture();
+    let mut first = send(&key, "owner", None);
+    first.request.principal = reserved("owner");
+    first.plan = Some(plan);
+    rig.registry.send(first).await.unwrap();
+    wait_idle(&rig, &key).await;
+    template.slots.insert("pct".into(), 101.into());
+    let mut order = order(&[DeliveryMode::TurnSystem, DeliveryMode::Steer], None);
+    order.template = Some(template);
+    let mut bad = send(&key, "bad-slot", Some(order));
+    bad.request.principal = reserved("ck-mc");
+    let before = records(&rig, &key).len();
+    assert!(matches!(rig.registry.send(bad).await,
+        Err(ServeError::InvalidParams { field, .. }) if field == "template"));
+    assert_eq!(records(&rig, &key).len(), before);
+}
+
+#[tokio::test]
+async fn template_text_is_recorded_once_and_falls_through_to_steer_after_restart() {
+    let (exec, gate) = FakeExecutor::gated_with_step_boundary();
+    let rig = Rig::new("ordered-template-restart", exec, SHORT_TTL);
+    let key = rig.key("s");
+    let (plan, template) = template_fixture();
+    let mut first = send(&key, "owner", None);
+    first.request.principal = reserved("owner");
+    first.plan = Some(plan);
+    rig.registry.send(first).await.unwrap();
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    let mut order = order(&[DeliveryMode::TurnSystem, DeliveryMode::Steer], None);
+    order.template = Some(template);
+    let mut note = send(&key, "template", Some(order));
+    note.request.principal = reserved("ck-mc");
+    assert!(matches!(
+        rig.registry.send(note).await.unwrap(),
+        SendResponse::Pending { .. }
+    ));
+    let queued = records(&rig, &key)
+        .into_iter()
+        .find_map(|record| match record {
+            WalRecord::Queued { request, .. } => Some(request.input),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(queued).unwrap(),
+        serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Context is 82% full."}]}
+        ])
+    );
+    broca_test_support::wait_for(
+        "the template's actor closes",
+        async {
+            while rig.registry.slot_state(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || "the actor did not close".into(),
+    )
+    .await;
+    let mut owner = send(&key, "next", None);
+    owner.request.principal = reserved("owner");
+    rig.registry.send(owner).await.unwrap();
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    let wal = records(&rig, &key);
+    assert_eq!(
+        wal.iter()
+            .filter(|record| matches!(
+                record,
+                WalRecord::SendDelivered {
+                    mode: DeliveryMode::Steer,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(!wal.iter().any(|record| matches!(
+        record,
+        WalRecord::SendDelivered {
+            mode: DeliveryMode::TurnSystem,
+            ..
+        }
+    )));
+    let page = rig
+        .registry
+        .read(broca_module::serve::SessionReadRequest::new(
+            key,
+            Some(0),
+            Some(200),
+        ))
+        .await
+        .unwrap();
+    let note = page.messages.iter().find(|entry| entry.message.content.iter().any(|block|
+        matches!(block, broca_protocol::ContentBlock::Text { text } if text == "Context is 82% full."))).unwrap();
+    assert_eq!(note.delivered_as.as_ref().unwrap().mode, "steer");
 }
 
 /// Open a session whose owner is the module `owner` and whose frozen plan names `ck-mc` as a
@@ -573,7 +742,7 @@ async fn idle_start_without_the_grant_is_refused() {
     );
     start.request.principal = reserved("ck-mc");
     match rig.registry.send(start).await {
-        Err(ServeError::DeliveryRefused { code, .. }) => assert_eq!(code, "idle_start_not_granted"),
+        Err(ServeError::InvalidParams { field, .. }) => assert_eq!(field, "delivery"),
         other => panic!("idle_start without the grant is refused: {other:?}"),
     }
     assert_eq!(records(&rig, &key).len(), before, "nothing written");

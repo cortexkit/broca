@@ -5,11 +5,69 @@ use super::*;
 use broca_core::compaction_provider::{answer::StepAnswer, status::StepStatus};
 use broca_core::WalStore;
 use cortexkit_role_llm_runner::read::{EntrySource, ModelEntry};
-use cortexkit_role_llm_runner_conformance::{
-    CompactionAnswer, CompactionCall, CompactionCallKind, CompactionMessage, CompactionObservation,
-    CompactionScript, CompactionSetup, CompactionStep,
-};
+use cortexkit_role_llm_runner_conformance::{CompactionMessage, CompactionSetup};
 use std::collections::BTreeMap;
+
+// The synchronous-client regression rig outlives the old conformance scripting API.
+// Keep its script vocabulary local; the published suite does not exercise this protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CompactionAnswer {
+    Noop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CompactionStep {
+    Answer(CompactionAnswer),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CompactionScript {
+    pub setup: CompactionSetup,
+    pub steps: Vec<CompactionStep>,
+    pub call_timeout_ms: u64,
+    pub wait_cap_ms: u64,
+    pub prompt_cache_lifetime_ms: u64,
+    pub context_window: u64,
+    pub output_limit: u64,
+    pub safety_margin: u64,
+    pub request_tokens: u64,
+}
+
+impl CompactionScript {
+    pub fn new(initial: CompactionMessage) -> Self {
+        Self {
+            setup: CompactionSetup::Ready(initial),
+            steps: Vec::new(),
+            call_timeout_ms: 25,
+            wait_cap_ms: 100,
+            prompt_cache_lifetime_ms: 100,
+            context_window: 1000,
+            output_limit: 100,
+            safety_margin: 50,
+            request_tokens: 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CompactionCallKind {
+    Setup,
+    Step,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CompactionCall {
+    pub kind: CompactionCallKind,
+    pub request_id: String,
+    pub issued_at_ms: u64,
+    pub deadline_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct CompactionObservation {
+    pub calls: Vec<CompactionCall>,
+    pub model_inputs: Vec<Vec<ModelEntry>>,
+}
 
 pub(super) const MODULE: &str = "conformance-compaction";
 pub(super) const MODEL_PREFIX: &str = "conformance-model-";
@@ -84,14 +142,12 @@ impl subc_client_rs::ModuleHandler for Provider {
             .expect("provider request id")
             .to_owned();
         let now = params["now"].as_u64().expect("actual runner clock");
-        let mut held = None;
         let answer = {
             let mut sessions = self.shared.compaction.lock().unwrap();
             let state = sessions
                 .get_mut(session)
                 .expect("installed provider script");
             let setup = method == "compaction.setup";
-            let index = state.calls.len();
             state.calls.push(CompactionCall {
                 kind: if setup {
                     CompactionCallKind::Setup
@@ -144,30 +200,10 @@ impl subc_client_rs::ModuleHandler for Provider {
                         remember_answer(state, &answer);
                         serde_json::to_value(answer).unwrap()
                     }
-                    CompactionStep::Hold(_) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        state.senders.insert(index, tx);
-                        held = Some(rx);
-                        Value::Null
-                    }
                 }
             }
         };
-        if let Some(rx) = held {
-            let answer = tokio::select! {
-                answer = rx => match answer { Ok(answer) => answer, Err(_) => return killed() },
-                _ = self.shared.released.notified() => return killed(),
-            };
-            response(serde_json::to_value(answer).unwrap())
-        } else {
-            response(answer)
-        }
-    }
-}
-fn killed() -> subc_client_rs::HandlerOutcome {
-    subc_client_rs::HandlerOutcome::Error {
-        code: "conformance_killed".into(),
-        message: "runner killed".into(),
+        response(answer)
     }
 }
 fn response(value: Value) -> subc_client_rs::HandlerOutcome {
@@ -193,19 +229,6 @@ fn native_compaction(message: &CompactionMessage) -> Value {
 fn wire_answer(id: &str, answer: CompactionAnswer) -> StepAnswer {
     let value = match answer {
         CompactionAnswer::Noop => json!({"answer":"noop","request_id":id}),
-        CompactionAnswer::Message(message) => {
-            json!({"answer":"compaction_message","request_id":id,"compaction":native_compaction(&message)})
-        }
-        CompactionAnswer::Wait { reason, bound_ms } => {
-            json!({"answer":"wait","request_id":id,"reason":reason,"bound_ms":bound_ms})
-        }
-        CompactionAnswer::Refuse {
-            code,
-            reason,
-            provider_code,
-        } => {
-            json!({"answer":"refuse","request_id":id,"code":code.as_str(),"reason":reason,"provider_code":provider_code})
-        }
     };
     serde_json::from_value(value).expect("valid role answer")
 }
@@ -544,86 +567,6 @@ impl BrocaSubject {
                     "compaction work did not settle for {session}"
                 )))
             }
-        }
-    }
-    pub(super) async fn advance_compaction(
-        &self,
-        session: &str,
-        milliseconds: u64,
-    ) -> Result<(), HarnessError> {
-        self.settle_compaction(session).await?;
-        let root = self.compaction_root(session)?;
-        let now = {
-            let mut clocks = self.shared.compaction_clocks.lock().unwrap();
-            let now = clocks.get_mut(&root).unwrap();
-            *now += milliseconds;
-            *now
-        };
-        atomic_write(
-            &root.join("test-clock"),
-            &serde_json::to_vec(&json!({"now_ms":now})).unwrap(),
-        )?;
-        self.shared.note(
-            session,
-            format_args!("advance +{milliseconds} wrote test-clock now_ms={now}"),
-        );
-        // Polling advances the daemon's shared clock, which wakes its actual deadline futures.
-        // Do not return just because the adapter's timestamp has changed.
-        sleep(Duration::from_millis(120)).await;
-        self.settle_compaction(session).await
-    }
-    pub(super) async fn deliver_compaction(
-        &self,
-        session: &str,
-        index: usize,
-        id: Option<String>,
-        answer: CompactionAnswer,
-    ) -> Result<(), HarnessError> {
-        self.settle_compaction(session).await?;
-        let (original, answer, sender) = {
-            let mut states = self.shared.compaction.lock().unwrap();
-            let state = states.get_mut(session).unwrap();
-            let original = state
-                .calls
-                .get(index)
-                .ok_or_else(|| HarnessError::new("no observed call at index"))?
-                .request_id
-                .clone();
-            let answer = wire_answer(id.as_deref().unwrap_or(&original), answer);
-            remember_answer(state, &answer);
-            (original, answer, state.senders.remove(&index))
-        };
-        if let Some(sender) = sender {
-            sender.send(answer).map_err(|_| {
-                HarnessError::new("held real SDK call was cancelled before receipt")
-            })?;
-            sleep(Duration::from_millis(20)).await;
-            self.settle_compaction(session).await
-        } else {
-            // Unary SDK responses cannot deliver duplicates. This debug-only filesystem
-            // ingress injects the literal second answer into the same bounded run inbox;
-            // only core's normal discard consumer records it, and it acknowledges fsync.
-            let directory = self
-                .compaction_root(session)?
-                .join("test-compaction")
-                .join(session);
-            let _ = std::fs::remove_file(directory.join("ack"));
-            atomic_write(
-                &directory.join("receipt"),
-                &serde_json::to_vec(&json!({"original_request_id":original,"answer":answer}))
-                    .unwrap(),
-            )?;
-            broca_test_support::wait_until(
-                "duplicate receipt durable discard acknowledgement",
-                || async {
-                    let ack = directory.join("ack");
-                    ack.exists()
-                        .then_some(())
-                        .ok_or_else(|| format!("{} is absent", ack.display()))
-                },
-            )
-            .await;
-            Ok(())
         }
     }
     pub(super) async fn release_model_compaction(&self, session: &str) -> Result<(), HarnessError> {

@@ -21,14 +21,12 @@ pub const OP_ROLE_DESCRIBE: &str = "role.describe";
 pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
 pub const OP_SESSION_BASELINE: &str = "session.baseline";
-/// Answer one runner-tagged part's stored text, or a character range of it.
-pub const OP_SESSION_RESOLVE: &str = "session.resolve";
 /// The capability group of a runner that tags every stored part and serves `session.resolve`.
-pub const TAGS_CAPABILITY: &str = "tags";
+pub use cortexkit_role_llm_runner::capabilities::TAGS as TAGS_CAPABILITY;
 /// `session.resolve` names a tag no part of the session's transcript holds.
-pub const UNKNOWN_TAG: &str = "unknown_tag";
-/// `session.resolve`'s `range` is inverted or ends past the part's text.
-pub const RANGE_OUT_OF_BOUNDS: &str = "range_out_of_bounds";
+pub use cortexkit_role_llm_runner::errors::UNKNOWN_TAG;
+/// Answer one runner-tagged part's stored text, or a character range of it.
+pub use cortexkit_role_llm_runner::ops::SESSION_RESOLVE as OP_SESSION_RESOLVE;
 
 pub use broca_protocol::READ_REPLY_MAX_BYTES;
 /// The `session.read` byte cap a page stops at when the request names none.
@@ -36,23 +34,23 @@ pub const READ_DEFAULT_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 /// The largest `session.read` byte cap broca honours; a larger request is capped to it.
 pub const READ_MAXIMUM_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 
-/// A request member is malformed, unknown, or combined with one it excludes. `detail.field`
-/// names it.
-pub const INVALID_PARAMS: &str = "invalid_params";
-/// A read names a lineage that is not the session's current one. The caller re-reads from the
-/// tail.
-pub const LINEAGE_CHANGED: &str = "lineage_changed";
-/// `after_mid` names no message of the lineage.
-pub const UNKNOWN_MID: &str = "unknown_mid";
-/// `run.result` names no run of the session.
-pub const UNKNOWN_RUN: &str = "unknown_run";
-/// A terminal refusal when an indivisible `session.read` reply exceeds the transport frame
-/// limit. The detail is `cortexkit_role_llm_runner::errors::ReplyTooLargeDetail`.
-pub use cortexkit_role_llm_runner::errors::REPLY_TOO_LARGE;
 /// A send whose delivery mode the runner does not declare, with `detail.delivery` naming it.
 /// broca declares every mode the role defines (`queue`, `steer` and `interrupt`), so it never
 /// answers this code; it is listed so the code set matches the role's.
-pub const DELIVERY_UNSUPPORTED: &str = "delivery_unsupported";
+pub use cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED;
+/// A request member is malformed, unknown, or combined with one it excludes. `detail.field`
+/// names it.
+pub use cortexkit_role_llm_runner::errors::INVALID_PARAMS;
+/// A read names a lineage that is not the session's current one. The caller re-reads from the
+/// tail.
+pub use cortexkit_role_llm_runner::errors::LINEAGE_CHANGED;
+/// A terminal refusal when an indivisible `session.read` reply exceeds the transport frame
+/// limit. The detail is `cortexkit_role_llm_runner::errors::ReplyTooLargeDetail`.
+pub use cortexkit_role_llm_runner::errors::REPLY_TOO_LARGE;
+/// `after_mid` names no message of the lineage.
+pub use cortexkit_role_llm_runner::errors::UNKNOWN_MID;
+/// `run.result` names no run of the session.
+pub use cortexkit_role_llm_runner::errors::UNKNOWN_RUN;
 
 /// The `detail` of an `invalid_params` or `send_id_reuse` refusal: the request member at fault.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,18 +213,18 @@ pub fn broca_role_describe(implementation_version: &str) -> RoleDescribeResponse
 }
 
 /// The `role.describe` capability naming the `delivery_order` group of `session.send`.
-pub const DELIVERY_ORDER_GROUP: &str = "delivery_order";
+pub use cortexkit_role_llm_runner::capabilities::DELIVERY_ORDER as DELIVERY_ORDER_GROUP;
 
 /// Discovery follows all installed writers through one capability calculation. Decoding
 /// compaction, retention or hook records alone does not promise to execute those writers.
 pub fn broca_role_describe_with_writers(
     implementation_version: &str,
-    compaction_writer: bool,
+    _compaction_writer: bool,
     retention_writer: bool,
     hook_writer: bool,
 ) -> RoleDescribeResponse {
     use cortexkit_role_llm_runner::describe::{steer_receipt, Major};
-    let mut ops = [
+    let ops = [
         OP_ROLE_DESCRIBE,
         OP_SESSION_BASELINE,
         "session.read",
@@ -257,8 +255,6 @@ pub fn broca_role_describe_with_writers(
         "session_class",
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
-        // Draft name of the role's additive tags group (llm-runner 0.2.7, unpublished): every
-        // stored part has a durable tag, reads carry them, `session.resolve` answers them.
         TAGS_CAPABILITY,
         // `session.send` takes an ordered `delivery` list with `dedupe_key` and `expires_at_ms`.
         // `turn_system` is accepted in a list but is never possible on this runner yet, so the
@@ -267,10 +263,8 @@ pub fn broca_role_describe_with_writers(
     ]
     .map(String::from)
     .to_vec();
-    if compaction_writer {
-        ops.push(crate::OP_COMPACTION_READY.into());
-        capabilities.extend(["compaction".into(), "model_view".into()]);
-    }
+    // The retained synchronous client cannot serve the published asynchronous compaction
+    // contract. Do not advertise compaction or its model-view operations until it can.
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
     }
@@ -310,52 +304,22 @@ pub fn broca_role_describe_with_writers(
     }
 }
 
-/// `session.resolve` params. Strict.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResolveParams {
-    pub tag: u64,
-    /// A half-open range of the part's text, counted in Unicode scalar values (Rust `char`s).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<CharRange>,
-}
+pub use cortexkit_role_llm_runner::tags::{
+    CharRange, ResolveReply as ResolveResponse, ResolveRequest as ResolveParams, RANGE_FIELD,
+};
 
-/// A half-open `[start, end)` range of a part's text, in Unicode scalar values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CharRange {
-    pub start: u64,
-    pub end: u64,
-}
-
-/// `session.resolve`: the part a tag names and its stored text, exactly as stored (or the
-/// requested range of it). `part` is the same opaque key a read entry's tag row carries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveResponse {
-    pub tag: u64,
-    pub part: String,
-    /// The part's kind: `text`, `reasoning`, `redacted_reasoning`, `tool_call` or `tool_result`.
-    pub kind: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<CharRange>,
+/// A dropped ordered send is a terminal send state, not a request refusal: retries must
+/// report the durable outcome without inviting the sender to submit the text again.
+pub fn ordered_send_ended_reply(
+    submission_id: &str,
+    outcome: &str,
+) -> cortexkit_role_llm_runner::send::SendReply {
+    cortexkit_role_llm_runner::send::SendReply::new(outcome).with_submission_id(submission_id)
 }
 
 /// `text`, or its `range` of characters. `None` when the range is inverted or ends past the text.
 pub fn resolve_range(text: &str, range: Option<CharRange>) -> Option<String> {
-    let Some(range) = range else {
-        return Some(text.to_owned());
-    };
-    let len = text.chars().count() as u64;
-    if range.start > range.end || range.end > len {
-        return None;
-    }
-    Some(
-        text.chars()
-            .skip(range.start as usize)
-            .take((range.end - range.start) as usize)
-            .collect(),
-    )
+    cortexkit_role_llm_runner::tags::slice(text, range.as_ref()).ok()
 }
 
 /// `session.baseline` params: none. Strict.
@@ -814,16 +778,16 @@ mod pinned_reply_bytes {
     }
 
     #[test]
-    fn writer_declares_complete_compaction_groups() {
+    fn synchronous_writer_does_not_declare_published_compaction() {
         use cortexkit_role_llm_runner::describe::check_describe;
         let encoded =
             serde_json::to_value(broca_role_describe_with_writers("test", true, false, false))
                 .unwrap();
         check_describe(&encoded).unwrap_or_else(|error| panic!("{error:?}"));
         let capabilities = encoded["capabilities"].as_array().unwrap();
-        assert!(capabilities.contains(&serde_json::json!("compaction")));
-        assert!(capabilities.contains(&serde_json::json!("model_view")));
-        assert!(encoded["majors"][0]["ops"]
+        assert!(!capabilities.contains(&serde_json::json!("compaction")));
+        assert!(!capabilities.contains(&serde_json::json!("model_view")));
+        assert!(!encoded["majors"][0]["ops"]
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("compaction.ready")));
@@ -847,15 +811,12 @@ mod pinned_reply_bytes {
                         caps.contains(&serde_json::json!(ORDERED_HOOK_PHASES)),
                         hooks
                     );
-                    assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
-                    assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
-                    assert_eq!(
-                        encoded["majors"][0]["ops"]
-                            .as_array()
-                            .unwrap()
-                            .contains(&serde_json::json!(crate::OP_COMPACTION_READY)),
-                        compaction
-                    );
+                    assert!(!caps.contains(&serde_json::json!("compaction")));
+                    assert!(!caps.contains(&serde_json::json!("model_view")));
+                    assert!(!encoded["majors"][0]["ops"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!(crate::OP_COMPACTION_READY)));
                     assert_eq!(encoded.get("retention").is_some(), retention);
                 }
             }
@@ -926,7 +887,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "459918df86f7423be23f7d868c0d47361ed18e87a7c2bf0af424998634d46d7f";
+        "bb2412dc18e3bb8a66617aa5aefd017929bb69e8126b973cb002c5b7d6ea7951";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

@@ -22,11 +22,6 @@ use broca_protocol::{
 use broca_wal::{record::SendEndReason, WalRecord};
 use std::sync::Arc;
 
-/// Why `turn_system` is never possible in this build, on every provider lane: a send cannot yet
-/// name a plan-declared template, so the runner has no template bytes and typed slots to validate
-/// and render. A list naming it falls through to its next mode.
-pub const TURN_SYSTEM_TEMPLATE_UNIMPLEMENTED: &str = "turn_system_template_unimplemented";
-
 /// What a request boundary offers, for choosing a send's mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Boundary {
@@ -75,6 +70,7 @@ pub fn choose_mode(
         DeliveryMode::TurnSystem => false,
         DeliveryMode::Steer => boundary.running,
         DeliveryMode::IdleStart => boundary.idle,
+        _ => false,
     })
 }
 
@@ -238,6 +234,7 @@ mod tests {
             modes: modes.to_vec(),
             dedupe_key: None,
             expires_at_ms: None,
+            template: None,
         }
     }
 

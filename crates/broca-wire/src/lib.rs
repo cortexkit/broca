@@ -301,17 +301,29 @@ pub struct SendParams {
     /// `delivery_order` group: a newer send from the same sender with the same key replaces a
     /// queued, undelivered one, which then ends `superseded`. Distinct from `send_id`: a retry
     /// with the same `send_id` is the same send, not a replacement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_dedupe_key"
+    )]
     pub dedupe_key: Option<String>,
     /// `delivery_order` group: Unix milliseconds after which a still-undelivered send is
     /// dropped, recorded durably, and ends `expired`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expires_at"
+    )]
     pub expires_at_ms: Option<u64>,
-    /// `delivery_order` group: a `turn_system` send names a plan-declared template and its slot
-    /// values here instead of carrying `input`. This runner renders no templates, so any send
-    /// carrying the member is refused by name rather than ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template: Option<serde_json::Value>,
+    /// `delivery_order` group: the sender names a plan-declared template, its digest and its
+    /// typed slot values instead of a prompt. The rendered text falls through `turn_system`
+    /// to the next possible mode because no provider lane supports turn-scoped system messages.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_template"
+    )]
+    pub template: Option<cortexkit_role_llm_runner::delivery_order::TemplateUse>,
     /// Deprecated inert compatibility field. The coordinator determines append behavior from the
     /// run identity.
     #[serde(default)]
@@ -482,16 +494,44 @@ where
 #[serde(untagged)]
 pub enum SendDelivery {
     /// `"queue"`, `"steer"` or `"interrupt"`, with the meaning they always had.
-    Mode(broca_protocol::Delivery),
+    Mode(cortexkit_role_llm_runner::send::Delivery),
     /// An ordered list of delivery modes (the `delivery_order` group).
     Order(Vec<broca_protocol::DeliveryMode>),
+}
+
+fn deserialize_dedupe_key<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(d)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("dedupe_key: {error}")))
+}
+
+fn deserialize_expires_at<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(d)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("expires_at_ms: {error}")))
+}
+
+fn deserialize_template<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<cortexkit_role_llm_runner::delivery_order::TemplateUse>, D::Error> {
+    cortexkit_role_llm_runner::delivery_order::TemplateUse::deserialize(d)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("template: {error}")))
 }
 
 impl SendDelivery {
     /// The legacy mode, when `delivery` is a string.
     pub fn mode(&self) -> Option<broca_protocol::Delivery> {
         match self {
-            SendDelivery::Mode(mode) => Some(*mode),
+            SendDelivery::Mode(mode) => Some(match mode {
+                cortexkit_role_llm_runner::send::Delivery::Queue => broca_protocol::Delivery::Queue,
+                cortexkit_role_llm_runner::send::Delivery::Steer => broca_protocol::Delivery::Steer,
+                cortexkit_role_llm_runner::send::Delivery::Interrupt => {
+                    broca_protocol::Delivery::Interrupt
+                }
+            }),
             SendDelivery::Order(_) => None,
         }
     }
@@ -503,28 +543,26 @@ impl SendParams {
         legacy_delivery(self.delivery.as_ref())
     }
 
-    /// The `delivery_order` group as this send uses it (see [`delivery_order`]). A `template`
-    /// is refused whatever `delivery` is: with a legacy string it is invalid, and in a list this
-    /// runner has no templates to render (`turn_system` is never possible here).
+    /// Decode the ordered-delivery members. Templates require a list and are rendered from
+    /// the attested sender's frozen plan before the send is recorded.
     pub fn delivery_order(
         &self,
     ) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
-        if self.template.is_some() {
+        if self.template.is_some() && !matches!(self.delivery, Some(SendDelivery::Order(_))) {
             return Err((
                 "template",
-                match self.delivery {
-                    Some(SendDelivery::Order(_)) => {
-                        "template sends are not supported by this runner".into()
-                    }
-                    _ => "template is valid only when delivery is an ordered list".into(),
-                },
+                "template is valid only when delivery is an ordered list".into(),
             ));
         }
-        delivery_order(
+        let mut order = delivery_order(
             self.delivery.as_ref(),
             self.dedupe_key.as_deref(),
             self.expires_at_ms,
-        )
+        )?;
+        if let Some(order) = &mut order {
+            order.template = self.template.clone();
+        }
+        Ok(order)
     }
 }
 
@@ -544,62 +582,48 @@ pub fn delivery_order(
     dedupe_key: Option<&str>,
     expires_at_ms: Option<u64>,
 ) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
-    let Some(SendDelivery::Order(modes)) = delivery else {
-        for (field, present) in [
-            ("dedupe_key", dedupe_key.is_some()),
-            ("expires_at_ms", expires_at_ms.is_some()),
-        ] {
-            if present {
-                return Err((
-                    field,
-                    format!("{field} is valid only when delivery is an ordered list"),
-                ));
-            }
-        }
-        return Ok(None);
+    use cortexkit_role_llm_runner::delivery_order::{
+        DeliveryOrder, DEDUPE_KEY_FIELD, EXPIRES_AT_FIELD,
     };
-    if dedupe_key.is_some_and(str::is_empty) {
-        return Err(("dedupe_key", "dedupe_key must not be empty".into()));
+    let modes = match delivery {
+        Some(SendDelivery::Order(modes)) => Some(modes.as_slice()),
+        _ => None,
+    };
+    let mut members = serde_json::Map::new();
+    if let Some(key) = dedupe_key {
+        members.insert(DEDUPE_KEY_FIELD.into(), key.into());
     }
-    Ok(Some(broca_protocol::DeliveryOrder {
-        modes: modes.clone(),
-        dedupe_key: dedupe_key.map(str::to_owned),
-        expires_at_ms,
-    }))
+    if let Some(at) = expires_at_ms {
+        members.insert(EXPIRES_AT_FIELD.into(), at.into());
+    }
+    DeliveryOrder::decode(modes, &members)
+        .map(|order| {
+            order.map(|order| broca_protocol::DeliveryOrder {
+                modes: order.modes,
+                dedupe_key: order.dedupe_key,
+                expires_at_ms: order.expires_at_ms,
+                template: order.template,
+            })
+        })
+        .map_err(|field| (field, format!("invalid ordered delivery member {field}")))
 }
 
-/// Decode `SendParams.delivery`: a legacy mode string, named with the three accepted modes on a
-/// refusal, or an ordered, non-empty list of distinct delivery modes. A JSON `null` reads as
-/// absent.
+/// Use the role's string-or-array decoder; its wire enum is private, so retain a local
+/// carrier only for broca's optional-send-id request shape.
 fn deserialize_delivery<'de, D>(deserializer: D) -> Result<Option<SendDelivery>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    if let serde_json::Value::Array(items) = &value {
-        let modes: Vec<broca_protocol::DeliveryMode> =
-            serde_json::from_value(value.clone()).map_err(|_| {
-                serde::de::Error::custom(format!(
-                    "delivery list entries must be \"tool_result\", \"turn_system\", \"steer\" or \"idle_start\"; got {value}"
-                ))
-            })?;
-        let distinct: std::collections::HashSet<_> = modes.iter().collect();
-        if items.is_empty() || distinct.len() != modes.len() {
-            return Err(serde::de::Error::custom(format!(
-                "delivery list must be non-empty and name each mode once; got {value}"
-            )));
-        }
-        return Ok(Some(SendDelivery::Order(modes)));
-    }
-    serde_json::from_value(value.clone())
-        .map(|mode| Some(SendDelivery::Mode(mode)))
-        .map_err(|_| {
-            serde::de::Error::custom(format!(
-                "delivery must be \"queue\", \"steer\" or \"interrupt\"; got {value}"
-            ))
-        })
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let request: cortexkit_role_llm_runner::send::SendRequest = serde_json::from_value(
+        serde_json::json!({"send_id": "decode-delivery", "delivery": value}),
+    )
+    .map_err(serde::de::Error::custom)?;
+    Ok(match (request.delivery_order, request.delivery) {
+        (Some(modes), _) => Some(SendDelivery::Order(modes)),
+        (_, Some(mode)) => Some(SendDelivery::Mode(mode)),
+        _ => None,
+    })
 }
 
 /// Every top-level key [`SendParams`] reads. Anything else on a `session.send` is ignored by
@@ -923,7 +947,11 @@ pub struct SessionReadMessage {
     pub message: broca_protocol::Message,
     /// The producing run, not the page's latest run. Historical/imported messages with
     /// no recoverable producer omit this member; legacy replies without it still decode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_run_attribution"
+    )]
     pub run: Option<broca_core::RunAttribution>,
     /// One entry per tool call the message carries, in its order: what broca recorded about
     /// each call's dispatch. Absent on a message with no tool call.
@@ -933,25 +961,41 @@ pub struct SessionReadMessage {
     /// of a session admitted before tags existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<SessionReadTag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_as: Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
 }
 
-/// One tagged part of a read entry: the runner's opaque key for the part (the key
-/// `session.resolve` answers with) and its tag.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionReadTag {
-    pub part: String,
-    pub tag: u64,
+fn serialize_run_attribution<S: serde::Serializer>(
+    run: &Option<broca_core::RunAttribution>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    run.as_ref()
+        .map(|run| cortexkit_role_llm_runner::read::RunAttribution {
+            run_id: run.run_id.clone(),
+            episode: run.episode.clone(),
+            is_final: run.is_final,
+        })
+        .serialize(serializer)
 }
+
+pub use cortexkit_role_llm_runner::tags::PartTag as SessionReadTag;
 
 /// The tag rows of `message`, the transcript message at `ordinal`; empty when it has no tags.
 pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
     message
         .part_tags()
         .map(|tags| {
-            tags.tagged()
-                .map(|(index, tag)| SessionReadTag {
-                    part: broca_protocol::tags::part_key(ordinal, index),
-                    tag,
+            tags.parts
+                .iter()
+                .enumerate()
+                .map(|(index, tag)| {
+                    let part = broca_protocol::tags::part_key(ordinal, index);
+                    match tag {
+                        Some(tag) => {
+                            SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(*tag))
+                        }
+                        None => SessionReadTag::untagged(part),
+                    }
                 })
                 .collect()
         })
@@ -3455,9 +3499,12 @@ mod delivery_params {
     #[test]
     fn delivery_decodes_the_three_modes_and_null_as_absent() {
         for (wire, mode) in [
-            ("queue", broca_protocol::Delivery::Queue),
-            ("steer", broca_protocol::Delivery::Steer),
-            ("interrupt", broca_protocol::Delivery::Interrupt),
+            ("queue", cortexkit_role_llm_runner::send::Delivery::Queue),
+            ("steer", cortexkit_role_llm_runner::send::Delivery::Steer),
+            (
+                "interrupt",
+                cortexkit_role_llm_runner::send::Delivery::Interrupt,
+            ),
         ] {
             assert_eq!(
                 send(serde_json::json!(wire)).unwrap().delivery,
@@ -3547,14 +3594,17 @@ mod delivery_order_params {
 
     /// `dedupe_key`, `expires_at_ms` and `template` are valid only with an ordered list: with a
     /// legacy string or no `delivery` the send is refused naming the field, never run with the
-    /// member ignored. A template is refused in a list too, since this runner renders none.
+    /// member ignored. A list retains the template for validation against the frozen plan.
     #[test]
     fn group_members_without_an_ordered_list_are_refused_by_name() {
         for delivery in [None, Some("queue"), Some("steer"), Some("interrupt")] {
             for (member, value) in [
                 ("dedupe_key", serde_json::json!("k")),
                 ("expires_at_ms", serde_json::json!(5)),
-                ("template", serde_json::json!({"id": "t", "slots": {}})),
+                (
+                    "template",
+                    serde_json::json!({"id": "t", "digest": "a".repeat(64), "slots": {}}),
+                ),
             ] {
                 let mut params = serde_json::json!({ member: value });
                 if let Some(delivery) = delivery {
@@ -3565,11 +3615,30 @@ mod delivery_order_params {
             }
         }
         let listed =
-            send(serde_json::json!({"delivery": ["steer"], "template": {"id": "t", "slots": {}}}))
+            send(serde_json::json!({"delivery": ["steer"], "template": {"id": "t", "digest": "a".repeat(64), "slots": {}}}))
                 .unwrap();
-        assert_eq!(listed.delivery_order().unwrap_err().0, "template");
+        assert_eq!(
+            listed
+                .delivery_order()
+                .unwrap()
+                .unwrap()
+                .template
+                .unwrap()
+                .id,
+            "t"
+        );
         let empty = send(serde_json::json!({"delivery": ["steer"], "dedupe_key": ""})).unwrap();
         assert_eq!(empty.delivery_order().unwrap_err().0, "dedupe_key");
+    }
+
+    #[test]
+    fn null_delivery_order_members_are_not_silently_omitted() {
+        for member in ["dedupe_key", "expires_at_ms", "template"] {
+            let error = send(serde_json::json!({"delivery":["steer"], member:null}))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(member), "{error}");
+        }
     }
 
     /// Empty lists, repeated modes and unknown modes are refused naming the field.
@@ -3584,7 +3653,7 @@ mod delivery_order_params {
             let error = send(serde_json::json!({"delivery": bad.clone()}))
                 .expect_err("refused")
                 .to_string();
-            assert!(error.contains("delivery list"), "{bad}: {error}");
+            assert!(error.contains("delivery"), "{bad}: {error}");
         }
     }
 }
@@ -4140,6 +4209,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            delivered_as: None,
             tags: Vec::new(),
             ordinal: 3,
             mid: "m3".into(),
@@ -4176,7 +4246,7 @@ mod caller_message_tests {
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
-            r#"{"ordinal":3,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"tags":[{"part":"m3#0","tag":7},{"part":"m3#1","tag":8}]}"#
+            r#"{"ordinal":3,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"tags":[{"part":"m3#0","tag":"§7§"},{"part":"m3#1","tag":"§8§"}]}"#
         );
         let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
         assert_eq!(decoded.tags, tagged.tags);

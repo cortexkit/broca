@@ -2132,6 +2132,20 @@ where
                     .await;
                 }
             };
+            if params.template.is_some()
+                && (req.params.get("prompt").is_some() || req.params.get("prompt_blocks").is_some())
+            {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("template".into()),
+                    "a template send must not also carry prompt or prompt_blocks",
+                )
+                .await;
+            }
             if let Err((field, message)) = params.delivery_order() {
                 return send_invalid_params(
                     writer,
@@ -2702,11 +2716,35 @@ where
                     .await;
                 }
             };
+            if let Err(field) = params.number() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    "tag must have the form §N§ for a positive integer N",
+                )
+                .await;
+            }
             match handler.resolve(&session, &params).await {
                 Ok(Ok(reply)) => {
                     send_json_response(writer, ver, channel, epoch, corr, &reply).await
                 }
                 Ok(Err((code, message))) => {
+                    if code == broca_wire::INVALID_PARAMS {
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            Some(broca_wire::RANGE_FIELD.into()),
+                            &message,
+                        )
+                        .await;
+                    }
                     send_error(writer, ver, channel, epoch, corr, code, &message).await
                 }
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
@@ -3106,15 +3144,8 @@ async fn send_serve_error(
             submission_id,
             outcome,
         } => {
-            let code = if *outcome == "superseded" {
-                "send_superseded"
-            } else {
-                "send_expired"
-            };
-            let body = ErrorBody::new(code, err.to_string()).with_detail(
-                serde_json::json!({"submission_id": submission_id, "outcome": outcome}),
-            );
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+            let reply = broca_wire::ordered_send_ended_reply(submission_id, outcome);
+            return send_json_response(writer, ver, channel, epoch, corr, &reply).await;
         }
         ServeError::DeliveryRefused { code, .. } => {
             let body = ErrorBody::new(*code, err.to_string())
@@ -4010,6 +4041,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    delivered_as: None,
                     run: None,
                     ordinal: 0,
                     mid: "m0".into(),
@@ -4023,6 +4055,7 @@ mod tests {
                     tags: Vec::new(),
                 },
                 SessionReadMessage {
+                    delivered_as: None,
                     run: None,
                     ordinal: 1,
                     mid: "m1".into(),
@@ -4425,6 +4458,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ended_ordered_send_retries_are_successful_terminal_replies() {
+        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
+        for outcome in ["superseded", "expired"] {
+            send_serve_error(
+                &tx,
+                PROTOCOL_VERSION,
+                7,
+                3,
+                11,
+                &ServeError::SendEnded {
+                    submission_id: "sub-note".into(),
+                    outcome,
+                },
+            )
+            .await
+            .unwrap();
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.header.ty, FrameType::Response, "{outcome}");
+            let value: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"result":{"state":outcome,"submission_id":"sub-note"}})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn plan_model_mismatch_bytes_are_pinned() {
         use sha2::{Digest, Sha256};
         let refusal = broca_fetch_plan::Refusal::PlanModelMismatch {
@@ -4582,6 +4642,7 @@ mod tests {
             let end = (from + 2).min(self.messages.len());
             let messages = (from..end)
                 .map(|ordinal| broca_wire::SessionReadMessage {
+                    delivered_as: None,
                     ordinal: ordinal as u64,
                     mid: format!("m{ordinal}"),
                     tags: broca_wire::tag_rows(ordinal as u64, &self.messages[ordinal]),
@@ -4666,7 +4727,12 @@ mod tests {
             let session = session.clone();
             async move {
                 handler
-                    .resolve(&session, &broca_wire::ResolveParams { tag, range })
+                    .resolve(&session, &{
+                        let mut params =
+                            broca_wire::ResolveParams::new(broca_protocol::tags::tag_mark(tag));
+                        params.range = range;
+                        params
+                    })
                     .await
             }
         };
@@ -4674,26 +4740,26 @@ mod tests {
         let whole = resolve(5, None).await.unwrap().unwrap();
         assert_eq!(
             serde_json::to_value(&whole).unwrap(),
-            serde_json::json!({"tag":5,"part":"m3#0","kind":"text","text":"héllo, 世界"})
+            serde_json::json!({"tag":"§5§","ordinal":3,"mid":"m3","part":"m3#0","content":"héllo, 世界"})
         );
         let second_part = resolve(6, None).await.unwrap().unwrap();
         assert_eq!(second_part.part, "m3#1");
-        assert_eq!(second_part.text, "tail");
+        assert_eq!(second_part.content, "tail");
 
         // A range counts characters, not bytes.
-        let range = broca_wire::CharRange { start: 1, end: 9 };
+        let range = broca_wire::CharRange::new(1, 9);
         let ranged = resolve(5, Some(range)).await.unwrap().unwrap();
-        assert_eq!(ranged.text, "éllo, 世界");
+        assert_eq!(ranged.content, "éllo, 世界");
         assert_eq!(ranged.range, Some(range));
-        let empty = broca_wire::CharRange { start: 9, end: 9 };
-        assert_eq!(resolve(5, Some(empty)).await.unwrap().unwrap().text, "");
+        let empty = broca_wire::CharRange::new(9, 9);
+        assert_eq!(resolve(5, Some(empty)).await.unwrap().unwrap().content, "");
 
         for bad in [
-            broca_wire::CharRange { start: 0, end: 10 },
-            broca_wire::CharRange { start: 4, end: 3 },
+            broca_wire::CharRange::new(0, 10),
+            broca_wire::CharRange::new(4, 3),
         ] {
             let refusal = resolve(5, Some(bad)).await.unwrap().unwrap_err();
-            assert_eq!(refusal.0, broca_wire::RANGE_OUT_OF_BOUNDS, "{bad:?}");
+            assert_eq!(refusal.0, broca_wire::INVALID_PARAMS, "{bad:?}");
         }
         let unknown = resolve(4, None).await.unwrap().unwrap_err();
         assert_eq!(unknown.0, broca_wire::UNKNOWN_TAG);
@@ -4702,13 +4768,14 @@ mod tests {
     #[test]
     fn resolve_params_are_strict() {
         assert!(serde_json::from_value::<broca_wire::ResolveParams>(
-            serde_json::json!({"tag":1,"range":{"start":0,"end":1}})
+            serde_json::json!({"tag":"§1§","range":{"start":0,"end":1}})
         )
         .is_ok());
         for bad in [
             serde_json::json!({}),
-            serde_json::json!({"tag":1,"origin":"owner"}),
-            serde_json::json!({"tag":1,"range":{"start":0}}),
+            serde_json::json!({"tag":"§1§","origin":"owner"}),
+            serde_json::json!({"tag":"§1§","range":{"start":0}}),
+            serde_json::json!({"tag":1}),
             serde_json::json!({"tag":-1}),
         ] {
             assert!(

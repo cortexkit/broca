@@ -42,6 +42,9 @@ pub struct RunAttribution {
     pub episode: String,
     #[serde(rename = "final")]
     pub is_final: bool,
+    /// Projection metadata stored with the row, exposed beside (not inside) its wire run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<broca_protocol::tags::DeliveryAttribution>,
 }
 fn producing_run(id: &RunId) -> RunAttribution {
     RunAttribution {
@@ -51,6 +54,7 @@ fn producing_run(id: &RunId) -> RunAttribution {
         // so the run and episode coordinates identify the same durable turn.
         episode: id.0.clone(),
         is_final: false,
+        delivery: None,
     }
 }
 
@@ -1282,6 +1286,7 @@ fn replay_seeded_with_compaction<'a>(
     // that survives an episode boundary.
     let mut prompt: Vec<Message> = Vec::new();
     let mut message_runs: Vec<Option<RunAttribution>> = Vec::new();
+    let mut ordered_submissions = std::collections::HashSet::new();
     let mut run_finals = std::collections::BTreeMap::new();
     let mut compaction = seed_compaction
         .cloned()
@@ -1350,6 +1355,7 @@ fn replay_seeded_with_compaction<'a>(
                 config,
                 input,
                 origin,
+                submission_id,
                 // `..` deliberately covers `manifest`: replay decodes a frozen plan manifest but
                 // does not act on it, and renders from the episode's own frozen config and input,
                 // the same as for an episode without one.
@@ -1422,12 +1428,21 @@ fn replay_seeded_with_compaction<'a>(
                     frozen_config: config.frozen_render_config.clone(),
                 });
                 let input_tags = rec.runner_tags();
-                prompt.extend(
-                    input
-                        .iter()
-                        .enumerate()
-                        .map(|(index, message)| tagged(message.clone(), input_tags.get(index))),
-                );
+                let idle_delivery = submission_id
+                    .as_ref()
+                    .is_some_and(|id| ordered_submissions.remove(id));
+                prompt.extend(input.iter().enumerate().map(|(index, message)| {
+                    let mut message = tagged(message.clone(), input_tags.get(index));
+                    if idle_delivery {
+                        message
+                            .tags
+                            .set_delivery(broca_protocol::tags::DeliveryAttribution {
+                                mode: broca_protocol::DeliveryMode::IdleStart,
+                                tool_call_id: None,
+                            });
+                    }
+                    message
+                }));
             }
             WalRecord::ModelStepFinished {
                 step_id,
@@ -1706,24 +1721,51 @@ fn replay_seeded_with_compaction<'a>(
             // follows the batch's `ToolBatchFinished`, so the result is in the newest tool
             // message. The stored `ToolResult` record itself is never changed.
             WalRecord::SendDelivered {
+                submission_id,
                 input,
                 tool_call_id,
                 appended_text,
+                mode,
                 ..
             } => {
+                ordered_submissions.remove(submission_id);
                 if let Some(input) = input {
                     let delivered_tags = rec.runner_tags();
                     ep.pending_steers
                         .extend(input.iter().enumerate().map(|(index, message)| {
-                            tagged(message.clone(), delivered_tags.get(index))
+                            let mut message = tagged(message.clone(), delivered_tags.get(index));
+                            message
+                                .tags
+                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
+                                    mode: *mode,
+                                    tool_call_id: None,
+                                });
+                            message
                         }));
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
                     crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
+                    if let Some(index) = prompt.iter().rposition(|message| {
+                        message.content.iter().any(|block| matches!(block,
+                            ContentBlock::ToolResult(result) if &result.tool_call_id == tool_call_id))
+                    }) {
+                        let delivery = broca_protocol::tags::DeliveryAttribution {
+                            mode: *mode, tool_call_id: Some(tool_call_id.0.clone()),
+                        };
+                        prompt[index].tags.set_delivery(delivery.clone());
+                        if let Some(Some(run)) = message_runs.get_mut(index) {
+                            run.delivery = Some(delivery);
+                        }
+                    }
                 }
             }
             // The order and the end of a queued send belong to the queue, not the prompt.
-            WalRecord::DeliveryOrdered { .. } | WalRecord::SendEnded { .. } => {}
+            WalRecord::DeliveryOrdered { submission_id, .. } => {
+                ordered_submissions.insert(submission_id.clone());
+            }
+            WalRecord::SendEnded { submission_id, .. } => {
+                ordered_submissions.remove(submission_id);
+            }
             WalRecord::BudgetFired {
                 run_id: fired_run_id,
                 ordinal,
@@ -1918,12 +1960,16 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
         message_runs.truncate(prompt.len());
-        message_runs.resize_with(prompt.len(), || {
-            run_id
+        for message in &prompt[message_runs.len()..] {
+            let mut attribution = run_id
                 .as_ref()
                 .filter(|_| ep.attributable)
-                .map(producing_run)
-        });
+                .map(producing_run);
+            if let Some(run) = &mut attribution {
+                run.delivery = message.tags.delivery().cloned();
+            }
+            message_runs.push(attribution);
+        }
         if matches!(rec, WalRecord::RunFinished { .. }) && ep.attributable {
             if let (Some(id), Some(ordinal)) = (
                 run_id.as_ref(),
@@ -1943,7 +1989,11 @@ fn replay_seeded_with_compaction<'a>(
                             .flatten()
                     }),
             ) {
-                let mut run = producing_run(id);
+                let mut run = message_runs
+                    .last()
+                    .and_then(|run| run.clone())
+                    .filter(|run| run.run_id == id.0)
+                    .unwrap_or_else(|| producing_run(id));
                 run.is_final = true;
                 run_finals.insert(ordinal, run);
                 if let Some(Some(run)) = message_runs.last_mut().filter(|_| !prompt.is_empty()) {

@@ -1435,9 +1435,11 @@ impl SqliteStore {
         }
         for (ordinal, run_json) in prepared.final_run_json {
             let run: broca_core::RunAttribution = serde_json::from_str(&run_json)?;
+            // A terminal-only tail knows the final ordinal, but not the stored row's delivery
+            // receipt. Update only the final flag so that metadata survives the projection seam.
             tx.execute(
-                "UPDATE message SET run_json=?3 WHERE session=?1 AND ord=?2 AND json_extract(run_json, '$.run_id')=?4",
-                rusqlite::params![key, ordinal, run_json, run.run_id],
+                "UPDATE message SET run_json=json_set(run_json, '$.final', json('true')) WHERE session=?1 AND ord=?2 AND json_extract(run_json, '$.run_id')=?3",
+                rusqlite::params![key, ordinal, run.run_id],
             )?;
         }
 
@@ -1485,7 +1487,7 @@ impl SqliteStore {
             ],
         )?;
         tx.execute(
-            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=1 WHERE session=?1",
+            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=2 WHERE session=?1",
             rusqlite::params![key, prepared.deferred_calls_json],
         )?;
         for run_id in prepared.withdrawals_owed_runs {
@@ -2318,7 +2320,9 @@ fn attribution_complete(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<boo
             |row| row.get(0),
         )
         .optional()?;
-    if version.is_some_and(|version| version != 1) {
+    // Version 2 includes ordered-delivery receipts. Older rows are backfilled from the WAL
+    // on their session's first read, just like rows missing run attribution.
+    if version.is_some_and(|version| version != 2) {
         return Ok(false);
     }
     // Session-scoped only: no global index build or startup scan of historical bodies.

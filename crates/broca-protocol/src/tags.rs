@@ -18,7 +18,7 @@ use crate::content::{ContentBlock, Message, Role, ToolOutput};
 
 /// The contract spelling of tag `tag`: `§N§`.
 pub fn tag_mark(tag: u64) -> String {
-    format!("§{tag}§")
+    cortexkit_role_llm_runner::tags::format_tag(tag).expect("stored tag numbers are positive")
 }
 
 /// The tags of one message: one tag per content block, in block order. Serialized as a bare
@@ -92,6 +92,16 @@ pub struct TagSlot {
     /// Whether [`render_tags_into`] already prefixed this message's text, so that rendering
     /// the same prompt again leaves it unchanged.
     rendered: bool,
+    delivery: Option<DeliveryAttribution>,
+}
+
+/// Delivery metadata projected beside a message, never into its stored content. The
+/// carrying tool id is resolved to its durable dispatch key by the read adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryAttribution {
+    pub mode: crate::DeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl PartialEq for TagSlot {
@@ -105,7 +115,16 @@ impl TagSlot {
         Self {
             tags,
             rendered: false,
+            delivery: None,
         }
+    }
+
+    pub fn delivery(&self) -> Option<&DeliveryAttribution> {
+        self.delivery.as_ref()
+    }
+
+    pub fn set_delivery(&mut self, delivery: DeliveryAttribution) {
+        self.delivery = Some(delivery);
     }
 
     pub fn get(&self) -> Option<&PartTags> {
@@ -234,39 +253,12 @@ fn retag(text: &mut String, tag: u64) {
     }
 }
 
-/// The text a part holds, as stored: what `session.resolve` answers and what a character
-/// range indexes. Text, reasoning and text tool outputs give their text; a tool call gives
-/// its arguments, a JSON tool output its value, both as compact JSON; a denial or error gives
-/// its message; an encrypted reasoning block gives its opaque data.
+/// A text part's text, or any other part's complete stored encoding. Resolving a non-text
+/// part must preserve its metadata as well as its payload.
 pub fn part_text(block: &ContentBlock) -> String {
     match block {
-        ContentBlock::Text { text }
-        | ContentBlock::TextWithState { text, .. }
-        | ContentBlock::Reasoning { text, .. } => text.clone(),
-        ContentBlock::RedactedReasoning { data, .. } => data.clone(),
-        ContentBlock::ToolCall(call) => {
-            serde_json::to_string(&call.input).expect("a JSON value serializes")
-        }
-        ContentBlock::ToolResult(result) => match &result.output {
-            ToolOutput::Text { text } => text.clone(),
-            ToolOutput::Json { value } => {
-                serde_json::to_string(value).expect("a JSON value serializes")
-            }
-            ToolOutput::Denied { reason } => reason.clone(),
-            ToolOutput::Error { message } => message.clone(),
-        },
-    }
-}
-
-/// The kind of a part, as `session.resolve` names it.
-pub fn part_kind(block: &ContentBlock) -> &'static str {
-    match block {
-        ContentBlock::Text { .. } => "text",
-        ContentBlock::TextWithState { .. } => "text",
-        ContentBlock::Reasoning { .. } => "reasoning",
-        ContentBlock::RedactedReasoning { .. } => "redacted_reasoning",
-        ContentBlock::ToolCall(_) => "tool_call",
-        ContentBlock::ToolResult(_) => "tool_result",
+        ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => text.clone(),
+        _ => serde_json::to_string(block).expect("a stored content block serializes"),
     }
 }
 
@@ -278,6 +270,23 @@ pub fn part_key(ordinal: u64, index: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolve_non_text_content_preserves_the_stored_encoding() {
+        let block = super::ContentBlock::Reasoning {
+            text: "thought".into(),
+            signature: Some("signed".into()),
+        };
+        assert_eq!(
+            super::part_text(&block),
+            r#"{"type":"reasoning","text":"thought","signature":"signed"}"#
+        );
+        assert_eq!(
+            super::part_text(&super::ContentBlock::Text {
+                text: "héllo".into()
+            }),
+            "héllo"
+        );
+    }
     use super::*;
     use crate::content::{ToolCall, ToolResult};
     use crate::ids::ToolCallId;

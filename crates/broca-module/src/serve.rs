@@ -337,24 +337,32 @@ fn resolve_in_page(
     params: &broca_wire::ResolveParams,
 ) -> Option<Result<broca_wire::ResolveResponse, (&'static str, String)>> {
     page.messages.iter().find_map(|entry| {
-        let row = entry.tags.iter().find(|row| row.tag == params.tag)?;
+        let number = params.number().ok()?;
+        let row = entry
+            .tags
+            .iter()
+            .find(|row| row.tag.as_deref() == Some(params.tag.as_str()))?;
         let (index, _) = entry
             .message
             .part_tags()?
             .tagged()
-            .find(|(_, tag)| *tag == params.tag)?;
+            .find(|(_, tag)| *tag == number)?;
         let block = entry.message.content.get(index)?;
         let stored = broca_protocol::tags::part_text(block);
         Some(match broca_wire::resolve_range(&stored, params.range) {
-            Some(text) => Ok(broca_wire::ResolveResponse {
-                tag: params.tag,
-                part: row.part.clone(),
-                kind: broca_protocol::tags::part_kind(block).to_owned(),
-                text,
-                range: params.range,
-            }),
+            Some(text) => {
+                let mut reply = broca_wire::ResolveResponse::new(
+                    &params.tag,
+                    entry.ordinal,
+                    &entry.mid,
+                    &row.part,
+                    text,
+                );
+                reply.range = params.range;
+                Ok(reply)
+            }
             None => Err((
-                broca_wire::RANGE_OUT_OF_BOUNDS,
+                broca_wire::INVALID_PARAMS,
                 format!(
                     "range must lie within the part's {} characters",
                     stored.chars().count()
@@ -381,6 +389,13 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                delivered_as: message
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.delivery.as_ref())
+                    .map(|delivery| {
+                        cortexkit_role_llm_runner::delivery_order::EntryDelivery::new(delivery.mode)
+                    }),
                 ordinal: message.ordinal,
                 mid: format!("m{}", message.ordinal),
                 tags: broca_wire::tag_rows(message.ordinal, &message.message),
@@ -1051,7 +1066,16 @@ pub trait ServeHandler: Send + Sync {
         session: &LineageKey,
         params: &broca_wire::ResolveParams,
     ) -> Result<Result<broca_wire::ResolveResponse, (&'static str, String)>, ServeError> {
-        let location = self.tag_location(session, params.tag).await?;
+        let number = match params.number() {
+            Ok(number) => number,
+            Err(_) => {
+                return Ok(Err((
+                    broca_wire::INVALID_PARAMS,
+                    "tag must have the form §N§ for a positive integer N".into(),
+                )))
+            }
+        };
+        let location = self.tag_location(session, number).await?;
         let mut lineage_id = None;
         if let Some((ordinal, _)) = location.and_then(|location| location.found) {
             let page = self
@@ -1268,8 +1292,22 @@ impl crate::LineageRegistry {
         let ordinals: Vec<u64> = response
             .messages
             .iter()
-            .filter(|message| !calls_of(&message.message).is_empty())
-            .map(|message| message.ordinal)
+            .filter_map(|message| {
+                if message
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.delivery.as_ref())
+                    .is_some_and(|delivery| {
+                        delivery.mode == broca_protocol::DeliveryMode::ToolResult
+                    })
+                {
+                    message.ordinal.checked_sub(1)
+                } else if !calls_of(&message.message).is_empty() {
+                    Some(message.ordinal)
+                } else {
+                    None
+                }
+            })
             .collect();
         if ordinals.is_empty() {
             return Ok(());
@@ -1293,6 +1331,24 @@ impl crate::LineageRegistry {
             .tool_turn_dispatches(session, &lineage_id, tail, &ordinals, prompt_len)
             .await?;
         for message in &mut response.messages {
+            if let Some(carrier) = message
+                .run
+                .as_ref()
+                .and_then(|run| run.delivery.as_ref())
+                .and_then(|delivery| delivery.tool_call_id.as_ref())
+            {
+                if let Some(dispatch) = message
+                    .ordinal
+                    .checked_sub(1)
+                    .and_then(|ordinal| dispatches.get(&ordinal))
+                    .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
+                {
+                    if let Some(receipt) = &mut message.delivered_as {
+                        receipt.call_key =
+                            dispatch.intent_seq.map(|seq| format!("{lineage_id}:{seq}"));
+                    }
+                }
+            }
             let ids = calls_of(&message.message);
             if ids.is_empty() {
                 continue;
@@ -2034,7 +2090,7 @@ impl ServeHandler for crate::LineageRegistry {
             RunStatusResponse::Completed { .. } => ("completed".to_owned(), None, None),
             RunStatusResponse::MaxSteps { .. } => ("max_steps".to_owned(), None, None),
             RunStatusResponse::BudgetExhausted { .. } => (
-                cortexkit_role_llm_runner::run::RUN_STATE_BUDGET_EXHAUSTED.to_owned(),
+                cortexkit_role_llm_runner::run::states::BUDGET_EXHAUSTED.to_owned(),
                 None,
                 None,
             ),

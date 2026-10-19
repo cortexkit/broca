@@ -562,50 +562,20 @@ impl Delivery {
     }
 }
 
-/// One way a `session.send` whose `delivery` is an ordered list can reach the model. At each
-/// request boundary the runner takes the first mode in the list that is possible there; when none
-/// is, the send waits, durably queued, for a later boundary.
-///
-/// The wire spellings are exactly `"tool_result"`, `"turn_system"`, `"steer"` and
-/// `"idle_start"`; any other value fails to decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryMode {
-    /// Appended to a tool result of the running turn, the first time that result is sent.
-    /// Possible only when a tool batch has just finished with a text or error result to carry it,
-    /// and only for a send whose input is text.
-    ToolResult,
-    /// A turn-scoped system message. Only a sender's plan-declared template may use it, and this
-    /// build renders none, so the mode is never possible and the list falls through.
-    TurnSystem,
-    /// A user message into the run in progress, at its next step boundary.
-    Steer,
-    /// A user message that starts a run on an idle session.
-    IdleStart,
-}
-
-impl DeliveryMode {
-    /// The wire spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DeliveryMode::ToolResult => "tool_result",
-            DeliveryMode::TurnSystem => "turn_system",
-            DeliveryMode::Steer => "steer",
-            DeliveryMode::IdleStart => "idle_start",
-        }
-    }
-}
+pub use cortexkit_role_llm_runner::delivery_order::Mode as DeliveryMode;
 
 /// What a send using the `delivery_order` group asked for: its ordered modes, and optionally a
 /// key under which a newer send from the same sender replaces this one while it is undelivered,
 /// and a wall-clock time (Unix milliseconds) after which it is dropped undelivered.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryOrder {
     pub modes: Vec<DeliveryMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<cortexkit_role_llm_runner::delivery_order::TemplateUse>,
 }
 
 impl DeliveryOrder {
