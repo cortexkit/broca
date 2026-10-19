@@ -194,6 +194,18 @@ async fn a_tool_result_delivery_appends_to_exactly_one_result_and_resumes_identi
     inbox.seed_ordered(vec![ordered("sub-a", &[DeliveryMode::ToolResult])]);
     let Ran { model, records } = run("tool-result", Model::new(false), inbox.clone(), None).await;
 
+    // Checked first: the tool's stored output is never changed by a delivery.
+    for record in &records {
+        if let WalRecord::ToolResult { result, .. } = record {
+            assert_eq!(
+                result.output,
+                ToolOutput::Text {
+                    text: "done".into()
+                },
+                "the stored result keeps the tool's own output"
+            );
+        }
+    }
     let delivered = position(&records, |record| {
         matches!(record, WalRecord::SendDelivered { .. })
     });
@@ -219,17 +231,6 @@ async fn a_tool_result_delivery_appends_to_exactly_one_result_and_resumes_identi
         records[delivered + 1],
         WalRecord::TurnFinished { .. }
     ));
-    for record in &records {
-        if let WalRecord::ToolResult { result, .. } = record {
-            assert_eq!(
-                result.output,
-                ToolOutput::Text {
-                    text: "done".into()
-                },
-                "the stored result keeps the tool's own output"
-            );
-        }
-    }
     assert_eq!(
         records
             .iter()
