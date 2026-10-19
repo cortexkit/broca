@@ -3650,18 +3650,14 @@ fn two_episode_pinned_bytes() -> String {
 /// beside the encrypted reasoning.
 const SUMMARY_REASONING_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
 
-fn reasoning_summary_golden_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../broca-wire/tests/golden/session_read.reasoning_summary.json")
-}
-
-/// A stored OpenAI Responses reasoning item reads back with its summary text as a `reasoning`
-/// part just before the opaque `redacted_reasoning` part, while the WAL keeps the step's content
-/// exactly as the provider produced it.
+/// A stored OpenAI Responses reasoning item that carries summary text reads back as exactly the
+/// stored blocks, in both the transcript and the model view: no derived readable part is added.
+/// Consumers line part-level data up with stored block positions, and compaction views are
+/// built from the model view, so an inserted block would misplace every later part.
 #[tokio::test]
-async fn responses_reasoning_summary_read_response_bytes_are_pinned() {
-    let rig = Rig::new("reasoning-summary-pin", Arc::new(NoopExec));
-    let key = rig.key("pinned");
+async fn responses_reasoning_summary_reads_back_as_the_stored_blocks() {
+    let rig = Rig::new("reasoning-summary-stored", Arc::new(NoopExec));
+    let key = rig.key("stored");
     let stored = vec![
         ContentBlock::RedactedReasoning {
             data: SUMMARY_REASONING_ITEM.into(),
@@ -3683,18 +3679,32 @@ async fn responses_reasoning_summary_read_response_bytes_are_pinned() {
         &key,
         &[started(&key, "run-1", "question"), step, finished_ok()],
     );
+    let stored_wire = serde_json::to_value(&stored).unwrap();
 
     let page = rig
         .registry
         .read(read_request(&key, Some(0), Some(10)))
         .await
         .expect("session.read");
-    let bytes = serde_json::to_string(&page).expect("serialize session.read response");
-    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
-        std::fs::write(reasoning_summary_golden_path(), format!("{bytes}\n")).unwrap();
-    }
-    let pinned = std::fs::read_to_string(reasoning_summary_golden_path()).unwrap();
-    assert_eq!(bytes, pinned.trim_end_matches('\n'));
+    let transcript = serde_json::to_value(&page).expect("serialize session.read response");
+    assert_eq!(transcript["messages"][1]["message"]["content"], stored_wire);
+
+    let model = rig
+        .registry
+        .route_read_model_page(
+            &key,
+            &broca_core::ModelPageRequest {
+                from_ordinal: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("model view read");
+    let model = serde_json::to_value(
+        broca_wire::ModelPage::try_from(model).expect("model page reaches the wire"),
+    )
+    .unwrap();
+    assert_eq!(model["messages"][1]["message"]["content"], stored_wire);
 
     let records = rig.wal_store.read_records(&key).expect("read WAL");
     let durable = records

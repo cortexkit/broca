@@ -79,16 +79,8 @@ fn serialized_page_bytes(
     })
 }
 
-fn entry(mut message: Message) -> ModelEntry {
+fn entry(message: Message) -> ModelEntry {
     let ordinal = message.ordinal.expect("full prompt stamped");
-    // A reader of the model view sees an OpenAI Responses reasoning summary as readable
-    // reasoning, as it would Anthropic thinking. Added here, before page bytes are measured, so
-    // the byte budget counts it; the stored message and the provider request are unaffected.
-    if let Some(content) =
-        broca_protocol::content::with_readable_reasoning_summaries(&message.content)
-    {
-        message.content = content;
-    }
     ModelEntry {
         source: serde_json::json!({"kind":"message", "ordinal":ordinal, "mid": format!("m{ordinal}")}),
         message,
@@ -543,10 +535,11 @@ mod tests {
         assert!(bytes + 32 < 4_194_304, "the complete frame still fits");
     }
 
-    /// The model view shows an OpenAI Responses reasoning item's summary as a readable
-    /// `reasoning` block just before the opaque item, which stays byte-for-byte as stored.
+    /// The model view shows a summary-bearing OpenAI Responses reasoning item exactly as stored,
+    /// with no derived readable block: compaction views are built from these entries, and part
+    /// positions must match the stored block indices.
     #[test]
-    fn model_view_shows_responses_reasoning_summaries_beside_the_opaque_item() {
+    fn model_view_keeps_responses_reasoning_items_as_stored() {
         let item = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"first"},{"type":"summary_text","text":"second"}],"encrypted_content":"cipher"}"#;
         let opaque = ContentBlock::RedactedReasoning {
             data: item.into(),
@@ -565,16 +558,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            page.messages[0].message.content,
-            [
-                ContentBlock::Reasoning {
-                    text: "first\n\nsecond".into(),
-                    signature: None,
-                },
-                opaque,
-                answer,
-            ]
-        );
+        assert_eq!(page.messages[0].message.content, [opaque, answer]);
     }
 }

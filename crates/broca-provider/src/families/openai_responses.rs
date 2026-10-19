@@ -640,7 +640,7 @@ pub struct OpenAiResponsesNormalizer {
     saw_refusal: bool,
     reasoning_items: BTreeMap<u64, String>,
     /// The (output_index, summary_index) of the last reasoning-summary part shown on the display
-    /// lane, so the first delta of the next part starts on a new paragraph instead of running on.
+    /// lane, so the first delta of the next part starts after a blank line instead of running on.
     last_summary_part: Option<(u64, u64)>,
     tool_calls: BTreeMap<u64, ToolCallBuf>,
     usage: Usage,
@@ -821,6 +821,7 @@ impl OpenAiResponsesNormalizer {
             // deltas are, so a long reasoning phase visibly progresses before the answer. This is
             // display only: the durable record of the summary is the complete reasoning item kept
             // from `response.output_item.done`, which is echoed back to the provider unchanged.
+            // `session.read` returns only stored blocks, so it never shows a readable copy.
             "response.reasoning_summary_text.delta" => {
                 let delta = v.get("delta").and_then(Value::as_str).unwrap_or("");
                 if !delta.is_empty() {
@@ -830,7 +831,7 @@ impl OpenAiResponsesNormalizer {
                     );
                     let mut text = String::with_capacity(delta.len() + 2);
                     if self.last_summary_part.is_some_and(|last| last != part) {
-                        text.push_str(broca_protocol::content::REASONING_SUMMARY_PART_SEPARATOR);
+                        text.push_str("\n\n");
                     }
                     self.last_summary_part = Some(part);
                     text.push_str(delta);

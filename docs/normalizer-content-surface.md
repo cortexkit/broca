@@ -44,7 +44,7 @@ The ChatGPT/Codex variant (`openai_responses_chatgpt.rs`) wraps this normalizer 
 | `response.in_progress` | nothing — `response.output` is empty, `status: in_progress` | n/a | no handler; verified empty in both captured fixtures |
 | `error` / `response.failed` | error (control) | n/a | `openai_responses.rs:557` |
 | `response.content_part.added` / `.done` | a message content part | unread — redundant | no handler |
-| `response.reasoning_summary_text.delta` | reasoning summary fragment | read — display only: a `reasoning_delta` on the display lane, with a blank line before each new summary part; the durable copy is the raw reasoning item | `OpenAiResponsesNormalizer::handle_event` |
+| `response.reasoning_summary_text.delta` | reasoning summary fragment | read — display lane only: a `reasoning_delta`, with a blank line before each new summary part. Nothing is stored and `session.read` (transcript and model view) shows no readable copy; the durable copy is the raw reasoning item, returned only as its stored `redacted_reasoning` block | `OpenAiResponsesNormalizer::handle_event` |
 | `response.reasoning_summary_text.done`, `response.reasoning.delta` / `.done` | reasoning summary text | unread — the `reasoning` output item carries the complete summary | no handler |
 
 Notes on the two unread rows:

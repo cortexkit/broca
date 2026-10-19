@@ -330,8 +330,8 @@ fn legacy_frozen_configs_keep_pre_state_decode_and_render_bytes() {
     }
 }
 
-/// A Responses step whose reasoning item carries summary text: the live stream shows that text,
-/// and `session.read` shows it as a readable part, but neither changes what is stored or sent.
+/// A Responses step whose reasoning item carries summary text: the live stream shows that text
+/// on the display lane, but that changes neither what is stored nor what is sent back.
 /// The step is decoded by the real normalizer, framed into the WAL, replayed, and rendered; the
 /// stored block must be the provider's raw item and the rebuilt request must echo it unchanged,
 /// for both the stateless (`store: false`) and the legacy continuation shapes.
