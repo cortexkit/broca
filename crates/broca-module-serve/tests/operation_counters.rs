@@ -197,12 +197,15 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         FrameType::Response
     );
 
+    // A cancel always goes through the registry's actor opening, which this rig refuses on
+    // purpose. `run.status` no longer does: a never-written session answers `idle` from its
+    // (absent) log without opening an actor.
     write_request(
         &mut client_writer,
         7,
         1,
         4,
-        serde_json::json!({"method": "run.status", "params": {}}),
+        serde_json::json!({"method": "run.cancel", "params": {"run_id": "no-such-run"}}),
     )
     .await;
     assert_eq!(
