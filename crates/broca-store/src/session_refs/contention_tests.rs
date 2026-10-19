@@ -148,8 +148,6 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
         .contains_key(&reference));
 }
 
-// Profile callbacks bracket statements without changing the normal busy handler.
-
 #[test]
 fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
     let mut output = String::new();
