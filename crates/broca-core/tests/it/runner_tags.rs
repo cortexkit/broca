@@ -12,7 +12,7 @@ use broca_core::{
 };
 use broca_protocol::{
     caller::RunFinishReason,
-    content::{AssistantMessage, ContentBlock, Message, Role, ToolCall},
+    content::{AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput},
     provider::{NormalizedEvent, ProviderControl},
     request::Tool,
     tags::render_tags_into,
@@ -160,20 +160,26 @@ async fn run(name: &str, render_tags: bool) -> Run {
     }
 }
 
+/// The payload of one part as a provider renders it: a text's text, a tool call's arguments as
+/// compact JSON, and a text tool result's text. This is where a rendered tag shows. It is not
+/// `broca_protocol::tags::part_text`, which gives `session.resolve`'s complete stored encoding
+/// of every non-text part (ids, kind and flags included).
+fn payload(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::ToolCall(call) => call.input.to_string(),
+        ContentBlock::ToolResult(result) => match &result.output {
+            ToolOutput::Text { text } => text.clone(),
+            other => panic!("the scripted tool answers with text, not {other:?}"),
+        },
+        other => broca_protocol::tags::part_text(other),
+    }
+}
+
 fn texts(messages: &[Message]) -> Vec<(Role, Vec<String>)> {
     messages
         .iter()
         .filter(|message| message.role != Role::System)
-        .map(|message| {
-            (
-                message.role,
-                message
-                    .content
-                    .iter()
-                    .map(broca_protocol::tags::part_text)
-                    .collect(),
-            )
-        })
+        .map(|message| (message.role, message.content.iter().map(payload).collect()))
         .collect()
 }
 

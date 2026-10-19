@@ -1091,9 +1091,37 @@ impl BrocaSubject {
 
     /// Whether `session`'s WAL holds exactly the durable state `point` names: what must be
     /// there, and nothing the next step would have written.
+    ///
+    /// For a point in a run's tool loop the counts are of the cut run alone: the records from
+    /// the session's last `RunStarted` on. A scenario may run earlier turns on the same session
+    /// first (the StepRecorded crash case runs one finished turn to read its lineage before the
+    /// kill), and those runs must each have ended before the cut one started. The compaction
+    /// points keep counting the whole WAL, as their scenarios run one turn per session.
     fn holds_point(&self, live: &Live, session: &str, point: &str) -> Result<(), String> {
         use broca_wal::WalRecord as R;
-        let records = self.records(live, session);
+        let all = self.records(live, session);
+        let current = if [points::FOLD_RECORDED, points::COMPACTION_APPLIED].contains(&point) {
+            0
+        } else {
+            all.iter()
+                .rposition(|r| matches!(r, R::RunStarted { .. }))
+                .unwrap_or(0)
+        };
+        let (earlier, records) = all.split_at(current);
+        let earlier_started = earlier
+            .iter()
+            .filter(|r| matches!(r, R::RunStarted { .. }))
+            .count();
+        let earlier_finished = earlier
+            .iter()
+            .filter(|r| matches!(r, R::RunFinished { .. }))
+            .count();
+        if earlier_started != earlier_finished {
+            return Err(format!(
+                "session {session}'s WAL holds an earlier run that never finished before the one \
+                 cut at {point}: {earlier_started} RunStarted, {earlier_finished} RunFinished"
+            ));
+        }
         let count = |want: fn(&R) -> bool| records.iter().filter(|r| want(r)).count();
         let started = count(|r| matches!(r, R::RunStarted { .. }));
         let steps = count(|r| matches!(r, R::ModelStepFinished { .. }));
@@ -1138,8 +1166,9 @@ impl BrocaSubject {
             Ok(())
         } else {
             Err(format!(
-                "session {session}'s WAL does not hold the state {point} names: {started} RunStarted, \
-                 {steps} steps, {intents} intents, {results} results, {finished} RunFinished"
+                "session {session}'s WAL does not hold the state {point} names in its last run \
+                 ({earlier_started} earlier finished runs): {started} RunStarted, {steps} steps, \
+                 {intents} intents, {results} results, {finished} RunFinished"
             ))
         }
     }
