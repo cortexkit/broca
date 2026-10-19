@@ -184,15 +184,34 @@ pub fn atomic_json(state_root: &Path, path: &Path, value: &impl Serialize) -> io
         .parent()
         .ok_or_else(|| invalid("cut path has no parent"))?;
     durable_dir(state_root, parent)?;
-    let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(value).map_err(invalid)?;
-    let publication = fence_index::before(state_root, path, &bytes)?;
+    publish_json_bytes(state_root, path, parent, &bytes)
+}
+
+/// Atomically publish pre-serialized JSON without changing its source bytes.
+pub fn atomic_json_bytes(state_root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("cut path has no parent"))?;
+    durable_dir(state_root, parent)?;
+    let _: Value = serde_json::from_slice(bytes).map_err(invalid)?;
+    publish_json_bytes(state_root, path, parent, bytes)
+}
+
+fn publish_json_bytes(
+    state_root: &Path,
+    path: &Path,
+    parent: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let publication = fence_index::before(state_root, path, bytes)?;
+    let temp = path.with_extension("json.tmp");
     let mut file = broca_owner_only::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(&temp)?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temp, path)?;
     sync_dir(parent)?;
