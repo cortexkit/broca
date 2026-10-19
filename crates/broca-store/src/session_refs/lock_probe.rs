@@ -47,9 +47,9 @@ pub(super) fn message(message: &str) {
     writeln!(probe.errors, "at_us={now} {message}").unwrap();
 }
 
-// Trace runs before sqlite3_step; profile runs after it, even for failed BEGINs.
-// BEGIN..COMMIT timestamps expose starvation between short successive writers.
-pub(super) fn event(connection: usize, done: bool, sql: &str, _: Duration) {
+// Installing SQLite's legacy profile callback replaces its trace callback. Use
+// profile alone, reconstructing statement start from its millisecond duration.
+pub(super) fn event(connection: usize, sql: &str, elapsed: Duration) {
     use std::fmt::Write;
     let mut probe = probe().lock().unwrap();
     let now = probe.start.elapsed().as_micros();
@@ -59,29 +59,21 @@ pub(super) fn event(connection: usize, done: bool, sql: &str, _: Duration) {
         .iter()
         .any(|prefix| sql.starts_with(prefix));
     if sql.starts_with("BEGIN") {
-        if done {
-            if sql.starts_with("BEGIN IMMEDIATE") {
-                state.acquired_us = Some(now);
-            }
-        } else {
-            state.begin_us = Some(now);
-            state.acquired_us = None;
-            state.implicit = false;
-        }
+        state.begin_us = Some(now.saturating_sub(elapsed.as_micros()));
+        state.acquired_us = sql.starts_with("BEGIN IMMEDIATE").then_some(now);
+        state.implicit = false;
     } else if write {
-        if !done && state.begin_us.is_none() {
-            state.begin_us = Some(now);
+        if state.begin_us.is_none() {
+            state.begin_us = Some(now.saturating_sub(elapsed.as_micros()));
             state.implicit = true;
         }
         // Deferred and implicit transactions acquire during their first DML.
         // Its completion is an upper bound on acquisition, not a lock wait.
-        if done && state.acquired_us.is_none() {
+        if state.acquired_us.is_none() {
             state.acquired_us = Some(now);
         }
     }
-    if done
-        && (sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK") || (write && state.implicit))
-    {
+    if sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK") || (write && state.implicit) {
         if let Some(begin) = state.begin_us.take() {
             let acquired = state.acquired_us.take().unwrap_or(begin);
             let hold = now - acquired;
@@ -109,10 +101,14 @@ pub(super) fn report(iteration: usize, panicked: bool) -> String {
     let probe = probe().lock().unwrap();
     let mut report = format!("CENSUS_LOCK_PROBE iteration={iteration} panicked={panicked}\n");
     for (name, state) in ["census", "serving"].into_iter().zip(&probe.connections) {
+        assert!(
+            state.transactions > 0,
+            "{name}: profile must observe transactions"
+        );
         writeln!(report, "conn={name} tx={} max_hold_lower_bound_us={} max_transaction_span_us={} max_first_statement_or_wait_us={} unfinished_begin_us={:?} unfinished_acquired_us={:?}", state.transactions, state.max_hold_us, state.max_span_us, state.max_wait_us, state.begin_us, state.acquired_us).unwrap();
     }
     report.push_str(&probe.errors);
-    report.push_str("timeline C=census S=serving; triples=begin,acquired,release in monotonic ms; acquisition for deferred/autocommit is first-DML completion\n");
+    report.push_str("timeline C=census S=serving; triples=begin,acquired,release in monotonic ms; begin reconstructed from profile duration (+/-1ms), deferred/autocommit acquisition is first-DML completion\n");
     if probe.timeline.len() <= 7500 {
         report.push_str(&probe.timeline);
     } else {

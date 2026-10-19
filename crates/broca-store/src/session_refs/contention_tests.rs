@@ -148,8 +148,7 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
         .contains_key(&reference));
 }
 
-// SQLite trace/profile callbacks bracket statements on the serving and census
-// connections. Leave the busy handler unchanged so its normal lock waits remain visible.
+// Profile callbacks bracket statements without changing the normal busy handler.
 
 #[test]
 fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
@@ -171,6 +170,8 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
         #[cfg(not(windows))]
         result.unwrap();
     }
+    #[cfg(not(windows))]
+    eprintln!("{output}");
     // A deliberately red Windows probe exposes timelines even when every scenario passes.
     #[cfg(windows)]
     panic!("{output}");
@@ -180,12 +181,7 @@ fn census_writer_scenario() {
     let (root, store) = fixture("writers");
     {
         let mut conn = store.conn.lock().unwrap();
-        conn.trace(Some(|sql| {
-            lock_probe::event(1, false, sql, std::time::Duration::ZERO)
-        }));
-        conn.profile(Some(|sql, elapsed| {
-            lock_probe::event(1, true, sql, elapsed)
-        }));
+        conn.profile(Some(|sql, elapsed| lock_probe::event(1, sql, elapsed)));
     }
     let index = Arc::new(CountingIndex {
         store: store.clone(),
@@ -197,12 +193,7 @@ fn census_writer_scenario() {
     let census_root = root.clone();
     let migration = std::thread::spawn(move || {
         let mut conn = census_connection(&census_root.join("run-index.db"));
-        conn.trace(Some(|sql| {
-            lock_probe::event(0, false, sql, std::time::Duration::ZERO)
-        }));
-        conn.profile(Some(|sql, elapsed| {
-            lock_probe::event(0, true, sql, elapsed)
-        }));
+        conn.profile(Some(|sql, elapsed| lock_probe::event(0, sql, elapsed)));
         batches::AFTER_WRITE_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 lock_probe::message("census AFTER_WRITE_HOOK send (after commit)");
