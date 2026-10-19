@@ -241,8 +241,9 @@ impl Fetcher for Answering<'_> {
         Ok(json!({"subscriptions": step.subscriptions}))
     }
 
-    /// Every compaction provider these tests name serves the role; the real-daemon tests below
-    /// ask a real provider instead.
+    /// Every compaction provider these tests name answers with the synchronous op set, which the
+    /// published role no longer accepts, so a plan that reaches this describe is refused. The
+    /// real-daemon tests below ask a real provider instead.
     async fn describe_compaction(&self, provider: &str) -> Result<DescribeAnswer, FetchError> {
         self.admitter
             .calls
@@ -1953,36 +1954,6 @@ async fn reader_refuses_frozen_step_transform_session_without_plan() {
     rig.finish().await;
 }
 
-struct CompactionScript {
-    requests: Arc<Mutex<Vec<Value>>>,
-    answers: Arc<Mutex<std::collections::VecDeque<Value>>>,
-}
-
-#[async_trait]
-impl subc_client_rs::ModuleHandler for CompactionScript {
-    async fn handle(
-        &self,
-        _: subc_client_rs::RequestCtx,
-        body: Vec<u8>,
-    ) -> subc_client_rs::HandlerOutcome {
-        let request: Value = serde_json::from_slice(&body).unwrap();
-        let answer = if request["method"] == "role.describe" {
-            json!({"majors":[{"version":"compaction-provider/v1", "ops":["role.describe","compaction.setup","compaction.step"], "stability":"alpha"}], "implementation_version":"0.0.0-test", "capabilities":[]})
-        } else {
-            self.requests.lock().unwrap().push(request.clone());
-            let mut answer = self
-                .answers
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| json!({"answer":"noop"}));
-            answer["request_id"] = request["params"]["request_id"].clone();
-            answer
-        };
-        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
-    }
-}
-
 fn compaction_only_plan(provider: &str) -> Value {
     let composition = json!({"providers":[{"provider":provider,"tools":[]}],
         "compaction":{"provider":provider}, "step_transform_items":[]});
@@ -2041,206 +2012,6 @@ async fn compaction_daemon(
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     (daemon, connection)
-}
-
-async fn apply_scripted_compaction(
-    tag: &str,
-    coverage: Option<Value>,
-    applied_text: &str,
-) -> Result<(Vec<u8>, Value), Value> {
-    use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
-    let (mut rig, _) = plan_rig(tag).await;
-    let (mut daemon, connection) = compaction_daemon(&rig.dir, json!({})).await;
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let initial = json!({"compaction_id":"coverage", "version":1, "range":{"from":0,"to":0},
-        "replacement":[{"role":"user", "content":[{"type":"text","text":"initial head"}]}]});
-    let mut applied = json!({"answer":"compaction_message", "compaction": {
-        "compaction_id":"coverage", "version":2, "range":{"from":0,"to":1},
-        "replacement":[{"role":"user", "content":[{"type":"text","text":applied_text}]}]
-    }});
-    if let Some(coverage) = coverage {
-        applied["coverage"] = coverage;
-    }
-    let answers = Arc::new(Mutex::new(std::collections::VecDeque::from([
-        json!({"answer":"ready", "initial":initial}),
-        applied,
-    ])));
-    let (_, serving) = subc_client_rs::serve_with_handle(
-        &connection,
-        ModuleManifest::builder("scripted-compaction", env!("CARGO_PKG_VERSION"))
-            .provides(vec![ProviderRole::ToolProvider {
-                tools: vec![],
-                identity_scope: vec![],
-                concurrency: Concurrency::ModuleManaged,
-                emits_push: false,
-                sub_supervises: false,
-            }])
-            .build(),
-        CompactionScript {
-            requests: requests.clone(),
-            answers,
-        },
-    )
-    .await
-    .unwrap();
-    let provider = tokio::spawn(serving);
-    let conn = Arc::new(
-        broca_subc::SubcConnection::connect(&connection)
-            .await
-            .unwrap(),
-    );
-    rig.set_compaction_plane(Arc::new(broca_subc::SubcCompactionPlane::new(conn)));
-    rig.script.hold_model(true);
-    let plan = compaction_only_plan("scripted-compaction");
-    let send = send_plan(&mut rig, 7, "apply", "raw user", Some(&plan), json!({})).await;
-    assert_eq!(
-        send.header.ty,
-        FrameType::Response,
-        "{}",
-        String::from_utf8_lossy(&send.body)
-    );
-    rig.wait_entered().await;
-    let described = rig
-        .request(7, json!({"method":"role.describe","params":{}}))
-        .await;
-    assert!(
-        cortexkit_role_llm_runner::describe::check_describe(&result(&described))
-            .unwrap()
-            .declares("compaction")
-    );
-    let page_reply = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"view":"model"}}),
-        )
-        .await;
-    if page_reply.header.ty == FrameType::Error {
-        let refusal = error_body(&page_reply);
-        rig.script.hold_model(false);
-        rig.wait_for_finished(1).await;
-        rig.finish().await;
-        provider.abort();
-        daemon.kill().await.unwrap();
-        daemon.wait().await.unwrap();
-        return Err(refusal);
-    }
-    let page = result(&page_reply);
-    assert_eq!(page["compaction_id"], "coverage");
-    assert_eq!(page["version"], 2);
-    assert_eq!(
-        page["messages"][0]["message"]["content"][0]["text"],
-        "applied head"
-    );
-    let prompt = serde_json::to_value(&rig.script.prompts.lock().unwrap()[0]).unwrap();
-    assert_eq!(
-        page["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["message"].clone())
-            .collect::<Vec<_>>(),
-        prompt.as_array().unwrap().clone()
-    );
-    let invalid = rig
-        .request(
-            7,
-            json!({"method":"session.read", "params":{"view":"model","after_mid":"m0"}}),
-        )
-        .await;
-    assert_eq!(error_body(&invalid)["detail"]["field"], "view");
-    let mut record = serde_json::to_value(
-        rig.records()
-            .into_iter()
-            .find(|r| {
-                matches!(
-                    r,
-                    WalRecord::CompactionMessage {
-                        kind: broca_wal::CompactionMessageKind::Step,
-                        ..
-                    }
-                )
-            })
-            .unwrap(),
-    )
-    .unwrap();
-    record["request_id"] = json!("@REQUEST_ID@");
-    record["cursor"]["lineage_id"] = json!("@LINEAGE_ID@");
-    let calls = requests.lock().unwrap().clone();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0]["method"], "compaction.setup");
-    assert_eq!(calls[0]["params"]["harness"], "runner");
-    assert_eq!(calls[1]["method"], "compaction.step");
-    rig.script.hold_model(false);
-    rig.wait_for_finished(1).await;
-    rig.finish().await;
-    provider.abort();
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-    Ok((
-        serde_json::to_vec(&record).unwrap(),
-        page["messages"].clone(),
-    ))
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_daemon_compaction_apply_mid_turn_model_view_and_coverage_ignore() {
-    if !subc_core_bin().exists() {
-        assert!(
-            std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
-            "real daemon required: {:?} is missing",
-            subc_core_bin()
-        );
-        println!(
-            "SKIP real_daemon_compaction_apply: {:?} is missing",
-            subc_core_bin()
-        );
-        return;
-    }
-    let without = apply_scripted_compaction("compaction-no-coverage", None, "applied head")
-        .await
-        .unwrap();
-    let with = apply_scripted_compaction(
-        "compaction-with-coverage",
-        Some(json!({"ordinal":0,"end_mid":"m0"})),
-        "applied head",
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        with, without,
-        "the optional trim hint changes neither durable view bytes nor model input"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_daemon_model_view_refuses_a_group_that_cannot_fit_one_frame() {
-    if !subc_core_bin().exists() {
-        assert!(
-            std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
-            "real daemon required: {:?} is missing",
-            subc_core_bin()
-        );
-        println!(
-            "SKIP real_daemon_model_view_refuses_a_group: {:?} is missing",
-            subc_core_bin()
-        );
-        return;
-    }
-
-    let oversized = "x".repeat(4_194_000);
-    let refusal = apply_scripted_compaction("model-view-over-frame", None, &oversized)
-        .await
-        .unwrap_err();
-    assert_eq!(refusal["code"], broca_wire::REPLY_TOO_LARGE);
-    assert!(refusal["detail"]["bytes"].as_u64().unwrap() > broca_wire::SUBC_MAX_FRAME_BYTES);
-    assert_eq!(refusal["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
-    // llm-runner 0.2.3's typed detail: the subject names the model-view group by its source.
-    let subject = &refusal["detail"]["subject"];
-    assert_eq!(subject["kind"], "model_group");
-    assert_eq!(subject["source"]["kind"], "replacement");
-    assert_eq!(subject["source"]["from_ordinal"], 0);
-    assert_eq!(subject["source"]["to_ordinal"], 1);
-    assert!(subject["source"]["compaction_id"].is_string());
 }
 
 /// The module a compaction-admission test names as the plan's compaction provider.
@@ -2533,44 +2304,32 @@ async fn real_daemon_reports_a_transient_compaction_describe_as_fetch_unavailabl
     real.finish().await;
 }
 
-/// A plan repeating its compaction provider in the composition is admitted unchanged.
-/// Admission asks only `role.describe`; `compaction.setup` runs after the plan is recorded.
+/// A provider that describes the synchronous compaction op set (`compaction.setup` and
+/// `compaction.step`) does not serve the published `compaction-provider/v1`, which also requires
+/// `view.get` and `compaction.ride`. Admission refuses it permanently, naming each missing op,
+/// after asking only `role.describe` and before any WAL byte, lineage file or Setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_daemon_admits_a_declaring_compaction_provider_and_runs_setup() {
+async fn real_daemon_refuses_a_provider_describing_the_synchronous_compaction_ops_before_writing() {
     let describe = json!({"majors": [{"version": "compaction-provider/v1",
         "ops": ["role.describe", "compaction.setup", "compaction.step"], "stability": "alpha"}],
         "implementation_version": "0.0.0-test", "capabilities": []});
-    let Some(mut real) =
-        RealCompactionAdmission::start("compaction-role-served", DescribeReply::Answer(describe))
-            .await
+    let Some(mut real) = RealCompactionAdmission::start(
+        "compaction-synchronous-ops",
+        DescribeReply::Answer(describe),
+    )
+    .await
     else {
         return;
     };
-    real.rig.script.push(&[Step::Text("done")]);
     let plan = compaction_only_plan(ADMISSION_COMPACTION);
     let frame = send_plan(&mut real.rig, 7, "turn-1", "hi", Some(&plan), json!({})).await;
-    result(&frame);
-    let records = real.rig.wait_for_finished(1).await;
-    let started = run_started(&records);
-    let frozen: Value = serde_json::from_str(manifest_of(started[0]).plan.as_json_text()).unwrap();
-    assert_eq!(frozen, plan);
+    error_body(&frame);
     assert_eq!(
-        manifest_of(started[0])
-            .role_versions
-            .get("compaction-provider")
-            .map(String::as_str),
-        Some("v1")
+        String::from_utf8(frame.body).unwrap(),
+        r#"{"code":"invalid_params","message":"compaction provider admission-compaction does not serve compaction-provider/v1","detail":{"field":"plan.compaction_item","problems":[{"op":"view.get","problem":"missing_op"},{"op":"compaction.ride","problem":"missing_op"}],"provider":"admission-compaction"}}"#
     );
-    let methods = real.methods();
-    assert_eq!(methods[0], "role.describe", "admission describes first");
-    assert_eq!(
-        methods
-            .iter()
-            .filter(|method| *method == "compaction.setup")
-            .count(),
-        1,
-        "{methods:?}"
-    );
+    real.assert_refused_before_writing();
+    assert_eq!(real.methods(), ["role.describe"]);
     real.assert_compaction_routes_only();
     real.finish().await;
 }
