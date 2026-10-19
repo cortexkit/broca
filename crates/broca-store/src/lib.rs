@@ -378,6 +378,12 @@ fn parse_meta_identity(raw: &str) -> Result<BindIdentity, WalManifestRebuildErro
 #[cfg(test)]
 thread_local! {
     static SQLITE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROJECTION_AFTER_STATE_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_after_state_read_hook(hook: impl FnOnce() + 'static) {
+    PROJECTION_AFTER_STATE_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 fn sqlite_open_observed() {
@@ -1336,6 +1342,12 @@ impl SqliteStore {
         // bypassing the busy timeout even for a short migration transaction.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current_state = current_projection_state(&tx, key)?;
+        #[cfg(test)]
+        PROJECTION_AFTER_STATE_READ_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         let conflict = {
             let expected_state = plan.expected_state();
             current_state.0 != expected_state.0 || current_state.1.as_deref() != expected_state.1

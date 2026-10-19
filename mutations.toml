@@ -17034,7 +17034,7 @@ package = "broca-store"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
-expect_red = ["session_refs::contention_tests::census_with_ref_projection_and_export_writers_has_no_failures_or_markers"]
+expect_red = ["session_refs::contention_tests::projection_commit_reserves_writer_before_reading_state"]
 file = "crates/broca-store/src/lib.rs"
 old = '''let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current_state = current_projection_state(&tx, key)?;'''

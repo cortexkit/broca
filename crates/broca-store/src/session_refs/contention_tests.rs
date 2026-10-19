@@ -1,6 +1,7 @@
 use super::*;
 use broca_core::{ExportIndex, RunIndex, RunIndexRow, RunIndexState, WalStore};
 use broca_protocol::{ModelHandle, RunFinishReason, RunId, Usage};
+use rusqlite::Connection;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc, Barrier,
@@ -58,6 +59,22 @@ fn census_connection(path: &std::path::Path) -> Connection {
 fn receive<T>(rx: &mpsc::Receiver<T>, event: &str) -> T {
     rx.recv_timeout(broca_test_support::EVENT_HANG_GUARD)
         .unwrap_or_else(|_| panic!("timed out waiting for {event}"))
+}
+
+thread_local! {
+    static PROJECTION_WRITER_BUSY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn projection_writer_busy_handler(attempt: i32) -> bool {
+    if attempt == 0 {
+        PROJECTION_WRITER_BUSY_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    true
 }
 
 #[test]
@@ -317,6 +334,98 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
             )
             .unwrap()
             .complete
+    );
+}
+
+#[test]
+fn projection_commit_reserves_writer_before_reading_state() {
+    #[derive(Debug)]
+    enum WriterEvent {
+        Waiting,
+        Committed,
+    }
+
+    let (root, store) = fixture("projection-reservation");
+    let database = root.join("run-index.db");
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE projection_writer_gate (id INTEGER PRIMARY KEY);")
+        .unwrap();
+
+    let session = BindIdentity::new("/project/race", "broca", "projection-race");
+    let run = RunId("projection-race-run".into());
+    let mut records = vec![crate::conformance::run_started(
+        0,
+        &run.0,
+        &session,
+        "hello",
+        ModelHandle::new("stub", "model"),
+    )];
+    records.extend(crate::conformance::text_turn(1, 0, "reply"));
+
+    let (snapshot_ready_tx, snapshot_ready_rx) = mpsc::channel();
+    let (projection_continue_tx, projection_continue_rx) = mpsc::channel();
+    let projection_store = store.clone();
+    let projection = std::thread::spawn(move || {
+        crate::set_projection_after_state_read_hook(move || {
+            snapshot_ready_tx.send(()).unwrap();
+            receive(&projection_continue_rx, "projection commit to continue");
+        });
+        projection_store.project(&session, &records)
+    });
+    receive(&snapshot_ready_rx, "projection state snapshot");
+
+    let (writer_event_tx, writer_event_rx) = mpsc::channel();
+    let (writer_continue_tx, writer_continue_rx) = mpsc::channel();
+    let writer_database = database.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = Connection::open(writer_database).unwrap();
+        let blocked_event_tx = writer_event_tx.clone();
+        PROJECTION_WRITER_BUSY_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                blocked_event_tx.send(WriterEvent::Waiting).unwrap();
+                receive(&writer_continue_rx, "projection writer to retry");
+            }));
+        });
+        conn.busy_handler(Some(projection_writer_busy_handler))
+            .unwrap();
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO projection_writer_gate DEFAULT VALUES;
+             COMMIT;",
+        )
+        .unwrap();
+        writer_event_tx.send(WriterEvent::Committed).unwrap();
+    });
+
+    let first_writer_event = receive(&writer_event_rx, "writer wait or commit");
+    let writer_waited = matches!(first_writer_event, WriterEvent::Waiting);
+    if writer_waited {
+        writer_continue_tx.send(()).unwrap();
+    }
+    projection_continue_tx.send(()).unwrap();
+
+    let projection_result = projection.join().unwrap();
+    writer.join().unwrap();
+    if writer_waited {
+        projection_result.expect("projection and the waiting writer must both commit");
+    } else {
+        assert!(
+            matches!(
+                projection_result,
+                Err(crate::StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    error,
+                    _
+                ))) if error.code == rusqlite::ffi::ErrorCode::DatabaseBusy
+            ),
+            "a deferred projection upgrade after a committed writer must report SQLITE_BUSY_SNAPSHOT"
+        );
+    }
+    assert!(
+        writer_waited,
+        "the other writer must wait until projection commits"
     );
 }
 
