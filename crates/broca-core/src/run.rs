@@ -9446,7 +9446,6 @@ mod tests {
 
         let store = Arc::new(CapturingProjectionStore::default());
         let warnings_before = projection_failures();
-        let behind_before = projection_behind_sessions();
         project_committed(
             &wal_store,
             store.clone() as Arc<dyn SessionStore>,
@@ -9463,7 +9462,7 @@ mod tests {
         );
         assert!(store.projected_seqs.lock().unwrap().is_empty());
         assert!(projection_failures() > warnings_before);
-        assert_eq!(projection_behind_sessions(), behind_before + 1);
+        assert!(crate::projection_health::is_behind(&session));
         project_committed(
             &ReadableWalStore,
             Arc::new(CapturingProjectionStore::default()) as Arc<dyn SessionStore>,
@@ -9472,7 +9471,7 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(projection_behind_sessions(), behind_before);
+        assert!(!crate::projection_health::is_behind(&session));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9508,13 +9507,13 @@ mod tests {
     #[tokio::test]
     async fn projection_failure_then_success_clears_behind_but_keeps_lifetime_count() {
         let _counter = PROJECTION_COUNTER_LOCK.lock().await;
-        PROJECTION_WARNING_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-        let session = BindIdentity::new("/tmp/project", "runner", "session");
-        let behind_before = projection_behind_sessions();
+        let failures_before = projection_failures();
+        let session = BindIdentity::new("/tmp/project", "runner", "projection-recovery");
 
         let (projector, pending) = projection_channel();
         projector.enqueue(1);
         let task_session = session.clone();
+        let task_session_probe = session.clone();
         let task = tokio::spawn(async move {
             projector_task(
                 &ReadableWalStore,
@@ -9525,7 +9524,7 @@ mod tests {
             .await;
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while projection_failures() == 0 {
+            while !crate::projection_health::is_behind(&task_session_probe) {
                 tokio::task::yield_now().await;
             }
         })
@@ -9536,14 +9535,15 @@ mod tests {
 
         // This retry succeeds: health no longer reports the session behind, while the lifetime
         // projection_failures metric still records the original failed attempt.
-        assert_eq!(
-            super::projection_failures(),
-            1,
+        // Other tests project in parallel, so the process-wide counters only ever prove a lower
+        // bound; this session's own membership is exact.
+        let failures_after_failure = super::projection_failures();
+        assert!(
+            failures_after_failure > failures_before,
             "a failing projection must be visible to operators"
         );
-        assert_eq!(
-            projection_behind_sessions(),
-            behind_before + 1,
+        assert!(
+            crate::projection_health::is_behind(&session),
             "the failed session is still behind"
         );
 
@@ -9555,14 +9555,12 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(
-            projection_failures(),
-            1,
+        assert!(
+            projection_failures() >= failures_after_failure,
             "recovery preserves the process-lifetime failure count"
         );
-        assert_eq!(
-            projection_behind_sessions(),
-            behind_before,
+        assert!(
+            !crate::projection_health::is_behind(&session),
             "successful projection clears the session's recovery debt"
         );
     }
@@ -9571,7 +9569,6 @@ mod tests {
     async fn two_projection_failures_with_one_recovery_leave_one_session_behind() {
         let _counter = PROJECTION_COUNTER_LOCK.lock().await;
         let failures_before = projection_failures();
-        let behind_before = projection_behind_sessions();
         let first = BindIdentity::new("/tmp/project", "runner", "health-first");
         let second = BindIdentity::new("/tmp/project", "runner", "health-second");
 
@@ -9585,8 +9582,10 @@ mod tests {
             )
             .await;
         }
-        assert_eq!(projection_failures(), failures_before + 2);
-        assert_eq!(projection_behind_sessions(), behind_before + 2);
+        let failures_after = projection_failures();
+        assert!(failures_after >= failures_before + 2);
+        assert!(crate::projection_health::is_behind(&first));
+        assert!(crate::projection_health::is_behind(&second));
 
         project_committed(
             &ReadableWalStore,
@@ -9596,10 +9595,10 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(projection_failures(), failures_before + 2);
-        assert_eq!(
-            projection_behind_sessions(),
-            behind_before + 1,
+        assert!(projection_failures() >= failures_after);
+        assert!(!crate::projection_health::is_behind(&first));
+        assert!(
+            crate::projection_health::is_behind(&second),
             "recovering one session leaves the other session's debt intact"
         );
 
@@ -9612,7 +9611,7 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(projection_behind_sessions(), behind_before);
+        assert!(!crate::projection_health::is_behind(&second));
     }
 
     struct CancellationProbeProvider {

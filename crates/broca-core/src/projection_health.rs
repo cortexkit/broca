@@ -25,3 +25,10 @@ pub(crate) fn record_success(session: &BindIdentity) {
 pub(crate) fn behind_sessions() -> u64 {
     behind().lock().unwrap().len() as u64
 }
+
+/// Whether this one session is behind. Tests assert on their own session through this, because
+/// the process-wide count also moves with every other test that projects in parallel.
+#[cfg(test)]
+pub(crate) fn is_behind(session: &BindIdentity) -> bool {
+    behind().lock().unwrap().contains(session)
+}
