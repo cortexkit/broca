@@ -145,9 +145,40 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
         .contains_key(&reference));
 }
 
+// SQLite trace/profile callbacks bracket statements on the serving and census
+// connections. Leave the busy handler unchanged so its normal lock waits remain visible.
+fn lock_probe(connection: &str, event: &str, sql: &str, elapsed: std::time::Duration) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed();
+    let sql = sql.trim_start();
+    if [
+        "BEGIN", "COMMIT", "ROLLBACK", "INSERT", "UPDATE", "DELETE", "PRAGMA",
+    ]
+    .iter()
+    .any(|prefix| sql.starts_with(prefix))
+    {
+        eprintln!(
+            "CENSUS_LOCK_PROBE t_us={} conn={connection} thread={:?} event={event} elapsed_us={} sql={}",
+            now.as_micros(),
+            std::thread::current().id(),
+            elapsed.as_micros(),
+            sql.chars().take(160).collect::<String>().replace('\n', " "),
+        );
+    }
+}
+
 #[test]
 fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
     let (root, store) = fixture("writers");
+    {
+        let mut conn = store.conn.lock().unwrap();
+        conn.trace(Some(|sql| {
+            lock_probe("serving", "start", sql, std::time::Duration::ZERO)
+        }));
+        conn.profile(Some(|sql, elapsed| {
+            lock_probe("serving", "done", sql, elapsed)
+        }));
+    }
     let index = Arc::new(CountingIndex {
         store: store.clone(),
         failures: AtomicUsize::new(0),
@@ -158,18 +189,26 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
     let census_root = root.clone();
     let migration = std::thread::spawn(move || {
         let mut conn = census_connection(&census_root.join("run-index.db"));
+        conn.trace(Some(|sql| {
+            lock_probe("census", "start", sql, std::time::Duration::ZERO)
+        }));
+        conn.profile(Some(|sql, elapsed| {
+            lock_probe("census", "done", sql, elapsed)
+        }));
         batches::AFTER_WRITE_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
+                eprintln!("CENSUS_LOCK_PROBE census AFTER_WRITE_HOOK send (after commit)");
                 started_tx.send(()).unwrap();
             }))
         });
-        let counts = census::run(
+        let result = census::run(
             &mut conn,
             &broca_core::ReadOnlyWalReader::new(census_root),
             None,
             true,
-        )
-        .unwrap();
+        );
+        eprintln!("CENSUS_LOCK_PROBE census result={result:?}");
+        let counts = result.unwrap();
         migration_active.store(false, Ordering::SeqCst);
         counts
     });
