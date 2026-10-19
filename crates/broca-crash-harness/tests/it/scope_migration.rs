@@ -149,15 +149,19 @@ fn ownership(log: &LogImage) -> SessionOwnershipV1 {
         .expect("a folded checkpoint carries the ownership summary")
 }
 
-/// Every `RunStarted` in `log` with its frame's version byte.
-fn run_starts(log: &LogImage) -> Vec<(u8, Option<SessionScope>)> {
+/// Every `RunStarted` in `log`, with whether its frame requires `scope/v1` and its scope.
+///
+/// Other features (runner tags, for one) gate every new session's frames, so the frame's
+/// version byte no longer tells a scoped frame from an unscoped one; the feature list does.
+fn run_starts(log: &LogImage) -> Vec<(bool, Option<SessionScope>)> {
     log.frames
         .iter()
         .filter_map(|frame| match &frame.body {
             FrameBody::Record(framed) => match &framed.record {
-                WalRecord::RunStarted { scope, .. } => {
-                    Some((log.bytes[frame.start + 4], scope.clone()))
-                }
+                WalRecord::RunStarted { scope, .. } => Some((
+                    framed.record.required_features().contains(&"scope/v1"),
+                    scope.clone(),
+                )),
                 _ => None,
             },
             FrameBody::Lineage(_) => None,
@@ -165,8 +169,10 @@ fn run_starts(log: &LogImage) -> Vec<(u8, Option<SessionScope>)> {
         .collect()
 }
 
-fn floor_of(state_root: &Path) -> Option<String> {
-    std::fs::read_to_string(state_root.join(broca_wal::FEATURE_FLOOR_FILENAME)).ok()
+/// Whether the state root's feature floor lists `scope/v1`.
+fn floor_has_scope(state_root: &Path) -> bool {
+    std::fs::read_to_string(state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+        .is_ok_and(|floor| floor.lines().any(|line| line == "scope/v1"))
 }
 
 #[tokio::test]
@@ -174,7 +180,7 @@ async fn both_sides_of_the_first_scoped_run_started_freeze_the_scope() {
     let handle = RunnerHandle::new(FIRST_SCOPED).await;
     assert_eq!(
         run_starts(&handle.reference.log),
-        [(3, Some(head_scope()))],
+        [(true, Some(head_scope()))],
         "the reference run freezes the scope in a gated frame"
     );
     for point in handle.record_boundaries(true) {
@@ -191,17 +197,16 @@ async fn both_sides_of_the_first_scoped_run_started_freeze_the_scope() {
         );
         assert_eq!(
             run_starts(&resumed.log),
-            [(3, Some(head_scope()))],
+            [(true, Some(head_scope()))],
             "{}: the resume ends with the one scoped RunStarted, gated",
             kill.label()
         );
         if !frozen_before {
             // The resume re-admitted the send and wrote the gated frame itself, so it raised
             // the feature floor in the state root first.
-            assert_eq!(
-                floor_of(&kill.state_root).as_deref(),
-                Some("scope/v1\n"),
-                "{}",
+            assert!(
+                floor_has_scope(&kill.state_root),
+                "{}: the feature floor lists scope/v1",
                 kill.label()
             );
         }
@@ -368,13 +373,12 @@ async fn the_migration_adopts_only_a_session_whose_every_episode_recorded_the_ow
                     let adopted = wait_for_records(&wal_path, 2).await;
                     assert_eq!(
                         run_starts(&adopted),
-                        [(1, None), (3, Some(head_scope()))],
+                        [(false, None), (true, Some(head_scope()))],
                         "{label}: the adopting RunStarted freezes the scope, gated"
                     );
-                    assert_eq!(
-                        floor_of(&kill.state_root).as_deref(),
-                        Some("scope/v1\n"),
-                        "{label}"
+                    assert!(
+                        floor_has_scope(&kill.state_root),
+                        "{label}: the feature floor lists scope/v1"
                     );
                 }
             }
@@ -451,7 +455,7 @@ async fn both_sides_of_the_adopting_run_started(handle: &RunnerHandle) {
         let resumed = LogImage::read(&path);
         assert_eq!(
             run_starts(&resumed),
-            [(1, None), (3, Some(head_scope()))],
+            [(false, None), (true, Some(head_scope()))],
             "cut at {records} (torn {torn}): one adopting RunStarted, gated, after the resume"
         );
         assert_eq!(
