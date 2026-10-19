@@ -6003,6 +6003,9 @@ mod state_directory_tests {
                 "the backup catalog must be owner-only"
             );
         }
+        #[cfg(windows)]
+        broca_owner_only::validate(&catalog_path)
+            .expect("the backup catalog ACL must be owner-only");
         let _ = std::fs::remove_dir_all(&state_root);
     }
 
