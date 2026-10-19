@@ -4,15 +4,28 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 
 
+class TransientQueryError(RuntimeError):
+    """A GitHub API failure that says nothing about the artifacts: a 5xx or a timeout."""
+
+
 def api(path):
-    result = subprocess.run(["gh", "api", path], text=True, capture_output=True, timeout=60)
+    try:
+        result = subprocess.run(["gh", "api", path], text=True, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired as error:
+        raise TransientQueryError(f"GitHub artifact query timed out: {error}") from error
     if result.returncode:
-        raise RuntimeError(f"GitHub artifact query failed: {result.stderr.strip()}")
+        message = result.stderr.strip()
+        # A server error is GitHub failing to answer, not an answer about this run, so the
+        # poll retries it until the deadline. Every other failure (auth, 404) is final.
+        if re.search(r"HTTP 5\d\d", message):
+            raise TransientQueryError(f"GitHub artifact query failed: {message}")
+        raise RuntimeError(f"GitHub artifact query failed: {message}")
     return json.loads(result.stdout)
 
 
@@ -38,15 +51,14 @@ def main():
     if wanted - producers.keys():
         parser.error("unsupported CI artifacts: " + ", ".join(sorted(wanted - producers.keys())))
     while True:
-        available = set()
-        page = 1
-        while True:
-            response = api(f"{base}/artifacts?per_page=100&page={page}")
-            artifacts = response["artifacts"]
-            available.update(a["name"] for a in artifacts if not a["expired"])
-            if len(artifacts) < 100:
-                break
-            page += 1
+        try:
+            available = list_artifacts(base)
+        except TransientQueryError as error:
+            if time.monotonic() >= deadline:
+                raise
+            print(f"Retrying after: {error}", flush=True)
+            time.sleep(min(max(args.poll_seconds, 1), max(0, deadline - time.monotonic())))
+            continue
         missing = wanted - available
         if not missing:
             print("Ready: " + ", ".join(sorted(wanted)), flush=True)
@@ -58,7 +70,14 @@ def main():
         needed_producers = {producers[name] for name in missing}
         page = 1
         while True:
-            jobs = api(f"{base}/jobs?per_page=100&page={page}")["jobs"]
+            try:
+                jobs = api(f"{base}/jobs?per_page=100&page={page}")["jobs"]
+            except TransientQueryError as error:
+                if time.monotonic() >= deadline:
+                    raise
+                print(f"Retrying after: {error}", flush=True)
+                active_producers = True
+                break
             for job in jobs:
                 name = job["name"].split(" / ")[-1]
                 if name in needed_producers:
@@ -76,6 +95,18 @@ def main():
             raise RuntimeError("Timed out waiting for artifacts: " + ", ".join(sorted(missing)))
         print("Waiting for: " + ", ".join(sorted(missing)), flush=True)
         time.sleep(min(args.poll_seconds, max(0, deadline - time.monotonic())))
+
+
+def list_artifacts(base):
+    available = set()
+    page = 1
+    while True:
+        response = api(f"{base}/artifacts?per_page=100&page={page}")
+        artifacts = response["artifacts"]
+        available.update(a["name"] for a in artifacts if not a["expired"])
+        if len(artifacts) < 100:
+            return available
+        page += 1
 
 
 if __name__ == "__main__":

@@ -539,6 +539,36 @@ class ArtifactWait(unittest.TestCase):
                              self.artifacts('fixtures-Windows', 'integration-windows')])
         self.assertEqual(api.call_count, 3)
 
+    def test_a_server_error_on_either_query_is_retried_until_the_artifacts_arrive(self):
+        # GitHub answered one poll with HTTP 502 and every waiting shard failed with it.
+        transient = self.module.TransientQueryError('gh: Server Error (HTTP 502)')
+        api = self.run_wait([transient,
+                             self.artifacts('fixtures-Windows'),
+                             transient,
+                             self.artifacts('fixtures-Windows', 'integration-windows')])
+        self.assertEqual(api.call_count, 4)
+
+    def test_api_classifies_only_server_errors_and_timeouts_as_transient(self):
+        def failed(stderr):
+            return subprocess.CompletedProcess(['gh'], 1, stdout='', stderr=stderr)
+
+        with patch.object(self.module.subprocess, 'run', return_value=failed('gh: Server Error (HTTP 502)')):
+            with self.assertRaises(self.module.TransientQueryError):
+                self.module.api('repos/x/actions/runs/1/artifacts')
+        with patch.object(self.module.subprocess, 'run', return_value=failed('gh: Not Found (HTTP 404)')):
+            with self.assertRaises(RuntimeError) as raised:
+                self.module.api('repos/x/actions/runs/1/artifacts')
+            self.assertNotIsInstance(raised.exception, self.module.TransientQueryError)
+        timeout = subprocess.TimeoutExpired(['gh'], 60)
+        with patch.object(self.module.subprocess, 'run', side_effect=timeout):
+            with self.assertRaises(self.module.TransientQueryError):
+                self.module.api('repos/x/actions/runs/1/artifacts')
+
+    def test_a_server_error_past_the_deadline_still_fails(self):
+        transient = self.module.TransientQueryError('gh: Server Error (HTTP 502)')
+        with self.assertRaises(self.module.TransientQueryError):
+            self.run_wait([transient], timeout=1e-9)
+
     def test_failed_required_producer_is_reported_by_name(self):
         with self.assertRaisesRegex(RuntimeError, r'Producer failed: fixtures / Fixtures \(Windows\) \(failure\)'):
             self.run_wait([self.artifacts('integration-windows'),
