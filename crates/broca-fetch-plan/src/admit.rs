@@ -1381,6 +1381,7 @@ mod tests {
 
     fn plan_with_declaration(provider: &str) -> Plan {
         Plan {
+            render_tags: false,
             text: "{}".into(),
             identity: "test-plan".into(),
             tool_items: Vec::new(),

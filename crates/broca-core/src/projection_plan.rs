@@ -151,6 +151,10 @@ pub struct PreparedProjection {
     pub truncate_prefix_to: Option<i64>,
     pub message_json: Vec<String>,
     pub message_run_json: Vec<String>,
+    /// Each message's runner tags as JSON (`null` for an untagged message), beside
+    /// `message_json`: the store keeps them in their own column, since a message's own
+    /// serialized form never carries them.
+    pub message_tags_json: Vec<Option<String>>,
     pub final_run_json: Vec<(i64, String)>,
     pub completed_steps: i64,
     pub usage_json: String,
@@ -437,6 +441,10 @@ pub fn plan_projection(
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?;
+    let message_tags_json = new_messages
+        .iter()
+        .map(|message| message.part_tags().map(serde_json::to_string).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
     // Keep RunFinished beyond the last materialized record: older resume code reads it
     // from the WAL to know the run ended. Replay those unmaterialized records too, persisting
     // their final-message metadata without moving the watermark past that terminal record.
@@ -514,6 +522,7 @@ pub fn plan_projection(
         truncate_prefix_to,
         message_json,
         message_run_json,
+        message_tags_json,
         final_run_json,
         completed_steps: u64_to_i64(completed_steps)?,
         usage_json,

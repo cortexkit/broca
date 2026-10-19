@@ -41,6 +41,7 @@ pub const OP_ROLE_DESCRIBE: &str = broca_wire::OP_ROLE_DESCRIBE;
 pub const OP_HEAD: &str = broca_wire::OP_SESSION_HEAD;
 pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
 pub const OP_BASELINE: &str = broca_wire::OP_SESSION_BASELINE;
+pub const OP_RESOLVE: &str = broca_wire::OP_SESSION_RESOLVE;
 /// Re-send a session's most recent model request shaped to generate nothing, keeping the
 /// provider's cached prefix alive between a caller's rounds.
 pub const OP_WARM: &str = broca_wire::OP_SESSION_WARM;
@@ -364,6 +365,14 @@ pub fn manifest_configured(
                     kind: ManagementOperationKind::Query,
                     description: Some(
                         "Describe what this build serves of the llm-runner/v1 role: its ops, capability groups and read byte cap."
+                            .to_string(),
+                    ),
+                },
+                ManagementOperation {
+                    name: OP_RESOLVE.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some(
+                        "Answer the stored text of one runner-tagged part, or a character range of it."
                             .to_string(),
                     ),
                 },

@@ -244,6 +244,7 @@ impl WalStore for ReadCountingWalStore {
 fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     let mut wal = store.open(&request.session).expect("open WAL for seed");
     let config = RunConfig {
+        render_tags: false,
         model: request.model.clone(),
         tools: request.tools.clone().into(),
         tool_choice: request.tool_choice.clone(),
@@ -267,6 +268,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -307,6 +309,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
 
 fn resumable_frozen_config(request: &RunRequest, stop_when: Vec<StopCondition>) -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: request.model.clone(),
         tools: request.tools.clone().into(),
         tool_choice: request.tool_choice.clone(),
@@ -910,6 +913,7 @@ async fn zero_step_count_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -986,6 +990,7 @@ async fn zero_context_limit_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -1151,6 +1156,7 @@ async fn volatile_cache_tail_with_tools_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -3733,6 +3739,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         tail: Vec::new(),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            tags: None,
             pending_order: None,
             input_budget: None,
             session_class: None,

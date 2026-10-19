@@ -301,6 +301,7 @@ struct PreparedProjection {
     truncate_prefix_to: Option<i64>,
     message_json: Vec<String>,
     message_run_json: Vec<String>,
+    message_tags_json: Vec<Option<String>>,
     final_run_json: Vec<(i64, String)>,
     completed_steps: i64,
     usage_json: String,
@@ -470,6 +471,8 @@ impl SqliteStore {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM message WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM message_tag WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM meta WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
@@ -952,6 +955,24 @@ impl SqliteStore {
             // JSON null is the explicit, computed marker for an unattributable message.
             conn.execute("ALTER TABLE message ADD COLUMN run_json TEXT", [])?;
         }
+        if !message_columns.contains("tags_json") {
+            // A message's runner tags (a JSON array, one per block). NULL for an untagged
+            // message, and on every row written before tags existed: those sessions have none.
+            conn.execute("ALTER TABLE message ADD COLUMN tags_json TEXT", [])?;
+        }
+        // The runner-tag index: which materialized message and block hold each tag, written
+        // with the message rows, so `session.resolve` finds a part without reading the
+        // transcript. Rows follow their message: a truncated or reset projection drops them.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS message_tag (
+                 session TEXT NOT NULL,
+                 tag     INTEGER NOT NULL,
+                 ord     INTEGER NOT NULL,
+                 part    INTEGER NOT NULL,
+                 PRIMARY KEY (session, tag)
+             )",
+            [],
+        )?;
         // SQLite stores columns added by ALTER TABLE after the existing checkpoint blob.
         // Covering the new scalar lets page reads fetch it without traversing that blob's
         // overflow pages; the remaining selected metadata already precedes the blob.
@@ -1271,6 +1292,7 @@ impl SqliteStore {
                         truncate_prefix_to: prepared.truncate_prefix_to,
                         message_json: prepared.message_json,
                         message_run_json: prepared.message_run_json,
+                        message_tags_json: prepared.message_tags_json,
                         final_run_json: prepared.final_run_json,
                         completed_steps: prepared.completed_steps,
                         usage_json: prepared.usage_json,
@@ -1352,6 +1374,7 @@ impl SqliteStore {
             }
             ProjectionPlan::Reset { .. } => {
                 tx.execute("DELETE FROM message WHERE session=?1", [key])?;
+                tx.execute("DELETE FROM message_tag WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
                 tx.commit()?;
                 return Ok(0);
@@ -1370,22 +1393,43 @@ impl SqliteStore {
 
         if prepared.reset {
             tx.execute("DELETE FROM message WHERE session=?1", [key])?;
+            tx.execute("DELETE FROM message_tag WHERE session=?1", [key])?;
             tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
         } else if let Some(truncate_to) = prepared.truncate_prefix_to {
             tx.execute(
                 "DELETE FROM message WHERE session=?1 AND ord>=?2",
                 rusqlite::params![key, truncate_to],
             )?;
+            tx.execute(
+                "DELETE FROM message_tag WHERE session=?1 AND ord>=?2",
+                rusqlite::params![key, truncate_to],
+            )?;
         }
         let mut next_ord = prepared.next_ord;
+        let mut tags_json = prepared.message_tags_json.into_iter();
         for (json, run_json) in prepared
             .message_json
             .into_iter()
             .zip(prepared.message_run_json)
         {
+            let tags_json = tags_json.next().flatten();
+            if let Some(tags_json) = &tags_json {
+                let tags: broca_protocol::tags::PartTags = serde_json::from_str(tags_json)?;
+                for (part, tag) in tags.tagged() {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO message_tag (session, tag, ord, part) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            key,
+                            i64::try_from(tag).map_err(StoreError::Int)?,
+                            next_ord,
+                            part as i64
+                        ],
+                    )?;
+                }
+            }
             tx.execute(
-                "INSERT OR REPLACE INTO message (session, ord, json, run_json) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![key, next_ord, json, run_json],
+                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![key, next_ord, json, run_json, tags_json],
             )?;
             next_ord += 1;
         }
@@ -1658,6 +1702,37 @@ impl MaterializedStore for SqliteStore {
             .map_err(|error| error.to_string())
     }
 
+    fn tag_location(
+        &self,
+        session: &BindIdentity,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, String> {
+        let key = Self::key(session);
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let (_, prefix_len) = current_projection_position(&tx, &key).map_err(|e| e.to_string())?;
+        let tag = i64::try_from(tag).map_err(|e| e.to_string())?;
+        let found = tx
+            .query_row(
+                "SELECT ord, part FROM message_tag WHERE session=?1 AND tag=?2 AND ord<?3",
+                rusqlite::params![key, tag, prefix_len],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|(ord, part)| {
+                Ok::<_, String>((
+                    u64::try_from(ord).map_err(|e| e.to_string())?,
+                    usize::try_from(part).map_err(|e| e.to_string())?,
+                ))
+            })
+            .transpose()?;
+        Ok(Some(broca_core::TagLocation {
+            found,
+            indexed_through: u64::try_from(prefix_len).map_err(|e| e.to_string())?,
+        }))
+    }
+
     fn read_page_with_attribution(
         &self,
         session: &BindIdentity,
@@ -1758,7 +1833,7 @@ impl MaterializedStore for SqliteStore {
         let end_i64 = i64::try_from(end).unwrap_or(i64::MAX);
         let mut stmt = tx
             .prepare(
-                "SELECT ord, json, run_json FROM message
+                "SELECT ord, json, run_json, tags_json FROM message
                  WHERE session=?1 AND ord>=?2 AND ord<?3 ORDER BY ord ASC",
             )
             .map_err(|e| e.to_string())?;
@@ -1768,16 +1843,17 @@ impl MaterializedStore for SqliteStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
         let mut rows = Vec::new();
         for encoded_row in encoded {
-            let (ordinal, json, run_json) = encoded_row.map_err(|e| e.to_string())?;
+            let (ordinal, json, run_json, tags_json) = encoded_row.map_err(|e| e.to_string())?;
             let run_json = run_json.ok_or(broca_core::StorePageReadError::AttributionStale)?;
             let run = serde_json::from_str(&run_json).map_err(|e| e.to_string())?;
             let ordinal = u64::try_from(ordinal).map_err(|e| e.to_string())?;
-            let mut message: Message = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let mut message = decode_message(json, tags_json).map_err(|e| e.to_string())?;
             message.ordinal = Some(ordinal);
             rows.push(StorePageRow {
                 ordinal,
@@ -2390,16 +2466,34 @@ fn trailing_origin_from_tx(
     Ok(None)
 }
 
-fn read_message_json(tx: &rusqlite::Transaction, key: &str) -> Result<Vec<String>, StoreError> {
-    let mut stmt = tx.prepare("SELECT json FROM message WHERE session=?1 ORDER BY ord ASC")?;
-    let rows = stmt.query_map([key], |row| row.get::<_, String>(0))?;
+type EncodedMessage = (String, Option<String>);
+
+fn read_message_json(
+    tx: &rusqlite::Transaction,
+    key: &str,
+) -> Result<Vec<EncodedMessage>, StoreError> {
+    let mut stmt =
+        tx.prepare("SELECT json, tags_json FROM message WHERE session=?1 ORDER BY ord ASC")?;
+    let rows = stmt.query_map([key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-fn decode_messages(encoded: Vec<String>) -> Result<Vec<Message>, StoreError> {
+/// A stored message with its runner tags, which live in their own column, attached.
+fn decode_message(json: String, tags_json: Option<String>) -> Result<Message, StoreError> {
+    let mut message: Message = serde_json::from_str(&json)?;
+    if let Some(tags_json) = tags_json {
+        let tags: broca_protocol::tags::PartTags = serde_json::from_str(&tags_json)?;
+        broca_core::tags::attach_parts(&mut message, Some(tags));
+    }
+    Ok(message)
+}
+
+fn decode_messages(encoded: Vec<EncodedMessage>) -> Result<Vec<Message>, StoreError> {
     encoded
         .into_iter()
-        .map(|json| serde_json::from_str(&json).map_err(Into::into))
+        .map(|(json, tags_json)| decode_message(json, tags_json))
         .collect()
 }
 

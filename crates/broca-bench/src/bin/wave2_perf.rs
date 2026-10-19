@@ -426,6 +426,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
     let suffix = format!("projection-{episodes}-{iteration}");
     let writer = fixture.writer.as_ref().expect("writer is present");
     writer.record(WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -449,6 +450,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
     });
     writer.record(WalRecord::StepStarted { step_id: StepId(1) });
     writer.record(WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(1),
         assistant_message: (AssistantMessage {
@@ -584,6 +586,7 @@ fn message(role: Role, text: String) -> Message {
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         role,
         content: vec![ContentBlock::Text { text }],
     }

@@ -1200,6 +1200,7 @@ mod tests {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
@@ -1210,6 +1211,7 @@ mod tests {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
@@ -1381,6 +1383,7 @@ mod tests {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::Tool,
                 content: vec![ContentBlock::ToolResult(
                     broca_protocol::content::ToolResult {

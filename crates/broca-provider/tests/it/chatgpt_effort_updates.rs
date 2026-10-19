@@ -28,6 +28,7 @@ fn config(model: &str, effort: &str, admitted: bool) -> FrozenRenderConfig {
 fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRecord {
     let frozen = config(model, effort, admitted);
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -45,6 +46,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         run_id: RunId(format!("run-{effort}")),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("chatgpt", model),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -73,6 +75,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
                 }],
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 cache_prefix_blocks: None,
             })
             .into_iter()

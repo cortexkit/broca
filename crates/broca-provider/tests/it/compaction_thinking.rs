@@ -67,6 +67,7 @@ fn seed() -> Vec<Message> {
 fn start(input: Vec<Message>) -> WalRecord {
     let frozen = anthropic_frozen_config("claude-opus-5-5");
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -84,6 +85,7 @@ fn start(input: Vec<Message>) -> WalRecord {
         run_id: RunId("compacted-run".into()),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("anthropic", "claude-opus-5-5"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -136,6 +138,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
 
 fn completion(label: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         step_id: StepId(0),
         assistant_message: Arc::new(broca_protocol::AssistantMessage {
             message_id: broca_protocol::MessageId(label.into()),

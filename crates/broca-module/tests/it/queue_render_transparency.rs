@@ -60,6 +60,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "do the thing".into(),
@@ -365,6 +366,7 @@ fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: msg.into() }],
         }],
@@ -645,6 +647,7 @@ async fn drained_run_renders_identical_bytes_to_idle_send() {
 
 fn recovered_stop_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        render_tags: false,
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         tools: vec![Tool {
             name: "edit".into(),
@@ -685,6 +688,7 @@ async fn crash_recovery_preserves_stop_before_tool_dispatch() {
     wal.append(
         1,
         &broca_wal::WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,

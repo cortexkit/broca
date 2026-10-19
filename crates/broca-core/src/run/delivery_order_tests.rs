@@ -134,6 +134,35 @@ struct Ran {
 }
 
 async fn run(name: &str, model: Model, inbox: Arc<SteerInbox>, during: Option<OrderedSend>) -> Ran {
+    run_with(name, model, inbox, during, None).await
+}
+
+/// A frozen plan manifest whose plan turns `render_tags` on.
+fn rendering_manifest() -> broca_wal::PlanManifest {
+    broca_wal::PlanManifest {
+        plan: broca_wal::OpaqueJson::from_json_text(
+            serde_json::json!({"step_transform_items":[],"render_tags":true}).to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        fetches: Vec::new(),
+        tools: request("manifest").tools.into(),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+        declarations: Vec::new(),
+    }
+}
+
+async fn run_with(
+    name: &str,
+    model: Model,
+    inbox: Arc<SteerInbox>,
+    during: Option<OrderedSend>,
+    manifest: Option<broca_wal::PlanManifest>,
+) -> Ran {
     let root =
         broca_test_support::scratch_root().join(format!("ordered-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -153,6 +182,7 @@ async fn run(name: &str, model: Model, inbox: Arc<SteerInbox>, during: Option<Or
         None,
         RunControl {
             steer: Some(inbox.clone()),
+            manifest: manifest.map(Arc::new),
             ..Default::default()
         },
         &out,
@@ -353,4 +383,106 @@ async fn a_run_without_ordered_sends_writes_no_delivery_records() {
             || !record
                 .required_features()
                 .contains(&broca_wal::framing::DELIVERY_ORDER_FEATURE)));
+}
+
+/// The prompt a replay of `records` rebuilds, with its tags rendered as a run frozen with
+/// `render_tags` renders them on a family that keeps assistant tags as metadata.
+fn rendered(records: &[WalRecord]) -> Vec<Message> {
+    let mut prompt = crate::replay::replay(records).unwrap().prompt;
+    broca_protocol::tags::render_tags_into(&mut prompt, Default::default());
+    prompt
+}
+
+/// With `render_tags` on, a `steer` delivery's message is a tagged part like any steer: its
+/// `SendDelivered` record carries the tag, the live request shows it, and a replay of the WAL
+/// renders the request the run sent.
+#[tokio::test]
+async fn a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild() {
+    let Ran { model, records } = run_with(
+        "steer-tagged",
+        Model::new(true),
+        SteerInbox::new(),
+        Some(ordered("sub-t", &[DeliveryMode::Steer])),
+        Some(rendering_manifest()),
+    )
+    .await;
+    let tag = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::SendDelivered {
+                tags: Some(tags), ..
+            } => Some(tags[0].parts[0]),
+            _ => None,
+        })
+        .expect("the steer delivery is tagged");
+    let sent = model.prompt(1);
+    assert_eq!(
+        sent.last().unwrap().content,
+        vec![ContentBlock::Text {
+            text: format!("§{tag}§ note")
+        }]
+    );
+    assert_eq!(
+        bytes(&rendered(&records)[..sent.len()]),
+        bytes(&sent),
+        "a rebuild renders what was sent"
+    );
+}
+
+/// With `render_tags` on, a `tool_result` delivery's text is part of the tool result it rides
+/// on: the result's own tag leads the result and the appended text, and the delivery has no tag
+/// of its own. A replay of the WAL renders the request the run sent.
+#[tokio::test]
+async fn a_tool_result_delivery_renders_inside_the_results_tagged_part() {
+    let inbox = SteerInbox::new();
+    inbox.seed_ordered(vec![ordered("sub-r", &[DeliveryMode::ToolResult])]);
+    let Ran { model, records } = run_with(
+        "tool-result-tagged",
+        Model::new(false),
+        inbox,
+        None,
+        Some(rendering_manifest()),
+    )
+    .await;
+    let carrier_tag = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::ToolResult {
+                result,
+                tags: Some(tags),
+                ..
+            } if result.tool_call_id.0 == "two" => Some(tags.parts[0]),
+            _ => None,
+        })
+        .expect("the carrier result is tagged");
+    assert!(records.iter().any(|record| matches!(
+        record,
+        WalRecord::SendDelivered {
+            mode: DeliveryMode::ToolResult,
+            tags: None,
+            ..
+        }
+    )));
+    let sent = model.prompt(1);
+    let carried = sent
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            ContentBlock::ToolResult(result) if result.tool_call_id.0 == "two" => {
+                Some(result.output.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        carried,
+        ToolOutput::Text {
+            text: format!("§{carrier_tag}§ done\n\nnote")
+        }
+    );
+    assert_eq!(
+        bytes(&rendered(&records)[..sent.len()]),
+        bytes(&sent),
+        "a rebuild renders what was sent"
+    );
 }

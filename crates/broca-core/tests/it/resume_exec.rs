@@ -200,6 +200,7 @@ fn request(run: &str, dir: &std::path::Path) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "edit a and b".into(),
@@ -315,7 +316,11 @@ fn truncate_wal(dir: &std::path::Path, keep: usize) {
     let path = wal_store.wal_path(&request("r", dir).session);
     let framed = FileWal::open(&path).unwrap().replay().unwrap();
     let _ = std::fs::remove_file(&path);
-    let mut wal = FileWal::open(&path).unwrap();
+    // The live run's records are tagged (gated frames), so the copy raises the store's
+    // feature floor as the store's own writer does.
+    let mut wal = FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(wal_store.feature_floor_path());
     for f in framed.into_iter().take(keep) {
         wal.append(f.fence, &f.record, true).unwrap();
     }

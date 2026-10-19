@@ -737,6 +737,7 @@ where
         framed(
             seq,
             WalRecord::Steered {
+                tags: None,
                 retention: None,
                 ts_ms: None,
                 send_id: None,
@@ -1596,6 +1597,7 @@ where
     records.push(framed(
         3,
         WalRecord::BudgetFired {
+            tags: None,
             run_id: RunId("r".into()),
             kind: BudgetKind::Nudge,
             threshold: 0,
@@ -2195,6 +2197,7 @@ pub(crate) fn text_step(seq: u64, step: u64, text: &str) -> FramedRecord {
     framed(
         seq,
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(step),
             assistant_message: (AssistantMessage {
@@ -2234,6 +2237,7 @@ fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
         framed(
             seq_base,
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(step),
                 assistant_message: AssistantMessage {
@@ -2264,6 +2268,7 @@ fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
         framed(
             seq_base + 2,
             WalRecord::ToolResult {
+                tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),
                 result: ToolResult {
@@ -2335,6 +2340,7 @@ pub(crate) fn run_started(
     framed(
         seq,
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2352,6 +2358,7 @@ pub(crate) fn run_started(
             run_id: RunId(run_id.into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                render_tags: false,
                 model,
                 tools: vec![].into(),
                 tool_choice: Default::default(),
@@ -2376,6 +2383,7 @@ pub(crate) fn run_started(
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: input.into() }],
             }]

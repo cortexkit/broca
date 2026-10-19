@@ -1904,6 +1904,9 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Result<Option<Vec<Value>>, HarnessError> {
         match method {
             "session.baseline" | "compaction.ready" | "run.status" => Ok(Some(vec![json!({})])),
+            // A tag the expired session's first part held: resolve reads through the same
+            // transcript path as session.read, so an expired session serves none of it.
+            "session.resolve" => Ok(Some(vec![json!({"tag": 1})])),
             _ => Err(HarnessError::new(format!(
                 "unclassified retention probe op: {method}"
             ))),

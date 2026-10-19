@@ -1949,6 +1949,7 @@ async fn chatgpt_refresh_run_rejecting(
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         role: Role::User,
         content: vec![ContentBlock::Text { text: "hi".into() }],
     }],

@@ -267,6 +267,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: text.into() }],
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }
     }
 
@@ -401,6 +402,7 @@ mod tests {
 
     fn consumed(run: &str, sub: &str) -> WalRecord {
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -418,6 +420,7 @@ mod tests {
             run_id: RunId(run.into()),
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(RunConfig {
+                render_tags: false,
                 model: ModelHandle::new("stub", "m"),
                 tools: vec![].into(),
                 tool_choice: ToolChoice::Auto,

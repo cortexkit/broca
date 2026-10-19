@@ -1433,6 +1433,7 @@ mod tests {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "Hello".into(),
@@ -1519,6 +1520,7 @@ mod tests {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "Hello".into(),
@@ -1828,6 +1830,7 @@ mod tests {
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
+                    tags: Default::default(),
                     role: Role::System,
                     content: vec![ContentBlock::Text {
                         text: "Be concise.".into(),
@@ -1837,6 +1840,7 @@ mod tests {
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
+                    tags: Default::default(),
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: "What time is it in Madrid?".into(),

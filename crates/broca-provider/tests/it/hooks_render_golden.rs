@@ -37,6 +37,7 @@ fn request() -> CallOptions {
         content,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         cache_prefix_blocks: None,
     }])
 }
@@ -59,6 +60,7 @@ fn tool_call_only_request() -> CallOptions {
         content,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         cache_prefix_blocks: None,
     }])
 }

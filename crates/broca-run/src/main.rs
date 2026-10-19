@@ -350,6 +350,7 @@ async fn run(args: Args) -> Result<i32, String> {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: args.prompt.clone(),
@@ -611,6 +612,7 @@ mod tests {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
         }]);

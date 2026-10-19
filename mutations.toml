@@ -1995,8 +1995,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
 expect_red = ["send_delivery::a_steer_during_a_tool_call_joins_the_running_turn_after_the_result"]
 file = "crates/broca-core/src/run.rs"
-old = "            origin: Some(cfg.model.clone()),\n            ordinal: None,\n        });\n        mutable_call_options(&mut opts).prompt.push(Message {\n            cache_prefix_blocks: None,\n            role: Role::Tool,"
-new = "            origin: Some(cfg.model.clone()),\n            ordinal: None,\n        });\n        // NON-VACUITY BREAK: take waiting steers between the call and its result\n        let mut early_steers = control.steer.as_ref().map(|inbox| inbox.take_at_step(|| {})).unwrap_or_default();\n        mutable_call_options(&mut opts).prompt.append(&mut early_steers);\n        mutable_call_options(&mut opts).prompt.push(Message {\n            cache_prefix_blocks: None,\n            role: Role::Tool,"
+old = "        mutable_call_options(&mut opts).prompt.push(answer);\n        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());"
+new = "        mutable_call_options(&mut opts).prompt.push(answer);\n        // NON-VACUITY BREAK: take waiting steers between the call and its result\n        let mut early_steers = control.steer.as_ref().map(|inbox| inbox.take_at_step(|| {})).unwrap_or_default();\n        mutable_call_options(&mut opts).prompt.append(&mut early_steers);\n        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());"
 
 [[control]]
 id = "steer-extends-final-step"
@@ -17177,6 +17177,131 @@ file = "crates/broca-module/src/fanout.rs"
 old = '''            sender: Arc::new(std::sync::OnceLock::new()),'''
 new = '''            sender: Arc::new(std::sync::OnceLock::from(broadcast::channel(capacity).0)), // NON-VACUITY BREAK: allocate at open'''
 
+[[control]]
+id = "runner-tags-writer-never-reuses-a-tag"
+guards = "The session writer advances its runner-tag counter past every part it tags, so no two parts of a session share a tag"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::tags_are_strictly_increasing_across_restart_resume_and_a_moved_session"]
+file = "crates/broca-core/src/tags.rs"
+old = '''    set_record_tags(record, tags.clone());
+    *state = LineageTags::On { next };'''
+new = '''    set_record_tags(record, tags.clone());
+    *state = LineageTags::On { next: first }; // NON-VACUITY BREAK: the next record reuses these tags'''
+
+[[control]]
+id = "runner-tags-restart-counts-past-every-recorded-tag"
+guards = "A writer reopened over a tagged WAL counts on from the highest tag any record holds, so a restart, resume or moved session never reuses a tag"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::tags_are_strictly_increasing_across_restart_resume_and_a_moved_session"]
+file = "crates/broca-core/src/tags.rs"
+old = '''                    *next = (*next).max(tag.saturating_add(1));'''
+new = '''                    let _ = tag; // NON-VACUITY BREAK: later records' tags are not counted'''
+
+[[control]]
+id = "runner-tags-deleted-lineage-floor"
+guards = "A lineage created after retention deleted its predecessor starts past the tombstone's recorded next tag, so no tag is reused across the deletion"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::a_lineage_after_retention_deletion_never_reuses_a_tag"]
+file = "crates/broca-core/src/tags.rs"
+old = '''                floor: own.max(floor),'''
+new = '''                floor: own, // NON-VACUITY BREAK: ignore the deleted lineage's floor'''
+
+[[control]]
+id = "runner-tags-assistant-text-only-on-anthropic"
+guards = "Assistant text shows its runner tag only on the Anthropic Messages family; every other family keeps assistant tags as metadata"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::only_anthropic_shows_assistant_text_tags"]
+file = "crates/broca-protocol/src/tags.rs"
+old = '''            assistant_text: family_id == Some(ANTHROPIC_MESSAGES_FAMILY),'''
+new = '''            assistant_text: family_id.is_some() || true, // NON-VACUITY BREAK: every family shows assistant tags'''
+
+[[control]]
+id = "runner-tags-never-render-into-thinking"
+guards = "Even on Anthropic, rendering runner tags never touches thinking, encrypted reasoning, tool-call arguments or provider-state text"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::anthropic_rendering_never_touches_thinking_tool_calls_or_provider_state"]
+file = "crates/broca-protocol/src/tags.rs"
+old = '''            (Role::Assistant, ContentBlock::Text { text }) if rendering.assistant_text => {'''
+new = '''            (Role::Assistant, ContentBlock::Text { text } | ContentBlock::Reasoning { text, .. }) if rendering.assistant_text => { // NON-VACUITY BREAK: render into thinking'''
+
+[[control]]
+id = "runner-tags-live-results-render-as-their-rebuild"
+guards = "A render_tags run attaches each tool result's tag to the message it adds live, so its request equals the request rebuilt from the WAL"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+file = "crates/broca-core/src/run.rs"
+old = '''        crate::tags::attach_parts(&mut results, result_tags);
+        mutable_call_options(&mut opts).prompt.push(results);'''
+new = '''        let _ = result_tags; // NON-VACUITY BREAK: the live tool message carries no tags
+        mutable_call_options(&mut opts).prompt.push(results);'''
+
+[[control]]
+id = "runner-tags-steer-carries-its-record-tags"
+guards = "A steer joins the running turn with the tags its Steered record was given, so the live request equals its rebuild"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+file = "crates/broca-core/src/steer.rs"
+old = '''        if let Some(tags) = record() {
+            for (message, tags) in messages.iter_mut().zip(&tags) {
+                crate::tags::attach(message, Some(tags));'''
+new = '''        if let Some(tags) = record() {
+            for (message, tags) in messages.iter_mut().zip(&tags) {
+                let _ = (message, tags); // NON-VACUITY BREAK: the queued steer loses its tags'''
+
+[[control]]
+id = "runner-tags-unseeded-writer-refuses"
+guards = "A writer whose lineage tag state is unknown refuses a record with parts instead of writing an untagged part into a tagged lineage"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::an_unseeded_writer_refuses_a_record_with_parts"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = '''            None if crate::tags::tag_shape(record).is_some() && record.runner_tags().is_empty() => {'''
+new = '''            None if false && crate::tags::tag_shape(record).is_some() => { // NON-VACUITY BREAK: write it untagged'''
+
+[[control]]
+id = "runner-tags-resolve-uses-the-tag-index"
+guards = "session.resolve finds a materialized tag through the store's tag index and reads one message, never the transcript from its start"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/wal_cost.rs"
+expect_red = ["session_read::wal_cost::resolving_a_tag_in_a_large_session_reads_no_whole_wal"]
+file = "crates/broca-store/src/lib.rs"
+old = '''        Ok(Some(broca_core::TagLocation {
+            found,'''
+new = '''        let _ = found;
+        Ok(Some(broca_core::TagLocation {
+            found: None, // NON-VACUITY BREAK: the index finds nothing'''
 # Sends with an ordered `delivery` list (the `delivery_order` group).
 [[control]]
 id = "delivery-order-run-without-idle-start"
@@ -17212,6 +17337,7 @@ file = "crates/broca-core/src/run.rs"
 old = '''    for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                tags: None,
                 hooks: r.hooks.take(),'''
 new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, resolutions.iter().map(|r| r.result.as_ref())); // NON-VACUITY BREAK: write the delivered text into the stored results
     for (id, text) in &early {
@@ -17222,6 +17348,7 @@ new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, r
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                tags: None,
                 hooks: r.hooks.take(),'''
 
 [[control]]
@@ -17280,3 +17407,16 @@ expect_red = ["delivery_order::a_keyed_retry_reports_the_delivered_runs_state_an
 file = "crates/broca-module/src/actor.rs"
 old = "Ok(Some(state)) => match indexed_finish_reason(&state.state) {"
 new = "Ok(Some(state)) => match None::<broca_protocol::RunFinishReason>.filter(|_| indexed_finish_reason(&state.state).is_some()) { // NON-VACUITY BREAK: report a finished run as active"
+
+[[control]]
+id = "runner-tags-steer-delivery-carries-its-record-tags"
+guards = "A send delivered as a steer joins the running turn with the tags its SendDelivered record was given, so the live request equals its rebuild"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/delivery_order_tests.rs"
+expect_red = ["run::delivery_order_tests::a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild"]
+file = "crates/broca-core/src/steer.rs"
+old = '''            if let Some(Some(tags)) = assigned.get(position) {'''
+new = '''            if let Some(Some(tags)) = assigned.get(position).filter(|_| false) { // NON-VACUITY BREAK: delivered steers lose their tags'''

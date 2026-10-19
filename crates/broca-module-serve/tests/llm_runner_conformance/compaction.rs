@@ -1066,9 +1066,20 @@ async fn recorded_setup_survives_sender_driven_recovery_without_repeating_setup(
     else {
         panic!("model read refused")
     };
+    // Compare each entry's source and message only. A model-view page entry also carries the
+    // message's runner tags (`tags`), which the compaction provider's observation of the model
+    // input does not record, so a whole-entry comparison would differ by that member alone.
+    let without_tags = |entries: Value| -> Vec<(Value, Value)> {
+        entries
+            .as_array()
+            .expect("model entries are an array")
+            .iter()
+            .map(|entry| (entry["source"].clone(), entry["message"].clone()))
+            .collect()
+    };
     assert_eq!(
-        serde_json::to_value(&observation.model_inputs[0]).unwrap(),
-        page["messages"]
+        without_tags(serde_json::to_value(&observation.model_inputs[0]).unwrap()),
+        without_tags(page["messages"].clone())
     );
     assert_eq!(observation.model_inputs[0].len(), 4);
     assert!(observation.model_inputs[0][3]

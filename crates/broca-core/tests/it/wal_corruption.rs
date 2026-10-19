@@ -142,6 +142,7 @@ fn request(run: &str, dir: &Path) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "edit a and b".into(),
@@ -230,7 +231,9 @@ fn parse_raw_frames(bytes: &[u8]) -> Vec<RawFrame> {
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&bytes[offset + 21..offset + 53]);
         let total_len = 53 + len as usize;
-        if ver == broca_wal::FRAMING_VERSION {
+        // Record frames: ordinary ones, and gated ones (a tagged session's records require
+        // `runner-tags/v1`). Lineage metadata frames are skipped.
+        if ver == broca_wal::FRAMING_VERSION || ver == broca_wal::GATED_FRAMING_VERSION {
             frames.push(RawFrame {
                 offset,
                 len,

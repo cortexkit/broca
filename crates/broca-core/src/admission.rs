@@ -601,6 +601,12 @@ pub struct AdmissionCheckpointV1 {
     /// Absent is an incomplete summary and must never be repaired from only a WAL tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::CompactionCheckpoint>,
+    /// The lineage's runner-tag state (see [`crate::tags`]), folded from its origin: whether its
+    /// records are tagged and the tag the next part gets. Absent in a checkpoint stored before
+    /// tags existed, or folded from a WAL tail, which must be repaired from the complete WAL
+    /// before a writer may tag anything, or it could reuse a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<crate::tags::LineageTags>,
     /// The `DeliveryOrdered` record whose `Queued` record has not been folded yet. The two are
     /// written in one barrier, but a running turn's own records can land between them, and a
     /// checkpoint can be cut there; the `Queued` record takes its order from here when it comes.
@@ -643,6 +649,7 @@ impl AdmissionCheckpointV1 {
             lineage_retention: Some(crate::LineageRetention::Unstarted),
             pending_fifo: Arc::new(Vec::new()),
             compaction: Some(crate::compaction::CompactionCheckpoint::None),
+            tags: Some(crate::tags::LineageTags::unstarted()),
             pending_order: None,
         }
     }
@@ -652,6 +659,7 @@ impl AdmissionCheckpointV1 {
         let mut checkpoint = Self::empty();
         if !records.is_empty() && !crate::retention::starts_at_lineage_origin(records) {
             checkpoint.lineage_retention = None;
+            checkpoint.tags = None;
         }
         checkpoint.fold_frames(records)?;
         if checkpoint
@@ -973,6 +981,9 @@ impl AdmissionCheckpointV1 {
             }
         }
         self.at_seq = seq;
+        if let Some(tags) = &mut self.tags {
+            tags.fold(record);
+        }
         if let Some(compaction) = &mut self.compaction {
             compaction.fold(record);
             if let (
@@ -1011,6 +1022,7 @@ impl AdmissionCheckpointV1 {
         self.effort_history.is_some()
             && self.input_budget.is_some()
             && self.lineage_retention.is_some()
+            && self.tags.is_some()
             && self
                 .ownership
                 .as_ref()
@@ -1128,11 +1140,13 @@ mod tests {
             content: vec![ContentBlock::Text { text: text.into() }],
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }
     }
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            render_tags: false,
             model: ModelHandle::new("stub", model),
             tools: Arc::new(vec![
                 Tool {
@@ -1318,6 +1332,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -1350,6 +1365,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(1),
                     assistant_message: AssistantMessage {
@@ -1396,6 +1412,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(1),
                     assistant_message: AssistantMessage {
@@ -1621,6 +1638,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(1),
                     assistant_message: AssistantMessage {
@@ -1656,6 +1674,7 @@ mod tests {
             frame(
                 14,
                 WalRecord::ToolNoDispatch {
+                    tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("batch".into()),
                     tool_call_id: ToolCallId("a".into()),
@@ -1667,6 +1686,7 @@ mod tests {
             frame(
                 15,
                 WalRecord::ToolNoDispatch {
+                    tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("batch".into()),
                     tool_call_id: ToolCallId("b".into()),
@@ -1684,6 +1704,7 @@ mod tests {
             frame(
                 17,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("r2".into()),
                     kind: BudgetKind::Nudge,
                     threshold: 2,
@@ -1694,6 +1715,7 @@ mod tests {
             frame(
                 18,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("r2".into()),
                     kind: BudgetKind::Finalize,
                     threshold: 2,
@@ -1704,6 +1726,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(2),
                     assistant_message: AssistantMessage {
@@ -2037,6 +2060,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(1),
                     assistant_message: AssistantMessage {
@@ -2059,6 +2083,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("budget".into()),
                     kind: BudgetKind::Nudge,
                     threshold: 1,
@@ -2069,6 +2094,7 @@ mod tests {
             frame(
                 4,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("budget".into()),
                     kind: BudgetKind::Nudge,
                     threshold: 1,
@@ -2107,6 +2133,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(id),
             assistant_message: AssistantMessage {
@@ -2137,6 +2164,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("budget".into()),
                     kind: BudgetKind::Finalize,
                     threshold: 1,
@@ -2223,6 +2251,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            tags: None,
             pending_order: None,
             input_budget: None,
             session_class: None,

@@ -494,7 +494,7 @@ fn drift_run_config(
     req: &broca_core::RunRequest,
     started: &broca_catalog::live::ProviderResolution,
 ) -> broca_wal::RunConfig {
-    broca_wal::RunConfig {
+    broca_wal::RunConfig { render_tags: false,
         model: req.model.clone(),
         tools: req.tools.clone().into(),
         tool_choice: req.tool_choice.clone(),
@@ -592,7 +592,7 @@ async fn resume_through_core(
     let mut wal = wal_store.open(&req.session).unwrap();
     wal.append(
         1,
-        &broca_wal::WalRecord::RunStarted { session_class: None, retention: None,
+        &broca_wal::WalRecord::RunStarted { tags: None, session_class: None, retention: None,
         hooks: None,
          title: None,
          on_restart: None,
@@ -1333,7 +1333,7 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
         *origin = serde_json::from_value(serde_json::json!({"kind": "seeded_from"})).unwrap();
     }
     wal.append(1, &imported, true).unwrap();
-    let tool = |n| broca_wal::WalRecord::ToolResult {
+    let tool = |n| broca_wal::WalRecord::ToolResult { tags: None,
         batch_id: broca_protocol::BatchId("batch".into()),
         result: Arc::new(broca_protocol::ToolResult { tool_call_id: broca_protocol::ToolCallId("tool".into()),
             output: broca_protocol::ToolOutput::Text { text: "x".repeat(n) }, is_error: false }),

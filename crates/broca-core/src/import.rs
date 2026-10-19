@@ -318,6 +318,15 @@ pub async fn run_import_with_store<W: WalStore>(
         return Err(ImportError::ImportIdReuse);
     }
 
+    // The import's records carry runner tags, counted on from whatever this WAL (a dangling
+    // earlier import) or a lineage retention deleted at this address already used.
+    let floor = wal_store
+        .retired_tag_floor(&request.session)
+        .map_err(|error| ImportError::Wal(error.to_string()))?;
+    writer.seed_lineage_tags(Some(
+        crate::tags::lineage_tags(frames.iter().map(|frame| &frame.record)).with_floor(floor),
+    ));
+
     if !frames.is_empty() {
         let dangling_seed =
             repairable_import_prefix(&frames)?.ok_or(ImportError::LineageNotEmpty)?;
@@ -334,6 +343,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -387,6 +397,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
 fn import_marker_config(request_digest: &str) -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: ModelHandle::new("import", "import"),
         tools: Vec::new().into(),
         tool_choice: ToolChoice::None,

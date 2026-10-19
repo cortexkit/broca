@@ -384,6 +384,7 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: spec.prompt.clone(),

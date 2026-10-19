@@ -13,6 +13,7 @@ use broca_protocol::{
         BudgetConfig, BudgetKind, ContextManagement, GenerationConfig, ModelHandle, ResponseFormat,
         StopCondition, SubmissionRequest, Tool, ToolChoice,
     },
+    tags::MessageTags,
     AttemptOutcome, BatchId, BindIdentity, BindPrincipal, CredentialRefresh, Delivery,
     InputTransformation, ModelAttempt, RunId, SessionScope, StepId, SubmissionId, ToolCallId,
     Usage,
@@ -278,6 +279,13 @@ pub enum WalRecord {
         /// Pre-user output; `input` holds the final messages. Absent when all providers pass.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooks: Option<Box<Hooks>>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One entry per message of `input`, in order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Arc<Vec<MessageTags>>>,
     },
     /// The assembled assistant unit for a completed model step.
     ModelStepFinished {
@@ -307,6 +315,13 @@ pub enum WalRecord {
         /// Post-assistant output; `assistant_message` holds the final message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooks: Option<Box<Hooks>>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One tag per block of `assistant_message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Box<MessageTags>>,
     },
     /// Evidence for ONE provider HTTP attempt of a model step: what was sent and received, as
     /// byte lengths and SHA-256 digests, and how the attempt ended. One per attempt, failed
@@ -448,6 +463,13 @@ pub enum WalRecord {
         /// Pre-tool output for a mutated input rejected before dispatch; `final` holds it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooks: Option<Box<Hooks>>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One tag, for the result replay builds from `reason`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Box<MessageTags>>,
     },
     /// The barrier's "after" half. `outcome` tags whether this is a real result, an
     /// ambiguous "sent but no result" outcome, or a synthetic interrupt/max-steps
@@ -487,6 +509,13 @@ pub enum WalRecord {
         /// skipped it would lose the obligation to withdraw the call from the provider.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_held: Option<ProviderHeld>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One tag, for `result`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Box<MessageTags>>,
     },
     /// Batch commit marker — written only after EXACTLY one terminal per planned
     /// call.
@@ -507,6 +536,13 @@ pub enum WalRecord {
         /// observation is intentionally absent from request and metering identities.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_text: Option<String>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One tag, for the budget message's text block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Box<MessageTags>>,
     },
     /// Session policy, frozen at admission even when the session was previously unlimited.
     InputTokenCapFrozen {
@@ -706,6 +742,13 @@ pub enum WalRecord {
         /// durable record, including records written before hooks existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooks: Option<Box<Hooks>>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One entry per message of `input`, in order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Arc<Vec<MessageTags>>>,
     },
     /// A tombstone removing a still-pending submission. An explicit caller retract has no
     /// failure; a permanently unadmittable queue head carries its atomic caller-visible terminal.
@@ -893,6 +936,13 @@ pub enum WalRecord {
         /// call closes with.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         closing_result: Option<Arc<ToolResult>>,
+        /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
+        /// this record carries, assigned by the session's writer as it appends the
+        /// record. Absent on every record of a session admitted before tags existed, which keeps
+        /// its exact bytes.
+        /// One tag, for `closing_result`; absent with `approved`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Box<MessageTags>>,
     },
     /// Which of a batch's held calls are still waiting for an answer, and the question each was
     /// filed as. Re-written whenever a filing returns or a question is answered. NOT
@@ -1000,6 +1050,11 @@ pub enum WalRecord {
         tool_call_id: Option<ToolCallId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         appended_text: Option<String>,
+        /// Runner tags (feature `runner-tags/v1`) of a `steer` delivery's `input`, one entry per
+        /// message, like a `Steered` record's. A `tool_result` delivery's `appended_text` is part
+        /// of the tool result it rides on and has no tag of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Arc<Vec<MessageTags>>>,
     },
 
     /// A record whose `type` this build does not know: written by a newer build, and
@@ -1166,10 +1221,65 @@ impl WalRecord {
         } else {
             base
         };
-        if self.carries_structured_output() {
+        let base = if self.carries_structured_output() {
             with_feature(base, crate::framing::STRUCTURED_OUTPUT_FEATURE)
         } else {
             base
+        };
+        if self.carries_runner_tags() {
+            with_feature(base, crate::framing::RUNNER_TAGS_FEATURE)
+        } else {
+            base
+        }
+    }
+
+    /// Whether this record carries runner tags, or is a run start frozen to render them. A
+    /// reader that skipped either would serve the session without its tags or render requests
+    /// without the tags the run was admitted to show, so both are must-understand.
+    fn carries_runner_tags(&self) -> bool {
+        match self {
+            WalRecord::RunStarted { tags, config, .. } => tags.is_some() || config.render_tags,
+            WalRecord::Steered { tags, .. } | WalRecord::SendDelivered { tags, .. } => {
+                tags.is_some()
+            }
+            WalRecord::ModelStepFinished { tags, .. }
+            | WalRecord::ToolNoDispatch { tags, .. }
+            | WalRecord::ToolResult { tags, .. }
+            | WalRecord::BudgetFired { tags, .. }
+            | WalRecord::ApprovalRecorded { tags, .. } => tags.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The runner tags this record carries, one entry per message, in the order the record
+    /// holds the messages. Empty for a record without tags.
+    pub fn runner_tags(&self) -> &[MessageTags] {
+        match self {
+            WalRecord::RunStarted {
+                tags: Some(tags), ..
+            }
+            | WalRecord::Steered {
+                tags: Some(tags), ..
+            }
+            | WalRecord::SendDelivered {
+                tags: Some(tags), ..
+            } => tags.as_slice(),
+            WalRecord::ModelStepFinished {
+                tags: Some(tags), ..
+            }
+            | WalRecord::ToolNoDispatch {
+                tags: Some(tags), ..
+            }
+            | WalRecord::ToolResult {
+                tags: Some(tags), ..
+            }
+            | WalRecord::BudgetFired {
+                tags: Some(tags), ..
+            }
+            | WalRecord::ApprovalRecorded {
+                tags: Some(tags), ..
+            } => std::slice::from_ref(tags.as_ref()),
+            _ => &[],
         }
     }
 
@@ -1958,6 +2068,13 @@ pub struct RunConfig {
     /// before the field existed; such a session followed the process-wide transform setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<ContextManagement>,
+    /// Whether this run shows runner tags to the model, frozen at admission from the plan's
+    /// `render_tags`. With it on, every tagged user text block and tool-result text output is
+    /// rendered with its `§N§ ` prefix; stored records never change. Omitted when false, which
+    /// renders exactly as before the field existed. Must-understand when true (feature
+    /// `runner-tags/v1`): a reader that ignored it would render different request bytes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub render_tags: bool,
 }
 
 /// The credential a run resolved at start, frozen for resume. A struct (not a bare string)
@@ -2301,6 +2418,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: Arc::new(AssistantMessage {
@@ -2356,6 +2474,7 @@ mod schema_tests {
     #[test]
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
         let config = RunConfig {
+            render_tags: false,
             model: ModelHandle::new("p", "m"),
             tools: Arc::new(vec![Tool {
                 name: "edit".into(),
@@ -2394,6 +2513,7 @@ mod schema_tests {
     #[test]
     fn tool_result_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
             result: Arc::new(ToolResult {
@@ -2456,11 +2576,13 @@ mod schema_tests {
             content: vec![ContentBlock::Text { text: text.into() }],
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }
     }
 
     fn min_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("p", "m"),
             tools: vec![].into(),
             tool_choice: ToolChoice::Auto,
@@ -2511,6 +2633,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2564,6 +2687,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2638,6 +2762,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(3),
             assistant_message: (AssistantMessage {
@@ -2658,6 +2783,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(0),
             assistant_message: (AssistantMessage {
@@ -2687,6 +2813,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: (AssistantMessage {
@@ -2725,6 +2852,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2777,6 +2905,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2813,6 +2942,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2866,6 +2996,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2923,6 +3054,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -3034,6 +3166,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -3195,6 +3328,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -3217,6 +3351,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: AssistantMessage {
@@ -3271,6 +3406,7 @@ mod schema_tests {
                 },
             },
             WalRecord::BudgetFired {
+                tags: None,
                 run_id: RunId("r1".into()),
                 kind: BudgetKind::Nudge,
                 threshold: 20,
@@ -3825,6 +3961,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: (AssistantMessage {
@@ -3867,6 +4004,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: (AssistantMessage {

@@ -155,6 +155,7 @@ mod gated {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hi".into() }],
             }],
@@ -265,6 +266,7 @@ mod gated {
             .open(&request.session)
             .expect("open WAL for resumable seed");
         let config = RunConfig {
+            render_tags: false,
             model: request.model.clone(),
             tools: request.tools.clone().into(),
             tool_choice: request.tool_choice.clone(),
@@ -289,6 +291,7 @@ mod gated {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,

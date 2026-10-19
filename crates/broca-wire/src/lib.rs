@@ -929,6 +929,33 @@ pub struct SessionReadMessage {
     /// each call's dispatch. Absent on a message with no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<SessionReadToolCall>,
+    /// The message's runner tags: one row per tagged part, in block order. Absent on a message
+    /// of a session admitted before tags existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<SessionReadTag>,
+}
+
+/// One tagged part of a read entry: the runner's opaque key for the part (the key
+/// `session.resolve` answers with) and its tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReadTag {
+    pub part: String,
+    pub tag: u64,
+}
+
+/// The tag rows of `message`, the transcript message at `ordinal`; empty when it has no tags.
+pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
+    message
+        .part_tags()
+        .map(|tags| {
+            tags.tagged()
+                .map(|(index, tag)| SessionReadTag {
+                    part: broca_protocol::tags::part_key(ordinal, index),
+                    tag,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The lineage state returned beside a `session.read` page.
@@ -4113,12 +4140,46 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            tags: Vec::new(),
             ordinal: 3,
             mid: "m3".into(),
             message: broca_protocol::Message::new(Role::Assistant, content),
             run: None,
             tool_calls: Vec::new(),
         }
+    }
+
+    /// A read entry carries one tag row per tagged part, after `tool_calls`; the message
+    /// itself keeps the exact bytes it had before tags existed, and an untagged entry has no
+    /// `tags` member at all.
+    #[test]
+    fn tagged_entries_carry_part_tag_rows_beside_an_unchanged_message() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
+        ];
+        let plain = read_message(content.clone());
+        let mut tagged = read_message(content);
+        tagged.message.set_tags(Some(std::sync::Arc::new(
+            broca_protocol::tags::PartTags::all([7, 8]),
+        )));
+        tagged.tags = tag_rows(tagged.ordinal, &tagged.message);
+        assert!(tag_rows(plain.ordinal, &plain.message).is_empty());
+
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        let tagged_json = serde_json::to_value(&tagged).unwrap();
+        assert!(plain_json.get("tags").is_none());
+        assert_eq!(tagged_json["message"], plain_json["message"]);
+        assert_eq!(
+            serde_json::to_string(&tagged).unwrap(),
+            r#"{"ordinal":3,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"tags":[{"part":"m3#0","tag":7},{"part":"m3#1","tag":8}]}"#
+        );
+        let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
+        assert_eq!(decoded.tags, tagged.tags);
     }
 
     /// A caller reads the transcript's text, never the provider bytes kept to send back. A

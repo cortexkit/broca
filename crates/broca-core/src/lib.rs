@@ -45,6 +45,7 @@ pub mod scope_admission;
 pub mod shutdown_seal;
 pub mod steer;
 pub mod stub_plane;
+pub mod tags;
 pub mod tool_plane;
 pub mod tool_repetition;
 pub mod wal_fold;
@@ -83,8 +84,8 @@ pub use context::{
     ExportError, ExportFact, ExportIndex, ExportPage, MaterializedStore, MissingExportRun,
     Persister, RunIndex, RunIndexRow, RunIndexState, SessionReadLineageState, SessionReadMessage,
     SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore, StorePageRow,
-    StorePageSnapshot, StorePrefix, ToolCallDispatch, WithdrawalRun, SESSION_READ_DEFAULT_LIMIT,
-    SESSION_READ_MAX_LIMIT,
+    StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
+    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
     read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest, ReadView,
@@ -145,6 +146,7 @@ pub use run::{
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::{OrderedAcceptance, SteerInbox};
 pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
+pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
 pub use wal_writer::{
     agent_session_ref, session_addr, FileWalStore, ObservedRecord, ReadOnlyWalReader,

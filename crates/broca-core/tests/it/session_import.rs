@@ -258,6 +258,7 @@ async fn materialized_import_prefix_merges_with_a_following_episode_tail() {
     };
     let next_config = (**config).clone();
     writer.record(WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -425,6 +426,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
     };
     let records = vec![
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -459,6 +461,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
             retries_used: 0,
         },
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -529,6 +532,7 @@ fn complete_import_records_for_test(
     prompt: &str,
 ) -> Vec<WalRecord> {
     let config = broca_wal::RunConfig {
+        render_tags: false,
         model: broca_protocol::request::ModelHandle::new("import", "import"),
         tools: Vec::new().into(),
         tool_choice: Default::default(),
@@ -551,6 +555,7 @@ fn complete_import_records_for_test(
     };
     vec![
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,

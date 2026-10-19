@@ -143,6 +143,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: broca_protocol::content::Role::User,
             content: vec![ContentBlock::Text {
                 text: "Use the read tool to read the file \"status.txt\", then reply with its \
@@ -269,6 +270,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         role: broca_protocol::content::Role::User,
         content: vec![ContentBlock::Text {
             text: "What time is it in Madrid right now? Use the get_time tool to find out, then tell me.".into(),
@@ -408,6 +410,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: broca_protocol::content::Role::User,
             content: vec![ContentBlock::Text {
                 text: "Think carefully, step by step, about which IANA timezone identifier Madrid \

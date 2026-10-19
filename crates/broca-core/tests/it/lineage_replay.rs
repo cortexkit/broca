@@ -25,6 +25,7 @@ use broca_wal::{PauseReason, RunConfig, RunOrigin, WalRecord};
 
 fn run_config(max_tokens: u32) -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
         tool_choice: ToolChoice::Auto,
@@ -54,6 +55,7 @@ fn run_config(max_tokens: u32) -> RunConfig {
 /// distinguished by `max_tokens` (so a per-episode-config test can tell them apart).
 fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -75,6 +77,7 @@ fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
         }]
@@ -87,6 +90,7 @@ fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
 /// A terminal (text-only) model step.
 fn step_text(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: (AssistantMessage {

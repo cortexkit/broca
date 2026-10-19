@@ -29,6 +29,7 @@ fn rich_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![ContentBlock::Text {
                 text: "Sys.".into(),
@@ -38,6 +39,7 @@ fn rich_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "Hi".into() }],
         },
@@ -45,6 +47,7 @@ fn rich_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::Assistant,
             content: vec![
                 ContentBlock::Reasoning {
@@ -161,6 +164,7 @@ fn cache_policy_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![
                 ContentBlock::Text {
@@ -175,6 +179,7 @@ fn cache_policy_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "m0".into() }],
         },
@@ -182,6 +187,7 @@ fn cache_policy_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::Assistant,
             content: vec![ContentBlock::Text { text: "m1".into() }],
         },
@@ -189,6 +195,7 @@ fn cache_policy_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "previous".into(),
@@ -198,6 +205,7 @@ fn cache_policy_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: "answer".into(),
@@ -207,6 +215,7 @@ fn cache_policy_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "latest".into(),

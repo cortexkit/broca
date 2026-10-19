@@ -263,6 +263,11 @@ pub struct PendingTurn {
     pub deferred: Vec<PreparedCall>,
     /// Approved calls awaiting second validation, never ordinary redispatch.
     pub approved: Vec<PreparedCall>,
+    /// The assistant message's runner tags, when the session has tags.
+    pub assistant_tags: Option<broca_protocol::tags::MessageTags>,
+    /// The runner tag of each already-durable terminal in `existing`, by call id in planned
+    /// order, for the terminals that have one.
+    pub existing_tags: Vec<(ToolCallId, u64)>,
 }
 
 /// A Prepared call retained by replay, with the records needed to resume its approval gate.
@@ -696,8 +701,20 @@ pub fn no_dispatch_result(tool_call_id: &ToolCallId, reason: &NoDispatchReason) 
 /// One terminal for a planned call.
 #[derive(Clone)]
 enum Terminal {
-    Result(Arc<ToolResult>, DispatchOutcome),
-    NoDispatch(NoDispatchReason),
+    /// The result, its outcome, and the result's runner tag when the session has tags.
+    Result(Arc<ToolResult>, DispatchOutcome, Option<u64>),
+    NoDispatch(NoDispatchReason, Option<u64>),
+}
+
+/// The single tag of a one-part record's tags (a tool result, a no-dispatch, a budget message).
+fn single_tag(tags: Option<&broca_protocol::tags::MessageTags>) -> Option<u64> {
+    tags.and_then(|tags| (tags.parts.len() == 1).then(|| tags.parts[0]))
+}
+
+/// `message` with its record's `tags` attached (see [`crate::tags::attach`]).
+fn tagged(mut message: Message, tags: Option<&broca_protocol::tags::MessageTags>) -> Message {
+    crate::tags::attach(&mut message, tags);
+    message
 }
 
 /// State of the currently-open tool batch during the linear walk.
@@ -729,9 +746,30 @@ impl OpenBatch {
     fn result_for(&self, position: usize) -> Option<ToolResult> {
         let id = &self.planned[position];
         self.terminals[position].as_ref().map(|t| match t {
-            Terminal::Result(r, _) => r.as_ref().clone(),
-            Terminal::NoDispatch(reason) => no_dispatch_result(id, reason),
+            Terminal::Result(r, _, _) => r.as_ref().clone(),
+            Terminal::NoDispatch(reason, _) => no_dispatch_result(id, reason),
         })
+    }
+
+    /// The runner tag of a planned call's terminal, when it has one.
+    fn tag_for(&self, position: usize) -> Option<u64> {
+        self.terminals[position].as_ref().and_then(|t| match t {
+            Terminal::Result(_, _, tag) | Terminal::NoDispatch(_, tag) => *tag,
+        })
+    }
+
+    /// The tags of the tool-role message holding every terminated call's result in planned
+    /// order. Each result is its own part with its own record's tag. `None` only when no
+    /// result carries a tag: a lineage admitted before tags existed.
+    fn result_tags(&self) -> Option<broca_protocol::tags::PartTags> {
+        let parts: Vec<Option<u64>> = (0..self.planned.len())
+            .filter(|position| self.terminals[*position].is_some())
+            .map(|position| self.tag_for(position))
+            .collect();
+        parts
+            .iter()
+            .any(Option::is_some)
+            .then(|| broca_protocol::tags::PartTags::new(parts))
     }
 
     // The runner writes terminals in source order for each repeated id. An
@@ -761,7 +799,7 @@ impl OpenBatch {
             .iter()
             .enumerate()
             .filter(|(position, _)| match &self.terminals[*position] {
-                Some(Terminal::Result(_, DispatchOutcome::Unknown)) => true,
+                Some(Terminal::Result(_, DispatchOutcome::Unknown, _)) => true,
                 Some(_) => false,
                 None => self.has_intent(*position), // intent ∧ ¬terminal
             })
@@ -809,6 +847,14 @@ impl OpenBatch {
 
     /// The already-terminated calls' reconstructed results, in planned order —
     /// included as-is on resume (never re-dispatched).
+    fn existing_tags(&self) -> Vec<(ToolCallId, u64)> {
+        self.planned
+            .iter()
+            .enumerate()
+            .filter_map(|(position, id)| self.tag_for(position).map(|tag| (id.clone(), tag)))
+            .collect()
+    }
+
     fn existing_results(&self) -> Vec<(ToolCallId, ToolResult)> {
         self.planned
             .iter()
@@ -831,8 +877,8 @@ impl OpenBatch {
         let mut saw_max_steps = false;
         for terminal in &self.terminals {
             match terminal {
-                Some(Terminal::Result(_, DispatchOutcome::MaxSteps)) => saw_max_steps = true,
-                Some(Terminal::Result(_, DispatchOutcome::Interrupted)) => {}
+                Some(Terminal::Result(_, DispatchOutcome::MaxSteps, _)) => saw_max_steps = true,
+                Some(Terminal::Result(_, DispatchOutcome::Interrupted, _)) => {}
                 // Any real/ambiguous/missing terminal → not a hard-stop batch.
                 _ => return None,
             }
@@ -893,6 +939,8 @@ struct Episode {
     /// The trailing tool-turn (assistant w/ tool calls) + its batch, held until the
     /// batch completes (then committed to the prompt).
     open_assistant: Option<Arc<AssistantMessage>>,
+    /// The runner tags of `open_assistant`, from its `ModelStepFinished`.
+    open_assistant_tags: Option<broca_protocol::tags::MessageTags>,
     open_batch: Option<OpenBatch>,
     open_step: Option<StepId>,
     open_batch_id: Option<BatchId>,
@@ -1373,7 +1421,13 @@ fn replay_seeded_with_compaction<'a>(
                         .map(|i| prompt.len() + i),
                     frozen_config: config.frozen_render_config.clone(),
                 });
-                prompt.extend(input.iter().cloned());
+                let input_tags = rec.runner_tags();
+                prompt.extend(
+                    input
+                        .iter()
+                        .enumerate()
+                        .map(|(index, message)| tagged(message.clone(), input_tags.get(index))),
+                );
             }
             WalRecord::ModelStepFinished {
                 step_id,
@@ -1381,8 +1435,10 @@ fn replay_seeded_with_compaction<'a>(
                 usage: u,
                 finish_reason,
                 retries_used,
+                tags: step_tags,
                 ..
             } => {
+                let step_tags = step_tags.as_deref();
                 ep.usage.accumulate(u);
                 ep.retries_used = ep.retries_used.saturating_add(*retries_used);
                 ep.last_step_usage = Some(*u);
@@ -1404,24 +1460,45 @@ fn replay_seeded_with_compaction<'a>(
                     // Preserve its answer text in future history, but omit tool calls because
                     // the tool-disabled turn never dispatches them and therefore has no results.
                     ep.first_step_message.get_or_insert(prompt.len());
-                    prompt.push(Message {
-                        cache_prefix_blocks: None,
-                        role: Role::Assistant,
-                        content: assistant_message
-                            .content
-                            .iter()
-                            .filter(|block| !matches!(block, ContentBlock::ToolCall(_)))
-                            .cloned()
-                            .collect(),
-                        origin: ep.origin.clone(),
-                        ordinal: None,
+                    // The finalize turn's tool calls are never dispatched, so neither the
+                    // transcript nor any request holds them. The kept blocks keep their own
+                    // tags. The dropped calls' tags stay assigned in the WAL record and are
+                    // never reused, but no transcript part holds them, so no read or
+                    // `session.resolve` answers them.
+                    let kept_tags = step_tags.map(|tags| {
+                        broca_protocol::tags::MessageTags::new(
+                            assistant_message
+                                .content
+                                .iter()
+                                .zip(&tags.parts)
+                                .filter(|(block, _)| !matches!(block, ContentBlock::ToolCall(_)))
+                                .map(|(_, tag)| *tag)
+                                .collect(),
+                        )
                     });
+                    prompt.push(tagged(
+                        Message {
+                            cache_prefix_blocks: None,
+                            role: Role::Assistant,
+                            content: assistant_message
+                                .content
+                                .iter()
+                                .filter(|block| !matches!(block, ContentBlock::ToolCall(_)))
+                                .cloned()
+                                .collect(),
+                            origin: ep.origin.clone(),
+                            ordinal: None,
+                            tags: Default::default(),
+                        },
+                        kept_tags.as_ref(),
+                    ));
                     ep.open_assistant = None;
                     ep.open_batch = None;
                     ep.natural_end = true;
                     ep.natural_end_extendable = false;
                 } else if assistant_message.tool_calls().next().is_some() {
                     ep.open_assistant = Some(assistant_message.clone()); // tool turn — held
+                    ep.open_assistant_tags = step_tags.cloned();
                     ep.open_step = Some(*step_id);
                     ep.open_step_record = Some(record_index);
                     ep.open_batch_id = None; // a new tool turn; its batch hasn't opened yet
@@ -1430,13 +1507,17 @@ fn replay_seeded_with_compaction<'a>(
                     // Terminal turn (no tools) — commit immediately. This step ends
                     // the loop, so the episode ended naturally here.
                     ep.first_step_message.get_or_insert(prompt.len());
-                    prompt.push(Message {
-                        cache_prefix_blocks: None,
-                        role: Role::Assistant,
-                        content: assistant_message.content.clone(),
-                        origin: ep.origin.clone(),
-                        ordinal: None,
-                    });
+                    prompt.push(tagged(
+                        Message {
+                            cache_prefix_blocks: None,
+                            role: Role::Assistant,
+                            content: assistant_message.content.clone(),
+                            origin: ep.origin.clone(),
+                            ordinal: None,
+                            tags: Default::default(),
+                        },
+                        step_tags,
+                    ));
                     ep.natural_end = true;
                     // Match live evaluation before its natural-end fallback, using the original
                     // assistant message. Budget-finalize turns above bypass stop_when in both paths.
@@ -1497,6 +1578,7 @@ fn replay_seeded_with_compaction<'a>(
                 decision,
                 closing_result,
                 elicitation_id,
+                tags: closing_tags,
                 ..
             } => {
                 if let Some(b) = &mut ep.open_batch {
@@ -1506,7 +1588,11 @@ fn replay_seeded_with_compaction<'a>(
                             if let Some(result) = closing_result {
                                 b.insert_terminal(
                                     call_id,
-                                    Terminal::Result(result.clone(), DispatchOutcome::Completed),
+                                    Terminal::Result(
+                                        result.clone(),
+                                        DispatchOutcome::Completed,
+                                        single_tag(closing_tags.as_deref()),
+                                    ),
                                 );
                             } else if *decision == DeferredDecision::Approved {
                                 prepared.approval = Some(Arc::new(rec.clone()));
@@ -1534,19 +1620,26 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::ToolNoDispatch {
                 tool_call_id,
                 reason,
+                tags,
                 ..
             } => {
                 if let Some(b) = &mut ep.open_batch {
-                    b.insert_terminal(tool_call_id, Terminal::NoDispatch(reason.clone()));
+                    b.insert_terminal(
+                        tool_call_id,
+                        Terminal::NoDispatch(reason.clone(), single_tag(tags.as_deref())),
+                    );
                 }
             }
             WalRecord::ToolResult {
-                result, outcome, ..
+                result,
+                outcome,
+                tags,
+                ..
             } => {
                 if let Some(b) = &mut ep.open_batch {
                     b.insert_terminal(
                         &result.tool_call_id,
-                        Terminal::Result(result.clone(), *outcome),
+                        Terminal::Result(result.clone(), *outcome, single_tag(tags.as_deref())),
                     );
                 }
                 // An Unknown terminal is ambiguous regardless of batch commit.
@@ -1571,7 +1664,13 @@ fn replay_seeded_with_compaction<'a>(
                             if let Some(step_record) = ep.open_step_record.take() {
                                 committed_tool_turns.push((prompt.len(), step_record));
                             }
-                            commit_tool_turn(&mut prompt, &assistant, b, ep.origin.clone());
+                            commit_tool_turn(
+                                &mut prompt,
+                                &assistant,
+                                ep.open_assistant_tags.take().as_ref(),
+                                b,
+                                ep.origin.clone(),
+                            );
                         }
                         ep.open_batch = None;
                         ep.open_step = None;
@@ -1594,7 +1693,13 @@ fn replay_seeded_with_compaction<'a>(
             // A message added to the running turn: held until the next step boundary, so it
             // never lands between a tool call and its result or ahead of the step it arrived in.
             WalRecord::Steered { input, .. } => {
-                ep.pending_steers.extend(input.iter().cloned());
+                let steer_tags = rec.runner_tags();
+                ep.pending_steers.extend(
+                    input
+                        .iter()
+                        .enumerate()
+                        .map(|(index, message)| tagged(message.clone(), steer_tags.get(index))),
+                );
             }
             // An ordered send delivered as a steer is placed exactly like a steer. One delivered
             // with a tool result renders that result followed by the recorded text; the record
@@ -1607,7 +1712,11 @@ fn replay_seeded_with_compaction<'a>(
                 ..
             } => {
                 if let Some(input) = input {
-                    ep.pending_steers.extend(input.iter().cloned());
+                    let delivered_tags = rec.runner_tags();
+                    ep.pending_steers
+                        .extend(input.iter().enumerate().map(|(index, message)| {
+                            tagged(message.clone(), delivered_tags.get(index))
+                        }));
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
                     crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
@@ -1673,7 +1782,10 @@ fn replay_seeded_with_compaction<'a>(
                     }
                     None => expected_text,
                 };
-                prompt.push(Message::new(Role::User, vec![ContentBlock::Text { text }]));
+                prompt.push(tagged(
+                    Message::new(Role::User, vec![ContentBlock::Text { text }]),
+                    rec.runner_tags().first(),
+                ));
             }
             WalRecord::RunFinished {
                 reason,
@@ -1913,13 +2025,17 @@ fn replay_seeded_with_compaction<'a>(
             .zip(ep.open_step_record)
             .map(|(assistant, step_record)| {
                 (
-                    Message {
-                        cache_prefix_blocks: None,
-                        role: Role::Assistant,
-                        content: assistant.content.clone(),
-                        origin: ep.origin.clone(),
-                        ordinal: None,
-                    },
+                    tagged(
+                        Message {
+                            cache_prefix_blocks: None,
+                            role: Role::Assistant,
+                            content: assistant.content.clone(),
+                            origin: ep.origin.clone(),
+                            ordinal: None,
+                            tags: Default::default(),
+                        },
+                        ep.open_assistant_tags.as_ref(),
+                    ),
                     step_record,
                 )
             })
@@ -2447,6 +2563,8 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
             redispatch: b.redispatchable(),
             deferred: b.prepared_in_state(OpenCallState::Deferred),
             approved: b.prepared_in_state(OpenCallState::Approved),
+            assistant_tags: ep.open_assistant_tags.clone(),
+            existing_tags: b.existing_tags(),
         },
         // model_step_finished with NO batch started → the batch never opened;
         // re-dispatch ALL the assistant's tool calls fresh (none ever ran).
@@ -2464,6 +2582,8 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
                 existing: Vec::new(),
                 deferred: Vec::new(),
                 approved: Vec::new(),
+                assistant_tags: ep.open_assistant_tags.clone(),
+                existing_tags: Vec::new(),
             }
         }
     };
@@ -2476,16 +2596,21 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
 fn commit_tool_turn(
     prompt: &mut Vec<Message>,
     assistant: &AssistantMessage,
+    assistant_tags: Option<&broca_protocol::tags::MessageTags>,
     batch: &OpenBatch,
     origin: Option<broca_protocol::request::ModelHandle>,
 ) {
-    prompt.push(Message {
-        cache_prefix_blocks: None,
-        role: Role::Assistant,
-        content: assistant.content.clone(),
-        origin,
-        ordinal: None,
-    });
+    prompt.push(tagged(
+        Message {
+            cache_prefix_blocks: None,
+            role: Role::Assistant,
+            content: assistant.content.clone(),
+            origin,
+            ordinal: None,
+            tags: Default::default(),
+        },
+        assistant_tags,
+    ));
     let content: Vec<ContentBlock> = batch
         .planned
         .iter()
@@ -2498,14 +2623,16 @@ fn commit_tool_turn(
         content,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
     });
+    crate::tags::attach_parts(prompt.last_mut().expect("just pushed"), batch.result_tags());
 }
 
 #[cfg(test)]
 mod steer_tests;
 
 #[cfg(test)]
-mod projection_boundary_tests {
+pub(crate) mod projection_boundary_tests {
     use broca_protocol::{
         caller::{PauseReason, RunFinishReason},
         content::{AssistantMessage, ContentBlock, FinishReason},
@@ -2545,6 +2672,7 @@ mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(step_id),
                 assistant_message: (AssistantMessage {
@@ -2597,10 +2725,11 @@ mod projection_boundary_tests {
         }
     }
 
-    pub(super) fn run_started(seq: u64, run_id: &str) -> FramedRecord {
+    pub(crate) fn run_started(seq: u64, run_id: &str) -> FramedRecord {
         framed(
             seq,
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -2618,6 +2747,7 @@ mod projection_boundary_tests {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
                 config: Box::new(RunConfig {
+                    render_tags: false,
                     model: ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: Default::default(),
@@ -2683,6 +2813,7 @@ mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                tags: None,
                 pending_order: None,
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
@@ -2747,6 +2878,7 @@ mod projection_boundary_tests {
             &[framed(
                 9,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("r1".into()),
                     kind: BudgetKind::Nudge,
                     threshold: 0,
@@ -2798,6 +2930,7 @@ mod projection_boundary_tests {
         let tail = [framed(
             9,
             WalRecord::BudgetFired {
+                tags: None,
                 run_id: RunId("r1".into()),
                 kind: BudgetKind::Nudge,
                 threshold: 1,
@@ -3120,6 +3253,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn approval(id: &str, key: &str, decision: DeferredDecision) -> WalRecord {
         WalRecord::ApprovalRecorded {
+            tags: None,
             call_key: key.into(),
             call_id: ToolCallId(id.into()),
             elicitation_id: Some(format!("q-{id}")),
@@ -3143,6 +3277,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: Arc::new(AssistantMessage {
@@ -3175,6 +3310,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn terminal(id: &str, withdrawal: Option<WithdrawElicitation>) -> WalRecord {
         WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: BatchId("b".into()),
             result: Arc::new(crate::resume::not_dispatched_result(&ToolCallId(id.into()))),

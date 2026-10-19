@@ -392,6 +392,7 @@ impl FakeExecutor {
 
     async fn write_started(&self, job: &RunJob) {
         let _seq = job.writer.record(broca_wal::WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -472,12 +473,14 @@ impl RunExecutor for FakeExecutor {
                     .unwrap()
                     .as_millis() as u64;
                 inbox.try_take_at_step_ordered(&job.req.run_id, now, |records| {
-                    for record in records {
-                        job.writer.record(record);
-                    }
+                    let assigned = records
+                        .into_iter()
+                        .map(|record| job.writer.record_tagged(record).1)
+                        .collect();
                     job.writer.record(broca_wal::WalRecord::StepStarted {
                         step_id: broca_protocol::StepId(1),
                     });
+                    assigned
                 });
             }
         }
@@ -503,6 +506,7 @@ impl RunExecutor for FakeExecutor {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),
         tool_choice: Default::default(),
@@ -608,6 +612,7 @@ pub fn req(key: &BindIdentity, run: &str) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
         }],

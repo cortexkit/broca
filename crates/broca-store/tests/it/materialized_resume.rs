@@ -168,6 +168,7 @@ fn request(dir: &std::path::Path) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "edit a then b".into(),
@@ -502,7 +503,10 @@ fn truncate_wal(dir: &std::path::Path, keep: usize) {
     let path = ws.wal_path(&request(dir).session);
     let framed = FileWal::open(&path).unwrap().replay().unwrap();
     let _ = std::fs::remove_file(&path);
-    let mut wal = FileWal::open(&path).unwrap();
+    // A tagged session's records are gated frames: raise the feature floor as the store does.
+    let mut wal = FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(ws.feature_floor_path());
     for f in framed.into_iter().take(keep) {
         wal.append(f.fence, &f.record, true).unwrap();
     }
@@ -577,7 +581,10 @@ fn write_wal_frames(dir: &std::path::Path, frames: &[broca_wal::FramedRecord]) {
     let ws = FileWalStore::new(dir.join("wal"));
     let path = ws.wal_path(&request(dir).session);
     let _ = std::fs::remove_file(&path);
-    let mut wal = FileWal::open(&path).unwrap();
+    // A tagged session's records are gated frames: raise the feature floor as the store does.
+    let mut wal = FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(ws.feature_floor_path());
     for frame in frames {
         wal.append(frame.fence, &frame.record, true).unwrap();
     }

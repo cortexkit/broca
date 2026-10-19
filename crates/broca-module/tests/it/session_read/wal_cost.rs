@@ -431,3 +431,230 @@ impl broca_core::ChargeBasisResolver for UnknownCharge {
         broca_core::NO_CHARGE_BASIS_OVERRIDES.into()
     }
 }
+
+/// `record` with runner tags covering its parts, starting at `first`; returns the next tag.
+fn tag_record(record: &mut WalRecord, first: u64) -> u64 {
+    use broca_protocol::tags::MessageTags;
+    match record {
+        WalRecord::RunStarted { input, tags, .. } => {
+            let mut next = first;
+            *tags = Some(Arc::new(
+                input
+                    .iter()
+                    .map(|message| {
+                        let start = next;
+                        next += message.content.len() as u64;
+                        MessageTags::new((start..next).collect())
+                    })
+                    .collect(),
+            ));
+            next
+        }
+        WalRecord::ModelStepFinished {
+            assistant_message,
+            tags,
+            ..
+        } => {
+            let next = first + assistant_message.content.len() as u64;
+            *tags = Some(Box::new(MessageTags::new((first..next).collect())));
+            next
+        }
+        _ => first,
+    }
+}
+
+/// A tagged session of `episodes` episodes with a 30 KB answer each: tags 1, 2 for the first
+/// episode's prompt and answer, 3, 4 for the next, and so on. Returns the next unused tag.
+fn seed_tagged(rig: &Rig, key: &BindIdentity, episodes: usize) -> u64 {
+    let mut wal = rig.wal_store.open(key).unwrap();
+    let text = "x".repeat(30_000);
+    let mut next = 1;
+    for episode in 0..episodes {
+        for mut record in [
+            started(key, &format!("run-{episode}"), &format!("prompt {episode}")),
+            assistant_text(0, &text),
+            finished_ok(),
+        ] {
+            next = tag_record(&mut record, next);
+            wal.append(1, &record, false).unwrap();
+        }
+    }
+    wal.sync().unwrap();
+    next
+}
+
+/// The rig's store, counting the message rows its page reads return. `indexed: false` hides
+/// the tag index, as a store without one would.
+struct RowCountingStore {
+    inner: Arc<broca_store::SqliteStore>,
+    rows: AtomicUsize,
+    indexed: bool,
+}
+
+impl broca_core::MaterializedStore for RowCountingStore {
+    fn tag_location(
+        &self,
+        session: &BindIdentity,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, String> {
+        if self.indexed {
+            self.inner.tag_location(session, tag)
+        } else {
+            Ok(None)
+        }
+    }
+    fn read_page_with_attribution(
+        &self,
+        session: &BindIdentity,
+        from_ordinal: Option<u64>,
+        limit: u64,
+        view: broca_core::ReadView,
+    ) -> Result<broca_core::StorePageSnapshot, broca_core::StorePageReadError> {
+        let snapshot = self
+            .inner
+            .read_page_with_attribution(session, from_ordinal, limit, view)?;
+        self.rows.fetch_add(snapshot.rows.len(), Ordering::SeqCst);
+        Ok(snapshot)
+    }
+    fn read_prefix_with_watermark(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<broca_core::StorePrefix, String> {
+        self.inner.read_prefix_with_watermark(session)
+    }
+    fn read_admission_snapshot(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<broca_core::AdmissionStoreSnapshot>, String> {
+        self.inner.read_admission_snapshot(session)
+    }
+}
+
+fn resolve_registry(
+    rig: &Rig,
+    counting: Arc<CountingStore>,
+    store: Arc<RowCountingStore>,
+) -> LineageRegistry {
+    let opener = Arc::new(
+        DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(&rig.lease_dir)),
+            counting.clone(),
+            Arc::new(NoopExec),
+        )
+        .with_run_index(rig.store.clone())
+        .with_materialized_store(rig.store.clone()),
+    );
+    LineageRegistry::new_with_reader(opener, counting, Some(store))
+}
+
+/// `session.resolve` finds a tag through the store's tag index and reads one message: no read
+/// of the WAL from its start, however long the session. A tag past the materialized prefix is
+/// found in the WAL after the store's watermark, again without a read from the start.
+#[tokio::test]
+async fn resolving_a_tag_in_a_large_session_reads_no_whole_wal() {
+    let rig = Rig::new("resolve-cost", Arc::new(NoopExec));
+    let key = rig.key("resolve");
+    let next = seed_tagged(&rig, &key, 200);
+    materialize_all(&rig, &key);
+    let counting = counter(&rig, &key);
+    let rows = Arc::new(RowCountingStore {
+        inner: rig.store.clone(),
+        rows: AtomicUsize::new(0),
+        indexed: true,
+    });
+    let registry = resolve_registry(&rig, counting.clone(), rows.clone());
+
+    // The control: without the index, finding tag 201 means paging through the transcript
+    // from its start, which reads every message row before it.
+    let unindexed = Arc::new(RowCountingStore {
+        inner: rig.store.clone(),
+        rows: AtomicUsize::new(0),
+        indexed: false,
+    });
+    let scanning = resolve_registry(&rig, counter(&rig, &key), unindexed.clone());
+    let scanned = scanning
+        .resolve(
+            &key,
+            &broca_wire::ResolveParams {
+                tag: 201,
+                range: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(scanned.text, "prompt 100");
+    assert!(
+        unindexed.rows.load(Ordering::SeqCst) > 200,
+        "a scan reads the rows before the part"
+    );
+
+    for (tag, text) in [(1, "prompt 0".to_owned()), (201, "prompt 100".to_owned())] {
+        counting.reset();
+        rows.rows.store(0, Ordering::SeqCst);
+        let start = Instant::now();
+        let answer = registry
+            .resolve(&key, &broca_wire::ResolveParams { tag, range: None })
+            .await
+            .unwrap()
+            .unwrap();
+        counting.report("resolve", start);
+        assert_eq!(answer.text, text);
+        assert_eq!(answer.part, format!("m{}#0", (tag - 1)));
+        assert_eq!(
+            rows.rows.load(Ordering::SeqCst),
+            1,
+            "the index names the one message to read for tag {tag}"
+        );
+        assert_eq!(counting.full.load(Ordering::SeqCst), 0, "tag {tag}");
+        assert_eq!(
+            counting.from_zero.load(Ordering::SeqCst),
+            0,
+            "resolving tag {tag} must not read the WAL from its start"
+        );
+    }
+
+    // A later episode the store has not materialized yet: found in the WAL past the watermark.
+    {
+        let mut wal = rig.wal_store.open(&key).unwrap();
+        let mut late = started(&key, "late", "unprojected prompt");
+        tag_record(&mut late, next);
+        wal.append(1, &late, true).unwrap();
+    }
+    counting.reset();
+    rows.rows.store(0, Ordering::SeqCst);
+    let answer = registry
+        .resolve(
+            &key,
+            &broca_wire::ResolveParams {
+                tag: next,
+                range: Some(broca_wire::CharRange { start: 0, end: 11 }),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.text, "unprojected");
+    assert_eq!(answer.part, "m400#0");
+    assert_eq!(
+        rows.rows.load(Ordering::SeqCst),
+        0,
+        "a tag past the materialized prefix reads no stored message"
+    );
+    assert_eq!(counting.full.load(Ordering::SeqCst), 0);
+    assert_eq!(counting.from_zero.load(Ordering::SeqCst), 0);
+
+    let unknown = registry
+        .resolve(
+            &key,
+            &broca_wire::ResolveParams {
+                tag: next + 1,
+                range: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(unknown.0, broca_wire::UNKNOWN_TAG);
+    assert_eq!(counting.from_zero.load(Ordering::SeqCst), 0);
+}

@@ -45,6 +45,10 @@ impl<'de> Deserialize<'de> for WriterReadParams {
 pub struct ModelEntry {
     pub source: EntrySource,
     pub message: broca_protocol::Message,
+    /// The runner tags of a transcript message's parts, as on a transcript page. Absent on a
+    /// replacement entry and on a message of a session admitted before tags existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<crate::SessionReadTag>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,9 +75,17 @@ impl TryFrom<broca_core::ModelPage> for ModelPage {
                 .messages
                 .into_iter()
                 .map(|entry| {
+                    let source: EntrySource = serde_json::from_value(entry.source)?;
+                    let tags = match &source {
+                        EntrySource::Message { ordinal, .. } => {
+                            crate::tag_rows(*ordinal, &entry.message)
+                        }
+                        EntrySource::Replacement { .. } => Vec::new(),
+                    };
                     Ok(ModelEntry {
-                        source: serde_json::from_value(entry.source)?,
+                        source,
                         message: entry.message,
+                        tags,
                     })
                 })
                 .collect::<Result<_, Self::Error>>()?,

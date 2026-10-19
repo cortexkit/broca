@@ -76,6 +76,7 @@ pub fn run_attribution_follows_each_episode<S: SessionStore>(store: S) {
         framed(
             8,
             WalRecord::Steered {
+                tags: None,
                 retention: None,
                 ts_ms: None,
                 send_id: Some("steer".into()),

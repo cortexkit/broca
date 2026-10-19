@@ -65,14 +65,25 @@ impl SteerInbox {
     }
 
     /// Queue `messages` for the running turn, calling `record` (which appends their `Steered`
-    /// record) under the same lock. Returns `false` without calling `record` once the inbox is
-    /// closed: the turn will render no further step, so the caller must not steer into it.
-    pub fn deliver(&self, messages: Vec<Message>, record: impl FnOnce()) -> bool {
+    /// record) under the same lock. `record` returns the runner tags the writer assigned to the
+    /// record, one entry per message, and the queued messages carry them: the turn renders the
+    /// same tags a replay of the record attaches. Returns `false` without calling `record` once
+    /// the inbox is closed: the turn will render no further step, so the caller must not steer
+    /// into it.
+    pub fn deliver(
+        &self,
+        mut messages: Vec<Message>,
+        record: impl FnOnce() -> Option<Vec<broca_protocol::tags::MessageTags>>,
+    ) -> bool {
         let mut state = self.lock();
         if state.closed {
             return false;
         }
-        record();
+        if let Some(tags) = record() {
+            for (message, tags) in messages.iter_mut().zip(&tags) {
+                crate::tags::attach(message, Some(tags));
+            }
+        }
         state.pending.extend(messages);
         true
     }
@@ -192,12 +203,17 @@ impl SteerInbox {
     ///
     /// This also decides every queued ordered send at this step boundary: an expired one ends (`SendEnded`), one whose first possible mode is `steer` is
     /// delivered (`SendDelivered`, its input taken after the steered messages), and the rest stay
-    /// queued. `record` receives those records and must append them before `StepStarted`.
+    /// queued. `record` receives those records and must append them before `StepStarted`. It
+    /// returns the runner tags the writer assigned to each record, in order (`None` for a record
+    /// without parts), and each delivered message carries its record's tags, as a replay of the
+    /// record attaches them.
     pub fn try_take_at_step_ordered(
         &self,
         run_id: &broca_protocol::RunId,
         now_ms: u64,
-        record: impl FnOnce(Vec<broca_wal::WalRecord>),
+        record: impl FnOnce(
+            Vec<broca_wal::WalRecord>,
+        ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
     ) -> Option<Vec<Message>> {
         use crate::delivery_order::{choose_mode, ended, steered, Boundary};
         let mut state = self.lock();
@@ -206,6 +222,8 @@ impl SteerInbox {
         }
         let mut taken = std::mem::take(&mut state.pending);
         let mut records = Vec::new();
+        // Each steer delivery's record position and the messages it delivers, in order.
+        let mut delivered = Vec::new();
         let mut kept = Vec::new();
         for send in std::mem::take(&mut state.ordered) {
             if send.order.expired_at(now_ms) {
@@ -221,14 +239,22 @@ impl SteerInbox {
                 == Some(broca_protocol::DeliveryMode::Steer)
             {
                 records.push(steered(&send, run_id));
-                taken.extend(send.input.iter().cloned());
+                delivered.push((records.len() - 1, send.input.clone()));
                 state.consumed.push(send.submission_id);
             } else {
                 kept.push(send);
             }
         }
         state.ordered = kept;
-        record(records);
+        let assigned = record(records);
+        for (position, mut messages) in delivered {
+            if let Some(Some(tags)) = assigned.get(position) {
+                for (message, tags) in messages.iter_mut().zip(tags) {
+                    crate::tags::attach(message, Some(tags));
+                }
+            }
+            taken.extend(messages);
+        }
         Some(taken)
     }
 
@@ -303,12 +329,18 @@ mod tests {
     fn delivery_step_and_close_follow_one_lock() {
         let inbox = SteerInbox::new();
         let mut log = Vec::new();
-        assert!(inbox.deliver(vec![message("a")], || log.push("steered")));
+        assert!(inbox.deliver(vec![message("a")], || {
+            log.push("steered");
+            None
+        }));
         let taken = inbox.take_at_step(|| log.push("step_started"));
         assert_eq!(taken, vec![message("a")]);
         assert_eq!(log, ["steered", "step_started"]);
 
-        assert!(inbox.deliver(vec![message("b")], || log.push("steered")));
+        assert!(inbox.deliver(vec![message("b")], || {
+            log.push("steered");
+            None
+        }));
         assert!(
             !inbox.close_if_empty(),
             "a queued steer keeps the turn open"
@@ -316,7 +348,10 @@ mod tests {
         assert!(!inbox.is_closed());
         inbox.take_at_step(|| {});
         assert!(inbox.close_if_empty());
-        assert!(!inbox.deliver(vec![message("c")], || log.push("late")));
+        assert!(!inbox.deliver(vec![message("c")], || {
+            log.push("late");
+            None
+        }));
         assert!(!log.contains(&"late"));
     }
     fn ordered(
@@ -380,7 +415,10 @@ mod tests {
         );
         let mut written = Vec::new();
         let taken = inbox
-            .try_take_at_step_ordered(&run, 0, |records| written = records)
+            .try_take_at_step_ordered(&run, 0, |records| {
+                written = records;
+                Vec::new()
+            })
             .unwrap();
         assert_eq!(kinds(&written), vec!["delivered b steer"]);
         assert_eq!(taken, vec![message("b")]);
@@ -409,7 +447,8 @@ mod tests {
         let mut written = Vec::new();
         let taken = inbox
             .try_take_at_step_ordered(&broca_protocol::RunId("r".into()), 10, |records| {
-                written = records
+                written = records;
+                Vec::new()
             })
             .unwrap();
         assert!(taken.is_empty());

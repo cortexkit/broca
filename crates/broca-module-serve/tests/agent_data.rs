@@ -186,6 +186,7 @@ impl Rig {
         let mut records = vec![
             started(session, run),
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(0),
                 assistant_message: AssistantMessage {
@@ -225,6 +226,7 @@ impl Rig {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                tags: None,
                 batch_id: batch.clone(),
                 result: Arc::new(ToolResult {
                     tool_call_id: call,
@@ -337,6 +339,7 @@ impl Rig {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(0),
                     assistant_message: broca_protocol::content::AssistantMessage {
@@ -376,6 +379,7 @@ impl Rig {
 }
 fn started(session: &BindIdentity, run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -393,6 +397,7 @@ fn started(session: &BindIdentity, run: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: vec![].into(),
             tool_choice: broca_protocol::ToolChoice::Auto,
@@ -919,6 +924,7 @@ async fn retention_marker_never_reaches_the_door() {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }]
         .into();
     }
@@ -2117,6 +2123,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
             }],
             tools: Some(vec![]),
             policy_allowed: Default::default(),

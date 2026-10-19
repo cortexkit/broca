@@ -109,6 +109,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -126,6 +127,7 @@ impl Fixture {
                 run_id: RunId(format!("run-{}", shape.label)),
                 session,
                 config: Box::new(RunConfig {
+                    render_tags: false,
                     model: ModelHandle::new("stub", "projection-bench"),
                     tools: Vec::new().into(),
                     tool_choice: Default::default(),
@@ -164,6 +166,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: (AssistantMessage {

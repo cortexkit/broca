@@ -59,6 +59,7 @@ mod tests {
             content: vec![broca_protocol::content::ContentBlock::Text { text: "hi".into() }],
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }]);
         o.tools = Arc::new(vec![Tool {
             name: "get_time".into(),

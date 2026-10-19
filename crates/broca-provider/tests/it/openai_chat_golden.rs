@@ -26,6 +26,7 @@ fn fixed_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![ContentBlock::Text {
                 text: "Be concise.".into(),
@@ -35,6 +36,7 @@ fn fixed_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "What time is it in Madrid?".into(),
@@ -44,6 +46,7 @@ fn fixed_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
@@ -56,6 +59,7 @@ fn fixed_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::Tool,
             content: vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id: ToolCallId("call_01".into()),

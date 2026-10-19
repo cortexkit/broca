@@ -43,6 +43,7 @@ fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: prompt.into(),
@@ -132,6 +133,7 @@ fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: prompt.into(),
@@ -163,6 +165,7 @@ fn seed_resume_without_terminal(
     let mut seeded = FileWal::open(wal.wal_path(session)).expect("open wal");
     let recs = vec![
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -180,6 +183,7 @@ fn seed_resume_without_terminal(
             session: session.clone(),
             ts_ms: None,
             config: Box::new(RunConfig {
+                render_tags: false,
                 model: ModelHandle::new("stub", "m"),
                 tools: vec![edit_tool()].into(),
                 tool_choice: ToolChoice::Auto,
@@ -204,6 +208,7 @@ fn seed_resume_without_terminal(
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "hello".into(),
@@ -214,6 +219,7 @@ fn seed_resume_without_terminal(
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: AssistantMessage {

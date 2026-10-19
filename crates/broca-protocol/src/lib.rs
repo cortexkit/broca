@@ -50,6 +50,7 @@ pub mod provider;
 pub mod request;
 pub mod session;
 pub mod structured_output;
+pub mod tags;
 pub mod usage;
 
 // Convenience re-exports for the common wire surface.

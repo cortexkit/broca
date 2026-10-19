@@ -21,6 +21,14 @@ pub const OP_ROLE_DESCRIBE: &str = "role.describe";
 pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
 pub const OP_SESSION_BASELINE: &str = "session.baseline";
+/// Answer one runner-tagged part's stored text, or a character range of it.
+pub const OP_SESSION_RESOLVE: &str = "session.resolve";
+/// The capability group of a runner that tags every stored part and serves `session.resolve`.
+pub const TAGS_CAPABILITY: &str = "tags";
+/// `session.resolve` names a tag no part of the session's transcript holds.
+pub const UNKNOWN_TAG: &str = "unknown_tag";
+/// `session.resolve`'s `range` is inverted or ends past the part's text.
+pub const RANGE_OUT_OF_BOUNDS: &str = "range_out_of_bounds";
 
 pub use broca_protocol::READ_REPLY_MAX_BYTES;
 /// The `session.read` byte cap a page stops at when the request names none.
@@ -229,6 +237,7 @@ pub fn broca_role_describe_with_writers(
         "session.retract",
         "session.subscribe",
         "session.send",
+        OP_SESSION_RESOLVE,
     ]
     .map(String::from)
     .to_vec();
@@ -248,6 +257,9 @@ pub fn broca_role_describe_with_writers(
         "session_class",
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
+        // Draft name of the role's additive tags group (llm-runner 0.2.7, unpublished): every
+        // stored part has a durable tag, reads carry them, `session.resolve` answers them.
+        TAGS_CAPABILITY,
         // `session.send` takes an ordered `delivery` list with `dedupe_key` and `expires_at_ms`.
         // `turn_system` is accepted in a list but is never possible on this runner yet, so the
         // list falls through to its next mode.
@@ -296,6 +308,54 @@ pub fn broca_role_describe_with_writers(
             backup_classes: vec!["head".into()],
         },
     }
+}
+
+/// `session.resolve` params. Strict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveParams {
+    pub tag: u64,
+    /// A half-open range of the part's text, counted in Unicode scalar values (Rust `char`s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<CharRange>,
+}
+
+/// A half-open `[start, end)` range of a part's text, in Unicode scalar values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CharRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// `session.resolve`: the part a tag names and its stored text, exactly as stored (or the
+/// requested range of it). `part` is the same opaque key a read entry's tag row carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveResponse {
+    pub tag: u64,
+    pub part: String,
+    /// The part's kind: `text`, `reasoning`, `redacted_reasoning`, `tool_call` or `tool_result`.
+    pub kind: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<CharRange>,
+}
+
+/// `text`, or its `range` of characters. `None` when the range is inverted or ends past the text.
+pub fn resolve_range(text: &str, range: Option<CharRange>) -> Option<String> {
+    let Some(range) = range else {
+        return Some(text.to_owned());
+    };
+    let len = text.chars().count() as u64;
+    if range.start > range.end || range.end > len {
+        return None;
+    }
+    Some(
+        text.chars()
+            .skip(range.start as usize)
+            .take((range.end - range.start) as usize)
+            .collect(),
+    )
 }
 
 /// `session.baseline` params: none. Strict.
@@ -709,7 +769,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "56570fe00f47f8e5b9e987032f05ce2775a03790d5e3253d3d529365f3a500cc",
+            "fb3ab9721fea0ef5264517d9b29b7062328b48882815d6d6a63c12f75d6fee9d",
         );
     }
 
@@ -866,7 +926,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "d82291bccbd81a624ececd24f9be7ca95a43c05034692b2c451925514abcad52";
+        "459918df86f7423be23f7d868c0d47361ed18e87a7c2bf0af424998634d46d7f";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

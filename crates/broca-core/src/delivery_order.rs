@@ -201,6 +201,7 @@ pub fn ended(submission_id: &SubmissionId, reason: SendEndReason) -> WalRecord {
 /// The record of a `steer` delivery of `send` into `run_id`.
 pub fn steered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
     WalRecord::SendDelivered {
+        tags: None,
         submission_id: send.submission_id.clone(),
         run_id: run_id.clone(),
         mode: DeliveryMode::Steer,
@@ -218,6 +219,7 @@ pub fn with_tool_result(
     text: String,
 ) -> WalRecord {
     WalRecord::SendDelivered {
+        tags: None,
         submission_id: send.submission_id.clone(),
         run_id: run_id.clone(),
         mode: DeliveryMode::ToolResult,

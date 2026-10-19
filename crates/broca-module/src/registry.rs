@@ -2447,6 +2447,51 @@ impl LineageRegistry {
             .map(|read| (read.page, read.tools))
     }
 
+    /// Where the session's materialized transcript holds the part tagged `tag`, from the store's
+    /// tag index alone: no message and no WAL record is read. `None` when no store with a tag
+    /// index is configured, or its lookup failed (logged); the caller then reads the transcript.
+    pub async fn route_tag_location(
+        &self,
+        key: &LineageKey,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, OpenError> {
+        self.check_expired(key, None).await?;
+        let Some(store) = self
+            .inner
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.store.clone())
+        else {
+            return Ok(None);
+        };
+        let session = key.clone();
+        match spawn_blocking(JobKind::StoreRead, move || {
+            store.tag_location(&session, tag)
+        })
+        .await
+        {
+            Ok(Ok(location)) => Ok(location),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "session",
+                    "session.resolve tag index lookup failed; reading the transcript instead: session={} wal={} {error}",
+                    key.session,
+                    broca_core::session_addr(key)
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "session",
+                    "session.resolve tag index task failed; reading the transcript instead: session={} wal={} {error}",
+                    key.session,
+                    broca_core::session_addr(key)
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// [`Self::route_read_with_tools`], with what the same snapshot says beyond the page: the
     /// dispatch facts of the tool turns its WAL tail commits, and the time of the tail's newest
     /// timestamped record.
@@ -4487,6 +4532,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -4504,6 +4550,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                render_tags: false,
                 model: ModelHandle::new("stub", "stub-model"),
                 tools: Vec::new().into(),
                 tool_choice: ToolChoice::Auto,
@@ -4538,6 +4585,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: (AssistantMessage {

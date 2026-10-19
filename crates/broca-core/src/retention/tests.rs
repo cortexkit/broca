@@ -13,6 +13,7 @@ pub(crate) const MARKER: &str = "retention-content-must-not-be-projected-5d8e7b"
 
 pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention,
         hooks: None,
@@ -30,6 +31,7 @@ pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/retention-test", "runner", "session"),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: Default::default(),
             tool_choice: Default::default(),
@@ -67,6 +69,7 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
         started("r1", retention),
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: AssistantMessage {
@@ -160,6 +163,7 @@ fn retention_last_title_tail_has_no_title() {
     .unwrap();
     let sends = [
         WalRecord::Steered {
+            tags: None,
             retention: None,
             ts_ms: Some(1500),
             title: Some(MARKER.into()),

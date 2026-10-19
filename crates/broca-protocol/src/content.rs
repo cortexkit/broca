@@ -59,6 +59,13 @@ pub struct Message {
     /// a new lineage, NEVER splice a message out.
     #[serde(skip)]
     pub ordinal: Option<u64>,
+    /// The runner tags of this message's parts (see [`crate::tags`]). In-memory
+    /// only, like `ordinal`: never serialized, so it never enters a rendered request or the
+    /// bytes of a stored message, and ignored by equality. Replay attaches it from the WAL
+    /// records that carry the tags, and reads from the store attach it from the row beside the
+    /// message.
+    #[serde(skip)]
+    pub tags: crate::tags::TagSlot,
 }
 
 impl Message {
@@ -71,6 +78,7 @@ impl Message {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }
     }
 
@@ -84,7 +92,18 @@ impl Message {
             cache_prefix_blocks: None,
             origin: Some(origin),
             ordinal: None,
+            tags: Default::default(),
         }
+    }
+
+    /// Attach (or clear) this message's runner tags. Rendering state starts over.
+    pub fn set_tags(&mut self, tags: Option<std::sync::Arc<crate::tags::PartTags>>) {
+        self.tags = crate::tags::TagSlot::new(tags);
+    }
+
+    /// This message's runner tags, when its session has them.
+    pub fn part_tags(&self) -> Option<&crate::tags::PartTags> {
+        self.tags.get()
     }
 
     /// The opaque per-message identity token (`m<ordinal>`) an external reduction transform

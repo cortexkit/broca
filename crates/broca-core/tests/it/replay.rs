@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 
 fn run_config() -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
         tool_choice: ToolChoice::Auto,
@@ -70,6 +71,7 @@ fn run_config() -> RunConfig {
 /// The ONE atomic run-start record (config + input).
 fn start(run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -91,6 +93,7 @@ fn start(run: &str, text: &str) -> WalRecord {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
         }]
@@ -114,6 +117,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
 
 fn step_with_call(step: u64, id: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: (assistant_tool_call(id, "edit")).into(),
@@ -144,6 +148,7 @@ fn usage_with_cache(input_tokens: u64, cached_input_tokens: u64, output_tokens: 
 
 fn step_text_with_usage(step: u64, text: &str, usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: (AssistantMessage {
@@ -183,6 +188,7 @@ fn intent(b: &str, id: &str) -> WalRecord {
 
 fn result(b: &str, id: &str, outcome: DispatchOutcome) -> WalRecord {
     WalRecord::ToolResult {
+        tags: None,
         hooks: None,
         batch_id: BatchId(b.into()),
         result: broca_protocol::content::ToolResult {
@@ -200,6 +206,7 @@ fn result(b: &str, id: &str, outcome: DispatchOutcome) -> WalRecord {
 
 fn no_dispatch(b: &str, id: &str) -> WalRecord {
     WalRecord::ToolNoDispatch {
+        tags: None,
         hooks: None,
         batch_id: BatchId(b.into()),
         tool_call_id: ToolCallId(id.into()),
@@ -692,6 +699,7 @@ fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "edit the file".into(),
@@ -776,6 +784,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -810,6 +819,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
+                    tags: Default::default(),
                     role: Role::User,
                     content: vec![ContentBlock::Text { text: "go".into() }],
                 }]
@@ -818,6 +828,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: assistant.clone().into(),
@@ -844,6 +855,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                tags: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),
                 result: ToolResultProto("t1", "did-a").into(),
@@ -898,6 +910,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "go".into() }],
         }],
@@ -1439,6 +1452,7 @@ fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str)
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: prompt.into(),
@@ -1475,6 +1489,7 @@ fn text_request_with_system(
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![ContentBlock::Text {
                 text: system.into(),
@@ -1825,6 +1840,7 @@ async fn append_seals_an_inferred_natural_end_before_starting_the_next_episode()
     let mut file = wal.open(&session).expect("open WAL for crash cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -1923,6 +1939,7 @@ async fn append_seals_an_inferred_hard_stop_before_starting_the_next_episode() {
     let mut file = wal.open(&session).expect("open WAL for hard-stop cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2348,6 +2365,7 @@ async fn cross_episode_resume_is_exactly_once() {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "turn-1".into(),
@@ -2414,6 +2432,7 @@ async fn cross_episode_resume_is_exactly_once() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -2445,6 +2464,7 @@ async fn cross_episode_resume_is_exactly_once() {
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
+                    tags: Default::default(),
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: "turn-2".into(),
@@ -2455,6 +2475,7 @@ async fn cross_episode_resume_is_exactly_once() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: assistant_tool_call("e2", "edit").into(),
@@ -2646,7 +2667,9 @@ async fn append_episode_resume_keeps_request_bytes_identical_after_system_dedup(
     let resume_wal = FileWalStore::new(resume_dir.join("wal"));
     let resume_path = resume_wal.wal_path(&session);
     {
-        let mut wal_file = FileWal::open(&resume_path).unwrap();
+        let mut wal_file = FileWal::open(&resume_path)
+            .unwrap()
+            .with_feature_floor(resume_wal.feature_floor_path());
         for record in &crash_records {
             wal_file.append(1, record, true).unwrap();
         }
@@ -2820,6 +2843,7 @@ fn req2(session: &BindIdentity) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "turn-2".into(),
@@ -3040,6 +3064,7 @@ fn budgeted_start(run: &str) -> WalRecord {
             submission_id,
             ..
         } => WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -3072,6 +3097,7 @@ fn budget_fired(
     ordinal: u64,
 ) -> WalRecord {
     WalRecord::BudgetFired {
+        tags: None,
         run_id: RunId(run.into()),
         kind,
         threshold,
@@ -3118,6 +3144,7 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
     let mut reordered = vec![
         budgeted_start("r"),
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: AssistantMessage {
@@ -3376,6 +3403,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -3397,6 +3425,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
+                    tags: Default::default(),
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: "interrupted question".into(),
