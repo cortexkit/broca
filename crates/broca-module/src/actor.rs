@@ -1260,6 +1260,9 @@ pub struct LineageActor<W: WalStore> {
     admitting_manifest: Option<Arc<broca_wal::PlanManifest>>,
     /// The `delivery_order` group of the send being handled, held only while it is handled.
     admitting_order: Option<broca_protocol::DeliveryOrder>,
+    /// The attested principal of the send being handled when it is a plan-named sender other
+    /// than the session's owner; the send itself continues under the owner's principal.
+    admitting_sent_by: Option<broca_protocol::BindPrincipal>,
     /// For sends with an ordered `delivery` list: `ended_submissions` holds each one the WAL
     /// records as ended undelivered (`SendEnded`: replaced or expired) with its reason, and
     /// `delivered_submissions` each one it records as delivered into a running turn
@@ -1267,6 +1270,9 @@ pub struct LineageActor<W: WalStore> {
     /// `retracted_submissions`, so a keyed retry of such a send is answered with its outcome.
     ended_submissions: HashMap<broca_protocol::SubmissionId, broca_wal::record::SendEndReason>,
     delivered_submissions: HashMap<broca_protocol::SubmissionId, RunId>,
+    /// The order each ordered send's `DeliveryOrdered` record carries, by submission, loaded and
+    /// kept current with `retracted_submissions`. A keyed retry must carry the same order.
+    ordered_submissions: HashMap<broca_protocol::SubmissionId, broca_protocol::DeliveryOrder>,
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     /// Shared permit for manual and automatic cache refreshes. While held, keep the writer
@@ -1468,8 +1474,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             first_episode: Arc::clone(&first_episode),
             admitting_manifest: None,
             admitting_order: None,
+            admitting_sent_by: None,
             ended_submissions: HashMap::new(),
             delivered_submissions: HashMap::new(),
+            ordered_submissions: HashMap::new(),
             restart_admitting: false,
             restart_waiters: Vec::new(),
             warm_in_flight: Default::default(),
@@ -1842,6 +1850,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = self.sync_retention_index().await;
                 self.admitting_retention = None;
                 self.admitting_order = None;
+                self.admitting_sent_by = None;
                 // A manifest only ever applies to the episode its own send starts.
                 self.admitting_manifest = None;
                 let _ = self
@@ -2430,7 +2439,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     async fn on_send(
         &mut self,
         run_id: RunId,
-        request: SubmissionRequest,
+        mut request: SubmissionRequest,
         kind: RunKind,
         key: SendKey,
         skip_materialization: bool,
@@ -2554,15 +2563,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let mut reopen_refusal = None;
         // A send using the `delivery_order` group from a module other than the session's owner is
         // admitted only if the session's frozen plan names that module as a sender, matched on
-        // the daemon-attested principal. Such a sender joins the session as it is: it never
-        // freezes, adopts or reopens the session's scope, so the owner checks below are skipped.
-        let named_sender = match self.admitting_order.clone() {
-            Some(order) => match self.ordered_sender(&request, &order).await {
-                Ok(named) => named,
+        // the daemon-attested principal. Such a sender never becomes the session's principal: the
+        // send continues as an internal send under the session's frozen principal, so it takes
+        // the frozen scope (its tool routes carry the owner's) and never freezes, adopts or
+        // reopens one. The sender itself is recorded only on its `DeliveryOrdered` record.
+        self.admitting_sent_by = None;
+        if let Some(order) = self.admitting_order.clone() {
+            match self.ordered_sender(&request, &order).await {
+                Ok(Some(owner)) => {
+                    self.admitting_sent_by = request.principal.replace(owner);
+                    request.scope = broca_protocol::SendScope::Internal;
+                }
+                Ok(None) => {}
                 Err(outcome) => return outcome,
-            },
-            None => false,
-        };
+            }
+        }
         if !self.agent_run_writer_enabled() {
             if let Some(scope) = &self.agent_run_scope {
                 return SendOutcome::ScopeRefused(
@@ -2588,7 +2603,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 return SendOutcome::Error(format!("agent-run sends cannot carry {field}"));
             }
         }
-        if request.scope != broca_protocol::SendScope::Internal && !named_sender {
+        if request.scope != broca_protocol::SendScope::Internal {
             let ownership = match self.load_ownership().await {
                 Ok(ownership) => ownership,
                 Err(error) => {
@@ -2694,6 +2709,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let request_identity_digest = key
             .is_keyed()
             .then(|| send_identity_digest(&request, delivery, conversation_key.as_deref()));
+        // The delivery order is part of a keyed send's identity: a retry that asks for another
+        // order (an ordered send retried as a legacy one, or the reverse) is refused by name.
+        if key.is_keyed() {
+            match self.send_order_differs(&run_id).await {
+                Ok(true) => {
+                    return SendOutcome::SendIdReuse {
+                        differing: "delivery",
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => return SendOutcome::Error(error),
+            }
+        }
         // A key already used by a steer is answered from that steer's record: a steer opens no
         // episode of its own, so the run-id lookup below cannot find it. This also refuses a
         // later send of another mode under the same key, naming `delivery`.
@@ -4311,6 +4339,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             principal: principal.clone(),
             order: None,
+            sent_by: None,
         };
         // The session writer is shared with the active run, so this sync is a durable queue
         // barrier in the same sequence space as run records. The `Pending` reply below follows
@@ -4344,15 +4373,68 @@ impl<W: WalStore + 'static> LineageActor<W> {
         SendOutcome::Pending { submission_id }
     }
 
-    /// Whether the send being handled comes from a plan-named sender other than the session's
-    /// owner (`Ok(true)`), from the owner (`Ok(false)`), or must be refused. The sender is the
-    /// principal the daemon stamped on the route, never a request field. A named sender may use
-    /// `idle_start` only if the plan grants it.
+    /// The answer to a keyed retry of an ordered send delivered into run `run_id`: that run's state
+    /// now, as for a retry of the send that started it. Finished once its terminal is durable,
+    /// paused while it is paused, and active otherwise.
+    async fn delivered_run_outcome(&mut self, run_id: RunId) -> SendOutcome {
+        if matches!(&self.state, RunState::Active { run_id: active, .. } if *active == run_id) {
+            if let Some(reason) = self.durable_finish_of_active(&run_id) {
+                return SendOutcome::Finished {
+                    run_id,
+                    reason,
+                    delivered: None,
+                };
+            }
+            return SendOutcome::Active {
+                run_id,
+                delivered: None,
+            };
+        }
+        match self.reconcile_from_wal(&run_id).await {
+            Ok(Some(state)) => match indexed_finish_reason(&state.state) {
+                Some(reason) => SendOutcome::Finished {
+                    run_id,
+                    reason,
+                    delivered: None,
+                },
+                None => match state.pause_reason {
+                    Some(reason) => SendOutcome::Paused { run_id, reason },
+                    None => SendOutcome::Active {
+                        run_id,
+                        delivered: None,
+                    },
+                },
+            },
+            Ok(None) => SendOutcome::Error(format!(
+                "the WAL records a delivery into run {} but not the run",
+                run_id.0
+            )),
+            Err(error) => SendOutcome::Error(error),
+        }
+    }
+
+    /// Whether a keyed send reuses the run id of an earlier send that asked for a different
+    /// delivery order: a legacy send (no order) and an ordered send, or two different orders.
+    /// The same `send_id` is the same send, so the order is part of its identity.
+    async fn send_order_differs(&mut self, run_id: &RunId) -> Result<bool, String> {
+        self.ensure_wal_scan_loaded().await?;
+        let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
+        let used = self.recorded_send_keys.contains_key(run_id)
+            || self.ordered_submissions.contains_key(&submission_id);
+        Ok(used && self.ordered_submissions.get(&submission_id) != self.admitting_order.as_ref())
+    }
+
+    /// Whether the send being handled comes from the session's owner (`Ok(None)`), from a
+    /// plan-named sender other than the owner (`Ok(Some(frozen principal))`: the principal the
+    /// send continues under), or must be refused. The sender is the principal the daemon stamped
+    /// on the route, never a request field. A named sender may use `idle_start` only if the plan
+    /// grants it. The session's frozen principal is its scope's owner when it is scoped, else
+    /// the principal of its first episode.
     async fn ordered_sender(
         &mut self,
         request: &SubmissionRequest,
         order: &broca_protocol::DeliveryOrder,
-    ) -> Result<bool, SendOutcome> {
+    ) -> Result<Option<broca_protocol::BindPrincipal>, SendOutcome> {
         let ownership = self.load_ownership().await.map_err(|error| {
             SendOutcome::Transient(format!(
                 "cannot read the session's history for the sender check: {error}"
@@ -4365,7 +4447,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         )
         .is_ok()
         {
-            return Ok(false);
+            return Ok(None);
         }
         let refused = |code: &'static str, message: String| SendOutcome::DeliveryRefused {
             code,
@@ -4402,7 +4484,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 format!("the session's plan does not let module {module_id} start runs"),
             ));
         }
-        Ok(true)
+        let frozen = ownership
+            .scope
+            .as_ref()
+            .map(|scope| scope.owner.clone())
+            .or_else(|| ownership.first_principal.clone());
+        frozen.map(Some).ok_or_else(|| {
+            SendOutcome::Transient("the session has no frozen principal to send under".into())
+        })
     }
 
     /// Queue a send using the `delivery_order` group: `DeliveryOrdered` then `Queued`, in one
@@ -4446,11 +4535,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     reason: reason.clone(),
                 };
             }
-            if let Some(delivered_into) = self.delivered_submissions.get(&submission_id) {
-                return SendOutcome::Active {
-                    run_id: delivered_into.clone(),
-                    delivered: None,
-                };
+            if let Some(delivered_into) = self.delivered_submissions.get(&submission_id).cloned() {
+                return self.delivered_run_outcome(delivered_into).await;
             }
             if self.retracted_submissions.contains(&submission_id) {
                 return SendOutcome::Retracted { submission_id };
@@ -4531,7 +4617,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             principal: principal.clone(),
             order: Some(order.clone()),
+            sent_by: self.admitting_sent_by.clone(),
         };
+        // Whose dedupe key this is: the plan-named sender, or the owner sending as itself.
+        let sender = self.admitting_sent_by.clone().or_else(|| principal.clone());
         let Some(send) = broca_core::delivery_order::OrderedSend::from_pending(&pending) else {
             unreachable!("an ordered pending entry has an order");
         };
@@ -4552,6 +4641,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let ordered = WalRecord::DeliveryOrdered {
             submission_id: submission_id.clone(),
             order: order.clone(),
+            sent_by: self.admitting_sent_by.clone(),
         };
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let write = |superseded: Option<&broca_protocol::SubmissionId>| {
@@ -4594,9 +4684,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .pending_fifo
                     .iter()
                     .filter_map(broca_core::delivery_order::OrderedSend::from_pending)
-                    .find(|queued| {
-                        queued.replaced_by(principal.as_ref(), order.dedupe_key.as_deref())
-                    })
+                    .find(|queued| queued.replaced_by(sender.as_ref(), order.dedupe_key.as_deref()))
                     .map(|queued| queued.submission_id);
                 write_once(queued_old.as_ref());
                 queued_old
@@ -4619,6 +4707,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
         self.note_recorded_send_key(&run_id, false, request_identity_digest.as_deref());
+        if self.wal_scan_complete {
+            self.ordered_submissions
+                .insert(submission_id.clone(), order.clone());
+        }
         broca_core::insert_in_drain_order(&mut self.pending_fifo, pending);
         if skip_materialization {
             self.skip_materialization_submissions
@@ -6984,6 +7076,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     submission_id,
                     reason,
                 } => Some((submission_id.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        self.ordered_submissions = records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::DeliveryOrdered {
+                    submission_id,
+                    order,
+                    ..
+                } => Some((submission_id.clone(), order.clone())),
                 _ => None,
             })
             .collect();

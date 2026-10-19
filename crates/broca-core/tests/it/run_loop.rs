@@ -3710,6 +3710,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
             )];
             PendingSubmission {
                 order: None,
+                sent_by: None,
                 hooks: None,
                 title: None,
                 conversation_key: None,
@@ -3732,7 +3733,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         tail: Vec::new(),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
-            pending_orders: Vec::new(),
+            pending_order: None,
             input_budget: None,
             session_class: None,
             lineage_retention: None,

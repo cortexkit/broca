@@ -148,7 +148,8 @@ pub fn apply_to_prompt(prompt: &mut [Message], tool_call_id: &ToolCallId, text: 
 pub struct OrderedSend {
     pub submission_id: SubmissionId,
     pub order: DeliveryOrder,
-    /// The principal that queued the send; dedupe replaces only sends from the same one.
+    /// The principal that sent it (a plan-named sender, or else the principal that queued it);
+    /// dedupe replaces only sends from the same one.
     pub principal: Option<BindPrincipal>,
     /// The user message(s) a `steer` delivery places.
     pub input: Vec<Message>,
@@ -170,7 +171,10 @@ impl OrderedSend {
         Some(Self {
             submission_id: pending.submission_id.clone(),
             order,
-            principal: pending.principal.clone(),
+            principal: pending
+                .sent_by
+                .clone()
+                .or_else(|| pending.principal.clone()),
             input: input
                 .into_iter()
                 .filter(|message| message.role != Role::System)

@@ -106,8 +106,15 @@ impl SendParamsExt for SendParams {
             delivery,
             dedupe_key,
             expires_at_ms,
+            template,
             append_episode,
         } = self;
+        // The serve adapter refuses a template by name before converting; nothing here uses it.
+        if template.is_some() {
+            return Err(broca_core::RunError::Config(
+                "template sends are not supported by this runner".into(),
+            ));
+        }
         // The one decode of the `delivery_order` group; the serve adapter has already refused a
         // malformed one by field, so an error here is a caller bug surfaced as a config refusal.
         let order =
@@ -388,6 +395,7 @@ mod tests {
             delivery: None,
             dedupe_key: None,
             expires_at_ms: None,
+            template: None,
             append_episode: false,
             context_management: None,
         }

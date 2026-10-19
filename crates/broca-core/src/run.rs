@@ -9197,7 +9197,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
-                pending_orders: Vec::new(),
+                pending_order: None,
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.

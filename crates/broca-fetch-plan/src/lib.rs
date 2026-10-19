@@ -25,6 +25,6 @@ pub use admit::{
 };
 pub use plan::{
     check_later_plan, check_send_members, parse_plan, plan_identity, plan_senders,
-    CompactionSupport, Plan, PlanSender, PlanTemplate, SENDERS_MEMBER,
+    CompactionSupport, Plan, PlanSender, PlanTemplate, SlotType, SENDERS_MEMBER,
 };
 pub use refusal::{Refusal, Unanswered};

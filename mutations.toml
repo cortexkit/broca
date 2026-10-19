@@ -17198,3 +17198,46 @@ file = "crates/broca-core/src/steer.rs"
 old = '''                records.push(steered(&send, run_id));'''
 new = '''                records.push(steered(&send, run_id));
                 kept.push(send.clone()); // NON-VACUITY BREAK: a delivered send stays replaceable'''
+
+[[control]]
+id = "delivery-order-named-sender-runs-as-owner"
+guards = "a plan-named sender's send runs under the session's frozen principal; the sender never becomes the session's principal"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_sender_never_becomes_the_sessions_principal"]
+file = "crates/broca-module/src/actor.rs"
+old = "self.admitting_sent_by = request.principal.replace(owner);"
+new = "self.admitting_sent_by = request.principal.clone(); let _ = owner; // NON-VACUITY BREAK: keep the sender as the principal"
+
+[[control]]
+id = "delivery-order-torn-order-dropped"
+guards = "an order whose Queued record a torn tail lost is dropped at the next record only the session's actor writes"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+test_file = "crates/broca-store/tests/it/delivery_order_resume.rs"
+expect_red = [
+    "delivery_order_resume::a_steer_delivery_survives_every_crash_cut_and_the_store_fold",
+    "delivery_order_resume::a_tool_result_delivery_survives_every_crash_cut_and_the_store_fold",
+    "delivery_order_resume::an_idle_start_delivery_survives_every_crash_cut",
+]
+file = "crates/broca-core/src/admission.rs"
+old = '''            | WalRecord::RunStarted { .. }
+            | WalRecord::Retracted { .. }
+            | WalRecord::Steered { .. } => self.pending_order.take(),'''
+new = '''            | WalRecord::Retracted { .. }
+            | WalRecord::Steered { .. } => self.pending_order.take(), // NON-VACUITY BREAK: a run start keeps a torn order'''
+
+[[control]]
+id = "delivery-order-retry-reports-run-state"
+guards = "a keyed retry of a delivered ordered send reports the delivered run's current state, finished once it ended"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_keyed_retry_reports_the_delivered_runs_state_and_keeps_its_order"]
+file = "crates/broca-module/src/actor.rs"
+old = "Ok(Some(state)) => match indexed_finish_reason(&state.state) {"
+new = "Ok(Some(state)) => match None::<broca_protocol::RunFinishReason>.filter(|_| indexed_finish_reason(&state.state).is_some()) { // NON-VACUITY BREAK: report a finished run as active"

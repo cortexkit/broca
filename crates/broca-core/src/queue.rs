@@ -75,6 +75,11 @@ pub struct PendingSubmission {
     /// for every other queued send, which drains into a run exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<broca_protocol::DeliveryOrder>,
+    /// The plan-named sender of an ordered send from a module other than the session's owner,
+    /// from its `DeliveryOrdered` record. `principal` is then the session's frozen principal,
+    /// which the send runs under; this is whose dedupe key the send carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_by: Option<broca_protocol::BindPrincipal>,
 }
 
 impl PendingSubmission {
@@ -134,7 +139,11 @@ pub fn insert_in_drain_order(queue: &mut Vec<PendingSubmission>, pending: Pendin
 /// once, which is the sense in which the field is safe to leave ungated.
 pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
     let retracted: HashSet<&SubmissionId> = records.iter().filter_map(removes_pending).collect();
-    let mut orders: std::collections::HashMap<&SubmissionId, &broca_protocol::DeliveryOrder> =
+    type Ordered<'a> = (
+        &'a broca_protocol::DeliveryOrder,
+        &'a Option<broca_protocol::BindPrincipal>,
+    );
+    let mut orders: std::collections::HashMap<&SubmissionId, Ordered<'_>> =
         std::collections::HashMap::new();
     let consumed: HashSet<&SubmissionId> = records
         .iter()
@@ -151,9 +160,10 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
         if let WalRecord::DeliveryOrdered {
             submission_id,
             order,
+            sent_by,
         } = record
         {
-            orders.insert(submission_id, order);
+            orders.insert(submission_id, (order, sent_by));
         }
         if let WalRecord::Queued {
             keep_warm,
@@ -188,7 +198,10 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
                     send_id: send_id.clone(),
                     title: title.clone(),
                     delivery: *delivery,
-                    order: orders.get(submission_id).map(|order| (*order).clone()),
+                    order: orders.get(submission_id).map(|(order, _)| (*order).clone()),
+                    sent_by: orders
+                        .get(submission_id)
+                        .and_then(|(_, sent_by)| (*sent_by).clone()),
                 },
             );
         }

@@ -958,9 +958,16 @@ pub enum WalRecord {
     /// order before it (a running turn's own records may lie between the two). The queued send
     /// then waits until a request boundary where one of its modes is possible; it starts a run
     /// only if its order lists `idle_start`.
+    ///
+    /// `sent_by` is the attested principal of a plan-named sender other than the session's
+    /// owner. Such a send is queued (and any run it starts recorded) under the session's frozen
+    /// principal, never the sender's, so the sender is kept only here: it is whose dedupe key
+    /// the send carries. Absent for a send from the owner.
     DeliveryOrdered {
         submission_id: SubmissionId,
         order: broca_protocol::DeliveryOrder,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
     },
     /// A queued, undelivered send that will never be delivered: a newer send from the same
     /// sender with the same `dedupe_key` replaced it, or it expired. Removes the send from the

@@ -242,7 +242,7 @@ const DEFERRED_CALL_PINNED: &[&str] = &[
 /// The records of sends with an ordered `delivery` list, each with its optional fields present
 /// and absent.
 const DELIVERY_ORDER_PINNED: &[&str] = &[
-    r#"{"type":"delivery_ordered","submission_id":"sub-r2","order":{"modes":["tool_result","turn_system","steer","idle_start"],"dedupe_key":"ctx-reduce","expires_at_ms":1790000000000}}"#,
+    r#"{"type":"delivery_ordered","submission_id":"sub-r2","order":{"modes":["tool_result","turn_system","steer","idle_start"],"dedupe_key":"ctx-reduce","expires_at_ms":1790000000000},"sent_by":{"kind":"reserved","module_id":"ck-mc"}}"#,
     r#"{"type":"delivery_ordered","submission_id":"sub-r2","order":{"modes":["steer"]}}"#,
     r#"{"type":"send_ended","submission_id":"sub-r2","reason":{"kind":"superseded","by":"sub-r3"}}"#,
     r#"{"type":"send_ended","submission_id":"sub-r2","reason":{"kind":"expired"}}"#,

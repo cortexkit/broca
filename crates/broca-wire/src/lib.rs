@@ -307,6 +307,11 @@ pub struct SendParams {
     /// dropped, recorded durably, and ends `expired`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
+    /// `delivery_order` group: a `turn_system` send names a plan-declared template and its slot
+    /// values here instead of carrying `input`. This runner renders no templates, so any send
+    /// carrying the member is refused by name rather than ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<serde_json::Value>,
     /// Deprecated inert compatibility field. The coordinator determines append behavior from the
     /// run identity.
     #[serde(default)]
@@ -498,10 +503,23 @@ impl SendParams {
         legacy_delivery(self.delivery.as_ref())
     }
 
-    /// The `delivery_order` group as this send uses it (see [`delivery_order`]).
+    /// The `delivery_order` group as this send uses it (see [`delivery_order`]). A `template`
+    /// is refused whatever `delivery` is: with a legacy string it is invalid, and in a list this
+    /// runner has no templates to render (`turn_system` is never possible here).
     pub fn delivery_order(
         &self,
     ) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
+        if self.template.is_some() {
+            return Err((
+                "template",
+                match self.delivery {
+                    Some(SendDelivery::Order(_)) => {
+                        "template sends are not supported by this runner".into()
+                    }
+                    _ => "template is valid only when delivery is an ordered list".into(),
+                },
+            ));
+        }
         delivery_order(
             self.delivery.as_ref(),
             self.dedupe_key.as_deref(),
@@ -517,41 +535,34 @@ pub fn legacy_delivery(delivery: Option<&SendDelivery>) -> broca_protocol::Deliv
 }
 
 /// The `delivery_order` group as a send uses it, or `None` for a send that uses none of it (which
-/// then behaves exactly as before the group existed). A legacy string combined with `dedupe_key`
-/// or `expires_at_ms` takes the list it stands for: absent or `"queue"` is `["idle_start"]` and
-/// `"steer"` is `["steer", "idle_start"]`; `"interrupt"` has no list form and is refused.
+/// then behaves exactly as before the group existed). `dedupe_key` and `expires_at_ms` are valid
+/// only when `delivery` is an ordered list: with a legacy string or no `delivery` they are
+/// refused, so a runner that would ignore them never sees them as part of an ordinary send.
 /// Refusals name the field.
 pub fn delivery_order(
     delivery: Option<&SendDelivery>,
     dedupe_key: Option<&str>,
     expires_at_ms: Option<u64>,
 ) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
-    use broca_protocol::{Delivery, DeliveryMode};
+    let Some(SendDelivery::Order(modes)) = delivery else {
+        for (field, present) in [
+            ("dedupe_key", dedupe_key.is_some()),
+            ("expires_at_ms", expires_at_ms.is_some()),
+        ] {
+            if present {
+                return Err((
+                    field,
+                    format!("{field} is valid only when delivery is an ordered list"),
+                ));
+            }
+        }
+        return Ok(None);
+    };
     if dedupe_key.is_some_and(str::is_empty) {
         return Err(("dedupe_key", "dedupe_key must not be empty".into()));
     }
-    let grouped = dedupe_key.is_some() || expires_at_ms.is_some();
-    let modes = match delivery {
-        Some(SendDelivery::Order(modes)) => modes.clone(),
-        _ if !grouped => return Ok(None),
-        None | Some(SendDelivery::Mode(Delivery::Queue)) => vec![DeliveryMode::IdleStart],
-        Some(SendDelivery::Mode(Delivery::Steer)) => {
-            vec![DeliveryMode::Steer, DeliveryMode::IdleStart]
-        }
-        Some(SendDelivery::Mode(Delivery::Interrupt)) => {
-            let field = if dedupe_key.is_some() {
-                "dedupe_key"
-            } else {
-                "expires_at_ms"
-            };
-            return Err((
-                field,
-                format!("{field} cannot be combined with delivery \"interrupt\""),
-            ));
-        }
-    };
     Ok(Some(broca_protocol::DeliveryOrder {
-        modes,
+        modes: modes.clone(),
         dedupe_key: dedupe_key.map(str::to_owned),
         expires_at_ms,
     }))
@@ -2656,6 +2667,7 @@ mod tests {
                 "delivery",
                 "dedupe_key",
                 "expires_at_ms",
+                "template",
                 "append_episode",
             ]
         );
@@ -3493,7 +3505,7 @@ mod delivery_order_params {
     }
 
     /// A send using none of the group has no order, whatever its legacy mode, so it runs exactly
-    /// as before; a legacy string with a group field takes the list it stands for.
+    /// as before.
     #[test]
     fn legacy_strings_keep_their_meaning() {
         for wire in [
@@ -3504,20 +3516,32 @@ mod delivery_order_params {
         ] {
             assert_eq!(send(wire).unwrap().delivery_order().unwrap(), None);
         }
-        let queue = send(serde_json::json!({"dedupe_key": "k"})).unwrap();
-        assert_eq!(
-            queue.delivery_order().unwrap().unwrap().modes,
-            vec![DeliveryMode::IdleStart]
-        );
-        let steer = send(serde_json::json!({"delivery": "steer", "expires_at_ms": 5})).unwrap();
-        assert_eq!(
-            steer.delivery_order().unwrap().unwrap().modes,
-            vec![DeliveryMode::Steer, DeliveryMode::IdleStart]
-        );
-        let interrupt =
-            send(serde_json::json!({"delivery": "interrupt", "dedupe_key": "k"})).unwrap();
-        assert_eq!(interrupt.delivery_order().unwrap_err().0, "dedupe_key");
-        let empty = send(serde_json::json!({"dedupe_key": ""})).unwrap();
+    }
+
+    /// `dedupe_key`, `expires_at_ms` and `template` are valid only with an ordered list: with a
+    /// legacy string or no `delivery` the send is refused naming the field, never run with the
+    /// member ignored. A template is refused in a list too, since this runner renders none.
+    #[test]
+    fn group_members_without_an_ordered_list_are_refused_by_name() {
+        for delivery in [None, Some("queue"), Some("steer"), Some("interrupt")] {
+            for (member, value) in [
+                ("dedupe_key", serde_json::json!("k")),
+                ("expires_at_ms", serde_json::json!(5)),
+                ("template", serde_json::json!({"id": "t", "slots": {}})),
+            ] {
+                let mut params = serde_json::json!({ member: value });
+                if let Some(delivery) = delivery {
+                    params["delivery"] = serde_json::json!(delivery);
+                }
+                let refused = send(params).unwrap().delivery_order().unwrap_err();
+                assert_eq!(refused.0, member, "{delivery:?}");
+            }
+        }
+        let listed =
+            send(serde_json::json!({"delivery": ["steer"], "template": {"id": "t", "slots": {}}}))
+                .unwrap();
+        assert_eq!(listed.delivery_order().unwrap_err().0, "template");
+        let empty = send(serde_json::json!({"delivery": ["steer"], "dedupe_key": ""})).unwrap();
         assert_eq!(empty.delivery_order().unwrap_err().0, "dedupe_key");
     }
 

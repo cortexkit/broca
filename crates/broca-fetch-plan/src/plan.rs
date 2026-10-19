@@ -89,12 +89,28 @@ pub struct PlanSender {
 }
 
 /// A `turn_system` template a sender declared: the text with its typed slots, and the digest
-/// of the text.
+/// of the text. A send names one as `template: {id, slots}`, giving a value for each slot; the
+/// runner validates and renders every value itself. An unknown id or a bad slot refuses the send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanTemplate {
     pub id: String,
     pub text_with_slots: String,
     pub digest: String,
+    /// The template's slots by name. There are no free-text slots.
+    pub slots: BTreeMap<String, SlotType>,
+}
+
+/// The type of one template slot, and so the values a send may give it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotType {
+    /// An integer, optionally bounded (inclusive).
+    Integer { min: Option<i64>, max: Option<i64> },
+    /// An integer from 0 to 100.
+    Percentage,
+    /// A tag that must resolve to a tag of the session.
+    Tag,
+    /// One of the listed strings.
+    Enum { values: Vec<String> },
 }
 
 /// Read the plan's `senders` member: absent means none. Each entry is
@@ -131,6 +147,14 @@ pub fn plan_senders(plan: &Map<String, Value>) -> Result<Vec<PlanSender>, Refusa
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err(Refusal::invalid(format!("{at}.templates"))),
         };
+        // A send names its template by id, so a sender's ids must be distinct.
+        let mut ids = BTreeSet::new();
+        if !templates
+            .iter()
+            .all(|template: &PlanTemplate| ids.insert(template.id.clone()))
+        {
+            return Err(Refusal::invalid(format!("{at}.templates")));
+        }
         senders.push(PlanSender {
             module,
             idle_start,
@@ -156,37 +180,57 @@ fn plan_template(value: &Value, at: &str) -> Result<PlanTemplate, Refusal> {
     {
         return Err(Refusal::invalid(format!("{at}.digest")));
     }
-    if let Some(slots) = object.get("slots") {
-        let slots = slots
+    if id.is_empty() {
+        return Err(Refusal::invalid(format!("{at}.id")));
+    }
+    let mut slots = BTreeMap::new();
+    if let Some(declared) = object.get("slots") {
+        let declared = declared
             .as_object()
             .ok_or_else(|| Refusal::invalid(format!("{at}.slots")))?;
-        for (name, slot) in slots {
+        for (name, slot) in declared {
             let slot_at = format!("{at}.slots.{name}");
-            let slot = slot.as_object().ok_or_else(|| Refusal::invalid(&slot_at))?;
-            let well_typed = match slot.get("type").and_then(Value::as_str) {
-                Some("integer") => ["min", "max"]
-                    .iter()
-                    .all(|bound| slot.get(*bound).is_none_or(Value::is_i64)),
-                Some("percentage" | "tag") => true,
+            let refuse = || Refusal::invalid(&slot_at);
+            let slot = slot.as_object().ok_or_else(refuse)?;
+            let bound = |key: &str| match slot.get(key) {
+                None => Ok(None),
+                Some(value) => value.as_i64().map(Some).ok_or_else(refuse),
+            };
+            let typed = match slot.get("type").and_then(Value::as_str) {
+                Some("integer") => {
+                    let (min, max) = (bound("min")?, bound("max")?);
+                    if min.zip(max).is_some_and(|(min, max)| min > max) {
+                        return Err(refuse());
+                    }
+                    SlotType::Integer { min, max }
+                }
+                Some("percentage") => SlotType::Percentage,
+                Some("tag") => SlotType::Tag,
                 Some("enum") => {
-                    slot.get("values")
+                    let values: Vec<String> = slot
+                        .get("values")
                         .and_then(Value::as_array)
-                        .is_some_and(|values| {
-                            !values.is_empty() && values.iter().all(Value::is_string)
-                        })
+                        .ok_or_else(refuse)?
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_owned).ok_or_else(refuse))
+                        .collect::<Result<_, _>>()?;
+                    let distinct: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+                    if values.is_empty() || distinct.len() != values.len() {
+                        return Err(refuse());
+                    }
+                    SlotType::Enum { values }
                 }
                 // No other slot type exists; in particular there are no free-text string slots.
-                _ => false,
+                _ => return Err(refuse()),
             };
-            if !well_typed {
-                return Err(Refusal::invalid(slot_at));
-            }
+            slots.insert(name.clone(), typed);
         }
     }
     Ok(PlanTemplate {
         id,
         text_with_slots,
         digest,
+        slots,
     })
 }
 
@@ -575,6 +619,24 @@ mod sender_tests {
         assert_eq!(read[0].module, "ck-mc");
         assert!(read[0].idle_start);
         assert_eq!(read[0].templates[0].id, "t");
+        assert_eq!(
+            read[0].templates[0].slots,
+            BTreeMap::from([
+                (
+                    "k".to_owned(),
+                    SlotType::Enum {
+                        values: vec!["a".into()]
+                    }
+                ),
+                (
+                    "n".to_owned(),
+                    SlotType::Integer {
+                        min: Some(0),
+                        max: None
+                    }
+                ),
+            ])
+        );
         assert!(!read[1].idle_start);
         assert!(read[1].templates.is_empty());
     }
@@ -598,6 +660,18 @@ mod sender_tests {
             (
                 json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{s}", "digest": digest, "slots": {"s": {"type": "string"}}}]}]),
                 "plan.senders[0].templates[0].slots.s",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{n}", "digest": digest, "slots": {"n": {"type": "integer", "min": 5, "max": 1}}}]}]),
+                "plan.senders[0].templates[0].slots.n",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{e}", "digest": digest, "slots": {"e": {"type": "enum", "values": ["a", "a"]}}}]}]),
+                "plan.senders[0].templates[0].slots.e",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "x", "digest": digest}, {"id": "t", "text_with_slots": "y", "digest": digest}]}]),
+                "plan.senders[0].templates",
             ),
         ] {
             assert_eq!(

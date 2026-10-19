@@ -48,6 +48,17 @@ pub struct FakeExecutor {
     /// `true` ⇒ an unscripted run takes one step boundary (through the run's steer inbox, as the
     /// real loop does) before it finishes, so ordered sends can be delivered into it.
     step_boundary: bool,
+    /// Every run this executor started: its run id, and the principal and scope its request
+    /// carried (the scope is what its tool routes would be opened under).
+    pub seen: std::sync::Mutex<Vec<SeenRun>>,
+}
+
+/// What a started run's request carried.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenRun {
+    pub run_id: String,
+    pub principal: Option<broca_protocol::BindPrincipal>,
+    pub scope: Option<broca_protocol::SessionScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +399,8 @@ impl FakeExecutor {
             on_restart: None,
             keep_warm: None,
             marker_order_version: None,
-            manifest: None,
+            // The frozen plan, as the real loop records it, so later sends see it.
+            manifest: job.control.manifest.as_deref().cloned().map(Box::new),
             scope: None,
             send_id: None,
             request_identity_digest: None,
@@ -419,6 +431,11 @@ impl RunExecutor for FakeExecutor {
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         self.started.fetch_add(1, Ordering::SeqCst);
+        self.seen.lock().unwrap().push(SeenRun {
+            run_id: job.req.run_id.0.clone(),
+            principal: job.req.principal.clone(),
+            scope: job.req.scope.clone(),
+        });
         if let Some(script) = self.scripted.lock().await.pop_front() {
             return self.execute_script(script, job, out).await;
         }

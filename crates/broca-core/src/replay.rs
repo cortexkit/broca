@@ -2683,7 +2683,7 @@ mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
-                pending_orders: Vec::new(),
+                pending_order: None,
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 lineage_retention: None,
