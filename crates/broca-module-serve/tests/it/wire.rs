@@ -6048,21 +6048,22 @@ async fn a_corrupt_wal_still_answers_open_failed_with_unchanged_bytes() {
     let mut route = PreparedWalRoute::start("corrupt-open-failed", corrupt_first_frame).await;
     let before = std::fs::read(&route.wal_path).unwrap();
 
-    // The read is lease-free and reads the WAL directly.
-    let read = route.expect_error(2, read_request()).await;
-    assert_eq!(
-        String::from_utf8(read).unwrap(),
-        r#"{"code":"open_failed","message":"open failed: wal range-read failed: wal corruption at offset 0: record seq=0 failed its digest — WAL corruption"}"#
-    );
+    // The read, and status on a session with no live actor and a small log, are lease-free
+    // and read the WAL directly.
+    let reader_refusal = r#"{"code":"open_failed","message":"open failed: wal range-read failed: wal corruption at offset 0: record seq=0 failed its digest — WAL corruption"}"#;
+    for (corr, request) in [(2, read_request()), (4, status_request())] {
+        let body = route.expect_error(corr, request.clone()).await;
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            reader_refusal,
+            "{request}"
+        );
+    }
 
     // Every actor-backed operation goes through the lineage opener, which opens the WAL for
     // writing and refuses it the same way for each of them.
     let opener_refusal = r#"{"code":"open_failed","message":"open failed: wal write failure: wal corruption at offset 0: record seq=0 failed its digest — WAL corruption"}"#;
-    for (corr, request) in [
-        (3, send_request()),
-        (4, status_request()),
-        (5, subscribe_request()),
-    ] {
+    for (corr, request) in [(3, send_request()), (5, subscribe_request())] {
         let body = route.expect_error(corr, request.clone()).await;
         assert_eq!(
             String::from_utf8(body).unwrap(),
@@ -6110,20 +6111,21 @@ async fn a_newer_writer_wal_answers_wal_newer_writer_on_every_served_path() {
     let mut route = PreparedWalRoute::start("newer-writer-code", append_newer_writer_frame).await;
     let before = std::fs::read(&route.wal_path).unwrap();
 
-    // The read is lease-free and reads the WAL directly.
-    let read = route.expect_error(2, read_request()).await;
-    assert_eq!(
-        String::from_utf8(read).unwrap(),
-        r#"{"code":"wal_newer_writer","message":"open failed: wal range-read failed: wal written by a newer broca (NewerWriter): the version 3 frame at offset 383 requires features this build does not know: probe-unknown/v1","detail":{"kind":"newer_writer","missing":["probe-unknown/v1"]}}"#
-    );
+    // The read, and status on a session with no live actor and a small log, are lease-free
+    // and read the WAL directly.
+    let reader_refusal = r#"{"code":"wal_newer_writer","message":"open failed: wal range-read failed: wal written by a newer broca (NewerWriter): the version 3 frame at offset 383 requires features this build does not know: probe-unknown/v1","detail":{"kind":"newer_writer","missing":["probe-unknown/v1"]}}"#;
+    for (corr, request) in [(2, read_request()), (4, status_request())] {
+        let body = route.expect_error(corr, request.clone()).await;
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            reader_refusal,
+            "{request}"
+        );
+    }
 
     // Every actor-backed operation first opens the session, which opens its WAL for writing.
     let opener_refusal = r#"{"code":"wal_newer_writer","message":"open failed: wal write failure: wal written by a newer broca (NewerWriter): the version 3 frame at offset 383 requires features this build does not know: probe-unknown/v1","detail":{"kind":"newer_writer","missing":["probe-unknown/v1"]}}"#;
-    for (corr, request) in [
-        (3, send_request()),
-        (4, status_request()),
-        (5, subscribe_request()),
-    ] {
+    for (corr, request) in [(3, send_request()), (5, subscribe_request())] {
         let body = route.expect_error(corr, request.clone()).await;
         assert_eq!(
             String::from_utf8(body).unwrap(),
