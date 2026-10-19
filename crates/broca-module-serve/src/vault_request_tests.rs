@@ -1655,6 +1655,7 @@ async fn routed_chatgpt_choice() -> AccountChoice {
         conversation_key: None, inherited_conversation_key: None,
         static_credential: &credential, caller_named_account: false,
         model: "gpt-6.1", session: &broca_protocol::BindIdentity::new("/tmp", "broca", "chatgpt"),
+        send_id: None,
         run_id: "chatgpt-run", initial_input_bytes: 42,
     }, async { Some(listing) }, tokio::time::Instant::now() + ADMISSION_BUDGET).await.unwrap();
     let requests = routing.requests.lock().unwrap();

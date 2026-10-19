@@ -380,7 +380,9 @@ pub enum AccountForOutcome {
     AuthRequired { decision_id: Option<String> },
     /// Any refusal broca passes on to the caller.
     Refused(AccountSelectionRefusal),
-    /// No usable answer: no reply in time, a failed route, or a reply broca cannot read.
+    /// Routing did not return a decision before the admission budget expired.
+    NoDecisionWithinBudget,
+    /// No usable answer: a failed route or a reply broca cannot read.
     Unreachable(String),
 }
 
@@ -393,6 +395,7 @@ impl AccountForOutcome {
             AccountForOutcome::Unsupported => "unsupported",
             AccountForOutcome::AuthRequired { .. } => "auth_required",
             AccountForOutcome::Refused(_) => "refused",
+            AccountForOutcome::NoDecisionWithinBudget => "no_decision_within_budget",
             AccountForOutcome::Unreachable(_) => "unreachable",
         }
     }
@@ -654,10 +657,7 @@ impl RoutingClient {
         };
         let started = std::time::Instant::now();
         let outcome = match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
-            Err(_) => AccountForOutcome::Unreachable(format!(
-                "no reply within the {} ms admission budget",
-                ADMISSION_BUDGET.as_millis()
-            )),
+            Err(_) => AccountForOutcome::NoDecisionWithinBudget,
             Ok(Err(cause)) => AccountForOutcome::Unreachable(cause),
             Ok(Ok(reply)) => classify_account_for_reply(reply),
         };
@@ -787,6 +787,7 @@ pub struct ChoiceInputs<'a> {
     pub caller_named_account: bool,
     pub model: &'a str,
     pub session: &'a BindIdentity,
+    pub send_id: Option<&'a str>,
     pub run_id: &'a str,
     pub initial_input_bytes: u64,
 }
@@ -954,6 +955,20 @@ where
             );
             static_fallback(broca_wal::ACCOUNT_DECISION_UNREACHABLE)
         }
+        AccountForOutcome::NoDecisionWithinBudget => {
+            client.counters.bump("unreachable");
+            tracing::info!(
+                target: "routing",
+                session = %broca_core::session_addr(inputs.session),
+                send_id = inputs.send_id.unwrap_or("<none>"),
+                provider = %provider,
+                auth_method = method.as_token(),
+                "routing did not provide an account decision within the {} ms admission budget; run {} takes the static account",
+                ADMISSION_BUDGET.as_millis(),
+                inputs.run_id
+            );
+            static_fallback(broca_wal::ACCOUNT_DECISION_UNREACHABLE)
+        }
         AccountForOutcome::AuthRequired { decision_id } => {
             client.counters.bump("auth_required");
             Ok(AccountChoice::AuthRequired(decision(
@@ -967,6 +982,18 @@ where
             client
                 .counters
                 .bump(&format!("refused.{}", refusal.routing_code));
+            tracing::warn!(
+                target: "routing",
+                session = %broca_core::session_addr(inputs.session),
+                send_id = inputs.send_id.unwrap_or("<none>"),
+                provider = %provider,
+                auth_method = method.as_token(),
+                routing_code = %refusal.routing_code,
+                class = ?refusal.class,
+                retry_after_s = ?refusal.retry_after_s,
+                decision_id = refusal.decision_id.as_deref().unwrap_or("<none>"),
+                "routing refused account selection"
+            );
             if matches!(
                 refusal.routing_code.as_str(),
                 "admission_conflict" | "invalid_request"
