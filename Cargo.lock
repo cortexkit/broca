@@ -541,6 +541,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "broca-store-contention-tests"
+version = "0.3.231"
+dependencies = [
+ "broca-test-support",
+ "rusqlite",
+ "tokio",
+]
+
+[[package]]
 name = "broca-subc"
 version = "0.3.231"
 dependencies = [

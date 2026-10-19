@@ -27,7 +27,7 @@ tokio.workspace = true
 tracing.workspace = true
 # Bundled SQLite — no system dependency; the persister is sync (runs off the hot
 # path), matching rusqlite's blocking API.
-rusqlite = { version = "0.32", features = ["bundled", "trace"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 broca-owner-only = { workspace = true, features = ["test-support"] }

@@ -17031,6 +17031,20 @@ file = "crates/broca-store/src/session_refs.rs"
 old = 'remaining.min(std::time::Duration::from_millis(timeout))'
 new = 'std::time::Duration::ZERO /* NON-VACUITY BREAK: fail ordinary SQLite contention instantly */'
 [[control]]
+id = "agent-data-census-short-polls-find-writer-gaps"
+guards = "migration finds short unlocked gaps that SQLite's growing default backoff repeatedly misses"
+runner = "cargo"
+package = "broca-store-contention-tests"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store-contention-tests/src/contention.rs"
+expect_red = ["contention::migration_busy_poll_finds_gaps_missed_by_default_backoff"]
+expect_message = "short polls must find an unlocked gap"
+file = "crates/broca-store/src/busy.rs"
+old = 'conn.busy_handler(Some(wait_for_migration_lock))'
+new = 'conn.busy_timeout(STORE_BUSY_TIMEOUT) // NON-VACUITY BREAK: restore the starvation-prone default backoff'
+
+[[control]]
 id = "bus-events-observe-only-after-wal-durable"
 guards = "Run lifecycle projection receives a WAL head only after the file barrier succeeds"
 runner = "cargo"

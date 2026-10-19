@@ -1,6 +1,4 @@
 use super::*;
-#[path = "lock_probe.rs"]
-mod lock_probe;
 use broca_core::{ExportIndex, RunIndex, RunIndexRow, RunIndexState, WalStore};
 use broca_protocol::{ModelHandle, RunFinishReason, RunId, Usage};
 use std::sync::{
@@ -15,8 +13,8 @@ struct CountingIndex {
 impl SessionRefIndex for CountingIndex {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
         let result = self.store.record_session(address, session);
-        if result.is_err() {
-            lock_probe::message(&format!("ref result={result:?}"));
+        if let Err(error) = &result {
+            eprintln!("session-ref projection failed: {error}");
             self.failures.fetch_add(1, Ordering::SeqCst);
         }
         result
@@ -48,12 +46,12 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Arc<SqliteStore>) {
     backfill(&store.conn.lock().unwrap()).unwrap();
     (root, store)
 }
-/// Opens a census connection the way production `census::migrate` does: with the store's
-/// busy timeout. A bare connection fails at the first lock overlap, which slower Windows
-/// runners hit, and would test a configuration production never uses.
+/// Use the production migration's lock-wait policy, not the serving connection's
+/// default SQLite backoff: the census must find gaps between foreground commits.
 fn census_connection(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
-    conn.busy_timeout(crate::STORE_BUSY_TIMEOUT).unwrap();
+    crate::busy::configure_migration_connection(&conn).unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
     conn
 }
 
@@ -150,67 +148,40 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
 
 #[test]
 fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
-    let mut output = String::new();
-    for iteration in 0..if cfg!(windows) { 20 } else { 1 } {
-        lock_probe::reset();
-        let result = std::panic::catch_unwind(census_writer_scenario);
-        if let Err(error) = &result {
-            lock_probe::message(&format!(
-                "scenario panic={}",
-                error
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| error.downcast_ref::<&str>().copied())
-                    .unwrap_or("non-string panic")
-            ));
-        }
-        output.push_str(&lock_probe::report(iteration, result.is_err()));
-        #[cfg(not(windows))]
-        result.unwrap();
-    }
-    #[cfg(not(windows))]
-    eprintln!("{output}");
-    // A deliberately red Windows probe exposes timelines even when every scenario passes.
-    #[cfg(windows)]
-    panic!("{output}");
-}
-
-fn census_writer_scenario() {
     let (root, store) = fixture("writers");
-    {
-        let mut conn = store.conn.lock().unwrap();
-        conn.profile(Some(|sql, elapsed| lock_probe::event(1, sql, elapsed)));
-    }
     let index = Arc::new(CountingIndex {
         store: store.clone(),
         failures: AtomicUsize::new(0),
     });
     let (started_tx, started_rx) = mpsc::channel();
+    let (ref_ready_tx, ref_ready_rx) = mpsc::channel();
     let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let migration_active = active.clone();
     let census_root = root.clone();
     let migration = std::thread::spawn(move || {
         let mut conn = census_connection(&census_root.join("run-index.db"));
-        conn.profile(Some(|sql, elapsed| lock_probe::event(0, sql, elapsed)));
         batches::AFTER_WRITE_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
-                lock_probe::message("census AFTER_WRITE_HOOK send (after commit)");
                 started_tx.send(()).unwrap();
+                // The hook runs after COMMIT, so this rendezvous never holds a
+                // SQLite lock while waiting for the foreground writer to start.
+                receive(&ref_ready_rx, "ref writer starting during census");
             }))
         });
-        let result = census::run(
+        let counts = census::run(
             &mut conn,
             &broca_core::ReadOnlyWalReader::new(census_root),
             None,
             true,
-        );
-        lock_probe::message(&format!("census result={result:?}"));
-        let counts = result.unwrap();
+        )
+        .unwrap();
         migration_active.store(false, Ordering::SeqCst);
         counts
     });
     receive(&started_rx, "census writes");
     let writers = Arc::new(Barrier::new(3));
+    let (projection_done_tx, projection_done_rx) = mpsc::channel();
+    let (ref_done_tx, ref_done_rx) = mpsc::channel();
     let projection_store = store.clone();
     let projection_start = writers.clone();
     let projections = std::thread::spawn(move || {
@@ -267,7 +238,11 @@ fn census_writer_scenario() {
                     (broca_core::ChargeBasis::Unknown, 1)
                 })
                 .unwrap();
-            std::thread::yield_now();
+            // Every store call has committed and released the serving mutex.
+            // Pair request rounds so neither foreground loop can monopolize it;
+            // the separate VFS test exercises an adversarial uninterrupted burst.
+            projection_done_tx.send(()).unwrap();
+            receive(&ref_done_rx, "ref write for request round");
         }
     });
     let ref_root = root.clone();
@@ -282,6 +257,9 @@ fn census_writer_scenario() {
             if active.load(Ordering::SeqCst) {
                 overlapping += 1;
             }
+            if i == 0 {
+                ref_ready_tx.send(()).unwrap();
+            }
             let session = BindIdentity::new("/project/new", "broca", format!("new-{i}"));
             let record = crate::conformance::run_started(
                 1,
@@ -295,6 +273,8 @@ fn census_writer_scenario() {
                 .unwrap()
                 .append(1, &record, true)
                 .unwrap();
+            ref_done_tx.send(()).unwrap();
+            receive(&projection_done_rx, "projection/export request round");
         }
         overlapping
     });

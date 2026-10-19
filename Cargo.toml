@@ -11,6 +11,7 @@ members = [
     "crates/broca-subc",
     "crates/broca-wal",
     "crates/broca-store",
+    "crates/broca-store-contention-tests",
     "crates/broca-catalog",
     "crates/broca-run",
     "crates/broca-module",

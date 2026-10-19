@@ -148,7 +148,18 @@ class WorkflowGraph(unittest.TestCase):
         self.assertTrue(all(i > wait for i in downloads))
         self.assertEqual(self.workflow('ci.yml')['permissions']['actions'], 'read')
         self.assertEqual(set(jobs['test']['needs']),
-                         {'lint', 'scripts', 'unit', 'integration-build', 'fixtures', 'integration', 'linux-deploy'})
+                         {'lint', 'scripts', 'unit', 'store-contention-macos', 'integration-build', 'fixtures', 'integration', 'linux-deploy'})
+
+    def test_store_contention_runs_on_all_three_native_platforms(self):
+        jobs = self.workflow('ci.yml')['jobs']
+        macos = jobs['store-contention-macos']
+        self.assertEqual(macos['runs-on'], 'macos-latest')
+        self.assertTrue(any(step.get('run') == 'cargo test --locked -p broca-store-contention-tests --lib'
+                            for step in macos['steps']))
+        self.assertEqual({row['os'] for row in jobs['unit']['strategy']['matrix']['include']},
+                         {'ubuntu', 'windows'})
+        self.assertTrue(any('cargo test --locked --workspace --lib' in step.get('run', '')
+                            for step in jobs['unit']['steps']))
 
     def test_scripts_prefetch_locked_dependencies_before_offline_suites(self):
         steps = self.workflow('ci.yml')['jobs']['scripts']['steps']
