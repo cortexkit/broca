@@ -607,6 +607,25 @@ pub struct AdmissionCheckpointV1 {
     /// before a writer may tag anything, or it could reuse a number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<crate::tags::LineageTags>,
+    /// The `DeliveryOrdered` record whose `Queued` record has not been folded yet. The two are
+    /// written in one barrier, but a running turn's own records can land between them, and a
+    /// checkpoint can be cut there; the `Queued` record takes its order from here when it comes.
+    ///
+    /// The session's actor writes the pair back to back, so a record only the actor writes
+    /// (`RunStarted`, `Queued`, `Retracted`, `Steered`, another `DeliveryOrdered`) arriving first
+    /// means the `Queued` record was lost to a torn tail: the entry is dropped then, and never
+    /// outlives the next thing the session's actor writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_order: Option<StagedOrder>,
+}
+
+/// A `DeliveryOrdered` record set aside for the `Queued` record that follows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StagedOrder {
+    pub submission_id: SubmissionId,
+    pub order: broca_protocol::DeliveryOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_by: Option<broca_protocol::BindPrincipal>,
 }
 
 impl AdmissionCheckpointV1 {
@@ -631,6 +650,7 @@ impl AdmissionCheckpointV1 {
             pending_fifo: Arc::new(Vec::new()),
             compaction: Some(crate::compaction::CompactionCheckpoint::None),
             tags: Some(crate::tags::LineageTags::unstarted()),
+            pending_order: None,
         }
     }
 
@@ -685,6 +705,26 @@ impl AdmissionCheckpointV1 {
                     reason,
                 })?;
         }
+        // A `Queued` record takes the order its `DeliveryOrdered` record set aside; any other
+        // record only the session's actor writes drops an entry whose `Queued` was lost.
+        let staged = match record {
+            WalRecord::DeliveryOrdered { .. }
+            | WalRecord::Queued { .. }
+            | WalRecord::RunStarted { .. }
+            | WalRecord::Retracted { .. }
+            | WalRecord::Steered { .. } => self.pending_order.take(),
+            _ => None,
+        };
+        let staged_for_queued = match record {
+            WalRecord::Queued { submission_id, .. } => {
+                staged.filter(|staged| &staged.submission_id == submission_id)
+            }
+            _ => None,
+        };
+        let (order_for_queued, sent_by_for_queued) = match staged_for_queued {
+            Some(staged) => (Some(staged.order), staged.sent_by),
+            None => (None, None),
+        };
         match record {
             WalRecord::RunStarted {
                 session_class,
@@ -835,6 +875,21 @@ impl AdmissionCheckpointV1 {
                 }
             }
             WalRecord::BudgetFired { .. } => {}
+            WalRecord::DeliveryOrdered {
+                submission_id,
+                order,
+                sent_by,
+            } => {
+                self.pending_order = Some(StagedOrder {
+                    submission_id: submission_id.clone(),
+                    order: order.clone(),
+                    sent_by: sent_by.clone(),
+                });
+            }
+            WalRecord::SendEnded { submission_id, .. }
+            | WalRecord::SendDelivered { submission_id, .. } => {
+                remove_pending(&mut self.pending_fifo, submission_id);
+            }
             WalRecord::Queued {
                 keep_warm,
                 submission_id,
@@ -863,6 +918,8 @@ impl AdmissionCheckpointV1 {
                     send_id: send_id.clone(),
                     title: title.clone(),
                     delivery: *delivery,
+                    order: order_for_queued,
+                    sent_by: sent_by_for_queued,
                 },
             ),
             WalRecord::Retracted { submission_id, .. } => {
@@ -2195,6 +2252,7 @@ mod tests {
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
             tags: None,
+            pending_order: None,
             input_budget: None,
             session_class: None,
             lineage_retention: None,
@@ -2204,6 +2262,8 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
+                order: None,
+                sent_by: None,
                 hooks: None,
                 title: None,
                 conversation_key: None,

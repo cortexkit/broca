@@ -166,6 +166,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     COMPACTION_WAIT_FEATURE,
     COMPACTION_FEATURE,
     DEFERRED_CALL_FEATURE,
+    DELIVERY_ORDER_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
@@ -288,6 +289,13 @@ pub const STEP_TRANSFORMS_FEATURE: &str = "step-transforms/v1";
 /// Reader builds interpret these records in replay, store projection and session reads. The
 /// production-writer source fence keeps them reader-only until a writer release is enabled.
 pub const DEFERRED_CALL_FEATURE: &str = "deferred-call/v1";
+
+/// The feature every record of a send with an ordered `delivery` list, a `dedupe_key` or an
+/// `expires_at_ms` requires: `delivery_ordered`, `send_ended` and `send_delivered` (see
+/// [`WalRecord::required_features`]). A reader without it must refuse such a WAL: skipping them
+/// would start a run from a queued send that may never start one, deliver a send that was
+/// replaced or expired, or render a prompt without a send that was delivered into it.
+pub const DELIVERY_ORDER_FEATURE: &str = "delivery-order/v1";
 
 /// A feature name that test builds treat as known, in addition to [`KNOWN_FEATURES`].
 ///
@@ -890,6 +898,7 @@ mod tests {
                 COMPACTION_WAIT_FEATURE,
                 COMPACTION_FEATURE,
                 DEFERRED_CALL_FEATURE,
+                DELIVERY_ORDER_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
@@ -1055,6 +1064,26 @@ mod tests {
 
     /// Neither the request fence, an applied view, another answer nor a wait exit can be
     /// skipped by a build that predates the corresponding must-understand feature.
+    /// A build that does not know `delivery-order/v1` refuses a delivery-order record as a newer
+    /// writer instead of skipping it: skipping it could start a run from a send that may never
+    /// start one, or deliver a send that was replaced.
+    #[test]
+    fn delivery_order_records_refuse_older_readers() {
+        let record: WalRecord = serde_json::from_str(
+            r#"{"type":"delivery_ordered","submission_id":"sub-r2","order":{"modes":["steer"]}}"#,
+        )
+        .unwrap();
+        let bytes = encode(7, 3, &record).unwrap();
+        let older: Vec<&str> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|known| *known != DELIVERY_ORDER_FEATURE)
+            .collect();
+        assert!(matches!(decode_next_with(&bytes, &older),
+            DecodeStep::NewerWriter { missing, .. } if missing == [DELIVERY_ORDER_FEATURE]));
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+    }
+
     #[test]
     fn compaction_records_require_their_features_and_refuse_older_readers() {
         for json in include_str!("../tests/fixtures/compaction_records.jsonl").lines() {

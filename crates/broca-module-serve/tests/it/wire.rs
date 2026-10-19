@@ -751,6 +751,7 @@ async fn over_cap_admission_is_typed_and_leaves_no_wal_or_run_index_row() {
             skip_materialization: false,
             kind: RunKind::FreshOrResume,
             plan: None,
+            order: None,
         })
         .await
         .expect_err("hard cap should deny before execution");
@@ -844,6 +845,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
         plan: None,
+        order: None,
     }
 }
 
@@ -890,6 +892,7 @@ fn budget_send(session: BindIdentity, run_id: &str) -> SendRequest {
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
         plan: None,
+        order: None,
     }
 }
 

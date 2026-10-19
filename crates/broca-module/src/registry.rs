@@ -1704,6 +1704,45 @@ impl LineageRegistry {
         session_class: Option<String>,
         stop_sequences_named: bool,
     ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_order(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            retention,
+            session_class,
+            stop_sequences_named,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::route_submission_with_class`] for a send that may use the `delivery_order` group:
+    /// `order` is its ordered list, dedupe key and expiry, or `None` for an ordinary send.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_order(
+        &self,
+        key: &LineageKey,
+        run_id: RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<crate::actor::SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        stop_sequences_named: bool,
+        order: Option<broca_protocol::DeliveryOrder>,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
         use crate::actor::{LineageCmd, SendOutcome};
         if let Some(class) = &session_class {
             broca_protocol::request::validate_session_class(class)
@@ -1729,6 +1768,7 @@ impl LineageRegistry {
                 skip_materialization,
                 delivery,
                 plan: plan.clone().map(Box::new),
+                order: order.clone().map(Box::new),
                 reply,
             };
             if handle.send(cmd).await.is_err() {

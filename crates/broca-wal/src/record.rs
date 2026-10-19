@@ -996,6 +996,67 @@ pub enum WalRecord {
         reason: Option<String>,
     },
 
+    // ── sends with an ordered `delivery` list (feature `delivery-order/v1`) ──
+    //
+    // Every record in this group is must-understand and is only ever written in a gated frame
+    // requiring `crate::framing::DELIVERY_ORDER_FEATURE`: an older build that skipped one would
+    // start a run from a send that must never start one, deliver a replaced or expired send, or
+    // render a prompt without a delivered send. Sessions whose sends use no ordered list, dedupe
+    // key or expiry never carry these records.
+    /// Records the delivery order of the `Queued` record for the same `submission_id` that
+    /// follows it.
+    /// Both are written in one barrier, this one first, so a durable `Queued` always has its
+    /// order before it (a running turn's own records may lie between the two). The queued send
+    /// then waits until a request boundary where one of its modes is possible; it starts a run
+    /// only if its order lists `idle_start`.
+    ///
+    /// `sent_by` is the attested principal of a plan-named sender other than the session's
+    /// owner. Such a send is queued (and any run it starts recorded) under the session's frozen
+    /// principal, never the sender's, so the sender is kept only here: it is whose dedupe key
+    /// the send carries. Absent for a send from the owner.
+    DeliveryOrdered {
+        submission_id: SubmissionId,
+        order: broca_protocol::DeliveryOrder,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
+    },
+    /// A queued, undelivered send that will never be delivered: a newer send from the same
+    /// sender with the same `dedupe_key` replaced it, or it expired. Removes the send from the
+    /// pending queue like `Retracted`, and says why.
+    SendEnded {
+        submission_id: SubmissionId,
+        reason: SendEndReason,
+    },
+    /// A queued send delivered into run `run_id` in `mode`, consuming it from the pending queue.
+    ///
+    /// With `steer` it carries the send's user message(s) in `input`, placed exactly like a
+    /// [`WalRecord::Steered`] record's input: at the episode's next `StepStarted` (written under
+    /// the same lock, right after this record), or at its `RunFinished` when no step follows.
+    ///
+    /// With `tool_result` it names the tool result it rides on and the exact text appended to that
+    /// result's output. The stored `ToolResult` record is never changed: a reader renders the
+    /// result followed by `appended_text`. It is written between the batch's `ToolBatchFinished`
+    /// and its `TurnFinished`, so a projection boundary never separates the result from it.
+    ///
+    /// A send delivered with `idle_start` has no record of this kind: the `RunStarted` that
+    /// consumes it (naming its `submission_id`) is its delivery.
+    SendDelivered {
+        submission_id: SubmissionId,
+        run_id: RunId,
+        mode: broca_protocol::DeliveryMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Arc<Vec<Message>>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<ToolCallId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        appended_text: Option<String>,
+        /// Runner tags (feature `runner-tags/v1`) of a `steer` delivery's `input`, one entry per
+        /// message, like a `Steered` record's. A `tool_result` delivery's `appended_text` is part
+        /// of the tool result it rides on and has no tag of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Arc<Vec<MessageTags>>>,
+    },
+
     /// A record whose `type` this build does not know: written by a newer build, and
     /// skipped by every reader under the contract on this enum.
     ///
@@ -1178,7 +1239,9 @@ impl WalRecord {
     fn carries_runner_tags(&self) -> bool {
         match self {
             WalRecord::RunStarted { tags, config, .. } => tags.is_some() || config.render_tags,
-            WalRecord::Steered { tags, .. } => tags.is_some(),
+            WalRecord::Steered { tags, .. } | WalRecord::SendDelivered { tags, .. } => {
+                tags.is_some()
+            }
             WalRecord::ModelStepFinished { tags, .. }
             | WalRecord::ToolNoDispatch { tags, .. }
             | WalRecord::ToolResult { tags, .. }
@@ -1196,6 +1259,9 @@ impl WalRecord {
                 tags: Some(tags), ..
             }
             | WalRecord::Steered {
+                tags: Some(tags), ..
+            }
+            | WalRecord::SendDelivered {
                 tags: Some(tags), ..
             } => tags.as_slice(),
             WalRecord::ModelStepFinished {
@@ -1508,6 +1574,9 @@ impl WalRecord {
             | WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => &[DEFERRED_CALL_FEATURE],
+            WalRecord::DeliveryOrdered { .. }
+            | WalRecord::SendEnded { .. }
+            | WalRecord::SendDelivered { .. } => &[crate::framing::DELIVERY_ORDER_FEATURE],
             // Informational: an older build may skip it, so it needs no feature.
             WalRecord::QuestionWithdrawalAcknowledged { .. } => &[],
             _ => &[],
@@ -1522,6 +1591,26 @@ impl WalRecord {
 pub enum RunCancelAt {
     Now,
     StepBoundary,
+}
+
+/// Why a queued send ended undelivered ([`WalRecord::SendEnded`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SendEndReason {
+    /// A newer send from the same sender with the same `dedupe_key` replaced it.
+    Superseded { by: SubmissionId },
+    /// Its `expires_at_ms` passed before any request boundary could deliver it.
+    Expired,
+}
+
+impl SendEndReason {
+    /// The outcome name a caller sees for the send: `superseded` or `expired`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SendEndReason::Superseded { .. } => "superseded",
+            SendEndReason::Expired => "expired",
+        }
+    }
 }
 
 // `WalRecord::required_features` returns sorted static slices without allocation. Records

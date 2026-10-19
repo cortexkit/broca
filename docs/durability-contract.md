@@ -102,17 +102,21 @@ rather than silently sending a request without the echo.
 Runner tags (**`runner-tags/v1`**): every message part broca stores has a per-session tag
 number (`§N§` in the llm-runner contract), assigned by the session's writer as it appends the
 record carrying the part and stored in that record's `tags` member: `run_started` and
-`steered` hold one array per input message, `model_step_finished` one per assistant block, and
-`tool_result`, `tool_no_dispatch`, a closing `approval_recorded` and `budget_fired` one each.
+`steered` (and a `steer` `send_delivered`) hold one array per input message,
+`model_step_finished` one per assistant block, and `tool_result`, `tool_no_dispatch`, a closing
+`approval_recorded` and `budget_fired` one each. A `tool_result` delivery's appended text is
+part of the result it rides on and has no tag of its own.
 Tags are strictly increasing in WAL order and never reused: the next tag is the highest the WAL
 holds plus one, so restarts, resumes and agent-data moves (which carry the WAL bytes) continue
 the count, and retention deletion records the next tag on its tombstone (`next_tag`) for the
 address's next lineage to start from. Tags are on for every lineage whose first episode a
 tag-writing build admits; a lineage first admitted earlier stays untagged and keeps its exact
 bytes. A run frozen with `run_config.render_tags` (from the plan's `render_tags`) renders each
-tagged user text block and text tool result with a `§N§ ` prefix in the request only; stored
-records never change, and assistant parts (text, signed thinking, tool calls, provider state)
-are never rendered with tags. Every tagged record, and every run start frozen with
+tagged user text block and text tool result with a `§N§ ` prefix in the request only, and on the
+`anthropic_messages` family each plain assistant text block too (a leading tag mark the model
+wrote is replaced by the part's own tag). Stored records never change, and signed thinking,
+encrypted reasoning, tool calls and text with provider state are never rendered with tags; other
+families keep assistant tags as metadata. Every tagged record, and every run start frozen with
 `render_tags`, is a gated frame requiring `runner-tags/v1`, which an older reader refuses by
 name. Records without tags keep their previous bytes and requirements, and a run without
 `render_tags` renders byte for byte as before, so no renderer version changes.

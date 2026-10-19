@@ -500,6 +500,11 @@ fn project_control_record<S: ControlProjectionSink>(
         // (a `RunStarted` unit does not carry its prompt either). It reaches readers through
         // `session.read`, placed where the model saw it.
         WalRecord::Steered { .. } => {}
+        // Ordered sends are caller input and queue state, like steers and queued sends: no
+        // control unit. A delivered one reaches readers through `session.read`.
+        WalRecord::DeliveryOrdered { .. }
+        | WalRecord::SendEnded { .. }
+        | WalRecord::SendDelivered { .. } => {}
         // The request changes recovery, not lifecycle: only RunFinished publishes a terminal.
         WalRecord::RunCancelRequested { .. } => {}
         // A record type written by a newer build: informational by the contract on

@@ -110,6 +110,9 @@ pub(crate) fn tag_shape(record: &WalRecord) -> Option<Vec<usize>> {
         WalRecord::RunStarted { input, .. } | WalRecord::Steered { input, .. } => {
             Some(input.iter().map(|message| message.content.len()).collect())
         }
+        WalRecord::SendDelivered {
+            input: Some(input), ..
+        } => Some(input.iter().map(|message| message.content.len()).collect()),
         WalRecord::ModelStepFinished {
             assistant_message, ..
         } => Some(vec![assistant_message.content.len()]),
@@ -127,7 +130,9 @@ pub(crate) fn tag_shape(record: &WalRecord) -> Option<Vec<usize>> {
 /// Write `tags` into `record`'s tag field. `tags` has one entry per message of `record`.
 pub(crate) fn set_record_tags(record: &mut WalRecord, tags: Vec<MessageTags>) {
     match record {
-        WalRecord::RunStarted { tags: field, .. } | WalRecord::Steered { tags: field, .. } => {
+        WalRecord::RunStarted { tags: field, .. }
+        | WalRecord::Steered { tags: field, .. }
+        | WalRecord::SendDelivered { tags: field, .. } => {
             *field = Some(Arc::new(tags));
         }
         WalRecord::ModelStepFinished { tags: field, .. }

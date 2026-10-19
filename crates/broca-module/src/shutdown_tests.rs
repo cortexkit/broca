@@ -545,6 +545,7 @@ async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
             skip_materialization: false,
             delivery: broca_protocol::Delivery::Queue,
             plan: None,
+            order: None,
             reply,
         })
         .await
@@ -627,6 +628,7 @@ async fn shutdown_rejects_new_admission() {
             skip_materialization: false,
             delivery: broca_protocol::Delivery::Queue,
             plan: None,
+            order: None,
             reply,
         })
         .await

@@ -73,8 +73,8 @@ pub use provider::{
 };
 pub use request::{
     AuthRequest, BudgetConfig, BudgetKind, BudgetNudge, CacheMode, CacheRequest, CacheRole,
-    CacheTail, CallOptions, Delivery, ExecutionMode, GenerationConfig, ModelHandle, ResponseFormat,
-    StepContext, StopCondition, SubmissionRequest, Tool, ToolChoice,
+    CacheTail, CallOptions, Delivery, DeliveryMode, DeliveryOrder, ExecutionMode, GenerationConfig,
+    ModelHandle, ResponseFormat, StepContext, StopCondition, SubmissionRequest, Tool, ToolChoice,
 };
 pub use session::{BindIdentity, BindPrincipal, BindScope, SendScope, SessionScope};
 pub use usage::Usage;

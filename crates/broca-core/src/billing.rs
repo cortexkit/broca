@@ -788,6 +788,9 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         | WalRecord::Queued { .. }
         | WalRecord::Steered { .. }
         | WalRecord::Retracted { .. }
+        | WalRecord::DeliveryOrdered { .. }
+        | WalRecord::SendEnded { .. }
+        | WalRecord::SendDelivered { .. }
         | WalRecord::ApprovalRequested { .. }
         | WalRecord::ApprovalResolved { .. } => None,
         // A record type written by a newer build cannot carry config: the contract on

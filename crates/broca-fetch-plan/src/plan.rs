@@ -72,6 +72,170 @@ pub struct Plan {
     /// tool-result text. The plan's optional `render_tags` boolean; absent means off. Each run
     /// freezes it at admission.
     pub render_tags: bool,
+    /// The modules other than the session's owner that may send into it (see [`plan_senders`]).
+    pub senders: Vec<PlanSender>,
+}
+
+/// The plan member naming the modules, other than the session's owner, that may send into the
+/// session with an ordered `delivery` list. Kept in one constant so a rename stays one edit.
+pub const SENDERS_MEMBER: &str = "senders";
+
+/// One module the plan lets send into the session besides its owner, matched against the
+/// daemon-attested principal of the send (`reserved:<module>`), never a request field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSender {
+    pub module: String,
+    /// Whether this sender may use `idle_start`, that is, start a run on an idle session.
+    pub idle_start: bool,
+    /// The templates this sender may use for `turn_system`, as declared. This build checks
+    /// their shape but renders none of them.
+    pub templates: Vec<PlanTemplate>,
+}
+
+/// A `turn_system` template a sender declared: the text with its typed slots, and the digest
+/// of the text. A send names one as `template: {id, slots}`, giving a value for each slot; the
+/// runner validates and renders every value itself. An unknown id or a bad slot refuses the send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTemplate {
+    pub id: String,
+    pub text_with_slots: String,
+    pub digest: String,
+    /// The template's slots by name. There are no free-text slots.
+    pub slots: BTreeMap<String, SlotType>,
+}
+
+/// The type of one template slot, and so the values a send may give it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotType {
+    /// An integer, optionally bounded (inclusive).
+    Integer { min: Option<i64>, max: Option<i64> },
+    /// An integer from 0 to 100.
+    Percentage,
+    /// A tag that must resolve to a tag of the session.
+    Tag,
+    /// One of the listed strings.
+    Enum { values: Vec<String> },
+}
+
+/// Read the plan's `senders` member: absent means none. Each entry is
+/// `{module, idle_start?, templates?: [{id, text_with_slots, digest, slots?}]}`. A slot is typed
+/// `integer` (optional `min`/`max`), `percentage`, `tag` or `enum` (`values`, a non-empty list of
+/// strings); there are no string slots. Refuses a malformed member naming its field.
+pub fn plan_senders(plan: &Map<String, Value>) -> Result<Vec<PlanSender>, Refusal> {
+    let Some(value) = plan.get(SENDERS_MEMBER) else {
+        return Ok(Vec::new());
+    };
+    let at = format!("plan.{SENDERS_MEMBER}");
+    let entries = value.as_array().ok_or_else(|| Refusal::invalid(&at))?;
+    let mut senders = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let at = format!("{at}[{index}]");
+        let object = entry.as_object().ok_or_else(|| Refusal::invalid(&at))?;
+        let module = string_member(object, "module", &at)?;
+        if module.is_empty() {
+            return Err(Refusal::invalid(format!("{at}.module")));
+        }
+        let idle_start = match object.get("idle_start") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(Refusal::invalid(format!("{at}.idle_start"))),
+        };
+        let templates = match object.get("templates") {
+            None => Vec::new(),
+            Some(Value::Array(templates)) => templates
+                .iter()
+                .enumerate()
+                .map(|(position, template)| {
+                    plan_template(template, &format!("{at}.templates[{position}]"))
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(Refusal::invalid(format!("{at}.templates"))),
+        };
+        // A send names its template by id, so a sender's ids must be distinct.
+        let mut ids = BTreeSet::new();
+        if !templates
+            .iter()
+            .all(|template: &PlanTemplate| ids.insert(template.id.clone()))
+        {
+            return Err(Refusal::invalid(format!("{at}.templates")));
+        }
+        senders.push(PlanSender {
+            module,
+            idle_start,
+            templates,
+        });
+    }
+    unique_providers(
+        SENDERS_MEMBER,
+        senders.iter().map(|sender| sender.module.as_str()),
+    )?;
+    Ok(senders)
+}
+
+fn plan_template(value: &Value, at: &str) -> Result<PlanTemplate, Refusal> {
+    let object = value.as_object().ok_or_else(|| Refusal::invalid(at))?;
+    let id = string_member(object, "id", at)?;
+    let text_with_slots = string_member(object, "text_with_slots", at)?;
+    let digest = string_member(object, "digest", at)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Refusal::invalid(format!("{at}.digest")));
+    }
+    if id.is_empty() {
+        return Err(Refusal::invalid(format!("{at}.id")));
+    }
+    let mut slots = BTreeMap::new();
+    if let Some(declared) = object.get("slots") {
+        let declared = declared
+            .as_object()
+            .ok_or_else(|| Refusal::invalid(format!("{at}.slots")))?;
+        for (name, slot) in declared {
+            let slot_at = format!("{at}.slots.{name}");
+            let refuse = || Refusal::invalid(&slot_at);
+            let slot = slot.as_object().ok_or_else(refuse)?;
+            let bound = |key: &str| match slot.get(key) {
+                None => Ok(None),
+                Some(value) => value.as_i64().map(Some).ok_or_else(refuse),
+            };
+            let typed = match slot.get("type").and_then(Value::as_str) {
+                Some("integer") => {
+                    let (min, max) = (bound("min")?, bound("max")?);
+                    if min.zip(max).is_some_and(|(min, max)| min > max) {
+                        return Err(refuse());
+                    }
+                    SlotType::Integer { min, max }
+                }
+                Some("percentage") => SlotType::Percentage,
+                Some("tag") => SlotType::Tag,
+                Some("enum") => {
+                    let values: Vec<String> = slot
+                        .get("values")
+                        .and_then(Value::as_array)
+                        .ok_or_else(refuse)?
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_owned).ok_or_else(refuse))
+                        .collect::<Result<_, _>>()?;
+                    let distinct: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+                    if values.is_empty() || distinct.len() != values.len() {
+                        return Err(refuse());
+                    }
+                    SlotType::Enum { values }
+                }
+                // No other slot type exists; in particular there are no free-text string slots.
+                _ => return Err(refuse()),
+            };
+            slots.insert(name.clone(), typed);
+        }
+    }
+    Ok(PlanTemplate {
+        id,
+        text_with_slots,
+        digest,
+        slots,
+    })
 }
 
 /// Hex SHA-256 of `bytes`.
@@ -398,6 +562,8 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
         return Err(Refusal::invalid("plan.compaction_item"));
     }
 
+    let senders = plan_senders(object)?;
+
     for (index, step) in step_items.iter().enumerate() {
         for (position, subscription) in step.subscriptions.iter().enumerate() {
             // Approval must fail closed: an unavailable hook cannot grant permission.
@@ -436,5 +602,93 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
         composition_digest: digest,
         composed,
         render_tags,
+        senders,
     })
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn senders(value: Value) -> Result<Vec<PlanSender>, Refusal> {
+        plan_senders(json!({ "senders": value }).as_object().unwrap())
+    }
+
+    /// Senders are read with their `idle_start` grant (absent means no grant) and templates; a
+    /// plan without the member names none.
+    #[test]
+    fn senders_are_read_with_their_grants() {
+        assert_eq!(plan_senders(&Map::new()).unwrap(), Vec::new());
+        let digest = "a".repeat(64);
+        let read = senders(json!([
+            {"module": "ck-mc", "idle_start": true, "templates": [{"id": "t", "text_with_slots": "{n} tools", "digest": digest, "slots": {"n": {"type": "integer", "min": 0}, "k": {"type": "enum", "values": ["a"]}}}]},
+            {"module": "other"}
+        ]))
+        .unwrap();
+        assert_eq!(read[0].module, "ck-mc");
+        assert!(read[0].idle_start);
+        assert_eq!(read[0].templates[0].id, "t");
+        assert_eq!(
+            read[0].templates[0].slots,
+            BTreeMap::from([
+                (
+                    "k".to_owned(),
+                    SlotType::Enum {
+                        values: vec!["a".into()]
+                    }
+                ),
+                (
+                    "n".to_owned(),
+                    SlotType::Integer {
+                        min: Some(0),
+                        max: None
+                    }
+                ),
+            ])
+        );
+        assert!(!read[1].idle_start);
+        assert!(read[1].templates.is_empty());
+    }
+
+    /// Malformed senders are refused naming the field; a string slot does not exist.
+    #[test]
+    fn malformed_senders_are_refused_by_field() {
+        let digest = "a".repeat(64);
+        for (value, field) in [
+            (json!({}), "plan.senders"),
+            (json!([{"idle_start": true}]), "plan.senders[0].module"),
+            (
+                json!([{"module": "m", "idle_start": "yes"}]),
+                "plan.senders[0].idle_start",
+            ),
+            (json!([{"module": "m"}, {"module": "m"}]), "plan.senders"),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "x", "digest": "short"}]}]),
+                "plan.senders[0].templates[0].digest",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{s}", "digest": digest, "slots": {"s": {"type": "string"}}}]}]),
+                "plan.senders[0].templates[0].slots.s",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{n}", "digest": digest, "slots": {"n": {"type": "integer", "min": 5, "max": 1}}}]}]),
+                "plan.senders[0].templates[0].slots.n",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{e}", "digest": digest, "slots": {"e": {"type": "enum", "values": ["a", "a"]}}}]}]),
+                "plan.senders[0].templates[0].slots.e",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "x", "digest": digest}, {"id": "t", "text_with_slots": "y", "digest": digest}]}]),
+                "plan.senders[0].templates",
+            ),
+        ] {
+            assert_eq!(
+                senders(value.clone()).unwrap_err(),
+                Refusal::invalid(field),
+                "{value}"
+            );
+        }
+    }
 }

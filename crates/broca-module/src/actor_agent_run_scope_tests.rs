@@ -159,6 +159,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
                 skip_materialization: false,
                 kind: RunKind::FreshOrResume,
                 plan,
+                order: None,
             })
             .await;
         AGENT_RUN_WRITER_FOR_TEST.set(false);
@@ -281,6 +282,7 @@ async fn writer_refuses_paused_retries_without_the_frozen_run_scope() {
                 skip_materialization: false,
                 kind: RunKind::FreshOrResume,
                 plan: None,
+                order: None,
             })
             .await;
         assert!(

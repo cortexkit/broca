@@ -351,9 +351,13 @@ call of that batch that never left the process), commits the batch, then seals t
 | `queued` | `submission_id`, `request` (the caller's full `SubmissionRequest`), `request_identity_digest` (absent), `principal` (absent), `send_id` (absent), `title` (absent; the send's title, carried onto the `run_started` that drains it, informational like `run_started.title`), `delivery` (absent; `"interrupt"` for the message an interrupting send queued before cancelling the run it interrupted). A prompt queued while a run was active. |
 | `retracted` | `submission_id`, `failure` (absent, `{run_id, error: ProviderError}` when the queued head could never be admitted). |
 | `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s)), `hooks` (absent; reserved, never written yet). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
+| `delivery_ordered` | `submission_id`, `order` (`{modes, dedupe_key?, expires_at_ms?}`). **Must-understand, feature `delivery-order/v1`**. The ordered `delivery` list of the `queued` record for the same submission that follows it in the same barrier (a running turn's own records may lie between them). Written only for a send using the `delivery_order` group. |
+| `send_ended` | `submission_id`, `reason` (`{kind: "superseded", by}` or `{kind: "expired"}`). **Must-understand, feature `delivery-order/v1`**. A queued ordered send that will never be delivered; removes it from the pending queue like `retracted`. |
+| `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"` or `"tool_result"`), `input` (with `steer`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
 
-The pending queue is `queued` minus `retracted` minus those consumed by a `run_started`
-carrying their `submission_id`. It drains every pending `delivery: "interrupt"` entry first,
+The pending queue is `queued` minus `retracted` (and `send_ended`) minus those consumed by a
+`run_started` carrying their `submission_id` (or a `send_delivered`). A queued send whose order
+has no `idle_start` never drains into a run. It drains every pending `delivery: "interrupt"` entry first,
 in WAL order, then the plain entries in WAL order. `queued.delivery` is deliberately NOT gated:
 a build that predates it drains everything in plain WAL order, so after a rollback an interrupt
 runs behind the plain sends queued before it. Each message is still run exactly once; only the

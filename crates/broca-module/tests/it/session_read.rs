@@ -543,6 +543,7 @@ async fn send_with_materialization(
             skip_materialization,
             kind: RunKind::FreshOrResume,
             plan: None,
+            order: None,
         })
         .await
         .expect("send starts");
@@ -2460,6 +2461,7 @@ async fn check_scoped_session_reads(agent_run: bool) {
                 skip_materialization: false,
                 kind: RunKind::FreshOrResume,
                 plan: None,
+                order: None,
             })
             .await;
         assert!(

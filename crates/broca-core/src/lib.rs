@@ -22,6 +22,7 @@ pub mod clock;
 pub mod compaction;
 pub mod consent;
 pub mod context;
+pub mod delivery_order;
 pub mod hooks;
 pub mod import;
 pub mod input_budget;
@@ -143,7 +144,7 @@ pub use run::{
     RunError, RunRequest, RunSummary, StartMode,
 };
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
-pub use steer::SteerInbox;
+pub use steer::{OrderedAcceptance, SteerInbox};
 pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
 pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
