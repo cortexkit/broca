@@ -390,6 +390,15 @@ struct Enrollment {
     deferred_races: u64,
 }
 
+// RetentionIndex returns `String`, erasing rusqlite's error code, so enrollment uses these known
+// SQLite busy messages to preserve the transient-store classification.
+const STORE_BUSY_ERROR_MARKERS: [&str; 4] = [
+    "database is locked",
+    "database is busy",
+    "store busy",
+    "sqlite_busy",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnrollmentFailureKind {
     VanishedFile,
@@ -451,14 +460,9 @@ impl EnrollmentFailure {
 
     fn store(error: String) -> Self {
         let lower = error.to_ascii_lowercase();
-        let kind = if [
-            "database is locked",
-            "database is busy",
-            "store busy",
-            "sqlite_busy",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+        let kind = if STORE_BUSY_ERROR_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
         {
             EnrollmentFailureKind::StoreBusy
         } else {

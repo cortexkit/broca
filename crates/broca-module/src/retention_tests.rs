@@ -630,6 +630,32 @@ fn enrollment_defers_a_busy_store_at_debug_with_a_counter() {
 }
 
 #[test]
+fn enrollment_classifies_a_real_sqlite_busy_error_as_store_busy() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let blocker = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| rig.service.enroll().unwrap());
+
+    assert_enrollment_deferred_log(&capture, "store_busy", tracing::Level::DEBUG);
+    let event = capture
+        .events()
+        .into_iter()
+        .find(|event| event.fields.get("kind").map(String::as_str) == Some("store_busy"))
+        .expect("the real SQLite busy error must be recorded");
+    let error = event
+        .fields
+        .get("error")
+        .expect("the store error is logged");
+    assert!(
+        error.contains("database is locked") || error.contains("database is busy"),
+        "expected SQLite's busy error, got: {error}"
+    );
+}
+
+#[test]
 fn sweep_confirms_wal_before_tombstoning_a_stale_candidate() {
     let rig = Rig::new();
     let id = rig.seed(1, 100, Some(200));

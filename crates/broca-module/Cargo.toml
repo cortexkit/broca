@@ -39,6 +39,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # streaming from a local server, rather than an in-process imitation of it.
 broca-provider = { path = "../broca-provider", features = ["live"] }
 sha2.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 test-clock = ["broca-core/test-clock"]

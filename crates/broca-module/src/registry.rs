@@ -2750,7 +2750,7 @@ impl LineageRegistry {
                     snapshot.watermark_seq,
                     snapshot.prefix_len
                 ),
-                class: broca_protocol::ErrorClass::Transient,
+                class: broca_protocol::ErrorClass::Permanent,
             });
         }
         let lineage_id = tail.lineage_id;
