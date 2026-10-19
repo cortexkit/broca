@@ -3646,6 +3646,69 @@ fn two_episode_pinned_bytes() -> String {
         .to_owned()
 }
 
+/// The provider's raw reasoning item, as an OpenAI Responses step stores it: two summary parts
+/// beside the encrypted reasoning.
+const SUMMARY_REASONING_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
+
+fn reasoning_summary_golden_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/session_read.reasoning_summary.json")
+}
+
+/// A stored OpenAI Responses reasoning item reads back with its summary text as a `reasoning`
+/// part just before the opaque `redacted_reasoning` part, while the WAL keeps the step's content
+/// exactly as the provider produced it.
+#[tokio::test]
+async fn responses_reasoning_summary_read_response_bytes_are_pinned() {
+    let rig = Rig::new("reasoning-summary-pin", Arc::new(NoopExec));
+    let key = rig.key("pinned");
+    let stored = vec![
+        ContentBlock::RedactedReasoning {
+            data: SUMMARY_REASONING_ITEM.into(),
+            provider_format: Some(broca_protocol::EncryptedReasoningFormat::OpenAiResponses),
+        },
+        ContentBlock::Text {
+            text: "All good.".into(),
+        },
+    ];
+    let mut step = assistant_text(0, "");
+    if let WalRecord::ModelStepFinished {
+        assistant_message, ..
+    } = &mut step
+    {
+        Arc::make_mut(assistant_message).content = stored.clone();
+    }
+    write_legacy_seed(
+        &rig.wal_store,
+        &key,
+        &[started(&key, "run-1", "question"), step, finished_ok()],
+    );
+
+    let page = rig
+        .registry
+        .read(read_request(&key, Some(0), Some(10)))
+        .await
+        .expect("session.read");
+    let bytes = serde_json::to_string(&page).expect("serialize session.read response");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(reasoning_summary_golden_path(), format!("{bytes}\n")).unwrap();
+    }
+    let pinned = std::fs::read_to_string(reasoning_summary_golden_path()).unwrap();
+    assert_eq!(bytes, pinned.trim_end_matches('\n'));
+
+    let records = rig.wal_store.read_records(&key).expect("read WAL");
+    let durable = records
+        .iter()
+        .find_map(|framed| match &framed.record {
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => Some(assistant_message.content.clone()),
+            _ => None,
+        })
+        .expect("step record");
+    assert_eq!(durable, stored, "the read never rewrites the stored step");
+}
+
 /// Also the proof that `include_tools: false` (what `read_request` sends) leaves the response
 /// byte-identical to the page whose tool-list fields are omitted.
 #[tokio::test]

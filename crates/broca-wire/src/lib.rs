@@ -886,20 +886,27 @@ pub enum SendResult {
 }
 
 /// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
-/// block with the same text, and every other block is written unchanged.
+/// block with the same text, each OpenAI Responses reasoning item that carries summary text is
+/// preceded by a readable `reasoning` block holding that text (the opaque `redacted_reasoning`
+/// block stays as stored), and every other block is written unchanged.
 fn serialize_caller_message<S: serde::Serializer>(
     message: &broca_protocol::Message,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use broca_protocol::ContentBlock;
-    if !message
-        .content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::TextWithState { .. }))
+    let summarized = broca_protocol::content::with_readable_reasoning_summaries(&message.content);
+    if summarized.is_none()
+        && !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::TextWithState { .. }))
     {
         return message.serialize(serializer);
     }
     let mut caller = message.clone();
+    if let Some(content) = summarized {
+        caller.content = content;
+    }
     for block in &mut caller.content {
         if let ContentBlock::TextWithState { text, .. } = block {
             *block = ContentBlock::Text {
@@ -919,6 +926,8 @@ pub struct SessionReadMessage {
     /// Written in the caller-facing vocabulary: assistant text that carries provider state
     /// (`text_with_state`) goes out as a plain `text` block. The state is opaque bytes broca
     /// keeps only to send back to the provider; a caller reading the transcript wants the text.
+    /// For the same reason an OpenAI Responses reasoning item's summary text is shown as a
+    /// `reasoning` block just before its `redacted_reasoning` block.
     #[serde(serialize_with = "serialize_caller_message")]
     pub message: broca_protocol::Message,
     /// The producing run, not the page's latest run. Historical/imported messages with
@@ -4157,6 +4166,60 @@ mod caller_message_tests {
         let message = read_message(vec![ContentBlock::Text {
             text: "plain".into(),
         }]);
+        assert_eq!(
+            serde_json::to_value(&message).unwrap()["message"],
+            serde_json::to_value(&message.message).unwrap()
+        );
+    }
+
+    const SUMMARY_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** check inputs"},{"type":"summary_text","text":"**Answering** inputs fine"}],"encrypted_content":"cipher"}"#;
+
+    /// A caller reads an OpenAI Responses reasoning item's summary as a `reasoning` part, the
+    /// shape Anthropic thinking is read in, placed just before the opaque item, which is written
+    /// exactly as stored.
+    #[test]
+    fn responses_reasoning_summary_reaches_callers_as_a_reasoning_part() {
+        let message = read_message(vec![
+            ContentBlock::RedactedReasoning {
+                data: SUMMARY_ITEM.into(),
+                provider_format: Some(broca_protocol::EncryptedReasoningFormat::OpenAiResponses),
+            },
+            ContentBlock::Text {
+                text: "All good.".into(),
+            },
+        ]);
+        let wire = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            wire["message"]["content"],
+            json!([
+                {"type": "reasoning", "text": "**Planning** check inputs\n\n**Answering** inputs fine"},
+                {"type": "redacted_reasoning", "data": SUMMARY_ITEM, "provider_format": "open_ai_responses"},
+                {"type": "text", "text": "All good."},
+            ])
+        );
+
+        // A reply decoded and served again keeps one readable part, not two.
+        let decoded: SessionReadMessage = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
+    }
+
+    /// A reasoning item with no summary text, and the legacy unscoped encrypted blob, gain no
+    /// readable part.
+    #[test]
+    fn reasoning_without_a_summary_is_unchanged() {
+        let message = read_message(vec![
+            ContentBlock::RedactedReasoning {
+                data: r#"{"id":"rs_2","type":"reasoning","summary":[],"encrypted_content":"c"}"#
+                    .into(),
+                provider_format: Some(
+                    broca_protocol::EncryptedReasoningFormat::OpenAiResponsesChatgpt,
+                ),
+            },
+            ContentBlock::RedactedReasoning {
+                data: SUMMARY_ITEM.into(),
+                provider_format: None,
+            },
+        ]);
         assert_eq!(
             serde_json::to_value(&message).unwrap()["message"],
             serde_json::to_value(&message.message).unwrap()

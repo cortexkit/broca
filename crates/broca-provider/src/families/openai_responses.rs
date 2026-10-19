@@ -639,6 +639,9 @@ pub struct OpenAiResponsesNormalizer {
     refusal_output_index: Option<u64>,
     saw_refusal: bool,
     reasoning_items: BTreeMap<u64, String>,
+    /// The (output_index, summary_index) of the last reasoning-summary part shown on the display
+    /// lane, so the first delta of the next part starts on a new paragraph instead of running on.
+    last_summary_part: Option<(u64, u64)>,
     tool_calls: BTreeMap<u64, ToolCallBuf>,
     usage: Usage,
     finish_reason: FinishReason,
@@ -682,6 +685,7 @@ impl OpenAiResponsesNormalizer {
             refusal_output_index: None,
             saw_refusal: false,
             reasoning_items: BTreeMap::new(),
+            last_summary_part: None,
             tool_calls: BTreeMap::new(),
             usage: Usage::default(),
             finish_reason: FinishReason::Stop,
@@ -811,6 +815,33 @@ impl OpenAiResponsesNormalizer {
                 self.completed_text_parts.insert((index, part));
                 if let Some(text) = v.get("text").and_then(Value::as_str) {
                     self.text_items.insert((index, part), text.to_owned());
+                }
+            }
+            // Reasoning summaries are shown live as reasoning text, the way Anthropic thinking
+            // deltas are, so a long reasoning phase visibly progresses before the answer. This is
+            // display only: the durable record of the summary is the complete reasoning item kept
+            // from `response.output_item.done`, which is echoed back to the provider unchanged.
+            "response.reasoning_summary_text.delta" => {
+                let delta = v.get("delta").and_then(Value::as_str).unwrap_or("");
+                if !delta.is_empty() {
+                    let part = (
+                        v.get("output_index").and_then(Value::as_u64).unwrap_or(0),
+                        v.get("summary_index").and_then(Value::as_u64).unwrap_or(0),
+                    );
+                    let mut text = String::with_capacity(delta.len() + 2);
+                    if self.last_summary_part.is_some_and(|last| last != part) {
+                        text.push_str(broca_protocol::content::REASONING_SUMMARY_PART_SEPARATOR);
+                    }
+                    self.last_summary_part = Some(part);
+                    text.push_str(delta);
+                    let mid = self
+                        .response_id
+                        .clone()
+                        .unwrap_or_else(|| MessageId(String::new()));
+                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                        message_id: mid,
+                        delta: text,
+                    }));
                 }
             }
             "response.refusal.delta" => {
@@ -1525,5 +1556,87 @@ mod tests {
         events.extend(normalizer.finish().unwrap());
         let text = extract_assistant_text(&events);
         assert_eq!(text, "part 0 omitted part 1 omitted");
+    }
+
+    /// The event shape a Meta Muse stream sent with `reasoning.summary: "auto"` and
+    /// `store: false`: two summary parts, each a whole line in one delta and arriving seconds
+    /// apart, then the answer. Each summary delta must reach the display lane as reasoning text,
+    /// in order and before the first answer delta, so a long reasoning phase is visible progress.
+    /// The assembled message must still carry only the provider's raw reasoning item, so the
+    /// durable record and the request echoed back are unchanged.
+    #[test]
+    fn reasoning_summary_deltas_reach_the_display_lane_before_the_answer() {
+        const REASONING_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
+        let events_in = [
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#.to_owned(),
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]}}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"**Planning** I will check the inputs."}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"**Planning** I will check the inputs."}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_part.done","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"**Planning** I will check the inputs."}}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":1,"delta":"**Answering** The inputs are fine."}"#.to_owned(),
+            r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":1,"text":"**Answering** The inputs are fine."}"#.to_owned(),
+            format!(r#"{{"type":"response.output_item.done","output_index":0,"item":{REASONING_ITEM}}}"#),
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#.to_owned(),
+            r#"{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"All good."}"#.to_owned(),
+            r#"{"type":"response.output_text.done","output_index":1,"content_index":0,"text":"All good."}"#.to_owned(),
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+        let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+        let mut events = Vec::new();
+        // One push per event, as the events arrived seconds apart on the measured stream.
+        for event in &events_in {
+            events.extend(
+                normalizer
+                    .push(format!("data: {event}\n\n").as_bytes())
+                    .unwrap(),
+            );
+        }
+        events.extend(normalizer.finish().unwrap());
+
+        let display: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizedEvent::Display(DisplayEvent::ReasoningDelta { message_id, delta }) => {
+                    assert_eq!(message_id.0, "resp_1");
+                    Some(("reasoning", delta.as_str()))
+                }
+                NormalizedEvent::Display(DisplayEvent::TextDelta { delta, .. }) => {
+                    Some(("text", delta.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            display,
+            [
+                ("reasoning", "**Planning** I will check the inputs."),
+                ("reasoning", "\n\n**Answering** The inputs are fine."),
+                ("text", "All good."),
+            ]
+        );
+
+        let message = events
+            .iter()
+            .find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .expect("assembled message");
+        assert_eq!(
+            message.content,
+            [
+                ContentBlock::RedactedReasoning {
+                    data: REASONING_ITEM.into(),
+                    provider_format: Some(EncryptedReasoningFormat::OpenAiResponses),
+                },
+                ContentBlock::Text {
+                    text: "All good.".into()
+                },
+            ]
+        );
     }
 }

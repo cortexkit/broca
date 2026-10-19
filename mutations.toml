@@ -17266,3 +17266,16 @@ expect_red = ["delivery_order::a_keyed_retry_reports_the_delivered_runs_state_an
 file = "crates/broca-module/src/actor.rs"
 old = "Ok(Some(state)) => match indexed_finish_reason(&state.state) {"
 new = "Ok(Some(state)) => match None::<broca_protocol::RunFinishReason>.filter(|_| indexed_finish_reason(&state.state).is_some()) { // NON-VACUITY BREAK: report a finished run as active"
+
+[[control]]
+id = "responses-reasoning-summary-reaches-display-lane"
+guards = "an OpenAI Responses reasoning-summary delta is emitted on the live display lane as a reasoning delta, in order and before the answer's first text delta"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/families/openai_responses.rs"
+expect_red = ["families::openai_responses::tests::reasoning_summary_deltas_reach_the_display_lane_before_the_answer"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = "                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {\n                        message_id: mid,\n                        delta: text,"
+new = "                    let _ = (NormalizedEvent::Display(DisplayEvent::ReasoningDelta { // NON-VACUITY BREAK: drop the summary display delta\n                        message_id: mid,\n                        delta: text,"
