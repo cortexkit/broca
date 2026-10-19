@@ -1529,8 +1529,9 @@ where
     )?;
 
     writer.seed_lineage_retention(snapshot.checkpoint_at_head.lineage_retention);
-    // A lineage that has not started counts on from any lineage retention deleted at this
-    // address, so a tag is never reused across the deletion.
+    // A lineage with no RunStarted yet takes its first tag from the highest `next_tag` that the
+    // retention tombstones at this session's WAL address recorded (`retired_tag_floor`), so a
+    // new lineage never reuses a tag of an earlier lineage that retention deleted.
     let lineage_tags = match snapshot.checkpoint_at_head.tags {
         Some(tags @ crate::tags::LineageTags::Unstarted { .. }) => Some(
             tags.with_floor(
@@ -6098,8 +6099,11 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         &mut batch.results,
     );
 
-    // Append the now-complete tool turn (assistant + results) to the prompt, with the tags
-    // replay recovered for what was durable and the ones the writer just assigned.
+    // Append the now-complete tool turn (assistant + results) to the prompt. The assistant
+    // message and the results that were durable before the resume take their tags from the
+    // replayed records (`pending.assistant_tags`, `pending.existing_tags`); each result this
+    // resume dispatched takes the tag the writer assigned when it appended that result's
+    // record (`WalHandle::take_call_tags`).
     let mut answer = Message {
         cache_prefix_blocks: None,
         role: Role::Assistant,
@@ -9023,8 +9027,10 @@ mod tests {
             1,
         )
         .expect("spawn writer");
-        // Dispatch runs here without the admission that seeds the writer's tag state; this
-        // untagged history is a lineage without tags.
+        // This test calls `dispatch_batch` directly, skipping `reconstruct_prior`, the admission
+        // step that seeds the writer's tag state from the WAL. Seed it as that step would: the
+        // seeded history's only record is an untagged ToolResult, which is a lineage admitted
+        // before tags existed, so its state is `Off` and the new records stay untagged.
         writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
         let calls = vec![
             ToolCall {
