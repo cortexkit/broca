@@ -134,7 +134,7 @@ impl Provider for StoppingProvider {
                                     text: "also this".into(),
                                 }],
                             )],
-                            || {},
+                            || None,
                         ));
                     }
                     if let Some(stop) = &stop {

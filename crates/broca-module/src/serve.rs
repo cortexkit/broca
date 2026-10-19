@@ -328,6 +328,39 @@ pub use broca_wire::{
     SessionReadResponse, SessionReadTool,
 };
 
+/// The answer for `params` from a read page, when one of its messages holds the tag.
+fn resolve_in_page(
+    page: &SessionReadResponse,
+    params: &broca_wire::ResolveParams,
+) -> Option<Result<broca_wire::ResolveResponse, (&'static str, String)>> {
+    page.messages.iter().find_map(|entry| {
+        let row = entry.tags.iter().find(|row| row.tag == params.tag)?;
+        let (index, _) = entry
+            .message
+            .part_tags()?
+            .tagged()
+            .find(|(_, tag)| *tag == params.tag)?;
+        let block = entry.message.content.get(index)?;
+        let stored = broca_protocol::tags::part_text(block);
+        Some(match broca_wire::resolve_range(&stored, params.range) {
+            Some(text) => Ok(broca_wire::ResolveResponse {
+                tag: params.tag,
+                part: row.part.clone(),
+                kind: broca_protocol::tags::part_kind(block).to_owned(),
+                text,
+                range: params.range,
+            }),
+            None => Err((
+                broca_wire::RANGE_OUT_OF_BOUNDS,
+                format!(
+                    "range must lie within the part's {} characters",
+                    stored.chars().count()
+                ),
+            )),
+        })
+    })
+}
+
 fn session_read_response(
     page: broca_core::SessionReadPage,
     tools: Option<crate::registry::SessionReadTools>,
@@ -970,6 +1003,79 @@ pub trait ServeHandler: Send + Sync {
     /// acquiring the session lease.
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError>;
 
+    /// Where the session's materialized transcript holds the part tagged `tag`, from the
+    /// store's tag index (see [`broca_core::TagLocation`]). `None` when this handler keeps no
+    /// tag index, which leaves [`ServeHandler::resolve`] to read the transcript from its start.
+    async fn tag_location(
+        &self,
+        _session: &LineageKey,
+        _tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+        Ok(None)
+    }
+
+    /// `session.resolve` — the stored text of the part tagged `params.tag`, or a character
+    /// range of it. A refusal is answered as its typed code and message.
+    ///
+    /// The tag index names the part's message, which is then read as a one-message
+    /// `session.read` page: the store's row and the WAL past the store's watermark, never the
+    /// whole transcript. A tag the index does not hold can only be in the transcript past the
+    /// materialized prefix, which is read from there, through the same page path (the WAL
+    /// after the watermark). Every read goes through `session.read`'s own path, so resolve
+    /// sees exactly what a read sees, under the same authorization; the pages after the first
+    /// are pinned to its lineage, so a lineage recreated mid-search is refused rather than
+    /// searched half old, half new.
+    async fn resolve(
+        &self,
+        session: &LineageKey,
+        params: &broca_wire::ResolveParams,
+    ) -> Result<Result<broca_wire::ResolveResponse, (&'static str, String)>, ServeError> {
+        let location = self.tag_location(session, params.tag).await?;
+        let mut lineage_id = None;
+        if let Some((ordinal, _)) = location.and_then(|location| location.found) {
+            let page = self
+                .read(SessionReadRequest::new(
+                    session.clone(),
+                    Some(ordinal),
+                    Some(1),
+                ))
+                .await?;
+            lineage_id = page.lineage_id.clone();
+            if let Some(answer) = resolve_in_page(&page, params) {
+                return Ok(answer);
+            }
+        }
+        // Not in the index: past the materialized prefix, or a store without an index.
+        let mut from = location.map_or(0, |location| location.indexed_through);
+        loop {
+            let mut request = SessionReadRequest::new(
+                session.clone(),
+                Some(from),
+                Some(broca_core::SESSION_READ_MAX_LIMIT),
+            );
+            request.lineage_id = lineage_id.clone();
+            let page = self.read(request).await?;
+            if lineage_id.is_none() {
+                lineage_id = page.lineage_id.clone();
+            }
+            if let Some(answer) = resolve_in_page(&page, params) {
+                return Ok(answer);
+            }
+            match page.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => {
+                    return Ok(Err((
+                        broca_wire::UNKNOWN_TAG,
+                        format!(
+                            "no part of the session's transcript holds tag {}",
+                            params.tag
+                        ),
+                    )))
+                }
+            }
+        }
+    }
+
     /// `run.cancel` — cooperatively cancel the active run (→ Cancelled).
     async fn cancel(
         &self,
@@ -1215,6 +1321,16 @@ impl ServeHandler for crate::LineageRegistry {
     }
     fn compaction_supported(&self) -> bool {
         crate::LineageRegistry::compaction_supported(self)
+    }
+
+    async fn tag_location(
+        &self,
+        session: &LineageKey,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+        self.route_tag_location(session, tag)
+            .await
+            .map_err(ServeError::from)
     }
 
     async fn read_model(

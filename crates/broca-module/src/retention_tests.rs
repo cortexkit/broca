@@ -2665,6 +2665,8 @@ async fn size_refusal_crash_cut_reopens_with_room_for_orphan_seal() {
     {
         let writer =
             broca_core::WalHandle::spawn(rig.service.wal.open(&rig.key).unwrap(), 1).unwrap();
+        // As admission would: the seeded lineage started without tags.
+        writer.seed_lineage_tags(Some(broca_core::LineageTags::Off));
         let mut oversized = started(&rig.key, "r2", None, now);
         if let WalRecord::RunStarted { title, .. } = &mut oversized {
             *title = Some("x".repeat(cap * 2));

@@ -83,8 +83,8 @@ pub use context::{
     ExportError, ExportFact, ExportIndex, ExportPage, MaterializedStore, MissingExportRun,
     Persister, RunIndex, RunIndexRow, RunIndexState, SessionReadLineageState, SessionReadMessage,
     SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore, StorePageRow,
-    StorePageSnapshot, StorePrefix, ToolCallDispatch, WithdrawalRun, SESSION_READ_DEFAULT_LIMIT,
-    SESSION_READ_MAX_LIMIT,
+    StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
+    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
     read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest, ReadView,

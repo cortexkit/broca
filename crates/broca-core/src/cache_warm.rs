@@ -485,7 +485,10 @@ pub fn last_recorded_request(
     // A run frozen with `render_tags` sent its tagged user and tool-result text with the tag
     // prefix, after the guidance above; the rebuilt request must carry the same bytes.
     if config.render_tags {
-        broca_protocol::tags::render_tags_into(&mut prompt);
+        broca_protocol::tags::render_tags_into(
+            &mut prompt,
+            broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
+        );
     }
     // The one turn a budget allows after its finalize message renders with tool calls disabled.
     let tool_choice = if prior.budget_finalize_pending {

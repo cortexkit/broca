@@ -542,6 +542,10 @@ async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_r
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, &bytes[..boundaries[cut + 1]]).unwrap();
         let writer = WalHandle::spawn(store.open(&rig.bind).unwrap(), 1).unwrap();
+        // The body runs without admission, which is what seeds the writer's tag state.
+        writer.seed_lineage_tags(Some(crate::tags::lineage_tags(
+            frames[..=cut].iter().map(|frame| &frame.record),
+        )));
         let questions = Arc::new(Questions {
             store: crate::FileWalStore::new(&cut_root),
             memory: None,

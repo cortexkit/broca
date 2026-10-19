@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use broca_protocol::tags::MessageTags;
+use broca_protocol::tags::{MessageTags, PartTags};
 use broca_wal::WalRecord;
 use serde::{Deserialize, Serialize};
 
@@ -176,11 +176,23 @@ pub(crate) fn stamp(state: &mut LineageTags, record: &mut WalRecord) -> Option<V
     Some(tags)
 }
 
-/// Attach `tags` to `message` when they fit its blocks one for one.
+/// Attach one record's `tags` to `message`, the message that record carries.
 pub fn attach(message: &mut broca_protocol::Message, tags: Option<&MessageTags>) {
-    if let Some(tags) = tags.filter(|tags| tags.parts.len() == message.content.len()) {
-        message.set_tags(Some(Arc::new(tags.clone())));
-    }
+    attach_parts(message, tags.map(PartTags::from));
+}
+
+/// Attach per-part `tags` to `message`. They cover its blocks one for one: a record's tags are
+/// assigned from the same blocks, so a mismatch is a broken invariant, never a partial tagging.
+pub fn attach_parts(message: &mut broca_protocol::Message, tags: Option<PartTags>) {
+    let Some(tags) = tags else {
+        return;
+    };
+    assert_eq!(
+        tags.parts.len(),
+        message.content.len(),
+        "runner tags must cover a message's blocks one for one"
+    );
+    message.set_tags(Some(Arc::new(tags)));
 }
 
 #[cfg(test)]
@@ -363,6 +375,40 @@ mod tests {
         assert_eq!(after_move.last(), Some(&9));
         assert!(strictly_increasing(&after_move), "{after_move:?}");
         assert!(moved.read_records(&session).unwrap().len() > 1);
+    }
+
+    /// A writer reopened over a non-empty WAL knows nothing of its lineage's tags until an
+    /// admission seeds it. It refuses a record with parts rather than write it untagged, and
+    /// its next barrier fails, so nothing can claim the record durable.
+    #[tokio::test]
+    async fn an_unseeded_writer_refuses_a_record_with_parts() {
+        use crate::WalStore;
+        let session = broca_protocol::BindIdentity::new("/tmp/p", "h", "unseeded");
+        let store = crate::FileWalStore::new(scratch("unseeded"));
+        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
+        writer.record(run_started());
+        writer.shutdown().await.unwrap();
+
+        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
+        assert_eq!(writer.lineage_tags(), None);
+        // A record without parts is written as before.
+        assert!(matches!(
+            writer.record(WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1)
+            }),
+            crate::RecordOutcome::Accepted(_)
+        ));
+        assert!(matches!(
+            writer.record(result("a")),
+            crate::RecordOutcome::Refused(_)
+        ));
+        assert!(writer.is_poisoned());
+        assert!(writer.sync().await.is_err());
+        assert!(!store
+            .read_records(&session)
+            .unwrap()
+            .iter()
+            .any(|frame| matches!(frame.record, WalRecord::ToolResult { .. })));
     }
 
     /// A lineage whose first episode was written without tags (by a build before tags) stays

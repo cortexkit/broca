@@ -191,8 +191,29 @@ impl From<&str> for StorePageReadError {
     }
 }
 
+/// Where a session's materialized transcript holds a runner-tagged part, from the store's tag
+/// index (see [`MaterializedStore::tag_location`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagLocation {
+    /// The part's `(transcript ordinal, block index)`, when a materialized message holds it.
+    pub found: Option<(u64, usize)>,
+    /// How many transcript messages the index covers: the materialized prefix. A tag not
+    /// found can only be in the transcript past this ordinal, which the WAL after the store's
+    /// watermark holds.
+    pub indexed_through: u64,
+}
+
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Look a runner tag up in the store's tag index, without reading any message. `None`
+    /// when this store keeps no tag index; the caller then has to read the whole transcript.
+    fn tag_location(
+        &self,
+        _session: &BindIdentity,
+        _tag: u64,
+    ) -> Result<Option<TagLocation>, String> {
+        Ok(None)
+    }
     /// Claim-check events are session-owned data, even though the broker carries only routing metadata.
     fn read_run_event(&self, _event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
         Ok(None)

@@ -236,7 +236,7 @@ async fn a_tag_rendering_run_shows_user_and_tool_tags_and_replay_rebuilds_the_sa
     // request the live run sent, so the provider's cached prefix still matches.
     for (nth, sent) in run.calls.iter().enumerate() {
         let mut rebuilt = replayed_prompt(&run.records, nth);
-        render_tags_into(&mut rebuilt);
+        render_tags_into(&mut rebuilt, Default::default());
         assert_eq!(texts(&rebuilt), texts(&sent.prompt), "request {nth}");
         assert_eq!(
             broca_core::canonical_request_bytes(&broca_protocol::CallOptions::new(rebuilt)),

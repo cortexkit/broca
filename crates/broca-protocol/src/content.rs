@@ -97,12 +97,12 @@ impl Message {
     }
 
     /// Attach (or clear) this message's runner tags. Rendering state starts over.
-    pub fn set_tags(&mut self, tags: Option<std::sync::Arc<crate::tags::MessageTags>>) {
+    pub fn set_tags(&mut self, tags: Option<std::sync::Arc<crate::tags::PartTags>>) {
         self.tags = crate::tags::TagSlot::new(tags);
     }
 
     /// This message's runner tags, when its session has them.
-    pub fn part_tags(&self) -> Option<&crate::tags::MessageTags> {
+    pub fn part_tags(&self) -> Option<&crate::tags::PartTags> {
         self.tags.get()
     }
 

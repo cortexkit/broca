@@ -3,15 +3,16 @@
 //! Tags are metadata: a prompt whose messages carry tags renders byte-for-byte like the same
 //! prompt without them, so a run that does not render tags sends exactly what it sent before
 //! tags existed. A run frozen with `render_tags` prefixes `§N§ ` to tagged user text and
-//! tool-result text only, never to assistant parts (text, signed reasoning, tool calls) or to
-//! a JSON tool output, and its bytes are pinned per family here.
+//! tool-result text, and on Anthropic Messages to plain assistant text as well. It never shows
+//! a tag in signed reasoning, a tool call or a JSON tool output, on any family. Its bytes are
+//! pinned per family here.
 
 use std::sync::Arc;
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult},
     request::{CallOptions, ModelHandle, Tool},
-    tags::{render_tags_into, MessageTags},
+    tags::{render_tags_into, PartTags, TagRendering},
     ToolCallId,
 };
 use broca_provider::families::{
@@ -24,7 +25,7 @@ use broca_provider::wire::{FrozenRenderConfig, WireFamily};
 use sha2::{Digest, Sha256};
 
 fn tagged(mut message: Message, parts: &[u64]) -> Message {
-    message.set_tags(Some(Arc::new(MessageTags::new(parts.to_vec()))));
+    message.set_tags(Some(Arc::new(PartTags::all(parts.iter().copied()))));
     message
 }
 
@@ -166,7 +167,7 @@ fn families() -> Vec<(&'static str, Box<dyn WireFamily>, FrozenRenderConfig)> {
 const RENDERED_SHA256: &[(&str, &str)] = &[
     (
         "anthropic_messages",
-        "843f84423d2762fca788e2315eacf815a5f37beb500e7b06c70e055bdeabe9ce",
+        "3a9a06b3a9d6d6abed6574a838e493fc6bb61b9f884b1738178d0a99973b1662",
     ),
     (
         "openai_chat",
@@ -221,22 +222,34 @@ fn tags_never_change_a_request_rendered_without_render_tags() {
 fn render_tags_prefixes_only_user_and_tool_result_text_and_is_pinned_per_family() {
     let mut digests = Vec::new();
     for (name, family, frozen) in families() {
+        let rendering = TagRendering::for_family(Some(name));
         let mut rendered_prompt = prompt(true);
-        render_tags_into(&mut rendered_prompt);
+        render_tags_into(&mut rendered_prompt, rendering);
         let body = family.render(&frozen, &options(rendered_prompt.clone()));
         let text = String::from_utf8(body.clone()).expect("a JSON request body");
         for mark in ["§1§ hello", "§6§ found it", "§8§ thanks"] {
             assert!(text.contains(mark), "{name}: missing {mark} in {text}");
         }
-        for untouched in ["§2§", "§3§", "§4§", "§5§", "§7§"] {
+        // Only Anthropic shows the assistant text's tag. No family shows the thinking's (2), a
+        // tool call's (4, 5) or the JSON result's (7).
+        assert_eq!(
+            text.contains("§3§ let me look"),
+            name == "anthropic_messages",
+            "{name}: assistant text {text}"
+        );
+        assert_eq!(rendering.assistant_text, name == "anthropic_messages");
+        for untouched in ["§2§", "§4§", "§5§", "§7§"] {
             assert!(
                 !text.contains(untouched),
-                "{name}: an assistant part or a JSON result was rendered with {untouched}: {text}"
+                "{name}: thinking, a call or a JSON result was rendered with {untouched}: {text}"
             );
+        }
+        if name != "anthropic_messages" {
+            assert!(!text.contains("§3§"), "{name}: {text}");
         }
         // Rendering an already rendered prompt again changes nothing: a part's rendering is
         // fixed the first time and every later request repeats it.
-        render_tags_into(&mut rendered_prompt);
+        render_tags_into(&mut rendered_prompt, rendering);
         assert_eq!(
             family.render(&frozen, &options(rendered_prompt)),
             body,

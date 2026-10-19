@@ -1846,9 +1846,6 @@ struct LiveTags {
         broca_protocol::ToolCallId,
         std::collections::VecDeque<MessageTags>,
     >,
-    /// For each `Steered` record (a message a caller added to the running turn), in WAL order,
-    /// the tags of its messages, one entry per message.
-    steers: std::collections::VecDeque<Vec<MessageTags>>,
     /// Assistant messages, by the step that produced them.
     steps: std::collections::HashMap<broca_protocol::StepId, MessageTags>,
     /// Budget messages, by their prompt ordinal.
@@ -1892,8 +1889,9 @@ pub struct WalHandle {
     /// then, and nothing is tagged while it is unknown). Read and advanced only under the
     /// enqueue lock, so tags follow WAL order. See [`crate::tags`].
     lineage_tags: Mutex<Option<crate::tags::LineageTags>>,
-    /// Tags assigned to tool results and steers, kept until the run loop attaches them to the
-    /// messages it adds to its in-memory prompt. Retained only while a run that renders tags
+    /// Tags assigned to tool results, assistant messages and budget messages, kept until the
+    /// run loop attaches them to the messages it adds to its in-memory prompt. (A steer's
+    /// messages get their tags from the record the steer inbox writes, see `SteerInbox::deliver`.) Retained only while a run that renders tags
     /// asked for them (`None` otherwise), so a run that does not render tags keeps nothing.
     live_tags: Mutex<Option<LiveTags>>,
     #[cfg(test)]
@@ -2144,7 +2142,7 @@ impl WalHandle {
         *self.lineage_tags.lock().unwrap()
     }
 
-    /// Keep (or stop keeping) the tags assigned to tool results and steers for the run loop.
+    /// Keep (or stop keeping) the tags the run loop attaches to the messages it adds.
     pub fn retain_live_tags(&self, retain: bool) {
         *self.live_tags.lock().unwrap() = retain.then(LiveTags::default);
     }
@@ -2179,11 +2177,6 @@ impl WalHandle {
             .as_mut()?
             .budgets
             .remove(&ordinal)
-    }
-
-    /// The tags assigned to the oldest kept steer, one entry per message.
-    pub fn take_steer_tags(&self) -> Option<Vec<MessageTags>> {
-        self.live_tags.lock().unwrap().as_mut()?.steers.pop_front()
     }
 
     /// Queue `record` like [`record`](Self::record) and also return the runner tags the writer
@@ -2224,20 +2217,21 @@ impl WalHandle {
     }
 
     /// Assign the record's runner tags, under the enqueue lock, and keep the ones the run loop
-    /// asked for.
-    fn stamp_tags(&self, record: &mut WalRecord) -> Option<Vec<MessageTags>> {
+    /// asked for. A record whose parts need tags is refused while the lineage's tag state is
+    /// unknown (a writer reopened over a non-empty WAL that no admission has seeded): writing
+    /// it untagged would leave an untagged part in a tagged lineage, and guessing a number
+    /// could reuse one.
+    fn stamp_tags(&self, record: &mut WalRecord) -> Result<Option<Vec<MessageTags>>, String> {
         let mut state = self.lineage_tags.lock().unwrap();
         let assigned = match state.as_mut() {
             Some(state) => crate::tags::stamp(state, record),
-            None => {
-                if crate::tags::tag_shape(record).is_some() && record.runner_tags().is_empty() {
-                    tracing::warn!(
-                        target: "wal",
-                        "record appended before its lineage's tag state was seeded; left untagged"
-                    );
-                }
-                None
+            None if crate::tags::tag_shape(record).is_some() && record.runner_tags().is_empty() => {
+                return Err(
+                    "a record with message parts was appended before the lineage's runner-tag                      state was seeded; refusing to write it untagged"
+                        .into(),
+                );
             }
+            None => None,
         };
         drop(state);
         if let Some(assigned) = &assigned {
@@ -2257,7 +2251,6 @@ impl WalHandle {
                         .entry(tool_call_id.clone())
                         .or_default()
                         .push_back(assigned[0].clone()),
-                    WalRecord::Steered { .. } => live.steers.push_back(assigned.clone()),
                     WalRecord::ModelStepFinished { step_id, .. } => {
                         live.steps.insert(*step_id, assigned[0].clone());
                     }
@@ -2270,7 +2263,7 @@ impl WalHandle {
                 }
             }
         }
-        assigned
+        Ok(assigned)
     }
 
     pub fn seed_input_token_limit(&self, limit: Option<u64>) {
@@ -2308,7 +2301,15 @@ impl WalHandle {
         reserved_terminal: bool,
         assigned: &mut Option<Vec<MessageTags>>,
     ) -> RecordOutcome {
-        *assigned = self.stamp_tags(&mut record);
+        *assigned = match self.stamp_tags(&mut record) {
+            Ok(assigned) => assigned,
+            Err(error) => {
+                // Fail-stop like any other append failure: the caller's next barrier fails, so
+                // no durability claim can cover the missing record.
+                set_poison(&self.poisoned, error.clone());
+                return RecordOutcome::Refused(WalWriteError::Failed(error));
+            }
+        };
         let (seq, frame) = if let Some(budget) = &self.append_budget {
             let seq = self.next_seq.load(Ordering::SeqCst);
             let mut budget = budget.lock().unwrap();

@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use broca_protocol::structured_output::FrozenStructuredOutput;
-use broca_protocol::tags::MessageTags;
 use broca_protocol::BindIdentity;
 use broca_protocol::{
     caller::{ControlUnit, PauseReason, RunFinishReason, SharedProviderError},
@@ -1913,30 +1912,15 @@ fn apply_committed_budget_firings(
     }
 }
 
-/// Attach the tags the writer kept for steered messages, in the order their records were
-/// written: each `Steered` record's tags cover its messages one for one.
-fn attach_steer_tags(writer: &WalHandle, steered: &mut [Message]) {
-    let mut pending: std::collections::VecDeque<MessageTags> = Default::default();
-    for message in steered {
-        if pending.is_empty() {
-            match writer.take_steer_tags() {
-                Some(tags) => pending.extend(tags),
-                None => return,
-            }
-        }
-        crate::tags::attach(message, pending.pop_front().as_ref());
-    }
-}
-
-/// The tags of the tool-role message holding `results`: each result's tag from `existing`
-/// (a terminal recovered from the WAL) or else the one the writer kept when it appended the
-/// result. `None` unless every result has one.
+/// The tags of the tool-role message holding `results`: each result is its own part, tagged
+/// from `existing` (a terminal recovered from the WAL) or else with the tag the writer kept
+/// when it appended the result. `None` only when no result has one (an untagged lineage).
 fn live_result_tags(
     writer: &WalHandle,
     results: &[ToolResult],
     existing: &mut std::collections::HashMap<ToolCallId, std::collections::VecDeque<u64>>,
-) -> Option<MessageTags> {
-    let parts: Option<Vec<u64>> = results
+) -> Option<broca_protocol::tags::PartTags> {
+    let parts: Vec<Option<u64>> = results
         .iter()
         .map(|result| {
             existing
@@ -1950,8 +1934,9 @@ fn live_result_tags(
         })
         .collect();
     parts
-        .filter(|parts| !parts.is_empty())
-        .map(MessageTags::new)
+        .iter()
+        .any(Option::is_some)
+        .then(|| broca_protocol::tags::PartTags::new(parts))
 }
 
 fn record_budget_firings(writer: &WalHandle, run_id: &RunId, firings: &[BudgetFiring]) {
@@ -4261,7 +4246,6 @@ where
                 Vec::new()
             }
         };
-        attach_steer_tags(writer, &mut steered);
         steer_backlog.append(&mut steered);
         if !steer_backlog.is_empty() {
             mutable_call_options(&mut opts)
@@ -4284,12 +4268,16 @@ where
             broca_protocol::content::stamp_ordinals(raw);
         }
         // A run frozen with `render_tags` shows each tagged user and tool-result text part
-        // with its `§N§ ` prefix. Each message is rendered once, the first time a request
-        // includes it, and depends only on its stored text and tags, so every later request
-        // repeats the same bytes. The native copies above stay unprefixed.
+        // with its `§N§ ` prefix, and on Anthropic Messages each assistant text part's tag too.
+        // Each message is rendered once, the first time a request includes it, and depends only
+        // on its stored text and tags, so every later request repeats the same bytes. The
+        // native copies above stay unprefixed.
         if render_tags && tags_rendered_len < opts.prompt.len() {
             broca_protocol::tags::render_tags_into(
                 &mut mutable_call_options(&mut opts).prompt[tags_rendered_len..],
+                broca_protocol::tags::TagRendering::for_render_config(
+                    &provider.render_config_blob(),
+                ),
             );
             tags_rendered_len = opts.prompt.len();
         }
@@ -5239,7 +5227,7 @@ where
             ordinal: None,
             tags: Default::default(),
         };
-        crate::tags::attach(&mut results, result_tags.as_ref());
+        crate::tags::attach_parts(&mut results, result_tags);
         mutable_call_options(&mut opts).prompt.push(results);
         append_budget_firings(
             writer,
@@ -6123,7 +6111,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         ordinal: None,
         tags: Default::default(),
     };
-    crate::tags::attach(&mut results, result_tags.as_ref());
+    crate::tags::attach_parts(&mut results, result_tags);
     prompt.push(results);
 
     Ok((BatchOutcome::finish_reason(batch.interruption), Vec::new()))
@@ -8975,6 +8963,9 @@ mod tests {
             1,
         )
         .expect("spawn writer");
+        // Dispatch runs here without the admission that seeds the writer's tag state; this
+        // untagged history is a lineage without tags.
+        writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
         let calls = vec![
             ToolCall {
                 thought_signature: None,

@@ -17182,13 +17182,82 @@ old = '''                floor: own.max(floor),'''
 new = '''                floor: own, // NON-VACUITY BREAK: ignore the deleted lineage's floor'''
 
 [[control]]
-id = "runner-tags-never-render-into-assistant-parts"
-guards = "Rendering runner tags prefixes only user text and tool-result text; assistant text, signed reasoning and tool calls keep their exact bytes"
+id = "runner-tags-assistant-text-only-on-anthropic"
+guards = "Assistant text shows its runner tag only on the Anthropic Messages family; every other family keeps assistant tags as metadata"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
 test_file = "crates/broca-protocol/src/tags.rs"
-expect_red = ["tags::tests::rendering_prefixes_user_and_tool_text_once_and_never_assistant_parts"]
+expect_red = ["tags::tests::only_anthropic_shows_assistant_text_tags"]
 file = "crates/broca-protocol/src/tags.rs"
-old = '''            (Role::User, ContentBlock::Text { text }) => prefix(text, *tag),'''
-new = '''            (Role::User | Role::Assistant, ContentBlock::Text { text }) => prefix(text, *tag), // NON-VACUITY BREAK: render into assistant text'''
+old = '''            assistant_text: family_id == Some(ANTHROPIC_MESSAGES_FAMILY),'''
+new = '''            assistant_text: family_id.is_some() || true, // NON-VACUITY BREAK: every family shows assistant tags'''
+
+[[control]]
+id = "runner-tags-never-render-into-thinking"
+guards = "Even on Anthropic, rendering runner tags never touches thinking, encrypted reasoning, tool-call arguments or provider-state text"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::anthropic_rendering_never_touches_thinking_tool_calls_or_provider_state"]
+file = "crates/broca-protocol/src/tags.rs"
+old = '''            (Role::Assistant, ContentBlock::Text { text }) if rendering.assistant_text => {'''
+new = '''            (Role::Assistant, ContentBlock::Text { text } | ContentBlock::Reasoning { text, .. }) if rendering.assistant_text => { // NON-VACUITY BREAK: render into thinking'''
+
+[[control]]
+id = "runner-tags-live-results-render-as-their-rebuild"
+guards = "A render_tags run attaches each tool result's tag to the message it adds live, so its request equals the request rebuilt from the WAL"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+file = "crates/broca-core/src/run.rs"
+old = '''        crate::tags::attach_parts(&mut results, result_tags);
+        mutable_call_options(&mut opts).prompt.push(results);'''
+new = '''        let _ = result_tags; // NON-VACUITY BREAK: the live tool message carries no tags
+        mutable_call_options(&mut opts).prompt.push(results);'''
+
+[[control]]
+id = "runner-tags-steer-carries-its-record-tags"
+guards = "A steer joins the running turn with the tags its Steered record was given, so the live request equals its rebuild"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+file = "crates/broca-core/src/steer.rs"
+old = '''                crate::tags::attach(message, Some(tags));'''
+new = '''                let _ = (message, tags); // NON-VACUITY BREAK: the queued steer loses its tags'''
+
+[[control]]
+id = "runner-tags-unseeded-writer-refuses"
+guards = "A writer whose lineage tag state is unknown refuses a record with parts instead of writing an untagged part into a tagged lineage"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::an_unseeded_writer_refuses_a_record_with_parts"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = '''            None if crate::tags::tag_shape(record).is_some() && record.runner_tags().is_empty() => {'''
+new = '''            None if false && crate::tags::tag_shape(record).is_some() => { // NON-VACUITY BREAK: write it untagged'''
+
+[[control]]
+id = "runner-tags-resolve-uses-the-tag-index"
+guards = "session.resolve finds a materialized tag through the store's tag index and reads one message, never the transcript from its start"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/wal_cost.rs"
+expect_red = ["session_read::wal_cost::resolving_a_tag_in_a_large_session_reads_no_whole_wal"]
+file = "crates/broca-store/src/lib.rs"
+old = '''        Ok(Some(broca_core::TagLocation {
+            found,'''
+new = '''        let _ = found;
+        Ok(Some(broca_core::TagLocation {
+            found: None, // NON-VACUITY BREAK: the index finds nothing'''

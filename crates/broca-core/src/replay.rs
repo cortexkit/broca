@@ -711,7 +711,7 @@ fn single_tag(tags: Option<&broca_protocol::tags::MessageTags>) -> Option<u64> {
     tags.and_then(|tags| (tags.parts.len() == 1).then(|| tags.parts[0]))
 }
 
-/// `message` with `tags` attached when they fit its blocks.
+/// `message` with its record's `tags` attached (see [`crate::tags::attach`]).
 fn tagged(mut message: Message, tags: Option<&broca_protocol::tags::MessageTags>) -> Message {
     crate::tags::attach(&mut message, tags);
     message
@@ -759,15 +759,17 @@ impl OpenBatch {
     }
 
     /// The tags of the tool-role message holding every terminated call's result in planned
-    /// order: one per result, or none unless every result has one.
-    fn result_tags(&self) -> Option<broca_protocol::tags::MessageTags> {
-        let parts: Option<Vec<u64>> = (0..self.planned.len())
+    /// order. Each result is its own part with its own record's tag. `None` only when no
+    /// result carries a tag: a lineage admitted before tags existed.
+    fn result_tags(&self) -> Option<broca_protocol::tags::PartTags> {
+        let parts: Vec<Option<u64>> = (0..self.planned.len())
             .filter(|position| self.terminals[*position].is_some())
             .map(|position| self.tag_for(position))
             .collect();
         parts
-            .filter(|parts| !parts.is_empty())
-            .map(broca_protocol::tags::MessageTags::new)
+            .iter()
+            .any(Option::is_some)
+            .then(|| broca_protocol::tags::PartTags::new(parts))
     }
 
     // The runner writes terminals in source order for each repeated id. An
@@ -1458,7 +1460,11 @@ fn replay_seeded_with_compaction<'a>(
                     // Preserve its answer text in future history, but omit tool calls because
                     // the tool-disabled turn never dispatches them and therefore has no results.
                     ep.first_step_message.get_or_insert(prompt.len());
-                    // The kept blocks keep their own tags; the dropped calls' tags go unused.
+                    // The finalize turn's tool calls are never dispatched, so neither the
+                    // transcript nor any request holds them. The kept blocks keep their own
+                    // tags. The dropped calls' tags stay assigned in the WAL record and are
+                    // never reused, but no transcript part holds them, so no read or
+                    // `session.resolve` answers them.
                     let kept_tags = step_tags.map(|tags| {
                         broca_protocol::tags::MessageTags::new(
                             assistant_message
@@ -2586,17 +2592,15 @@ fn commit_tool_turn(
         .enumerate()
         .filter_map(|(position, _)| batch.result_for(position).map(ContentBlock::ToolResult))
         .collect();
-    prompt.push(tagged(
-        Message {
-            cache_prefix_blocks: None,
-            role: Role::Tool,
-            content,
-            origin: None,
-            ordinal: None,
-            tags: Default::default(),
-        },
-        batch.result_tags().as_ref(),
-    ));
+    prompt.push(Message {
+        cache_prefix_blocks: None,
+        role: Role::Tool,
+        content,
+        origin: None,
+        ordinal: None,
+        tags: Default::default(),
+    });
+    crate::tags::attach_parts(prompt.last_mut().expect("just pushed"), batch.result_tags());
 }
 
 #[cfg(test)]

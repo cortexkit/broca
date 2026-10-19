@@ -26,7 +26,10 @@ pub fn render_step(
     }
     // A run frozen with `render_tags` sent tagged user and tool-result text with its tag prefix.
     if config.render_tags {
-        broca_protocol::tags::render_tags_into(&mut prior.prompt);
+        broca_protocol::tags::render_tags_into(
+            &mut prior.prompt,
+            broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
+        );
     }
     let frozen: FrozenRenderConfig = serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|e| format!("decode frozen_render_config: {e}"))?;

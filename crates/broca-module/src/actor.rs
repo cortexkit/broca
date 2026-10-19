@@ -3175,6 +3175,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     if let Some(provider) = prepared.refused {
                         return SendOutcome::PreUserUnavailable { provider };
                     }
+                    // A writer reopened for a paused session has not been seeded by a run yet;
+                    // the steer's message needs its runner tags from the lineage's state.
+                    if let Err(error) = self.seed_writer_tags().await {
+                        return SendOutcome::Transient(error);
+                    }
                     let writer = self.writer.as_ref().expect("writer live while paused");
                     if let Some(limit) = request
                         .budget
@@ -3229,6 +3234,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => return SendOutcome::Transient(error),
             };
+            // The running turn's admission seeded the writer; this only fills a writer that
+            // reopened without one, from the same history.
+            self.writer
+                .as_ref()
+                .expect("writer live while open")
+                .seed_lineage_tags(checkpoint.tags);
             let Some(episode) = checkpoint
                 .last_episode
                 .filter(|episode| episode.run_id == active)
@@ -3291,7 +3302,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             {
                 writer.record(WalRecord::InputTokenCapFrozen { limit });
             }
-            writer.record(record);
+            writer.record_tagged(record).1
         }) {
             // The run has decided it renders no further step and is writing its terminal: there
             // is no running turn left to join, so the message waits for the next turn instead.
@@ -6228,6 +6239,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
         broca_core::decide_scope(ownership, principal, send)
     }
 
+    /// Seed the writer's runner-tag state from the session's history when nothing seeded it yet,
+    /// so a record it appends outside a run (a steer into a paused run) is tagged like the rest.
+    async fn seed_writer_tags(&self) -> Result<(), String> {
+        let writer = self.writer.as_ref().expect("writer live while open");
+        if writer.lineage_tags().is_none() {
+            let checkpoint = self.load_checkpoint_at_head().await?;
+            writer.seed_lineage_tags(checkpoint.tags);
+        }
+        Ok(())
+    }
+
     /// The admission checkpoint of the session's history through its durable head, read without
     /// installing it as the actor's admission view.
     async fn load_checkpoint_at_head(&self) -> Result<broca_core::AdmissionCheckpointV1, String> {
@@ -6436,6 +6458,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .map(Box::new);
         self.registry
             .note_session_ownership(&self.key, self.gen, &snapshot.checkpoint_at_head);
+        // The writer also appends outside a run (a crash or shutdown seal, a steer into a paused
+        // run), so its runner-tag state comes from the same history as this admission view.
+        if let Some(writer) = &self.writer {
+            let tags = match snapshot.checkpoint_at_head.tags {
+                Some(tags @ broca_core::LineageTags::Unstarted { .. }) => Some(
+                    tags.with_floor(
+                        self.wal_store
+                            .retired_tag_floor(&self.key)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                ),
+                other => other,
+            };
+            writer.seed_lineage_tags(tags);
+        }
         self.prior_snapshot = Some(snapshot);
         Ok(())
     }

@@ -1948,70 +1948,6 @@ async fn authorize_route_request<H: ServeHandler>(
     }
 }
 
-/// Find the part tagged `params.tag` in `session`'s transcript and answer its stored text.
-///
-/// It reads the transcript through `session.read`'s own page path, oldest page first, so it
-/// sees exactly what a read sees and under the same authorization; the pages after the first
-/// are pinned to the first page's lineage, so a lineage recreated mid-scan is refused rather
-/// than searched half old, half new. A refusal is returned as its typed code and message.
-async fn resolve_tag<H: ServeHandler>(
-    handler: &H,
-    session: BrocaBindIdentity,
-    params: &broca_wire::ResolveParams,
-) -> Result<Result<broca_wire::ResolveResponse, (&'static str, String)>, ServeError> {
-    let mut from = 0;
-    let mut lineage_id = None;
-    loop {
-        let mut request = SessionReadRequest::new(
-            session.clone(),
-            Some(from),
-            Some(broca_core::SESSION_READ_MAX_LIMIT),
-        );
-        request.lineage_id = lineage_id.clone();
-        let page = handler.read(request).await?;
-        if lineage_id.is_none() {
-            lineage_id = page.lineage_id.clone();
-        }
-        for entry in &page.messages {
-            let Some(index) = entry.tags.iter().position(|row| row.tag == params.tag) else {
-                continue;
-            };
-            let Some(block) = entry.message.content.get(index) else {
-                continue;
-            };
-            let stored = broca_protocol::tags::part_text(block);
-            let Some(text) = broca_wire::resolve_range(&stored, params.range) else {
-                return Ok(Err((
-                    broca_wire::RANGE_OUT_OF_BOUNDS,
-                    format!(
-                        "range must lie within the part's {} characters",
-                        stored.chars().count()
-                    ),
-                )));
-            };
-            return Ok(Ok(broca_wire::ResolveResponse {
-                tag: params.tag,
-                part: entry.tags[index].part.clone(),
-                kind: broca_protocol::tags::part_kind(block).to_owned(),
-                text,
-                range: params.range,
-            }));
-        }
-        match page.next_from_ordinal {
-            Some(next) if next > from => from = next,
-            _ => {
-                return Ok(Err((
-                    broca_wire::UNKNOWN_TAG,
-                    format!(
-                        "no part of the session's transcript holds tag {}",
-                        params.tag
-                    ),
-                )))
-            }
-        }
-    }
-}
-
 /// Handle an authorized request on an already bound route channel by checking the request method and
 /// calling the matching handler for that method.
 #[allow(clippy::too_many_arguments)]
@@ -2751,7 +2687,7 @@ where
                     .await;
                 }
             };
-            match resolve_tag(handler.as_ref(), session, &params).await {
+            match handler.resolve(&session, &params).await {
                 Ok(Ok(reply)) => {
                     send_json_response(writer, ver, channel, epoch, corr, &reply).await
                 }
@@ -4673,8 +4609,8 @@ mod tests {
                 })
                 .collect(),
         );
-        message.set_tags(Some(Arc::new(broca_protocol::tags::MessageTags::new(
-            tags.to_vec(),
+        message.set_tags(Some(Arc::new(broca_protocol::tags::PartTags::all(
+            tags.iter().copied(),
         ))));
         message
     }
@@ -4694,7 +4630,11 @@ mod tests {
         let resolve = |tag, range| {
             let handler = &handler;
             let session = session.clone();
-            async move { resolve_tag(handler, session, &broca_wire::ResolveParams { tag, range }).await }
+            async move {
+                handler
+                    .resolve(&session, &broca_wire::ResolveParams { tag, range })
+                    .await
+            }
         };
 
         let whole = resolve(5, None).await.unwrap().unwrap();

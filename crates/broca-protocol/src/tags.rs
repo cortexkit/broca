@@ -7,7 +7,8 @@
 //!
 //! Tags are metadata, never message content: a message's stored bytes, its serialized form and
 //! its equality ignore them. Only a run frozen with `render_tags` shows them to the model, by
-//! prefixing user and tool-result text in the rendered request (see [`render_tags_into`]).
+//! prefixing user and tool-result text (and, on Anthropic Messages, assistant text) in the
+//! rendered request (see [`render_tags_into`]).
 
 use std::sync::Arc;
 
@@ -40,6 +41,45 @@ impl MessageTags {
     }
 }
 
+/// The tags of one transcript message's parts, as the transcript holds them: one entry per
+/// content block, in block order. Each part carries its own tag, so a message assembled from
+/// several records (a tool turn's results, one record per call) has each result's tag in its
+/// position. An entry is `None` only for a part whose record was written before its session's
+/// tags were on, which a tagged lineage never has. Serialized as an array of numbers (and
+/// `null`s), the form the store keeps beside each message row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PartTags {
+    pub parts: Vec<Option<u64>>,
+}
+
+impl PartTags {
+    pub fn new(parts: Vec<Option<u64>>) -> Self {
+        Self { parts }
+    }
+
+    /// Every part tagged, in order.
+    pub fn all(parts: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            parts: parts.into_iter().map(Some).collect(),
+        }
+    }
+
+    /// `(block index, tag)` for every tagged part.
+    pub fn tagged(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.parts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tag)| tag.map(|tag| (index, tag)))
+    }
+}
+
+impl From<&MessageTags> for PartTags {
+    fn from(tags: &MessageTags) -> Self {
+        Self::all(tags.parts.iter().copied())
+    }
+}
+
 /// A message's tags as it is held in memory. Never serialized: the WAL keeps tags on the
 /// records that carry the parts, and the store keeps them beside each message row.
 ///
@@ -48,7 +88,7 @@ impl MessageTags {
 /// this workspace is a check of content.
 #[derive(Debug, Clone, Default)]
 pub struct TagSlot {
-    tags: Option<Arc<MessageTags>>,
+    tags: Option<Arc<PartTags>>,
     /// Whether [`render_tags_into`] already prefixed this message's text, so that rendering
     /// the same prompt again leaves it unchanged.
     rendered: bool,
@@ -61,18 +101,18 @@ impl PartialEq for TagSlot {
 }
 
 impl TagSlot {
-    pub fn new(tags: Option<Arc<MessageTags>>) -> Self {
+    pub fn new(tags: Option<Arc<PartTags>>) -> Self {
         Self {
             tags,
             rendered: false,
         }
     }
 
-    pub fn get(&self) -> Option<&MessageTags> {
+    pub fn get(&self) -> Option<&PartTags> {
         self.tags.as_deref()
     }
 
-    pub fn shared(&self) -> Option<Arc<MessageTags>> {
+    pub fn shared(&self) -> Option<Arc<PartTags>> {
         self.tags.clone()
     }
 
@@ -81,27 +121,62 @@ impl TagSlot {
     }
 }
 
-/// Whether assistant text blocks may carry a rendered tag. Off: rendering into assistant
-/// parts waits on a live check of how Anthropic treats edited assistant text, and it must
-/// never touch signed thinking, tool-call arguments or any block carrying provider state.
-pub const RENDER_ASSISTANT_TAGS: bool = false;
+/// The wire family whose assistant text blocks may show their tags (see [`TagRendering`]).
+pub const ANTHROPIC_MESSAGES_FAMILY: &str = "anthropic_messages";
 
-/// Prefix `§N§ ` to every tagged user text block and every tagged tool-result text output in
-/// `messages`, in place. Used only to build the model's view of a run frozen with
-/// `render_tags`; stored records are never changed.
-///
-/// Untouched: assistant messages (see [`RENDER_ASSISTANT_TAGS`]), system messages, blocks with
-/// provider state, tool-result JSON, denial and error outputs, and any message without tags.
-/// A message is rendered at most once, so calling this again over a prompt that already holds
-/// rendered messages changes nothing. Its output depends only on the stored text and its tag,
-/// so every later render of the part is byte-identical.
-pub fn render_tags_into(messages: &mut [Message]) {
-    for message in messages {
-        render_message_tags(message);
+/// Which parts a run frozen with `render_tags` shows tags in, for the wire family it renders
+/// to. Tagged user text blocks and tagged tool-result text outputs always show them. Assistant
+/// text shows them only on Anthropic Messages, where a live check confirmed that a tagged text
+/// block beside unchanged signed thinking is accepted and keeps the cache. Every other family's
+/// assistant parts keep their tags as metadata only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TagRendering {
+    /// Plain assistant `text` blocks show their tag. Never thinking, encrypted reasoning,
+    /// tool calls or a text block carrying provider state.
+    pub assistant_text: bool,
+}
+
+impl TagRendering {
+    /// The rendering for the wire family `family_id` names (the frozen render config's
+    /// `family_id`); an unknown or absent family shows no assistant tags.
+    pub fn for_family(family_id: Option<&str>) -> Self {
+        Self {
+            assistant_text: family_id == Some(ANTHROPIC_MESSAGES_FAMILY),
+        }
+    }
+
+    /// The rendering for a run whose provider froze `frozen_render_config`.
+    pub fn for_render_config(frozen_render_config: &serde_json::Value) -> Self {
+        Self::for_family(
+            frozen_render_config
+                .get("family_id")
+                .and_then(serde_json::Value::as_str),
+        )
     }
 }
 
-fn render_message_tags(message: &mut Message) {
+/// Show the tags of `messages`' tagged parts in place, as `rendering` allows: `§N§ ` before
+/// each user text block and each tool-result text output, and, where the family allows it,
+/// in each plain assistant text block. Used only to build the model's view of a run frozen with
+/// `render_tags`; stored records are never changed.
+///
+/// An assistant text that already begins with a tag mark (the model wrote one, possibly the
+/// wrong number) is shown with the part's own tag in that mark's place; any other text gets the
+/// mark and a space prepended.
+///
+/// Untouched: system messages, thinking and encrypted reasoning, tool-call arguments, blocks
+/// with provider state, tool-result JSON, denial and error outputs, assistant parts where the
+/// family shows none, and any message without tags. A message is rendered at most once, so
+/// calling this again over a prompt that already holds rendered messages changes nothing. Its
+/// output depends only on the stored text and its tag, so every later render of the part, on a
+/// resume or a cache warm too, is byte-identical.
+pub fn render_tags_into(messages: &mut [Message], rendering: TagRendering) {
+    for message in messages {
+        render_message_tags(message, rendering);
+    }
+}
+
+fn render_message_tags(message: &mut Message, rendering: TagRendering) {
     if message.tags.rendered {
         return;
     }
@@ -111,8 +186,14 @@ fn render_message_tags(message: &mut Message) {
     message.tags.rendered = true;
     let role = message.role;
     for (block, tag) in message.content.iter_mut().zip(tags.parts.iter()) {
+        let Some(tag) = tag else {
+            continue;
+        };
         match (role, block) {
             (Role::User, ContentBlock::Text { text }) => prefix(text, *tag),
+            (Role::Assistant, ContentBlock::Text { text }) if rendering.assistant_text => {
+                retag(text, *tag)
+            }
             (Role::User | Role::Tool, ContentBlock::ToolResult(result)) => {
                 if let ToolOutput::Text { text } = &mut result.output {
                     prefix(text, *tag);
@@ -130,6 +211,27 @@ fn prefix(text: &mut String, tag: u64) {
     rendered.push(' ');
     rendered.push_str(text);
     *text = rendered;
+}
+
+/// The length in bytes of the `§N§` mark `text` begins with, if it begins with one.
+fn leading_mark_len(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix('§')?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    rest[digits..]
+        .strip_prefix('§')
+        .map(|_| 2 * '§'.len_utf8() + digits)
+}
+
+/// Show `tag` at the start of an assistant text: in place of a mark the text already begins
+/// with, or else prepended with a space.
+fn retag(text: &mut String, tag: u64) {
+    match leading_mark_len(text) {
+        Some(len) => text.replace_range(..len, &tag_mark(tag)),
+        None => prefix(text, tag),
+    }
 }
 
 /// The text a part holds, as stored: what `session.resolve` answers and what a character
@@ -181,12 +283,12 @@ mod tests {
     use crate::ids::ToolCallId;
 
     fn tagged(mut message: Message, parts: Vec<u64>) -> Message {
-        message.set_tags(Some(Arc::new(MessageTags::new(parts))));
+        message.set_tags(Some(Arc::new(PartTags::all(parts))));
         message
     }
 
     #[test]
-    fn rendering_prefixes_user_and_tool_text_once_and_never_assistant_parts() {
+    fn rendering_prefixes_user_and_tool_text_once_and_no_assistant_part_by_default() {
         let user = tagged(
             Message::new(
                 Role::User,
@@ -243,9 +345,9 @@ mod tests {
         let untagged = Message::new(Role::User, vec![ContentBlock::Text { text: "x".into() }]);
         let original_assistant = assistant.clone();
         let mut prompt = vec![user, assistant, tool, untagged.clone()];
-        render_tags_into(&mut prompt);
+        render_tags_into(&mut prompt, TagRendering::default());
         let once = format!("{prompt:?}");
-        render_tags_into(&mut prompt);
+        render_tags_into(&mut prompt, TagRendering::default());
         assert_eq!(
             format!("{prompt:?}"),
             once,
@@ -283,6 +385,94 @@ mod tests {
             }
         );
         assert_eq!(prompt[3].content, untagged.content);
+    }
+
+    fn assistant(blocks: Vec<ContentBlock>, parts: Vec<u64>) -> Message {
+        tagged(Message::new(Role::Assistant, blocks), parts)
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.into() }
+    }
+
+    /// Assistant text shows its tag on Anthropic Messages and on no other family.
+    #[test]
+    fn only_anthropic_shows_assistant_text_tags() {
+        for family in [
+            None,
+            Some("openai_chat"),
+            Some("openai_responses"),
+            Some("openai_responses_chatgpt"),
+            Some("gemini"),
+            Some("google_codeassist"),
+            Some("bedrock_converse"),
+        ] {
+            let mut prompt = vec![assistant(vec![text("answer")], vec![3])];
+            render_tags_into(&mut prompt, TagRendering::for_family(family));
+            assert_eq!(prompt[0].content, vec![text("answer")], "{family:?}");
+        }
+        let mut prompt = vec![assistant(vec![text("answer")], vec![3])];
+        render_tags_into(
+            &mut prompt,
+            TagRendering::for_render_config(
+                &serde_json::json!({"family_id": "anthropic_messages"}),
+            ),
+        );
+        assert_eq!(prompt[0].content, vec![text("§3§ answer")]);
+    }
+
+    /// On Anthropic, only plain assistant text shows a tag. A mark the model wrote at the
+    /// start is replaced by the part's own tag; thinking, encrypted reasoning, tool calls and
+    /// text with provider state keep their bytes, and rendering twice changes nothing.
+    #[test]
+    fn anthropic_rendering_never_touches_thinking_tool_calls_or_provider_state() {
+        use crate::content::{TextProviderFormat, TextProviderState};
+        let untouched = vec![
+            ContentBlock::Reasoning {
+                text: "think".into(),
+                signature: Some("sig".into()),
+            },
+            ContentBlock::RedactedReasoning {
+                data: "opaque".into(),
+                provider_format: None,
+            },
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId("c".into()),
+                tool_name: "t".into(),
+                input: serde_json::json!({"a": "§1§ arg"}),
+                thought_signature: Some("ts".into()),
+            }),
+            ContentBlock::TextWithState {
+                text: "stateful".into(),
+                provider_state: TextProviderState {
+                    format: TextProviderFormat::OpenAiResponses,
+                    data: "{}".into(),
+                },
+            },
+        ];
+        let mut blocks = untouched.clone();
+        blocks.extend([
+            text("§99§ wrong mark"),
+            text("§x§ not a mark"),
+            text("§12§"),
+            text(""),
+        ]);
+        let mut prompt = vec![assistant(blocks, vec![1, 2, 3, 4, 5, 6, 7, 8])];
+        let anthropic = TagRendering::for_family(Some(ANTHROPIC_MESSAGES_FAMILY));
+        render_tags_into(&mut prompt, anthropic);
+        let once = prompt[0].content.clone();
+        render_tags_into(&mut prompt, anthropic);
+        assert_eq!(prompt[0].content, once, "rendering twice changes nothing");
+        assert_eq!(&prompt[0].content[..4], untouched.as_slice());
+        assert_eq!(
+            &prompt[0].content[4..],
+            [
+                text("§5§ wrong mark"),
+                text("§6§ §x§ not a mark"),
+                text("§7§"),
+                text("§8§ "),
+            ]
+        );
     }
 
     #[test]

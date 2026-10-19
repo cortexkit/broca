@@ -821,12 +821,10 @@ pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionR
     message
         .part_tags()
         .map(|tags| {
-            tags.parts
-                .iter()
-                .enumerate()
+            tags.tagged()
                 .map(|(index, tag)| SessionReadTag {
                     part: broca_protocol::tags::part_key(ordinal, index),
-                    tag: *tag,
+                    tag,
                 })
                 .collect()
         })
@@ -3934,7 +3932,7 @@ mod caller_message_tests {
         let plain = read_message(content.clone());
         let mut tagged = read_message(content);
         tagged.message.set_tags(Some(std::sync::Arc::new(
-            broca_protocol::tags::MessageTags::new(vec![7, 8]),
+            broca_protocol::tags::PartTags::all([7, 8]),
         )));
         tagged.tags = tag_rows(tagged.ordinal, &tagged.message);
         assert!(tag_rows(plain.ordinal, &plain.message).is_empty());

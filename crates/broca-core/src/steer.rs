@@ -46,14 +46,25 @@ impl SteerInbox {
     }
 
     /// Queue `messages` for the running turn, calling `record` (which appends their `Steered`
-    /// record) under the same lock. Returns `false` without calling `record` once the inbox is
-    /// closed: the turn will render no further step, so the caller must not steer into it.
-    pub fn deliver(&self, messages: Vec<Message>, record: impl FnOnce()) -> bool {
+    /// record) under the same lock. `record` returns the runner tags the writer assigned to the
+    /// record, one entry per message, and the queued messages carry them: the turn renders the
+    /// same tags a replay of the record attaches. Returns `false` without calling `record` once
+    /// the inbox is closed: the turn will render no further step, so the caller must not steer
+    /// into it.
+    pub fn deliver(
+        &self,
+        mut messages: Vec<Message>,
+        record: impl FnOnce() -> Option<Vec<broca_protocol::tags::MessageTags>>,
+    ) -> bool {
         let mut state = self.lock();
         if state.closed {
             return false;
         }
-        record();
+        if let Some(tags) = record() {
+            for (message, tags) in messages.iter_mut().zip(&tags) {
+                crate::tags::attach(message, Some(tags));
+            }
+        }
         state.pending.extend(messages);
         true
     }
@@ -161,12 +172,18 @@ mod tests {
     fn delivery_step_and_close_follow_one_lock() {
         let inbox = SteerInbox::new();
         let mut log = Vec::new();
-        assert!(inbox.deliver(vec![message("a")], || log.push("steered")));
+        assert!(inbox.deliver(vec![message("a")], || {
+            log.push("steered");
+            None
+        }));
         let taken = inbox.take_at_step(|| log.push("step_started"));
         assert_eq!(taken, vec![message("a")]);
         assert_eq!(log, ["steered", "step_started"]);
 
-        assert!(inbox.deliver(vec![message("b")], || log.push("steered")));
+        assert!(inbox.deliver(vec![message("b")], || {
+            log.push("steered");
+            None
+        }));
         assert!(
             !inbox.close_if_empty(),
             "a queued steer keeps the turn open"
@@ -174,7 +191,10 @@ mod tests {
         assert!(!inbox.is_closed());
         inbox.take_at_step(|| {});
         assert!(inbox.close_if_empty());
-        assert!(!inbox.deliver(vec![message("c")], || log.push("late")));
+        assert!(!inbox.deliver(vec![message("c")], || {
+            log.push("late");
+            None
+        }));
         assert!(!log.contains(&"late"));
     }
 }
