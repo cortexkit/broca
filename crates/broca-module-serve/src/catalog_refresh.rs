@@ -1040,7 +1040,7 @@ mod tests {
             for result in [
                 Ok(tool_reply(refusal.clone(), true)),
                 Ok(refusal),
-                Err(ConnError::Rejected(format!("{code} — {message}"))),
+                Err(ConnError::Rejected(format!("{code} — {message}").into())),
             ] {
                 let [first, _] = split_pages(&full_response(7, 10));
                 let route = scripted_route(vec![Ok(first), result]);
@@ -1077,7 +1077,7 @@ mod tests {
             for result in [
                 Ok(tool_reply(refusal.clone(), true)),
                 Ok(refusal),
-                Err(ConnError::Rejected(format!("refused — {message}"))),
+                Err(ConnError::Rejected(format!("refused — {message}").into())),
             ] {
                 let route = scripted_route(vec![result]);
                 let cache = Arc::new(CatalogCache::empty());

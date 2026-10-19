@@ -17593,3 +17593,17 @@ new = 'if false && store_has_history && matches!(tail.records(), broca_wal::WalR
 
 
 
+
+
+[[control]]
+id = "subc-unknown-channel-compares-structured-code"
+guards = "only the structured unknown_channel refusal evicts a cached route when other text has the old prefix"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::unknown_channel_rejection_uses_the_structured_code"]
+file = "crates/broca-subc/src/connection.rs"
+old = '.is_some_and(|code| code == "unknown_channel")'
+new = '.is_some_and(|_| rejection.message.starts_with("unknown_channel")) // NON-VACUITY BREAK'

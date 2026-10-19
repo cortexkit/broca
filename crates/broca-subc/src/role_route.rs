@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use tokio::time::{timeout_at, Instant};
 
-use crate::connection::{rejection_code, ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
+use crate::connection::{ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
 
 type RouteKey = (BindIdentity, String);
 type RouteSlot = Arc<AsyncMutex<Option<RouteHandle>>>;
@@ -270,7 +270,7 @@ fn expired() -> FetchError {
 fn open_error(error: ConnError) -> FetchError {
     match error {
         ConnError::Rejected(message) => {
-            let code = rejection_code(&message);
+            let code = message.code();
             if code == subc_protocol::error_codes::UNKNOWN_MODULE {
                 FetchError::UnknownModule
             } else {

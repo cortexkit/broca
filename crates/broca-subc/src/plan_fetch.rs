@@ -18,7 +18,7 @@ use serde_json::Value;
 use subc_protocol::scope::{ScopeSelector, CAP_SCOPES_V1};
 use subc_protocol::tool_call::ToolCallRequest;
 
-use crate::connection::{rejection_code, ConnError, RouteHandle, SubcConnection};
+use crate::connection::{ConnError, RouteHandle, SubcConnection};
 
 /// The refusal code a provider answers a fetch with when the same fetch may succeed if sent
 /// again; admission retries such a refusal until its deadline.
@@ -185,7 +185,7 @@ fn invalid_answer() -> FetchError {
 fn open_error(error: ConnError) -> FetchError {
     match error {
         ConnError::Rejected(message) => {
-            let code = rejection_code(&message);
+            let code = message.code();
             if code == subc_protocol::error_codes::UNKNOWN_MODULE {
                 FetchError::UnknownModule
             } else {
