@@ -1,4 +1,6 @@
 use super::*;
+#[path = "lock_probe.rs"]
+mod lock_probe;
 use broca_core::{ExportIndex, RunIndex, RunIndexRow, RunIndexState, WalStore};
 use broca_protocol::{ModelHandle, RunFinishReason, RunId, Usage};
 use std::sync::{
@@ -14,6 +16,7 @@ impl SessionRefIndex for CountingIndex {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
         let result = self.store.record_session(address, session);
         if result.is_err() {
+            lock_probe::message(&format!("ref result={result:?}"));
             self.failures.fetch_add(1, Ordering::SeqCst);
         }
         result
@@ -147,36 +150,41 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
 
 // SQLite trace/profile callbacks bracket statements on the serving and census
 // connections. Leave the busy handler unchanged so its normal lock waits remain visible.
-fn lock_probe(connection: &str, event: &str, sql: &str, elapsed: std::time::Duration) {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let now = START.get_or_init(std::time::Instant::now).elapsed();
-    let sql = sql.trim_start();
-    if [
-        "BEGIN", "COMMIT", "ROLLBACK", "INSERT", "UPDATE", "DELETE", "PRAGMA",
-    ]
-    .iter()
-    .any(|prefix| sql.starts_with(prefix))
-    {
-        eprintln!(
-            "CENSUS_LOCK_PROBE t_us={} conn={connection} thread={:?} event={event} elapsed_us={} sql={}",
-            now.as_micros(),
-            std::thread::current().id(),
-            elapsed.as_micros(),
-            sql.chars().take(160).collect::<String>().replace('\n', " "),
-        );
-    }
-}
 
 #[test]
 fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
+    let mut output = String::new();
+    for iteration in 0..if cfg!(windows) { 20 } else { 1 } {
+        lock_probe::reset();
+        let result = std::panic::catch_unwind(census_writer_scenario);
+        if let Err(error) = &result {
+            lock_probe::message(&format!(
+                "scenario panic={}",
+                error
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| error.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic")
+            ));
+        }
+        output.push_str(&lock_probe::report(iteration, result.is_err()));
+        #[cfg(not(windows))]
+        result.unwrap();
+    }
+    // A deliberately red Windows probe exposes timelines even when every scenario passes.
+    #[cfg(windows)]
+    panic!("{output}");
+}
+
+fn census_writer_scenario() {
     let (root, store) = fixture("writers");
     {
         let mut conn = store.conn.lock().unwrap();
         conn.trace(Some(|sql| {
-            lock_probe("serving", "start", sql, std::time::Duration::ZERO)
+            lock_probe::event(1, false, sql, std::time::Duration::ZERO)
         }));
         conn.profile(Some(|sql, elapsed| {
-            lock_probe("serving", "done", sql, elapsed)
+            lock_probe::event(1, true, sql, elapsed)
         }));
     }
     let index = Arc::new(CountingIndex {
@@ -190,14 +198,14 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
     let migration = std::thread::spawn(move || {
         let mut conn = census_connection(&census_root.join("run-index.db"));
         conn.trace(Some(|sql| {
-            lock_probe("census", "start", sql, std::time::Duration::ZERO)
+            lock_probe::event(0, false, sql, std::time::Duration::ZERO)
         }));
         conn.profile(Some(|sql, elapsed| {
-            lock_probe("census", "done", sql, elapsed)
+            lock_probe::event(0, true, sql, elapsed)
         }));
         batches::AFTER_WRITE_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
-                eprintln!("CENSUS_LOCK_PROBE census AFTER_WRITE_HOOK send (after commit)");
+                lock_probe::message("census AFTER_WRITE_HOOK send (after commit)");
                 started_tx.send(()).unwrap();
             }))
         });
@@ -207,7 +215,7 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
             None,
             true,
         );
-        eprintln!("CENSUS_LOCK_PROBE census result={result:?}");
+        lock_probe::message(&format!("census result={result:?}"));
         let counts = result.unwrap();
         migration_active.store(false, Ordering::SeqCst);
         counts
