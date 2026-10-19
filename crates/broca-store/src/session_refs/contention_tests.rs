@@ -45,6 +45,15 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Arc<SqliteStore>) {
     backfill(&store.conn.lock().unwrap()).unwrap();
     (root, store)
 }
+/// Opens a census connection the way production `census::migrate` does: with the store's
+/// busy timeout. A bare connection fails at the first lock overlap, which slower Windows
+/// runners hit, and would test a configuration production never uses.
+fn census_connection(path: &std::path::Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.busy_timeout(crate::STORE_BUSY_TIMEOUT).unwrap();
+    conn
+}
+
 fn receive<T>(rx: &mpsc::Receiver<T>, event: &str) -> T {
     rx.recv_timeout(broca_test_support::EVENT_HANG_GUARD)
         .unwrap_or_else(|_| panic!("timed out waiting for {event}"))
@@ -73,7 +82,7 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
     let (resume_tx, resume_rx) = mpsc::channel();
     let census_root = root.clone();
     let migration = std::thread::spawn(move || {
-        let mut conn = Connection::open(census_root.join("run-index.db")).unwrap();
+        let mut conn = census_connection(&census_root.join("run-index.db"));
         batches::AFTER_WRITE_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 census_started_tx.send(()).unwrap();
@@ -111,7 +120,7 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
     assert!(!broca_core::session_projection_incomplete(&root).unwrap());
     assert!(first.complete);
     assert!(first.addresses > 0);
-    let mut conn = Connection::open(root.join("run-index.db")).unwrap();
+    let mut conn = census_connection(&root.join("run-index.db"));
     let second = census::run(
         &mut conn,
         &broca_core::ReadOnlyWalReader::new(&root),
@@ -148,7 +157,7 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
     let migration_active = active.clone();
     let census_root = root.clone();
     let migration = std::thread::spawn(move || {
-        let mut conn = Connection::open(census_root.join("run-index.db")).unwrap();
+        let mut conn = census_connection(&census_root.join("run-index.db"));
         batches::AFTER_WRITE_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 started_tx.send(()).unwrap();
@@ -364,7 +373,7 @@ fn interrupted_candidate_batch_is_replayed_before_census_completion() {
     corrupt.extend_from_slice(&bytes);
     std::fs::write(&path, &corrupt).unwrap();
     store.record_session(&address, &session).unwrap();
-    let mut conn = Connection::open(root.join("run-index.db")).unwrap();
+    let mut conn = census_connection(&root.join("run-index.db"));
     conn.execute(
         "INSERT INTO agent_data_census(address) VALUES(?1)",
         [&address],
@@ -415,7 +424,7 @@ fn interrupted_candidate_batch_is_replayed_before_census_completion() {
 #[test]
 fn persistent_sqlite_contention_waits_until_busy_timeout() {
     let (root, store) = fixture("sqlite-timeout");
-    let blocker = Connection::open(root.join("run-index.db")).unwrap();
+    let blocker = census_connection(&root.join("run-index.db"));
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let session = BindIdentity::new("/project/new", "broca", "locked-for-budget");
     let started = std::time::Instant::now();
