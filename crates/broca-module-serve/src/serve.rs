@@ -4379,6 +4379,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            usage: Default::default(),
             detail: None,
             run_id: "run".into(),
             state: "active".into(),

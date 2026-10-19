@@ -597,7 +597,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     let final_step_finish_reason = state.final_step_finish_reason;
     let undelivered_steers = state.undelivered_steers;
     let indeterminate_tool_calls = state.indeterminate_tool_calls;
-    let usage = state.usage;
+    let usage = Some(state.run_usage);
     let retries_used = state.retries_used;
     let title = state.title;
     let structured_output = state.structured_output;
@@ -612,6 +612,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     });
     match state.state {
         State::Active => RunStatusResponse::Active {
+            usage,
             step: state.live_step,
             title,
             awaiting_approval: None,
@@ -2081,6 +2082,10 @@ impl ServeHandler for crate::LineageRegistry {
         let mut structured_output = state
             .as_ref()
             .and_then(|state| state.structured_output.clone());
+        let mut usage = state
+            .as_ref()
+            .map(|state| state.run_usage.clone())
+            .unwrap_or_default();
         let status = run_status_response(state);
         let (mut state, reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
@@ -2117,6 +2122,10 @@ impl ServeHandler for crate::LineageRegistry {
                 detail = reconciled
                     .as_ref()
                     .and_then(|state| state.budget_detail.clone());
+                usage = reconciled
+                    .as_ref()
+                    .map(|state| state.run_usage.clone())
+                    .unwrap_or_default();
                 structured_output = reconciled.and_then(|state| state.structured_output);
                 state = serde_json::to_value(reason)
                     .ok()
@@ -2136,6 +2145,7 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         let response = broca_wire::RunResultResponse {
+            usage,
             detail,
             run_id: run_id.0,
             state,
@@ -2310,6 +2320,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    run_usage: Default::default(),
                     budget_detail: None,
                     structured_output: None,
                     live_step: None,

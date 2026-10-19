@@ -77,7 +77,11 @@ fn check_golden(file: &str, served: &str) {
         std::fs::write(&path, format!("{served}\n")).unwrap();
         println!("{file}: {served}");
     }
-    assert_eq!(served, std::fs::read_to_string(path).unwrap().trim_end());
+    let golden = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        legacy_bytes(served.as_bytes(), golden.trim_end().as_bytes()),
+        golden.trim_end().as_bytes()
+    );
 }
 
 #[tokio::test]

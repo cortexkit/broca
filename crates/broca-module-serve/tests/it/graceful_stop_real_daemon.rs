@@ -11,6 +11,8 @@
 //! GOODBYE starts the final grace. Unix only: the signal cases and process census use Unix tools.
 #![cfg(unix)]
 
+use crate::delivery_rig as usage_compat;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1072,6 +1074,9 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(&path, &bytes).unwrap();
     }
+    let golden =
+        std::fs::read(&path).expect("generate the crash-orphan golden through the real serve path");
+    let bytes = usage_compat::legacy_bytes(&bytes, &golden);
     use sha2::{Digest, Sha256};
     assert_eq!(
         format!("{:x}", Sha256::digest(&bytes)),

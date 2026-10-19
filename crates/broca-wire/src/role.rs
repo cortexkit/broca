@@ -168,6 +168,8 @@ pub struct FinalMessage {
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default)]
+    pub usage: broca_protocol::usage::RunUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub run_id: String,

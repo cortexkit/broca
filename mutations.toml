@@ -72,6 +72,18 @@ new = '''                let records = self.read_durable_wal(key).await?.0;
                 let latest = records.iter().rev().find_map'''
 
 [[control]]
+id = "run-usage-unreported-only-when-all-absent"
+guards = "A partially reported completed step is reported, even when fresh input is absent or the reported output is zero"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+test_file = "crates/broca-module/tests/it/session_read/run_usage.rs"
+expect_red = ["session_read::run_usage::usage_unreported_only_when_all_fields_absent_golden"]
+file = "crates/broca-protocol/src/usage.rs"
+old = '''        let unreported = u64::from(*usage == Usage::default());'''
+new = '''        let unreported = u64::from(usage.input_tokens.is_none()); // NON-VACUITY BREAK: mistake partial usage for no usage'''
+
+[[control]]
 id = "module-run-result-reuses-status-wal"
 guards = "A closed run result reuses the authoritative status snapshot instead of decoding the full WAL again"
 runner = "cargo"

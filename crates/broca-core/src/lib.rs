@@ -114,7 +114,7 @@ pub use replay::{
     DeferredCallObligations, DeferredCallProjection, LateApprovalView, OpenCallState,
     OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall, ProjectedDeferredCall,
     ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError, ReplayResolution,
-    ReplayState,
+    ReplayState, RunUsageProjection,
 };
 pub use resume::{
     close_out_open_batch, not_dispatched_result, outcome_unknown_result, resume_started_record,

@@ -530,6 +530,10 @@ pub(crate) fn indexed_run_state(
     let use_index_metadata = row.usage.is_some() && row.state != RunIndexState::Interrupted;
     let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
     Ok(Some(ReconciledRunState {
+        run_usage: reconciled
+            .as_ref()
+            .map(|state| state.run_usage.clone())
+            .unwrap_or_default(),
         budget_detail: reconciled
             .as_ref()
             .and_then(|state| state.budget_detail.clone()),
@@ -5485,7 +5489,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
             {
                 let live_step = step_progress.lock().unwrap().clone();
                 let title = self.live_run_title(run_id).await?;
+                let head = self
+                    .writer
+                    .as_ref()
+                    .expect("active writer")
+                    .durable_head()
+                    .load(Ordering::Acquire);
+                self.approvals.wait_covered(head).await;
+                let run_usage = match self.approvals.run_usage(run_id, head) {
+                    Some(usage) => usage,
+                    // A checkpoint-only startup may omit the run's earlier model steps.
+                    // Reconcile the full WAL rather than report a partial cache as complete.
+                    None => self
+                        .reconcile_from_wal(run_id)
+                        .await?
+                        .map(|state| state.run_usage)
+                        .unwrap_or_default(),
+                };
                 return Ok(Some(ReconciledRunState {
+                    run_usage,
                     budget_detail: None,
                     structured_output: None,
                     live_step,

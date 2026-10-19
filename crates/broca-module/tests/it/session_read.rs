@@ -28,6 +28,8 @@ use broca_wal::{DispatchOutcome, FileWal, RunConfig, Wal, WalRecord};
 use tokio::sync::{mpsc, Mutex};
 #[path = "session_read/attribution.rs"]
 mod attribution;
+#[path = "session_read/run_usage.rs"]
+mod run_usage;
 #[path = "session_read/wal_cost.rs"]
 mod wal_cost;
 
@@ -2910,11 +2912,14 @@ async fn read_paging_defaults_and_no_actor_invariant() {
         .run_status(&key, RunId("run-complete".into()))
         .await
         .expect("completed run status");
+    let run_status = serde_json::to_value(run_status).expect("serialize run status");
     assert_eq!(
-        serde_json::to_value(run_status).expect("serialize run status")["usage"],
-        serde_json::to_value(usage()).expect("serialize expected usage"),
+        serde_json::from_value::<Usage>(run_status["usage"].clone()).unwrap(),
+        usage(),
         "run.status resolves the durable terminal's exact run-total usage"
     );
+    assert_eq!(run_status["usage"]["steps"], 1);
+    assert_eq!(run_status["usage"]["unreported_steps"], 0);
 }
 
 #[tokio::test]

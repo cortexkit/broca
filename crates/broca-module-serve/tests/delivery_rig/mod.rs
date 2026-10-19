@@ -34,6 +34,10 @@ use subc_protocol::{
 use subc_transport::{read_frame, write_frame};
 use tokio::sync::{mpsc, Notify};
 
+#[path = "../../../broca-wire/tests/support/run_usage.rs"]
+mod usage_compat;
+pub use usage_compat::legacy_bytes;
+
 /// One scripted model step.
 #[derive(Clone)]
 pub enum Step {
@@ -1042,8 +1046,13 @@ pub fn golden_path(file: &str) -> PathBuf {
 pub fn assert_golden(frame: &Frame, file: &str, run_id: &str) {
     let pinned = std::fs::read_to_string(golden_path(file)).unwrap();
     let expected = pinned.trim_end_matches('\n').replace("@RUN_ID@", run_id);
+    let actual = if file.starts_with("run_status.") {
+        legacy_bytes(&frame.body, expected.as_bytes())
+    } else {
+        frame.body.to_vec()
+    };
     assert_eq!(
-        String::from_utf8_lossy(&frame.body),
+        String::from_utf8_lossy(&actual),
         expected,
         "the reply bytes pinned in {file}"
     );

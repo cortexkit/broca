@@ -125,7 +125,7 @@ session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, update
 session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
-run.result { run_id } → { run_id, state, reason?, error?, final_message?: { ordinal, mid, text } }
+run.result { run_id } → { run_id, state, usage, reason?, error?, final_message?: { ordinal, mid, text } }
 session.baseline {} → { state: "not_yet" | "ready", baseline? } (owner only)
 role.describe {} → the llm-runner/v1 major, its ops and capability groups, max_bytes
 
@@ -141,7 +141,7 @@ session.retract { session, submission_id }
 
 run.cancel { run_id, at?: "now" | "step_boundary" } → "ack" | "not_active" (§13)
 run.status { run_id | session }
-    → { state, run_id?, step?, last_error?, head: cursor, title? } (state enum §14)
+    → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
 
 The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
@@ -170,6 +170,21 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   matched by content, so a message an import brought in has no dispatch facts. Facts of a turn
   in the read's WAL tail come with the page; an older turn's come from a per-session cache that
   one pass over the whole WAL fills the first time a read needs them.
+- Every known run's `run.status` and `run.result` carry `usage` from completed
+  `ModelStepFinished` WAL records, including while the run is active. It always has
+  `steps` and `unreported_steps`; a run with no completed step reports exactly
+  `{"steps":0,"unreported_steps":0}`. A step is unreported only if **all five** token
+  measurements are absent; a partial report or an explicit zero is reported.
+  The optional totals `input_tokens`, `cached_input_tokens`, `cache_write_tokens`,
+  `output_tokens` and `reasoning_tokens` sum only reported contributions, staying absent
+  until a step reports that measurement. Partial totals are lower bounds, not estimates.
+  Input is fresh input only; reasoning is already included in output, never added to it.
+  `by_model`, omitted until a step completes, lists contributions in first-seen order
+  for each `{provider, model, variant?}` frozen in the step's episode's `RunConfig`.
+  Each entry carries the same counters and optional token totals. An unnamed variant is
+  omitted, never an empty string; each entry contributes to the run totals, including
+  unreported steps. These counters and the model breakdown do not change subscriber
+  `step_finished` / `run_finished` usage units or the WAL record format.
 - `run.result`'s `final_message.text` joins the final assistant message's text parts with
   nothing inserted, leaving reasoning out; a completed run with no text answers `""`.
   It is not paged and is not subject to `session.read.max_bytes`; when its complete encoded frame

@@ -1145,13 +1145,69 @@ pub struct PendingApproval {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/run_usage.rs"]
+mod usage_compat;
+
+#[cfg(test)]
 mod approval_wire_tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
     #[test]
+    fn every_run_status_golden_preserves_existing_fields() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if !path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("run_status.")
+            {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let golden = std::str::from_utf8(&bytes).unwrap().trim_end();
+            let value: serde_json::Value = serde_json::from_str(golden).unwrap();
+            let reply = value.get("result").unwrap_or(&value);
+            let status: RunStatusResponse = serde_json::from_value(reply.clone()).unwrap();
+            let encoded = serde_json::to_vec(&status).unwrap();
+            let expected = serde_json::to_vec(reply).unwrap();
+            let normalized: serde_json::Value =
+                serde_json::from_slice(&crate::usage_compat::legacy_bytes(&encoded, &expected))
+                    .unwrap();
+            // New vectors pin the full usage object; legacy fixtures pin their original fields.
+            if path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("run_status.usage_")
+            {
+                assert_eq!(
+                    serde_json::to_value(status).unwrap(),
+                    *reply,
+                    "{}",
+                    path.display()
+                );
+            } else {
+                assert_eq!(normalized, *reply, "{}", path.display());
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 25,
+            "expected the full run.status golden inventory, got {checked}"
+        );
+        println!("checked {checked} run.status goldens");
+    }
+
+    #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            usage: None,
             step: None,
             title: None,
             awaiting_approval: Some(AwaitingApproval {
@@ -1357,6 +1413,8 @@ pub struct PausedRunAuth {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunStatusResponse {
     Active {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<broca_protocol::usage::RunUsage>,
         /// Snapshot of the live actor's in-flight model step; never read from WAL.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         step: Option<broca_protocol::provider::InFlightStep>,
@@ -1374,7 +1432,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_reason: Option<broca_protocol::PauseReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// Why the run paused, spelled as `session.read` spells `lineage_state.reason`
@@ -1407,7 +1465,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         indeterminate_tool_calls: Option<Vec<ToolCallId>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
@@ -1428,7 +1486,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
@@ -1449,7 +1507,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
@@ -1468,7 +1526,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1487,7 +1545,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
@@ -1508,7 +1566,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// The typed error the run ended with, the same value `session.read` reports in
@@ -1533,7 +1591,7 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
+        usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
@@ -2583,6 +2641,16 @@ mod tests {
         );
     }
 
+    fn assert_run_status_round_trip(json: serde_json::Value) {
+        let decoded: RunStatusResponse =
+            serde_json::from_value(json.clone()).expect("fixture deserializes");
+        let actual = serde_json::to_vec(&decoded).expect("fixture serializes");
+        let golden = serde_json::to_vec(&json).unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&crate::usage_compat::legacy_bytes(&actual, &golden)).unwrap();
+        assert_eq!(actual, json);
+    }
+
     #[test]
     fn moved_request_types_round_trip_without_shape_drift() {
         assert_json_round_trip::<RouteRequest>(serde_json::json!({
@@ -2940,7 +3008,7 @@ mod tests {
                 }
             }
         }));
-        assert_json_round_trip::<RunStatusResponse>(serde_json::json!({
+        assert_run_status_round_trip(serde_json::json!({
             "state": "completed",
             "final_step_finish_reason": "stop",
             "retries_used": 0,
@@ -2965,7 +3033,10 @@ mod tests {
             "3adae8212da6e360bccb3749042dd951e493339885c04a2f31cf39f0ee99c106"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "context_overflow");
@@ -2985,7 +3056,10 @@ mod tests {
             "f07df1b323d8f3647244a19f71f789b1c34bbbb7ba2501e49533c67a95979070"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "permanent");
@@ -3010,7 +3084,10 @@ mod tests {
             "b08ee350f532852dde29bf65be3457275bcb49ad2cd4bb84a848c41ac2f31aed"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "permanent");
@@ -3037,7 +3114,10 @@ mod tests {
             "ae4eeb23f2a63b7f01310a255d289f88b59fa834b782ab2344d36a31da4521e1"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "permanent");
@@ -3064,7 +3144,10 @@ mod tests {
             "f3c98f18ec6bc276b28958c1832f66ff14244e305bb47b976b93dfd39b7f7d58"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "permanent");
@@ -3086,7 +3169,10 @@ mod tests {
             "765110eaddd433895df1b9ef548f5a7e1318af772c6a21f5f42d83e761b13502"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "completed");
         assert_eq!(value["structured_output"]["enforcement"], "best_effort");
@@ -3108,7 +3194,10 @@ mod tests {
             "0808b7ea8077acca9e76567a7564bd20a892a58677a10c6b0c168bd4c85303ce"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "transient");
@@ -3130,7 +3219,10 @@ mod tests {
             "60f81787d89b463cae21b1d45cf58036ae6a5bd629d343f6b07c85cc0291015d"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&status).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&status).unwrap(), bytes),
+            bytes
+        );
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "error");
         assert_eq!(value["error"]["class"], "transient");
@@ -3158,7 +3250,7 @@ mod tests {
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(bytes.as_bytes())), digest);
             let pinned: serde_json::Value = serde_json::from_str(bytes).unwrap();
-            assert_json_round_trip::<RunStatusResponse>(pinned["result"].clone());
+            assert_run_status_round_trip(pinned["result"].clone());
         }
         for state in [
             "interrupted",
@@ -3169,10 +3261,10 @@ mod tests {
             "transform_unavailable",
         ] {
             let legacy = serde_json::json!({"state": state, "retries_used": 0});
-            assert_json_round_trip::<RunStatusResponse>(legacy.clone());
+            assert_run_status_round_trip(legacy.clone());
             let mut empty = legacy.clone();
             empty["undelivered_steers"] = serde_json::json!([]);
-            assert_json_round_trip::<RunStatusResponse>(empty);
+            assert_run_status_round_trip(empty);
         }
     }
 
@@ -3205,7 +3297,7 @@ mod tests {
             }
         ));
 
-        assert_json_round_trip::<RunStatusResponse>(serde_json::json!({
+        assert_run_status_round_trip(serde_json::json!({
             "state": "interrupted",
             "indeterminate_tool_calls": ["call-1"],
             "retries_used": 0
@@ -3222,7 +3314,10 @@ mod tests {
         let error = serde_json::to_value(error).unwrap();
         assert_eq!(error["class"], "transient");
         assert_eq!(error["provider_code"], "previous_process_ended_unsealed");
-        assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+        assert_eq!(
+            crate::usage_compat::legacy_bytes(&serde_json::to_vec(&decoded).unwrap(), bytes),
+            bytes
+        );
 
         let legacy = br#"{"state":"interrupted","retries_used":0}"#;
         let legacy_status: RunStatusResponse = serde_json::from_slice(legacy).unwrap();
@@ -3272,7 +3367,7 @@ mod tests {
             "reason": "auth_required",
             "error": {"class": "auth_required", "message": "reauth"}
         });
-        assert_json_round_trip::<RunStatusResponse>(with_cause.clone());
+        assert_run_status_round_trip(with_cause.clone());
 
         // A consumer compiled against the shape without the cause fields still decodes a
         // response that carries them; it simply does not see them.
@@ -3877,24 +3972,33 @@ mod title_wire_tests {
             RunStatusResponse::Completed {
                 final_step_finish_reason: Some(FinishReason::Stop),
                 undelivered_steers: Some(Vec::new()),
-                usage: Some(Usage::default()),
+                usage: Some(Default::default()),
                 retries_used: 0,
                 title: Some("Fix the login bug".into()),
                 structured_output: None,
             }
         );
         assert_eq!(status.title(), Some("Fix the login bug"));
-        assert_eq!(serde_json::to_value(&status).unwrap(), reply["result"]);
+        let encoded = serde_json::to_vec(&status).unwrap();
+        let golden = serde_json::to_vec(&reply["result"]).unwrap();
+        let normalized: serde_json::Value =
+            serde_json::from_slice(&crate::usage_compat::legacy_bytes(&encoded, &golden)).unwrap();
+        assert_eq!(normalized, reply["result"]);
         let untitled =
             include_bytes!("../tests/golden/run_status.completed_no_undelivered_steers.json");
         let untitled: serde_json::Value = serde_json::from_slice(untitled).unwrap();
         let decoded: RunStatusResponse =
             serde_json::from_value(untitled["result"].clone()).unwrap();
         assert_eq!(decoded.title(), None);
-        assert_eq!(serde_json::to_value(&decoded).unwrap(), untitled["result"]);
+        let bytes = serde_json::to_vec(&decoded).unwrap();
+        let golden = serde_json::to_vec(&untitled["result"]).unwrap();
+        let normalized: serde_json::Value =
+            serde_json::from_slice(&crate::usage_compat::legacy_bytes(&bytes, &golden)).unwrap();
+        assert_eq!(normalized, untitled["result"]);
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                usage: None,
                 step: None,
                 title: None,
                 awaiting_approval: None
@@ -3908,6 +4012,7 @@ mod title_wire_tests {
             )
             .unwrap(),
             RunStatusResponse::Active {
+                usage: None,
                 awaiting_approval: None,
                 step: None,
                 title: Some("t".into())

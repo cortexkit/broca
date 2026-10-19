@@ -7,6 +7,8 @@
 //! Each case runs on its own session of one rig, in order, because a rig costs a daemon and a
 //! broca boot.
 
+use crate::delivery_rig as usage_compat;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2161,7 +2163,7 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
         format!("{:x}", Sha256::digest(&golden)),
         "f975a084cb4e89e88c01de1c17343919d6f2f06da9d3fb500bf7ccfaf4edb169"
     );
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
     let value = serde_json::to_value(status).unwrap();
     assert_eq!(value["auth"]["credential_id"], "oauth:anthropic:acct-b");
     assert_eq!(value["auth"]["account_ref"], "acct-b");
@@ -2219,7 +2221,7 @@ async fn session_too_large_status_matches_golden_through_real_serve() {
         format!("{:x}", Sha256::digest(&golden)),
         "3bcd6d3df82bcf4f59695db4386d8a628a8cfbca321c63ec7da02000a83d9b37"
     );
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
 
 /// Regenerate the fixture only from the daemon's real run.status reply:
@@ -2276,7 +2278,7 @@ async fn output_ceiling_status_matches_golden_through_real_serve() {
         format!("{:x}", Sha256::digest(&golden)),
         "309db3ddb13181b8be1cc1407ef818d4fc57613002861bdf514e5ddc490f01c5"
     );
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
 
 /// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
@@ -2325,7 +2327,7 @@ async fn context_overflow_anthropic_status_matches_golden_through_real_serve() {
     }
     let golden = std::fs::read(&path)
         .expect("generate the context-overflow golden through the real serve path");
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
 
 /// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
@@ -2386,7 +2388,7 @@ async fn billing_exhausted_xai_status_matches_golden_through_real_serve() {
     }
     let golden = std::fs::read(&path)
         .expect("generate the billing-exhausted golden through the real serve path");
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
 
 /// The fake OpenAI upstream answers [`OPENAI_INVALID_SCHEMA_BODY`], a RECONSTRUCTED body: the
@@ -2454,7 +2456,7 @@ async fn request_invalid_openai_status_matches_golden_through_real_serve() {
     }
     let golden = std::fs::read(&path)
         .expect("generate the request-invalid golden through the real serve path");
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
 
 /// An OpenRouter request its credit cannot pay for ends the run `credit_insufficient` after one
@@ -2604,7 +2606,7 @@ fn assert_golden_file(bytes: &[u8], file: &str) {
     }
     let golden = std::fs::read(&path)
         .unwrap_or_else(|_| panic!("generate {file} through the real serve path"));
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(bytes, &golden), golden);
 }
 
 /// An Anthropic API key out of credit ends the run `billing_exhausted` after one attempt, naming
@@ -2730,7 +2732,7 @@ async fn account_limit_exhausted_code_assist_status_matches_golden_through_real_
     }
     let golden = std::fs::read(&path)
         .expect("generate the Code Assist account-limit golden through the real serve path");
-    assert_eq!(bytes, golden);
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2825,10 +2827,9 @@ async fn grammar_too_large_status_and_memo_through_real_serve() {
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(&path, &bytes).unwrap();
     }
-    assert_eq!(
-        bytes,
-        std::fs::read(&path).expect("generate the grammar fallback golden through real serve")
-    );
+    let golden =
+        std::fs::read(&path).expect("generate the grammar fallback golden through real serve");
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
     let second = rig
         .raw_send("grammar-memo", "grammar-second", extra)
         .await
