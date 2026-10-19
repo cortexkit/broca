@@ -105,3 +105,19 @@ consumer). Headers suffice for ordinary lifecycle handling; Core can read
 `health.check` exposes `bus_events` with `bus_events_published`,
 `bus_outbox_depth` (pending lifecycle rows, not retained bodies),
 `bus_publish_failures`, `bus_events_oversize`, and `bus_outbox_dropped`.
+
+Those counters move only once events reach the outbox, so `bus_events` also says
+whether an enabled publisher is doing its work:
+
+- `bus_account_known`: the machine account is known, so projection can run. The
+  log announces it once as `run events armed`.
+- `bus_hints_seen`: durable WAL barriers the publisher was told about.
+- `bus_sessions_projected`: session projections into the outbox that completed.
+  Barriers seen with nothing projected means projection is not running.
+- `bus_recovery_pending` and `bus_recovery_walks`: sessions the current recovery
+  walk has yet to visit, and walks finished. Startup recovery visits every session
+  the module knows, a slice of at most 100 ms per loop pass, so live runs are
+  projected and published while it is still under way.
+- `bus_loop_pass_age_ms`: milliseconds since the publisher loop began its latest
+  pass. A running loop begins one every 250 ms; a value that keeps growing means a
+  pass is stuck. Null when `bus_run_events_enabled` is off.

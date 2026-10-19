@@ -2833,6 +2833,15 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "bus_publish_failures": 0,
             "bus_events_oversize": 0,
             "bus_outbox_dropped": 0,
+            // The liveness readings an enabled publisher moves. This rig leaves
+            // `bus_run_events_enabled` off, so no publisher loop runs and the pass age is null
+            // rather than a number that could look healthy.
+            "bus_hints_seen": 0,
+            "bus_sessions_projected": 0,
+            "bus_account_known": false,
+            "bus_recovery_pending": 0,
+            "bus_recovery_walks": 0,
+            "bus_loop_pass_age_ms": null,
         })
     );
     assert!(metrics["catalog_age_ms"].as_i64().unwrap() >= 5_000);

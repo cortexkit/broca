@@ -1,4 +1,10 @@
 //! Private JetStream tests. No production daemon, credentials, or installed ck-* binaries.
+//!
+//! Most tests here drive the outbox and publisher directly. `real_daemon_turn_publishes_*`
+//! instead runs the real `ck-broca` under the real `ck-subc` daemon, with run events switched on
+//! in its config file, and checks that one ordinary turn reaches the stream with nothing but the
+//! process's own wiring in between. The ck-bus credential service is a stand-in registered from
+//! this process; it mints user credentials from the private broker's own trust chain.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use broca_core::{FileWalStore, WalStore};
 use broca_module_serve::{bus_events::now_ms, bus_events_nats::NatsPublisher};
@@ -52,10 +58,14 @@ fn scratch() -> Scratch {
 }
 
 fn started(session: &BindIdentity) -> WalRecord {
+    started_at(session, now_ms())
+}
+
+fn started_at(session: &BindIdentity, ts_ms: u64) -> WalRecord {
     WalRecord::RunStarted {
         run_id: RunId("bus-run".into()),
         session: session.clone(),
-        ts_ms: Some(now_ms()),
+        ts_ms: Some(ts_ms),
         config: Box::new(RunConfig {
             model: ModelHandle::new("fixture", "model"),
             tools: vec![].into(),
@@ -420,9 +430,13 @@ async fn real_bus_crash_after_wal_commit_replays_after_restart() {
     };
     let publisher = provision(&conn, &names).await;
     let temp = scratch();
+    // The child is this test binary, not the module. It writes only under its fixture root, and
+    // the pinned state root keeps it there even if that ever changed; this file also starts the
+    // real module, which is why its every spawn site is checked for a pinned state root.
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "bus_crash_child"])
         .env("BROCA_BUS_CRASH_FIXTURE", temp.path())
+        .env("BROCA_STATE_ROOT", temp.path())
         .status()
         .unwrap();
     assert_eq!(child.code(), Some(86));
@@ -461,4 +475,595 @@ async fn real_bus_crash_after_wal_commit_replays_after_restart() {
     assert_eq!(delivery.message.id, pending.event_key);
     assert_eq!(delivery.message.digest, pending.digest());
     cursor.ack().await.unwrap();
+}
+
+// ---- one turn through the real daemon -----------------------------------------------------------
+
+/// The ck-bus credential service as broca reaches it: a management surface named `ckbus` that
+/// answers `ckbus.credential`, `ckbus.credential_renew` and `ckbus.nonce_sign` with a
+/// `{"result": ...}` body. It holds one user key, whose JWT the private broker's trust chain signs
+/// for the provisioned account, and signs the broker's connect nonce with it.
+#[cfg(unix)]
+struct FakeCkBus {
+    user: Arc<KeyPair>,
+    jwt: String,
+    acct: String,
+    server_url: String,
+    /// Every method broca asked for, in order.
+    methods: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl subc_client_rs::ModuleHandler for FakeCkBus {
+    async fn handle(
+        &self,
+        _ctx: subc_client_rs::RequestCtx,
+        body: Vec<u8>,
+    ) -> subc_client_rs::HandlerOutcome {
+        use base64::engine::general_purpose::STANDARD;
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let method = request["method"].as_str().unwrap_or_default().to_string();
+        self.methods.lock().unwrap().push(method.clone());
+        let public = self.user.public_key();
+        let exp = unix_now() + 3600;
+        let result = match method.as_str() {
+            "ckbus.credential" => json!({
+                "jwt": self.jwt,
+                "exp": exp,
+                "acct": self.acct,
+                "inbox_prefix": ConnectConfig::new(public.clone()).unwrap().inbox_prefix(),
+                "server_url": self.server_url,
+                "credential_public": public,
+            }),
+            "ckbus.credential_renew" => {
+                json!({"jwt": self.jwt, "exp": exp, "credential_public": public})
+            }
+            "ckbus.nonce_sign" => {
+                let nonce = STANDARD
+                    .decode(request["params"]["nonce_b64"].as_str().unwrap_or_default())
+                    .unwrap_or_default();
+                json!({"signature_b64": STANDARD.encode(self.user.sign(&nonce).unwrap())})
+            }
+            other => {
+                return subc_client_rs::HandlerOutcome::Error {
+                    code: "unknown_method".into(),
+                    message: format!("the ckbus stand-in does not serve {other}"),
+                }
+            }
+        };
+        subc_client_rs::HandlerOutcome::Response(
+            serde_json::to_vec(&json!({ "result": result })).unwrap(),
+        )
+    }
+
+    async fn on_bind(
+        &self,
+        _req: &subc_client_rs::RouteBindRequest,
+    ) -> subc_client_rs::BindDecision {
+        subc_client_rs::BindDecision::accept()
+    }
+}
+
+#[cfg(unix)]
+const GEMINI_MODEL: &str = "gemini-2.5-flash";
+
+/// One Gemini SSE chunk carrying a short answer and its usage, for every model request.
+#[cfg(unix)]
+const GEMINI_TEXT_SSE: &str = concat!(
+    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}],\"role\":\"model\"},",
+    "\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":5,",
+    "\"candidatesTokenCount\":1}}\n\n",
+);
+
+#[cfg(unix)]
+async fn serve_gemini() -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                if reader.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                let mut stream = reader.into_inner();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    GEMINI_TEXT_SSE.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(GEMINI_TEXT_SSE.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    url
+}
+
+#[cfg(unix)]
+struct DaemonRig {
+    daemon: tokio::process::Child,
+    dir: std::path::PathBuf,
+    ckbus: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for DaemonRig {
+    fn drop(&mut self) {
+        if let Some(task) = self.ckbus.take() {
+            task.abort();
+        }
+        broca_test_support::kill_and_reap_tree(&mut self.daemon);
+        broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
+        broca_test_support::remove_rig_dir(&self.dir);
+    }
+}
+
+/// The records of the WAL whose `RunStarted` names `session`, found by scanning: the address
+/// hashes the project root as the daemon normalised it, which need not be this test's spelling.
+#[cfg(unix)]
+fn session_records(wal_dir: &std::path::Path, session: &str) -> Option<Vec<WalRecord>> {
+    for entry in std::fs::read_dir(wal_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+            continue;
+        }
+        let Ok(range) =
+            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
+        else {
+            continue;
+        };
+        let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
+            continue;
+        };
+        let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
+        if records.iter().any(
+            |record| matches!(record, WalRecord::RunStarted { session: bound, .. } if bound.session == session),
+        ) {
+            return Some(records);
+        }
+    }
+    None
+}
+
+/// The outbox rows of `run_id`, as `(subject, published_ms)`, read without migrating the file
+/// the running module owns.
+#[cfg(unix)]
+fn outbox_rows(db: &std::path::Path, run_id: &str) -> Result<Vec<(String, Option<u64>)>, String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+    let mut statement = conn
+        .prepare("SELECT subject, published_ms FROM bus_event_outbox WHERE run_id=?1 ORDER BY seq")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string());
+    rows
+}
+
+/// One ordinary turn on a module whose config switches run events on must put its `run.started`
+/// and `run.ended` on the account's event stream, acknowledged, with no test code between the WAL
+/// and the broker. The publisher's health block must also show that it saw the run's WAL barrier
+/// and projected it, which is what tells an operator an armed publisher is actually working.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_turn_publishes_run_started_and_run_ended() {
+    use std::time::Instant;
+    let subc_source = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
+    if !subc_source.exists() {
+        assert!(
+            std::env::var_os("BROCA_REQUIRE_SUBC").is_none_or(|value| value.is_empty()),
+            "run_events_bus: {subc_source:?} is missing, but BROCA_REQUIRE_SUBC requires it"
+        );
+        println!("SKIP real_daemon_turn_publishes_run_started_and_run_ended: {subc_source:?} is missing; set BROCA_REQUIRE_SUBC=1 to require it");
+        return;
+    }
+    let Some((bus, conn, names, account_public)) = fixture().await else {
+        return;
+    };
+    let publisher = provision(&conn, &names).await;
+    let model_url = serve_gemini().await;
+    let subc = broca_test_support::ckdev_binary(&subc_source, broca_test_support::scratch_root());
+    std::env::remove_var("SUBC_MODULE_ID");
+    std::env::remove_var("SUBC_LAUNCH_NONCE");
+
+    let dir = scratch().path().join("rig");
+    let config_home = dir.join("config");
+    let runtime_dir = dir.join("runtime");
+    let state_root = dir.join("broca-state");
+    let project = dir.join("project");
+    for path in [&runtime_dir, &project, &state_root.join("catalog")] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let project = project.canonicalize().unwrap();
+    seed_history(&state_root, &project, history_sessions());
+    std::fs::write(
+        state_root.join("catalog/fusiform-lkg.json"),
+        serde_json::to_vec_pretty(&json!({
+            "source": "run-events-bus",
+            "resolved_at_ms": 1,
+            "catalog_version": 1,
+            "models": {
+                format!("google/{GEMINI_MODEL}"): {
+                    "existence": "present",
+                    "capability.attachment": false,
+                    "capability.reasoning": false,
+                    "capability.tool_call": true,
+                    "limit.context": 1000000,
+                    "limit.output": 8192
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // The switch is read from the module's own config file, exactly as in production.
+    let broca_config = dir.join("broca.jsonc");
+    std::fs::write(
+        &broca_config,
+        "{\n  // run events on, as in production\n  \"bus_run_events_enabled\": true,\n}\n",
+    )
+    .unwrap();
+    let subc_config = config_home.join("cortexkit/subc.jsonc");
+    std::fs::create_dir_all(subc_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &subc_config,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "modules": {
+                "broca": {
+                    "program": broca_test_support::ckdev_binary(
+                        env!("CARGO_BIN_EXE_ck-broca"),
+                        broca_test_support::scratch_root(),
+                    ),
+                    "args": [],
+                    "env": {
+                        "BROCA_STATE_ROOT": state_root,
+                        "BROCA_CONFIG_PATH": broca_config,
+                        "BROCA_PROVIDER_BASE_URL": model_url,
+                        "BROCA_TOOL_MODULE": "unused-tools",
+                        "XDG_DATA_HOME": dir.join("data-home"),
+                    },
+                    "enabled": true
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let daemon = broca_test_support::retry_executable_file_busy(|| {
+        broca_test_support::tokio_rig_command(&subc, &dir, "daemon")?
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_DATA_HOME", dir.join("data-home"))
+            .env_remove("BROCA_STATE_ROOT")
+            .env("SUBC_PORT", "0")
+            .env_remove("SUBC_LAUNCH_NONCE")
+            .env_remove("SUBC_LAUNCH_NONCE_FD")
+            .env_remove("SUBC_MODULE_ID")
+            .kill_on_drop(true)
+            .spawn()
+    })
+    .expect("spawn ck-subc");
+    let mut rig = DaemonRig {
+        daemon,
+        dir: dir.clone(),
+        ckbus: None,
+    };
+    let connection_file = runtime_dir.join("subc-connection.json");
+    broca_test_support::wait_until("the daemon's connection file", || async {
+        if connection_file.exists() {
+            Ok(())
+        } else {
+            Err("not published yet".to_string())
+        }
+    })
+    .await;
+    let user = Arc::new(KeyPair::new_user());
+    let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ckbus = FakeCkBus {
+        jwt: bus
+            .trust
+            .user_jwt(&box_root_id(), &account_public, &user, unix_now() - 60),
+        user,
+        acct: names.account().to_string(),
+        server_url: bus.url.clone(),
+        methods: methods.clone(),
+    };
+    let manifest = subc_protocol::manifest::ModuleManifest::builder("ckbus", "0.0.0")
+        .provides(vec![
+            subc_protocol::manifest::ProviderRole::ManagementSurface {
+                operations: [
+                    "ckbus.credential",
+                    "ckbus.credential_renew",
+                    "ckbus.nonce_sign",
+                ]
+                .iter()
+                .map(|name| subc_protocol::manifest::ManagementOperation {
+                    name: name.to_string(),
+                    kind: subc_protocol::manifest::ManagementOperationKind::Mutate,
+                    description: None,
+                })
+                .collect(),
+                config_schema: json!({}),
+                observability: Vec::new(),
+                identity_scope: Vec::new(),
+                concurrency: subc_protocol::manifest::Concurrency::ModuleManaged,
+            },
+        ])
+        .build();
+    let (_, serving) = subc_client_rs::serve_with_handle(&connection_file, manifest, ckbus)
+        .await
+        .expect("register the ckbus stand-in");
+    rig.ckbus = Some(tokio::spawn(async move {
+        let _ = serving.await;
+    }));
+
+    // Durable barriers that land before the publisher learns its account are left to the
+    // recovery walk, by design. Send the turn once ck-bus has issued the credential: the connect
+    // that asked for it sets the account before the publisher next takes its barriers.
+    broca_test_support::wait_until("broca's ckbus.credential request", || async {
+        let seen = methods.lock().unwrap().clone();
+        if seen.iter().any(|method| method == "ckbus.credential") {
+            Ok(())
+        } else {
+            Err(format!("{seen:?}"))
+        }
+    })
+    .await;
+
+    // One ordinary turn.
+    let caller = broca_subc::SubcConnection::connect(&connection_file)
+        .await
+        .unwrap();
+    let session = BindIdentity::new(&project, "runner", "bus-turn");
+    let route = caller
+        .route_open_management_within(
+            "broca",
+            &session,
+            broca_subc::RouteOpenRetry::within(Duration::from_secs(30), Duration::from_millis(100)),
+        )
+        .await
+        .expect("open broca");
+    caller
+        .route_request(
+            &route,
+            serde_json::to_vec(&json!({"method": "session.send", "params": {
+                "prompt": "hello",
+                "send_id": "bus-turn-send",
+                "tools": [],
+                "model": {"provider": "google", "model": GEMINI_MODEL},
+            }}))
+            .unwrap(),
+        )
+        .await
+        .expect("session.send");
+    let wal_dir = state_root.join("wal");
+    let sent = Instant::now();
+    let run_id = broca_test_support::wait_until("the turn's RunFinished", || async {
+        let records = session_records(&wal_dir, "bus-turn");
+        let run_id = records.as_ref().and_then(|records| {
+            records.iter().find_map(|record| match record {
+                WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+                _ => None,
+            })
+        });
+        match (&records, run_id) {
+            (Some(records), Some(run_id))
+                if records
+                    .iter()
+                    .any(|record| matches!(record, WalRecord::RunFinished { .. })) =>
+            {
+                Ok(run_id)
+            }
+            _ => Err(format!("{records:?}")),
+        }
+    })
+    .await;
+
+    println!("turn finished {:?} after the send", sent.elapsed());
+    // Both lifecycle events reach the broker, read back from the stream itself.
+    let mut cursor = publisher
+        .stream
+        .consumer(DurableOwner::Module("prefrontal-core"))
+        .await
+        .unwrap();
+    let mut kinds = Vec::new();
+    // A live run's events are due within seconds of its terminal. Today's history makes the
+    // startup recovery walk take far longer than this here (about 18 s on an Apple laptop), so
+    // the deadline holds only if live barriers are published without waiting for that walk.
+    let stream_deadline = Instant::now() + Duration::from_secs(STREAM_DEADLINE_S);
+    while !(kinds.contains(&"run.started".to_string()) && kinds.contains(&"run.ended".to_string()))
+    {
+        let remaining = stream_deadline.saturating_duration_since(Instant::now());
+        let delivery = match tokio::time::timeout(remaining, cursor.next()).await {
+            Ok(Ok(Some(delivery))) => delivery,
+            // A pull that expires with nothing to deliver; ask again until the deadline.
+            Ok(Ok(None)) if !remaining.is_zero() => continue,
+            other => {
+                let last = match other {
+                    Err(_) | Ok(Ok(_)) => "timed out",
+                    Ok(Err(_)) => "consumer error",
+                };
+                let db = state_root.join("run-index.db");
+                panic!(
+                    "the turn's run events never reached the stream (got {kinds:?}, then {last}); \
+                     outbox rows: {:?}; broca health: {}\n{}",
+                    outbox_rows(&db, &run_id),
+                    broca_metrics(&connection_file).await,
+                    bus_log_lines(&dir.join("data-home/cortexkit/broca/logs")),
+                );
+            }
+        };
+        assert_eq!(delivery.message.headers["run_id"], run_id);
+        kinds.push(delivery.message.headers["kind"].clone());
+        cursor.ack().await.unwrap();
+    }
+    assert_eq!(kinds.first().map(String::as_str), Some("run.started"));
+    println!(
+        "both events on the stream {:?} after the send",
+        sent.elapsed()
+    );
+
+    // The outbox records each lifecycle event as acknowledged by the broker.
+    let db = state_root.join("run-index.db");
+    let rows = broca_test_support::wait_until("both outbox rows acknowledged", || async {
+        match outbox_rows(&db, &run_id) {
+            Ok(rows)
+                if rows
+                    .iter()
+                    .any(|(s, p)| s.ends_with(".run.started.v1") && p.is_some())
+                    && rows
+                        .iter()
+                        .any(|(s, p)| s.ends_with(".run.ended.v1") && p.is_some()) =>
+            {
+                Ok(rows)
+            }
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert!(
+        rows.iter().all(|(_, published)| published.is_some()),
+        "{rows:?}"
+    );
+
+    // Health shows the pipeline armed and moving, not just enabled.
+    let metrics = broca_metrics(&connection_file).await;
+    let events = &metrics["bus_events"];
+    assert_eq!(events["enabled"], true, "{metrics}");
+    assert_eq!(
+        events["bus_account_known"], true,
+        "health must say the publisher knows its account: {events}"
+    );
+    assert!(
+        events["bus_events_published"].as_u64() >= Some(2),
+        "{events}"
+    );
+    assert_eq!(events["bus_outbox_depth"], 0, "{events}");
+    assert!(
+        events["bus_hints_seen"].as_u64() >= Some(1),
+        "health must count the turn's durable WAL barriers: {events}"
+    );
+    assert!(
+        events["bus_sessions_projected"].as_u64() >= Some(1),
+        "health must count the session projections: {events}"
+    );
+    assert!(
+        events["bus_loop_pass_age_ms"]
+            .as_u64()
+            .is_some_and(|age| age < 5_000),
+        "the publisher loop must still be making passes: {events}"
+    );
+    drop(rig);
+}
+
+/// How many finished sessions from before this launch the state root holds. A production state
+/// root carries thousands, and every one of them is a session the publisher's startup recovery
+/// must visit; a fresh rig with none hides any cost that walk imposes on live runs.
+#[cfg(unix)]
+fn history_sessions() -> usize {
+    std::env::var("BROCA_BUS_TEST_HISTORY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(HISTORY_SESSIONS)
+}
+
+#[cfg(unix)]
+const HISTORY_SESSIONS: usize = 3000;
+
+/// Seconds from a turn's terminal to both of its lifecycle events on the stream.
+#[cfg(unix)]
+const STREAM_DEADLINE_S: u64 = 5;
+
+/// Write `count` sessions that each ran and finished two days ago, discoverable the way the module
+/// discovers sessions after a restart. Their events are older than the outbox retention, so their
+/// projection publishes nothing and the stream carries only the live turn's events.
+#[cfg(unix)]
+fn seed_history(state_root: &std::path::Path, project: &std::path::Path, count: usize) {
+    let started = std::time::Instant::now();
+    let index = Arc::new(SqliteStore::open(state_root.join("run-index.db")).unwrap());
+    let wal = FileWalStore::new(state_root.join("wal"));
+    wal.set_session_ref_index(index);
+    let old = now_ms() - 2 * broca_store::bus_events::RETENTION_MS;
+    for n in 0..count {
+        let session = BindIdentity::new(project, "runner", format!("history-{n}"));
+        let mut writer = wal.open(&session).unwrap();
+        writer.append(1, &started_at(&session, old), false).unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::RunFinished {
+                    reason: RunFinishReason::Completed,
+                    ts_ms: Some(old),
+                    usage: Usage::default(),
+                    error: None,
+                    retries_used: 0,
+                },
+                false,
+            )
+            .unwrap();
+    }
+    drop(wal);
+    // A production state root finished its one-time session-ref census long ago. Without it the
+    // module would start that census at boot, on a second connection that holds the run index's
+    // write lock for seconds at a time, which is not the state this test reproduces.
+    broca_store::session_refs::migrate(
+        &state_root.join("run-index.db"),
+        &broca_core::ReadOnlyWalReader::new(state_root),
+    )
+    .expect("complete the session-ref census for the seeded history");
+    println!(
+        "seeded {count} historical sessions in {:?}",
+        started.elapsed()
+    );
+}
+
+/// The module's own run event log lines, without the per-session notice that recovered history
+/// was too old to publish, which the seeded history repeats thousands of times.
+#[cfg(unix)]
+fn bus_log_lines(logs: &std::path::Path) -> String {
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(logs).into_iter().flatten().flatten() {
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        lines.extend(
+            text.lines()
+                .filter(|line| line.contains("bus") && !line.contains("older than 24 hours"))
+                .map(str::to_string),
+        );
+    }
+    lines.join("\n")
+}
+
+#[cfg(unix)]
+async fn broca_metrics(connection_file: &std::path::Path) -> serde_json::Value {
+    let conn = broca_subc::SubcConnection::connect(connection_file)
+        .await
+        .unwrap();
+    conn.supervisor_health_probe("broca")
+        .await
+        .expect("broca health")
+        .metrics
+        .unwrap_or_default()
 }
