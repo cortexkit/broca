@@ -109,6 +109,7 @@ fn ordered(id: &str, modes: &[DeliveryMode]) -> OrderedSend {
             modes: modes.to_vec(),
             dedupe_key: None,
             expires_at_ms: None,
+            template: None,
         },
         principal: None,
         input: vec![Message::new(

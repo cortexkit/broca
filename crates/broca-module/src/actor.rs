@@ -2569,13 +2569,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // reopens one. The sender itself is recorded only on its `DeliveryOrdered` record.
         self.admitting_sent_by = None;
         if let Some(order) = self.admitting_order.clone() {
-            match self.ordered_sender(&request, &order).await {
-                Ok(Some(owner)) => {
-                    self.admitting_sent_by = request.principal.replace(owner);
-                    request.scope = broca_protocol::SendScope::Internal;
-                }
-                Ok(None) => {}
+            let owner = match self.ordered_sender(&request, &order).await {
+                Ok(owner) => owner,
                 Err(outcome) => return outcome,
+            };
+            if let Some(template) = &order.template {
+                if let Err(outcome) = self.render_ordered_template(&mut request, template).await {
+                    return outcome;
+                }
+            }
+            if let Some(owner) = owner {
+                self.admitting_sent_by = request.principal.replace(owner);
+                request.scope = broca_protocol::SendScope::Internal;
             }
         }
         if !self.agent_run_writer_enabled() {
@@ -4469,7 +4474,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         };
         let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = &request.principal else {
             return Err(refused(
-                "sender_not_permitted",
+                cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
                 "only the session's owner or a module its plan names may send with an ordered delivery list".into(),
             ));
         };
@@ -4487,13 +4492,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .unwrap_or_default();
         let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
             return Err(refused(
-                "sender_not_permitted",
+                cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
                 format!("the session's plan does not name module {module_id} as a sender"),
             ));
         };
         if order.starts_runs() && !sender.idle_start {
             return Err(refused(
-                "idle_start_not_granted",
+                cortexkit_role_llm_runner::errors::INVALID_PARAMS,
                 format!("the session's plan does not let module {module_id} start runs"),
             ));
         }
@@ -4505,6 +4510,65 @@ impl<W: WalStore + 'static> LineageActor<W> {
         frozen.map(Some).ok_or_else(|| {
             SendOutcome::Transient("the session has no frozen principal to send under".into())
         })
+    }
+
+    /// Render once at admission from the attested sender's frozen template. The queued
+    /// request contains the resulting text, so recovery replays bytes rather than slots.
+    async fn render_ordered_template(
+        &mut self,
+        request: &mut SubmissionRequest,
+        template: &cortexkit_role_llm_runner::delivery_order::TemplateUse,
+    ) -> Result<(), SendOutcome> {
+        let refused = |problem: String| SendOutcome::DeliveryRefused {
+            code: cortexkit_role_llm_runner::errors::INVALID_PARAMS,
+            field: "template",
+            message: format!("cannot render the sender's template: {problem}"),
+        };
+        let ownership = self
+            .load_ownership()
+            .await
+            .map_err(SendOutcome::Transient)?;
+        let senders = ownership
+            .first_episode
+            .as_ref()
+            .and_then(|first| first.manifest.as_ref())
+            .and_then(|manifest| {
+                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
+            })
+            .and_then(|plan| {
+                plan.as_object()
+                    .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
+            })
+            .unwrap_or_default();
+        let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = &request.principal else {
+            return Err(refused("no template is declared for this caller".into()));
+        };
+        let templates = senders
+            .iter()
+            .find(|sender| &sender.module == module_id)
+            .map(|sender| sender.templates.as_slice())
+            .unwrap_or_default();
+        let mut assigned = std::collections::BTreeSet::new();
+        if templates
+            .iter()
+            .flat_map(|template| template.slots.values())
+            .any(|slot| matches!(slot, cortexkit_role_llm_runner::delivery_order::Slot::Tag))
+        {
+            for record in self.read_wal_records().await.map_err(SendOutcome::Error)? {
+                for tags in record.runner_tags() {
+                    assigned.extend(tags.parts.iter().copied());
+                }
+            }
+        }
+        let text = cortexkit_role_llm_runner::delivery_order::render(templates, template, |tag| {
+            assigned.contains(&tag)
+        })
+        .map_err(|problem| refused(format!("{problem:?}")))?;
+        request.input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text }],
+        )];
+        Ok(())
     }
 
     /// Queue a send using the `delivery_order` group: `DeliveryOrdered` then `Queued`, in one
@@ -4555,23 +4619,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 return SendOutcome::Retracted { submission_id };
             }
         }
-        if order.modes == [broca_protocol::DeliveryMode::TurnSystem] {
-            return SendOutcome::DeliveryRefused {
-                code: "invalid_params",
-                field: "delivery",
-                message: format!(
-                    "turn_system is not possible on this runner ({}), and the list names no other mode",
-                    broca_core::delivery_order::TURN_SYSTEM_TEMPLATE_UNIMPLEMENTED
-                ),
-            };
-        }
-        if order.expired_at(self.ordered_now_ms()) {
-            return SendOutcome::DeliveryRefused {
-                code: "invalid_params",
-                field: "expires_at_ms",
-                message: "expires_at_ms has already passed".into(),
-            };
-        }
+        let expired = order.expired_at(self.ordered_now_ms());
         // Like a plain queued send, a send that may start a run is refused on a session paused
         // for re-authentication: it would wait behind a run nothing is going to end.
         if order.starts_runs() && matches!(self.state, RunState::Idle) {
@@ -4668,9 +4716,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             writer.record(ordered);
             writer.record(queued);
+            if expired {
+                writer.record(broca_core::delivery_order::ended(
+                    &submission_id,
+                    broca_wal::record::SendEndReason::Expired,
+                ));
+            }
         };
         let open_inbox = match &self.state {
-            RunState::Active { steer, .. } if !steer.is_closed() => Some(Arc::clone(steer)),
+            RunState::Active { steer, .. } if !expired && !steer.is_closed() => {
+                Some(Arc::clone(steer))
+            }
             _ => None,
         };
         let mut write = Some(write);
@@ -4723,6 +4779,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if self.wal_scan_complete {
             self.ordered_submissions
                 .insert(submission_id.clone(), order.clone());
+        }
+        if expired {
+            self.ended_submissions.insert(
+                submission_id.clone(),
+                broca_wal::record::SendEndReason::Expired,
+            );
+            self.prior_snapshot = None;
+            return SendOutcome::SendEnded {
+                submission_id,
+                reason: broca_wal::record::SendEndReason::Expired,
+            };
         }
         broca_core::insert_in_drain_order(&mut self.pending_fifo, pending);
         if skip_materialization {

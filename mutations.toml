@@ -17420,3 +17420,82 @@ expect_red = ["run::delivery_order_tests::a_steer_delivery_is_a_tagged_part_that
 file = "crates/broca-core/src/steer.rs"
 old = '''            if let Some(Some(tags)) = assigned.get(position) {'''
 new = '''            if let Some(Some(tags)) = assigned.get(position).filter(|_| false) { // NON-VACUITY BREAK: delivered steers lose their tags'''
+
+[[control]]
+id = "mode3-no-synchronous-compaction-discovery"
+guards = "the retained synchronous compaction client never advertises the published asynchronous capability"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/role.rs"
+expect_red = ["role::pinned_reply_bytes::synchronous_writer_does_not_declare_published_compaction"]
+file = "crates/broca-wire/src/role.rs"
+old = "    if hook_writer {"
+new = '''    capabilities.push("compaction".into()); // NON-VACUITY BREAK: claim the asynchronous contract
+    if hook_writer {'''
+
+[[control]]
+id = "mode3-ordered-retry-terminal-state"
+guards = "superseded ordered-send retries are successful terminal replies rather than pending work"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::ended_ordered_send_retries_are_successful_terminal_replies"]
+file = "crates/broca-wire/src/role.rs"
+old = "cortexkit_role_llm_runner::send::SendReply::new(outcome)"
+new = '''cortexkit_role_llm_runner::send::SendReply::new(if outcome == "superseded" { "pending" } else { outcome }) /* NON-VACUITY BREAK */'''
+
+[[control]]
+id = "mode3-already-expired-send-never-starts"
+guards = "an ordered send already expired at admission is durably ended without starting a run"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::already_expired_send_is_durable_and_never_starts"]
+file = "crates/broca-module/src/actor.rs"
+old = "let expired = order.expired_at(self.ordered_now_ms());"
+new = "let expired = false; // NON-VACUITY BREAK: admit already expired sends as live work"
+
+[[control]]
+id = "mode3-idle-start-grant"
+guards = "a plan sender without the idle_start grant is refused invalid_params before any write"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::idle_start_without_the_grant_is_refused"]
+file = "crates/broca-module/src/actor.rs"
+old = "if order.starts_runs() && !sender.idle_start {"
+new = "if false { // NON-VACUITY BREAK: ignore the plan sender's idle_start grant"
+
+[[control]]
+id = "mode3-template-slot-validation"
+guards = "unrenderable template slots refuse the send before any WAL write or delivery"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::template_invalid_slot_is_refused_without_writes"]
+file = "crates/broca-module/src/actor.rs"
+old = '''.map_err(|problem| refused(format!("{problem:?}")))?;'''
+new = ".unwrap_or_default(); // NON-VACUITY BREAK: record an unrenderable template instead of refusing"
+
+[[control]]
+id = "mode3-delivery-receipts-survive-projection"
+guards = "ordered delivery receipts survive WAL replay and store projection as message metadata"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/delivery_order_resume.rs"
+expect_red = ["delivery_order_resume::ordered_delivery_receipts_survive_the_store_fold"]
+file = "crates/broca-core/src/replay.rs"
+old = "run.delivery = message.tags.delivery().cloned();"
+new = "run.delivery = None; // NON-VACUITY BREAK: lose the ordered receipt at projection"

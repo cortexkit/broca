@@ -365,6 +365,7 @@ mod tests {
                 modes: modes.to_vec(),
                 dedupe_key: key.map(str::to_owned),
                 expires_at_ms: None,
+                template: None,
             },
             principal: None,
             input: vec![message(id)],

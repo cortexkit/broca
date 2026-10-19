@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 /// The pinned role types and rules shared by compaction consumers without extra dependencies.
-pub use cortexkit_role_compaction_provider as compaction_provider;
+pub mod compaction_provider;
 
 pub mod account_report;
 pub mod admission;

@@ -109,17 +109,14 @@ impl SendParamsExt for SendParams {
             template,
             append_episode,
         } = self;
-        // The serve adapter refuses a template by name before converting; nothing here uses it.
-        if template.is_some() {
-            return Err(broca_core::RunError::Config(
-                "template sends are not supported by this runner".into(),
-            ));
-        }
         // The one decode of the `delivery_order` group; the serve adapter has already refused a
         // malformed one by field, so an error here is a caller bug surfaced as a config refusal.
-        let order =
+        let mut order =
             broca_wire::delivery_order(delivery.as_ref(), dedupe_key.as_deref(), expires_at_ms)
                 .map_err(|(_, message)| broca_core::RunError::Config(message))?;
+        if let Some(order) = &mut order {
+            order.template = template.clone();
+        }
         let delivery = broca_wire::legacy_delivery(delivery.as_ref());
         // The serve adapter fills an omitted model before converting, from the session's frozen
         // one where the send may omit it, and refuses the send otherwise.
@@ -133,7 +130,7 @@ impl SendParamsExt for SendParams {
                         .into(),
                 ));
             }
-            None if prompt.is_empty() => {
+            None if prompt.is_empty() && template.is_none() => {
                 return Err(broca_core::RunError::Config(
                     "caller sent neither prompt nor prompt_blocks; send one prompt input".into(),
                 ));

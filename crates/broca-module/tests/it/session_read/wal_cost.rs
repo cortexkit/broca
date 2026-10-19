@@ -573,17 +573,11 @@ async fn resolving_a_tag_in_a_large_session_reads_no_whole_wal() {
     });
     let scanning = resolve_registry(&rig, counter(&rig, &key), unindexed.clone());
     let scanned = scanning
-        .resolve(
-            &key,
-            &broca_wire::ResolveParams {
-                tag: 201,
-                range: None,
-            },
-        )
+        .resolve(&key, &broca_wire::ResolveParams::new("§201§"))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(scanned.text, "prompt 100");
+    assert_eq!(scanned.content, "prompt 100");
     assert!(
         unindexed.rows.load(Ordering::SeqCst) > 200,
         "a scan reads the rows before the part"
@@ -594,12 +588,15 @@ async fn resolving_a_tag_in_a_large_session_reads_no_whole_wal() {
         rows.rows.store(0, Ordering::SeqCst);
         let start = Instant::now();
         let answer = registry
-            .resolve(&key, &broca_wire::ResolveParams { tag, range: None })
+            .resolve(
+                &key,
+                &broca_wire::ResolveParams::new(broca_protocol::tags::tag_mark(tag)),
+            )
             .await
             .unwrap()
             .unwrap();
         counting.report("resolve", start);
-        assert_eq!(answer.text, text);
+        assert_eq!(answer.content, text);
         assert_eq!(answer.part, format!("m{}#0", (tag - 1)));
         assert_eq!(
             rows.rows.load(Ordering::SeqCst),
@@ -626,15 +623,13 @@ async fn resolving_a_tag_in_a_large_session_reads_no_whole_wal() {
     let answer = registry
         .resolve(
             &key,
-            &broca_wire::ResolveParams {
-                tag: next,
-                range: Some(broca_wire::CharRange { start: 0, end: 11 }),
-            },
+            &broca_wire::ResolveParams::new(broca_protocol::tags::tag_mark(next))
+                .with_range(broca_wire::CharRange::new(0, 11)),
         )
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(answer.text, "unprojected");
+    assert_eq!(answer.content, "unprojected");
     assert_eq!(answer.part, "m400#0");
     assert_eq!(
         rows.rows.load(Ordering::SeqCst),
@@ -647,10 +642,7 @@ async fn resolving_a_tag_in_a_large_session_reads_no_whole_wal() {
     let unknown = registry
         .resolve(
             &key,
-            &broca_wire::ResolveParams {
-                tag: next + 1,
-                range: None,
-            },
+            &broca_wire::ResolveParams::new(broca_protocol::tags::tag_mark(next + 1)),
         )
         .await
         .unwrap()

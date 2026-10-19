@@ -6,6 +6,7 @@ const THREE_MIB: usize = 3 * 1024 * 1024;
 
 fn message(ordinal: u64, len: usize) -> SessionReadMessage {
     SessionReadMessage {
+        delivered_as: None,
         tags: Vec::new(),
         ordinal,
         mid: format!("m{ordinal}"),
@@ -16,6 +17,7 @@ fn message(ordinal: u64, len: usize) -> SessionReadMessage {
             }],
         ),
         run: Some(broca_core::RunAttribution {
+            delivery: None,
             run_id: "producing-run".into(),
             episode: "producing-run".into(),
             is_final: false,

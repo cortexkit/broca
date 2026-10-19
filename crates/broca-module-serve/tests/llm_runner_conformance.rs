@@ -50,6 +50,8 @@ use tokio::time::{sleep, Instant};
 const TOOL_MODULE: &str = "conformance-tools";
 /// The stand-in module whose launch nonce gives the suite a second caller identity.
 const OWNER_MODULE: &str = "conformance-owner";
+const SENDER_MODULE: &str = "conformance-sender";
+const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
 /// The harness every session the suite opens is bound under.
@@ -149,6 +151,7 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    plan_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
@@ -376,7 +379,16 @@ async fn serve_model_request(
     }
     let request: Value = serde_json::from_slice(&buffer[body_start..]).unwrap_or(Value::Null);
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
-    let session = if let Some(session) = request["model"].as_str().and_then(|model| {
+    let model = request["model"].as_str().unwrap_or_default();
+    let model = model.strip_prefix("mock/").unwrap_or(model);
+    let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
+        shared
+            .plan_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+            .then(|| session.to_owned())
+    } else if let Some(session) = request["model"].as_str().and_then(|model| {
         model
             .strip_prefix("mock/")
             .unwrap_or(model)
@@ -841,6 +853,16 @@ impl BrocaSubject {
                     "enabled": true,
                     "reserved": true,
                 },
+                SENDER_MODULE: {
+                    "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+                    "args": [],
+                    "env": {
+                        "FAKE_AFT_MODULE_ID": SENDER_MODULE,
+                        "FAKE_AFT_LAUNCH_NONCE_PATH": root.join("sender.nonce"),
+                    },
+                    "enabled": true,
+                    "reserved": true,
+                },
             }
         });
         let mut config = config;
@@ -945,9 +967,18 @@ impl BrocaSubject {
         let identity = if stamp.principal == "direct" {
             None
         } else {
+            let module = stamp
+                .principal
+                .strip_prefix("reserved:")
+                .ok_or_else(|| HarnessError::new("expected a reserved module principal"))?;
+            let nonce_path = match module {
+                OWNER_MODULE => live.owner_nonce.clone(),
+                SENDER_MODULE => live.owner_nonce.with_file_name("sender.nonce"),
+                _ => return Err(HarnessError::new("unknown conformance module principal")),
+            };
             let deadline = Instant::now() + Duration::from_secs(20);
             let nonce = loop {
-                if let Ok(text) = std::fs::read_to_string(&live.owner_nonce) {
+                if let Ok(text) = std::fs::read_to_string(&nonce_path) {
                     if !text.trim().is_empty() {
                         break text.trim().to_owned();
                     }
@@ -960,7 +991,7 @@ impl BrocaSubject {
                 sleep(Duration::from_millis(25)).await;
             };
             Some(ConsumerIdentity {
-                module_id: OWNER_MODULE.into(),
+                module_id: module.into(),
                 launch_nonce: nonce,
             })
         };
@@ -1120,6 +1151,9 @@ impl Harness for BrocaSubject {
     type Route = BrocaRoute;
 
     fn declared_points(&self) -> Vec<PointDeclaration> {
+        if skip_crash_kills() {
+            return Vec::new();
+        }
         let points: Vec<_> = [
             points::ADMITTED,
             points::SEND_RECORDED,
@@ -1127,8 +1161,6 @@ impl Harness for BrocaSubject {
             points::DISPATCH_INTENT,
             points::TOOL_RESULT_RECORDED,
             points::TERMINAL,
-            points::COMPACTION_APPLIED,
-            points::FOLD_RECORDED,
         ]
         .into_iter()
         .map(|point| {
@@ -1504,8 +1536,8 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Queue,
             Capability::Interrupt,
             Capability::HoldToolCalls,
-            Capability::Compaction,
-            Capability::ModelView,
+            Capability::Tags,
+            Capability::DeliveryOrder,
         ]
         .into_iter()
         .collect();
@@ -1570,6 +1602,10 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self.shared.plan_sessions.lock().unwrap().contains(session) {
+            return json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")}})
+                .as_object().unwrap().clone();
+        }
         if let Some(fields) = self.compaction_fields(session, first) {
             return fields;
         }
@@ -1585,6 +1621,45 @@ impl LlmRunnerSubject for BrocaSubject {
             }],
         });
         fields.as_object().cloned().expect("an object")
+    }
+
+    fn send_fields_with_plan(
+        &self,
+        session: &str,
+        first: bool,
+        members: &Map<String, Value>,
+    ) -> Option<Map<String, Value>> {
+        self.shared
+            .plan_sessions
+            .lock()
+            .unwrap()
+            .insert(session.into());
+        let mut fields = self.send_fields(session, first);
+        if first {
+            let composition = json!({"providers":[{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],"step_transform_items":[]});
+            let mut plan = json!({
+                "tool_items":[{"provider":TOOL_MODULE,"preset":"conformance","params":{}}],
+                "system_text_items":[],
+                "step_transform_items":[],
+                "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+                "composition":composition,
+            });
+            plan.as_object_mut().unwrap().extend(members.clone());
+            fields.insert("plan".into(), plan);
+        }
+        Some(fields)
+    }
+
+    fn plan_sender(&self) -> Option<cortexkit_role_llm_runner_conformance::PlanSenderIdentity> {
+        Some(
+            cortexkit_role_llm_runner_conformance::PlanSenderIdentity::new(
+                RouteStamp {
+                    principal: format!("reserved:{SENDER_MODULE}"),
+                    scope: None,
+                },
+                SENDER_MODULE,
+            ),
+        )
     }
 
     fn tool_provider_module(&self) -> String {
@@ -1718,7 +1793,7 @@ impl LlmRunnerSubject for BrocaSubject {
                     Some(
                         cortexkit_role_llm_runner_conformance::ToolResultObservation::new(
                             false,
-                            cortexkit_role_llm_runner::run::RUN_STATE_BUDGET_EXHAUSTED,
+                            cortexkit_role_llm_runner::run::states::BUDGET_EXHAUSTED,
                         ),
                     )
                 }
@@ -1868,19 +1943,6 @@ impl LlmRunnerSubject for BrocaSubject {
             },
         )
     }
-    async fn install_compaction_script(
-        &self,
-        session: &str,
-        script: cortexkit_role_llm_runner_conformance::CompactionScript,
-    ) -> Result<(), HarnessError> {
-        self.install_compaction(session, script).await
-    }
-    async fn compaction_observation(
-        &self,
-        session: &str,
-    ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
-        self.compaction_observe(session).await
-    }
     #[cfg(feature = "test-clock")]
     async fn advance_retention_clock(
         &self,
@@ -1906,27 +1968,11 @@ impl LlmRunnerSubject for BrocaSubject {
             "session.baseline" | "compaction.ready" | "run.status" => Ok(Some(vec![json!({})])),
             // A tag the expired session's first part held: resolve reads through the same
             // transcript path as session.read, so an expired session serves none of it.
-            "session.resolve" => Ok(Some(vec![json!({"tag": 1})])),
+            "session.resolve" => Ok(Some(vec![json!({"tag": "§1§"})])),
             _ => Err(HarnessError::new(format!(
                 "unclassified retention probe op: {method}"
             ))),
         }
-    }
-    async fn advance_compaction_clock(
-        &self,
-        session: &str,
-        milliseconds: u64,
-    ) -> Result<(), HarnessError> {
-        self.advance_compaction(session, milliseconds).await
-    }
-    async fn answer_compaction(
-        &self,
-        session: &str,
-        index: usize,
-        id: Option<String>,
-        answer: cortexkit_role_llm_runner_conformance::CompactionAnswer,
-    ) -> Result<(), HarnessError> {
-        self.deliver_compaction(session, index, id, answer).await
     }
     async fn release_compaction_model(&self, session: &str) -> Result<(), HarnessError> {
         self.release_model_compaction(session).await
@@ -2159,14 +2205,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "retention_above_max_refused",
         "retention_active_run_never_expires",
         "crash_at_RetentionTombstoned",
-        "compaction_setup_durable_once",
-        "compaction_fence_crash_replays_model_view",
-        "model_view_half_open_ranges_and_travel",
-        "compaction_unavailable_distinct_from_refuse",
-        "compaction_wait_cap",
-        "compaction_late_or_stale_answers_discarded",
-        "compaction_step_timeout_uses_last_view",
-        "compaction_one_view_per_step",
         "input_token_cap_at_limit",
         "input_token_cap_crossing_tools",
         "input_token_cap_restart_between_episodes",
@@ -2189,6 +2227,19 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             .iter()
             .find(|case| case.case == name)
             .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        if skip_crash_kills()
+            && case
+                .requires
+                .iter()
+                .any(|cap| matches!(cap, Capability::KillAt(_)))
+        {
+            assert!(
+                matches!(case.outcome, CaseOutcome::Skipped { .. }),
+                "{name}: {:?}",
+                case.outcome
+            );
+            continue;
+        }
         assert_eq!(
             case.outcome,
             CaseOutcome::Passed,
@@ -2226,12 +2277,24 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     );
     assert!(structured_cases
         .iter()
-        .all(|case| case.outcome == CaseOutcome::Passed));
+        .all(|case| case.outcome == CaseOutcome::Passed
+            || (skip_crash_kills()
+                && case.case == "structured_output_frozen_across_restart"
+                && matches!(case.outcome, CaseOutcome::Skipped { .. }))));
     println!(
-        "Shared structured-output cases: {} ran, {} passed, 0 skipped",
+        "Shared structured-output cases: {} total, {} passed",
         structured_cases.len(),
-        structured_cases.len()
+        structured_cases
+            .iter()
+            .filter(|case| case.outcome == CaseOutcome::Passed)
+            .count()
     );
+    if skip_crash_kills() {
+        assert!(report.kills.is_empty());
+        println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
+        broca_test_support::remove_rig_dir(&scratch);
+        return;
+    }
     assert!(
         report
             .kills
@@ -2240,16 +2303,12 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "{}",
         report.render()
     );
-    for point in [points::COMPACTION_APPLIED, points::FOLD_RECORDED] {
-        assert!(
-            report
-                .kills
-                .iter()
-                .any(|kill| kill.point.as_str() == point && kill.mechanism.is_real_process_kill()),
-            "missing real compaction cut at {point}"
-        );
-    }
     broca_test_support::remove_rig_dir(&scratch);
+}
+
+/// Sandboxed runs can exercise every non-kill case without claiming crash conformance.
+fn skip_crash_kills() -> bool {
+    std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
 }
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume
@@ -2994,14 +3053,14 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
         )));
     for group in ["compaction", "model_view"] {
         assert!(
-            describe["capabilities"]
+            !describe["capabilities"]
                 .as_array()
                 .unwrap()
                 .contains(&json!(group)),
-            "the installed compaction writer must declare {group}"
+            "the synchronous client must not declare the published {group} group"
         );
     }
-    assert!(describe["majors"][0]["ops"]
+    assert!(!describe["majors"][0]["ops"]
         .as_array()
         .unwrap()
         .contains(&json!("compaction.ready")));

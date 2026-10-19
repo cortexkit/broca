@@ -173,7 +173,7 @@ fn parser_allows_only_the_compaction_owners_replace_subscriptions() {
 /// A `role.describe` answer serving `compaction-provider/v1` with every required op.
 fn serving_describe() -> Value {
     json!({"majors": [{"version": "compaction-provider/v1",
-        "ops": ["role.describe", "compaction.setup", "compaction.step"], "stability": "alpha"}],
+        "ops": ["role.describe", "compaction.setup", "view.get", "compaction.ride"], "stability": "alpha"}],
         "implementation_version": "test", "capabilities": []})
 }
 
@@ -325,7 +325,7 @@ async fn a_provider_whose_describe_lacks_the_role_is_refused_invalid_params_nami
         (
             json!({"majors": [{"version": "compaction-provider/v1",
                 "ops": ["role.describe", "compaction.setup"]}], "implementation_version": "mc"}),
-            json!([{"problem": "missing_op", "op": "compaction.step"}]),
+            json!([{"problem": "missing_op", "op": "view.get"}, {"problem": "missing_op", "op": "compaction.ride"}]),
         ),
     ];
     for (describe, problems) in cases {

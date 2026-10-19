@@ -229,6 +229,7 @@ fn accept(dir: &std::path::Path, mode: DeliveryMode) -> [WalRecord; 2] {
                 modes: vec![mode],
                 dedupe_key: None,
                 expires_at_ms: None,
+                template: None,
             },
             sent_by: None,
         },
@@ -413,6 +414,80 @@ fn reads_agree(dir: &std::path::Path, store: &SqliteStore) {
         bytes(&replayed),
         "store-backed read equals a full replay"
     );
+    assert_eq!(
+        stored
+            .messages
+            .iter()
+            .map(|entry| &entry.run)
+            .collect::<Vec<_>>(),
+        replayed
+            .messages
+            .iter()
+            .map(|entry| &entry.run)
+            .collect::<Vec<_>>(),
+        "the projection preserves run and delivery attribution"
+    );
+}
+
+#[tokio::test]
+async fn ordered_delivery_receipts_survive_the_store_fold() {
+    for mode in [
+        DeliveryMode::Steer,
+        DeliveryMode::ToolResult,
+        DeliveryMode::IdleStart,
+    ] {
+        let dir = broca_test_support::scratch_root().join(format!(
+            "delivery-receipts-{}-{}",
+            std::process::id(),
+            mode.as_str()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+        run_next(&dir, "r0", vec![text_turn("m0")], Some(store.clone())).await;
+        append(&dir, &accept(&dir, mode));
+        run_next(&dir, "r1", delivering_scripts(), Some(store.clone())).await;
+        let frames = frames(&dir);
+        let session = request(&dir, "r0", "").session;
+        Persister::project(store.as_ref(), &session, &frames).unwrap();
+        reads_agree(&dir, &store);
+        let snapshot = store
+            .read_page_with_watermark(&session, Some(0), 200, broca_core::context::ReadView::Raw)
+            .unwrap();
+        let delivery_seq = frames
+            .iter()
+            .find(|frame| match &frame.record {
+                WalRecord::SendDelivered { submission_id, .. } => submission_id.0 == SUB,
+                WalRecord::RunStarted {
+                    submission_id: Some(id),
+                    ..
+                } => id.0 == SUB,
+                _ => false,
+            })
+            .unwrap()
+            .seq;
+        assert!(
+            snapshot.watermark_seq >= delivery_seq,
+            "the receipt is in the store, not the tail"
+        );
+        let page = read_session_page(&snapshot, &[], Some(0), Some(200)).unwrap();
+        let receipts: Vec<_> = page
+            .messages
+            .iter()
+            .filter_map(|entry| entry.run.as_ref()?.delivery.as_ref())
+            .collect();
+        assert_eq!(receipts.len(), 1, "{mode:?}");
+        assert_eq!(receipts[0].mode, mode);
+        assert_eq!(
+            receipts[0].tool_call_id.as_deref(),
+            if mode == DeliveryMode::ToolResult {
+                Some("t1")
+            } else {
+                None
+            }
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 async fn sweep(mode: DeliveryMode) {
