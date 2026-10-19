@@ -17581,3 +17581,18 @@ expect_red = ["delivery_order_resume::ordered_delivery_receipts_survive_the_stor
 file = "crates/broca-core/src/replay.rs"
 old = "run.delivery = message.tags.delivery().cloned();"
 new = "run.delivery = None; // NON-VACUITY BREAK: lose the ordered receipt at projection"
+
+
+[[control]]
+id = "session-read-refuses-missing-wal-for-indexed-prefix"
+guards = "stored session history is never served as a complete transcript when no WAL source covers it"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read.rs"
+expect_red = ["session_read::missing_live_wal_rejects_indexed_store_prefix_even_without_archive"]
+file = "crates/broca-module/src/registry.rs"
+old = 'if store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) {'
+new = 'if false && store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK'
+
