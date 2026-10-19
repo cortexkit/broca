@@ -37,8 +37,8 @@ static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// The counters in [`Metrics`] only move once events reach the outbox, so a publisher that is
 /// stuck before that point reads exactly like an idle one: every number zero while runs flow.
 /// These readings separate the stages. Durable barriers seen with no session projected means
-/// projection is not keeping up; a pending recovery count says how much history a walk still
-/// has to visit; a loop age that keeps growing means one pass of the loop is stuck.
+/// projection is not keeping up; a pending recovery count says how many sessions a recovery
+/// walk still has to visit; a loop age that keeps growing means one pass of the loop is stuck.
 struct Liveness {
     /// Durable WAL barriers the publisher was told about.
     hints_seen: AtomicU64,
@@ -50,6 +50,8 @@ struct Liveness {
     recovery_pending: AtomicU64,
     /// Recovery walks that visited every session they listed.
     recovery_walks: AtomicU64,
+    /// Sessions recovery walks have visited, each a read of that session's WAL.
+    recovery_visits: AtomicU64,
     /// When the loop last began a pass, on `broca_diagnostics`' monotonic clock; zero before the
     /// first pass.
     pass_started_ms: AtomicU64,
@@ -63,6 +65,7 @@ impl Liveness {
             account_known: std::sync::atomic::AtomicBool::new(false),
             recovery_pending: AtomicU64::new(0),
             recovery_walks: AtomicU64::new(0),
+            recovery_visits: AtomicU64::new(0),
             pass_started_ms: AtomicU64::new(0),
         }
     }
@@ -100,6 +103,10 @@ pub fn health() -> serde_json::Value {
             count(&LIVENESS.recovery_pending),
         );
         fields.insert("bus_recovery_walks".into(), count(&LIVENESS.recovery_walks));
+        fields.insert(
+            "bus_recovery_visits".into(),
+            count(&LIVENESS.recovery_visits),
+        );
         // Milliseconds since the loop began its latest pass. A running loop begins one every
         // quarter second, so a value that keeps growing means a pass is stuck. Null when no
         // loop has started, which is always the case with `bus_run_events_enabled` off.
@@ -226,8 +233,8 @@ enum VisitError {
     Projection(String),
 }
 
-/// Bring one session's outbox projection up to its durable WAL head after process loss or
-/// hint overflow.
+/// Bring one open session's outbox projection up to its durable WAL head after process loss
+/// or hint overflow. A session with no checkpoint starts at its head, as a live barrier would.
 ///
 /// The head is the last sequence decoded BEFORE the read-side flush: the flush proves every
 /// frame written before it, so a frame appended after the read cannot ride on that proof.
@@ -262,23 +269,22 @@ fn recover_session(
     let position = store
         .bus_event_position(session, &epoch)
         .map_err(|e| VisitError::Projection(e.to_string()))?;
-    if position >= head {
-        return Ok(Visit::Current {
-            head,
-            projected: false,
-        });
-    }
-    match wal.flush_for_read(session) {
-        Ok(_identity) => {}
-        Err(error) if missing(&error) => return Ok(Visit::Absent),
-        Err(_) => return Err(VisitError::Unreadable),
+    // Nothing new needs no durability proof; projecting the empty remainder still settles
+    // whether the session's run is open, so a session whose run finished leaves the walk.
+    let current = position >= head;
+    if !current {
+        match wal.flush_for_read(session) {
+            Ok(_identity) => {}
+            Err(error) if missing(&error) => return Ok(Visit::Absent),
+            Err(_) => return Err(VisitError::Unreadable),
+        }
     }
     store
-        .project_bus_events(session, &epoch, &records, now)
+        .project_new_bus_events(session, &epoch, &records, now)
         .map_err(|e| VisitError::Projection(e.to_string()))?;
     Ok(Visit::Current {
         head,
-        projected: true,
+        projected: !current,
     })
 }
 
@@ -291,18 +297,20 @@ struct WalkStep {
     projected: u64,
 }
 
-/// Longest a single pass of the publisher loop spends visiting historical sessions.
+/// Longest a single pass of the publisher loop spends on a recovery walk.
 ///
-/// A recovery walk visits every session the module knows, and a long-lived state root holds
-/// tens of thousands: each visit reads that session's whole WAL and, when anything is left to
-/// project, fsyncs it. Run in one piece, the walk held the loop for many minutes after every
-/// start while live runs' events waited behind it and health read all zeros. Sliced, live
-/// events are projected and published between slices, and the walk finishes in the background.
+/// A walk visits only sessions with a run open during the current enabled period, normally a
+/// handful. Each visit reads that session's whole WAL and, when anything is left to project,
+/// fsyncs it, so a slice bound still keeps a slow disk or an unusually long open list from
+/// holding live runs' events behind the walk: they are projected and published between slices.
 const WALK_SLICE: Duration = Duration::from_millis(100);
 
 /// Passes on which a live barrier's projection is attempted before its session is left to a
 /// recovery walk.
 const LIVE_PROJECTION_ATTEMPTS: u32 = 5;
+
+/// Longest a single pass of the publisher loop spends publishing from the outbox.
+const DRAIN_SLICE: Duration = Duration::from_millis(200);
 
 /// Visit queued sessions until `budget` has passed, at least one per call so a walk always
 /// advances. Returns the sessions still queued.
@@ -316,6 +324,7 @@ fn walk_step(
     let started = std::time::Instant::now();
     let mut step = WalkStep::default();
     while let Some(session) = queue.pop_front() {
+        LIVENESS.recovery_visits.fetch_add(1, Ordering::Relaxed);
         match recover_session(store, wal, &session, now) {
             Ok(Visit::Current {
                 projected: true, ..
@@ -336,6 +345,24 @@ fn walk_step(
         }
     }
     (queue, step)
+}
+
+/// Begin or continue the enabled period, logging which. Returns whether it is in force.
+fn begin_period(store: &SqliteStore) -> bool {
+    match store.begin_bus_event_period(now_ms()) {
+        Ok(start) if start.fresh => {
+            tracing::info!(target: "bus", discarded = start.discarded, "run events on: a new period begins, so only runs written from now on become events");
+            true
+        }
+        Ok(_) => {
+            tracing::info!(target: "bus", "run events on: continuing the period an earlier process began");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(target: "bus", %error, "could not begin the run event period; retrying");
+            false
+        }
+    }
 }
 
 pub struct Service {
@@ -361,9 +388,18 @@ impl Service {
         } = self;
         let _ = METRICS.set(store.bus_metrics_arc());
         if !config.enabled {
+            // Off is recorded, so turning events on again begins a new period instead of
+            // turning everything written meanwhile into events.
+            if let Err(error) = store.end_bus_event_period() {
+                tracing::warn!(target: "bus", %error, "could not record that run events are off");
+            }
             return None;
         }
         ENABLED.store(true, Ordering::Relaxed);
+        // Begin the period before this process writes any WAL, so every run it starts records
+        // where its events begin. A failure is retried on each pass, and nothing is projected
+        // until it succeeds.
+        let mut period_ready = begin_period(&store);
         Some(tokio::spawn(async move {
             let mut publisher = None;
             let mut account_known = false;
@@ -439,10 +475,19 @@ impl Service {
                     publisher = None;
                     retry_at = tokio::time::Instant::now();
                 }
+                if !period_ready {
+                    let s = store.clone();
+                    period_ready = broca_diagnostics::spawn_blocking(
+                        broca_diagnostics::JobKind::StoreWrite,
+                        move || begin_period(&s),
+                    )
+                    .await
+                    .unwrap_or(false);
+                }
                 let (mut heads, overflow) = hints.take();
                 recovery |= overflow;
                 // Once an account is known, WAL projection continues during a broker outage.
-                if account_known {
+                if account_known && period_ready {
                     // Barriers whose projection failed on an earlier pass are tried again here,
                     // unless a newer barrier for the same session has replaced them.
                     let mut attempts: HashMap<BindIdentity, u32> = HashMap::new();
@@ -476,7 +521,7 @@ impl Service {
                                 else {
                                     return Err("run event WAL is absent".into());
                                 };
-                                s.project_bus_events(&session, &epoch, &records, now)
+                                s.project_new_bus_events(&session, &epoch, &records, now)
                                     .map_err(|e| e.to_string())
                             },
                         )
@@ -512,7 +557,7 @@ impl Service {
                         let s = store.clone();
                         match broca_diagnostics::spawn_blocking(
                             broca_diagnostics::JobKind::StoreRead,
-                            move || s.bus_event_sessions(),
+                            move || s.bus_event_open_sessions(),
                         )
                         .await
                         {
@@ -579,8 +624,11 @@ impl Service {
                 if let Some(bus) = publisher.as_ref() {
                     if tokio::time::Instant::now() >= retry_at {
                         // One sequential publisher preserves each run's WAL order through retries.
-                        for _ in 0..64 {
-                            match store.drain_bus_event(bus.as_ref(), now).await {
+                        // A pass drains until the outbox is empty or its budget is spent, so a
+                        // backlog clears at the broker's pace rather than a fixed count per pass.
+                        let drain_started = tokio::time::Instant::now();
+                        while drain_started.elapsed() < DRAIN_SLICE {
+                            match store.drain_bus_event(bus.as_ref(), now_ms()).await {
                                 Ok(DrainResult::Published) => {
                                     backoff = Duration::from_secs(1);
                                 }
@@ -757,7 +805,7 @@ mod tests {
         drop(writer);
         let names = AccountNames::derive("box_broca_test").unwrap();
         store.enable_bus_events(names.account()).unwrap();
-        let queue = store.bus_event_sessions().unwrap().into();
+        let queue = vec![missing.clone(), healthy.clone()].into();
         let (queue, step) = walk_step(&store, &wal, queue, Duration::MAX, now_ms());
         assert!(queue.is_empty());
         assert!(!step.incomplete);
@@ -804,6 +852,225 @@ mod tests {
         assert!(!step.incomplete);
         let (queue, _) = walk_step(&store, &wal, queue, Duration::MAX, now_ms());
         assert!(queue.is_empty());
+    }
+
+    fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> broca_wal::WalRecord {
+        broca_wal::WalRecord::RunStarted {
+            run_id: broca_protocol::RunId(run_id.into()),
+            session: session.clone(),
+            ts_ms: Some(ts_ms),
+            config: Box::new(broca_wal::RunConfig {
+                model: broca_protocol::request::ModelHandle::new("fixture", "model"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: vec![],
+                context_management: None,
+            }),
+            input: Arc::new(vec![]),
+            origin: Default::default(),
+            on_restart: None,
+            keep_warm: None,
+            project_id: None,
+            principal: None,
+            retention: None,
+            session_class: None,
+            submission_id: None,
+            send_id: None,
+            request_identity_digest: None,
+            title: None,
+            scope: None,
+            marker_order_version: None,
+            manifest: None,
+            hooks: None,
+        }
+    }
+
+    fn run_finished(ts_ms: u64) -> broca_wal::WalRecord {
+        broca_wal::WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Completed,
+            ts_ms: Some(ts_ms),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    /// Every publication the publisher made, as `(kind, run_id)`.
+    #[derive(Default)]
+    struct RecordingBus(Mutex<Vec<(String, String)>>);
+
+    #[async_trait]
+    impl BusPublisher for RecordingBus {
+        async fn publish(
+            &self,
+            event: &broca_store::bus_events::Publication,
+        ) -> Result<cortexkit_bus_trait::PublishReceipt, String> {
+            let mut seen = self.0.lock().unwrap();
+            seen.push((
+                event.headers["kind"].clone(),
+                event.headers["run_id"].clone(),
+            ));
+            Ok(cortexkit_bus_trait::PublishReceipt::new(
+                seen.len() as u64,
+                false,
+            ))
+        }
+    }
+
+    struct Connector(Arc<RecordingBus>);
+
+    #[async_trait]
+    impl BusConnector for Connector {
+        async fn connect(&self) -> Result<BusConnection, String> {
+            Ok(BusConnection {
+                publisher: self.0.clone(),
+                account: AccountNames::derive("box_broca_test").unwrap(),
+                refresh_at_ms: u64::MAX,
+            })
+        }
+    }
+
+    struct NoActor;
+
+    #[async_trait]
+    impl broca_module::registry::LineageOpener for NoActor {
+        async fn open(
+            &self,
+            _key: &broca_module::LineageKey,
+            _gen: u64,
+            _registry: broca_module::registry::RegistryHandle,
+        ) -> Result<broca_module::registry::ActorHandle, broca_module::registry::OpenError>
+        {
+            Err(broca_module::registry::OpenError::Open(
+                "the publisher test opens no actor".into(),
+            ))
+        }
+    }
+
+    /// Turning events on over a store full of finished runs publishes nothing for them, even
+    /// when those sessions write again, and publishes every run that starts afterwards,
+    /// including a new run on one of the historical sessions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bus_enable_publishes_only_runs_started_after_it() {
+        use broca_core::{RunIndex, RunIndexRow, RunIndexState};
+        let root = broca_test_support::scratch_root().join(format!("bus-enable-{}", now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
+        let hints = Arc::new(Hints::default());
+        let wal =
+            Arc::new(FileWalStore::new(root.join("wal")).with_durable_observer(hints.observer()));
+        wal.set_session_ref_index(store.clone());
+        // History: runs that finished an hour ago, recent enough that projecting them would
+        // publish rather than drop them. Their WAL barriers are left in the publisher's hints
+        // for its first pass, just as a write to an old session after run events are turned on
+        // would leave them.
+        let hour_ago = now_ms() - 60 * 60 * 1000;
+        let session = |n: usize| BindIdentity::new(&root, "runner", format!("history-{n}"));
+        for n in 0..100 {
+            let run_id = format!("old-{n}");
+            store
+                .index_run_active(&RunIndexRow {
+                    run_id: run_id.clone(),
+                    session: session(n),
+                    submission_id: None,
+                    request_identity_digest: None,
+                    state: RunIndexState::Active,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: None,
+                    withdrawals_owed: false,
+                })
+                .unwrap();
+            let mut writer = wal.open(&session(n)).unwrap();
+            writer
+                .append(1, &run_started(&session(n), &run_id, hour_ago), true)
+                .unwrap();
+            writer.append(1, &run_finished(hour_ago), true).unwrap();
+            store
+                .index_run_terminal(&run_id, RunIndexState::Completed, None, None, 0)
+                .unwrap();
+        }
+        // The period begins strictly after the history's last state change.
+        std::thread::sleep(Duration::from_millis(5));
+        let bus = Arc::new(RecordingBus::default());
+        let stop = CancellationToken::new();
+        let _service = Service {
+            config: Config { enabled: true },
+            store: store.clone(),
+            wal: wal.clone(),
+            registry: LineageRegistry::new_with_reader(
+                Arc::new(NoActor),
+                wal.clone(),
+                Some(store.clone()),
+            ),
+            connector: Some(Arc::new(Connector(bus.clone()))),
+            hints: hints.clone(),
+            stop: stop.clone(),
+        }
+        .spawn()
+        .unwrap();
+        // After the switch: a run on a new session and a second run on a historical one.
+        let fresh = BindIdentity::new(&root, "runner", "fresh");
+        for (who, run_id) in [(&fresh, "new-run"), (&session(0), "second-run")] {
+            let mut writer = wal.open(who).unwrap();
+            writer
+                .append(1, &run_started(who, run_id, now_ms()), true)
+                .unwrap();
+            writer.append(1, &run_finished(now_ms()), true).unwrap();
+        }
+        let expected = [
+            ("run.started", "new-run"),
+            ("run.ended", "new-run"),
+            ("run.started", "second-run"),
+            ("run.ended", "second-run"),
+        ];
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let seen = bus.0.lock().unwrap().clone();
+            if expected
+                .iter()
+                .all(|(kind, run)| seen.iter().any(|(k, r)| k == kind && r == run))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runs started after enabling were not all published: {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Let a few more passes run, so anything owed for history would have been published.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        stop.cancel();
+        let seen = bus.0.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            expected.len(),
+            "history must publish nothing: {seen:?}"
+        );
+        assert!(store.pending_bus_event().unwrap().is_none());
+        assert_eq!(
+            store
+                .bus_metrics()
+                .bus_outbox_dropped
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]

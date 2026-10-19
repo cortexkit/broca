@@ -47,6 +47,9 @@ impl Metrics {
 pub(crate) struct State {
     account: Mutex<Option<AccountNames>>,
     metrics: Arc<Metrics>,
+    /// When the current enabled period began, in Unix milliseconds; zero while none is active.
+    /// Read on the WAL writer's thread before every run start, so it is kept in memory.
+    period_started_ms: AtomicU64,
 }
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -59,9 +62,25 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             UNIQUE(epoch, run_id, seq, subject)
          );
          CREATE INDEX IF NOT EXISTS bus_event_pending ON bus_event_outbox(published_ms, at_ms);
+         -- Unpublished lifecycle rows only, in insertion order (every key is 0, so entries sort
+         -- by rowid). The drain's next-row query and the startup depth count read this index
+         -- instead of scanning a table that also holds a day of published bodies.
+         CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
+            WHERE published_ms IS NULL AND best_effort=0;
+         CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);
          CREATE TABLE IF NOT EXISTS bus_event_projection (
             session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
             state_json TEXT NOT NULL
+         );
+         -- Sessions with a run started, or in flight, during the current enabled period that
+         -- projection has not yet seen finish. Recovery after process loss visits only these.
+         CREATE TABLE IF NOT EXISTS bus_event_open (
+            session TEXT PRIMARY KEY, identity TEXT NOT NULL
+         );
+         -- The one row says when the current enabled period began. Absent means events were
+         -- off at the last start, so the next enable begins a new period.
+         CREATE TABLE IF NOT EXISTS bus_event_period (
+            id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL
          );",
     )
 }
@@ -74,6 +93,31 @@ struct Projection {
     send_ids: Vec<String>,
     truncated: bool,
     structured_output: Option<StructuredOutputStatus>,
+    /// A run has started and projection has not yet seen it finish.
+    #[serde(default)]
+    open: bool,
+}
+
+/// Where a projection starts for a session that has no checkpoint for this WAL epoch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Baseline {
+    /// Every record is new: emit from the first record.
+    FromStart,
+    /// Only what happened during the current enabled period is new. History is replayed
+    /// for state without emitting anything, except the session's most recent run (its last
+    /// `RunStarted`) when the run index shows that run active or paused, or shows it changing
+    /// state during the period; that run's records are emitted.
+    SinceEnable,
+}
+
+/// How a new enabled period began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodStart {
+    pub started_ms: u64,
+    /// False when this start continues the period a previous process began.
+    pub fresh: bool,
+    /// Unpublished lifecycle rows left by an earlier period and discarded.
+    pub discarded: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +155,12 @@ impl SqliteStore {
         if configured.as_ref().is_some_and(|old| old != &names) {
             return Err("run event account changed during this process".into());
         }
+        let first = configured.is_none();
         *configured = Some(names);
-        self.refresh_bus_depth().map_err(|e| e.to_string())?;
+        drop(configured);
+        if first {
+            self.resync_bus_depth().map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -124,26 +172,91 @@ impl SqliteStore {
         self.bus_events.metrics.clone()
     }
 
-    pub fn bus_event_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+    /// Begin, or continue after a restart, the period during which run events are on.
+    ///
+    /// Events describe what happens while the switch is on. A store that kept history from
+    /// before, or rows from an earlier period, must not turn either into events: a fresh period
+    /// therefore discards unpublished lifecycle rows (published ones stay for claim-check
+    /// reads until pruned), every projection checkpoint and the open-session list, so each
+    /// session starts again from its head when it next writes.
+    pub fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let existing: Option<u64> = tx
+            .query_row(
+                "SELECT started_ms FROM bus_event_period WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let start = match existing {
+            Some(started_ms) => PeriodStart {
+                started_ms,
+                fresh: false,
+                discarded: 0,
+            },
+            None => {
+                let discarded = tx.execute(
+                    "DELETE FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",
+                    [],
+                )? as u64;
+                tx.execute("DELETE FROM bus_event_projection", [])?;
+                tx.execute("DELETE FROM bus_event_open", [])?;
+                tx.execute(
+                    "INSERT INTO bus_event_period(id, started_ms) VALUES(1, ?1)",
+                    [now_ms],
+                )?;
+                PeriodStart {
+                    started_ms: now_ms,
+                    fresh: true,
+                    discarded,
+                }
+            }
+        };
+        tx.commit()?;
+        drop(conn);
+        self.bus_events
+            .period_started_ms
+            .store(start.started_ms, Ordering::Relaxed);
+        if start.discarded > 0 {
+            self.bus_metrics()
+                .bus_outbox_dropped
+                .fetch_add(start.discarded, Ordering::Relaxed);
+        }
+        self.resync_bus_depth()?;
+        Ok(start)
+    }
+
+    /// Record that run events are off, so the next enable begins a new period. Writes only
+    /// when a period was recorded. Returns whether one was.
+    pub fn end_bus_event_period(&self) -> Result<bool, StoreError> {
+        self.bus_events
+            .period_started_ms
+            .store(0, Ordering::Relaxed);
         let conn = self.conn.lock().unwrap();
-        let mut sessions = conn
-            .prepare("SELECT DISTINCT session FROM run_index")?
+        let recorded: Option<u64> = conn
+            .query_row(
+                "SELECT started_ms FROM bus_event_period WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if recorded.is_none() {
+            return Ok(false);
+        }
+        conn.execute("DELETE FROM bus_event_period", [])?;
+        Ok(true)
+    }
+
+    /// Sessions whose current-period run projection has not yet seen finish: the only
+    /// sessions recovery after process loss needs to visit.
+    pub fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sessions = conn
+            .prepare("SELECT identity FROM bus_event_open ORDER BY session")?
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect::<Result<Vec<BindIdentity>, StoreError>>()?;
-        let candidates = conn
-            .prepare("SELECT project_root,harness,session FROM agent_data_session_ref")?
-            .query_map([], |r| {
-                Ok(BindIdentity {
-                    project_root: std::path::PathBuf::from(r.get::<_, String>(0)?),
-                    harness: r.get(1)?,
-                    session: r.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        sessions.extend(candidates);
-        sessions.sort_by_key(Self::key);
-        sessions.dedup();
         Ok(sessions)
     }
 
@@ -169,12 +282,10 @@ impl SqliteStore {
             Err(e) => return Err(StoreError::BusEvent(e.to_string())),
         };
         let conn = self.conn.lock().unwrap();
-        let event_key = insert_event(&conn, &account, session, epoch, event, &bytes, now_ms)?;
-        // Progress is retained for claim-check reads but never retried as lifecycle work.
-        conn.execute(
-            "UPDATE bus_event_outbox SET best_effort=1 WHERE event_key=?1",
-            params![event_key],
-        )?;
+        // Progress is retained for claim-check reads but never retried as lifecycle work, so it
+        // is written best-effort and never counts toward the outbox depth.
+        let (event_key, _) =
+            insert_event(&conn, &account, session, epoch, event, &bytes, now_ms, true)?;
         Ok(Some(Publication {
             event_key,
             subject: event
@@ -201,7 +312,9 @@ impl SqliteStore {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT seq FROM bus_event_projection WHERE session=?1 AND epoch=?2",
+                // An empty epoch is a checkpoint taken before a legacy WAL minted its lineage,
+                // which happens on the very append the checkpoint precedes.
+                "SELECT seq FROM bus_event_projection WHERE session=?1 AND (epoch=?2 OR epoch='')",
                 params![Self::key(session), epoch],
                 |r| r.get(0),
             )
@@ -212,12 +325,42 @@ impl SqliteStore {
     /// `records` must be bounded by a successful writer or read-side durability barrier.
     /// The event checkpoint is independent of the transcript's turn-boundary watermark:
     /// starting and pausing a run must not wait for a complete assistant turn.
+    ///
+    /// A session with no checkpoint for `epoch` is projected from its first record. The
+    /// publisher uses [`Self::project_new_bus_events`] instead, which never turns history from
+    /// before the current enabled period into events.
     pub fn project_bus_events(
         &self,
         session: &BindIdentity,
         epoch: &str,
         records: &[FramedRecord],
         now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.project_events(session, epoch, records, now_ms, Baseline::FromStart)
+    }
+
+    /// [`Self::project_bus_events`] for the publisher. A session with no checkpoint for `epoch`
+    /// starts at its head: its history updates the projection state but emits nothing, unless
+    /// its latest run is still live, in which case that run's records are emitted. A run is
+    /// live when the run index shows it active or paused, or shows it changing state during
+    /// the current period. A run the index does not know is treated as history.
+    pub fn project_new_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.project_events(session, epoch, records, now_ms, Baseline::SinceEnable)
+    }
+
+    fn project_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+        baseline: Baseline,
     ) -> Result<(), StoreError> {
         let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
             return Ok(());
@@ -232,20 +375,38 @@ impl SqliteStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (mut seq, mut state) = match saved {
-            Some((old_epoch, seq, json)) if old_epoch == epoch => {
-                (seq, serde_json::from_str::<Projection>(&json)?)
+        let (mut seq, mut state, checkpointed) = match saved {
+            Some((old_epoch, seq, json)) if old_epoch == epoch || old_epoch.is_empty() => {
+                (seq, serde_json::from_str::<Projection>(&json)?, true)
             }
-            _ => (0, Projection::default()),
+            _ => (0, Projection::default(), false),
+        };
+        // Records at or below this sequence update the projection state and nothing else.
+        let quiet_through = if checkpointed || baseline == Baseline::FromStart {
+            0
+        } else {
+            let period = self.bus_events.period_started_ms.load(Ordering::Relaxed);
+            let head = records.last().map_or(0, |frame| frame.seq);
+            match records.iter().rev().find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { run_id, .. } => Some((frame.seq, run_id.0.as_str())),
+                _ => None,
+            }) {
+                Some((started, run_id)) if period != 0 && run_is_live(&tx, run_id, period)? => {
+                    started - 1
+                }
+                _ => head,
+            }
         };
         let mut oversize = 0;
         let mut dropped = 0;
+        let mut inserted = 0;
         for frame in records.iter().filter(|r| r.seq > seq).collect::<Vec<_>>() {
             if frame.seq != seq + 1 {
                 return Err(StoreError::BusEvent(
                     "run event WAL range has a sequence gap".into(),
                 ));
             }
+            let loud = frame.seq > quiet_through;
             let detail = match &frame.record {
                 WalRecord::RunStarted {
                     run_id,
@@ -258,10 +419,13 @@ impl SqliteStore {
                     state = Projection {
                         run_id: Some(run_id.0.clone()),
                         last_at_ms: ts_ms.unwrap_or(0),
+                        open: true,
                         ..Projection::default()
                     };
-                    tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
+                    if loud {
+                        tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
                         params![run_id.0, serde_json::to_string(session)?, submission_id.as_ref().map(|s| &s.0), request_identity_digest, ts_ms, title])?;
+                    }
                     Some(RunEventDetail::Started {})
                 }
                 WalRecord::Steered { send_id, ts_ms, .. } => {
@@ -306,7 +470,9 @@ impl SqliteStore {
                     ..
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
-                    tx.execute("UPDATE run_index SET state='paused',state_changed_ms=?2 WHERE run_id=?1 AND state IN ('active','paused')", params![run_id.0, state.last_at_ms])?;
+                    if loud {
+                        tx.execute("UPDATE run_index SET state='paused',state_changed_ms=?2 WHERE run_id=?1 AND state IN ('active','paused')", params![run_id.0, state.last_at_ms])?;
+                    }
                     Some(RunEventDetail::Paused {
                         pause_reason: *reason,
                     })
@@ -319,7 +485,8 @@ impl SqliteStore {
                     retries_used,
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
-                    if let Some(run_id) = &state.run_id {
+                    state.open = false;
+                    if let (true, Some(run_id)) = (loud, &state.run_id) {
                         let terminal = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
                         tx.execute("UPDATE run_index SET state=?2,state_changed_ms=?3,usage_json=?4,retries_used=?5 WHERE run_id=?1", params![run_id, terminal, state.last_at_ms, serde_json::to_string(usage)?, retries_used])?;
                     }
@@ -335,7 +502,7 @@ impl SqliteStore {
                 }
                 _ => None,
             };
-            if let (Some(detail), Some(run_id)) = (detail, state.run_id.as_ref()) {
+            if let (true, Some(detail), Some(run_id)) = (loud, detail, state.run_id.as_ref()) {
                 let mut event = RunEvent {
                     v: 1,
                     session_ref: agent_session_ref(session),
@@ -352,7 +519,10 @@ impl SqliteStore {
                         dropped += 1;
                     }
                     Ok(bytes) => {
-                        insert_event(&tx, &account, session, epoch, &event, &bytes, now_ms)?;
+                        let (_, new_row) = insert_event(
+                            &tx, &account, session, epoch, &event, &bytes, now_ms, false,
+                        )?;
+                        inserted += u64::from(new_row);
                     }
                     Err(EncodeError::Oversize(_)) => {
                         oversize += 1;
@@ -365,7 +535,19 @@ impl SqliteStore {
         }
         tx.execute("INSERT INTO bus_event_projection(session,epoch,seq,state_json) VALUES(?1,?2,?3,?4) ON CONFLICT(session) DO UPDATE SET epoch=excluded.epoch,seq=excluded.seq,state_json=excluded.state_json",
             params![key,epoch,seq,serde_json::to_string(&state)?])?;
+        if state.open {
+            tx.execute(
+                "INSERT OR IGNORE INTO bus_event_open(session, identity) VALUES(?1, ?2)",
+                params![key, serde_json::to_string(session)?],
+            )?;
+        } else {
+            tx.execute("DELETE FROM bus_event_open WHERE session=?1", [&key])?;
+        }
         tx.commit()?;
+        drop(conn);
+        self.bus_metrics()
+            .bus_outbox_depth
+            .fetch_add(inserted, Ordering::Relaxed);
         self.bus_metrics()
             .bus_events_oversize
             .fetch_add(oversize, Ordering::Relaxed);
@@ -375,8 +557,6 @@ impl SqliteStore {
                 .fetch_add(dropped, Ordering::Relaxed);
             tracing::warn!(target: "bus", dropped, "dropping recovered run events older than 24 hours");
         }
-        drop(conn);
-        self.refresh_bus_depth()?;
         Ok(())
     }
 
@@ -401,7 +581,7 @@ impl SqliteStore {
 
     pub fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
         self.conn.lock().unwrap().query_row(
-            "SELECT event_key,subject,epoch,run_id,seq,session,body FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0 ORDER BY rowid LIMIT 1", [],
+            "SELECT event_key,subject,epoch,run_id,seq,session,body FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 ORDER BY rowid LIMIT 1", [],
             |r| {
                 let session: String = r.get(5)?;
                 let session: BindIdentity = serde_json::from_str(&session).map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
@@ -443,38 +623,55 @@ impl SqliteStore {
         _receipt: PublishReceipt,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let updated=self.conn.lock().unwrap().execute("UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",params![event.event_key,now_ms])?;
+        let conn = self.conn.lock().unwrap();
+        let lifecycle: Option<bool> = conn
+            .query_row(
+                "SELECT best_effort=0 FROM bus_event_outbox WHERE event_key=?1 AND published_ms IS NULL",
+                [&event.event_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let updated = conn.execute(
+            "UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",
+            params![event.event_key, now_ms],
+        )? as u64;
+        drop(conn);
         self.bus_metrics()
             .bus_events_published
-            .fetch_add(updated as u64, Ordering::Relaxed);
-        self.refresh_bus_depth()
+            .fetch_add(updated, Ordering::Relaxed);
+        if updated > 0 && lifecycle == Some(true) {
+            self.lower_bus_depth(updated);
+        }
+        Ok(())
     }
 
     pub fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
+        let cutoff = now_ms.saturating_sub(RETENTION_MS);
         let dropped: u64 = conn.query_row(
-            "SELECT count(*) FROM bus_event_outbox WHERE at_ms<?1 AND published_ms IS NULL AND best_effort=0",
-            [now_ms.saturating_sub(RETENTION_MS)],
+            "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 AND at_ms<?1",
+            [cutoff],
             |r| r.get(0),
         )?;
-        let deleted = conn.execute(
-            "DELETE FROM bus_event_outbox WHERE at_ms<?1",
-            [now_ms.saturating_sub(RETENTION_MS)],
-        )?;
+        let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?;
+        drop(conn);
         if dropped > 0 {
+            self.lower_bus_depth(dropped);
             self.bus_metrics()
                 .bus_outbox_dropped
                 .fetch_add(dropped, Ordering::Relaxed);
             tracing::warn!(target: "bus", dropped, "dropping run events older than 24 hours without a publish acknowledgement");
         }
-        drop(conn);
-        self.refresh_bus_depth()?;
         Ok(deleted)
     }
 
-    fn refresh_bus_depth(&self) -> Result<(), StoreError> {
+    /// Set the depth gauge from the table, once per enable or period start. Every other change
+    /// moves the counter with the row it inserts, publishes or prunes: the count is a pass over
+    /// every pending row, and running it per projection held the shared connection for the
+    /// length of that pass while every other store operation waited.
+    fn resync_bus_depth(&self) -> Result<(), StoreError> {
         let depth = self.conn.lock().unwrap().query_row(
-            "SELECT count(*) FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",
+            "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0",
             [],
             |r| r.get(0),
         )?;
@@ -483,8 +680,74 @@ impl SqliteStore {
             .store(depth, Ordering::Relaxed);
         Ok(())
     }
+
+    fn lower_bus_depth(&self, by: u64) {
+        let depth = &self.bus_metrics().bus_outbox_depth;
+        let mut current = depth.load(Ordering::Relaxed);
+        while let Err(seen) = depth.compare_exchange_weak(
+            current,
+            current.saturating_sub(by),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = seen;
+        }
+    }
 }
 
+/// Record, before a run's first record is appended during an enabled period, where that
+/// session's projection starts: the WAL's head and lineage just before the append. Earlier
+/// records are history and are never emitted. A checkpoint the session already has for the
+/// same lineage is kept, since it may be behind with events still owed.
+pub(crate) fn record_run_start(
+    conn: &Connection,
+    session: &BindIdentity,
+    prior_head: u64,
+    lineage: Option<&str>,
+) -> Result<(), StoreError> {
+    let key = SqliteStore::key(session);
+    let epoch = lineage.unwrap_or_default();
+    conn.execute(
+        "INSERT INTO bus_event_projection(session,epoch,seq,state_json) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(session) DO UPDATE SET epoch=excluded.epoch, seq=excluded.seq, state_json=excluded.state_json
+         WHERE bus_event_projection.epoch != excluded.epoch AND excluded.epoch != ''",
+        params![key, epoch, prior_head, serde_json::to_string(&Projection::default())?],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO bus_event_open(session, identity) VALUES(?1, ?2)",
+        params![key, serde_json::to_string(session)?],
+    )?;
+    Ok(())
+}
+
+impl SqliteStore {
+    pub(crate) fn bus_event_period_active(&self) -> bool {
+        self.bus_events.period_started_ms.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// Whether the run index shows `run_id` still live, or changing state during the period that
+/// began at `period_started_ms`. A run it does not know is not live.
+fn run_is_live(
+    conn: &Connection,
+    run_id: &str,
+    period_started_ms: u64,
+) -> Result<bool, StoreError> {
+    let row: Option<(String, Option<u64>)> = conn
+        .query_row(
+            "SELECT state, state_changed_ms FROM run_index WHERE run_id=?1",
+            [run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.is_some_and(|(state, changed)| {
+        matches!(state.as_str(), "active" | "paused")
+            || changed.is_some_and(|changed| changed >= period_started_ms)
+    }))
+}
+
+/// Insert one outbox row; returns its key and whether the row is new.
+#[allow(clippy::too_many_arguments)]
 fn insert_event(
     conn: &Connection,
     account: &AccountNames,
@@ -493,7 +756,8 @@ fn insert_event(
     event: &RunEvent,
     bytes: &[u8],
     now_ms: u64,
-) -> Result<String, StoreError> {
+    best_effort: bool,
+) -> Result<(String, bool), StoreError> {
     let subject = event
         .subject(account)
         .map_err(|e| StoreError::BusEvent(e.to_string()))?;
@@ -501,9 +765,9 @@ fn insert_event(
         matches!(event.detail, RunEventDetail::Progress { .. }).then_some(event.at_ms);
     let key_bytes = serde_jcs::to_vec(&(epoch, &event.run_id, event.seq, &subject, observation))?;
     let event_key = format!("{:x}", Sha256::digest(key_bytes));
-    conn.execute("INSERT OR IGNORE INTO bus_event_outbox(event_key,run_id,seq,subject,epoch,session,body,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![event_key,event.run_id,event.seq,subject,epoch,serde_json::to_string(session)?,bytes,now_ms])?;
-    Ok(event_key)
+    let inserted = conn.execute("INSERT OR IGNORE INTO bus_event_outbox(event_key,run_id,seq,subject,epoch,session,body,at_ms,best_effort) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![event_key,event.run_id,event.seq,subject,epoch,serde_json::to_string(session)?,bytes,now_ms,best_effort])?;
+    Ok((event_key, inserted == 1))
 }
 
 #[cfg(test)]
@@ -707,6 +971,138 @@ mod tests {
         assert_eq!(consumed["step"], 3);
         let ended: serde_json::Value = serde_json::from_slice(&events[2].3).unwrap();
         assert_eq!(ended["terminal"], "interrupted");
+    }
+
+    /// A fresh period discards what an earlier period left unpublished and every checkpoint,
+    /// keeps published bodies for claim-check reads, and is continued, not restarted, by a
+    /// later start while events stay on. Turning events off makes the next start fresh again.
+    #[test]
+    fn bus_period_discards_earlier_backlog_and_continues_across_restarts() {
+        let store = enabled();
+        let records = [start(), finish(2, RunFinishReason::Completed)];
+        store
+            .project_bus_events(&session(), "epoch", &records, 2000)
+            .unwrap();
+        let published = store.pending_bus_event().unwrap().unwrap();
+        store
+            .acknowledge_bus_event(&published, PublishReceipt::new(1, false), 2100)
+            .unwrap();
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            1
+        );
+        let first = store.begin_bus_event_period(5000).unwrap();
+        assert_eq!(
+            first,
+            PeriodStart {
+                started_ms: 5000,
+                fresh: true,
+                discarded: 1
+            }
+        );
+        let left = rows(&store);
+        assert_eq!(left.len(), 1, "only the published body survives: {left:?}");
+        assert_eq!(left[0].0, published.event_key);
+        assert_eq!(store.bus_event_position(&session(), "epoch").unwrap(), 0);
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            store
+                .bus_metrics()
+                .bus_outbox_dropped
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            store.begin_bus_event_period(9000).unwrap(),
+            PeriodStart {
+                started_ms: 5000,
+                fresh: false,
+                discarded: 0
+            }
+        );
+        assert!(store.end_bus_event_period().unwrap());
+        assert!(!store.end_bus_event_period().unwrap());
+        assert!(store.begin_bus_event_period(9000).unwrap().fresh);
+    }
+
+    /// With no checkpoint, the publisher's projection treats history as already seen: a
+    /// finished run emits nothing, while a run the index shows live still emits.
+    #[test]
+    fn bus_new_projection_starts_at_the_head_unless_the_latest_run_is_live() {
+        let store = enabled();
+        store.begin_bus_event_period(10_000).unwrap();
+        let records = [start(), finish(2, RunFinishReason::Completed)];
+        store
+            .project_new_bus_events(&session(), "epoch", &records, 20_000)
+            .unwrap();
+        assert!(rows(&store).is_empty(), "history became events");
+        assert_eq!(store.bus_event_position(&session(), "epoch").unwrap(), 2);
+        assert!(store.bus_event_open_sessions().unwrap().is_empty());
+        let live = BindIdentity::new("/project", "test", "live");
+        store
+            .index_run_active(&broca_core::RunIndexRow {
+                run_id: "r1".into(),
+                session: live.clone(),
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+        store
+            .project_new_bus_events(&live, "epoch", &[start()], 20_000)
+            .unwrap();
+        assert_eq!(rows(&store).len(), 1, "a live run's start is owed");
+        assert_eq!(store.bus_event_open_sessions().unwrap(), vec![live]);
+    }
+
+    /// The depth gauge follows the rows each call inserts and acknowledges; it is not counted
+    /// again from the table on every projection.
+    #[test]
+    fn bus_outbox_depth_moves_with_its_own_rows_without_a_recount() {
+        let store = enabled();
+        store
+            .project_bus_events(&session(), "epoch", &[start()], 1000)
+            .unwrap();
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            1
+        );
+        // Set the `bus_outbox_depth` gauge to 100 while `bus_event_outbox` holds one pending
+        // row. A projection that counts only its own new row leaves 101; one that recounted
+        // the table would set 2.
+        store
+            .bus_metrics()
+            .bus_outbox_depth
+            .store(100, Ordering::Relaxed);
+        store
+            .project_bus_events(
+                &session(),
+                "epoch",
+                &[start(), finish(2, RunFinishReason::Completed)],
+                2000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            101,
+            "a projection must add its own rows, not recount the table"
+        );
+        let next = store.pending_bus_event().unwrap().unwrap();
+        store
+            .acknowledge_bus_event(&next, PublishReceipt::new(1, false), 3000)
+            .unwrap();
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            100
+        );
     }
 
     #[test]

@@ -23,6 +23,29 @@ capability field. Disabled means no publisher task, no event projection and no
 outbox writes. If credentials are unavailable, WAL recovery waits and retries;
 once the account is known, a broker outage does not stop outbox projection.
 
+### What becomes an event
+
+Events describe what happens while the switch is on; history never becomes an
+event. Each time the daemon starts with events on after a start with them off
+(including the first start ever), a new **enabled period** begins and is
+recorded in `run-index.db`. A new period discards unpublished lifecycle rows and
+every projection checkpoint left by an earlier period (published bodies stay
+until pruned) and counts the discarded rows in `bus_outbox_dropped`. A start
+with events still on continues the recorded period. A start with them off
+records that, so turning them on again begins a fresh period.
+
+During a period, just before a run's `RunStarted` is appended, the run index
+records the session's WAL head and lineage at that moment: that session's
+events begin with the new run. A session that writes during the period without
+starting a run (a crash-orphan seal, a resumed pause, maintenance) and has no
+checkpoint yet starts at its head; its history is replayed for state only. The
+exception is a latest run the run index shows active or paused, or changing
+state during the period: that run's records are emitted.
+
+Recovery after process loss visits only sessions with a run open in the
+current period: those whose run started, or was found in flight, and has not
+yet been projected as finished. It never walks every session in the store.
+
 ## Subjects and payload
 
 The machine account comes from ck-bus, not the caller:
@@ -80,7 +103,11 @@ checkpoint, and the outbox in `run-index.db`; it does not wait for transcript
 turn-boundary projection. Recovery re-derives rows idempotently by WAL epoch,
 run, sequence and subject. One publisher drains in insertion/WAL order and marks
 published **only after a JetStream `PublishReceipt`**, retrying failures with
-exponential backoff (1–60 seconds). A crash after broker ack but before the mark
+exponential backoff (1–60 seconds). Each loop pass (every 250 ms) publishes until
+the outbox is empty or 200 ms have passed. `bus_outbox_depth` is a counter moved
+by each insert, acknowledgement and prune, and set from an indexed count only
+when the publisher first learns its machine account from ck-bus or an enabled
+period (see "What becomes an event") begins. A crash after broker ack but before the mark
 can republish the identical key/digest. Broker deduplication is finite; consumers
 must also be idempotent.
 
@@ -114,10 +141,11 @@ whether an enabled publisher is doing its work:
 - `bus_hints_seen`: durable WAL barriers the publisher was told about.
 - `bus_sessions_projected`: session projections into the outbox that completed.
   Barriers seen with nothing projected means projection is not running.
-- `bus_recovery_pending` and `bus_recovery_walks`: sessions the current recovery
-  walk has yet to visit, and walks finished. Startup recovery visits every session
-  the module knows, a slice of at most 100 ms per loop pass, so live runs are
-  projected and published while it is still under way.
+- `bus_recovery_pending`, `bus_recovery_walks` and `bus_recovery_visits`:
+  sessions the current recovery walk has yet to visit, walks finished, and
+  sessions visited in total. Recovery visits only sessions with a run open in
+  the current period, a slice of at most 100 ms per loop pass, so live runs are
+  projected and published while it is under way.
 - `bus_loop_pass_age_ms`: milliseconds since the publisher loop began its latest
   pass. A running loop begins one every 250 ms; a value that keeps growing means a
   pass is stuck. Null when `bus_run_events_enabled` is off.

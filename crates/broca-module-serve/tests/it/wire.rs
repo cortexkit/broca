@@ -2841,6 +2841,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "bus_account_known": false,
             "bus_recovery_pending": 0,
             "bus_recovery_walks": 0,
+            "bus_recovery_visits": 0,
             "bus_loop_pass_age_ms": null,
         })
     );

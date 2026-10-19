@@ -58,12 +58,12 @@ fn scratch() -> Scratch {
 }
 
 fn started(session: &BindIdentity) -> WalRecord {
-    started_at(session, now_ms())
+    started_at(session, "bus-run", now_ms())
 }
 
-fn started_at(session: &BindIdentity, ts_ms: u64) -> WalRecord {
+fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
     WalRecord::RunStarted {
-        run_id: RunId("bus-run".into()),
+        run_id: RunId(run_id.into()),
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(RunConfig {
@@ -414,6 +414,9 @@ fn bus_crash_child() {
     let session = BindIdentity::new("/test", "test", "crash");
     let wal = FileWalStore::new(root.join("wal"));
     let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
+    // As the module does when events are on: the run start below records where the session's
+    // events begin and lists it for recovery.
+    index.begin_bus_event_period(now_ms()).unwrap();
     wal.set_session_ref_index(index);
     wal.open(&session)
         .unwrap()
@@ -445,8 +448,8 @@ async fn real_bus_crash_after_wal_commit_replays_after_restart() {
     let wal = FileWalStore::new(temp.path().join("wal"));
     let session = BindIdentity::new("/test", "test", "crash");
     assert!(
-        store.bus_event_sessions().unwrap().contains(&session),
-        "startup must discover the crash-committed WAL without a run-index admission row"
+        store.bus_event_open_sessions().unwrap().contains(&session),
+        "startup recovery must list the crash-committed run without a run-index admission row"
     );
     project(&store, &wal, &session);
     let pending = store.pending_bus_event().unwrap().unwrap();
@@ -890,9 +893,9 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
         .await
         .unwrap();
     let mut kinds = Vec::new();
-    // A live run's events are due within seconds of its terminal. Today's history makes the
-    // startup recovery walk take far longer than this here (about 18 s on an Apple laptop), so
-    // the deadline holds only if live barriers are published without waiting for that walk.
+    // A live run's events are due within seconds of its terminal. A publisher that walked every
+    // historical session at startup took about 18 s here on an Apple laptop before the turn's
+    // events went out, so the deadline also holds startup work to what this period needs.
     let stream_deadline = Instant::now() + Duration::from_secs(STREAM_DEADLINE_S);
     while !(kinds.contains(&"run.started".to_string()) && kinds.contains(&"run.ended".to_string()))
     {
@@ -976,12 +979,53 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
             .is_some_and(|age| age < 5_000),
         "the publisher loop must still be making passes: {events}"
     );
+
+    // History stays history: none of the seeded runs became an event, and starting the
+    // publisher cost work in proportion to the runs open during this period, which is none,
+    // not to the sessions the store holds.
+    assert_eq!(
+        events["bus_outbox_dropped"], 0,
+        "historical events were projected and then dropped: {events}"
+    );
+    assert!(
+        events["bus_recovery_walks"].as_u64() >= Some(1),
+        "the startup recovery walk must have finished: {events}"
+    );
+    assert!(
+        events["bus_recovery_visits"].as_u64() <= Some(1),
+        "startup recovery must visit only sessions with a run open in this period: {events}"
+    );
+    let (foreign_rows, checkpoints) = history_footprint(&db, &run_id).unwrap();
+    assert_eq!(foreign_rows, 0, "the outbox holds events of other runs");
+    assert!(
+        checkpoints <= 1,
+        "{checkpoints} sessions were projected; only the live one should be"
+    );
     drop(rig);
 }
 
+/// Outbox rows of runs other than `run_id`, and how many sessions have a projection checkpoint.
+#[cfg(unix)]
+fn history_footprint(db: &std::path::Path, run_id: &str) -> Result<(u64, u64), String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+    let count = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+        conn.query_row(sql, params, |row| row.get::<_, u64>(0))
+            .map_err(|e| e.to_string())
+    };
+    Ok((
+        count(
+            "SELECT count(*) FROM bus_event_outbox WHERE run_id != ?1",
+            &[&run_id],
+        )?,
+        count("SELECT count(*) FROM bus_event_projection", &[])?,
+    ))
+}
+
 /// How many finished sessions from before this launch the state root holds. A production state
-/// root carries thousands, and every one of them is a session the publisher's startup recovery
-/// must visit; a fresh rig with none hides any cost that walk imposes on live runs.
+/// root carries tens of thousands; a fresh rig with none hides any cost the publisher spends on
+/// them, and any events it wrongly makes from them.
 #[cfg(unix)]
 fn history_sessions() -> usize {
     std::env::var("BROCA_BUS_TEST_HISTORY")
@@ -997,26 +1041,44 @@ const HISTORY_SESSIONS: usize = 3000;
 #[cfg(unix)]
 const STREAM_DEADLINE_S: u64 = 5;
 
-/// Write `count` sessions that each ran and finished two days ago, discoverable the way the module
-/// discovers sessions after a restart. Their events are older than the outbox retention, so their
-/// projection publishes nothing and the stream carries only the live turn's events.
+/// Write `count` sessions that each ran and finished an hour ago, recorded in the run index as
+/// finished, as a production state root holds them. Their events are well inside the outbox
+/// retention, so a publisher that turned history into events would publish them all.
 #[cfg(unix)]
 fn seed_history(state_root: &std::path::Path, project: &std::path::Path, count: usize) {
+    use broca_core::{RunIndex, RunIndexRow, RunIndexState};
     let started = std::time::Instant::now();
     let index = Arc::new(SqliteStore::open(state_root.join("run-index.db")).unwrap());
     let wal = FileWalStore::new(state_root.join("wal"));
-    wal.set_session_ref_index(index);
-    let old = now_ms() - 2 * broca_store::bus_events::RETENTION_MS;
+    wal.set_session_ref_index(index.clone());
+    let hour_ago = now_ms() - 60 * 60 * 1000;
     for n in 0..count {
         let session = BindIdentity::new(project, "runner", format!("history-{n}"));
+        let run_id = format!("history-run-{n}");
+        index
+            .index_run_active(&RunIndexRow {
+                run_id: run_id.clone(),
+                session: session.clone(),
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
         let mut writer = wal.open(&session).unwrap();
-        writer.append(1, &started_at(&session, old), false).unwrap();
+        writer
+            .append(1, &started_at(&session, &run_id, hour_ago), false)
+            .unwrap();
         writer
             .append(
                 1,
                 &WalRecord::RunFinished {
                     reason: RunFinishReason::Completed,
-                    ts_ms: Some(old),
+                    ts_ms: Some(hour_ago),
                     usage: Usage::default(),
                     error: None,
                     retries_used: 0,
@@ -1024,7 +1086,11 @@ fn seed_history(state_root: &std::path::Path, project: &std::path::Path, count: 
                 false,
             )
             .unwrap();
+        index
+            .index_run_terminal(&run_id, RunIndexState::Completed, None, None, 0)
+            .unwrap();
     }
+    drop(index);
     drop(wal);
     // A production state root finished its one-time session-ref census long ago. Without it the
     // module would start that census at boot, on a second connection that holds the run index's

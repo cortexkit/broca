@@ -17097,14 +17097,79 @@ file = "crates/broca-module-serve/src/bus_events.rs"
 old = "        if started.elapsed() >= budget {"
 new = "        if false && started.elapsed() >= budget { // NON-VACUITY BREAK: ignore the slice budget"
 
+[[control]]
+id = "bus-events-history-is-not-backfilled"
+guards = "A session without a checkpoint starts at its WAL head: turning events on publishes nothing for runs that finished before, even when their sessions write again"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_enable_publishes_only_runs_started_after_it"]
+expect_message = "history must publish nothing"
+file = "crates/broca-store/src/bus_events.rs"
+old = "let quiet_through = if checkpointed || baseline == Baseline::FromStart {"
+new = "let quiet_through = if true || checkpointed || baseline == Baseline::FromStart { // NON-VACUITY BREAK: backfill history"
+
+[[control]]
+id = "bus-events-new-projection-starts-at-head"
+guards = "The publisher's projection of a session without a checkpoint replays its finished history for state only"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_new_projection_starts_at_the_head_unless_the_latest_run_is_live"]
+expect_message = "history became events"
+file = "crates/broca-store/src/bus_events.rs"
+old = "let quiet_through = if checkpointed || baseline == Baseline::FromStart {"
+new = "let quiet_through = if true || checkpointed || baseline == Baseline::FromStart { // NON-VACUITY BREAK: backfill history"
+
+[[control]]
+id = "bus-events-run-start-records-its-baseline"
+guards = "A run started during an enabled period records where its session's events begin before RunStarted is appended, so the new run is published"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_enable_publishes_only_runs_started_after_it"]
+expect_message = "runs started after enabling were not all published"
+file = "crates/broca-store/src/session_refs.rs"
+old = "            if events {"
+new = "            if false && events { // NON-VACUITY BREAK: record no event baseline"
+
+[[control]]
+id = "bus-events-new-period-discards-earlier-backlog"
+guards = "A new enabled period discards unpublished lifecycle rows and checkpoints left by an earlier period"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_period_discards_earlier_backlog_and_continues_across_restarts"]
+file = "crates/broca-store/src/bus_events.rs"
+old = '''                    "DELETE FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",'''
+new = '''                    "DELETE FROM bus_event_outbox WHERE 0", // NON-VACUITY BREAK: keep the earlier backlog'''
+
+[[control]]
+id = "bus-events-depth-is-a-counter"
+guards = "The outbox depth gauge moves with each projection's own rows instead of recounting the table under the shared connection"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_outbox_depth_moves_with_its_own_rows_without_a_recount"]
+expect_message = "a projection must add its own rows, not recount the table"
+file = "crates/broca-store/src/bus_events.rs"
+old = '''            .fetch_add(inserted, Ordering::Relaxed);'''
+new = '''            .fetch_add(inserted, Ordering::Relaxed);
+        self.resync_bus_depth()?; // NON-VACUITY BREAK: recount the outbox on every projection'''
+
 # The rows below run one turn on the real ck-broca under the real ck-subc daemon, with run events
 # switched on and three thousand historical sessions in the state root. They need SUBC_CORE_BIN
 # and a nats-server of at least 2.10 (on PATH or in CK_NATS_SERVER_BIN), with BROCA_REQUIRE_SUBC=1
 # and CK_BUS_TESTKIT_REQUIRE=1 so a missing fixture fails instead of skipping. The Linux mutation
 # job installs no nats-server, so these are macOS rows.
 [[control]]
-id = "bus-events-live-runs-do-not-wait-for-recovery"
-guards = "A live run's run.started and run.ended reach the stream within seconds while the startup recovery walk over historical sessions is still under way"
+id = "bus-events-recovery-visits-only-open-sessions"
+guards = "Startup recovery visits only sessions with a run open in the current enabled period, never every session the store knows"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test run_events_bus"
@@ -17112,10 +17177,10 @@ platforms = ["macos"]
 select = "expected"
 test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
 expect_red = ["real_daemon_turn_publishes_run_started_and_run_ended"]
-expect_message = "never reached the stream"
-file = "crates/broca-module-serve/src/bus_events.rs"
-old = "const WALK_SLICE: Duration = Duration::from_millis(100);"
-new = "const WALK_SLICE: Duration = Duration::MAX; // NON-VACUITY BREAK: walk all history in one pass"
+expect_message = "startup recovery must visit only sessions with a run open in this period"
+file = "crates/broca-store/src/bus_events.rs"
+old = '''.prepare("SELECT identity FROM bus_event_open ORDER BY session")?'''
+new = '''.prepare("SELECT json_object('project_root',project_root,'harness',harness,'session',session) FROM agent_data_session_ref")? // NON-VACUITY BREAK: walk every known session'''
 
 [[control]]
 id = "bus-events-health-counts-projections"

@@ -6,9 +6,16 @@ fn record_candidate(
     root: &Path,
     address: &str,
     session: &BindIdentity,
+    run_start: Option<(u64, Option<broca_wal::WalLineageId>)>,
 ) -> Result<Option<ProjectionAdmission>, String> {
     if let Some(index) = index {
-        if let Err(error) = index.record_session(address, session) {
+        let recorded = match run_start {
+            Some((prior_head, lineage)) => {
+                index.record_run_start(address, session, prior_head, lineage)
+            }
+            None => index.record_session(address, session),
+        };
+        if let Err(error) = recorded {
             let admission = ProjectionAdmission::begin(root)
                 .map_err(|marker| format!("session-ref projection failed ({error}); cannot persist incomplete marker: {marker}"))?;
             tracing::warn!(%error, "session-ref projection unavailable; durable incomplete marker preserves WAL admission");
@@ -30,6 +37,21 @@ pub fn agent_session_ref(session: &BindIdentity) -> String {
 /// preserves availability when SQLite cannot accept the conservative candidate.
 pub trait SessionRefIndex: Send + Sync {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String>;
+
+    /// [`Self::record_session`] for a `RunStarted` about to be appended, with the WAL's head and
+    /// lineage just before that append. An index that also tracks run events uses them to
+    /// start the session's event projection at that head, so that nothing written before
+    /// becomes an event. The default records only the session ref.
+    fn record_run_start(
+        &self,
+        address: &str,
+        session: &BindIdentity,
+        prior_head: u64,
+        lineage: Option<broca_wal::WalLineageId>,
+    ) -> Result<(), String> {
+        let _ = (prior_head, lineage);
+        self.record_session(address, session)
+    }
 }
 
 impl FileWalStore {
@@ -49,6 +71,7 @@ impl FileWalStore {
             self.root.parent().unwrap_or(&self.root),
             address,
             session,
+            None,
         )
     }
 
@@ -105,9 +128,14 @@ impl AdmissionWal {
         } = record
         {
             let index = self.index.lock().unwrap().clone();
-            admission =
-                record_candidate(index.as_deref(), &self.state_root, &self.address, session)
-                    .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
+            admission = record_candidate(
+                index.as_deref(),
+                &self.state_root,
+                &self.address,
+                session,
+                Some((self.wal.last_seq(), self.wal.lineage_id())),
+            )
+            .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
             if self.wal.last_seq() == 0 {
                 if let Some((ordinary, ephemeral, durable, classes)) = &self.placement {
                     let path = if retention.is_some() {
