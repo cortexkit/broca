@@ -189,7 +189,7 @@ async fn resumed_dispatch_uses_the_wal_frozen_provider_preset_not_new_control() 
     assert!(!seen.is_empty(), "resume dispatched a tool batch");
     assert!(
         seen.iter()
-            .all(|preset| preset.as_deref() == Some("worker")),
+            .all(|preset| preset.as_deref() == Some("reader")),
         "{seen:?}"
     );
 }

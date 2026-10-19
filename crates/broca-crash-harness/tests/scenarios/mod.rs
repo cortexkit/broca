@@ -394,13 +394,15 @@ pub fn planned_manifest() -> broca_wal::PlanManifest {
     }]);
     // SHA-256 of `{}` for the illustrative catalog and composition.
     let empty_object = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+    // A non-confining preset: these sessions run unscoped, and an episode whose plan asks for
+    // the `worker` preset refuses to start without a scope.
     broca_wal::PlanManifest {
         declarations: Vec::new(),
         plan: broca_wal::OpaqueJson::from_json_text(
-            r#"{"tool_items":[{"provider":"aft","preset":"worker"}]}"#,
+            r#"{"tool_items":[{"provider":"aft","preset":"reader"}]}"#,
         )
         .unwrap(),
-        plan_identity: "a05119060e35f01b27a61bc78fcce24ce3a3b701529a8e8d690d00c76a7d87d4".into(),
+        plan_identity: "a0dfbc0f5d00737f5634ed960e392e853478c1eb05570968e18e24ec00988648".into(),
         composition_digest: empty_object.into(),
         fetches: vec![broca_wal::ProviderFetch {
             provider: "aft".into(),

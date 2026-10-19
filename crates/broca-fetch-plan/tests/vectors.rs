@@ -600,7 +600,7 @@ impl Fetcher for Simulated {
         );
         Ok(DescribeAnswer::Answered(json!({
             "majors": [{"version": "compaction-provider/v1",
-                "ops": ["role.describe", "compaction.setup", "compaction.step"],
+                "ops": ["role.describe", "compaction.setup", "view.get", "compaction.ride"],
                 "stability": "alpha"}],
             "implementation_version": "test", "capabilities": []
         })))
