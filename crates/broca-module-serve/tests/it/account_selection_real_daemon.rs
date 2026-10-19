@@ -1048,16 +1048,129 @@ impl Rig {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
+        Self::request_on(&conn, &route, "session.send", params).await
+    }
+
+    /// One request on a fresh management route to session `name`: the result, or the whole
+    /// refusal body (code, message and detail, which carries a classified refusal's `class`).
+    async fn raw_request(&self, name: &str, method: &str, params: Value) -> Result<Value, Value> {
+        let conn = SubcConnection::connect(&self.connection_file)
+            .await
+            .unwrap();
+        let route = conn
+            .route_open_management_within(
+                "broca",
+                &self.session(name),
+                broca_subc::RouteOpenRetry::within(
+                    Duration::from_secs(10),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap();
+        Self::request_on(&conn, &route, method, params).await
+    }
+
+    async fn request_on(
+        conn: &SubcConnection,
+        route: &broca_subc::RouteHandle,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Value> {
         match conn
             .route_request_terminal(
-                &route,
-                serde_json::to_vec(&json!({"method": "session.send", "params": params})).unwrap(),
+                route,
+                serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
             )
             .await
             .unwrap()
         {
             Ok(bytes) => Ok(serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone()),
             Err(bytes) => Err(serde_json::from_slice(&bytes).unwrap()),
+        }
+    }
+
+    /// The rig's shared failure dump for session `name`: the daemon's supervisor record of
+    /// broca, the daemon and broca log tails, and the session's WAL record kinds.
+    async fn diagnostics(&self, name: &str) -> String {
+        format!(
+            "{}{}",
+            super::session_client::supervisor_diagnostics(&self.connection_file, "broca").await,
+            self.log_diagnostics(name)
+        )
+    }
+
+    /// The log tails and WAL part of [`Self::diagnostics`], for a caller that cannot wait.
+    fn log_diagnostics(&self, name: &str) -> String {
+        super::session_client::rig_diagnostics(
+            &self.root.join("data-home/cortexkit"),
+            &self.state_root,
+            name,
+        )
+    }
+
+    /// `outcome`'s result, or a panic naming `what`, the refusal's class, code and reason, and
+    /// the rig's failure dump.
+    async fn expect_ok(&self, name: &str, what: &str, outcome: Result<Value, Value>) -> Value {
+        match outcome {
+            Ok(result) => result,
+            Err(refusal) => panic!(
+                "{what} on {name} was refused: {}\n{}",
+                refusal_summary(&refusal),
+                self.diagnostics(name).await
+            ),
+        }
+    }
+
+    /// `outcome`'s refusal, or a panic naming `what`, the answer it got instead, and the rig's
+    /// failure dump.
+    async fn expect_refused(&self, name: &str, what: &str, outcome: Result<Value, Value>) -> Value {
+        match outcome {
+            Err(refusal) => refusal,
+            Ok(result) => panic!(
+                "{what} on {name} was answered, not refused: {result}\n{}",
+                self.diagnostics(name).await
+            ),
+        }
+    }
+
+    /// `run.status` on session `name` once it answers. A restarted broca marks the sessions its
+    /// predecessor left with an unsealed run before it serves, then seals them in the background;
+    /// until a session is sealed, its status is refused as transient
+    /// ([`is_pending_crash_orphan_seal`]), which the caller is to retry. Only that refusal is
+    /// retried, within the shared hang guard; any other refusal fails at once.
+    async fn settled_status(&self, name: &str) -> Value {
+        let mut last = None;
+        let settled = broca_test_support::event_timeout(
+            &format!("{name}: run.status past crash-orphan sealing"),
+            async {
+                loop {
+                    match self.raw_request(name, "run.status", json!({})).await {
+                        Ok(status) => return Ok(status),
+                        Err(refusal) if is_pending_crash_orphan_seal(&refusal) => {
+                            last = Some(refusal);
+                        }
+                        Err(refusal) => return Err(refusal),
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+            String::new,
+        )
+        .await;
+        match settled {
+            Ok(Ok(status)) => status,
+            Ok(Err(refusal)) => panic!(
+                "run.status on {name} was refused: {}\n{}",
+                refusal_summary(&refusal),
+                self.diagnostics(name).await
+            ),
+            Err(_) => panic!(
+                "run.status on {name} still refused after {:?}; last refusal: {}\n{}",
+                broca_test_support::EVENT_HANG_GUARD,
+                last.as_ref().map_or("none".into(), refusal_summary),
+                self.diagnostics(name).await
+            ),
         }
     }
 
@@ -1072,24 +1185,28 @@ impl Rig {
     }
 
     async fn finished_run(&self, name: &str, id: &str) -> Vec<FramedRecord> {
-        broca_test_support::wait_until(&format!("terminal for {name}/{id}"), || async {
-            let frames = self.frames(name);
-            let mut in_run = false;
-            let done = frames.iter().any(|f| match &f.record {
-                WalRecord::RunStarted { run_id, .. } => {
-                    in_run = run_id.0 == id;
-                    false
+        broca_test_support::wait_for(
+            &format!("terminal for {name}/{id}"),
+            async {
+                loop {
+                    let frames = self.frames(name);
+                    let mut in_run = false;
+                    let done = frames.iter().any(|f| match &f.record {
+                        WalRecord::RunStarted { run_id, .. } => {
+                            in_run = run_id.0 == id;
+                            false
+                        }
+                        WalRecord::RunFinished { .. } => in_run,
+                        _ => false,
+                    });
+                    if done {
+                        return frames;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                WalRecord::RunFinished { .. } => in_run,
-                _ => false,
-            });
-            if done {
-                return Ok(frames);
-            }
-            Err(broca_test_support::record_kinds(
-                frames.iter().map(|f| &f.record),
-            ))
-        })
+            },
+            || self.log_diagnostics(name),
+        )
         .await
     }
 
@@ -1263,6 +1380,25 @@ impl Rig {
             .metrics
             .unwrap_or(Value::Null)
     }
+}
+
+/// A refusal body's class, code and reason, for a failure message.
+fn refusal_summary(refusal: &Value) -> String {
+    format!(
+        "class={}, code={}, reason={}, detail={}",
+        refusal["detail"]["class"], refusal["code"], refusal["message"], refusal["detail"]
+    )
+}
+
+/// Whether `refusal` is the one a status poll gets while a restarted broca has marked the
+/// session's unsealed run for its crash-orphan seal pass but not yet sealed it: `open_failed`,
+/// classed transient, which the poller is to retry.
+fn is_pending_crash_orphan_seal(refusal: &Value) -> bool {
+    refusal["code"] == "open_failed"
+        && refusal["detail"]["class"] == "transient"
+        && refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("crash-orphan sealing is pending"))
 }
 
 fn spec<'a>(send_id: &'a str, auth: Option<broca_wire::AuthParams>) -> SendSpec<'a> {
@@ -1855,37 +1991,61 @@ async fn queued_conversation_key_survives_drain_and_crash_before_drain() {
         rig.upstream
             .hold
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let client = rig.client(name).await;
-        let active = send(&client, "active", None).await;
+        // Every request this test waits on goes through `expect_ok`/`expect_refused`, so a
+        // refusal is reported with its class, code and reason and the rig's failure dump.
+        let _client = rig.client(name).await;
+        let active = rig
+            .expect_ok(
+                name,
+                "the active send",
+                rig.raw_send(name, "active", json!({})).await,
+            )
+            .await;
+        let active = active["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the active send names its run: {active}"))
+            .to_owned();
         rig.wait_held().await;
         let queued = rig
-            .raw_send(
+            .expect_ok(
                 name,
-                "queued",
-                json!({"conversation_key": "consult:queue:phase"}),
+                "the queued send",
+                rig.raw_send(
+                    name,
+                    "queued",
+                    json!({"conversation_key": "consult:queue:phase"}),
+                )
+                .await,
             )
-            .await
-            .unwrap();
+            .await;
         assert_eq!(queued["state"], "pending");
         let before = rig.wal_bytes(name);
         assert_eq!(
-            rig.raw_send(
+            rig.expect_ok(
                 name,
-                "queued",
-                json!({"conversation_key": "consult:queue:phase"})
+                "the queued send's retry",
+                rig.raw_send(
+                    name,
+                    "queued",
+                    json!({"conversation_key": "consult:queue:phase"})
+                )
+                .await,
             )
-            .await
-            .unwrap(),
+            .await,
             queued
         );
         let reuse = rig
-            .raw_send(
+            .expect_refused(
                 name,
-                "queued",
-                json!({"conversation_key": "consult:other:phase"}),
+                "the queued send id with another key",
+                rig.raw_send(
+                    name,
+                    "queued",
+                    json!({"conversation_key": "consult:other:phase"}),
+                )
+                .await,
             )
-            .await
-            .unwrap_err();
+            .await;
         assert_eq!(reuse["code"], "send_id_reuse");
         assert_eq!(reuse["detail"]["field"], "conversation_key");
         assert_eq!(rig.wal_bytes(name), before);
@@ -1905,6 +2065,13 @@ async fn queued_conversation_key_survives_drain_and_crash_before_drain() {
             continue;
         }
         if crash {
+            // A test-clock build holds the restarted broca's crash-orphan seal pass while this
+            // file exists, so the status poll below deterministically meets the session marked
+            // but not yet sealed: the window a loaded machine can also open.
+            #[cfg(feature = "test-clock")]
+            let seal_gate = rig.state_root.join("test-crash-orphan-seal-gate");
+            #[cfg(feature = "test-clock")]
+            std::fs::write(&seal_gate, b"held").unwrap();
             #[cfg(unix)]
             {
                 let pids = children(rig.daemon.id().unwrap());
@@ -1920,13 +2087,35 @@ async fn queued_conversation_key_survives_drain_and_crash_before_drain() {
             rig.upstream
                 .hold
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            let reopened = rig.client(name).await;
-            reopened.status().await.unwrap();
+            let _reopened = rig.client(name).await;
+            #[cfg(feature = "test-clock")]
+            {
+                let pending = rig
+                    .expect_refused(
+                        name,
+                        "run.status while the seal pass is held",
+                        rig.raw_request(name, "run.status", json!({})).await,
+                    )
+                    .await;
+                assert!(
+                    is_pending_crash_orphan_seal(&pending),
+                    "{}",
+                    refusal_summary(&pending)
+                );
+                std::fs::remove_file(&seal_gate).unwrap();
+            }
+            rig.settled_status(name).await;
         } else {
             rig.upstream
                 .hold
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            client.cancel(&active).await.unwrap();
+            rig.expect_ok(
+                name,
+                "run.cancel of the active run",
+                rig.raw_request(name, "run.cancel", json!({"run_id": active}))
+                    .await,
+            )
+            .await;
         }
         let frames = rig.finished_run(name, id).await;
         rig.assert_affinity(id, "consult:queue:phase");

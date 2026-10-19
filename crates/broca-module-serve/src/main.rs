@@ -646,7 +646,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     let _crash_orphan_seal = {
         let registry = Arc::clone(&registry);
+        #[cfg(feature = "test-clock")]
+        let seal_gate = state_root.join(CRASH_ORPHAN_SEAL_GATE);
         tokio::spawn(async move {
+            #[cfg(feature = "test-clock")]
+            hold_crash_orphan_seal(&seal_gate).await;
             let started = std::time::Instant::now();
             let sweep = registry.seal_marked_crash_orphans(crash_orphans).await;
             // One line per pass, at WARN like the shutdown seal's, and on every boot: a
@@ -955,6 +959,21 @@ async fn mark_crash_orphans(
     })
     .await
     .unwrap_or_default()
+}
+
+/// A debug-only control for real-daemon tests, in the state root: while this file exists, the
+/// boot's crash-orphan seal pass waits before it opens any session. Sessions are marked before
+/// serving begins, so a test that creates the file before killing broca can observe, without
+/// racing, a restarted process whose orphans are marked but not yet sealed. Only a `test-clock`
+/// build reads it.
+#[cfg(feature = "test-clock")]
+const CRASH_ORPHAN_SEAL_GATE: &str = "test-crash-orphan-seal-gate";
+
+#[cfg(feature = "test-clock")]
+async fn hold_crash_orphan_seal(gate: &std::path::Path) {
+    while gate.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 /// The SIGTERM trigger for the seal. Not a backstop: until subc gives modules their own process
