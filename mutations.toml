@@ -1353,7 +1353,7 @@ test_file = "crates/broca-core/src/replay.rs"
 expect_red = ["replay::deferred_tests::late_records_leave_finished_prompt_byte_identical"]
 file = "crates/broca-core/src/replay.rs"
 old = "WalRecord::LateApprovalRecorded { .. }\n            | WalRecord::LateDispatchIntent { .. }\n            | WalRecord::LateResult { .. } => {}"
-new = "WalRecord::LateApprovalRecorded { .. } | WalRecord::LateDispatchIntent { .. } => {}\n            WalRecord::LateResult { result, .. } => { // NON-VACUITY BREAK\n                prompt.push(Message { cache_prefix_blocks: None, role: Role::Tool, content: vec![ContentBlock::ToolResult(result.as_ref().clone())], origin: None, ordinal: None });\n            }"
+new = "WalRecord::LateApprovalRecorded { .. } | WalRecord::LateDispatchIntent { .. } => {}\n            WalRecord::LateResult { result, .. } => { // NON-VACUITY BREAK\n                prompt.push(Message { cache_prefix_blocks: None, role: Role::Tool, content: vec![ContentBlock::ToolResult(result.as_ref().clone())], origin: None, ordinal: None, tags: Default::default() });\n            }"
 
 # This proof checks the following behavior: before making another model call, the reader refuses a
 # Prepared batch paused by a restart.
@@ -12355,7 +12355,7 @@ old = '''if settled.is_some_and(|answer| answer.decision == ConsentDecision::App
         report('''
 new = '''if settled.is_some_and(|answer| answer.decision == ConsentDecision::Approved) {
         let WalRecord::ToolCallDeferred { call_id, .. } = prepared else { unreachable!() };
-        durable(WalRecord::ApprovalRecorded { call_key: key.into(), call_id: call_id.clone(), elicitation_id: Some(recovered.id.clone()), decision: broca_wal::DeferredDecision::Approved, approval_digest: None, closing_result: None }).await?; // NON-VACUITY BREAK
+        durable(WalRecord::ApprovalRecorded { call_key: key.into(), call_id: call_id.clone(), elicitation_id: Some(recovered.id.clone()), decision: broca_wal::DeferredDecision::Approved, approval_digest: None, closing_result: None, tags: None }).await?; // NON-VACUITY BREAK
         report('''
 
 [[control]]

@@ -234,10 +234,17 @@ async fn budget_finalize_args_cut_closes_steer_inbox_before_terminal() {
 
 #[tokio::test]
 async fn size_refusal_closes_steer_inbox_before_terminal() {
+    let mut started = crate::retention::tests::started("r1", None);
+    let WalRecord::RunStarted { tags, .. } = &mut started else {
+        unreachable!();
+    };
+    *tags = Some(std::sync::Arc::new(vec![
+        broca_protocol::tags::MessageTags::new(vec![1]),
+    ]));
     let records = Arc::new(Mutex::new(vec![FramedRecord {
         seq: 1,
         fence: 1,
-        record: crate::retention::tests::started("r1", None),
+        record: started,
     }]));
     let gate = Arc::new(TerminalGate::default());
     // No append cap is installed: a refusal to write cannot masquerade as inbox closure.
@@ -251,6 +258,12 @@ async fn size_refusal_closes_steer_inbox_before_terminal() {
         )
         .unwrap(),
     );
+    // Keep the fixture's existing tagged run so an admitted steer can be written while sync waits.
+    let lineage_tags = {
+        let records = records.lock().unwrap();
+        crate::tags::lineage_tags(records.iter().map(|frame| &frame.record))
+    };
+    writer.seed_lineage_tags(Some(lineage_tags));
     let inbox = crate::SteerInbox::new();
     let running = {
         let writer = writer.clone();
@@ -274,8 +287,22 @@ async fn size_refusal_closes_steer_inbox_before_terminal() {
         })
     };
     gate.wait().await;
-    let delivered = try_late_steer(&inbox, &writer);
+    // Keep a broken open inbox from blocking this test behind the terminal's WAL sync.
+    let inbox_for_delivery = inbox.clone();
+    let writer_for_delivery = writer.clone();
+    let mut delivery = tokio::task::spawn_blocking(move || {
+        try_late_steer(&inbox_for_delivery, &writer_for_delivery)
+    });
+    let delivered =
+        match tokio::time::timeout(std::time::Duration::from_secs(1), &mut delivery).await {
+            Ok(result) => result,
+            Err(_) => {
+                gate.release();
+                delivery.await
+            }
+        };
     gate.release();
+    let delivered = delivered.unwrap();
     assert_eq!(
         running.await.unwrap().unwrap().reason,
         RunFinishReason::Error
