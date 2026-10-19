@@ -72,6 +72,23 @@ new = '''                let records = self.read_durable_wal(key).await?.0;
                 let latest = records.iter().rev().find_map'''
 
 [[control]]
+id = "module-indexed-status-keeps-run-usage"
+guards = "Live and closed indexed-terminal answers retain completed-step usage from authoritative WAL reconciliation"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/closed_poll_tests.rs"
+expect_red = ["actor::closed_poll_tests::closed_one_shot_polls_leave_actor_closed_and_match_live_answers"]
+expect_message = "indexed status must retain completed-step usage from the WAL"
+file = "crates/broca-module/src/actor.rs"
+old = '''        run_usage: reconciled
+            .as_ref()
+            .map(|state| state.run_usage.clone())
+            .unwrap_or_default(),'''
+new = '''        run_usage: Default::default(), // NON-VACUITY BREAK: discard the reconciled run usage at the shared index boundary.'''
+
+[[control]]
 id = "run-usage-unreported-only-when-all-absent"
 guards = "A partially reported completed step is reported, even when fresh input is absent or the reported output is zero"
 runner = "cargo"

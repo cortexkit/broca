@@ -257,7 +257,8 @@ async fn queued_lower_cap_stops_the_active_crossing_step_before_tools() {
 
 #[tokio::test]
 async fn active_status_and_result_count_only_completed_steps() {
-    let mut rig = Rig::start("active-run-usage").await;
+    let mut rig =
+        Rig::start_with_idle_ttl("active-run-usage", std::time::Duration::from_millis(100)).await;
     rig.script.hold_model(true);
     rig.script.hold_tool(true);
     rig.script
@@ -307,5 +308,22 @@ async fn active_status_and_result_count_only_completed_steps() {
     assert_eq!(result(&status)["usage"], result(&answer)["usage"]);
     assert_eq!(result(&status)["usage"]["steps"], 2);
     assert_eq!(result(&status)["usage"]["input_tokens"], 12);
+    let final_usage = result(&status)["usage"].clone();
+    rig.wait_closed().await;
+    for method in ["run.status", "run.result"] {
+        let reply = rig
+            .request(7, json!({"method":method,"params":{"run_id":run}}))
+            .await;
+        assert_eq!(
+            result(&reply)["usage"],
+            final_usage,
+            "closed {method} must retain the live terminal's usage"
+        );
+        assert_eq!(
+            rig.registry().slot_counts().open,
+            0,
+            "a usage read must not reopen the closed actor"
+        );
+    }
     rig.finish().await;
 }

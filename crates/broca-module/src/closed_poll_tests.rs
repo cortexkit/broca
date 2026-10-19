@@ -204,6 +204,17 @@ async fn closed_one_shot_polls_leave_actor_closed_and_match_live_answers() {
             assert!(registry.slot_state(&key).is_none());
         }
         let result: serde_json::Value = serde_json::from_slice(&closed[2]).unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&closed[1]).unwrap();
+        assert_eq!(status["usage"], result["usage"]);
+        assert_eq!(
+            result["usage"]["steps"], 1,
+            "indexed status must retain completed-step usage from the WAL"
+        );
+        assert_eq!(result["usage"]["unreported_steps"], 1);
+        assert_eq!(result["usage"]["by_model"][0]["steps"], 1);
+        assert_eq!(result["usage"]["by_model"][0]["unreported_steps"], 1);
+        assert!(result["usage"].get("input_tokens").is_none());
+        assert!(result["usage"].get("output_tokens").is_none());
         assert_eq!(
             result["state"],
             if reason == RunFinishReason::Completed {
