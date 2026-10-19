@@ -718,8 +718,20 @@ One in-process **lineage actor** per open session with states **`Opening | Open 
 Closing | Closed`**. ALL `session.send`/`retract`/`subscribe` for a lineage go through
 its actor; a teardown cannot start while an op holds the actor. Lease lifetime: the actor
 holds the lease while there are **subscribers OR pending work OR within a short idle
-TTL**; otherwise it transitions `Closing` → releases the lease → `Closed`; the next op
-re-opens (`Opening` → reacquire → replay). Races handled by the actor:
+TTL**; otherwise it transitions `Closing` → releases the lease → `Closed`. A send,
+cancel, retract or subscription re-opens it (`Opening` → reacquire → replay).
+Finished one-shots can be polled without reopening their actor. Session status
+reads a closed live WAL only when it is at most 1 MiB; larger, archived or
+size-unknown logs use the ordinary actor path so repeated polls do not replay
+the entire history. There is no reverse WAL reader to locate the latest episode
+without a seek anchor. Run-keyed status/result and transcript reads retain their
+durable index/WAL paths. Unproven history is refused rather than guessed, and a
+nonterminal index row cannot override a WAL terminal. While crash-orphan sealing
+is pending, an unsealed run is retryable; afterward a status poll can open its
+coordinator and seal an unmarked orphan as interrupted rather than strand it.
+Durable queued work also wakes the coordinator, even when the latest run has
+already finished, so a crash cannot leave the FIFO permanently idle.
+Races handled by the actor:
 - A send arriving as the actor is `Closing` → it waits/re-opens, never races a half-torn
   state.
 - Two concurrent re-opens of one lineage → the actor registry admits exactly one

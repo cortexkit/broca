@@ -93,6 +93,9 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
 
 #[async_trait]
 impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOpener<L, W> {
+    fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
+        self.run_index.clone()
+    }
     fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
         self.wal_store
             .check_move(key, write)

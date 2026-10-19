@@ -144,6 +144,12 @@ pub trait WalStore: Send + Sync {
         )))
     }
 
+    /// Size of the live log without decoding records. Unknown or archived logs return
+    /// `None`, so status can use its existing actor path instead of an unbounded read.
+    fn live_wal_bytes(&self, _session: &BindIdentity) -> Result<Option<u64>, WalError> {
+        Ok(None)
+    }
+
     /// The session's first durable user message (the first user message of the first
     /// `RunStarted` or `Steered` record that adds one), with the number of WAL bytes read to
     /// find it. A file store reads only as far as that record; this default decodes the whole
@@ -1396,6 +1402,16 @@ impl WalStore for FileWalStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(WalError::Io(error)),
         }
+    }
+
+    fn live_wal_bytes(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
+        self.resolve_live_path(session)?
+            .map(|path| {
+                std::fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .map_err(WalError::Io)
+            })
+            .transpose()
     }
 
     fn read_records(

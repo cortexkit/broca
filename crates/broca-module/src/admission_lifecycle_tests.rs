@@ -67,6 +67,7 @@ async fn expiry_read_failure_joins_nonrestart_admission_before_next_attempt() {
         leases, wal.clone(), executor.clone(),
     ).with_idle_ttl(Duration::from_secs(60))));
     registry.set_retention_service(retention.clone());
+    registry.actor_for(&key).await.unwrap();
     registry.route_status(&key).await.unwrap();
     let send = tokio::spawn({
         let registry = registry.clone(); let key = key.clone();

@@ -23,6 +23,9 @@ use tokio::sync::{broadcast, mpsc};
 const CLOSE_REOPEN_MAX_RETRIES: usize = 3;
 const CLOSE_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 const SESSION_CACHE_SESSIONS: usize = 4096;
+// There is no reverse WAL reader. Keep small one-shot observations lease-free,
+// but let a large session's coordinator amortize recovery across later polls.
+pub(crate) const STATUS_WAL_READ_MAX_BYTES: u64 = 1024 * 1024;
 
 /// FIFO cache for session facts that can be recomputed on a miss. Updating a fact does not
 /// refresh its insertion age, and targeted removal also releases its eviction bookkeeping.
@@ -385,6 +388,10 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    /// Read-only access to the derived run index, without acquiring a session writer.
+    fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
+        None
+    }
     fn check_move(&self, _key: &LineageKey, _write: bool) -> Result<(), OpenError> {
         Ok(())
     }
@@ -1999,29 +2006,52 @@ impl LineageRegistry {
         }
         use crate::actor::LineageCmd;
         loop {
-            let closed = !self.inner.slots.lock().unwrap().contains_key(key);
-            if closed && self.inner.reader.is_some() {
+            let live = {
+                let slots = self.inner.slots.lock().unwrap();
+                match slots.get(key) {
+                    Some(Entry::Open { handle, .. }) => Some(handle.clone()),
+                    _ => None,
+                }
+            };
+            let Some(handle) = live else {
+                let indexed = match self.inner.opener.run_index_reader() {
+                    Some(index) => {
+                        let id = run_id.0.clone();
+                        spawn_blocking(JobKind::StoreRead, move || index.lookup_run(&id))
+                            .await
+                            .map_err(|error| {
+                                OpenError::Open(format!("run-index lookup task failed: {error}"))
+                            })?
+                            .map_err(|error| {
+                                OpenError::Open(format!("run-index lookup failed: {error}"))
+                            })?
+                            .filter(|row| row.session == *key)
+                    }
+                    None => None,
+                };
                 let records = self.read_durable_wal(key).await?.0;
-                let state = broca_core::reconcile_run_state(
+                let reconciled = broca_core::reconcile_run_state(
                     records.iter().map(|frame| &frame.record),
                     &run_id.0,
                 );
-                if matches!(
-                    self.check_move(key, true),
-                    Err(OpenError::SessionMoving { .. })
-                ) {
-                    return Ok((state, Some(records)));
-                }
-                if let Some(state) = state {
-                    if state.state.is_terminal() || state.state == broca_core::RunIndexState::Paused
-                    {
-                        return Ok((Some(state), Some(records)));
+                let state = crate::actor::indexed_run_state(indexed, reconciled)
+                    .map_err(OpenError::Open)?;
+                if state
+                    .as_ref()
+                    .is_some_and(|state| state.state == broca_core::RunIndexState::Active)
+                {
+                    if self.crash_orphan_pending(key) {
+                        return Err(OpenError::Classified {
+                            reason: "could not tell run status: crash-orphan sealing is pending"
+                                .into(),
+                            class: broca_protocol::ErrorClass::Transient,
+                        });
                     }
+                    self.recover_status_orphan(key, &run_id).await?;
+                    continue;
                 }
-                // Missing or nonterminal WAL state is not proof of an unknown run: the index
-                // may retain a terminal even when its WAL is unavailable. Preserve that fallback.
-            }
-            let handle = self.actor_for(key).await?;
+                return Ok((state, Some(records)));
+            };
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::RunState {
                 run_id: run_id.clone(),
@@ -2988,9 +3018,70 @@ impl LineageRegistry {
         *self.inner.status_open_probe.lock().unwrap() = Some(probe);
     }
 
-    /// Existing actors answer status in the same command loop that admits new runs.
-    /// An unopened session is classified under its lease from the first RunStarted;
-    /// ordinary status does not replay the entire WAL before creating its actor.
+    fn crash_orphan_pending(&self, key: &LineageKey) -> bool {
+        self.inner
+            .crash_orphan_marks
+            .lock()
+            .unwrap()
+            .contains_key(key)
+    }
+
+    async fn recover_status_orphan(
+        &self,
+        key: &LineageKey,
+        run_id: &RunId,
+    ) -> Result<(), OpenError> {
+        // A poll may discover an orphan the boot inventory missed. Install its seal
+        // mark before any opener can publish a generation; otherwise startup can resume it.
+        let marked = {
+            let slots = self.inner.slots.lock().unwrap();
+            if slots.contains_key(key) {
+                false
+            } else {
+                self.inner
+                    .crash_orphan_marks
+                    .lock()
+                    .unwrap()
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(run_id.clone())
+            }
+        };
+        let opened = self.actor_for_mode(key, None, None, true).await;
+        if opened.is_err() && marked {
+            let mut marks = self.inner.crash_orphan_marks.lock().unwrap();
+            if let Some(runs) = marks.get_mut(key) {
+                runs.remove(run_id);
+                if runs.is_empty() {
+                    marks.remove(key);
+                }
+            }
+        }
+        opened.map(|_| ())
+    }
+
+    async fn status_needs_actor(&self, key: &LineageKey) -> Result<bool, OpenError> {
+        let Some(reader) = &self.inner.reader else {
+            return Ok(true);
+        };
+        let wal = reader.wal_store.clone();
+        let session = key.clone();
+        spawn_blocking(JobKind::WalRead, move || {
+            let bytes = wal.live_wal_bytes(&session)?;
+            Ok::<_, broca_wal::WalError>(match bytes {
+                Some(bytes) => bytes > STATUS_WAL_READ_MAX_BYTES,
+                None => wal.wal_present(&session) != Some(false),
+            })
+        })
+        .await
+        .map_err(|error| OpenError::Open(format!("status WAL metadata task failed: {error}")))?
+        .map_err(|error| {
+            OpenError::from_wal_read(format!("status WAL metadata failed: {error}"), &error)
+        })
+    }
+
+    /// Small closed logs can be observed without a writer. Large or unknown logs
+    /// retain the actor path because a WAL range without a seek anchor decodes from zero.
     pub async fn route_status(
         &self,
         key: &LineageKey,
@@ -3004,7 +3095,92 @@ impl LineageRegistry {
         }
         use crate::actor::{LineageCmd, LineageStatus};
         loop {
-            let handle = self.actor_for_mode(key, None, None, true).await?;
+            let live = {
+                let slots = self.inner.slots.lock().unwrap();
+                match slots.get(key) {
+                    Some(Entry::Open { handle, .. }) => Some(handle.clone()),
+                    _ => None,
+                }
+            };
+            let Some(handle) = live else {
+                #[cfg(all(test, feature = "test-clock"))]
+                if let Some(probe) = self.inner.status_open_probe.lock().unwrap().take() {
+                    probe();
+                }
+                if self.status_needs_actor(key).await? {
+                    if self.crash_orphan_pending(key) {
+                        return Err(OpenError::Classified {
+                            reason:
+                                "could not tell session status: crash-orphan sealing is pending"
+                                    .into(),
+                            class: broca_protocol::ErrorClass::Transient,
+                        });
+                    }
+                    self.actor_for_mode(key, None, None, true).await?;
+                    continue;
+                }
+                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map(|frame| match &frame.record {
+                    broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id),
+                    _ => None,
+                });
+                // A crash may leave durable queued work after an already-finished run.
+                // Observation must still wake its coordinator so that FIFO can drain.
+                let pending_work = records
+                    .iter()
+                    .any(|frame| matches!(frame.record, broca_wal::WalRecord::Queued { .. }))
+                    && !broca_core::pending_submissions(
+                        &records
+                            .iter()
+                            .map(|frame| frame.record.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .is_empty();
+                if let (Some(run_id), Some(index)) = (latest, self.inner.opener.run_index_reader())
+                {
+                    let session = key.clone();
+                    let id = run_id.0.clone();
+                    let terminal = spawn_blocking(JobKind::StoreRead, move || {
+                        index.lookup_run(&id).map(|row| {
+                            row.is_some_and(|row| row.session == session && row.state.is_terminal())
+                        })
+                    })
+                    .await
+                    .map_err(|error| {
+                        OpenError::Open(format!("run-index lookup task failed: {error}"))
+                    })?
+                    .map_err(|error| {
+                        OpenError::Open(format!("run-index lookup failed: {error}"))
+                    })?;
+                    if terminal && !pending_work {
+                        return Ok(LineageStatus::Idle);
+                    }
+                }
+                if latest.is_some_and(|run_id| {
+                    broca_core::reconcile_run_state(
+                        records.iter().map(|frame| &frame.record),
+                        &run_id.0,
+                    )
+                    .is_some_and(|state| state.state == broca_core::RunIndexState::Active)
+                }) {
+                    if self.crash_orphan_pending(key) {
+                        return Err(OpenError::Classified {
+                            reason:
+                                "could not tell session status: crash-orphan sealing is pending"
+                                    .into(),
+                            class: broca_protocol::ErrorClass::Transient,
+                        });
+                    }
+                    self.recover_status_orphan(key, latest.expect("active run has a start"))
+                        .await?;
+                    continue;
+                }
+                if pending_work {
+                    self.actor_for_mode(key, None, None, true).await?;
+                    continue;
+                }
+                return Ok(LineageStatus::Idle);
+            };
             let (reply, rx) = tokio::sync::oneshot::channel();
             if handle.send(LineageCmd::Status { reply }).await.is_err() {
                 continue;
@@ -4374,7 +4550,9 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("build test runtime");
-            let result = runtime.block_on(registry_for_op.route_status(&session_for_op));
+            let result = runtime
+                .block_on(registry_for_op.actor_for(&session_for_op))
+                .map(|_| ());
             let _ = result_tx.send(result);
         });
 

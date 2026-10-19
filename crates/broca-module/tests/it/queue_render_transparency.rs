@@ -718,6 +718,7 @@ async fn crash_recovery_preserves_stop_before_tool_dispatch() {
     drop(wal);
 
     // Opening the actor first recovers the unfinished durable episode before serving status.
+    rig.registry.actor_for(&key).await.unwrap();
     let _ = rig.registry.route_status(&key).await.unwrap();
 
     let mut terminal_reason = None;

@@ -805,6 +805,7 @@ async fn crash_orphan_pass_skips_a_session_another_process_holds() {
     assert_eq!(f.index_state(), RunIndexState::Active);
     drop(other_process);
     // The mark is dropped with the skip, so a later open does not act on a stale decision.
+    f.registry.actor_for(&f.key).await.unwrap();
     assert_eq!(
         f.registry.route_status(&f.key).await.unwrap(),
         LineageStatus::Idle

@@ -413,6 +413,7 @@ async fn shutdown_indeterminate_status_distinguishes_missing_and_matching_result
                 poll_gate: None,
             }),
         )));
+        reopened.actor_for(&f.key).await.unwrap();
         let status = reopened
             .route_run_state(&f.key, RunId("shutdown-run".into()))
             .await

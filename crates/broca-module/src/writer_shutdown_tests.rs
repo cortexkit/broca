@@ -136,6 +136,7 @@ impl Fixture {
     }
 
     async fn open_dirty(&self, key: &BindIdentity) {
+        self.registry.actor_for(key).await.unwrap();
         assert_eq!(
             self.registry.route_status(key).await.unwrap(),
             LineageStatus::Idle
@@ -228,6 +229,7 @@ async fn recovered_idle_writer_failure_does_not_taint_later_stop() {
     f.fail_idle_close(&f.key).await;
     let failed_at = f.registry.seal_failures()[0].timestamp;
     f.opener.fail.store(false, Ordering::Release);
+    f.registry.actor_for(&f.key).await.unwrap();
     assert_eq!(
         f.registry.route_status(&f.key).await.unwrap(),
         LineageStatus::Idle
@@ -287,6 +289,7 @@ async fn recovery_clears_only_the_recovered_session_debt() {
     f.opener.fail.store(false, Ordering::Release);
     f.fail_idle_close(&other).await;
     f.opener.fail.store(false, Ordering::Release);
+    f.registry.actor_for(&f.key).await.unwrap();
     assert_eq!(
         f.registry.route_status(&f.key).await.unwrap(),
         LineageStatus::Idle

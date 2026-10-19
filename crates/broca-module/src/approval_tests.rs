@@ -490,6 +490,7 @@ async fn unmarked_running_approval_honours_on_restart() {
     for resume in [false, true] {
         let rig = Rig::new(true);
         let key = rig.seed(resume, false, false, false);
+        rig.registry.actor_for(&rig.key).await.unwrap();
         rig.registry.route_status(&rig.key).await.unwrap();
         if resume {
             rig.eventually(|| {
@@ -572,6 +573,7 @@ async fn withdrawal_refiles_same_key_retries_and_stops_for_each_terminal_class()
                 }
             }),
         ]);
+        rig.registry.actor_for(&rig.key).await.unwrap();
         rig.registry.route_status(&rig.key).await.unwrap();
         rig.eventually(|| !rig.row().withdrawals_owed).await;
         assert_eq!(
@@ -585,6 +587,7 @@ async fn withdrawal_refiles_same_key_retries_and_stops_for_each_terminal_class()
             .iter()
             .all(|requested| requested == &key));
         assert_eq!(rig.frames().iter().filter(|frame| matches!(&frame.record, WalRecord::QuestionWithdrawalAcknowledged { call_key, .. } if call_key == &key)).count(), 1);
+        rig.registry.actor_for(&rig.key).await.unwrap();
         rig.registry.route_status(&rig.key).await.unwrap();
         assert_eq!(questions.withdrawals.lock().unwrap().len(), 2);
         rig.stop().await;
@@ -595,6 +598,7 @@ async fn withdrawal_refiles_same_key_retries_and_stops_for_each_terminal_class()
 async fn approved_closed_call_has_no_debt_and_sends_no_withdrawal() {
     let rig = Rig::new(true);
     rig.seed(true, false, true, true);
+    rig.registry.actor_for(&rig.key).await.unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
     assert!(!rig.row().withdrawals_owed);
     assert!(rig
@@ -670,6 +674,7 @@ async fn expired_withdrawal_is_acknowledged_without_any_route_op() {
         .index_run_terminal("r", RunIndexState::Interrupted, None, None, 0)
         .unwrap();
     rig.store.index_run_withdrawals_owed("r", true).unwrap();
+    rig.registry.actor_for(&rig.key).await.unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
     rig.eventually(|| !rig.row().withdrawals_owed).await;
     let questions = rig.executor.questions.as_ref().unwrap();
@@ -713,6 +718,7 @@ async fn pending_status_uses_call_states_and_the_latest_filing_marker() {
     use crate::serve::ServeHandler;
     let rig = Rig::new(true);
     let key = rig.seed(true, false, false, false);
+    rig.registry.actor_for(&rig.key).await.unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
     // A complete marker frame on disk may still be awaiting fsync. Wait on the served,
     // durable status instead of treating a raw WAL read as proof that filing was synced.
@@ -1244,6 +1250,7 @@ async fn reader_unmarked_running_prepared_calls_close_regardless_of_restart_poli
         for approved in [false, true] {
             let rig = Rig::new(false);
             rig.seed(resume, false, approved, false);
+            rig.registry.actor_for(&rig.key).await.unwrap();
             let status = broca_test_support::event_timeout(
                 "reader_unmarked_running_prepared_calls_close_regardless_of_restart_policy",
                 rig.registry.route_status(&rig.key),
@@ -1260,7 +1267,7 @@ async fn reader_unmarked_running_prepared_calls_close_regardless_of_restart_poli
             rig.stop().await;
             assert!(
                 completed,
-                "reader open must seal rather than retry a refused Prepared resume"
+                "explicit actor open must seal rather than retry a refused Prepared resume"
             );
             assert_eq!(rig.row().state, RunIndexState::Interrupted);
             assert_eq!(rig.row().withdrawals_owed, !approved);
@@ -1389,6 +1396,7 @@ async fn active_approval_status_polls_do_not_read_the_wal() {
     let rig = Rig::new(true);
     let key = rig.seed(true, false, false, false);
     let questions = rig.executor.questions.as_ref().unwrap();
+    rig.registry.actor_for(&rig.key).await.unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
     broca_test_support::event_timeout(
         "active approval await entered",
@@ -1441,6 +1449,7 @@ async fn unavailable_approval_await_closes_a_previously_reported_pending_call() 
     let rig = Rig::new(true);
     let key = rig.seed(true, false, false, false);
     let questions = rig.executor.questions.as_ref().unwrap();
+    rig.registry.actor_for(&rig.key).await.unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
     broca_test_support::event_timeout(
         "approval await entered before refusal",
@@ -1903,6 +1912,7 @@ async fn reopen_clears_acknowledged_discovery_without_more_question_ops() {
         .index_run_terminal("r", RunIndexState::Interrupted, None, None, 0)
         .unwrap();
     rig.store.index_run_withdrawals_owed("r", true).unwrap();
+    rig.registry.actor_for(&rig.key).await.unwrap();
     rig.registry.route_status(&rig.key).await.unwrap();
     let cleared = broca_test_support::event_timeout(
         "reopen_clears_acknowledged_discovery_without_more_question_ops",

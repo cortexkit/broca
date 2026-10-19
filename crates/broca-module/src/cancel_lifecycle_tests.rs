@@ -81,6 +81,7 @@ async fn cancel_lookup_failure_is_error_but_healthy_absence_is_not_active() {
         Arc::new(FileLeaseStore::new(dir.join("leases"))), wal.clone(),
         Arc::new(QuickDone { close_count: Arc::new(AtomicUsize::new(0)) }),
     ).with_idle_ttl(Duration::from_secs(60))));
+    registry.actor_for(&key).await.unwrap();
     registry.route_status(&key).await.unwrap();
     wal.fail_next_read();
     assert!(matches!(crate::serve::ServeHandler::cancel(&registry, &key, RunId("missing".into())).await,

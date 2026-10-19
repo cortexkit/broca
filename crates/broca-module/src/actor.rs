@@ -508,6 +508,76 @@ pub enum LineageStatus {
     Closing,
 }
 
+/// Terminal index rows retain metadata even after WAL archival. Nonterminal rows
+/// may lag a durable finish, so only the WAL can substantiate their state.
+pub(crate) fn indexed_run_state(
+    indexed: Option<RunIndexRow>,
+    reconciled: Option<ReconciledRunState>,
+) -> Result<Option<ReconciledRunState>, String> {
+    let Some(row) = indexed.filter(|row| row.state.is_terminal()) else {
+        return Ok(reconciled);
+    };
+    if row.state == RunIndexState::BudgetExhausted
+        && reconciled
+            .as_ref()
+            .and_then(|state| state.budget_detail.as_ref())
+            .is_none()
+    {
+        return Err("budget_exhausted detail is unavailable from the durable WAL".into());
+    }
+    // Interrupted and legacy rows do not store enough terminal metadata; the WAL
+    // also carries steer receipts, error causes and structured-output results.
+    let use_index_metadata = row.usage.is_some() && row.state != RunIndexState::Interrupted;
+    let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
+    Ok(Some(ReconciledRunState {
+        budget_detail: reconciled
+            .as_ref()
+            .and_then(|state| state.budget_detail.clone()),
+        structured_output: reconciled
+            .as_ref()
+            .and_then(|state| state.structured_output.clone()),
+        live_step: None,
+        state: row.state,
+        undelivered_steers: reconciled
+            .as_ref()
+            .and_then(|state| state.undelivered_steers.clone()),
+        final_step_finish_reason: if use_index_metadata {
+            row.final_step_finish_reason
+        } else {
+            reconciled
+                .as_ref()
+                .and_then(|state| state.final_step_finish_reason)
+        },
+        indeterminate_tool_calls: if use_index_metadata {
+            None
+        } else {
+            reconciled
+                .as_ref()
+                .and_then(|state| state.indeterminate_tool_calls.clone())
+        },
+        usage: if use_index_metadata {
+            row.usage
+        } else {
+            reconciled.as_ref().and_then(|state| state.usage)
+        },
+        retries_used: if use_index_metadata {
+            row.retries_used
+        } else {
+            reconciled.as_ref().map_or(0, |state| state.retries_used)
+        },
+        title: row
+            .title
+            .or_else(|| reconciled.as_ref().and_then(|state| state.title.clone())),
+        error: if use_wal_error {
+            reconciled.and_then(|state| state.error)
+        } else {
+            None
+        },
+        pause_reason: None,
+        auth_selection: None,
+    }))
+}
+
 /// Posts a `RunFinished` to the actor when the run task ends — INCLUDING on a panic
 /// (unwind). The normal path calls `finish(result)`, which sends the real result and
 /// disarms the guard; if the task panics before `finish`, `Drop` fires and sends a
@@ -5369,111 +5439,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Tier 2/3: consult the index (propagate a lookup ERROR rather than mask it).
         let indexed = self.lookup_indexed_run(run_id).await?;
 
-        match indexed {
-            // Tier 2: a terminal index row is trustworthy (terminals never go stale-forward).
-            Some(row) if row.state.is_terminal() => {
-                if row.usage.is_some() && row.state != RunIndexState::Interrupted {
-                    // The index omits steer delivery and error causes. Derive those from
-                    // durable WAL once per terminal, retaining the index's other metadata.
-                    // Propagate read failures rather than reporting an unread cause or steer
-                    // as absent; a genuinely absent WAL still permits the index fallback.
-                    let reconciled = self.terminal_wal_state(run_id).await?;
-                    if row.state == RunIndexState::BudgetExhausted
-                        && reconciled
-                            .as_ref()
-                            .and_then(|state| state.budget_detail.clone())
-                            .is_none()
-                    {
-                        return Err(
-                            "budget_exhausted detail is unavailable from the durable WAL".into(),
-                        );
-                    }
-                    let undelivered_steers = reconciled
-                        .as_ref()
-                        .and_then(|state| state.undelivered_steers.clone());
-                    // A row written before the title column existed, or by a resume that wrote no
-                    // `RunStarted`, has none; the WAL record already read here is the authority.
-                    let title = row
-                        .title
-                        .clone()
-                        .or_else(|| reconciled.as_ref().and_then(|state| state.title.clone()));
-                    let budget_detail = reconciled
-                        .as_ref()
-                        .and_then(|state| state.budget_detail.clone());
-                    let structured_output = reconciled
-                        .as_ref()
-                        .and_then(|state| state.structured_output.clone());
-                    let error = if row.state == RunIndexState::Error {
-                        reconciled.and_then(|state| state.error)
-                    } else {
-                        None
-                    };
-                    return Ok(Some(ReconciledRunState {
-                        budget_detail,
-                        structured_output,
-                        live_step: None,
-                        state: row.state,
-                        undelivered_steers,
-                        final_step_finish_reason: row.final_step_finish_reason,
-                        indeterminate_tool_calls: None,
-                        usage: row.usage,
-                        retries_used: row.retries_used,
-                        error,
-                        pause_reason: None,
-                        auth_selection: None,
-                        title,
-                    }));
-                }
-                // Interrupted rows cannot answer which calls are ambiguous, and legacy or
-                // synthetic rows can lack terminal metadata. Reconcile those rows from the WAL.
-                let reconciled = self.terminal_wal_state(run_id).await?;
-                if row.state == RunIndexState::BudgetExhausted
-                    && reconciled
-                        .as_ref()
-                        .and_then(|state| state.budget_detail.clone())
-                        .is_none()
-                {
-                    return Err(
-                        "budget_exhausted detail is unavailable from the durable WAL".into(),
-                    );
-                }
-                Ok(Some(ReconciledRunState {
-                    budget_detail: reconciled
-                        .as_ref()
-                        .and_then(|state| state.budget_detail.clone()),
-                    structured_output: reconciled
-                        .as_ref()
-                        .and_then(|state| state.structured_output.clone()),
-                    live_step: None,
-                    state: row.state,
-                    undelivered_steers: reconciled
-                        .as_ref()
-                        .and_then(|state| state.undelivered_steers.clone()),
-                    final_step_finish_reason: reconciled
-                        .as_ref()
-                        .and_then(|state| state.final_step_finish_reason),
-                    indeterminate_tool_calls: reconciled
-                        .as_ref()
-                        .and_then(|state| state.indeterminate_tool_calls.clone()),
-                    usage: reconciled.as_ref().and_then(|state| state.usage),
-                    retries_used: reconciled.as_ref().map_or(0, |state| state.retries_used),
-                    title: row
-                        .title
-                        .clone()
-                        .or_else(|| reconciled.as_ref().and_then(|state| state.title.clone())),
-                    // A terminal row is never paused, so no pause reason applies here.
-                    error: reconciled.and_then(|state| state.error),
-                    pause_reason: None,
-                    auth_selection: None,
-                }))
-            }
-            // Tier 3a: the index says Active/Paused but NO live actor backs it (this actor
-            // isn't running it) → reconcile from the WAL.
-            Some(_) => self.reconcile_from_wal(run_id).await,
-            // Tier 3b: index miss → reconcile from the WAL (the run may predate the index,
-            // or the index write was lost).
-            None => self.reconcile_from_wal(run_id).await,
-        }
+        let reconciled = if indexed.as_ref().is_some_and(|row| row.state.is_terminal()) {
+            self.terminal_wal_state(run_id).await?
+        } else {
+            self.reconcile_from_wal(run_id).await?
+        };
+        indexed_run_state(indexed, reconciled)
     }
 
     async fn terminal_wal_state(
@@ -9690,6 +9661,10 @@ mod tests {
         let registry = LineageRegistry::new(Arc::new(opener));
 
         registry
+            .actor_for(&key)
+            .await
+            .expect("explicitly reopen the finished lineage");
+        registry
             .route_status(&key)
             .await
             .expect("opening the finished lineage succeeds");
@@ -9767,6 +9742,7 @@ mod tests {
         .with_idle_ttl(Duration::from_secs(30));
         let registry = LineageRegistry::new(Arc::new(opener));
 
+        registry.actor_for(&key).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), registry.route_status(&key))
             .await
             .expect("best-effort export failure must not hold startup recovery for retries")
@@ -10030,6 +10006,7 @@ mod tests {
 
         // Liveness wait, not a latency assertion; see the Windows CI note on the
         // slow-live-export test for why 1s bounds flake there.
+        registry.actor_for(&key).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), registry.route_status(&key))
             .await
             .expect("one transient recovery read must retry, then serve the queued command")
@@ -10511,6 +10488,10 @@ mod import_idempotency_tests {
         )
         .with_run_index(store);
         let registry = LineageRegistry::new(Arc::new(opener));
+        registry
+            .actor_for(&key)
+            .await
+            .expect("explicitly open actor");
         assert_eq!(
             registry.route_status(&key).await.expect("open actor"),
             LineageStatus::Idle
@@ -10567,6 +10548,10 @@ mod import_idempotency_tests {
         .with_materialized_store(store);
         let registry = LineageRegistry::new(Arc::new(opener));
 
+        registry
+            .actor_for(&key)
+            .await
+            .expect("explicitly open idle actor");
         assert_eq!(
             registry.route_status(&key).await.expect("open idle actor"),
             LineageStatus::Idle
@@ -11014,3 +10999,7 @@ mod agent_run_scope_tests;
 #[cfg(test)]
 #[path = "wal_proof_tests.rs"]
 mod wal_proof_tests;
+
+#[cfg(test)]
+#[path = "closed_poll_tests.rs"]
+mod closed_poll_tests;

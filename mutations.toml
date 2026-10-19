@@ -9,6 +9,69 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "module-status-wakes-durable-queued-work"
+guards = "A status poll wakes durable queued work left behind a terminal instead of stranding FIFO after a crash"
+runner = "cargo"
+select = "expected"
+package = "broca-crash-harness"
+target = "--test steer_interrupt"
+test_file = "crates/broca-crash-harness/tests/steer_interrupt.rs"
+expect_red = ["interrupt_during_a_model_stream_at_every_record_boundary"]
+expect_message = "timed out waiting for idle session with no pending or open episodes"
+file = "crates/broca-module/src/registry.rs"
+old = "if pending_work {"
+new = "if false && pending_work { // NON-VACUITY BREAK: leave durable queued work asleep."
+
+[[control]]
+id = "module-large-status-polls-avoid-full-history"
+guards = "Large closed worker sessions amortize actor recovery instead of decoding every episode on each status poll"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/closed_poll_tests.rs"
+expect_red = ["actor::closed_poll_tests::large_closed_session_status_poll_cost_is_independent_of_history"]
+expect_message = "closed status must not reread from sequence zero on each poll"
+file = "crates/broca-module/src/registry.rs"
+old = "if self.status_needs_actor(key).await? {"
+new = "if false && self.status_needs_actor(key).await? { // NON-VACUITY BREAK: replay large histories on every poll."
+
+[[control]]
+id = "module-unmarked-orphan-status-recovers"
+guards = "After boot sealing, a run status poll seals an unmarked orphan instead of refusing it forever"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/closed_poll_tests.rs"
+expect_red = ["actor::closed_poll_tests::closed_unmarked_orphan_status_makes_progress_after_boot_sealing"]
+expect_message = "run status must make recovery progress"
+file = "crates/broca-module/src/registry.rs"
+old = '''                    self.recover_status_orphan(key, &run_id).await?;
+                    continue;'''
+new = '''                    return Err(OpenError::Classified {
+                        reason: "could not tell run status: orphan recovery disabled".into(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    }); // NON-VACUITY BREAK: strand an unmarked orphan after boot.'''
+
+[[control]]
+id = "module-closed-status-poll-does-not-reopen"
+guards = "Polling a finished one-shot observes durable status without retaining a new idle actor"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/closed_poll_tests.rs"
+expect_red = ["actor::closed_poll_tests::closed_one_shot_polls_leave_actor_closed_and_match_live_answers"]
+expect_message = "poll must not reopen a closed actor"
+file = "crates/broca-module/src/registry.rs"
+old = '''                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map'''
+new = '''                let records = self.read_durable_wal(key).await?.0;
+                self.actor_for(key).await?; // NON-VACUITY BREAK: reopen on an observer poll.
+                let latest = records.iter().rev().find_map'''
+
+[[control]]
 id = "module-run-result-reuses-status-wal"
 guards = "A closed run result reuses the authoritative status snapshot instead of decoding the full WAL again"
 runner = "cargo"
@@ -2023,8 +2086,8 @@ test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
 select = "expected"
 expect_red = ["send_delivery::step_limit_with_a_late_steer_reports_undelivered_send_id"]
 file = "crates/broca-module/src/actor.rs"
-old = "                    let undelivered_steers = reconciled\n                        .as_ref()\n                        .and_then(|state| state.undelivered_steers.clone());"
-new = "                    let undelivered_steers: Option<Vec<String>> = None; // NON-VACUITY BREAK"
+old = "        undelivered_steers: reconciled\n            .as_ref()\n            .and_then(|state| state.undelivered_steers.clone()),"
+new = "        undelivered_steers: None, // NON-VACUITY BREAK: discard the durable steer receipts."
 
 [[control]]
 id = "send-id-reuse-different-payload"
@@ -7327,9 +7390,12 @@ features = ["test-clock"]
 select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::cold_status_rechecks_clock_without_the_mutating_opener"]
-file = "crates/broca-module/src/opener.rs"
-old = "self.open_mode(key, gen, registry, None, None, true).await"
-new = "self.open_mode(key, gen, registry, None, None, false).await // NON-VACUITY BREAK: open without leased status classification"
+file = "crates/broca-module/src/registry.rs"
+old = '''                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map'''
+new = '''                self.actor_for(key).await?; // NON-VACUITY BREAK: acquire a mutating writer before checking expiry.
+                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map'''
 
 [[control]]
 id = "retention-audit-live-status-admission-order"
@@ -7429,32 +7495,35 @@ old = "let owned = owns_prior_episode || prior.run_id.as_ref() == Some(&req.run_
 new = "let owned = true || owns_prior_episode || prior.run_id.as_ref() == Some(&req.run_id); // NON-VACUITY BREAK"
 
 [[control]]
-id = "retention-followup-status-lease-classification"
-guards = "status classifies newly created expired retention only inside its leased open path"
+id = "retention-followup-status-read-classification"
+guards = "closed status rechecks newly created expired retention before serving durable history"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 features = ["test-clock"]
 select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
-expect_red = ["retention::tests::status_classifies_created_expired_retention_under_the_open_lease"]
-file = "crates/broca-module/src/opener.rs"
-old = "self.open_mode(key, gen, registry, None, None, true).await"
-new = "self.open_mode(key, gen, registry, None, None, false).await // NON-VACUITY BREAK: classify outside leased status mode"
+expect_red = ["retention::tests::status_classifies_created_expired_retention_without_opening_actor"]
+file = "crates/broca-module/src/registry.rs"
+old = "ReadPurpose::Session => self.check_expired(key, None).await?,"
+new = "ReadPurpose::Session => (), // NON-VACUITY BREAK: skip the read-time expiry check."
 
 [[control]]
 id = "retention-followup-status-no-full-read"
-guards = "ordinary cold status adds no full-history read before normal actor recovery"
+guards = "cold status uses the bounded durable WAL reader without creating an actor"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 features = ["test-clock"]
 select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
-expect_red = ["retention::tests::cold_forever_status_performs_no_full_wal_reads_before_ordinary_open"]
-file = "crates/broca-module/src/opener.rs"
-old = "            if status && service.is_some() {\n                let meta = store"
-new = "            if status && service.is_some() {\n                let _ = wal.read_records(&session); // NON-VACUITY BREAK: replay ordinary history\n                let meta = store"
+expect_red = ["retention::tests::cold_forever_status_uses_bounded_wal_without_opening_actor"]
+file = "crates/broca-module/src/registry.rs"
+old = '''                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map'''
+new = '''                let _ = self.inner.reader.as_ref().unwrap().wal_store.read_records(key); // NON-VACUITY BREAK: use the unbounded history reader.
+                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map'''
 
 [[control]]
 id = "retention-followup-empty-wal-history-loss"
