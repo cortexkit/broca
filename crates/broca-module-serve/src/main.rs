@@ -6019,6 +6019,12 @@ mod state_directory_tests {
             .expect("create the existing catalog")
             .write_all(EMBEDDED_ENGRAM_CATALOG)
             .expect("write the existing catalog");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&catalog_path, std::fs::Permissions::from_mode(0o644))
+                .expect("make the existing catalog readable to others");
+        }
         let before = std::fs::metadata(&catalog_path).expect("read existing catalog metadata");
         let modified_before = before.modified().expect("read existing catalog mtime");
         #[cfg(unix)]
@@ -6038,7 +6044,13 @@ mod state_directory_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
             assert_eq!((after.dev(), after.ino()), identity_before);
+            assert_eq!(
+                after.permissions().mode() & 0o777,
+                0o600,
+                "an existing matching catalog must remain owner-only"
+            );
         }
         let _ = std::fs::remove_dir_all(&state_root);
     }
