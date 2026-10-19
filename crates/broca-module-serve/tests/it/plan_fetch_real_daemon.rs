@@ -350,7 +350,13 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     rig.registry().set_plan_admitter(admitter);
     rig.script.push(&[Step::Text("admitted")]);
     rig.bind(7).await;
-    let optional = raw_vector("plans/broca-worker-optional-tool-with-text.json");
+    // This rig binds an unscoped route, and a `worker` tool preset is admitted only over a
+    // scoped one (a scope the real daemon must also hold live). Ask for a non-confining preset;
+    // the composition, and so its digest, does not carry the tool items' presets.
+    let mut optional = raw_vector("plans/broca-worker-optional-tool-with-text.json");
+    for item in optional["tool_items"].as_array_mut().unwrap() {
+        item["preset"] = json!("reader");
+    }
     let reply = result(&rig.request(7, json!({"method":"session.send", "params":{
         "send_id":"optional-first", "prompt":"hi", "model":{"provider":"fake","model":"fake"},
         "plan":optional

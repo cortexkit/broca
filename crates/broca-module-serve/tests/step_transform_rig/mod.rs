@@ -109,7 +109,9 @@ pub fn append(text: &str) -> Value {
 pub fn plan(subscriptions: &[Value], grants: bool) -> Value {
     let items = json!([{"provider":MODULE,"preset":"worker","params":{"verbatim":[null,{"x":1}]},"subscriptions":subscriptions}]);
     let composition = json!({"providers":[{"provider":MODULE,"tools":[{"name":"work","capabilities":[]}]}],"step_transform_items":items});
-    let mut plan = json!({"tool_items":[{"provider":MODULE,"preset":"worker","params":{}}],"system_text_items":[],"step_transform_items":items,
+    // The tool item uses a non-confining preset: these rigs bind unscoped routes, and a
+    // `worker` tool preset is admitted only over a scoped one.
+    let mut plan = json!({"tool_items":[{"provider":MODULE,"preset":"reader","params":{}}],"system_text_items":[],"step_transform_items":items,
         "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),"composition":composition});
     if grants {
         plan["user_grants"] = json!([{"module":MODULE,"hook":"post_tool","tools":["work"]}]);

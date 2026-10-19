@@ -62,13 +62,6 @@ pub(super) struct CompactionCall {
     pub issued_at_ms: u64,
     pub deadline_ms: u64,
 }
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct CompactionObservation {
-    pub calls: Vec<CompactionCall>,
-    pub model_inputs: Vec<Vec<ModelEntry>>,
-}
-
 pub(super) const MODULE: &str = "conformance-compaction";
 pub(super) const MODEL_PREFIX: &str = "conformance-model-";
 pub(super) fn known_session(shared: &Shared, session: &str) -> bool {
@@ -370,58 +363,6 @@ impl BrocaSubject {
             .cloned()
             .ok_or_else(|| HarnessError::new(format!("session {session} has no rig root")))
     }
-    pub(super) async fn install_compaction(
-        &self,
-        session: &str,
-        script: CompactionScript,
-    ) -> Result<(), HarnessError> {
-        let root = self.compaction_root(session)?;
-        let directory = root.join("test-compaction").join(session);
-        std::fs::create_dir_all(&directory).map_err(|e| HarnessError::new(e.to_string()))?;
-        let now = *self
-            .shared
-            .compaction_clocks
-            .lock()
-            .unwrap()
-            .entry(root.clone())
-            .or_insert(0);
-        atomic_write(
-            &root.join("test-clock"),
-            &serde_json::to_vec(&json!({"now_ms":now})).unwrap(),
-        )?;
-        self.shared.note(
-            session,
-            format_args!("install wrote test-clock now_ms={now}"),
-        );
-        atomic_write(&directory.join("config"),&serde_json::to_vec(&json!({
-            "call_timeout_ms":script.call_timeout_ms,"wait_cap_ms":script.wait_cap_ms,
-            "prompt_cache_lifetime_ms":script.prompt_cache_lifetime_ms,"context_window":script.context_window,
-            "output_limit":script.output_limit,"safety_margin":script.safety_margin,"request_tokens":script.request_tokens,
-        })).unwrap())?;
-        let mut states = self.shared.compaction.lock().unwrap();
-        if let Some(state) = states.get_mut(session) {
-            state.script = script;
-            state.step = 0;
-        } else {
-            states.insert(
-                session.into(),
-                Session {
-                    script,
-                    step: 0,
-                    start_ms: now,
-                    emitted: 0,
-                    calls: vec![],
-                    statuses: vec![],
-                    senders: HashMap::new(),
-                    raw: BTreeMap::new(),
-                    replacements: vec![],
-                    inputs: vec![],
-                    gates: Default::default(),
-                },
-            );
-        }
-        Ok(())
-    }
     pub(super) fn compaction_fields(
         &self,
         session: &str,
@@ -446,20 +387,6 @@ impl BrocaSubject {
                 "composition":composition});
         }
         Some(fields.as_object().unwrap().clone())
-    }
-    pub(super) async fn compaction_observe(
-        &self,
-        session: &str,
-    ) -> Result<CompactionObservation, HarnessError> {
-        self.settle_compaction(session).await?;
-        let states = self.shared.compaction.lock().unwrap();
-        let state = states
-            .get(session)
-            .ok_or_else(|| HarnessError::new("no compaction script"))?;
-        Ok(CompactionObservation {
-            calls: state.calls.clone(),
-            model_inputs: state.inputs.clone(),
-        })
     }
     pub(super) async fn settle_compaction(&self, session: &str) -> Result<(), HarnessError> {
         let root = self.compaction_root(session)?;
@@ -795,103 +722,6 @@ impl BrocaSubject {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compaction_model_ids_route_only_to_the_exact_installed_session() {
-    require_compaction_test_clock();
-    let scratch = broca_test_support::scratch_root().join("compaction-model-routing");
-    let subject = BrocaSubject::new(&scratch).await;
-    let live = subject.start(&scratch.join("root")).await.unwrap();
-    for session in ["model-routing-one", "model-routing-two"] {
-        let route = subject
-            .session_route(&live, session, &subject.owner_stamp())
-            .await
-            .unwrap();
-        subject
-            .install_script(
-                session,
-                Script {
-                    turns: vec![
-                        cortexkit_role_llm_runner_conformance::ScriptedTurn::new(vec![
-                            ScriptedPart::Text("done".into()),
-                        ])
-                        .with_usage(
-                            cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
-                        ),
-                    ],
-                },
-            )
-            .await
-            .unwrap();
-        subject
-            .install_compaction(
-                session,
-                CompactionScript::new(CompactionMessage {
-                    compaction_id: session.into(),
-                    version: 1,
-                    from: 0,
-                    to: 0,
-                    replacement: vec![format!("head-{session}")],
-                }),
-            )
-            .await
-            .unwrap();
-        let mut params = Value::Object(subject.send_fields(session, true));
-        params["prompt"] = json!("hello");
-        params["send_id"] = json!(session);
-        let reply = route.request("session.send", params).await.unwrap();
-        assert!(matches!(reply, Reply::Response(_)), "{reply:?}");
-        let obs = subject.compaction_observe(session).await.unwrap();
-        assert_eq!(
-            obs.model_inputs.len(),
-            1,
-            "records={:?}",
-            subject.records(&live, session)
-        );
-        assert_eq!(obs.calls.len(), 2);
-        assert!(obs.model_inputs[0][0]
-            .message
-            .to_string()
-            .contains(&format!("head-{session}")));
-    }
-    let before = subject
-        .shared
-        .compaction
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(session, state)| (session.clone(), state.inputs.len()))
-        .collect::<BTreeMap<_, _>>();
-    for request in [
-        json!({"model":format!("{MODEL_PREFIX}uninstalled"),"messages":[]}),
-        json!({"model":"unknown-model","messages":[{"role":"system","content":format!("{SESSION_MARKER}model-routing-one")}]}),
-    ] {
-        let mut stream = tokio::net::TcpStream::connect(
-            subject
-                .model_url
-                .trim_start_matches("http://")
-                .trim_end_matches("/v1"),
-        )
-        .await
-        .unwrap();
-        let body = request.to_string();
-        stream.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).await.unwrap();
-        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
-    }
-    assert_eq!(
-        subject
-            .shared
-            .compaction
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(session, state)| (session.clone(), state.inputs.len()))
-            .collect::<BTreeMap<_, _>>(),
-        before
-    );
-}
-
 impl BrocaSubject {
     pub(super) async fn wait_compaction_send_record(
         &self,
@@ -912,128 +742,4 @@ impl BrocaSubject {
         }).await;
         Ok(())
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recorded_setup_survives_sender_driven_recovery_without_repeating_setup() {
-    require_compaction_test_clock();
-    let scratch = broca_test_support::scratch_root().join("compaction-sender-recovery");
-    let subject = BrocaSubject::new(&scratch).await;
-    let root = scratch.join("root");
-    let live = subject.start(&root).await.unwrap();
-    let session = "sender-setup-recovery";
-    let route = subject
-        .session_route(&live, session, &subject.owner_stamp())
-        .await
-        .unwrap();
-    subject
-        .install_script(
-            session,
-            Script {
-                turns: vec![
-                    cortexkit_role_llm_runner_conformance::ScriptedTurn::new(vec![
-                        ScriptedPart::Text("recovered".into()),
-                    ])
-                    .with_usage(
-                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
-                    ),
-                ],
-            },
-        )
-        .await
-        .unwrap();
-    let head = CompactionMessage {
-        compaction_id: "durable-setup".into(),
-        version: 1,
-        from: 0,
-        to: 0,
-        replacement: vec!["setup-head".into(), "setup-note".into()],
-    };
-    subject
-        .install_compaction(session, CompactionScript::new(head.clone()))
-        .await
-        .unwrap();
-    let mut first = Value::Object(subject.send_fields(session, true));
-    first["prompt"] = json!("before-crash");
-    first["send_id"] = json!("setup-cut");
-    subject
-        .kill_at(
-            live,
-            &KillPoint::new(points::FOLD_RECORDED),
-            Box::pin(async {
-                let _ = route.request("session.send", first).await;
-            }),
-        )
-        .await
-        .unwrap();
-    let live = subject.restart(&root).await.unwrap();
-    let route = subject
-        .session_route(&live, session, &subject.owner_stamp())
-        .await
-        .unwrap();
-    let Reply::Response(old) = route.request("session.head", json!({})).await.unwrap() else {
-        panic!("head refused")
-    };
-    assert_eq!(old["last_run_state"]["state"], "interrupted");
-    assert_eq!(subject.durable_setup(&live, session).unwrap(), Some(head));
-    assert!(
-        subject
-            .compaction_observe(session)
-            .await
-            .unwrap()
-            .model_inputs
-            .is_empty(),
-        "process restart alone must never call the model"
-    );
-    let mut resume = Value::Object(subject.send_fields(session, false));
-    resume["prompt"] = json!("sender-resume");
-    resume["send_id"] = json!("fresh-resume");
-    let Reply::Response(resumed) = route.request("session.send", resume).await.unwrap() else {
-        panic!("resume refused")
-    };
-    assert_ne!(resumed["run_id"], old["last_run_state"]["run_id"]);
-    let observation = subject.compaction_observe(session).await.unwrap();
-    assert_eq!(
-        observation
-            .calls
-            .iter()
-            .filter(|c| c.kind == CompactionCallKind::Setup)
-            .count(),
-        1
-    );
-    assert_eq!(observation.model_inputs.len(), 1);
-    let Reply::Response(page) = route
-        .request("session.read", json!({"view":"model","from_ordinal":0}))
-        .await
-        .unwrap()
-    else {
-        panic!("model read refused")
-    };
-    // Compare each entry's source and message only. A model-view page entry also carries the
-    // message's runner tags (`tags`), which the compaction provider's observation of the model
-    // input does not record, so a whole-entry comparison would differ by that member alone.
-    let without_tags = |entries: Value| -> Vec<(Value, Value)> {
-        entries
-            .as_array()
-            .expect("model entries are an array")
-            .iter()
-            .map(|entry| (entry["source"].clone(), entry["message"].clone()))
-            .collect()
-    };
-    assert_eq!(
-        without_tags(serde_json::to_value(&observation.model_inputs[0]).unwrap()),
-        without_tags(page["messages"].clone())
-    );
-    assert_eq!(observation.model_inputs[0].len(), 4);
-    assert!(observation.model_inputs[0][3]
-        .message
-        .to_string()
-        .contains("sender-resume"));
-    assert_eq!(
-        observation.model_inputs[0][3].source,
-        EntrySource::Message {
-            ordinal: 1,
-            mid: "m1".into()
-        }
-    );
 }

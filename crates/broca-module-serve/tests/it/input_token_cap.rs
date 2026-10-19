@@ -275,17 +275,23 @@ async fn active_status_and_result_count_only_completed_steps() {
         );
     }
     rig.script.hold_model(false);
-    broca_test_support::wait_until("first step durable while tool is held", || async {
-        if rig
-            .records()
-            .iter()
-            .any(|record| matches!(record, broca_wal::WalRecord::ModelStepFinished { .. }))
-        {
-            Ok(())
-        } else {
-            Err("first step has not committed".into())
-        }
-    })
+    // Wait for the effect the assertions read: the actor counts a step once the writer reports
+    // it durable, a moment after the record reaches the file, so polling the WAL alone races.
+    broca_test_support::wait_for(
+        "status counts the first durable step",
+        async {
+            loop {
+                let reply = rig
+                    .request(7, json!({"method":"run.status","params":{"run_id":run}}))
+                    .await;
+                if result(&reply)["usage"]["steps"] == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+        || "run.status never counted the durable first step".into(),
+    )
     .await;
     for method in ["run.status", "run.result"] {
         let reply = rig
