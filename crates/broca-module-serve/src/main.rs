@@ -8,7 +8,7 @@
 use broca_diagnostics::{spawn_blocking, JobKind};
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ use tokio::net::TcpStream;
 
 const DEFAULT_MODULE_ID: &str = "broca";
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
+const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.json");
 /// Maximum time a credential-resolving call keeps STARTING work toward the credentials module:
 /// waiting for it to register, and retrying its temporary route-open refusals. Boot never spends
 /// this budget, and it stays below the 10-second response deadline a caller of broca ordinarily
@@ -256,6 +257,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
     create_state_directories(&state_root)?;
+    // The catalog only guides external backup capture; a filesystem refusal must not take
+    // session service offline.
+    if let Err(error) = write_engram_catalog(&state_root) {
+        tracing::error!(
+            target: "engram",
+            path = %state_root.join("engram-catalog.json").display(),
+            "could not publish the backup catalog; continuing to serve: {error}"
+        );
+    }
     let _archive_timer = archive_config.spawn(state_root.clone());
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
@@ -5882,6 +5892,55 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
     Ok(())
 }
 
+fn write_engram_catalog(state_root: &Path) -> std::io::Result<()> {
+    let path = state_root.join("engram-catalog.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        Ok(_) => {
+            if std::fs::read(&path)? == EMBEDDED_ENGRAM_CATALOG {
+                ensure_engram_catalog_owner_only(&path)?;
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    broca_wal::migration::atomic_json_bytes(state_root, &path, EMBEDDED_ENGRAM_CATALOG)
+}
+
+fn ensure_engram_catalog_owner_only(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if broca_owner_only::validate(path).is_err() {
+            broca_owner_only::repair(path)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
     use super::*;
@@ -5891,16 +5950,18 @@ mod windows_acl_tests {
         let fixture = BroadParent::new("state");
         let root = fixture.path.join("state");
         create_state_directories(&root).unwrap();
+        write_engram_catalog(&root).unwrap();
         assert_private(&root);
         assert_private(&root.join("leases"));
         assert_private(&root.join("wal-durable"));
         assert_private(&root.join("wal-archive-durable"));
+        assert_private(&root.join("engram-catalog.json"));
     }
 }
 
 #[cfg(test)]
 mod state_directory_tests {
-    use super::create_state_directories;
+    use super::{create_state_directories, write_engram_catalog, EMBEDDED_ENGRAM_CATALOG};
     use std::path::PathBuf;
 
     // broca's owner-only scratch root, not the system temp directory: on Windows the owner-only
@@ -5914,6 +5975,111 @@ mod state_directory_tests {
             "broca-state-directory-{tag}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn first_boot_writes_the_tracked_engram_catalog_bytes() {
+        let state_root = fresh_root("catalog-first-boot");
+        create_state_directories(&state_root).expect("create startup state directories");
+
+        write_engram_catalog(&state_root).expect("write the embedded backup catalog");
+
+        let catalog_path = state_root.join("engram-catalog.json");
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read the written backup catalog"),
+            EMBEDDED_ENGRAM_CATALOG,
+            "the state-root catalog must exactly match the tracked source"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&catalog_path)
+                    .expect("read catalog permissions")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "the backup catalog must be owner-only"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn identical_engram_catalog_is_not_rewritten() {
+        let state_root = fresh_root("catalog-identical");
+        create_state_directories(&state_root).expect("create startup state directories");
+        let catalog_path = state_root.join("engram-catalog.json");
+        let mut options = broca_owner_only::OpenOptions::new();
+        options.write(true).create_new(true);
+        use std::io::Write;
+        options
+            .open(&catalog_path)
+            .expect("create the existing catalog")
+            .write_all(EMBEDDED_ENGRAM_CATALOG)
+            .expect("write the existing catalog");
+        let before = std::fs::metadata(&catalog_path).expect("read existing catalog metadata");
+        let modified_before = before.modified().expect("read existing catalog mtime");
+        #[cfg(unix)]
+        let identity_before = {
+            use std::os::unix::fs::MetadataExt;
+            (before.dev(), before.ino())
+        };
+
+        write_engram_catalog(&state_root).expect("leave the identical catalog in place");
+
+        let after = std::fs::metadata(&catalog_path).expect("read catalog metadata after boot");
+        assert_eq!(
+            after.modified().expect("read catalog mtime after boot"),
+            modified_before,
+            "an identical catalog must keep its mtime"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!((after.dev(), after.ino()), identity_before);
+        }
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn differing_engram_catalog_is_replaced_with_the_embedded_file() {
+        let state_root = fresh_root("catalog-replaced");
+        create_state_directories(&state_root).expect("create startup state directories");
+        let catalog_path = state_root.join("engram-catalog.json");
+        std::fs::write(&catalog_path, b"stale catalog").expect("write stale catalog");
+        #[cfg(unix)]
+        let identity_before = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&catalog_path).expect("read stale catalog metadata");
+            (metadata.dev(), metadata.ino())
+        };
+
+        write_engram_catalog(&state_root).expect("replace the stale catalog");
+
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read replaced catalog"),
+            EMBEDDED_ENGRAM_CATALOG
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata =
+                std::fs::metadata(&catalog_path).expect("read replaced catalog metadata");
+            assert_ne!((metadata.dev(), metadata.ino()), identity_before);
+        }
+        assert!(
+            std::fs::read_dir(&state_root)
+                .expect("list state root")
+                .all(|entry| !entry
+                    .expect("read state root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("engram-catalog.json.tmp")),
+            "atomic publication must leave no temporary catalog file"
+        );
+        let _ = std::fs::remove_dir_all(&state_root);
     }
 
     #[test]
