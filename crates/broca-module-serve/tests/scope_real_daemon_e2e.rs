@@ -16,6 +16,9 @@
 //! answered with broca's `scope_adoption_refused`, relayed by the daemon from the bind.
 #![cfg(unix)]
 
+#[path = "../../broca-wire/tests/support/run_usage.rs"]
+mod usage_compat;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1609,10 +1612,8 @@ async fn active_status_reports_held_model_step_and_content() {
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(&path, &bytes).unwrap();
     }
-    assert_eq!(
-        bytes,
-        std::fs::read(path).expect("active-step golden generated through serve")
-    );
+    let expected = std::fs::read(path).expect("active-step golden generated through serve");
+    assert_eq!(usage_compat::legacy_bytes(&bytes, &expected), expected);
     let cancelled = scope_request(
         &basal,
         &route,

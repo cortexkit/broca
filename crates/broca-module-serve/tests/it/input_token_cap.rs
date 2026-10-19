@@ -76,7 +76,11 @@ async fn budget_exhausted_status_golden_and_result_through_serve() {
         std::fs::write(&path, format!("{served}\n")).unwrap();
         println!("run_status.budget_exhausted.json: {served}");
     }
-    assert_eq!(served, std::fs::read_to_string(path).unwrap().trim_end());
+    let golden = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        legacy_bytes(served.as_bytes(), golden.trim_end().as_bytes()),
+        golden.trim_end().as_bytes()
+    );
     assert_eq!(
         result(&status)["detail"],
         json!({"limit":10,"spent":10,"cause":"limit_reached"})
@@ -116,10 +120,12 @@ async fn unreported_usage_detail_keeps_only_measured_steps_before_unknown() {
         .await;
     // The first episode reported 5 fresh + 2 cached + 3 cache-write tokens. The second
     // omitted fresh input, so spent stays 10 rather than estimating that step from its cache split.
+    let legacy = r#"{"state":"budget_exhausted","detail":{"limit":50,"spent":10,"cause":"usage_unreported"},"final_step_finish_reason":"tool_calls","undelivered_steers":[],"usage":{"cached_input_tokens":2,"cache_write_tokens":3,"output_tokens":99},"retries_used":0}"#;
     assert_eq!(
-        raw_result(&status),
-        r#"{"state":"budget_exhausted","detail":{"limit":50,"spent":10,"cause":"usage_unreported"},"final_step_finish_reason":"tool_calls","undelivered_steers":[],"usage":{"cached_input_tokens":2,"cache_write_tokens":3,"output_tokens":99},"retries_used":0}"#
+        legacy_bytes(raw_result(&status).as_bytes(), legacy.as_bytes()),
+        legacy.as_bytes()
     );
+    assert_eq!(result(&status)["usage"]["unreported_steps"], 0);
     assert_eq!(
         result(&status)["detail"],
         json!({"limit":50,"spent":10,"cause":"usage_unreported"})
@@ -246,5 +252,78 @@ async fn queued_lower_cap_stops_the_active_crossing_step_before_tools() {
     rig.wait_idle().await;
     assert!(rig.script.dispatched.lock().unwrap().is_empty());
     assert_eq!(rig.script.prompts.lock().unwrap().len(), 1);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn active_status_and_result_count_only_completed_steps() {
+    let mut rig =
+        Rig::start_with_idle_ttl("active-run-usage", std::time::Duration::from_millis(100)).await;
+    rig.script.hold_model(true);
+    rig.script.hold_tool(true);
+    rig.script
+        .push(&[measured(Some(5), true), measured(Some(7), false)]);
+    let send = rig.send("usage", "hello", None).await;
+    let run = result(&send)["run_id"].as_str().unwrap().to_owned();
+    for method in ["run.status", "run.result"] {
+        let reply = rig
+            .request(7, json!({"method":method,"params":{"run_id":run}}))
+            .await;
+        assert_eq!(
+            result(&reply)["usage"],
+            json!({"steps":0,"unreported_steps":0})
+        );
+    }
+    rig.script.hold_model(false);
+    broca_test_support::wait_until("first step durable while tool is held", || async {
+        if rig
+            .records()
+            .iter()
+            .any(|record| matches!(record, broca_wal::WalRecord::ModelStepFinished { .. }))
+        {
+            Ok(())
+        } else {
+            Err("first step has not committed".into())
+        }
+    })
+    .await;
+    for method in ["run.status", "run.result"] {
+        let reply = rig
+            .request(7, json!({"method":method,"params":{"run_id":run}}))
+            .await;
+        assert_eq!(result(&reply)["state"], "active");
+        assert_eq!(result(&reply)["usage"]["steps"], 1);
+        assert_eq!(result(&reply)["usage"]["unreported_steps"], 0);
+        assert_eq!(result(&reply)["usage"]["input_tokens"], 5);
+    }
+    rig.script.hold_tool(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let status = rig
+        .request(7, json!({"method":"run.status","params":{"run_id":run}}))
+        .await;
+    let answer = rig
+        .request(7, json!({"method":"run.result","params":{"run_id":run}}))
+        .await;
+    assert_eq!(result(&status)["usage"], result(&answer)["usage"]);
+    assert_eq!(result(&status)["usage"]["steps"], 2);
+    assert_eq!(result(&status)["usage"]["input_tokens"], 12);
+    let final_usage = result(&status)["usage"].clone();
+    rig.wait_closed().await;
+    for method in ["run.status", "run.result"] {
+        let reply = rig
+            .request(7, json!({"method":method,"params":{"run_id":run}}))
+            .await;
+        assert_eq!(
+            result(&reply)["usage"],
+            final_usage,
+            "closed {method} must retain the live terminal's usage"
+        );
+        assert_eq!(
+            rig.registry().slot_counts().open,
+            0,
+            "a usage read must not reopen the closed actor"
+        );
+    }
     rig.finish().await;
 }

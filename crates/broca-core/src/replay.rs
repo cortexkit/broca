@@ -2236,6 +2236,53 @@ pub fn latest_projection_boundary(
     latest
 }
 
+/// A completed-step usage fold for one run id. The same durable records feed
+/// cold reconciliation and the live writer's small status projection.
+#[derive(Debug, Clone)]
+pub struct RunUsageProjection {
+    run_id: RunId,
+    active: bool,
+    model: Option<(broca_protocol::request::ModelHandle, Option<String>)>,
+    pub usage: broca_protocol::usage::RunUsage,
+}
+
+impl RunUsageProjection {
+    pub fn new(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            active: false,
+            model: None,
+            usage: Default::default(),
+        }
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn observe(&mut self, record: &WalRecord) {
+        match record {
+            WalRecord::RunStarted { run_id, config, .. } => {
+                self.active = run_id == &self.run_id;
+                if self.active {
+                    self.model = Some((config.model.clone(), config.variant.clone()));
+                }
+            }
+            WalRecord::ModelStepFinished { usage, .. } if self.active => {
+                if let Some((model, variant)) = &self.model {
+                    self.usage.accumulate(
+                        &model.provider_module_id,
+                        &model.model_id,
+                        variant.as_deref(),
+                        usage,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A run state reconciled from the WAL, including terminal metadata absent from the index.
 ///
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
@@ -2257,6 +2304,8 @@ pub struct ReconciledRunState {
     pub final_step_finish_reason: Option<FinishReason>,
     pub indeterminate_tool_calls: Option<Vec<ToolCallId>>,
     pub usage: Option<Usage>,
+    /// Completed-step totals across every episode bearing this run id.
+    pub run_usage: broca_protocol::usage::RunUsage,
     pub retries_used: u32,
     /// The typed error carried verbatim by the record that settled `state`: the run's
     /// `RunFinished`, its `RunPaused`, or a queued-admission `Retracted` failure. `None` when
@@ -2278,6 +2327,7 @@ pub fn reconcile_run_state<'a>(
 ) -> Option<ReconciledRunState> {
     use crate::{projection::IndeterminateToolCalls, RunIndexState};
 
+    let mut run_usage = RunUsageProjection::new(RunId(run_id.to_owned()));
     let mut active_run: Option<String> = None;
     let mut active_zero_step_seed = false;
     let mut has_completed_step = false;
@@ -2297,6 +2347,7 @@ pub fn reconcile_run_state<'a>(
     // so its `Queued` record can name this run before any `RunStarted` does.
     let queued_submission = format!("sub-{run_id}");
     for rec in records {
+        run_usage.observe(rec);
         match rec {
             WalRecord::RunStarted {
                 run_id: rid,
@@ -2334,6 +2385,7 @@ pub fn reconcile_run_state<'a>(
                         final_step_finish_reason: None,
                         indeterminate_tool_calls: None,
                         usage: None,
+                        run_usage: Default::default(),
                         retries_used: 0,
                         error: None,
                         pause_reason: None,
@@ -2431,6 +2483,7 @@ pub fn reconcile_run_state<'a>(
                         indeterminate_tool_calls: (*reason == RunFinishReason::Interrupted)
                             .then(|| indeterminate_tool_calls.snapshot()),
                         usage: has_completed_step.then_some(*usage),
+                        run_usage: Default::default(),
                         retries_used: *retries_used,
                         error: error.clone(),
                         pause_reason: None,
@@ -2454,6 +2507,7 @@ pub fn reconcile_run_state<'a>(
                     final_step_finish_reason: None,
                     indeterminate_tool_calls: None,
                     usage: Some(total_usage),
+                    run_usage: Default::default(),
                     retries_used: total_retries_used,
                     error: error.clone(),
                     pause_reason: Some(*reason),
@@ -2481,6 +2535,7 @@ pub fn reconcile_run_state<'a>(
                     final_step_finish_reason: None,
                     indeterminate_tool_calls: None,
                     usage: None,
+                    run_usage: Default::default(),
                     retries_used: 0,
                     error: Some(failure.error.clone()),
                     pause_reason: None,
@@ -2500,6 +2555,7 @@ pub fn reconcile_run_state<'a>(
             final_step_finish_reason: None,
             indeterminate_tool_calls: Some(Vec::new()),
             usage: None,
+            run_usage: run_usage.usage,
             retries_used: 0,
             error: None,
             pause_reason: None,
@@ -2507,7 +2563,11 @@ pub fn reconcile_run_state<'a>(
             title,
         });
     }
-    found.map(|state| ReconciledRunState { title, ..state })
+    found.map(|state| ReconciledRunState {
+        title,
+        run_usage: run_usage.usage,
+        ..state
+    })
 }
 
 /// Classify the LAST episode's trailing state into a resolution. Order matters

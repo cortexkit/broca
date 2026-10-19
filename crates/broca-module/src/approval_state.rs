@@ -1,5 +1,5 @@
-//! Small durable approval facts for actor status and terminal-index eligibility.
-//! The writer tap copies IDs and deadlines, never arguments, messages or tool results.
+//! Small durable approval and completed-step usage facts for actor status.
+//! The writer tap copies IDs, deadlines and usage totals, never arguments, messages or tool results.
 use broca_protocol::RunId;
 use broca_wal::{FramedRecord, WalLineageId, WalRecord};
 use std::collections::{BTreeMap, HashMap};
@@ -15,6 +15,7 @@ struct RunFacts {
 #[derive(Default)]
 struct Facts {
     current: Option<RunId>,
+    usage: Option<broca_core::RunUsageProjection>,
     // At most the current run is cached. Historical withdrawal obligations are
     // durable debt records, not status facts retained on the writer thread.
     runs: HashMap<RunId, RunFacts>,
@@ -62,6 +63,18 @@ impl ApprovalState {
         self.changed.notify_waiters();
     }
     fn fold(facts: &mut Facts, seq: u64, lineage: Option<WalLineageId>, record: &WalRecord) {
+        if let WalRecord::RunStarted { run_id, .. } = record {
+            if facts
+                .usage
+                .as_ref()
+                .is_none_or(|usage| usage.run_id() != run_id)
+            {
+                facts.usage = Some(broca_core::RunUsageProjection::new(run_id.clone()));
+            }
+        }
+        if let Some(usage) = &mut facts.usage {
+            usage.observe(record);
+        }
         match record {
             WalRecord::RunStarted { run_id, title, .. } => {
                 facts.current = Some(run_id.clone());
@@ -157,6 +170,7 @@ impl ApprovalState {
             return;
         }
         facts.current = current;
+        facts.usage = None;
         facts.runs.clear();
         if let Some(id) = facts.current.clone() {
             facts.runs.entry(id).or_default().prepared = complete.then_some(false);
@@ -249,6 +263,25 @@ impl ApprovalState {
                 .collect(),
         })
     }
+    pub(crate) fn run_usage(
+        &self,
+        run_id: &RunId,
+        head: u64,
+    ) -> Option<broca_protocol::usage::RunUsage> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return None;
+        }
+        let facts = self.facts.lock().ok()?;
+        if self.covered.load(Ordering::Acquire) < head {
+            return None;
+        }
+        let projection = facts
+            .usage
+            .as_ref()
+            .filter(|usage| usage.run_id() == run_id)?;
+        Some(projection.usage.clone())
+    }
+
     pub(crate) fn title(&self, run_id: &RunId) -> Option<Option<String>> {
         if !self.healthy.load(Ordering::Acquire) {
             return None;
@@ -259,6 +292,7 @@ impl ApprovalState {
         if let Ok(mut facts) = self.facts.lock() {
             if facts.current.as_ref() == Some(run_id) {
                 facts.current = None;
+                facts.usage = None;
                 facts.runs.clear();
             }
         }
