@@ -387,6 +387,91 @@ pub struct RetentionService {
 struct Enrollment {
     recovered: bool,
     retry: std::collections::HashSet<PathBuf>,
+    deferred_races: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnrollmentFailureKind {
+    VanishedFile,
+    MidWrite,
+    UnreadableFile,
+    StoreBusy,
+    MigrationInProgress,
+}
+
+impl EnrollmentFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::VanishedFile => "vanished_file",
+            Self::MidWrite => "mid_write",
+            Self::UnreadableFile => "unreadable_file",
+            Self::StoreBusy => "store_busy",
+            Self::MigrationInProgress => "migration_in_progress",
+        }
+    }
+
+    fn is_benign_race(self) -> bool {
+        matches!(
+            self,
+            Self::VanishedFile | Self::StoreBusy | Self::MigrationInProgress
+        )
+    }
+}
+
+struct EnrollmentFailure {
+    kind: EnrollmentFailureKind,
+    error: String,
+}
+
+impl EnrollmentFailure {
+    fn new(kind: EnrollmentFailureKind, error: impl Into<String>) -> Self {
+        Self {
+            kind,
+            error: error.into(),
+        }
+    }
+
+    fn wal(error: broca_wal::WalError) -> Self {
+        let kind = match &error {
+            broca_wal::WalError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+                EnrollmentFailureKind::VanishedFile
+            }
+            broca_wal::WalError::SessionMoving { .. }
+            | broca_wal::WalError::SessionMoved { .. } => {
+                EnrollmentFailureKind::MigrationInProgress
+            }
+            broca_wal::WalError::Corrupt {
+                source: broca_wal::framing::FrameError::NonTailIncompleteFrame,
+                ..
+            } => EnrollmentFailureKind::MidWrite,
+            _ => EnrollmentFailureKind::UnreadableFile,
+        };
+        Self::new(kind, error.to_string())
+    }
+
+    fn store(error: String) -> Self {
+        let lower = error.to_ascii_lowercase();
+        let kind = if [
+            "database is locked",
+            "database is busy",
+            "store busy",
+            "sqlite_busy",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            EnrollmentFailureKind::StoreBusy
+        } else {
+            EnrollmentFailureKind::UnreadableFile
+        };
+        Self::new(kind, error)
+    }
+}
+
+impl From<String> for EnrollmentFailure {
+    fn from(error: String) -> Self {
+        Self::new(EnrollmentFailureKind::UnreadableFile, error)
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +576,17 @@ impl RetentionService {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         broca_wal::read_records_range(path, self.wal.max_read_bytes(), 0, None, None)
             .map_err(|e| e.to_string())
+    }
+
+    fn read_enrollment_path(
+        &self,
+        path: &Path,
+    ) -> Result<broca_wal::WalRangeRead, EnrollmentFailure> {
+        #[cfg(test)]
+        self.file_work
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        broca_wal::read_records_range(path, self.wal.max_read_bytes(), 0, None, None)
+            .map_err(EnrollmentFailure::wal)
     }
 
     fn initial_lineage(&self, path: &Path) -> Result<String, String> {
@@ -892,39 +988,59 @@ impl RetentionService {
             match self.enroll_path(&path) {
                 Ok(true) => replayed += 1,
                 Ok(false) => {}
-                Err(_) => {
-                    tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
-                        "enrollment deferred");
-                    state.retry.insert(path);
+                Err(failure) => {
+                    if failure.kind.is_benign_race() {
+                        state.deferred_races = state.deferred_races.saturating_add(1);
+                        tracing::debug!(target: "retention.enrollment", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                            kind = failure.kind.as_str(), error = %failure.error, counter = state.deferred_races,
+                            "enrollment deferred");
+                    } else {
+                        tracing::warn!(target: "retention", session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                            kind = failure.kind.as_str(), error = %failure.error,
+                            "enrollment deferred");
+                    }
+                    if failure.kind != EnrollmentFailureKind::VanishedFile {
+                        state.retry.insert(path);
+                    }
                 }
             }
         }
         Ok(replayed)
     }
 
-    fn enroll_path(&self, path: &Path) -> Result<bool, String> {
+    fn enroll_path(&self, path: &Path) -> Result<bool, EnrollmentFailure> {
         #[cfg(test)]
         self.file_work
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = match fs::metadata(path) {
             Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.to_string()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(EnrollmentFailure::new(
+                    EnrollmentFailureKind::VanishedFile,
+                    error.to_string(),
+                ));
+            }
+            Err(error) => return Err(error.to_string().into()),
         };
-        let portable = self
-            .wal
-            .root()
-            .join(path.file_name().ok_or("retention WAL filename")?);
+        let portable =
+            self.wal
+                .root()
+                .join(path.file_name().ok_or_else(|| {
+                    EnrollmentFailure::from("retention WAL filename".to_string())
+                })?);
         if portable
             .with_extension("moving")
             .try_exists()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             || portable
                 .with_extension("moved")
                 .try_exists()
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
         {
-            return Err("retention enrollment deferred by migration marker".into());
+            return Err(EnrollmentFailure::new(
+                EnrollmentFailureKind::MigrationInProgress,
+                "retention enrollment deferred by migration marker",
+            ));
         }
         // The hashed address is not reversible. Writers leave a content-free identity
         // sidecar; older WALs without one need replay to discover their session.
@@ -932,39 +1048,53 @@ impl RetentionService {
             Ok(found) => found,
             Err(error) => {
                 if path.try_exists().is_ok_and(|exists| !exists) {
-                    return Ok(false);
+                    return Err(EnrollmentFailure::new(
+                        EnrollmentFailureKind::VanishedFile,
+                        error.error,
+                    ));
                 }
-                self.mark_unreadable_address(
-                    path.file_stem()
-                        .ok_or("retention address missing")?
-                        .to_string_lossy()
-                        .into(),
-                );
+                if error.kind == EnrollmentFailureKind::UnreadableFile {
+                    self.mark_unreadable_address(
+                        path.file_stem()
+                            .ok_or_else(|| {
+                                EnrollmentFailure::from("retention address missing".to_string())
+                            })?
+                            .to_string_lossy()
+                            .into(),
+                    );
+                }
                 return Err(error);
             }
         };
         let Some(key) = first else { return Ok(false) };
-        self.wal.check_move(&key, true).map_err(|e| e.to_string())?;
+        self.wal
+            .check_move(&key, true)
+            .map_err(EnrollmentFailure::wal)?;
         let matching = self
             .index
-            .live(&key)?
+            .live(&key)
+            .map_err(EnrollmentFailure::store)?
             .is_some_and(|row| row.wal_bytes == bytes);
         if matching && !discovered {
             return Ok(false);
         }
-        let _lease = self.lease(&key)?;
+        let _lease = self.lease(&key).map_err(EnrollmentFailure::store)?;
         if discovered {
-            self.remember_session(&key)?;
+            self.remember_session(&key)
+                .map_err(EnrollmentFailure::store)?;
         }
         if !matching {
             if let Err(error) = self.rederive(&key) {
                 if path.try_exists().is_ok_and(|exists| !exists) {
-                    return Ok(false);
+                    return Err(EnrollmentFailure::new(
+                        EnrollmentFailureKind::VanishedFile,
+                        error,
+                    ));
                 }
                 if self.read_path(path).is_err() {
                     self.mark_unreadable(&key);
                 }
-                return Err(error);
+                return Err(EnrollmentFailure::store(error));
             }
         }
         Ok(true)
@@ -993,7 +1123,10 @@ impl RetentionService {
             .collect()
     }
 
-    fn read_first_session(&self, path: &Path) -> Result<(Option<BindIdentity>, bool), String> {
+    fn read_first_session(
+        &self,
+        path: &Path,
+    ) -> Result<(Option<BindIdentity>, bool), EnrollmentFailure> {
         #[cfg(test)]
         self.file_work
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1009,7 +1142,7 @@ impl RetentionService {
                 }
             }
         }
-        let read = self.read_path(path)?;
+        let read = self.read_enrollment_path(path)?;
         Ok((
             frames(&read).iter().find_map(|frame| match &frame.record {
                 WalRecord::RunStarted { session, .. } => Some(session.clone()),
