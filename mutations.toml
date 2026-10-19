@@ -1854,6 +1854,29 @@ old = "retry_after_s: detail[\"retry_after_s\"].as_u64(),"
 new = "retry_after_s: None, // NON-VACUITY BREAK"
 
 [[control]]
+id = "routing-refusal-warning"
+guards = "routing refusals are warned with the send and routing decision identity"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/account_routing_tests.rs"
+expect_red = ["account_routing::tests::refusal_log_names_send_and_routing_decision"]
+file = "crates/broca-module-serve/src/account_routing.rs"
+old = '''            tracing::warn!(
+                target: "routing",
+                session = %broca_core::session_addr(inputs.session),
+                send_id = inputs.send_id.unwrap_or("<none>"),
+                provider = %provider,
+                auth_method = method.as_token(),
+                routing_code = %refusal.routing_code,
+                class = ?refusal.class,
+                retry_after_s = ?refusal.retry_after_s,
+                decision_id = refusal.decision_id.as_deref().unwrap_or("<none>"),
+                "routing refused account selection"
+            );'''
+new = "// NON-VACUITY BREAK: refusal logs are needed to identify affected sends"
+
+[[control]]
 id = "wire-account-refusal-retry-hint"
 guards = "account_selection_refused repeats routing's wait as the generic retry_after_secs hint"
 runner = "cargo"

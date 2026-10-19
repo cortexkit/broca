@@ -2867,6 +2867,7 @@ mod executor {
                     caller_named_account: pinned_account.is_some(),
                     model: req.model.model_id.as_str(),
                     session: &req.session,
+                    send_id: req.send_id.as_deref(),
                     run_id: &req.run_id.0,
                     initial_input_bytes,
                 },

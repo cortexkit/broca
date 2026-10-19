@@ -164,6 +164,7 @@ async fn choose(
             caller_named_account,
             model: "claude-opus-5-5",
             session: &session(),
+            send_id: None,
             run_id: "run-1",
             initial_input_bytes: 42,
         },
@@ -243,7 +244,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let static_credential = CredentialId::parse("oauth:anthropic").unwrap();
     let budget = Duration::from_millis(250);
     let started = std::time::Instant::now();
-    let choice = choose_account(
+    let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
             conversation_key: None,
@@ -252,14 +253,15 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
             caller_named_account: false,
             model: "claude-opus-5-5",
             session: &session(),
+            send_id: None,
             run_id: "run-1",
             initial_input_bytes: 0,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + budget,
-    )
-    .await
-    .unwrap();
+    ))
+    .await;
+    let choice = choice.unwrap();
     let elapsed = started.elapsed();
     assert_eq!(path_of(&choice), "unreachable");
     assert_eq!(
@@ -271,6 +273,11 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
         elapsed >= budget && elapsed < budget + Duration::from_millis(500),
         "waited {elapsed:?} for a {budget:?} budget"
     );
+    assert!(events.iter().any(|event| {
+        event.target == "routing"
+            && event.level == tracing::Level::INFO
+            && event.message().contains("takes the static account")
+    }));
     // The production budget leaves the caller's 10 s send deadline room for a 5 s vault read.
     assert!(ADMISSION_BUDGET <= Duration::from_secs(2));
 }
@@ -290,6 +297,7 @@ async fn a_slow_listing_shares_the_admission_budget() {
             caller_named_account: false,
             model: "claude-opus-5-5",
             session: &session(),
+            send_id: None,
             run_id: "run-1",
             initial_input_bytes: 0,
         },
@@ -429,6 +437,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
             caller_named_account: false,
             model: "claude-opus-5-5",
             session: &session(),
+            send_id: None,
             run_id: "run-1",
             initial_input_bytes: 42,
         },
@@ -521,6 +530,57 @@ async fn refusal_for(code: &str) -> AccountSelectionRefusal {
     assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP], "asked once");
     assert_eq!(client.counters.get(&format!("refused.{code}")), 1);
     refusal
+}
+
+#[tokio::test]
+async fn refusal_log_names_send_and_routing_decision() {
+    let routing = FakeRouting::refusing(
+        "account_hold",
+        json!({
+            "code": "account_hold",
+            "retry_after_s": 1260,
+            "decision_id": "acd-refused",
+            "exclusions": [],
+        }),
+    );
+    let client = client(&routing);
+    let credential = CredentialId::parse("oauth:anthropic").unwrap();
+    let session = session();
+    let (result, events) = broca_test_support::capture_logs(choose_account(
+        &client,
+        ChoiceInputs {
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &credential,
+            caller_named_account: false,
+            model: "claude-opus-5-5",
+            session: &session,
+            send_id: Some("send-refused"),
+            run_id: "run-refused",
+            initial_input_bytes: 42,
+        },
+        async { Some(two_accounts()) },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    ))
+    .await;
+
+    let refusal = result.expect_err("routing refusal passes through");
+    assert_eq!(refusal.routing_code, "account_hold");
+    assert_eq!(refusal.class, ErrorClass::Transient);
+    assert_eq!(refusal.retry_after_s, Some(1260));
+    assert_eq!(refusal.decision_id.as_deref(), Some("acd-refused"));
+    let event = events
+        .iter()
+        .find(|event| event.target == "routing" && event.level == tracing::Level::WARN)
+        .expect("routing refusal warning");
+    assert_eq!(
+        event.fields.get("send_id").map(String::as_str),
+        Some("send-refused")
+    );
+    assert_eq!(
+        event.fields.get("decision_id").map(String::as_str),
+        Some("acd-refused")
+    );
 }
 
 fn transient(code: &str) -> AccountSelectionRefusal {
