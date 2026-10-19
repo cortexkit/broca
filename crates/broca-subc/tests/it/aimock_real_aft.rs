@@ -144,6 +144,7 @@ async fn loop_drives_aimock_through_real_aft() {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: format!("Read the file {rel_name} and report its contents."),

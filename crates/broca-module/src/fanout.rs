@@ -1185,6 +1185,7 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -1202,6 +1203,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                render_tags: false,
                 model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                 tools: vec![].into(),
                 tool_choice: Default::default(),
@@ -1230,6 +1232,7 @@ mod tests {
 
     fn tool_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: (AssistantMessage {
@@ -1277,6 +1280,7 @@ mod tests {
     #[cfg(unix)]
     fn text_step(step_id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(step_id),
             assistant_message: (AssistantMessage {
@@ -1865,6 +1869,7 @@ mod tests {
         );
 
         writer.record(WalRecord::BudgetFired {
+            tags: None,
             run_id: RunId("r1".into()),
             kind: broca_protocol::request::BudgetKind::Finalize,
             threshold: 1,
@@ -2362,6 +2367,7 @@ mod tests {
             framed(
                 3,
                 WalRecord::ToolResult {
+                    tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("b1".into()),
                     result: broca_protocol::content::ToolResult {
@@ -2618,6 +2624,7 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    tags: None,
                     session_class: None,
                     retention: None,
                     hooks: None,
@@ -2635,6 +2642,7 @@ mod tests {
                     run_id: RunId("r1".into()),
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
+                        render_tags: false,
                         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                         tools: vec![].into(),
                         tool_choice: Default::default(),
@@ -2664,6 +2672,7 @@ mod tests {
                 seq: 2,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(1),
                     assistant_message: AssistantMessage {

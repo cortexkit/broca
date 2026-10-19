@@ -23,6 +23,7 @@ fn msg(text: &str) -> Message {
         content: vec![ContentBlock::Text { text: text.into() }],
         origin: None,
         ordinal: None,
+        tags: Default::default(),
     }
 }
 
@@ -75,6 +76,7 @@ fn retracted(id: &str) -> WalRecord {
 
 fn consume(run: &str, sub: &str) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -92,6 +94,7 @@ fn consume(run: &str, sub: &str) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("stub", "m"),
             tools: vec![].into(),
             tool_choice: ToolChoice::Auto,

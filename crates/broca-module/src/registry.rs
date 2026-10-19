@@ -4447,6 +4447,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -4464,6 +4465,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                render_tags: false,
                 model: ModelHandle::new("stub", "stub-model"),
                 tools: Vec::new().into(),
                 tool_choice: ToolChoice::Auto,
@@ -4498,6 +4500,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: (AssistantMessage {

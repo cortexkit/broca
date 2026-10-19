@@ -34,6 +34,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -51,6 +52,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
                 run_id: RunId("maintenance-run".into()),
                 session: session.clone(),
                 config: Box::new(RunConfig {
+                    render_tags: false,
                     model: ModelHandle::new("import", "import"),
                     tools: Vec::new().into(),
                     tool_choice: Default::default(),

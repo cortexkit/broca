@@ -10,6 +10,7 @@ fn root(tag: &str) -> std::path::PathBuf {
 }
 pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -27,6 +28,7 @@ pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: vec![].into(),
             tool_choice: broca_protocol::ToolChoice::Auto,

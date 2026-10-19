@@ -191,6 +191,7 @@ pub fn close_out_open_batch(
             ),
         };
         records.push(WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: batch.batch_id.clone(),
             result: Arc::new(result),

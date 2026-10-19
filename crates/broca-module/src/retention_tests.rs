@@ -8,6 +8,7 @@ const MARKER: &str = "RETENTION-MODULE-CONTENT-SENTINEL-59137";
 #[cfg(any(target_os = "linux", feature = "test-clock"))]
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: broca_protocol::StepId(1),
         assistant_message: broca_protocol::AssistantMessage {
@@ -538,6 +539,48 @@ fn sweep_confirms_wal_before_tombstoning_a_stale_candidate() {
     );
 }
 
+/// Deleting a tagged lineage records the tag its next part would have had, and the address's
+/// next lineage counts on from there, so no tag is reused across the deletion.
+#[test]
+fn deletion_records_the_next_tag_and_a_later_lineage_starts_past_it() {
+    let rig = Rig::new();
+    {
+        let _lease = rig.service.lease(&rig.key).unwrap();
+        let mut wal = rig
+            .service
+            .wal
+            .open_with_retention(&rig.key, Some(1))
+            .unwrap();
+        let mut start = started(&rig.key, "r1", Some(1), 100);
+        if let WalRecord::RunStarted { tags, .. } = &mut start {
+            *tags = Some(Arc::new(vec![broca_protocol::tags::MessageTags::new(
+                vec![41],
+            )]));
+        }
+        wal.append(1, &start, true).unwrap();
+        wal.append(1, &finished(200), true).unwrap();
+        rig.service.remember_session(&rig.key).unwrap();
+    }
+    assert_eq!(rig.service.wal.retired_tag_floor(&rig.key).unwrap(), 1);
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert!(rig
+        .service
+        .delete_expired(&rig.key, 1200)
+        .unwrap()
+        .is_some());
+    let stone = rig.service.tombstones(&rig.key).unwrap().pop().unwrap();
+    assert_eq!(stone.next_tag, Some(42));
+    assert_eq!(rig.service.wal.retired_tag_floor(&rig.key).unwrap(), 42);
+    // The next lineage at the address is unstarted; seeded with the floor, its first part gets
+    // the next unused tag rather than 1.
+    assert_eq!(
+        broca_core::LineageTags::unstarted()
+            .with_floor(rig.service.wal.retired_tag_floor(&rig.key).unwrap())
+            .next(),
+        Some(42)
+    );
+}
+
 #[test]
 fn sweep_deletes_and_keeps_terminal_content_free_rows() {
     let rig = Rig::new();
@@ -896,6 +939,7 @@ fn sidecar_removal_failure_leaves_completion_retryable() {
         .with_extension("session");
     let temp = side.with_extension("session.tmp");
     let stone = Tombstone {
+        next_tag: None,
         lineage_id: id.clone(),
         expired_at_ms: 1200,
         seq: 1,
@@ -931,6 +975,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
     let rig = Rig::new();
     let id = rig.seed(30, 100, Some(200));
     let stone = Tombstone {
+        next_tag: None,
         lineage_id: id.clone(),
         expired_at_ms: u64::MAX - 10,
         seq: 2,
@@ -948,6 +993,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                next_tag: None,
                 lineage_id: "a".repeat(32),
                 expired_at_ms: 1,
                 seq: 3,
@@ -1002,6 +1048,7 @@ fn unfinished_deletion_resumes_each_disk_boundary_and_never_moves_a_new_lineage(
         let rig = Rig::new();
         let id = rig.seed(1, 100, Some(200));
         let stone = Tombstone {
+            next_tag: None,
             lineage_id: id.clone(),
             expired_at_ms: 1200,
             seq: 1,
@@ -1888,6 +1935,7 @@ async fn expiry_frees_cached_sender_and_ownership_for_the_next_lineage() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                next_tag: None,
                 lineage_id: id,
                 expired_at_ms: now + RETAINED_SECONDS * 1000,
                 seq: 1,
@@ -1999,6 +2047,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
             assistant_message: broca_protocol::AssistantMessage {
@@ -2048,6 +2097,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ToolResult {
+            tags: None,
             batch_id: broca_protocol::BatchId("b".into()),
             result: broca_core::not_dispatched_result(&broca_protocol::ToolCallId("c".into()))
                 .into(),
@@ -2193,6 +2243,7 @@ fn interrupted_retention_deletion_exports_owed_identity_without_restoring_wal() 
     let _lease = rig.service.lease(&rig.key).unwrap();
     rig.service.rederive(&rig.key).unwrap();
     let stone = Tombstone {
+        next_tag: None,
         lineage_id: lineage.clone(),
         expired_at_ms: 1020,
         seq: 1,
@@ -2916,6 +2967,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: broca_protocol::StepId(1),
                 assistant_message: broca_protocol::AssistantMessage {
@@ -3216,6 +3268,7 @@ fn readable_record_first_legacy_deletion_accepts_live_and_moved_layouts() {
         );
         if moved {
             let stone = Tombstone {
+                next_tag: None,
                 lineage_id: id.clone(),
                 expired_at_ms: 1200,
                 seq: 1,
@@ -3515,6 +3568,7 @@ async fn missing_materialized_history_is_not_known_empty_ownership() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
             assistant_message: broca_protocol::AssistantMessage {
@@ -3576,6 +3630,7 @@ async fn zero_record_wal_does_not_hide_materialized_ownership_history() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: broca_protocol::StepId(1),
                 assistant_message: broca_protocol::AssistantMessage {
@@ -3644,6 +3699,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
             assistant_message: broca_protocol::AssistantMessage {
@@ -3779,6 +3835,7 @@ async fn cold_forever_status_performs_no_full_wal_reads_before_ordinary_open() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
             assistant_message: broca_protocol::AssistantMessage {
@@ -4129,6 +4186,7 @@ fn deletion_recovery_isolates_persistent_bad_tombstone_and_evicts_good_keys() {
             .write_tombstone(
                 &rig.key,
                 &Tombstone {
+                    next_tag: None,
                     lineage_id: id.clone(),
                     expired_at_ms: 1200,
                     seq: 1,

@@ -60,6 +60,7 @@ mod gated {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "ping".into(),
@@ -665,6 +666,7 @@ mod gated {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::System,
                 content: vec![ContentBlock::Text {
                     text: "system prefix".into(),
@@ -674,6 +676,7 @@ mod gated {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "m0 stable prefix".into(),
@@ -683,6 +686,7 @@ mod gated {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "latest user boundary".into(),

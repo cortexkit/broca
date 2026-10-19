@@ -420,6 +420,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    tags: None,
                     session_class: None,
                     retention: None,
                     hooks: None,
@@ -437,6 +438,7 @@ mod tests {
                     session,
                     ts_ms: Some(now - age * DAY_MS),
                     config: Box::new(RunConfig {
+                        render_tags: false,
                         model: broca_protocol::ModelHandle::new("stub", "m"),
                         tools: vec![].into(),
                         tool_choice: broca_protocol::ToolChoice::Auto,
@@ -756,6 +758,7 @@ mod identity_tests {
         wal.append(
             1,
             &broca_wal::WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -773,6 +776,7 @@ mod identity_tests {
                 session: broca_protocol::BindIdentity::new("/old-location", "runner", "legacy"),
                 ts_ms: Some(1),
                 config: Box::new(broca_wal::RunConfig {
+                    render_tags: false,
                     model: broca_protocol::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: broca_protocol::ToolChoice::Auto,

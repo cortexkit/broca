@@ -6,6 +6,7 @@ const THREE_MIB: usize = 3 * 1024 * 1024;
 
 fn message(ordinal: u64, len: usize) -> SessionReadMessage {
     SessionReadMessage {
+        tags: Vec::new(),
         ordinal,
         mid: format!("m{ordinal}"),
         message: Message::new(

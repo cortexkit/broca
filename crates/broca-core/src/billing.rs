@@ -844,6 +844,7 @@ mod tests {
 
     fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
         RunConfig {
+            render_tags: false,
             model: ModelHandle::new(provider, model),
             tools: vec![].into(),
             tool_choice: ToolChoice::Auto,
@@ -884,6 +885,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -918,6 +920,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(id),
                 assistant_message: (AssistantMessage {
@@ -1082,6 +1085,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::BudgetFired {
+                    tags: None,
                     run_id: RunId("budget".into()),
                     kind: BudgetKind::Nudge,
                     threshold: 1,
@@ -1500,6 +1504,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,

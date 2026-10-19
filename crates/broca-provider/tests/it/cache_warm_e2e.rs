@@ -298,6 +298,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role,
             content: vec![ContentBlock::Text { text: text.into() }],
         }

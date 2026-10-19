@@ -1723,6 +1723,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(2),
                     assistant_message: broca_protocol::AssistantMessage {
@@ -1847,6 +1848,7 @@ mod tests {
 
     fn run_started(n: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(n),
             assistant_message: (broca_protocol::content::AssistantMessage {
@@ -2152,6 +2154,7 @@ mod tests {
     #[cfg(unix)]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(n),
             assistant_message: (broca_protocol::content::AssistantMessage {
@@ -2729,6 +2732,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(i),
                     assistant_message: (broca_protocol::content::AssistantMessage {

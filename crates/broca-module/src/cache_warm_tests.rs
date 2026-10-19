@@ -812,6 +812,7 @@ impl Fixture {
         });
         let records = [
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -857,6 +858,7 @@ impl Fixture {
                 served_account_ref: None,
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: broca_protocol::content::AssistantMessage {

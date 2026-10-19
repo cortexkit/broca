@@ -70,6 +70,7 @@ async fn openai_chat_family_runs_live_against_a_compatible_provider() {
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Reply with exactly the word: pong".into(),

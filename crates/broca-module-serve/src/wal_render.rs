@@ -24,6 +24,10 @@ pub fn render_step(
     {
         restore_repetition_guidance(&mut prior.prompt[span]);
     }
+    // A run frozen with `render_tags` sent tagged user and tool-result text with its tag prefix.
+    if config.render_tags {
+        broca_protocol::tags::render_tags_into(&mut prior.prompt);
+    }
     let frozen: FrozenRenderConfig = serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|e| format!("decode frozen_render_config: {e}"))?;
     let family = broca_provider::registry::wire_family(frozen.family_id)
@@ -75,6 +79,7 @@ mod tests {
                 })],
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 cache_prefix_blocks: None,
             },
             Message {
@@ -86,6 +91,7 @@ mod tests {
                 })],
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 cache_prefix_blocks: None,
             },
         ]

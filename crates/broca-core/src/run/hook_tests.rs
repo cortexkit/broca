@@ -1187,6 +1187,7 @@ async fn excluded_unknown(interrupted: bool) {
 
 fn result_record(id: &str, text: &str) -> WalRecord {
     WalRecord::ToolResult {
+        tags: None,
         batch_id: BatchId("b".into()),
         result: Arc::new(ToolResult {
             tool_call_id: ToolCallId(id.into()),
@@ -1214,6 +1215,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
         tool_call_id: "a".into(),
     };
     let model = WalRecord::ModelStepFinished {
+        tags: None,
         step_id: StepId(1),
         assistant_message: Arc::new(AssistantMessage {
             message_id: broca_protocol::MessageId("m".into()),

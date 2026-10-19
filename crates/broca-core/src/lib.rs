@@ -44,6 +44,7 @@ pub mod scope_admission;
 pub mod shutdown_seal;
 pub mod steer;
 pub mod stub_plane;
+pub mod tags;
 pub mod tool_plane;
 pub mod tool_repetition;
 pub mod wal_fold;
@@ -144,6 +145,7 @@ pub use run::{
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::SteerInbox;
 pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
+pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
 pub use wal_writer::{
     agent_session_ref, session_addr, FileWalStore, ObservedRecord, ReadOnlyWalReader,

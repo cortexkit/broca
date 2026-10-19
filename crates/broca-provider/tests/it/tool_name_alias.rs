@@ -21,6 +21,7 @@ fn options() -> CallOptions {
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         role: Role::Assistant,
         content: vec![ContentBlock::ToolCall(ToolCall {
             thought_signature: None,

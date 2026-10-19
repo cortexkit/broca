@@ -19,6 +19,7 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -36,6 +37,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
         run_id: RunId("r1".into()),
         session: BindIdentity::new("/tmp/project", "runner", "session"),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("stub", "m"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -64,6 +66,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
 
 fn steered(text: &str) -> WalRecord {
     WalRecord::Steered {
+        tags: None,
         retention: None,
         ts_ms: None,
         title: None,
@@ -83,6 +86,7 @@ fn step_started(step: u64) -> WalRecord {
 
 fn text_step(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: Arc::new(AssistantMessage {
@@ -99,6 +103,7 @@ fn text_step(step: u64, text: &str) -> WalRecord {
 
 fn call_step(step: u64, call: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: Arc::new(AssistantMessage {
@@ -144,6 +149,7 @@ fn tool_turn(step: u64, call: &str) -> (Vec<WalRecord>, Vec<WalRecord>) {
         ],
         vec![
             WalRecord::ToolResult {
+                tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),
                 result: Arc::new(ToolResult {

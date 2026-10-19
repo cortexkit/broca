@@ -20,6 +20,7 @@ fn session(i: usize) -> BindIdentity {
 }
 fn record(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -37,6 +38,7 @@ fn record(session: &BindIdentity) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("stub", "synthetic"),
             tools: vec![].into(),
             tool_choice: Default::default(),

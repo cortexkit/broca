@@ -347,6 +347,7 @@ fn session_read_response(
             .map(|message| SessionReadMessage {
                 ordinal: message.ordinal,
                 mid: format!("m{}", message.ordinal),
+                tags: broca_wire::tag_rows(message.ordinal, &message.message),
                 message: message.message,
                 run: message.run,
                 tool_calls: Vec::new(),

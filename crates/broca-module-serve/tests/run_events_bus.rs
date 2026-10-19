@@ -53,10 +53,12 @@ fn scratch() -> Scratch {
 
 fn started(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         run_id: RunId("bus-run".into()),
         session: session.clone(),
         ts_ms: Some(now_ms()),
         config: Box::new(RunConfig {
+            render_tags: false,
             model: ModelHandle::new("fixture", "model"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -223,6 +225,7 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
         .append(
             1,
             &WalRecord::Steered {
+                tags: None,
                 retention: None,
                 ts_ms: Some(now_ms()),
                 send_id: Some("steer-a".into()),

@@ -2245,6 +2245,7 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
     let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
     let key = crate::context::call_key(rig.writer.lineage_id().unwrap(), seq);
     let approval = WalRecord::ApprovalRecorded {
+        tags: None,
         call_key: key,
         call_id: ToolCallId("c".into()),
         elicitation_id: Some("q".into()),
@@ -2479,6 +2480,7 @@ async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
         .unwrap();
     let key = crate::context::call_key(writer.lineage_id().unwrap(), prepared.seq);
     writer.record(WalRecord::ApprovalRecorded {
+        tags: None,
         call_key: key,
         call_id: ToolCallId("c".into()),
         elicitation_id: Some("q".into()),

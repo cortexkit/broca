@@ -17,6 +17,7 @@ fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
+        tags: Default::default(),
     }
 }
 
@@ -27,6 +28,7 @@ fn assistant_from(model: &str, content: Vec<ContentBlock>) -> Message {
         content,
         origin: Some(ModelHandle::new("anthropic", model)),
         ordinal: None,
+        tags: Default::default(),
     }
 }
 

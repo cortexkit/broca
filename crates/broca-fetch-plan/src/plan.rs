@@ -68,6 +68,10 @@ pub struct Plan {
     pub composition_digest: String,
     /// Each provider's composed tools, by provider id.
     pub composed: BTreeMap<String, Vec<ComposedTool>>,
+    /// Whether the session's runs show runner tags (`§N§ `) to the model on user and
+    /// tool-result text. The plan's optional `render_tags` boolean; absent means off. Each run
+    /// freezes it at admission.
+    pub render_tags: bool,
 }
 
 /// Hex SHA-256 of `bytes`.
@@ -272,6 +276,11 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
             "plan.system_text_items[{index}].optional"
         )));
     }
+    let render_tags = match object.get("render_tags") {
+        None => false,
+        Some(Value::Bool(render)) => *render,
+        Some(_) => return Err(Refusal::invalid("plan.render_tags")),
+    };
     let compaction_item = match object.get("compaction_item") {
         None => None,
         Some(value) => Some(item(value, "plan.compaction_item", false)?),
@@ -426,5 +435,6 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
         composition,
         composition_digest: digest,
         composed,
+        render_tags,
     })
 }

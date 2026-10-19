@@ -178,6 +178,7 @@ fn request(project_root: &Path) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "write two notes through the real subc spine".into(),

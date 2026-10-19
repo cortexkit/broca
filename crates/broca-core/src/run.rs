@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use broca_protocol::structured_output::FrozenStructuredOutput;
+use broca_protocol::tags::MessageTags;
 use broca_protocol::BindIdentity;
 use broca_protocol::{
     caller::{ControlUnit, PauseReason, RunFinishReason, SharedProviderError},
@@ -1529,6 +1530,19 @@ where
     )?;
 
     writer.seed_lineage_retention(snapshot.checkpoint_at_head.lineage_retention);
+    // A lineage that has not started counts on from any lineage retention deleted at this
+    // address, so a tag is never reused across the deletion.
+    let lineage_tags = match snapshot.checkpoint_at_head.tags {
+        Some(tags @ crate::tags::LineageTags::Unstarted { .. }) => Some(
+            tags.with_floor(
+                wal_store
+                    .retired_tag_floor(&req.session)
+                    .map_err(|error| RunError::Wal(error.to_string()))?,
+            ),
+        ),
+        other => other,
+    };
+    writer.seed_lineage_tags(lineage_tags);
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
     let last_input = episode.map(|episode| episode.input.clone());
@@ -1870,6 +1884,7 @@ fn due_budget_firings(
 impl BudgetFiring {
     fn record(&self, run_id: &RunId) -> WalRecord {
         WalRecord::BudgetFired {
+            tags: None,
             run_id: run_id.clone(),
             kind: self.kind,
             threshold: self.threshold,
@@ -1898,6 +1913,47 @@ fn apply_committed_budget_firings(
     }
 }
 
+/// Attach the tags the writer kept for steered messages, in the order their records were
+/// written: each `Steered` record's tags cover its messages one for one.
+fn attach_steer_tags(writer: &WalHandle, steered: &mut [Message]) {
+    let mut pending: std::collections::VecDeque<MessageTags> = Default::default();
+    for message in steered {
+        if pending.is_empty() {
+            match writer.take_steer_tags() {
+                Some(tags) => pending.extend(tags),
+                None => return,
+            }
+        }
+        crate::tags::attach(message, pending.pop_front().as_ref());
+    }
+}
+
+/// The tags of the tool-role message holding `results`: each result's tag from `existing`
+/// (a terminal recovered from the WAL) or else the one the writer kept when it appended the
+/// result. `None` unless every result has one.
+fn live_result_tags(
+    writer: &WalHandle,
+    results: &[ToolResult],
+    existing: &mut std::collections::HashMap<ToolCallId, std::collections::VecDeque<u64>>,
+) -> Option<MessageTags> {
+    let parts: Option<Vec<u64>> = results
+        .iter()
+        .map(|result| {
+            existing
+                .get_mut(&result.tool_call_id)
+                .and_then(std::collections::VecDeque::pop_front)
+                .or_else(|| {
+                    writer
+                        .take_call_tags(&result.tool_call_id)
+                        .and_then(|tags| tags.parts.first().copied())
+                })
+        })
+        .collect();
+    parts
+        .filter(|parts| !parts.is_empty())
+        .map(MessageTags::new)
+}
+
 fn record_budget_firings(writer: &WalHandle, run_id: &RunId, firings: &[BudgetFiring]) {
     for firing in firings {
         writer.record(firing.record(run_id));
@@ -1905,6 +1961,7 @@ fn record_budget_firings(writer: &WalHandle, run_id: &RunId, firings: &[BudgetFi
 }
 
 async fn append_budget_firings(
+    writer: &WalHandle,
     prompt: &mut Vec<Message>,
     run_id: &RunId,
     firings: &[BudgetFiring],
@@ -1912,12 +1969,17 @@ async fn append_budget_firings(
 ) {
     for firing in firings {
         debug_assert_eq!(prompt.len() as u64, firing.ordinal);
-        prompt.push(Message::new(
+        let mut message = Message::new(
             Role::User,
             vec![ContentBlock::Text {
                 text: firing.text.clone(),
             }],
-        ));
+        );
+        crate::tags::attach(
+            &mut message,
+            writer.take_budget_tags(firing.ordinal).as_ref(),
+        );
+        prompt.push(message);
         let _ = send(
             out,
             OutputEvent::Control(ControlUnit::BudgetFired {
@@ -2846,6 +2908,24 @@ where
             return Err(error);
         }
     };
+    // Whether this run shows runner tags to the model: frozen in the run's own config on a
+    // resume, read from the session's frozen plan when a new episode is admitted. A lineage
+    // admitted before tags existed has none to show, so it never renders them and its records
+    // keep their exact bytes.
+    let render_tags = if is_resume && !append_episode {
+        prior
+            .run_config
+            .as_ref()
+            .is_some_and(|config| config.render_tags)
+    } else {
+        writer.lineage_tags() != Some(crate::tags::LineageTags::Off)
+            && control
+                .manifest
+                .as_deref()
+                .or(prior.manifest.as_deref())
+                .is_some_and(crate::tags::plan_renders_tags)
+    };
+    writer.retain_live_tags(render_tags);
     let context_limit = if is_resume && !append_episode {
         prior
             .run_config
@@ -3748,7 +3828,8 @@ where
         // synced, reclaim the vector when no observer retained the record; otherwise the mutable
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
-        let run_started_seq = writer.record(WalRecord::RunStarted {
+        let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
+            tags: None,
             session_class: req.session_class.clone(),
             retention: req.retention,
             hooks: control.input_hooks.clone().map(|mut hooks| {
@@ -3776,6 +3857,7 @@ where
             session: req.session.clone(),
             config: remember_warm_config(
                 RunConfig {
+                    render_tags,
                     model: cfg.model.clone(),
                     tools: Arc::clone(&tools),
                     tool_choice: cfg.tool_choice.clone(),
@@ -3862,7 +3944,16 @@ where
         } else {
             Vec::new()
         };
+        let input_start = prompt.len();
         prompt.extend(Arc::unwrap_or_clone(episode_input));
+        // The writer tagged the input as it appended the RunStarted; the prompt's copies carry
+        // the same tags, as replay attaches them.
+        for (message, tags) in prompt[input_start..]
+            .iter_mut()
+            .zip(input_tags.iter().flatten())
+        {
+            crate::tags::attach(message, Some(tags));
+        }
         stamped_len = lineage_prefix_stamped_len;
         total_usage = Usage::default();
         total_retries_used = 0;
@@ -4015,7 +4106,7 @@ where
             &resolved_run_id,
             &budget_firings,
         );
-        append_budget_firings(&mut prompt, &resolved_run_id, &budget_firings, out).await;
+        append_budget_firings(writer, &mut prompt, &resolved_run_id, &budget_firings, out).await;
         if let Some(reason) = interrupt.0 {
             // The completed turn was itself ambiguous → interrupt.
             control.close_steers();
@@ -4049,6 +4140,8 @@ where
     // Reuse one immutable request snapshot for the whole turn loop. The renderer owns a
     // cloned Arc while its blocking job runs, so every append below first proves that no
     // in-flight render can force a copy of the durable prompt.
+    // How much of the prompt has had its runner tags rendered (see `render_tags`).
+    let mut tags_rendered_len = 0;
     let mut opts = Arc::new(CallOptions {
         ephemeral_session: retention_lineage()?,
         render_episodes: Arc::new(render_episodes.into()),
@@ -4104,6 +4197,7 @@ where
                 &recovered_firings,
             );
             append_budget_firings(
+                writer,
                 &mut mutable_call_options(&mut opts).prompt,
                 &resolved_run_id,
                 &recovered_firings,
@@ -4167,6 +4261,7 @@ where
                 Vec::new()
             }
         };
+        attach_steer_tags(writer, &mut steered);
         steer_backlog.append(&mut steered);
         if !steer_backlog.is_empty() {
             mutable_call_options(&mut opts)
@@ -4187,6 +4282,16 @@ where
                 raw.extend_from_slice(&opts.prompt[raw.len()..]);
             }
             broca_protocol::content::stamp_ordinals(raw);
+        }
+        // A run frozen with `render_tags` shows each tagged user and tool-result text part
+        // with its `§N§ ` prefix. Each message is rendered once, the first time a request
+        // includes it, and depends only on its stored text and tags, so every later request
+        // repeats the same bytes. The native copies above stay unprefixed.
+        if render_tags && tags_rendered_len < opts.prompt.len() {
+            broca_protocol::tags::render_tags_into(
+                &mut mutable_call_options(&mut opts).prompt[tags_rendered_len..],
+            );
+            tags_rendered_len = opts.prompt.len();
         }
 
         // The finalize turn keeps the declared toolset BYTE-IDENTICAL and disables calls via
@@ -4569,6 +4674,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    tags: None,
                                     hooks: metadata,
                                     step_id,
                                     assistant_message: Arc::new(final_message),
@@ -4669,6 +4775,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            tags: None,
                             hooks: message_hooks,
                             step_id,
                             assistant_message: Arc::clone(&message),
@@ -4701,6 +4808,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: message_hooks,
                     step_id,
                     assistant_message: Arc::clone(&message),
@@ -4998,13 +5106,16 @@ where
                 // content, stamped with this episode's model), and the next iteration renders
                 // the steered message after it.
                 budget_state = step_budget_state;
-                mutable_call_options(&mut opts).prompt.push(Message {
+                let mut answer = Message {
                     cache_prefix_blocks: None,
                     role: Role::Assistant,
                     content: assembled.content.clone(),
                     origin: Some(cfg.model.clone()),
                     ordinal: None,
-                });
+                    tags: Default::default(),
+                };
+                crate::tags::attach(&mut answer, writer.take_step_tags(step_id).as_ref());
+                mutable_call_options(&mut opts).prompt.push(answer);
                 continue;
             }
             if wants_final_text {
@@ -5102,7 +5213,7 @@ where
             assembled.tool_calls(),
             &mut batch.results,
         );
-        mutable_call_options(&mut opts).prompt.push(Message {
+        let mut answer = Message {
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: assembled.content,
@@ -5111,8 +5222,12 @@ where
             // config → byte-identical live-vs-resume.
             origin: Some(cfg.model.clone()),
             ordinal: None,
-        });
-        mutable_call_options(&mut opts).prompt.push(Message {
+            tags: Default::default(),
+        };
+        crate::tags::attach(&mut answer, writer.take_step_tags(step_id).as_ref());
+        mutable_call_options(&mut opts).prompt.push(answer);
+        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());
+        let mut results = Message {
             cache_prefix_blocks: None,
             role: Role::Tool,
             content: batch
@@ -5122,8 +5237,12 @@ where
                 .collect(),
             origin: None,
             ordinal: None,
-        });
+            tags: Default::default(),
+        };
+        crate::tags::attach(&mut results, result_tags.as_ref());
+        mutable_call_options(&mut opts).prompt.push(results);
         append_budget_firings(
+            writer,
             &mut mutable_call_options(&mut opts).prompt,
             &resolved_run_id,
             &budget_firings,
@@ -5891,6 +6010,12 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     for (id, result) in pending.existing {
         existing.entry(id).or_default().push_back(result);
     }
+    let mut existing_tags: std::collections::HashMap<ToolCallId, std::collections::VecDeque<u64>> =
+        std::collections::HashMap::new();
+    for (id, tag) in pending.existing_tags {
+        existing_tags.entry(id).or_default().push_back(tag);
+    }
+    let assistant_tags = pending.assistant_tags;
 
     let mut resume = ResumeCtx {
         batch_already_started: pending.batch_id.is_some(),
@@ -5973,15 +6098,20 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         &mut batch.results,
     );
 
-    // Append the now-complete tool turn (assistant + results) to the prompt.
-    prompt.push(Message {
+    // Append the now-complete tool turn (assistant + results) to the prompt, with the tags
+    // replay recovered for what was durable and the ones the writer just assigned.
+    let mut answer = Message {
         cache_prefix_blocks: None,
         role: Role::Assistant,
         content: pending.assistant.content,
         origin: Some(origin),
         ordinal: None,
-    });
-    prompt.push(Message {
+        tags: Default::default(),
+    };
+    crate::tags::attach(&mut answer, assistant_tags.as_ref());
+    prompt.push(answer);
+    let result_tags = live_result_tags(writer, &batch.results, &mut existing_tags);
+    let mut results = Message {
         cache_prefix_blocks: None,
         role: Role::Tool,
         content: batch
@@ -5991,7 +6121,10 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
             .collect(),
         origin: None,
         ordinal: None,
-    });
+        tags: Default::default(),
+    };
+    crate::tags::attach(&mut results, result_tags.as_ref());
+    prompt.push(results);
 
     Ok((BatchOutcome::finish_reason(batch.interruption), Vec::new()))
 }
@@ -6447,6 +6580,7 @@ fn tool_args_rejection_records(
     let mut existing = std::collections::HashMap::new();
     for result in rejected {
         records.push(WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
             result: Arc::new(result.clone()),
@@ -6851,6 +6985,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolNoDispatch {
+                        tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
                         tool_call_id: tool_call_id.clone(),
@@ -6863,6 +6998,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolResult {
+                        tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
                         result: Arc::clone(result),
@@ -6889,6 +7025,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolNoDispatch {
+                        tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
                         tool_call_id: tool_call_id.clone(),
@@ -6901,6 +7038,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolResult {
+                        tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
                         result: Arc::clone(result),
@@ -6912,6 +7050,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 }
                 CallPlan::Synthetic { result, reason } => {
                     writer.record(WalRecord::ToolResult {
+                        tags: None,
                         hooks: None,
                         batch_id: batch_id.clone(),
                         result: Arc::clone(result),
@@ -6923,6 +7062,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 }
                 CallPlan::Stopped(tool_call_id) => {
                     writer.record(WalRecord::ToolResult {
+                        tags: None,
                         hooks: None,
                         batch_id: batch_id.clone(),
                         result: Arc::new(crate::resume::not_dispatched_result(tool_call_id)),
@@ -7071,6 +7211,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                tags: None,
                 hooks: r.hooks.take(),
                 batch_id: batch_id.clone(),
                 result: Arc::clone(&r.result),
@@ -7494,6 +7635,7 @@ async fn finalize_hard_stop(
             .iter()
             .any(|result| result.tool_call_id == r.tool_call_id);
         writer.record(WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
             result: r.clone().into(),
@@ -8010,6 +8152,7 @@ mod tests {
         let mut prior = crate::replay::replay(&[]).unwrap();
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
+            render_tags: false,
             model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -8814,6 +8957,7 @@ mod tests {
             is_error: false,
         };
         let prior_record = WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
             result: prior_result.clone().into(),
@@ -9100,6 +9244,7 @@ mod tests {
         }
 
         let config = RunConfig {
+            render_tags: false,
             model: ModelHandle::new("stub", "m"),
             tools: Vec::new().into(),
             tool_choice: ToolChoice::Auto,
@@ -9138,6 +9283,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                tags: Some(crate::tags::LineageTags::Off),
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.
@@ -10101,6 +10247,7 @@ mod approval_gate {
         history.record(
             writer,
             WalRecord::ApprovalRecorded {
+                tags: None,
                 call_key: call.key.clone(),
                 call_id: call.call().tool_call_id,
                 elicitation_id: call.id.clone(),
@@ -10119,6 +10266,7 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         for call in open {
             writer.record(WalRecord::ToolResult {
+                tags: None,
                 batch_id: ctx.batch_id.clone(),
                 result: Arc::new(crate::resume::not_dispatched_result(
                     &call.call().tool_call_id,
@@ -10214,6 +10362,7 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         if let Some(outcome) = resolution.outcome.take() {
             let record = WalRecord::ToolResult {
+                tags: None,
                 batch_id: ctx.batch_id.clone(),
                 result: Arc::clone(&resolution.result),
                 outcome,
@@ -10529,6 +10678,7 @@ mod approval_gate {
                 hooks,
             } => {
                 writer.record(WalRecord::ToolNoDispatch {
+                    tags: None,
                     batch_id: ctx.batch_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     reason: reason.clone(),
@@ -10541,6 +10691,7 @@ mod approval_gate {
                 hooks,
             } => {
                 writer.record(WalRecord::ToolResult {
+                    tags: None,
                     batch_id: ctx.batch_id.clone(),
                     result: Arc::clone(result),
                     reason: Some(reason.clone()),

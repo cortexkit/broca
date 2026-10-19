@@ -334,6 +334,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -387,6 +388,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
 fn import_marker_config(request_digest: &str) -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: ModelHandle::new("import", "import"),
         tools: Vec::new().into(),
         tool_choice: ToolChoice::None,

@@ -501,6 +501,7 @@ mod prompt_fold_tests {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }
     }
 

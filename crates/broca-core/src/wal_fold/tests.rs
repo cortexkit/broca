@@ -134,6 +134,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -151,6 +152,7 @@ impl Fixture {
                 session: session.clone(),
                 ts_ms: ts,
                 config: Box::new(RunConfig {
+                    render_tags: false,
                     model: broca_protocol::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: broca_protocol::ToolChoice::Auto,
@@ -1965,6 +1967,7 @@ fn a_steered_session_folds_and_extracts_with_its_gate() {
         wal.append(
             1,
             &WalRecord::Steered {
+                tags: None,
                 retention: None,
                 ts_ms: None,
                 title: None,

@@ -174,6 +174,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
+    RUNNER_TAGS_FEATURE,
     RUN_CANCEL_AT_FEATURE,
     SCOPE_FEATURE,
     SESSION_CLASS_FEATURE,
@@ -221,6 +222,13 @@ pub const RESTART_PAUSE_FEATURE: &str = "restart-pause/v1";
 /// must not ignore them and keep content indefinitely. Reader builds enforce retention across
 /// admission, projection, reads and deletion; production sends stay off until capability rollout.
 pub const RETENTION_FEATURE: &str = "retention/v1";
+
+/// Runner tags: the per-part tag numbers and per-message origins a session's records carry,
+/// and a run start frozen to render them (`RunConfig::render_tags`). A reader that skipped them
+/// would serve the session's reads without tags, let a later write reuse a number, or render a
+/// run's requests without the tags it was admitted to show. Every record of a session admitted
+/// by a tag-writing build carries them; sessions admitted earlier keep their exact bytes.
+pub const RUNNER_TAGS_FEATURE: &str = "runner-tags/v1";
 
 /// Pending cancellation changes recovery's next action, so a reader may not skip it.
 pub const RUN_CANCEL_AT_FEATURE: &str = "run-cancel-at/v1";
@@ -890,6 +898,7 @@ mod tests {
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
+                RUNNER_TAGS_FEATURE,
                 RUN_CANCEL_AT_FEATURE,
                 SCOPE_FEATURE,
                 SESSION_CLASS_FEATURE,
@@ -899,6 +908,7 @@ mod tests {
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
             ]
         );
+        assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
         assert_eq!(COMPACTION_FEATURE, "compaction/v1");
         assert_eq!(COMPACTION_WAIT_FEATURE, "compaction-wait/v1");
@@ -979,6 +989,68 @@ mod tests {
         refrozen["frozen_render_config"]["provider_text_state"] = serde_json::json!(false);
         let legacy: WalRecord = serde_json::from_value(refrozen).unwrap();
         assert!(legacy.required_features().is_empty());
+    }
+
+    /// Every record kind that carries runner tags, and a run start frozen to render them, is a
+    /// gated frame requiring `runner-tags/v1`: a build that predates the feature refuses it by
+    /// that name instead of reading the session without its tags. The same records without
+    /// tags keep their ungated bytes.
+    #[test]
+    fn runner_tags_are_must_understand_and_older_readers_refuse_them_by_name() {
+        let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}});
+        let result = serde_json::json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"c","output":{"kind":"text","text":"r"}},"outcome":"completed"});
+        let untagged = [
+            run.clone(),
+            serde_json::json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"text","text":"a"}]},"usage":{},"retries_used":0}),
+            result.clone(),
+            serde_json::json!({"type":"tool_no_dispatch","batch_id":"b","tool_call_id":"c","reason":{"kind":"denied","reason":"no"}}),
+            serde_json::json!({"type":"budget_fired","run_id":"r","kind":"nudge","threshold":1,"ordinal":3}),
+        ];
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != RUNNER_TAGS_FEATURE)
+            .collect();
+        let mut tagged = Vec::new();
+        for value in untagged {
+            let plain: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert!(!plain.required_features().contains(&RUNNER_TAGS_FEATURE));
+            let mut with_tags = value;
+            with_tags["tags"] = if with_tags["type"] == "run_started" {
+                serde_json::json!([[7]])
+            } else {
+                serde_json::json!([7])
+            };
+            tagged.push(with_tags);
+        }
+        let mut steered = serde_json::json!({"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"s"}]}]});
+        steered["tags"] = serde_json::json!([[8]]);
+        tagged.push(steered);
+        let mut render = run;
+        render["config"]["render_tags"] = serde_json::json!(true);
+        tagged.push(render);
+        for value in tagged {
+            let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                record.required_features().contains(&RUNNER_TAGS_FEATURE),
+                "{value}"
+            );
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                panic!("a tag-reading build decodes {value}");
+            };
+            assert_eq!(framed.record, record);
+            assert_eq!(
+                serde_json::to_value(&framed.record).unwrap()["tags"],
+                value["tags"],
+                "tags survive the round trip"
+            );
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [RUNNER_TAGS_FEATURE]),
+                "an older reader refuses {value} by name"
+            );
+        }
     }
 
     /// Neither the request fence, an applied view, another answer nor a wait exit can be

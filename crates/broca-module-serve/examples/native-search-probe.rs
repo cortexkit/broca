@@ -606,6 +606,7 @@ async fn run(args: Args) -> Result<(), String> {
                             cache_prefix_blocks: None,
                             origin: None,
                             ordinal: None,
+                            tags: Default::default(),
                             role: Role::System,
                             content: vec![ContentBlock::Text { text }],
                         });
@@ -614,6 +615,7 @@ async fn run(args: Args) -> Result<(), String> {
                         cache_prefix_blocks: None,
                         origin: None,
                         ordinal: None,
+                        tags: Default::default(),
                         role: Role::User,
                         content: vec![ContentBlock::Text {
                             text: args.query.clone(),

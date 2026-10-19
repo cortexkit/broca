@@ -1972,8 +1972,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
 expect_red = ["send_delivery::a_steer_during_a_tool_call_joins_the_running_turn_after_the_result"]
 file = "crates/broca-core/src/run.rs"
-old = "            origin: Some(cfg.model.clone()),\n            ordinal: None,\n        });\n        mutable_call_options(&mut opts).prompt.push(Message {\n            cache_prefix_blocks: None,\n            role: Role::Tool,"
-new = "            origin: Some(cfg.model.clone()),\n            ordinal: None,\n        });\n        // NON-VACUITY BREAK: take waiting steers between the call and its result\n        let mut early_steers = control.steer.as_ref().map(|inbox| inbox.take_at_step(|| {})).unwrap_or_default();\n        mutable_call_options(&mut opts).prompt.append(&mut early_steers);\n        mutable_call_options(&mut opts).prompt.push(Message {\n            cache_prefix_blocks: None,\n            role: Role::Tool,"
+old = "        mutable_call_options(&mut opts).prompt.push(answer);\n        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());"
+new = "        mutable_call_options(&mut opts).prompt.push(answer);\n        // NON-VACUITY BREAK: take waiting steers between the call and its result\n        let mut early_steers = control.steer.as_ref().map(|inbox| inbox.take_at_step(|| {})).unwrap_or_default();\n        mutable_call_options(&mut opts).prompt.append(&mut early_steers);\n        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());"
 
 [[control]]
 id = "steer-extends-final-step"
@@ -17139,3 +17139,56 @@ expect_message = "an actor with no subscriber must not reserve either ring"
 file = "crates/broca-module/src/fanout.rs"
 old = '''            sender: Arc::new(std::sync::OnceLock::new()),'''
 new = '''            sender: Arc::new(std::sync::OnceLock::from(broadcast::channel(capacity).0)), // NON-VACUITY BREAK: allocate at open'''
+
+[[control]]
+id = "runner-tags-writer-never-reuses-a-tag"
+guards = "The session writer advances its runner-tag counter past every part it tags, so no two parts of a session share a tag"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::tags_are_strictly_increasing_across_restart_resume_and_a_moved_session"]
+file = "crates/broca-core/src/tags.rs"
+old = '''    set_record_tags(record, tags.clone());
+    *state = LineageTags::On { next };'''
+new = '''    set_record_tags(record, tags.clone());
+    *state = LineageTags::On { next: first }; // NON-VACUITY BREAK: the next record reuses these tags'''
+
+[[control]]
+id = "runner-tags-restart-counts-past-every-recorded-tag"
+guards = "A writer reopened over a tagged WAL counts on from the highest tag any record holds, so a restart, resume or moved session never reuses a tag"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::tags_are_strictly_increasing_across_restart_resume_and_a_moved_session"]
+file = "crates/broca-core/src/tags.rs"
+old = '''                    *next = (*next).max(tag.saturating_add(1));'''
+new = '''                    let _ = tag; // NON-VACUITY BREAK: later records' tags are not counted'''
+
+[[control]]
+id = "runner-tags-deleted-lineage-floor"
+guards = "A lineage created after retention deleted its predecessor starts past the tombstone's recorded next tag, so no tag is reused across the deletion"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::a_lineage_after_retention_deletion_never_reuses_a_tag"]
+file = "crates/broca-core/src/tags.rs"
+old = '''                floor: own.max(floor),'''
+new = '''                floor: own, // NON-VACUITY BREAK: ignore the deleted lineage's floor'''
+
+[[control]]
+id = "runner-tags-never-render-into-assistant-parts"
+guards = "Rendering runner tags prefixes only user text and tool-result text; assistant text, signed reasoning and tool calls keep their exact bytes"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::rendering_prefixes_user_and_tool_text_once_and_never_assistant_parts"]
+file = "crates/broca-protocol/src/tags.rs"
+old = '''            (Role::User, ContentBlock::Text { text }) => prefix(text, *tag),'''
+new = '''            (Role::User | Role::Assistant, ContentBlock::Text { text }) => prefix(text, *tag), // NON-VACUITY BREAK: render into assistant text'''

@@ -675,6 +675,7 @@ mod tests {
                 seq,
                 fence: 1,
                 record: WalRecord::Steered {
+                    tags: None,
                     retention: None,
                     ts_ms: Some(1100),
                     send_id: Some(id.into()),

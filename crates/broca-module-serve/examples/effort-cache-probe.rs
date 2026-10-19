@@ -21,6 +21,7 @@ fn message(role: Role, text: String) -> Message {
         content: vec![ContentBlock::Text { text }],
         origin: None,
         ordinal: None,
+        tags: Default::default(),
         cache_prefix_blocks: None,
     }
 }

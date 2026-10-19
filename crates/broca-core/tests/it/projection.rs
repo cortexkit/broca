@@ -40,6 +40,7 @@ fn framed(seq: u64, record: WalRecord) -> FramedRecord {
 
 fn run_config() -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
         tool_choice: ToolChoice::Auto,
@@ -64,6 +65,7 @@ fn run_config() -> RunConfig {
 
 fn started(run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -85,6 +87,7 @@ fn started(run: &str) -> WalRecord {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "q".into() }],
         }]
@@ -120,6 +123,7 @@ fn assistant_two_calls() -> AssistantMessage {
 
 fn step_with_two_calls(step: u64) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: (assistant_two_calls()).into(),
@@ -137,6 +141,7 @@ fn tool_result(id: &str, text: &str) -> WalRecord {
 
 fn tool_result_with_outcome(id: &str, text: &str, outcome: DispatchOutcome) -> WalRecord {
     WalRecord::ToolResult {
+        tags: None,
         hooks: None,
         batch_id: BatchId("b1".into()),
         result: ToolResult {
@@ -294,6 +299,7 @@ fn projection_shape_and_cursors() {
 #[test]
 fn run_terminal_carries_last_recorded_step_finish_reason() {
     let terminal_step = WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(1),
         assistant_message: (AssistantMessage {
@@ -882,6 +888,7 @@ fn budget_firing_projects_to_control_stream() {
     let projected = project_control(&[framed(
         7,
         WalRecord::BudgetFired {
+            tags: None,
             run_id: RunId("r-budget".into()),
             kind: BudgetKind::Finalize,
             threshold: 30,
@@ -917,6 +924,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "queued".into(),
@@ -959,6 +967,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             call_key: None,
         },
         WalRecord::ToolNoDispatch {
+            tags: None,
             hooks: None,
             batch_id: BatchId("b-all".into()),
             tool_call_id: ToolCallId("c2".into()),
@@ -972,6 +981,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         },
         WalRecord::TurnFinished { step_id: StepId(1) },
         WalRecord::BudgetFired {
+            tags: None,
             run_id: RunId("r-all".into()),
             kind: BudgetKind::Finalize,
             threshold: 2,
@@ -1082,6 +1092,7 @@ fn cursor_only_projection_matches_full_projection_for_every_record_prefix() {
 #[test]
 fn a_steered_record_projects_no_control_unit() {
     let steered = WalRecord::Steered {
+        tags: None,
         retention: None,
         ts_ms: None,
         title: None,

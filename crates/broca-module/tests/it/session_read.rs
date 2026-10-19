@@ -1474,6 +1474,7 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: ModelHandle::new("stub", "stub-model"),
         tools: vec![tool("lookup")].into(),
         tool_choice: ToolChoice::Auto,
@@ -1498,6 +1499,7 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -1531,6 +1533,7 @@ fn assistant_text(step: u64, text: &str) -> WalRecord {
 
 fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        tags: None,
         hooks: None,
         step_id: StepId(step),
         assistant_message: (AssistantMessage {
@@ -2588,6 +2591,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
     vec![
         started(key, run, &format!("{run} question")),
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(0),
             assistant_message: (AssistantMessage {
@@ -2613,6 +2617,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
         },
         intent,
         WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
             result: ToolResult {
@@ -2721,6 +2726,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2749,6 +2755,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(0),
             assistant_message: AssistantMessage {
@@ -2773,6 +2780,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             planned_calls: vec![call_id.clone()],
         },
         WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
             result: ToolResult {
@@ -2791,6 +2799,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
         },
         WalRecord::TurnFinished { step_id: StepId(0) },
         WalRecord::BudgetFired {
+            tags: None,
             run_id,
             kind: BudgetKind::Nudge,
             threshold: 1,
@@ -3038,6 +3047,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&active, "run-active", "open"),
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(0),
                 assistant_message: (AssistantMessage {
@@ -3136,6 +3146,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -3164,6 +3175,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(0),
                 assistant_message: (AssistantMessage {
@@ -3188,6 +3200,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 planned_calls: vec![call_id.clone()],
             },
             WalRecord::ToolResult {
+                tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),
                 result: ToolResult {
@@ -3204,6 +3217,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
             WalRecord::ToolBatchFinished { batch_id },
             WalRecord::TurnFinished { step_id: StepId(0) },
             WalRecord::BudgetFired {
+                tags: None,
                 run_id,
                 kind: BudgetKind::Nudge,
                 threshold: 1,
@@ -3266,6 +3280,7 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -3810,6 +3825,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
     let rig = Rig::new("steered-read", Arc::new(NoopExec));
     let key = rig.key("steered");
     let steered = WalRecord::Steered {
+        tags: None,
         retention: None,
         ts_ms: None,
         title: None,

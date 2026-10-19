@@ -318,6 +318,12 @@ pub struct Tombstone {
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_ms: Option<u64>,
+    /// The runner tag the deleted lineage's next part would have had (and at least every earlier
+    /// tombstone's). A lineage created at this address afterwards starts counting here, so no
+    /// tag is reused across the deletion. Absent for an untagged lineage, one whose WAL could
+    /// not be read, and every tombstone written before tags existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_tag: Option<u64>,
 }
 
 /// Each failed write increments the address's repair generation so an older repair cannot
@@ -1122,19 +1128,28 @@ impl RetentionService {
             tracing::warn!(target: "retention", session = %broca_core::session_addr(key), runs = ?failed_exports,
                 "retention billing catch-up failed; deleting content anyway");
         }
-        let seq = self
-            .tombstones(key)?
-            .into_iter()
+        let earlier = self.tombstones(key)?;
+        let seq = earlier
+            .iter()
             .map(|s| s.seq)
             .max()
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("tombstone sequence exhausted")?;
+        let own_next_tag = read.as_ref().ok().and_then(|read| {
+            broca_core::tags::lineage_tags(frames(read).iter().map(|frame| &frame.record)).next()
+        });
+        let next_tag = earlier
+            .iter()
+            .filter_map(|stone| stone.next_tag)
+            .chain(own_next_tag)
+            .max();
         let stone = Tombstone {
             lineage_id: id.clone(),
             expired_at_ms: deadline,
             seq,
             completed_at_ms: None,
+            next_tag,
         };
         self.remember_session(key)?;
         self.write_tombstone(key, &stone)?;

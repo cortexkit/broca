@@ -20,6 +20,7 @@ mod queue_crash;
 mod replay;
 mod resume_exec;
 mod run_loop;
+mod runner_tags;
 mod session_import;
 mod terminal_reason_crash_cut;
 mod terminal_reason_stop_conditions;

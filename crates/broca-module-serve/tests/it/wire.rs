@@ -233,6 +233,7 @@ impl RunExecutor for FakeExec {
         }
         self.started.fetch_add(1, Ordering::SeqCst);
         job.writer.record(broca_wal::WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -353,6 +354,7 @@ impl RunExecutor for ReauthCoreExec {
             config.budget = job.req.budget.clone();
             config.stop_when = job.req.stop_when.clone();
             job.writer.record(WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -409,6 +411,7 @@ impl RunExecutor for ReauthCoreExec {
                 account_decision: None,
             });
             job.writer.record(WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -495,6 +498,7 @@ impl RunExecutor for ReauthCoreExec {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),
         tool_choice: Default::default(),
@@ -973,6 +977,7 @@ async fn unresolved_decrement_to_zero_allows_admission_at_the_export_head() {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -4694,7 +4699,9 @@ async fn manifest_wal_attach_streams_control_units() {
             );
         }
         assert_eq!(gated, 1, "the admitted run wrote one RunStarted");
-        let needle = br#"{"requires":["plan-manifest/v1"],"record":{"type":"run_started""#;
+        // The admitted run's input is tagged, so the frame requires runner tags as well.
+        let needle =
+            br#"{"requires":["plan-manifest/v1","runner-tags/v1"],"record":{"type":"run_started""#;
         assert!(bytes.windows(needle.len()).any(|window| window == needle));
         let staged = wal_path.with_extension("staged");
         std::fs::write(&staged, bytes).unwrap();
@@ -5851,6 +5858,7 @@ impl PreparedWalRoute {
                 file.append(
                     1,
                     &WalRecord::RunStarted {
+                        tags: None,
                         session_class: None,
                         retention: None,
                         hooks: None,

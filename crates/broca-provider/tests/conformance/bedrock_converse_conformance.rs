@@ -24,6 +24,7 @@ fn rich_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![ContentBlock::Text {
                 text: "Sys.".into(),
@@ -33,6 +34,7 @@ fn rich_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "Hi".into() }],
         },
@@ -40,6 +42,7 @@ fn rich_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,

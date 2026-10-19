@@ -324,6 +324,7 @@ fn keep_all_scope_strips_only_the_foreign_signed_thinking() {
 fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() {
     let records = vec![
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -341,6 +342,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
             run_id: RunId("run-import".into()),
             session: BindIdentity::new("/project", "runner", "imported"),
             config: Box::new(RunConfig {
+                render_tags: false,
                 model: ModelHandle::new("import", "import"),
                 tools: Vec::new().into(),
                 tool_choice: ToolChoice::None,

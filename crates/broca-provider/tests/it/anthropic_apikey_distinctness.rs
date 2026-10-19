@@ -29,6 +29,7 @@ fn request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![broca_protocol::content::ContentBlock::Text {
                 text: "Be concise.".into(),
@@ -38,6 +39,7 @@ fn request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![broca_protocol::content::ContentBlock::Text {
                 text: "Hello.".into(),

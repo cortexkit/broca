@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
+use broca_protocol::tags::MessageTags;
 use broca_protocol::BindIdentity;
 use broca_wal::{
     FileWal, Wal, WalByteAnchor, WalError, WalRangeRead, WalRecord, DEFAULT_MAX_READ_BYTES,
@@ -80,6 +81,14 @@ pub trait WalStore: Send + Sync {
         _session_class: Option<&str>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
         self.open_with_retention(session, retention)
+    }
+
+    /// The lowest runner tag a new lineage at `session` may use. When retention deleted an
+    /// earlier lineage at this address, its tombstone recorded the tag that lineage would have
+    /// given next, and a new lineage must start there so it reuses none of the deleted tags.
+    /// With no such tombstone the answer is 1. The default, for a store without tombstones, is 1.
+    fn retired_tag_floor(&self, _session: &BindIdentity) -> Result<u64, WalError> {
+        Ok(1)
     }
 
     /// Read the first run's frozen policy, independently of any materialized watermark.
@@ -1196,6 +1205,36 @@ impl FileWalStore {
     }
 }
 
+/// The highest `next_tag` the retention tombstones in `dir` recorded, or 1. A tombstone is the
+/// JSON object retention writes when it deletes a lineage; one written before tags existed has
+/// no `next_tag` and counts as 1. An unreadable tombstone is an error: guessing low could make a
+/// new lineage reuse a deleted lineage's tags.
+pub fn retired_tag_floor_in(dir: &Path) -> Result<u64, WalError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(1),
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    let mut floor = 1;
+    for entry in entries {
+        let path = entry.map_err(WalError::Io)?.path();
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        let stone: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| WalError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+        if let Some(next) = stone.get("next_tag").and_then(serde_json::Value::as_u64) {
+            floor = floor.max(next);
+        }
+    }
+    Ok(floor)
+}
+
 /// The address half of `wal_path`: FNV-1a over the bind triple, rendered as the WAL's stem.
 ///
 /// SINGLE-SITED ON PURPOSE. This was inline in `wal_path` until 2026-09-04, and the reason to
@@ -1225,6 +1264,9 @@ pub fn session_addr(session: &BindIdentity) -> String {
 impl WalStore for FileWalStore {
     fn backup_classes(&self) -> Vec<String> {
         self.backup_classes.clone()
+    }
+    fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
+        retired_tag_floor_in(&self.tombstone_path(session, ""))
     }
     fn open_with_class(
         &self,
@@ -1796,6 +1838,23 @@ type AfterReserveProbe = Arc<dyn Fn(u64) + Send + Sync>;
 #[cfg(test)]
 type EnqueueContentionProbe = Arc<dyn Fn() + Send + Sync>;
 
+/// Tags the writer assigned that the run loop has yet to attach to its in-memory prompt.
+#[derive(Default)]
+struct LiveTags {
+    /// By tool call id, oldest first: a model may reuse an id across batches.
+    calls: std::collections::HashMap<
+        broca_protocol::ToolCallId,
+        std::collections::VecDeque<MessageTags>,
+    >,
+    /// For each `Steered` record (a message a caller added to the running turn), in WAL order,
+    /// the tags of its messages, one entry per message.
+    steers: std::collections::VecDeque<Vec<MessageTags>>,
+    /// Assistant messages, by the step that produced them.
+    steps: std::collections::HashMap<broca_protocol::StepId, MessageTags>,
+    /// Budget messages, by their prompt ordinal.
+    budgets: std::collections::HashMap<u64, MessageTags>,
+}
+
 /// The loop's handle to the writer task.
 pub struct WalHandle {
     /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
@@ -1828,6 +1887,15 @@ pub struct WalHandle {
     /// Frozen policy proved at reconstruction or by this writer's first run.
     /// Unknown on an inherited log until its complete WAL/checkpoint is read.
     lineage_retention: Mutex<Option<crate::LineageRetention>>,
+    /// The lineage's runner-tag state: which tag the next part gets. Known for an empty WAL at
+    /// spawn; otherwise seeded by the admission that reconstructed the session (`None` until
+    /// then, and nothing is tagged while it is unknown). Read and advanced only under the
+    /// enqueue lock, so tags follow WAL order. See [`crate::tags`].
+    lineage_tags: Mutex<Option<crate::tags::LineageTags>>,
+    /// Tags assigned to tool results and steers, kept until the run loop attaches them to the
+    /// messages it adds to its in-memory prompt. Retained only while a run that renders tags
+    /// asked for them (`None` otherwise), so a run that does not render tags keeps nothing.
+    live_tags: Mutex<Option<LiveTags>>,
     #[cfg(test)]
     after_reserve_probe: Mutex<Option<AfterReserveProbe>>,
     #[cfg(test)]
@@ -2022,6 +2090,8 @@ impl WalHandle {
             lineage_retention: Mutex::new(
                 (last_seq == 0).then_some(crate::LineageRetention::Unstarted),
             ),
+            lineage_tags: Mutex::new((last_seq == 0).then(crate::tags::LineageTags::unstarted)),
+            live_tags: Mutex::new(None),
             #[cfg(test)]
             after_reserve_probe: Mutex::new(None),
             #[cfg(test)]
@@ -2056,6 +2126,75 @@ impl WalHandle {
         }
     }
 
+    /// Seed the lineage's tag state from a reconstruction of its WAL. Replaces an unknown or
+    /// unstarted state (an unstarted one may gain a deleted predecessor's floor); a started
+    /// state this writer has already advanced is kept.
+    pub fn seed_lineage_tags(&self, tags: Option<crate::tags::LineageTags>) {
+        let _guard = self.lock_enqueue();
+        let mut current = self.lineage_tags.lock().unwrap();
+        if let (None | Some(crate::tags::LineageTags::Unstarted { .. }), Some(tags)) =
+            (*current, tags)
+        {
+            *current = Some(tags);
+        }
+    }
+
+    /// The lineage's tag state as this writer holds it.
+    pub fn lineage_tags(&self) -> Option<crate::tags::LineageTags> {
+        *self.lineage_tags.lock().unwrap()
+    }
+
+    /// Keep (or stop keeping) the tags assigned to tool results and steers for the run loop.
+    pub fn retain_live_tags(&self, retain: bool) {
+        *self.live_tags.lock().unwrap() = retain.then(LiveTags::default);
+    }
+
+    /// The tag assigned to the oldest kept result of call `id`.
+    pub fn take_call_tags(&self, id: &broca_protocol::ToolCallId) -> Option<MessageTags> {
+        let mut guard = self.live_tags.lock().unwrap();
+        let live = guard.as_mut()?;
+        let queue = live.calls.get_mut(id)?;
+        let tags = queue.pop_front();
+        if queue.is_empty() {
+            live.calls.remove(id);
+        }
+        tags
+    }
+
+    /// The tags assigned to the assistant message of step `step_id`.
+    pub fn take_step_tags(&self, step_id: broca_protocol::StepId) -> Option<MessageTags> {
+        self.live_tags
+            .lock()
+            .unwrap()
+            .as_mut()?
+            .steps
+            .remove(&step_id)
+    }
+
+    /// The tags assigned to the budget message at prompt ordinal `ordinal`.
+    pub fn take_budget_tags(&self, ordinal: u64) -> Option<MessageTags> {
+        self.live_tags
+            .lock()
+            .unwrap()
+            .as_mut()?
+            .budgets
+            .remove(&ordinal)
+    }
+
+    /// The tags assigned to the oldest kept steer, one entry per message.
+    pub fn take_steer_tags(&self) -> Option<Vec<MessageTags>> {
+        self.live_tags.lock().unwrap().as_mut()?.steers.pop_front()
+    }
+
+    /// Queue `record` like [`record`](Self::record) and also return the runner tags the writer
+    /// assigned to it, one entry per message it carries.
+    pub fn record_tagged(&self, record: WalRecord) -> (RecordOutcome, Option<Vec<MessageTags>>) {
+        let _guard = self.lock_enqueue();
+        let mut assigned = None;
+        let outcome = self.enqueue_record_with(record, false, &mut assigned);
+        (outcome, assigned)
+    }
+
     /// The first run's policy, if this handle has proved it. Unknown is not forever.
     pub fn is_retention_lineage(&self) -> Option<bool> {
         match *self.lineage_retention.lock().unwrap() {
@@ -2084,6 +2223,56 @@ impl WalHandle {
         self.enqueue_record(record, false)
     }
 
+    /// Assign the record's runner tags, under the enqueue lock, and keep the ones the run loop
+    /// asked for.
+    fn stamp_tags(&self, record: &mut WalRecord) -> Option<Vec<MessageTags>> {
+        let mut state = self.lineage_tags.lock().unwrap();
+        let assigned = match state.as_mut() {
+            Some(state) => crate::tags::stamp(state, record),
+            None => {
+                if crate::tags::tag_shape(record).is_some() && record.runner_tags().is_empty() {
+                    tracing::warn!(
+                        target: "wal",
+                        "record appended before its lineage's tag state was seeded; left untagged"
+                    );
+                }
+                None
+            }
+        };
+        drop(state);
+        if let Some(assigned) = &assigned {
+            if let Some(live) = self.live_tags.lock().unwrap().as_mut() {
+                match record {
+                    WalRecord::ToolResult { result, .. } => live
+                        .calls
+                        .entry(result.tool_call_id.clone())
+                        .or_default()
+                        .push_back(assigned[0].clone()),
+                    WalRecord::ToolNoDispatch { tool_call_id, .. }
+                    | WalRecord::ApprovalRecorded {
+                        call_id: tool_call_id,
+                        ..
+                    } => live
+                        .calls
+                        .entry(tool_call_id.clone())
+                        .or_default()
+                        .push_back(assigned[0].clone()),
+                    WalRecord::Steered { .. } => live.steers.push_back(assigned.clone()),
+                    WalRecord::ModelStepFinished { step_id, .. } => {
+                        live.steps.insert(*step_id, assigned[0].clone());
+                    }
+                    WalRecord::BudgetFired { ordinal, .. } => {
+                        live.budgets.insert(*ordinal, assigned[0].clone());
+                    }
+                    // An episode boundary: nothing kept from the episode before is still owed.
+                    WalRecord::RunStarted { .. } => *live = LiveTags::default(),
+                    _ => {}
+                }
+            }
+        }
+        assigned
+    }
+
     pub fn seed_input_token_limit(&self, limit: Option<u64>) {
         if let Some(limit) = limit {
             let mut old = self.input_token_limit.load(Ordering::SeqCst);
@@ -2110,6 +2299,16 @@ impl WalHandle {
     }
 
     fn enqueue_record(&self, record: WalRecord, reserved_terminal: bool) -> RecordOutcome {
+        self.enqueue_record_with(record, reserved_terminal, &mut None)
+    }
+
+    fn enqueue_record_with(
+        &self,
+        mut record: WalRecord,
+        reserved_terminal: bool,
+        assigned: &mut Option<Vec<MessageTags>>,
+    ) -> RecordOutcome {
+        *assigned = self.stamp_tags(&mut record);
         let (seq, frame) = if let Some(budget) = &self.append_budget {
             let seq = self.next_seq.load(Ordering::SeqCst);
             let mut budget = budget.lock().unwrap();

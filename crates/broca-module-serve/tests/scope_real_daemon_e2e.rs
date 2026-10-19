@@ -553,7 +553,8 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         )],
         "broca froze exactly the (owner, ref, scope_epoch) the daemon stamped"
     );
-    let gated = br#"{"requires":["scope/v1"],"record":{"type":"run_started""#;
+    // The session is tagged too, so its RunStarted also requires runner tags.
+    let gated = br#"{"requires":["runner-tags/v1","scope/v1"],"record":{"type":"run_started""#;
     assert_eq!(
         wal.windows(gated.len())
             .filter(|window| *window == gated)
@@ -565,7 +566,7 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         std::fs::read_to_string(rig.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
             .ok()
             .as_deref(),
-        Some("scope/v1\n"),
+        Some("runner-tags/v1\nscope/v1\n"),
         "the feature floor lists scope/v1"
     );
 

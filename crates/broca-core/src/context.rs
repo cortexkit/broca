@@ -1787,6 +1787,7 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -1804,6 +1805,7 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    render_tags: false,
                     model: broca_protocol::request::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: Default::default(),
@@ -1830,12 +1832,14 @@ mod tests {
                     content: vec![ContentBlock::Text { text: "hi".into() }],
                     origin: None,
                     ordinal: None,
+                    tags: Default::default(),
                 }]
                 .into(),
                 origin: broca_wal::RunOrigin::Fresh,
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: AssistantMessage {
@@ -1871,6 +1875,7 @@ mod tests {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                tags: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 result: ToolResult {
@@ -1891,6 +1896,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(2),
                 assistant_message: AssistantMessage {
@@ -2139,6 +2145,7 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -2167,6 +2174,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(3),
                 assistant_message: (AssistantMessage {
@@ -2191,6 +2199,7 @@ mod tests {
                 planned_calls: vec![ToolCallId("t2".into())],
             },
             WalRecord::ToolResult {
+                tags: None,
                 hooks: None,
                 batch_id: BatchId("b2".into()),
                 result: ToolResult {
@@ -2213,6 +2222,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(4),
                 assistant_message: (AssistantMessage {
@@ -2806,6 +2816,7 @@ mod episode_merge_regression {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            render_tags: false,
             model: ModelHandle::new("stub", model),
             tools: Vec::new().into(),
             tool_choice: Default::default(),
@@ -2830,6 +2841,7 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -2853,6 +2865,7 @@ mod episode_merge_regression {
                 content: vec![ContentBlock::Text { text: text.into() }],
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
             }]
             .into(),
             origin: RunOrigin::Fresh,
@@ -2874,6 +2887,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                tags: None,
                 hooks: None,
                 step_id: StepId(1),
                 assistant_message: AssistantMessage {

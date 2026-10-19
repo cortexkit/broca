@@ -542,6 +542,7 @@ mod tests {
             framed(
                 1,
                 broca_wal::WalRecord::RunStarted {
+                    tags: None,
                     session_class: None,
                     retention: None,
                     hooks: None,
@@ -559,6 +560,7 @@ mod tests {
                     session: broca_protocol::BindIdentity::new("/tmp/project", "harness", "s"),
                     ts_ms: Some(100),
                     config: Box::new(broca_wal::RunConfig {
+                        render_tags: false,
                         model: broca_protocol::request::ModelHandle::new(provider, "model"),
                         tools: Vec::new().into(),
                         tool_choice: Default::default(),

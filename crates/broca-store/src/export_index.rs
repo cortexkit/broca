@@ -664,6 +664,7 @@ mod tests {
 
     fn config(usage_policy: &str) -> RunConfig {
         RunConfig {
+            render_tags: false,
             model: ModelHandle::new("xai", "grok-4"),
             tools: Vec::new().into(),
             tool_choice: ToolChoice::Auto,
@@ -721,6 +722,7 @@ mod tests {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -763,6 +765,7 @@ mod tests {
                 seq: records.len() as u64 + 1,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    tags: None,
                     hooks: None,
                     step_id: StepId(ordinal as u64),
                     assistant_message: (broca_protocol::content::AssistantMessage {

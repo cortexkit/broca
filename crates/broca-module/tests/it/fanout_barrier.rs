@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, Notify};
 fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -53,6 +54,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "q".into() }],
             }]
@@ -62,6 +64,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
         },
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: assistant_one_call().into(),
@@ -72,6 +75,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
             speed_used: None,
         },
         WalRecord::ToolResult {
+            tags: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
             result: ToolResult {
@@ -182,6 +186,7 @@ fn assistant_one_call() -> AssistantMessage {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),
         tool_choice: Default::default(),
@@ -312,6 +317,7 @@ fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
         }],

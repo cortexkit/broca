@@ -328,6 +328,7 @@ pub async fn run_live<F: WireFamily + 'static>(
         }],
         origin: None,
         ordinal: None,
+        tags: Default::default(),
     });
     let req_input = input.clone();
     let req = RunRequest {
@@ -480,6 +481,7 @@ fn flush_tool_results(
             .collect(),
         origin: None,
         ordinal: None,
+        tags: Default::default(),
     });
 }
 
@@ -554,6 +556,7 @@ impl LiveOutcome {
                         content: message.content.clone(),
                         origin: None,
                         ordinal: None,
+                        tags: Default::default(),
                     });
                 }
                 OutputEvent::Control(ControlUnit::ToolResult { result }) => {

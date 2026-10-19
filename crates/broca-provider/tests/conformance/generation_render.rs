@@ -26,6 +26,7 @@ fn base_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::System,
             content: vec![ContentBlock::Text {
                 text: "Be concise.".into(),
@@ -35,6 +36,7 @@ fn base_request() -> CallOptions {
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
+            tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "Say hi.".into(),

@@ -182,6 +182,7 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
                 seal.deposit_hook(
                     stage.clone(),
                     WalRecord::ToolResult {
+                        tags: None,
                         batch_id: ctx.batch_id.clone(),
                         result: Arc::new(result),
                         hooks,

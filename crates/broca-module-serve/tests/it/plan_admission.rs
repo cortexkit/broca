@@ -25,7 +25,7 @@ use subc_protocol::FrameType;
 
 /// The `RunStarted` a plan-less first send writes, as record JSON, with the parts that differ
 /// per run (the scratch project root, the run id and the timestamp) replaced by placeholders. Every other byte is pinned.
-const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1}"#;
+const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1,"tags":[[1]]}"#;
 
 /// The `session.baseline` reply of a session admitted without a plan, running the rig's one
 /// tool: no items, no composition digest, both generations 0.
@@ -69,7 +69,12 @@ async fn a_plan_less_session_keeps_its_bytes() {
         unreachable!()
     };
     assert!(manifest.is_none());
-    assert!(started.required_features().is_empty());
+    // Every lineage a tag-writing build admits is tagged, so the input's runner tags are the
+    // only must-understand member a plan-less first episode carries.
+    assert_eq!(
+        started.required_features(),
+        [broca_wal::RUNNER_TAGS_FEATURE]
+    );
 
     let baseline = rig
         .request(
@@ -979,7 +984,10 @@ async fn the_first_planned_episode_raises_the_feature_floor() {
     let started = run_started(&records);
     assert_eq!(
         started[0].required_features(),
-        [broca_wal::PLAN_MANIFEST_FEATURE]
+        [
+            broca_wal::PLAN_MANIFEST_FEATURE,
+            broca_wal::RUNNER_TAGS_FEATURE
+        ]
     );
     let floor = broca_wal::read_floor(&floor_path).unwrap();
     assert!(

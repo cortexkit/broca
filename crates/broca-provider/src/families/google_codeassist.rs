@@ -488,6 +488,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: text.into() }],
             origin: None,
             ordinal: None,
+            tags: Default::default(),
         }
     }
 

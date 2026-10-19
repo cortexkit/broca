@@ -3184,6 +3184,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         writer.record(WalRecord::InputTokenCapFrozen { limit });
                     }
                     writer.record(WalRecord::Steered {
+                        tags: None,
                         retention: self.admitting_retention,
                         ts_ms: self.retention_timestamp(),
                         send_id: identity.send_id,
@@ -3272,6 +3273,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let input = prepared.input.clone();
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let record = WalRecord::Steered {
+            tags: None,
             retention: self.admitting_retention,
             ts_ms: self.retention_timestamp(),
             send_id: identity.send_id.clone(),
@@ -6679,6 +6681,7 @@ mod tests {
             // normally. The guard's terminal is suppressed by the seam, so this clean
             // return delivers NOTHING to the actor — only the backstop can recover it.
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -6718,6 +6721,7 @@ mod tests {
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            render_tags: false,
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -6821,6 +6825,7 @@ mod tests {
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
+                tags: Default::default(),
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hi".into() }],
             }],
@@ -6946,6 +6951,7 @@ mod tests {
             let mut config = min_config();
             config.tools_were_omitted = job.control.tools_were_omitted;
             job.writer.record(WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -7004,6 +7010,7 @@ mod tests {
             _out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -7068,6 +7075,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -7290,6 +7298,7 @@ mod tests {
 
             if ordinal == 1 {
                 job.writer.record(WalRecord::RunStarted {
+                    tags: None,
                     session_class: None,
                     retention: None,
                     hooks: None,
@@ -7455,6 +7464,7 @@ mod tests {
         ) -> Result<RunSummary, RunError> {
             let ordinal = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             job.writer.record(WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -7553,6 +7563,7 @@ mod tests {
                 started.len() == 1
             };
             job.writer.record(WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -7767,6 +7778,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -8435,6 +8447,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -9021,6 +9034,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -9103,6 +9117,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -9703,6 +9718,7 @@ mod import_idempotency_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                tags: None,
                 session_class: None,
                 retention: None,
                 hooks: None,
@@ -9797,6 +9813,7 @@ mod import_idempotency_tests {
         let writer =
             WalHandle::spawn(wal_store.open(&key).expect("open WAL"), 1).expect("spawn WAL writer");
         writer.record(broca_wal::WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -9819,6 +9836,7 @@ mod import_idempotency_tests {
             submission_id: None,
         });
         writer.record(broca_wal::WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: AssistantMessage {
