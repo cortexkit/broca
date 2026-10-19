@@ -534,4 +534,30 @@ mod tests {
         assert!(bytes > broca_protocol::READ_REPLY_MAX_BYTES);
         assert!(bytes + 32 < 4_194_304, "the complete frame still fits");
     }
+
+    /// The model view shows a summary-bearing OpenAI Responses reasoning item exactly as stored,
+    /// with no derived readable block: compaction views are built from these entries, and part
+    /// positions must match the stored block indices.
+    #[test]
+    fn model_view_keeps_responses_reasoning_items_as_stored() {
+        let item = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"first"},{"type":"summary_text","text":"second"}],"encrypted_content":"cipher"}"#;
+        let opaque = ContentBlock::RedactedReasoning {
+            data: item.into(),
+            provider_format: Some(broca_protocol::EncryptedReasoningFormat::OpenAiResponses),
+        };
+        let answer = ContentBlock::Text {
+            text: "answer".into(),
+        };
+        let mut message = Message::new(Role::Assistant, vec![opaque.clone(), answer.clone()]);
+        message.ordinal = Some(0);
+        let page = assemble(
+            vec![message],
+            None,
+            &ModelPageRequest::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(page.messages[0].message.content, [opaque, answer]);
+    }
 }

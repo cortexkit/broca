@@ -329,3 +329,93 @@ fn legacy_frozen_configs_keep_pre_state_decode_and_render_bytes() {
         );
     }
 }
+
+/// A Responses step whose reasoning item carries summary text: the live stream shows that text
+/// on the display lane, but that changes neither what is stored nor what is sent back.
+/// The step is decoded by the real normalizer, framed into the WAL, replayed, and rendered; the
+/// stored block must be the provider's raw item and the rebuilt request must echo it unchanged,
+/// for both the stateless (`store: false`) and the legacy continuation shapes.
+#[test]
+fn responses_reasoning_summary_request_bytes_survive_wal_replay() {
+    const ITEM: &str = r#"{"id":"rs_summary","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
+    let model = ModelHandle::new("fixture-provider", "model");
+    for stateless in [true, false] {
+        let mut frozen = openai_responses_frozen_config("model");
+        if !frozen.static_options.is_object() {
+            frozen.static_options = json!({});
+        }
+        frozen.static_options["store"] = json!(!stateless);
+        let message = decoded(
+            &OpenAiResponses,
+            &frozen,
+            include_str!("../fixtures/responses_reasoning_summary.sse"),
+        );
+        let stored = vec![
+            ContentBlock::RedactedReasoning {
+                data: ITEM.into(),
+                provider_format: Some(broca_protocol::EncryptedReasoningFormat::OpenAiResponses),
+            },
+            ContentBlock::Text {
+                text: "All good.".into(),
+            },
+        ];
+        assert_eq!(message.content, stored, "the step stores only the raw item");
+
+        let records: Vec<WalRecord> = vec![
+            serde_json::from_value(json!({
+                "type":"run_started", "run_id":"summary", "session":{"project_root":"/tmp/provider-state","harness":"test","session":"summary"},
+                "config":{"model":model,"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":frozen.renderer_version,"frozen_render_config":frozen},
+                "input":[{"role":"user","content":[{"type":"text","text":"check"}]}],"origin":{"kind":"fresh"}
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"model_step_finished","step_id":1,"assistant_message":message,"usage":{},"retries_used":0
+            }))
+            .unwrap(),
+        ];
+        let restored: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let bytes = encode(index as u64 + 1, 1, record).unwrap();
+                let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                    panic!("framed WAL record")
+                };
+                framed.record
+            })
+            .collect();
+        let state = broca_core::replay(&restored).unwrap();
+        let assistant = state
+            .prompt
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(assistant.content, stored, "replay keeps the stored item");
+
+        let mut opts = CallOptions::new(state.prompt);
+        opts.target_model = Some(model.clone());
+        opts.step_context = Some(broca_protocol::StepContext {
+            run_id: "summary".into(),
+            step_index: 2,
+        });
+        let body: Value = serde_json::from_slice(&OpenAiResponses.render(&frozen, &opts)).unwrap();
+        let expected = if stateless {
+            concat!(
+                r#"[{"content":"check","role":"user","type":"message"},"#,
+                r#"{"encrypted_content":"synthetic-cipher","id":"rs_summary","summary":[{"text":"**Planning** I will check the inputs.","type":"summary_text"},{"text":"**Answering** The inputs are fine.","type":"summary_text"}],"type":"reasoning"},"#,
+                r#"{"content":"All good.","role":"assistant","type":"message"}]"#
+            )
+        } else {
+            concat!(
+                r#"[{"content":"check","role":"user","type":"message"},"#,
+                r#"{"content":null,"encrypted_content":"synthetic-cipher","summary":[{"text":"**Planning** I will check the inputs.","type":"summary_text"},{"text":"**Answering** The inputs are fine.","type":"summary_text"}],"type":"reasoning"},"#,
+                r#"{"content":"All good.","role":"assistant","type":"message"}]"#
+            )
+        };
+        assert_eq!(
+            String::from_utf8(broca_protocol::canonical_json_bytes(&body["input"])).unwrap(),
+            expected,
+            "stateless={stateless}"
+        );
+    }
+}

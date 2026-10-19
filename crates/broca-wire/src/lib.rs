@@ -4223,6 +4223,30 @@ mod caller_message_tests {
             serde_json::to_value(&message.message).unwrap()
         );
     }
+
+    /// A summary-bearing OpenAI Responses reasoning item is written exactly as stored, with no
+    /// derived readable part. Consumers line part-level data up with the stored block positions,
+    /// so an inserted block would shift every later part away from its stored index.
+    #[test]
+    fn responses_reasoning_summary_is_read_as_the_stored_blocks_only() {
+        let item = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** check inputs"}],"encrypted_content":"cipher"}"#;
+        let message = read_message(vec![
+            ContentBlock::RedactedReasoning {
+                data: item.into(),
+                provider_format: Some(broca_protocol::EncryptedReasoningFormat::OpenAiResponses),
+            },
+            ContentBlock::Text {
+                text: "All good.".into(),
+            },
+        ]);
+        assert_eq!(
+            serde_json::to_value(&message).unwrap()["message"]["content"],
+            json!([
+                {"type": "redacted_reasoning", "data": item, "provider_format": "open_ai_responses"},
+                {"type": "text", "text": "All good."},
+            ])
+        );
+    }
 }
 pub use broca_protocol::run_events;
 

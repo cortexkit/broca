@@ -3661,6 +3661,79 @@ fn two_episode_pinned_bytes() -> String {
         .to_owned()
 }
 
+/// The provider's raw reasoning item, as an OpenAI Responses step stores it: two summary parts
+/// beside the encrypted reasoning.
+const SUMMARY_REASONING_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
+
+/// A stored OpenAI Responses reasoning item that carries summary text reads back as exactly the
+/// stored blocks, in both the transcript and the model view: no derived readable part is added.
+/// Consumers line part-level data up with stored block positions, and compaction views are
+/// built from the model view, so an inserted block would misplace every later part.
+#[tokio::test]
+async fn responses_reasoning_summary_reads_back_as_the_stored_blocks() {
+    let rig = Rig::new("reasoning-summary-stored", Arc::new(NoopExec));
+    let key = rig.key("stored");
+    let stored = vec![
+        ContentBlock::RedactedReasoning {
+            data: SUMMARY_REASONING_ITEM.into(),
+            provider_format: Some(broca_protocol::EncryptedReasoningFormat::OpenAiResponses),
+        },
+        ContentBlock::Text {
+            text: "All good.".into(),
+        },
+    ];
+    let mut step = assistant_text(0, "");
+    if let WalRecord::ModelStepFinished {
+        assistant_message, ..
+    } = &mut step
+    {
+        Arc::make_mut(assistant_message).content = stored.clone();
+    }
+    write_legacy_seed(
+        &rig.wal_store,
+        &key,
+        &[started(&key, "run-1", "question"), step, finished_ok()],
+    );
+    let stored_wire = serde_json::to_value(&stored).unwrap();
+
+    let page = rig
+        .registry
+        .read(read_request(&key, Some(0), Some(10)))
+        .await
+        .expect("session.read");
+    let transcript = serde_json::to_value(&page).expect("serialize session.read response");
+    assert_eq!(transcript["messages"][1]["message"]["content"], stored_wire);
+
+    let model = rig
+        .registry
+        .route_read_model_page(
+            &key,
+            &broca_core::ModelPageRequest {
+                from_ordinal: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("model view read");
+    let model = serde_json::to_value(
+        broca_wire::ModelPage::try_from(model).expect("model page reaches the wire"),
+    )
+    .unwrap();
+    assert_eq!(model["messages"][1]["message"]["content"], stored_wire);
+
+    let records = rig.wal_store.read_records(&key).expect("read WAL");
+    let durable = records
+        .iter()
+        .find_map(|framed| match &framed.record {
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => Some(assistant_message.content.clone()),
+            _ => None,
+        })
+        .expect("step record");
+    assert_eq!(durable, stored, "the read never rewrites the stored step");
+}
+
 /// Also the proof that `include_tools: false` (what `read_request` sends) leaves the response
 /// byte-identical to the page whose tool-list fields are omitted.
 #[tokio::test]
