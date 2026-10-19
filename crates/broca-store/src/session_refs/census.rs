@@ -221,7 +221,7 @@ pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCo
         None
     };
     let mut conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    conn.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+    crate::busy::configure_migration_connection(&conn)?;
     conn.pragma_update(None, "wal_autocheckpoint", 0)?;
     let mut writes = MigrationWriteStats::default();
     if incomplete {

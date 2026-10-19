@@ -66,6 +66,13 @@ Every transaction releases the lock, yields and leaves an unlocked pacing interv
 before attempting the next batch. The migration connection does not run automatic
 checkpoints inside its commits.
 
+The migration connection waits up to the same five-second store budget for a
+write lock, polling at a fixed one-millisecond interval. SQLite's default busy
+handler backs off to much longer sleeps and can repeatedly miss the short unlocked
+gaps in a burst of projection or export commits. Short polling avoids that
+backoff-induced starvation without retrying failed batches or extending the wait
+budget. Foreground connections keep their existing busy-timeout policy.
+
 Census progress and in-flight addresses are durable. An interrupted address with
 partially inserted candidates is replayed rather than mistaken for a fully
 represented WAL. After interruption, enumeration adds any new addresses but

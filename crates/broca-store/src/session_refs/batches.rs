@@ -61,8 +61,8 @@ pub(super) fn write_batch<T>(
             hook();
         }
     });
-    // SQLite's busy handler backs off. An explicit unlocked interval, rather
-    // than immediately reacquiring, lets foreground projection/export win.
+    // An explicit unlocked interval, rather than immediately reacquiring, lets
+    // foreground projection/export win even with the migration's short busy polls.
     if paced {
         std::thread::sleep(held.saturating_mul(3).max(Duration::from_millis(2)));
     }
@@ -73,6 +73,51 @@ pub(super) fn write_batch<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::busy::{configure_migration_connection, BUSY_WAIT_HOOK};
+
+    #[test]
+    fn migration_busy_handler_waits_for_foreground_commit() {
+        let path = broca_test_support::scratch_root()
+            .join(format!("migration-busy-{}.db", std::process::id()));
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE sample(id INTEGER PRIMARY KEY); BEGIN IMMEDIATE;"
+        ).unwrap();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(path).unwrap();
+            configure_migration_connection(&conn).unwrap();
+            BUSY_WAIT_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |delay| {
+                    waiting_tx.send(delay).unwrap();
+                }));
+            });
+            write_batch(
+                &conn,
+                &[1],
+                &mut MigrationWriteStats::default(),
+                false,
+                |tx, id| {
+                    tx.execute("INSERT INTO sample VALUES(?1)", [id])?;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+        });
+        let delay = waiting_rx
+            .recv_timeout(broca_test_support::EVENT_HANG_GUARD)
+            .unwrap();
+        assert_eq!(delay, Duration::from_millis(1));
+        blocker.execute_batch("COMMIT").unwrap();
+        assert_eq!(writer.join().unwrap().unwrap(), 1);
+        assert_eq!(
+            blocker
+                .query_row("SELECT count(*) FROM sample", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
 
     #[test]
     fn migration_write_budget_yields_before_the_row_limit() {

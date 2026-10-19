@@ -30,7 +30,8 @@ use broca_wal::{
 };
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
-const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+mod busy;
+use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
 pub mod caps;
