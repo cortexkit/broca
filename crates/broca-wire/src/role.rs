@@ -206,6 +206,9 @@ pub fn broca_role_describe(implementation_version: &str) -> RoleDescribeResponse
     broca_role_describe_with_writers(implementation_version, false, false, false)
 }
 
+/// The `role.describe` capability naming the `delivery_order` group of `session.send`.
+pub const DELIVERY_ORDER_GROUP: &str = "delivery_order";
+
 /// Discovery follows all installed writers through one capability calculation. Decoding
 /// compaction, retention or hook records alone does not promise to execute those writers.
 pub fn broca_role_describe_with_writers(
@@ -245,6 +248,10 @@ pub fn broca_role_describe_with_writers(
         "session_class",
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
+        // `session.send` takes an ordered `delivery` list with `dedupe_key` and `expires_at_ms`.
+        // `turn_system` is accepted in a list but is never possible on this runner yet, so the
+        // list falls through to its next mode.
+        DELIVERY_ORDER_GROUP,
     ]
     .map(String::from)
     .to_vec();
@@ -702,7 +709,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "be8550d469403072f2ca4c0aae65aca39fa625b2143b99955421a2eeaacc1207",
+            "56570fe00f47f8e5b9e987032f05ce2775a03790d5e3253d3d529365f3a500cc",
         );
     }
 
@@ -859,7 +866,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "c70f69130228f30d9f18dc7c39b007dd4c8bbc52c92ee5090ff5aebe311cd7e6";
+        "d82291bccbd81a624ececd24f9be7ca95a43c05034692b2c451925514abcad52";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

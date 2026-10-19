@@ -116,6 +116,9 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::StructuredOutputResult { .. } => "structured_output_result",
         WalRecord::StructuredOutputDowngraded { .. } => "structured_output_downgraded",
+        WalRecord::DeliveryOrdered { .. } => "delivery_ordered",
+        WalRecord::SendEnded { .. } => "send_ended",
+        WalRecord::SendDelivered { .. } => "send_delivered",
         WalRecord::Unknown => "unknown",
     }
 }
@@ -236,6 +239,39 @@ const DEFERRED_CALL_PINNED: &[&str] = &[
     r#"{"type":"question_withdrawal_acknowledged","call_key":"lineage:7","answer":"not_sent","reason":"expired"}"#,
 ];
 
+/// The records of sends with an ordered `delivery` list, each with its optional fields present
+/// and absent.
+const DELIVERY_ORDER_PINNED: &[&str] = &[
+    r#"{"type":"delivery_ordered","submission_id":"sub-r2","order":{"modes":["tool_result","turn_system","steer","idle_start"],"dedupe_key":"ctx-reduce","expires_at_ms":1790000000000},"sent_by":{"kind":"reserved","module_id":"ck-mc"}}"#,
+    r#"{"type":"delivery_ordered","submission_id":"sub-r2","order":{"modes":["steer"]}}"#,
+    r#"{"type":"send_ended","submission_id":"sub-r2","reason":{"kind":"superseded","by":"sub-r3"}}"#,
+    r#"{"type":"send_ended","submission_id":"sub-r2","reason":{"kind":"expired"}}"#,
+    r#"{"type":"send_delivered","submission_id":"sub-r2","run_id":"r1","mode":"steer","input":[{"role":"user","content":[{"type":"text","text":"note"}]}]}"#,
+    r#"{"type":"send_delivered","submission_id":"sub-r2","run_id":"r1","mode":"tool_result","tool_call_id":"t1","appended_text":"\n\nnote"}"#,
+];
+
+/// Every delivery-order record is must-understand: it is written only in a gated frame naming
+/// `delivery-order/v1` (a build without that name refuses it; see the framing tests), and this
+/// build reads it back unchanged.
+#[test]
+fn delivery_order_records_are_must_understand_and_round_trip() {
+    use crate::framing::{
+        decode_next, encode, DecodeStep, DELIVERY_ORDER_FEATURE, GATED_FRAMING_VERSION,
+    };
+    for bytes in DELIVERY_ORDER_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+        assert!(!record.is_informational(), "{bytes}");
+        assert_eq!(record.required_features(), &[DELIVERY_ORDER_FEATURE]);
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION);
+        let DecodeStep::Record { framed, .. } = decode_next(&frame) else {
+            panic!("this build must read {bytes}")
+        };
+        assert_eq!(framed.record, record);
+    }
+}
+
 const CANCEL_AT_PINNED: &[&str] = &[
     r#"{"type":"run_cancel_requested","run_id":"r","at":"step_boundary"}"#,
     r#"{"type":"run_cancel_requested","run_id":"r","at":"now"}"#,
@@ -328,6 +364,7 @@ fn every_record_kind_keeps_its_pinned_bytes() {
         .iter()
         .chain(DEFERRED_CALL_PINNED)
         .chain(CANCEL_AT_PINNED)
+        .chain(DELIVERY_ORDER_PINNED)
         .chain(INPUT_CAP_PINNED)
         .chain(STRUCTURED_OUTPUT_PINNED)
     {
@@ -382,6 +419,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(include_str!("../../tests/fixtures/compaction_records.jsonl").lines())
         .chain(DEFERRED_CALL_PINNED.iter().copied())
         .chain(CANCEL_AT_PINNED.iter().copied())
+        .chain(DELIVERY_ORDER_PINNED.iter().copied())
         .chain(INPUT_CAP_PINNED.iter().copied())
         .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
@@ -428,6 +466,9 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "late_dispatch_intent",
         "late_result",
         "question_withdrawal_acknowledged",
+        "delivery_ordered",
+        "send_ended",
+        "send_delivered",
     ];
     assert_eq!(pinned, every_kind.into_iter().collect());
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");

@@ -173,6 +173,10 @@ pub enum LineageCmd {
         /// The fetch plan the send carried, if any. Boxed so this command stays small enough to
         /// hand back whole in the registry's `Err` when the actor's channel is closed.
         plan: Option<Box<SendPlan>>,
+        /// The send's `delivery_order` group, when it uses one (an ordered `delivery` list, a
+        /// `dedupe_key` or an expiry). Such a send is always queued; see
+        /// `broca_core::delivery_order`.
+        order: Option<Box<broca_protocol::DeliveryOrder>>,
         reply: oneshot::Sender<SendOutcome>,
     },
     /// Durably import a provider-free synthetic episode on the session writer.
@@ -366,6 +370,20 @@ pub enum SendOutcome {
     /// The send's fetch plan, or a member it carried beside a frozen plan, was refused. Nothing
     /// was written.
     PlanRefused(broca_fetch_plan::Refusal),
+    /// A send using the `delivery_order` group was refused before anything was written: `code`
+    /// names why (`sender_not_permitted`, `idle_start_not_granted`, or `invalid_params` for a
+    /// list that can never be delivered or an expiry already past, with `field` naming it).
+    DeliveryRefused {
+        code: &'static str,
+        field: &'static str,
+        message: String,
+    },
+    /// A retry of an ordered send that ended undelivered: replaced by a newer send under its
+    /// dedupe key, or expired.
+    SendEnded {
+        submission_id: broca_protocol::SubmissionId,
+        reason: broca_wal::record::SendEndReason,
+    },
     /// An input hook refused a steer or queued send before any durable write or interrupt.
     PreUserUnavailable {
         provider: String,
@@ -1240,6 +1258,21 @@ pub struct LineageActor<W: WalStore> {
     /// The manifest the send being handled froze for a session with no episode yet, held only
     /// while that send is handled so the episode it starts records it.
     admitting_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// The `delivery_order` group of the send being handled, held only while it is handled.
+    admitting_order: Option<broca_protocol::DeliveryOrder>,
+    /// The attested principal of the send being handled when it is a plan-named sender other
+    /// than the session's owner; the send itself continues under the owner's principal.
+    admitting_sent_by: Option<broca_protocol::BindPrincipal>,
+    /// For sends with an ordered `delivery` list: `ended_submissions` holds each one the WAL
+    /// records as ended undelivered (`SendEnded`: replaced or expired) with its reason, and
+    /// `delivered_submissions` each one it records as delivered into a running turn
+    /// (`SendDelivered`) with that run. Both are loaded and kept current with
+    /// `retracted_submissions`, so a keyed retry of such a send is answered with its outcome.
+    ended_submissions: HashMap<broca_protocol::SubmissionId, broca_wal::record::SendEndReason>,
+    delivered_submissions: HashMap<broca_protocol::SubmissionId, RunId>,
+    /// The order each ordered send's `DeliveryOrdered` record carries, by submission, loaded and
+    /// kept current with `retracted_submissions`. A keyed retry must carry the same order.
+    ordered_submissions: HashMap<broca_protocol::SubmissionId, broca_protocol::DeliveryOrder>,
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     /// Shared permit for manual and automatic cache refreshes. While held, keep the writer
@@ -1440,6 +1473,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             crash_orphan_candidates: None,
             first_episode: Arc::clone(&first_episode),
             admitting_manifest: None,
+            admitting_order: None,
+            admitting_sent_by: None,
+            ended_submissions: HashMap::new(),
+            delivered_submissions: HashMap::new(),
+            ordered_submissions: HashMap::new(),
             restart_admitting: false,
             restart_waiters: Vec::new(),
             warm_in_flight: Default::default(),
@@ -1786,8 +1824,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 skip_materialization,
                 delivery,
                 plan,
+                order,
                 reply,
             } => {
+                self.admitting_order = order.map(|order| *order);
                 // Keep the reply available to input hooks so a dropped RPC cannot write its
                 // unacknowledged transform. Ordinary run admission keeps its existing barrier.
                 let prior_reply = self.send_reply.replace(reply);
@@ -1809,6 +1849,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .await;
                 let _ = self.sync_retention_index().await;
                 self.admitting_retention = None;
+                self.admitting_order = None;
+                self.admitting_sent_by = None;
                 // A manifest only ever applies to the episode its own send starts.
                 self.admitting_manifest = None;
                 let _ = self
@@ -2397,7 +2439,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     async fn on_send(
         &mut self,
         run_id: RunId,
-        request: SubmissionRequest,
+        mut request: SubmissionRequest,
         kind: RunKind,
         key: SendKey,
         skip_materialization: bool,
@@ -2519,6 +2561,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // `scope_owner_mismatch` refusal for it. The send is refused with it further down if it
         // turns out to be a retry of a run started under the old epoch, which it cannot resume.
         let mut reopen_refusal = None;
+        // A send using the `delivery_order` group from a module other than the session's owner is
+        // admitted only if the session's frozen plan names that module as a sender, matched on
+        // the daemon-attested principal. Such a sender never becomes the session's principal: the
+        // send continues as an internal send under the session's frozen principal, so it takes
+        // the frozen scope (its tool routes carry the owner's) and never freezes, adopts or
+        // reopens one. The sender itself is recorded only on its `DeliveryOrdered` record.
+        self.admitting_sent_by = None;
+        if let Some(order) = self.admitting_order.clone() {
+            match self.ordered_sender(&request, &order).await {
+                Ok(Some(owner)) => {
+                    self.admitting_sent_by = request.principal.replace(owner);
+                    request.scope = broca_protocol::SendScope::Internal;
+                }
+                Ok(None) => {}
+                Err(outcome) => return outcome,
+            }
+        }
         if !self.agent_run_writer_enabled() {
             if let Some(scope) = &self.agent_run_scope {
                 return SendOutcome::ScopeRefused(
@@ -2650,6 +2709,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let request_identity_digest = key
             .is_keyed()
             .then(|| send_identity_digest(&request, delivery, conversation_key.as_deref()));
+        // The delivery order is part of a keyed send's identity: a retry that asks for another
+        // order (an ordered send retried as a legacy one, or the reverse) is refused by name.
+        if key.is_keyed() {
+            match self.send_order_differs(&run_id).await {
+                Ok(true) => {
+                    return SendOutcome::SendIdReuse {
+                        differing: "delivery",
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => return SendOutcome::Error(error),
+            }
+        }
         // A key already used by a steer is answered from that steer's record: a steer opens no
         // episode of its own, so the run-id lookup below cannot find it. This also refuses a
         // later send of another mode under the same key, naming `delivery`.
@@ -2894,6 +2966,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        // A send using the `delivery_order` group is always queued with its order, and delivered
+        // at the first request boundary where one of its modes is possible.
+        if !resume_indexed_run {
+            if let Some(order) = self.admitting_order.clone() {
+                return self
+                    .queue_ordered_submission(
+                        run_id,
+                        request,
+                        identity,
+                        skip_materialization,
+                        order,
+                    )
+                    .await;
+            }
+        }
         // A retry of a send whose own episode is unfinished resumes that episode, whatever mode
         // it was sent with: its message is already durable and must not be steered or queued
         // a second time.
@@ -3865,6 +3952,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             recorded: std::sync::Mutex::new(recorded),
         });
         let steer = broca_core::SteerInbox::new();
+        // The run may deliver every ordered send still queued, except the one this run consumes.
+        steer.seed_ordered(
+            self.pending_fifo
+                .iter()
+                .filter(|pending| submission_id.as_ref() != Some(&pending.submission_id))
+                .filter_map(broca_core::delivery_order::OrderedSend::from_pending)
+                .collect(),
+        );
         let step_progress = Arc::new(std::sync::Mutex::new(None));
         let control = RunControl {
             step_progress: Some(Arc::clone(&step_progress)),
@@ -4243,6 +4338,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request: request.clone(),
             request_identity_digest: request_identity_digest.clone(),
             principal: principal.clone(),
+            order: None,
+            sent_by: None,
         };
         // The session writer is shared with the active run, so this sync is a durable queue
         // barrier in the same sequence space as run records. The `Pending` reply below follows
@@ -4272,6 +4369,368 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if skip_materialization {
             self.skip_materialization_submissions
                 .insert(submission_id.clone());
+        }
+        SendOutcome::Pending { submission_id }
+    }
+
+    /// The answer to a keyed retry of an ordered send delivered into run `run_id`: that run's state
+    /// now, as for a retry of the send that started it. Finished once its terminal is durable,
+    /// paused while it is paused, and active otherwise.
+    async fn delivered_run_outcome(&mut self, run_id: RunId) -> SendOutcome {
+        if matches!(&self.state, RunState::Active { run_id: active, .. } if *active == run_id) {
+            if let Some(reason) = self.durable_finish_of_active(&run_id) {
+                return SendOutcome::Finished {
+                    run_id,
+                    reason,
+                    delivered: None,
+                };
+            }
+            return SendOutcome::Active {
+                run_id,
+                delivered: None,
+            };
+        }
+        match self.reconcile_from_wal(&run_id).await {
+            Ok(Some(state)) => match indexed_finish_reason(&state.state) {
+                Some(reason) => SendOutcome::Finished {
+                    run_id,
+                    reason,
+                    delivered: None,
+                },
+                None => match state.pause_reason {
+                    Some(reason) => SendOutcome::Paused { run_id, reason },
+                    None => SendOutcome::Active {
+                        run_id,
+                        delivered: None,
+                    },
+                },
+            },
+            Ok(None) => SendOutcome::Error(format!(
+                "the WAL records a delivery into run {} but not the run",
+                run_id.0
+            )),
+            Err(error) => SendOutcome::Error(error),
+        }
+    }
+
+    /// Whether a keyed send reuses the run id of an earlier send that asked for a different
+    /// delivery order: a legacy send (no order) and an ordered send, or two different orders.
+    /// The same `send_id` is the same send, so the order is part of its identity.
+    async fn send_order_differs(&mut self, run_id: &RunId) -> Result<bool, String> {
+        self.ensure_wal_scan_loaded().await?;
+        let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
+        let used = self.recorded_send_keys.contains_key(run_id)
+            || self.ordered_submissions.contains_key(&submission_id);
+        Ok(used && self.ordered_submissions.get(&submission_id) != self.admitting_order.as_ref())
+    }
+
+    /// Whether the send being handled comes from the session's owner (`Ok(None)`), from a
+    /// plan-named sender other than the owner (`Ok(Some(frozen principal))`: the principal the
+    /// send continues under), or must be refused. The sender is the principal the daemon stamped
+    /// on the route, never a request field. A named sender may use `idle_start` only if the plan
+    /// grants it. The session's frozen principal is its scope's owner when it is scoped, else
+    /// the principal of its first episode.
+    async fn ordered_sender(
+        &mut self,
+        request: &SubmissionRequest,
+        order: &broca_protocol::DeliveryOrder,
+    ) -> Result<Option<broca_protocol::BindPrincipal>, SendOutcome> {
+        let ownership = self.load_ownership().await.map_err(|error| {
+            SendOutcome::Transient(format!(
+                "cannot read the session's history for the sender check: {error}"
+            ))
+        })?;
+        if broca_core::scope_admission::decide_owner_access(
+            &ownership,
+            request.principal.as_ref(),
+            &request.scope,
+        )
+        .is_ok()
+        {
+            return Ok(None);
+        }
+        let refused = |code: &'static str, message: String| SendOutcome::DeliveryRefused {
+            code,
+            field: "delivery",
+            message,
+        };
+        let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = &request.principal else {
+            return Err(refused(
+                "sender_not_permitted",
+                "only the session's owner or a module its plan names may send with an ordered delivery list".into(),
+            ));
+        };
+        let senders = ownership
+            .first_episode
+            .as_ref()
+            .and_then(|first| first.manifest.as_ref())
+            .and_then(|manifest| {
+                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
+            })
+            .and_then(|plan| {
+                plan.as_object()
+                    .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
+            })
+            .unwrap_or_default();
+        let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
+            return Err(refused(
+                "sender_not_permitted",
+                format!("the session's plan does not name module {module_id} as a sender"),
+            ));
+        };
+        if order.starts_runs() && !sender.idle_start {
+            return Err(refused(
+                "idle_start_not_granted",
+                format!("the session's plan does not let module {module_id} start runs"),
+            ));
+        }
+        let frozen = ownership
+            .scope
+            .as_ref()
+            .map(|scope| scope.owner.clone())
+            .or_else(|| ownership.first_principal.clone());
+        frozen.map(Some).ok_or_else(|| {
+            SendOutcome::Transient("the session has no frozen principal to send under".into())
+        })
+    }
+
+    /// Queue a send using the `delivery_order` group: `DeliveryOrdered` then `Queued`, in one
+    /// barrier, synced before the reply. An undelivered send from the same sender under the same
+    /// dedupe key ends `superseded` first, in the same barrier. While a turn runs, all three are
+    /// written under its inbox lock, so a send the turn already delivered is never replaced and
+    /// the turn sees the new send at its next boundary. On an idle session a list naming
+    /// `idle_start` then drains into a run at once; any other list waits.
+    async fn queue_ordered_submission(
+        &mut self,
+        run_id: RunId,
+        mut request: SubmissionRequest,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        order: broca_protocol::DeliveryOrder,
+    ) -> SendOutcome {
+        if self.registry.is_stopping() {
+            return SendOutcome::Transient("module is stopping".into());
+        }
+        let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
+        // A retry with the same `send_id` is the same send: answer what became of it.
+        if let Some(existing) = self
+            .pending_fifo
+            .iter()
+            .find(|pending| pending.submission_id == submission_id)
+        {
+            if existing.order.as_ref() != Some(&order) {
+                return SendOutcome::SendIdReuse {
+                    differing: "delivery",
+                };
+            }
+            return SendOutcome::Pending { submission_id };
+        }
+        if identity.send_id.is_some() {
+            if let Err(error) = self.ensure_wal_scan_loaded().await {
+                return SendOutcome::Error(error);
+            }
+            if let Some(reason) = self.ended_submissions.get(&submission_id) {
+                return SendOutcome::SendEnded {
+                    submission_id,
+                    reason: reason.clone(),
+                };
+            }
+            if let Some(delivered_into) = self.delivered_submissions.get(&submission_id).cloned() {
+                return self.delivered_run_outcome(delivered_into).await;
+            }
+            if self.retracted_submissions.contains(&submission_id) {
+                return SendOutcome::Retracted { submission_id };
+            }
+        }
+        if order.modes == [broca_protocol::DeliveryMode::TurnSystem] {
+            return SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field: "delivery",
+                message: format!(
+                    "turn_system is not possible on this runner ({}), and the list names no other mode",
+                    broca_core::delivery_order::TURN_SYSTEM_TEMPLATE_UNIMPLEMENTED
+                ),
+            };
+        }
+        if order.expired_at(self.ordered_now_ms()) {
+            return SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field: "expires_at_ms",
+                message: "expires_at_ms has already passed".into(),
+            };
+        }
+        // Like a plain queued send, a send that may start a run is refused on a session paused
+        // for re-authentication: it would wait behind a run nothing is going to end.
+        if order.starts_runs() && matches!(self.state, RunState::Idle) {
+            match self.paused_run().await {
+                Ok(Some((paused, reason)))
+                    if reason == broca_protocol::PauseReason::AuthRequired =>
+                {
+                    return SendOutcome::RunPaused {
+                        run_id: paused,
+                        reason,
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => return SendOutcome::Transient(error),
+            }
+        }
+        if let Err(error) = self.record_frozen_model(&mut request).await {
+            return SendOutcome::Error(error);
+        }
+        let manifest = match self.frozen_input_manifest().await {
+            Ok(manifest) => manifest,
+            Err(outcome) => return outcome,
+        };
+        let prepared = match self
+            .prepare_input(
+                request.input.clone(),
+                broca_protocol::Delivery::Queue,
+                manifest,
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        if let Some(provider) = &prepared.refused {
+            return SendOutcome::PreUserUnavailable {
+                provider: provider.clone(),
+            };
+        }
+        let SendIdentity {
+            conversation_key,
+            title,
+            send_id,
+            request_identity_digest,
+        } = identity;
+        let hooks = prepared.queued_hooks();
+        let principal = request.principal.clone();
+        let pending = PendingSubmission {
+            hooks: hooks.clone(),
+            conversation_key: conversation_key.clone(),
+            delivery: None,
+            send_id: send_id.clone(),
+            title: title.clone(),
+            submission_id: submission_id.clone(),
+            request: request.clone(),
+            request_identity_digest: request_identity_digest.clone(),
+            principal: principal.clone(),
+            order: Some(order.clone()),
+            sent_by: self.admitting_sent_by.clone(),
+        };
+        // Whose dedupe key this is: the plan-named sender, or the owner sending as itself.
+        let sender = self.admitting_sent_by.clone().or_else(|| principal.clone());
+        let Some(send) = broca_core::delivery_order::OrderedSend::from_pending(&pending) else {
+            unreachable!("an ordered pending entry has an order");
+        };
+        let queued = WalRecord::Queued {
+            retention: self.admitting_retention,
+            ts_ms: self.retention_timestamp(),
+            hooks,
+            keep_warm: request.keep_warm,
+            conversation_key,
+            delivery: None,
+            send_id,
+            title,
+            submission_id: submission_id.clone(),
+            request: Box::new(request),
+            request_identity_digest: request_identity_digest.clone(),
+            principal: principal.clone(),
+        };
+        let ordered = WalRecord::DeliveryOrdered {
+            submission_id: submission_id.clone(),
+            order: order.clone(),
+            sent_by: self.admitting_sent_by.clone(),
+        };
+        let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
+        let write = |superseded: Option<&broca_protocol::SubmissionId>| {
+            if let Some(old) = superseded {
+                writer.record(broca_core::delivery_order::ended(
+                    old,
+                    broca_wal::record::SendEndReason::Superseded {
+                        by: submission_id.clone(),
+                    },
+                ));
+            }
+            writer.record(ordered);
+            writer.record(queued);
+        };
+        let open_inbox = match &self.state {
+            RunState::Active { steer, .. } if !steer.is_closed() => Some(Arc::clone(steer)),
+            _ => None,
+        };
+        let mut write = Some(write);
+        let mut write_once = |old: Option<&broca_protocol::SubmissionId>| {
+            if let Some(write) = write.take() {
+                write(old);
+            }
+        };
+        let superseded = match open_inbox.map(|inbox| inbox.accept_ordered(send, &mut write_once)) {
+            Some(broca_core::OrderedAcceptance::Queued { superseded }) => superseded,
+            Some(broca_core::OrderedAcceptance::Closed) | None => {
+                // No turn can deliver anything now, so the actor's own queue decides what this
+                // send replaces. First drop what the ending turn already delivered or ended, so
+                // a delivered send is never replaced.
+                if let RunState::Active { steer, .. } = &self.state {
+                    let consumed = steer.take_consumed();
+                    if !consumed.is_empty() {
+                        self.pending_fifo
+                            .retain(|pending| !consumed.contains(&pending.submission_id));
+                        self.wal_scan_complete = false;
+                    }
+                }
+                let queued_old = self
+                    .pending_fifo
+                    .iter()
+                    .filter_map(broca_core::delivery_order::OrderedSend::from_pending)
+                    .find(|queued| queued.replaced_by(sender.as_ref(), order.dedupe_key.as_deref()))
+                    .map(|queued| queued.submission_id);
+                write_once(queued_old.as_ref());
+                queued_old
+            }
+        };
+        if let Err(error) = writer.sync().await {
+            return SendOutcome::Error(error.to_string());
+        }
+        if let Some(old) = superseded {
+            self.pending_fifo
+                .retain(|pending| pending.submission_id != old);
+            self.skip_materialization_submissions.remove(&old);
+            if self.wal_scan_complete {
+                self.ended_submissions.insert(
+                    old,
+                    broca_wal::record::SendEndReason::Superseded {
+                        by: submission_id.clone(),
+                    },
+                );
+            }
+        }
+        self.note_recorded_send_key(&run_id, false, request_identity_digest.as_deref());
+        if self.wal_scan_complete {
+            self.ordered_submissions
+                .insert(submission_id.clone(), order.clone());
+        }
+        broca_core::insert_in_drain_order(&mut self.pending_fifo, pending);
+        if skip_materialization {
+            self.skip_materialization_submissions
+                .insert(submission_id.clone());
+        }
+        self.prior_snapshot = None;
+        // On an idle session `idle_start` is the first possible mode of any list naming it
+        // (nothing else is possible without a running turn), so the send starts its run now.
+        if order.starts_runs() && matches!(self.state, RunState::Idle) {
+            if let Err(error) = self.drain_queue_one().await {
+                tracing::warn!(target: "admission", "ordered send drain deferred: {error}");
+            }
+            if let RunState::Active { run_id: active, .. } = &self.state {
+                if *active == run_id {
+                    return SendOutcome::Active {
+                        run_id,
+                        delivered: None,
+                    };
+                }
+            }
         }
         SendOutcome::Pending { submission_id }
     }
@@ -5114,11 +5573,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 steer,
                 skip_materialization,
                 ..
-            } if *task_run_id == run_id && *active_attempt == attempt_id => (
-                durable.clone(),
-                cancel.is_cancelled() || steer.boundary_cancel().is_cancelled(),
-                *skip_materialization,
-            ),
+            } if *task_run_id == run_id && *active_attempt == attempt_id => {
+                // Drop from the actor's queue every ordered send this run delivered or ended.
+                // The queue is re-read from the WAL below, but that re-read can be deferred, and a
+                // stale entry would be handed to the next run and delivered a second time.
+                let consumed = steer.take_consumed();
+                if !consumed.is_empty() {
+                    self.pending_fifo
+                        .retain(|pending| !consumed.contains(&pending.submission_id));
+                    // The delivery and end records were written by the run, not this actor.
+                    self.wal_scan_complete = false;
+                }
+                (
+                    durable.clone(),
+                    cancel.is_cancelled() || steer.boundary_cancel().is_cancelled(),
+                    *skip_materialization,
+                )
+            }
             // Stale terminal (backstop already fired, or a different/older run) — ignore.
             _ => return false,
         };
@@ -5259,8 +5730,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return Ok(());
         }
         self.flush_capped_export_barrier().await?;
+        self.expire_ordered_sends().await?;
         loop {
-            let Some(first) = self.pending_fifo.first().cloned() else {
+            // An ordered send without `idle_start` never starts a run: it stays queued for the
+            // boundaries of a run other work starts.
+            let Some(first) = self
+                .pending_fifo
+                .iter()
+                .find(|pending| pending.starts_runs())
+                .cloned()
+            else {
                 return Ok(());
             };
             // An interrupt queued behind a paused run ends that run first (it ends `Cancelled`,
@@ -5323,6 +5802,53 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => return Err(error.to_string()),
             }
         }
+    }
+
+    /// End every queued ordered send whose expiry has passed: `SendEnded {expired}`, synced, and
+    /// dropped from the queue, so it is never delivered.
+    async fn expire_ordered_sends(&mut self) -> Result<(), String> {
+        let now = self.ordered_now_ms();
+        let expired: Vec<_> = self
+            .pending_fifo
+            .iter()
+            .filter(|pending| {
+                pending
+                    .order
+                    .as_ref()
+                    .is_some_and(|order| order.expired_at(now))
+            })
+            .map(|pending| pending.submission_id.clone())
+            .collect();
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let writer = self.writer.as_ref().expect("writer live while open");
+        for submission_id in &expired {
+            writer.record(broca_core::delivery_order::ended(
+                submission_id,
+                broca_wal::record::SendEndReason::Expired,
+            ));
+        }
+        writer.sync().await.map_err(|error| error.to_string())?;
+        self.pending_fifo
+            .retain(|pending| !expired.contains(&pending.submission_id));
+        for submission_id in expired {
+            self.skip_materialization_submissions.remove(&submission_id);
+            if self.wal_scan_complete {
+                self.ended_submissions
+                    .insert(submission_id, broca_wal::record::SendEndReason::Expired);
+            }
+        }
+        self.prior_snapshot = None;
+        Ok(())
+    }
+
+    /// The wall clock ordered-send expiry is compared against: the retention clock when one is
+    /// installed (tests drive it), else the system clock.
+    fn ordered_now_ms(&self) -> u64 {
+        self.registry
+            .retention_service()
+            .map_or_else(epoch_ms, |service| service.clock.now_ms())
     }
 
     async fn persist_failed_queued_admission(
@@ -6543,6 +7069,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .collect();
         self.recorded_send_keys = recorded_send_keys(records);
         self.recorded_steers = recorded_steers(records);
+        self.ended_submissions = records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::SendEnded {
+                    submission_id,
+                    reason,
+                } => Some((submission_id.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        self.ordered_submissions = records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::DeliveryOrdered {
+                    submission_id,
+                    order,
+                    ..
+                } => Some((submission_id.clone(), order.clone())),
+                _ => None,
+            })
+            .collect();
+        self.delivered_submissions = records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::SendDelivered {
+                    submission_id,
+                    run_id,
+                    ..
+                } => Some((submission_id.clone(), run_id.clone())),
+                _ => None,
+            })
+            .collect();
         self.wal_scan_complete = true;
     }
 
@@ -6619,8 +7177,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .collect())
     }
 
+    /// Whether queued work will start a run once the session is idle. An ordered send whose list
+    /// has no `idle_start` never starts one, so it does not count: it waits for a run that other
+    /// work starts.
     fn has_pending(&self) -> bool {
-        !self.pending_fifo.is_empty()
+        self.pending_fifo.iter().any(PendingSubmission::starts_runs)
     }
 
     /// Cancel + join the per-subscriber fan-out tasks (and the projector) BEFORE the writer

@@ -104,8 +104,23 @@ impl SendParamsExt for SendParams {
             service_tier,
             one_shot,
             delivery,
+            dedupe_key,
+            expires_at_ms,
+            template,
             append_episode,
         } = self;
+        // The serve adapter refuses a template by name before converting; nothing here uses it.
+        if template.is_some() {
+            return Err(broca_core::RunError::Config(
+                "template sends are not supported by this runner".into(),
+            ));
+        }
+        // The one decode of the `delivery_order` group; the serve adapter has already refused a
+        // malformed one by field, so an error here is a caller bug surfaced as a config refusal.
+        let order =
+            broca_wire::delivery_order(delivery.as_ref(), dedupe_key.as_deref(), expires_at_ms)
+                .map_err(|(_, message)| broca_core::RunError::Config(message))?;
+        let delivery = broca_wire::legacy_delivery(delivery.as_ref());
         // The serve adapter fills an omitted model before converting, from the session's frozen
         // one where the send may omit it, and refuses the send otherwise.
         let Some(model) = model else {
@@ -218,8 +233,9 @@ impl SendParamsExt for SendParams {
             request: Box::new(submission),
             skip_materialization: one_shot == Some(true),
             kind: RunKind::FreshOrResume,
-            delivery: delivery.unwrap_or_default(),
+            delivery,
             plan: None,
+            order,
         })
     }
 }
@@ -377,6 +393,9 @@ mod tests {
             work_class: None,
             one_shot: None,
             delivery: None,
+            dedupe_key: None,
+            expires_at_ms: None,
+            template: None,
             append_episode: false,
             context_management: None,
         }

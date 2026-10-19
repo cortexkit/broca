@@ -345,6 +345,7 @@ impl Session {
                 kind: RunKind::FreshOrResume,
                 delivery,
                 plan: None,
+                order: None,
             })
             .await
             .unwrap_or_else(|error| panic!("send {send_id}: {error}"))

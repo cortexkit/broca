@@ -35,6 +35,7 @@ fn send_req(key: &broca_protocol::BindIdentity, run: &str) -> SendRequest {
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
         plan: None,
+        order: None,
     }
 }
 

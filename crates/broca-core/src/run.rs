@@ -4155,10 +4155,20 @@ where
         // this point, so the same messages are appended to the live prompt here first.
         // The inbox's lock makes "which steers are before this StepStarted" the same question
         // for the WAL and for this prompt (see `crate::steer`).
+        // Queued sends with an ordered `delivery` list are decided under the same lock: one whose
+        // first possible mode is `steer` joins this step after the steered messages, and one that
+        // expired ends. Their records precede `StepStarted`, exactly where replay places them.
         let mut steered = match &control.steer {
-            Some(inbox) => match inbox.try_take_at_step(|| {
-                writer.record(WalRecord::StepStarted { step_id });
-            }) {
+            Some(inbox) => match inbox.try_take_at_step_ordered(
+                &resolved_run_id,
+                control.now_ms().unwrap_or(0),
+                |records| {
+                    for record in records {
+                        writer.record(record);
+                    }
+                    writer.record(WalRecord::StepStarted { step_id });
+                },
+            ) {
                 Some(steered) => steered,
                 None => break RunFinishReason::Cancelled,
             },
@@ -6556,6 +6566,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     hooks: Option<&crate::hooks::HookRuntime<'_>>,
     warm: Option<crate::keep_warm_wait::WarmWait<'_>>,
     out: &mpsc::Sender<OutputEvent>,
+    ordered: Option<&RunControl>,
 ) -> Result<BatchOutcome, RunError> {
     let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
     let ctx = BatchCtx {
@@ -7092,6 +7103,12 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     writer.record(WalRecord::ToolBatchFinished {
         batch_id: batch_id.clone(),
     });
+    let appends = deliver_ordered_with_results(
+        writer,
+        ordered,
+        run_id,
+        resolutions.iter().map(|r| r.result.as_ref()),
+    );
     writer.record(WalRecord::TurnFinished { step_id });
     record_budget_firings(writer, run_id, budget_firings);
     writer.sync().await?;
@@ -7118,11 +7135,49 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             .await;
         }
     }
+    let mut results = results;
+    apply_ordered_appends(&mut results, &appends);
     Ok(BatchOutcome {
         results,
         interruption,
         open: Vec::new(),
     })
+}
+
+/// Deliver, at the commit of a tool batch, each queued ordered send whose first possible mode is
+/// `tool_result` (see `crate::delivery_order`). Its records go between the batch's
+/// `ToolBatchFinished` and `TurnFinished`, in the same barrier, so a projection boundary never
+/// separates a result from the text delivered with it. Returns the text to append to the live
+/// copies of the results; the durable `ToolResult` records are never changed.
+fn deliver_ordered_with_results<'a>(
+    writer: &WalHandle,
+    control: Option<&RunControl>,
+    run_id: &RunId,
+    results: impl IntoIterator<Item = &'a ToolResult>,
+) -> Vec<(ToolCallId, String)> {
+    let Some((inbox, control)) =
+        control.and_then(|control| Some((control.steer.as_deref()?, control)))
+    else {
+        return Vec::new();
+    };
+    inbox.deliver_with_tool_results(run_id, control.now_ms().unwrap_or(0), results, |records| {
+        for record in records {
+            writer.record(record);
+        }
+    })
+}
+
+/// Append each delivered text to the live copy of the result it rides on, as replay renders it
+/// from the `SendDelivered` record. The caller's events carry the tool's own output unchanged.
+fn apply_ordered_appends(results: &mut [ToolResult], appends: &[(ToolCallId, String)]) {
+    for (tool_call_id, text) in appends {
+        if let Some(result) = results
+            .iter_mut()
+            .find(|result| &result.tool_call_id == tool_call_id)
+        {
+            crate::delivery_order::append_to_result(result, text);
+        }
+    }
 }
 
 /// UTF-8 bytes bound the character count, so this sits far below the smallest known
@@ -7708,6 +7763,9 @@ async fn send(out: &mpsc::Sender<OutputEvent>, ev: OutputEvent) -> bool {
 #[cfg(test)]
 #[path = "run/boundary_cancel_tests.rs"]
 mod boundary_cancel_tests;
+#[cfg(test)]
+#[path = "run/delivery_order_tests.rs"]
+mod delivery_order_tests;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
 use hook_dispatch::{
@@ -8890,6 +8948,7 @@ mod tests {
             None,
             None,
             &out,
+            None,
         )
         .await
         .expect("resume batch resolves");
@@ -9138,6 +9197,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                pending_order: None,
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.
@@ -10597,6 +10657,7 @@ mod approval_gate {
                 hooks,
                 warm,
                 out,
+                Some(control),
             )
             .await;
         }
@@ -10758,6 +10819,15 @@ mod approval_gate {
         writer.record(WalRecord::ToolBatchFinished {
             batch_id: ctx.batch_id.clone(),
         });
+        let appends = deliver_ordered_with_results(
+            writer,
+            Some(control),
+            run_id,
+            slots.iter().filter_map(|slot| match slot {
+                Slot::Done(result) => Some(result.result.as_ref()),
+                _ => None,
+            }),
+        );
         writer.record(WalRecord::TurnFinished { step_id: step });
         record_budget_firings(writer, run_id, firings);
         writer.sync().await?;
@@ -10782,6 +10852,8 @@ mod approval_gate {
                 .await;
             }
         }
+        let mut results = results;
+        apply_ordered_appends(&mut results, &appends);
         Ok(BatchOutcome {
             results,
             interruption: result,
@@ -12472,8 +12544,23 @@ async fn dispatch_batch_controlled<T: ToolPlane, A: ApprovalPolicy>(
         .await
     } else {
         Box::pin(dispatch_batch(
-            run_id, step, session, scope, calls, manifest, plane, approval, writer, resume,
-            firings, emit, stop, hooks, warm, out,
+            run_id,
+            step,
+            session,
+            scope,
+            calls,
+            manifest,
+            plane,
+            approval,
+            writer,
+            resume,
+            firings,
+            emit,
+            stop,
+            hooks,
+            warm,
+            out,
+            Some(control),
         ))
         .await
     }

@@ -7,6 +7,7 @@
 //! the suite slow to build and slow to start.
 
 mod append_only_render;
+mod delivery_order_resume;
 mod import_projection;
 mod maintenance_cli;
 mod materialized_resume;

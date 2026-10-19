@@ -2132,6 +2132,18 @@ where
                     .await;
                 }
             };
+            if let Err((field, message)) = params.delivery_order() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    &message,
+                )
+                .await;
+            }
             if params
                 .cache
                 .as_ref()
@@ -2187,18 +2199,21 @@ where
             // name a model.
             let inherit_frozen: std::collections::BTreeSet<
                 broca_protocol::request::InheritedParam,
-            > = match params.delivery {
-                Some(broca_protocol::Delivery::Steer | broca_protocol::Delivery::Interrupt) => {
-                    broca_protocol::request::InheritedParam::ALL
-                        .iter()
-                        .filter(|(_, member)| {
-                            req.params
-                                .get(*member)
-                                .is_none_or(serde_json::Value::is_null)
-                        })
-                        .map(|(param, _)| *param)
-                        .collect()
-                }
+            > = match params.delivery.as_ref().map(|delivery| delivery.mode()) {
+                // An ordered list joins the session as it is, like a steer: what it omits comes
+                // from the session's frozen values.
+                Some(
+                    Some(broca_protocol::Delivery::Steer | broca_protocol::Delivery::Interrupt)
+                    | None,
+                ) => broca_protocol::request::InheritedParam::ALL
+                    .iter()
+                    .filter(|(_, member)| {
+                        req.params
+                            .get(*member)
+                            .is_none_or(serde_json::Value::is_null)
+                    })
+                    .map(|(param, _)| *param)
+                    .collect(),
                 _ => Default::default(),
             };
             if params.model.is_none() {
@@ -3058,6 +3073,25 @@ async fn send_serve_error(
         ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
         ServeError::VariantUnsupported(_) => "variant_unsupported",
         ServeError::SendRetracted { .. } => "send_retracted",
+        ServeError::SendEnded {
+            submission_id,
+            outcome,
+        } => {
+            let code = if *outcome == "superseded" {
+                "send_superseded"
+            } else {
+                "send_expired"
+            };
+            let body = ErrorBody::new(code, err.to_string()).with_detail(
+                serde_json::json!({"submission_id": submission_id, "outcome": outcome}),
+            );
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
+        ServeError::DeliveryRefused { code, .. } => {
+            let body = ErrorBody::new(*code, err.to_string())
+                .with_detail(serde_json::json!({"field": "delivery"}));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::SendIdReuse { .. } => "send_id_reuse",
         ServeError::Transient(_) => "transient",
         ServeError::BaselineRequired => "baseline_required",
