@@ -729,6 +729,8 @@ durable index/WAL paths. Unproven history is refused rather than guessed, and a
 nonterminal index row cannot override a WAL terminal. While crash-orphan sealing
 is pending, an unsealed run is retryable; afterward a status poll can open its
 coordinator and seal an unmarked orphan as interrupted rather than strand it.
+Durable queued work also wakes the coordinator, even when the latest run has
+already finished, so a crash cannot leave the FIFO permanently idle.
 Races handled by the actor:
 - A send arriving as the actor is `Closing` → it waits/re-opens, never races a half-torn
   state.

@@ -3124,6 +3124,18 @@ impl LineageRegistry {
                     broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id),
                     _ => None,
                 });
+                // A crash may leave durable queued work after an already-finished run.
+                // Observation must still wake its coordinator so that FIFO can drain.
+                let pending_work = records
+                    .iter()
+                    .any(|frame| matches!(frame.record, broca_wal::WalRecord::Queued { .. }))
+                    && !broca_core::pending_submissions(
+                        &records
+                            .iter()
+                            .map(|frame| frame.record.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .is_empty();
                 if let (Some(run_id), Some(index)) = (latest, self.inner.opener.run_index_reader())
                 {
                     let session = key.clone();
@@ -3140,7 +3152,7 @@ impl LineageRegistry {
                     .map_err(|error| {
                         OpenError::Open(format!("run-index lookup failed: {error}"))
                     })?;
-                    if terminal {
+                    if terminal && !pending_work {
                         return Ok(LineageStatus::Idle);
                     }
                 }
@@ -3161,6 +3173,10 @@ impl LineageRegistry {
                     }
                     self.recover_status_orphan(key, latest.expect("active run has a start"))
                         .await?;
+                    continue;
+                }
+                if pending_work {
+                    self.actor_for_mode(key, None, None, true).await?;
                     continue;
                 }
                 return Ok(LineageStatus::Idle);

@@ -9,6 +9,20 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "module-status-wakes-durable-queued-work"
+guards = "A status poll wakes durable queued work left behind a terminal instead of stranding FIFO after a crash"
+runner = "cargo"
+select = "expected"
+package = "broca-crash-harness"
+target = "--test steer_interrupt"
+test_file = "crates/broca-crash-harness/tests/steer_interrupt.rs"
+expect_red = ["interrupt_during_a_model_stream_at_every_record_boundary"]
+expect_message = "timed out waiting for idle session with no pending or open episodes"
+file = "crates/broca-module/src/registry.rs"
+old = "if pending_work {"
+new = "if false && pending_work { // NON-VACUITY BREAK: leave durable queued work asleep."
+
+[[control]]
 id = "module-large-status-polls-avoid-full-history"
 guards = "Large closed worker sessions amortize actor recovery instead of decoding every episode on each status poll"
 runner = "cargo"
