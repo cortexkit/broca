@@ -17191,6 +17191,184 @@ new = '''                WalRecord::RunFinished { reason: broca_protocol::RunFin
                     reason,'''
 
 [[control]]
+id = "bus-events-recovery-slice-honours-its-budget"
+guards = "One slice of the run event recovery walk stops when its time budget runs out and hands the unvisited sessions back, so the publisher loop returns to live runs between slices"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_recovery_walk_slice_stops_at_its_budget_and_keeps_the_rest"]
+expect_message = "a zero budget still visits exactly one session"
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "        if started.elapsed() >= budget {"
+new = "        if false && started.elapsed() >= budget { // NON-VACUITY BREAK: ignore the slice budget"
+
+[[control]]
+id = "bus-events-history-is-not-backfilled"
+guards = "A session without a checkpoint starts at its first run stamped during the enabled period: turning events on publishes nothing for runs from before, even when their sessions write again"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_enable_publishes_only_runs_started_after_it"]
+expect_message = "history must publish nothing"
+file = "crates/broca-store/src/bus_events.rs"
+old = "} if period != 0 && *ts_ms >= period => Some(frame.seq),"
+new = "} if period != 0 || *ts_ms >= period => Some(frame.seq), // NON-VACUITY BREAK: start at the first run ever, backfilling history"
+
+[[control]]
+id = "bus-events-new-projection-starts-at-the-period"
+guards = "The publisher's projection of a session without a checkpoint emits nothing for runs started before the period"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_new_projection_starts_at_the_first_run_of_the_period"]
+expect_message = "history became events"
+file = "crates/broca-store/src/bus_events.rs"
+old = "} if period != 0 && *ts_ms >= period => Some(frame.seq),"
+new = "} if period != 0 || *ts_ms >= period => Some(frame.seq), // NON-VACUITY BREAK: start at the first run ever, backfilling history"
+
+[[control]]
+id = "bus-events-new-period-discards-earlier-backlog"
+guards = "A new enabled period discards unpublished lifecycle rows and checkpoints left by an earlier period"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_period_discards_earlier_backlog_and_continues_across_restarts"]
+file = "crates/broca-store/src/bus_events.rs"
+old = '''                    "DELETE FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",'''
+new = '''                    "DELETE FROM bus_event_outbox WHERE 0", // NON-VACUITY BREAK: keep the earlier backlog'''
+
+[[control]]
+id = "bus-events-depth-is-a-counter"
+guards = "The outbox depth gauge moves with each projection's own rows instead of recounting the table under the shared connection"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_outbox_depth_moves_with_its_own_rows_without_a_recount"]
+expect_message = "a projection must add its own rows, not recount the table"
+file = "crates/broca-store/src/bus_events.rs"
+old = '''            .fetch_add(inserted, Ordering::Relaxed);'''
+new = '''            .fetch_add(inserted, Ordering::Relaxed);
+        self.resync_bus_depth()?; // NON-VACUITY BREAK: recount the outbox on every projection'''
+
+[[control]]
+id = "bus-events-projection-reads-the-tail"
+guards = "A projection reads only the end of a session's WAL, as far back as the checkpoint or the period start needs, not its whole history"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_projection_reads_only_the_tail_of_a_long_history"]
+expect_message = "instead of the tail"
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "const TAIL_WINDOW: u64 = 256 * 1024;"
+new = "const TAIL_WINDOW: u64 = u64::MAX; // NON-VACUITY BREAK: read every WAL whole"
+
+# The rows below run one turn on the real ck-broca under the real ck-subc daemon, with run events
+# switched on and three thousand historical sessions in the state root. They need SUBC_CORE_BIN
+# and a nats-server of at least 2.10 (on PATH or in CK_NATS_SERVER_BIN), with BROCA_REQUIRE_SUBC=1
+# and CK_BUS_TESTKIT_REQUIRE=1 so a missing fixture fails instead of skipping. The Linux mutation
+# job installs no nats-server, so these are macOS rows.
+[[control]]
+id = "bus-events-recovery-visits-only-open-sessions"
+guards = "Startup recovery visits only sessions with a run open in the current enabled period, never every session the store knows"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_daemon_turn_publishes_run_started_and_run_ended"]
+expect_message = "the startup recovery walk must have finished"
+file = "crates/broca-store/src/bus_events.rs"
+old = '''.prepare("SELECT identity FROM bus_event_open ORDER BY session")?'''
+new = '''.prepare("SELECT json_object('project_root',project_root,'harness',harness,'session',session) FROM agent_data_session_ref")? // NON-VACUITY BREAK: walk every known session'''
+
+[[control]]
+id = "bus-events-recovery-finds-admitted-runs"
+guards = "Recovery after a crash finds a run the run index admitted during the period even though it was never projected"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_crash_after_wal_commit_replays_after_restart"]
+expect_message = "startup recovery must list the crash-committed run"
+file = "crates/broca-store/src/bus_events.rs"
+old = "        if period != 0 {"
+new = "        if false && period != 0 { // NON-VACUITY BREAK: ignore the run index's live runs"
+
+[[control]]
+id = "bus-events-health-counts-projections"
+guards = "Run event health counts completed session projections, so barriers seen with nothing projected is visible"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_daemon_turn_publishes_run_started_and_run_ended"]
+expect_message = "health must count the session projections"
+[[control.edits]]
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "                            LIVENESS.sessions_projected.fetch_add(1, Ordering::Relaxed);"
+new = "                            // NON-VACUITY BREAK: live projections go uncounted"
+[[control.edits]]
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = ".fetch_add(step.projected, Ordering::Relaxed);"
+new = ".fetch_add(0, Ordering::Relaxed); // NON-VACUITY BREAK: recovered projections go uncounted"
+
+[[control]]
+id = "bus-events-health-counts-durable-barriers"
+guards = "Run event health counts the durable WAL barriers the publisher is told about"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_daemon_turn_publishes_run_started_and_run_ended"]
+expect_message = "health must count the turn's durable WAL barriers"
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "            LIVENESS.hints_seen.fetch_add(1, Ordering::Relaxed);"
+new = "            // NON-VACUITY BREAK: barriers go uncounted"
+
+[[control]]
+id = "bus-events-health-reports-account-known"
+guards = "Run event health says when the publisher has learned its machine account and can project"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_daemon_turn_publishes_run_started_and_run_ended"]
+expect_message = "health must say the publisher knows its account"
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "                        LIVENESS.account_known.store(true, Ordering::Relaxed);"
+new = "                        // NON-VACUITY BREAK: the account is never reported known"
+
+[[control]]
+id = "bus-events-health-reports-loop-pass-age"
+guards = "Run event health reports how long ago the publisher loop began a pass, so a stuck pass shows as a growing age"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_daemon_turn_publishes_run_started_and_run_ended"]
+expect_message = "the publisher loop must still be making passes"
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "                LIVENESS.pass_started();"
+new = "                // NON-VACUITY BREAK: passes are never stamped"
+
+[[control]]
 id = "core-append-prefix-moves-the-prior-conversation"
 guards = "An appended episode moves the reconstructed prior conversation into its prompt instead of keeping a second decoded copy for the whole run"
 runner = "cargo"

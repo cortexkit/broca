@@ -16,8 +16,8 @@ pub mod record;
 
 pub use file_wal::{
     file_identity, format_manifest_line, read_records_range, read_records_range_from_valid_anchor,
-    replay_file, wal_file_exists, FileWal, Wal, WalByteAnchor, WalError, WalRangeRead,
-    WalRangeRecords, DEFAULT_MAX_READ_BYTES,
+    read_records_tail, replay_file, wal_bytes_read, wal_file_exists, FileWal, Wal, WalByteAnchor,
+    WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
 };
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
 #[cfg(any(test, feature = "test-known-feature"))]

@@ -1282,6 +1282,107 @@ pub fn read_records_range(
     select_decoded_range(decoded, &bytes, 0, file_id, after_seq, through_seq)
 }
 
+/// The newest records of a WAL file, read from at most its last `tail_bytes`.
+pub struct WalTailRead {
+    /// Contiguous records ending at the file's last complete record. A torn trailing append
+    /// is discarded, as every reader does.
+    pub records: Vec<FramedRecord>,
+    /// The read began at the file's first byte, so `records` holds the whole WAL.
+    pub from_start: bool,
+    /// The file's lineage identity, when its first frame or the bytes read carry one.
+    pub lineage_id: Option<WalLineageId>,
+    /// Whether the file existed.
+    pub file_present: bool,
+}
+
+/// Read the newest records of a WAL without decoding it from the start.
+///
+/// Frames carry no back-pointers, so the read finds the first frame boundary inside the
+/// last `tail_bytes` by trying each offset: an offset counts only when a frame there verifies
+/// its digest and every following frame decodes in sequence to the end of the file. JSON
+/// payloads cannot hold a frame's raw binary header, so a boundary found this way is a real
+/// one. When no boundary is found (a single frame larger than the window) the whole file is
+/// read instead. Like [`read_records_range`], this opens no write handle.
+pub fn read_records_tail(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+    tail_bytes: u64,
+) -> Result<WalTailRead, WalError> {
+    let path = path.as_ref();
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalTailRead {
+                records: Vec::new(),
+                from_start: true,
+                lineage_id: None,
+                file_present: false,
+            });
+        }
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    let file_size = file.metadata().map_err(WalError::Io)?.len();
+    if file_size > max_bytes {
+        return Err(WalError::TooLarge {
+            max_bytes,
+            file_size,
+        });
+    }
+    if tail_bytes < file_size {
+        let start = file_size - tail_bytes;
+        let suffix = read_open_file_capped(&mut file, start, max_bytes, file_size)?;
+        let first_frame = read_first_frame_lineage(&mut file, max_bytes)?;
+        for offset in 0..suffix.len() {
+            let DecodeStep::Record { framed, .. } = decode_next(&suffix[offset..]) else {
+                continue;
+            };
+            if let Ok(decoded) = decode_bytes(&suffix[offset..], start + offset as u64, framed.seq)
+            {
+                return Ok(WalTailRead {
+                    records: decoded
+                        .records
+                        .into_iter()
+                        .map(|(record, _)| record)
+                        .collect(),
+                    from_start: false,
+                    lineage_id: decoded.lineage_id.or(first_frame),
+                    file_present: true,
+                });
+            }
+        }
+    }
+    let bytes = read_open_file_capped(&mut file, 0, max_bytes, file_size)?;
+    let decoded = decode_bytes(&bytes, 0, 1)?;
+    Ok(WalTailRead {
+        records: decoded
+            .records
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect(),
+        from_start: true,
+        lineage_id: decoded.lineage_id,
+        file_present: true,
+    })
+}
+
+/// The lineage identity a WAL records in its first frame. A WAL that predates lineage
+/// identities starts with a record instead, and answers `None`.
+fn read_first_frame_lineage(
+    file: &mut File,
+    max_bytes: u64,
+) -> Result<Option<WalLineageId>, WalError> {
+    file.seek(SeekFrom::Start(0)).map_err(WalError::Io)?;
+    let mut head = Vec::new();
+    file.take(4096.min(max_bytes))
+        .read_to_end(&mut head)
+        .map_err(WalError::Io)?;
+    WAL_BYTES_READ.fetch_add(head.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(match decode_next(&head) {
+        DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id),
+        _ => None,
+    })
+}
+
 /// Decode a digest-verified archive member in place, preserving WAL lineage and sequence
 /// validation. The caller supplies an identity for the immutable payload, not a live inode.
 /// Archive corruption must be an error before this call, never a `Partial` transcript:
@@ -1596,6 +1697,15 @@ fn select_range(
     range
 }
 
+/// Bytes this process has read from WAL files through the range and tail readers.
+static WAL_BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes this process has read from WAL files through the range and tail readers, for
+/// measuring what a reader costs; archive member reads are not included.
+pub fn wal_bytes_read() -> u64 {
+    WAL_BYTES_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn read_open_file_capped(
     file: &mut File,
     start: u64,
@@ -1608,6 +1718,7 @@ fn read_open_file_capped(
     file.take(read_cap)
         .read_to_end(&mut bytes)
         .map_err(WalError::Io)?;
+    WAL_BYTES_READ.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if start.saturating_add(bytes.len() as u64) > max_bytes {
         return Err(WalError::TooLarge {
             max_bytes,
@@ -2263,6 +2374,43 @@ mod tests {
         let range = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None).unwrap();
         assert_eq!(range.lineage_id, Some(same));
         assert_eq!(range.records.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A tail read decodes only the end of the file: it returns the newest records in
+    /// sequence and the lineage from the first frame, without falling back to a read from the
+    /// start. A window larger than the file reads it whole.
+    #[test]
+    fn tail_read_returns_the_newest_records_without_decoding_the_prefix() {
+        let path = tmp("tail-read");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        for _ in 0..2000 {
+            wal.append(1, &run_started(1), false).unwrap();
+        }
+        wal.sync().unwrap();
+        drop(wal);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let lineage = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None)
+            .unwrap()
+            .lineage_id;
+        let tail = read_records_tail(&path, DEFAULT_MAX_READ_BYTES, 4096).unwrap();
+        assert!(
+            !tail.from_start,
+            "a 4 KiB window must find a frame boundary"
+        );
+        assert_eq!(tail.lineage_id, lineage);
+        let seqs: Vec<u64> = tail.records.iter().map(|record| record.seq).collect();
+        assert!(
+            !seqs.is_empty() && seqs.len() < 2000,
+            "{} records",
+            seqs.len()
+        );
+        assert_eq!(*seqs.last().unwrap(), 2000);
+        assert!(seqs.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        let whole = read_records_tail(&path, DEFAULT_MAX_READ_BYTES, size).unwrap();
+        assert!(whole.from_start);
+        assert_eq!(whole.records.len(), 2000);
         let _ = std::fs::remove_file(&path);
     }
 
