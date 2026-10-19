@@ -192,10 +192,12 @@ fn usage() -> (u64, u64) {
 
 fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
     WalRecord::RunStarted {
+        tags: None,
         run_id: RunId(run_id.into()),
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(broca_wal::RunConfig {
+            render_tags: false,
             model: broca_protocol::request::ModelHandle::new("profile", "model"),
             tools: vec![].into(),
             tool_choice: Default::default(),

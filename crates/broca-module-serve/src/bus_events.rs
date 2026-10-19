@@ -962,10 +962,12 @@ mod tests {
 
     fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> broca_wal::WalRecord {
         broca_wal::WalRecord::RunStarted {
+            tags: None,
             run_id: broca_protocol::RunId(run_id.into()),
             session: session.clone(),
             ts_ms: Some(ts_ms),
             config: Box::new(broca_wal::RunConfig {
+                render_tags: false,
                 model: broca_protocol::request::ModelHandle::new("fixture", "model"),
                 tools: vec![].into(),
                 tool_choice: Default::default(),
