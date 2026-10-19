@@ -1836,7 +1836,10 @@ async fn permanent_poison_head_is_consumed_before_younger_queue_work() {
 
     broca_test_support::event_timeout(
         "permanent_poison_head_is_consumed_before_younger_queue_work",
-        rig.registry.route_status(&key),
+        async {
+            rig.registry.actor_for(&key).await?;
+            rig.registry.route_status(&key).await
+        },
         || {
             format!(
                 "slot={:?}, in_flight={}",
@@ -1904,7 +1907,10 @@ async fn transient_queued_admission_retries_without_consuming_the_head() {
 
     broca_test_support::event_timeout(
         "transient_queued_admission_retries_without_consuming_the_head",
-        rig.registry.route_status(&key),
+        async {
+            rig.registry.actor_for(&key).await?;
+            rig.registry.route_status(&key).await
+        },
         || {
             format!(
                 "slot={:?}, in_flight={}",
@@ -2243,6 +2249,7 @@ async fn reopened_actor_seals_inferred_natural_end_before_draining_queue() {
     seed_unsealed_run_with_queue(&rig, &key, UnsealedTerminal::NaturalEnd);
     assert_unsealed_append_would_corrupt(&rig, &key);
 
+    rig.registry.actor_for(&key).await.unwrap();
     let _ = rig.registry.route_status(&key).await.unwrap();
     wait_until_idle(&rig, &key).await;
     assert_eq!(
@@ -2294,6 +2301,7 @@ async fn reopened_actor_seals_inferred_hard_stop_before_draining_queue() {
     seed_unsealed_run_with_queue(&rig, &key, UnsealedTerminal::HardStop);
     assert_unsealed_append_would_corrupt(&rig, &key);
 
+    rig.registry.actor_for(&key).await.unwrap();
     let _ = rig.registry.route_status(&key).await.unwrap();
     wait_until_idle(&rig, &key).await;
     assert_eq!(
@@ -2886,9 +2894,9 @@ async fn run_task_panic_does_not_wedge_the_actor() {
         .iter()
         .any(|record| matches!(record, WalRecord::RunFinished { .. })));
 
-    // route_run_state must open a new actor because the prior generation's slot is gone. Startup
-    // recovery resumes r1, durably seals it, and only then drains r2; the old actor stayed open
-    // forever and never reached this recovery path.
+    // Explicitly reopen the lost actor generation. Startup recovery resumes r1, durably
+    // seals it, and only then drains r2; observation alone must not start that work.
+    rig.registry.actor_for(&key).await.unwrap();
     let reopened_state = rig
         .registry
         .route_run_state(&key, broca_protocol::RunId("r1".into()))
@@ -3503,13 +3511,13 @@ async fn same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop() {
         Some(store.clone()),
     );
 
-    // Looking up the original run starts recovery of its unfinished durable episode. A renderer
-    // version mismatch marks that run Interrupted before any provider call instead of creating a
-    // replacement episode.
+    // Explicit recovery of the unfinished episode detects renderer drift before any
+    // provider call, rather than creating a replacement episode.
+    registry.actor_for(&key).await.unwrap();
     let _ = registry
         .route_run_state(&key, original.run_id.clone())
         .await
-        .expect("open the lineage and start recovery");
+        .expect("read the explicitly reopened lineage");
     broca_test_support::wait_for(
         "same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop",
         async {

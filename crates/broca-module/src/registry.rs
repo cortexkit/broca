@@ -385,6 +385,10 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    /// Read-only access to the derived run index, without acquiring a session writer.
+    fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
+        None
+    }
     fn check_move(&self, _key: &LineageKey, _write: bool) -> Result<(), OpenError> {
         Ok(())
     }
@@ -1999,29 +2003,47 @@ impl LineageRegistry {
         }
         use crate::actor::LineageCmd;
         loop {
-            let closed = !self.inner.slots.lock().unwrap().contains_key(key);
-            if closed && self.inner.reader.is_some() {
+            let live = {
+                let slots = self.inner.slots.lock().unwrap();
+                match slots.get(key) {
+                    Some(Entry::Open { handle, .. }) => Some(handle.clone()),
+                    _ => None,
+                }
+            };
+            let Some(handle) = live else {
+                let indexed = match self.inner.opener.run_index_reader() {
+                    Some(index) => {
+                        let id = run_id.0.clone();
+                        spawn_blocking(JobKind::StoreRead, move || index.lookup_run(&id))
+                            .await
+                            .map_err(|error| {
+                                OpenError::Open(format!("run-index lookup task failed: {error}"))
+                            })?
+                            .map_err(|error| {
+                                OpenError::Open(format!("run-index lookup failed: {error}"))
+                            })?
+                            .filter(|row| row.session == *key)
+                    }
+                    None => None,
+                };
                 let records = self.read_durable_wal(key).await?.0;
-                let state = broca_core::reconcile_run_state(
+                let reconciled = broca_core::reconcile_run_state(
                     records.iter().map(|frame| &frame.record),
                     &run_id.0,
                 );
-                if matches!(
-                    self.check_move(key, true),
-                    Err(OpenError::SessionMoving { .. })
-                ) {
-                    return Ok((state, Some(records)));
+                let state = crate::actor::indexed_run_state(indexed, reconciled)
+                    .map_err(OpenError::Open)?;
+                if state
+                    .as_ref()
+                    .is_some_and(|state| state.state == broca_core::RunIndexState::Active)
+                {
+                    return Err(OpenError::Classified {
+                        reason: "could not tell run status: durable run is unsealed and no live actor owns it".into(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    });
                 }
-                if let Some(state) = state {
-                    if state.state.is_terminal() || state.state == broca_core::RunIndexState::Paused
-                    {
-                        return Ok((Some(state), Some(records)));
-                    }
-                }
-                // Missing or nonterminal WAL state is not proof of an unknown run: the index
-                // may retain a terminal even when its WAL is unavailable. Preserve that fallback.
-            }
-            let handle = self.actor_for(key).await?;
+                return Ok((state, Some(records)));
+            };
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::RunState {
                 run_id: run_id.clone(),
@@ -2988,9 +3010,8 @@ impl LineageRegistry {
         *self.inner.status_open_probe.lock().unwrap() = Some(probe);
     }
 
-    /// Existing actors answer status in the same command loop that admits new runs.
-    /// An unopened session is classified under its lease from the first RunStarted;
-    /// ordinary status does not replay the entire WAL before creating its actor.
+    /// Existing actors answer status in the command loop that admits new runs. Without
+    /// one, prove the durable history instead of opening a writer merely to observe it.
     pub async fn route_status(
         &self,
         key: &LineageKey,
@@ -3004,7 +3025,37 @@ impl LineageRegistry {
         }
         use crate::actor::{LineageCmd, LineageStatus};
         loop {
-            let handle = self.actor_for_mode(key, None, None, true).await?;
+            let live = {
+                let slots = self.inner.slots.lock().unwrap();
+                match slots.get(key) {
+                    Some(Entry::Open { handle, .. }) => Some(handle.clone()),
+                    _ => None,
+                }
+            };
+            let Some(handle) = live else {
+                #[cfg(all(test, feature = "test-clock"))]
+                if let Some(probe) = self.inner.status_open_probe.lock().unwrap().take() {
+                    probe();
+                }
+                let records = self.read_durable_wal(key).await?.0;
+                let latest = records.iter().rev().find_map(|frame| match &frame.record {
+                    broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id),
+                    _ => None,
+                });
+                if latest.is_some_and(|run_id| {
+                    broca_core::reconcile_run_state(
+                        records.iter().map(|frame| &frame.record),
+                        &run_id.0,
+                    )
+                    .is_some_and(|state| state.state == broca_core::RunIndexState::Active)
+                }) {
+                    return Err(OpenError::Classified {
+                        reason: "could not tell session status: durable run is unsealed and no live actor owns it".into(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    });
+                }
+                return Ok(LineageStatus::Idle);
+            };
             let (reply, rx) = tokio::sync::oneshot::channel();
             if handle.send(LineageCmd::Status { reply }).await.is_err() {
                 continue;
@@ -4374,7 +4425,9 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("build test runtime");
-            let result = runtime.block_on(registry_for_op.route_status(&session_for_op));
+            let result = runtime
+                .block_on(registry_for_op.actor_for(&session_for_op))
+                .map(|_| ());
             let _ = result_tx.send(result);
         });
 

@@ -881,6 +881,7 @@ async fn restart_pause_queues_plain_send_and_delivers_steer_on_boot() {
         return;
     }
     let next = f.reopen(vec![text_step("resumed"), text_step("queued")]);
+    next.registry.actor_for(&next.key).await.unwrap();
     let state = next
         .registry
         .route_run_state(&next.key, RunId("restart-run".into()))
@@ -956,7 +957,7 @@ async fn restart_pause_can_be_cancelled_before_boot_resume() {
         return;
     }
     let next = f.reopen(vec![text_step("must not run")]);
-    next.registry.route_status(&next.key).await.unwrap();
+    next.registry.actor_for(&next.key).await.unwrap();
     next.registry
         .route_cancel(&next.key, RunId("restart-run".into()))
         .await

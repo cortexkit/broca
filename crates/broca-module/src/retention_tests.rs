@@ -50,6 +50,7 @@ async fn status_poll_large_nonretained_session_does_not_read_wal() {
             .unwrap();
         }
         let registry = rig.registry(None);
+        registry.actor_for(&rig.key).await.unwrap();
         registry.route_status(&rig.key).await.unwrap();
         let before = rig.service.wal.range_reads_for_test();
         for _ in 0..3 {
@@ -3788,7 +3789,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
 }
 
 #[tokio::test]
-async fn cold_forever_status_performs_no_full_wal_reads_before_ordinary_open() {
+async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
     struct Count {
         inner: Arc<FileWalStore>,
         full: Arc<AtomicU64>,
@@ -3818,6 +3819,12 @@ async fn cold_forever_status_performs_no_full_wal_reads_before_ordinary_open() {
             anchor: Option<&broca_wal::WalByteAnchor>,
         ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
             self.inner.read_records_range(key, after, through, anchor)
+        }
+        fn flush_for_read(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+            self.inner.flush_for_read(key)
+        }
+        fn file_identity(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+            self.inner.file_identity(key)
         }
         fn lineage_exists(
             &self,
@@ -3904,19 +3911,19 @@ async fn cold_forever_status_performs_no_full_wal_reads_before_ordinary_open() {
     assert_eq!(
         full.load(Ordering::SeqCst),
         0,
-        "ordinary status must not read/replay full history to classify it"
+        "cold status must use bounded WAL reads rather than the full-history reader"
     );
     assert_eq!(
         registry.slot_counts().open,
-        1,
-        "ordinary opener recovery is preserved"
+        0,
+        "status must not create an idle actor"
     );
     assert!(registry.stop_and_seal().await);
 }
 
 #[cfg(feature = "test-clock")]
 #[tokio::test]
-async fn status_classifies_created_expired_retention_under_the_open_lease() {
+async fn status_classifies_created_expired_retention_without_opening_actor() {
     let rig = Rig::new();
     let now = rig.service.clock.now_ms();
     fs::write(

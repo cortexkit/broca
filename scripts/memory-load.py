@@ -233,8 +233,26 @@ async def run(args):
             channel = args.routes + i + 1
             await peer.bind(channel, project, f"short-{i}")
             result = await peer.call(channel, "session.send", {"prompt": "ONE_SHOT", "model": {"provider": "anthropic", "model": "claude-opus-4-6"}, "tools": [], "one_shot": True})
-            await until_idle(peer, channel)
+            if args.short_polls:
+                deadline = time.monotonic() + 120
+                while True:
+                    status = await peer.call(channel, "run.status", {"run_id": result["run_id"]})
+                    if status["state"] not in ("active", "paused"):
+                        break
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"short run did not finish: {status}")
+                    await asyncio.sleep(.05)
+            else:
+                await until_idle(peer, channel)
             assert result["state"] in ("active", "finished"), result
+        if args.short_polls:
+            await snapshot(root, "before_polls", process.pid)
+            for i in range(args.shorts):
+                channel = args.routes + i + 1
+                for _ in range(args.short_polls):
+                    status = await peer.call(channel, "run.status", {})
+                    assert status == "idle" or status.get("state") == "idle", status
+            await snapshot(root, "after_polls", process.pid)
         # Short sessions whose actors outlive this phase are still warm at the steady
         # snapshot. If the phase runs longer than the idle TTL, the earliest ones have closed.
         shorts_seconds = round(time.monotonic() - shorts_started, 1)
@@ -249,6 +267,7 @@ async def run(args):
         assert len(stub.requests) == 2 * args.sessions + args.shorts, "provider retries or missing requests"
         wal_sizes = [p.stat().st_size for p in (root / "wal").rglob("*") if p.is_file() and p.stat().st_size > 1024 * 1024]
         summary = {"sessions": args.sessions, "shorts": args.shorts, "routes": args.routes,
+                   "short_polls": args.short_polls,
                    "shorts_seconds": shorts_seconds, "idle_ttl_ms": args.idle_ttl_ms,
                    "requests": stub.requests, "events": peer.events, "wal_sizes": wal_sizes}
         (root / "load.json").write_text(json.dumps(summary, indent=2))
@@ -289,6 +308,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sessions", type=int, default=50)
     parser.add_argument("--shorts", type=int, default=200)
+    parser.add_argument("--short-polls", type=int, default=0,
+                        help="status polls per finished short session, after the entire burst")
     parser.add_argument("--routes", type=int, default=4397)
     parser.add_argument("--idle-ttl-ms", type=int, default=None,
                         help="actor idle TTL for the server; omitted keeps the production default (30 s)")

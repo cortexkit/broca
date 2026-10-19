@@ -718,8 +718,12 @@ One in-process **lineage actor** per open session with states **`Opening | Open 
 Closing | Closed`**. ALL `session.send`/`retract`/`subscribe` for a lineage go through
 its actor; a teardown cannot start while an op holds the actor. Lease lifetime: the actor
 holds the lease while there are **subscribers OR pending work OR within a short idle
-TTL**; otherwise it transitions `Closing` → releases the lease → `Closed`; the next op
-re-opens (`Opening` → reacquire → replay). Races handled by the actor:
+TTL**; otherwise it transitions `Closing` → releases the lease → `Closed`. A send,
+cancel, retract or subscription re-opens it (`Opening` → reacquire → replay).
+Status, result and transcript reads do not open a closed actor: they use the durable
+run index and bounded, lease-free WAL reads. Unproven history is refused rather
+than guessed, and a nonterminal index row cannot override a WAL terminal.
+Races handled by the actor:
 - A send arriving as the actor is `Closing` → it waits/re-opens, never races a half-torn
   state.
 - Two concurrent re-opens of one lineage → the actor registry admits exactly one

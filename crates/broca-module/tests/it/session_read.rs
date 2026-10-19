@@ -1782,6 +1782,7 @@ async fn legacy_terminal_index_row_reconciles_metadata_from_wal() {
     rig.store
         .index_run_terminal("run-legacy", RunIndexState::Completed, None, None, 0)
         .expect("index legacy terminal");
+    rig.registry.actor_for(&key).await.unwrap();
     rig.registry
         .route_status(&key)
         .await
