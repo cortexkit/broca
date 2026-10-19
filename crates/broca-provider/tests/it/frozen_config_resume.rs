@@ -231,7 +231,11 @@ mod gated {
         let path = wal_path(dir);
         let framed = FileWal::open(&path).unwrap().replay().unwrap();
         let _ = std::fs::remove_file(&path);
-        let mut wal = FileWal::open(&path).unwrap();
+        // Records of a new session are gated (runner tags), so the rewrite needs the same
+        // feature floor the store keeps beside its WAL directory.
+        let mut wal = FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
         for f in framed.into_iter().take(keep) {
             wal.append(f.fence, &f.record, true).unwrap();
         }
