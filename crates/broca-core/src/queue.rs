@@ -70,12 +70,37 @@ pub struct PendingSubmission {
     /// send and for older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<broca_protocol::Delivery>,
+    /// The ordered delivery list, dedupe key and expiry of a send using the `delivery_order`
+    /// group, from the `DeliveryOrdered` record written just before its `Queued` record. Absent
+    /// for every other queued send, which drains into a run exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<broca_protocol::DeliveryOrder>,
 }
 
 impl PendingSubmission {
     /// Whether this entry was queued by an interrupting send.
     pub fn is_interrupt(&self) -> bool {
         self.delivery == Some(broca_protocol::Delivery::Interrupt)
+    }
+
+    /// Whether draining this entry may start a run: every plain queued send, and an ordered send
+    /// only when its list names `idle_start`.
+    pub fn starts_runs(&self) -> bool {
+        self.order
+            .as_ref()
+            .is_none_or(broca_protocol::DeliveryOrder::starts_runs)
+    }
+}
+
+/// The submission a record removes from the pending queue without starting a run: a tombstone
+/// (`Retracted`, or `SendEnded` for a replaced or expired ordered send) or the delivery of an
+/// ordered send into a running turn (`SendDelivered`).
+pub fn removes_pending(record: &WalRecord) -> Option<&SubmissionId> {
+    match record {
+        WalRecord::Retracted { submission_id, .. }
+        | WalRecord::SendEnded { submission_id, .. }
+        | WalRecord::SendDelivered { submission_id, .. } => Some(submission_id),
+        _ => None,
     }
 }
 
@@ -108,13 +133,9 @@ pub fn insert_in_drain_order(queue: &mut Vec<PendingSubmission>, pending: Pendin
 /// sends queued before it. That changes ORDER only: every message is still delivered exactly
 /// once, which is the sense in which the field is safe to leave ungated.
 pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
-    let retracted: HashSet<&SubmissionId> = records
-        .iter()
-        .filter_map(|r| match r {
-            WalRecord::Retracted { submission_id, .. } => Some(submission_id),
-            _ => None,
-        })
-        .collect();
+    let retracted: HashSet<&SubmissionId> = records.iter().filter_map(removes_pending).collect();
+    let mut orders: std::collections::HashMap<&SubmissionId, &broca_protocol::DeliveryOrder> =
+        std::collections::HashMap::new();
     let consumed: HashSet<&SubmissionId> = records
         .iter()
         .filter_map(|r| match r {
@@ -127,6 +148,13 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
         .collect();
     let mut pending = Vec::new();
     for record in records {
+        if let WalRecord::DeliveryOrdered {
+            submission_id,
+            order,
+        } = record
+        {
+            orders.insert(submission_id, order);
+        }
         if let WalRecord::Queued {
             keep_warm,
             submission_id,
@@ -160,6 +188,7 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
                     send_id: send_id.clone(),
                     title: title.clone(),
                     delivery: *delivery,
+                    order: orders.get(submission_id).map(|order| (*order).clone()),
                 },
             );
         }

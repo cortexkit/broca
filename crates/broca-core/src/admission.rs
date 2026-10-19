@@ -601,6 +601,12 @@ pub struct AdmissionCheckpointV1 {
     /// Absent is an incomplete summary and must never be repaired from only a WAL tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::CompactionCheckpoint>,
+    /// Orders from `DeliveryOrdered` records whose `Queued` record has not been folded yet, by
+    /// submission. The two are written in one barrier, but a running turn's own records can land
+    /// between them, and a checkpoint can be cut there; the `Queued` record takes its order from
+    /// here whenever it comes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_orders: Vec<(SubmissionId, broca_protocol::DeliveryOrder)>,
 }
 
 impl AdmissionCheckpointV1 {
@@ -624,6 +630,7 @@ impl AdmissionCheckpointV1 {
             lineage_retention: Some(crate::LineageRetention::Unstarted),
             pending_fifo: Arc::new(Vec::new()),
             compaction: Some(crate::compaction::CompactionCheckpoint::None),
+            pending_orders: Vec::new(),
         }
     }
 
@@ -677,6 +684,15 @@ impl AdmissionCheckpointV1 {
                     reason,
                 })?;
         }
+        // A `Queued` record takes the order its `DeliveryOrdered` record set aside.
+        let order_for_queued = match record {
+            WalRecord::Queued { submission_id, .. } => self
+                .pending_orders
+                .iter()
+                .position(|(ordered, _)| ordered == submission_id)
+                .map(|at| self.pending_orders.remove(at).1),
+            _ => None,
+        };
         match record {
             WalRecord::RunStarted {
                 session_class,
@@ -827,6 +843,19 @@ impl AdmissionCheckpointV1 {
                 }
             }
             WalRecord::BudgetFired { .. } => {}
+            WalRecord::DeliveryOrdered {
+                submission_id,
+                order,
+            } => {
+                self.pending_orders
+                    .retain(|(ordered, _)| ordered != submission_id);
+                self.pending_orders
+                    .push((submission_id.clone(), order.clone()));
+            }
+            WalRecord::SendEnded { submission_id, .. }
+            | WalRecord::SendDelivered { submission_id, .. } => {
+                remove_pending(&mut self.pending_fifo, submission_id);
+            }
             WalRecord::Queued {
                 keep_warm,
                 submission_id,
@@ -855,6 +884,7 @@ impl AdmissionCheckpointV1 {
                     send_id: send_id.clone(),
                     title: title.clone(),
                     delivery: *delivery,
+                    order: order_for_queued,
                 },
             ),
             WalRecord::Retracted { submission_id, .. } => {
@@ -2166,6 +2196,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            pending_orders: Vec::new(),
             input_budget: None,
             session_class: None,
             lineage_retention: None,
@@ -2175,6 +2206,7 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
+                order: None,
                 hooks: None,
                 title: None,
                 conversation_key: None,

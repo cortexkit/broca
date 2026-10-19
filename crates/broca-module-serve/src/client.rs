@@ -214,6 +214,8 @@ impl SessionClient {
             work_class: None,
             one_shot: spec.one_shot,
             delivery: None,
+            dedupe_key: None,
+            expires_at_ms: None,
             // Inert (back-compat wire field); the coordinator decides append-vs-no-op from
             // run_id identity. A fresh send over an idle lineage auto-appends a new episode.
             append_episode: false,
@@ -625,6 +627,8 @@ mod tests {
             work_class: None,
             one_shot: None,
             delivery: None,
+            dedupe_key: None,
+            expires_at_ms: None,
             append_episode: false,
             context_management: None,
         };

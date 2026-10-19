@@ -93,8 +93,12 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
         ),
         (
             "crates/broca-module/src/actor.rs".to_owned(),
+            // Two `Queued` writers: the plain queued send, and a send with an ordered `delivery`
+            // list, which is queued with the same retention fields.
             vec![
                 "Queued.retention".to_owned(),
+                "Queued.retention".to_owned(),
+                "Queued.ts_ms".to_owned(),
                 "Queued.ts_ms".to_owned(),
                 "Steered.retention".to_owned(),
                 "Steered.retention".to_owned(),

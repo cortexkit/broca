@@ -17139,3 +17139,58 @@ expect_message = "an actor with no subscriber must not reserve either ring"
 file = "crates/broca-module/src/fanout.rs"
 old = '''            sender: Arc::new(std::sync::OnceLock::new()),'''
 new = '''            sender: Arc::new(std::sync::OnceLock::from(broadcast::channel(capacity).0)), // NON-VACUITY BREAK: allocate at open'''
+
+# Sends with an ordered `delivery` list (the `delivery_order` group).
+[[control]]
+id = "delivery-order-run-without-idle-start"
+guards = "a queued send whose ordered delivery list has no idle_start never drains into a run"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::an_ordered_list_without_idle_start_never_starts_a_run"]
+only = false
+file = "crates/broca-core/src/queue.rs"
+old = '''    pub fn starts_runs(&self) -> bool {
+        self.order'''
+new = '''    pub fn starts_runs(&self) -> bool {
+        true || self.order // NON-VACUITY BREAK: every queued send may start a run'''
+
+[[control]]
+id = "delivery-order-tool-result-keeps-stored-result"
+guards = "a tool_result delivery never changes the stored ToolResult record; the text rides on its own record"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/delivery_order_tests.rs"
+expect_red = ["run::delivery_order_tests::a_tool_result_delivery_appends_to_exactly_one_result_and_resumes_identically"]
+file = "crates/broca-core/src/run.rs"
+old = '''    for r in &mut resolutions {
+        if let Some(outcome) = r.outcome {
+            let record = WalRecord::ToolResult {
+                hooks: r.hooks.take(),'''
+new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, resolutions.iter().map(|r| r.result.as_ref())); // NON-VACUITY BREAK: write the delivered text into the stored results
+    for (id, text) in &early {
+        for r in resolutions.iter_mut().filter(|r| &r.result.tool_call_id == id) {
+            crate::delivery_order::append_to_result(Arc::make_mut(&mut r.result), text);
+        }
+    }
+    for r in &mut resolutions {
+        if let Some(outcome) = r.outcome {
+            let record = WalRecord::ToolResult {
+                hooks: r.hooks.take(),'''
+
+[[control]]
+id = "delivery-order-dedupe-spares-delivered"
+guards = "a dedupe key replaces only an undelivered send; a send the turn delivered is never replaced"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/steer.rs"
+expect_red = ["steer::tests::dedupe_replaces_only_an_undelivered_send"]
+file = "crates/broca-core/src/steer.rs"
+old = '''                records.push(steered(&send, run_id));'''
+new = '''                records.push(steered(&send, run_id));
+                kept.push(send.clone()); // NON-VACUITY BREAK: a delivered send stays replaceable'''

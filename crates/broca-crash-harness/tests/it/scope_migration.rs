@@ -284,6 +284,7 @@ fn owner_send() -> SendRequest {
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
         plan: None,
+        order: None,
     }
 }
 

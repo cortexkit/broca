@@ -245,6 +245,9 @@ pub struct SendRequest {
     /// The fetch plan the send carried: its identity, and for a session the serve layer found
     /// with no episode, the manifest admission built from it.
     pub plan: Option<crate::actor::SendPlan>,
+    /// The send's `delivery_order` group (an ordered `delivery` list, a `dedupe_key` or an
+    /// expiry), or `None` for a send that uses none of it and so behaves exactly as before.
+    pub order: Option<broca_protocol::DeliveryOrder>,
 }
 
 /// Where a session stands with respect to fetch plans, as its durable history says.
@@ -698,6 +701,19 @@ pub enum ServeError {
     SendRetracted {
         submission_id: String,
     },
+    /// The ordered send named by a deterministic send identity ended undelivered: `outcome` is
+    /// `superseded` (a newer send from the same sender replaced it under its dedupe key) or
+    /// `expired`.
+    SendEnded {
+        submission_id: String,
+        outcome: &'static str,
+    },
+    /// A send using the `delivery_order` group was refused by its sender: `code` is
+    /// `sender_not_permitted` or `idle_start_not_granted`.
+    DeliveryRefused {
+        code: &'static str,
+        message: String,
+    },
     /// A deterministic send identity was reused with a different frozen request field.
     SendIdReuse {
         differing: String,
@@ -801,6 +817,11 @@ impl std::fmt::Display for ServeError {
             ServeError::SendRetracted { submission_id } => {
                 write!(f, "submission '{submission_id}' was retracted")
             }
+            ServeError::SendEnded {
+                submission_id,
+                outcome,
+            } => write!(f, "submission '{submission_id}' ended {outcome}"),
+            ServeError::DeliveryRefused { message, .. } => f.write_str(message),
             ServeError::SendIdReuse { differing } => write!(
                 f,
                 "send_id was already used with different {differing}; retries must be byte-identical"
@@ -1379,7 +1400,7 @@ impl ServeHandler for crate::LineageRegistry {
             }
         }
         match self
-            .route_submission_with_class(
+            .route_submission_with_order(
                 &req.session,
                 req.run_id,
                 *req.request,
@@ -1396,6 +1417,7 @@ impl ServeHandler for crate::LineageRegistry {
                 req.retention,
                 req.session_class,
                 req.stop_sequences_named,
+                req.order,
             )
             .await?
         {
@@ -1439,6 +1461,24 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::Retracted { submission_id } => Err(ServeError::SendRetracted {
                 submission_id: submission_id.0,
             }),
+            SendOutcome::SendEnded {
+                submission_id,
+                reason,
+            } => Err(ServeError::SendEnded {
+                submission_id: submission_id.0,
+                outcome: reason.as_str(),
+            }),
+            SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field,
+                message,
+            } => Err(ServeError::InvalidParams {
+                field: field.into(),
+                message,
+            }),
+            SendOutcome::DeliveryRefused { code, message, .. } => {
+                Err(ServeError::DeliveryRefused { code, message })
+            }
             SendOutcome::SendIdReuse { differing } => Err(ServeError::SendIdReuse {
                 differing: differing.to_owned(),
             }),

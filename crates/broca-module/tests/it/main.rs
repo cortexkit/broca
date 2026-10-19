@@ -10,6 +10,7 @@ mod common;
 mod compaction;
 
 mod coordinator_races;
+mod delivery_order;
 mod fanout_barrier;
 mod queue_render_transparency;
 mod serve_dispatch;

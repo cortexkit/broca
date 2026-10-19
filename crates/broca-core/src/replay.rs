@@ -1596,6 +1596,25 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::Steered { input, .. } => {
                 ep.pending_steers.extend(input.iter().cloned());
             }
+            // An ordered send delivered as a steer is placed exactly like a steer. One delivered
+            // with a tool result renders that result followed by the recorded text; the record
+            // follows the batch's `ToolBatchFinished`, so the result is in the newest tool
+            // message. The stored `ToolResult` record itself is never changed.
+            WalRecord::SendDelivered {
+                input,
+                tool_call_id,
+                appended_text,
+                ..
+            } => {
+                if let Some(input) = input {
+                    ep.pending_steers.extend(input.iter().cloned());
+                }
+                if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
+                    crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
+                }
+            }
+            // The order and the end of a queued send belong to the queue, not the prompt.
+            WalRecord::DeliveryOrdered { .. } | WalRecord::SendEnded { .. } => {}
             WalRecord::BudgetFired {
                 run_id: fired_run_id,
                 ordinal,
@@ -2009,7 +2028,9 @@ pub fn latest_projection_boundary(
                 pending_zero_step_seed =
                     matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }).then_some(framed.seq);
             }
-            WalRecord::Steered { .. } => steer_pending = true,
+            WalRecord::Steered { .. } | WalRecord::SendDelivered { input: Some(_), .. } => {
+                steer_pending = true
+            }
             WalRecord::ModelStepFinished {
                 assistant_message, ..
             } if assistant_message.tool_calls().next().is_none() => {
@@ -2662,6 +2683,7 @@ mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                pending_orders: Vec::new(),
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 lineage_retention: None,

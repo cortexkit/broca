@@ -45,6 +45,9 @@ pub struct FakeExecutor {
     panic_after_start: bool,
     /// Optional scripted outcomes for tests that need specific WAL/index transitions.
     scripted: Mutex<VecDeque<RunScript>>,
+    /// `true` ⇒ an unscripted run takes one step boundary (through the run's steer inbox, as the
+    /// real loop does) before it finishes, so ordered sends can be delivered into it.
+    step_boundary: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +81,18 @@ impl FakeExecutor {
         let me = Arc::new(Self {
             auto_finish: false,
             gate: Mutex::new(Some(rx)),
+            ..Default::default()
+        });
+        (me, RunGate { tx })
+    }
+
+    /// Gated runs that take one step boundary after they are released, before finishing.
+    pub fn gated_with_step_boundary() -> (Arc<Self>, RunGate) {
+        let (tx, rx) = mpsc::channel(64);
+        let me = Arc::new(Self {
+            auto_finish: false,
+            gate: Mutex::new(Some(rx)),
+            step_boundary: true,
             ..Default::default()
         });
         (me, RunGate { tx })
@@ -378,7 +393,8 @@ impl FakeExecutor {
             send_id: None,
             request_identity_digest: None,
             project_id: None,
-            principal: None,
+            // The bind's principal, as the real loop records it, so owner checks see it.
+            principal: job.req.principal.clone(),
             ts_ms: None,
             run_id: job.req.run_id.clone(),
             session: job.req.session.clone(),
@@ -430,6 +446,22 @@ impl RunExecutor for FakeExecutor {
             // Block until released (or the gate is drained).
             if let Some(rx) = self.gate.lock().await.as_mut() {
                 let _ = rx.recv().await;
+            }
+        }
+        if self.step_boundary {
+            if let Some(inbox) = job.control.steer.as_ref() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                inbox.try_take_at_step_ordered(&job.req.run_id, now, |records| {
+                    for record in records {
+                        job.writer.record(record);
+                    }
+                    job.writer.record(broca_wal::WalRecord::StepStarted {
+                        step_id: broca_protocol::StepId(1),
+                    });
+                });
             }
         }
         job.writer.record(broca_wal::WalRecord::RunFinished {

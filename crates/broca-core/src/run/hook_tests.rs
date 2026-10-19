@@ -207,6 +207,7 @@ async fn batch<A: ApprovalPolicy>(
         Some(runtime),
         None,
         &out,
+        None,
     )
     .await
     .unwrap()
@@ -1472,6 +1473,7 @@ async fn sealed_post_tool(
             Some(&runtime),
             None,
             &out,
+            None,
         );
         tokio::pin!(run);
         for _ in 0..count {

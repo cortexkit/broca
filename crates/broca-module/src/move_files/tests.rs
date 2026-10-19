@@ -369,6 +369,7 @@ async fn actor_critical_section_holds_dispatch_until_completion_and_then_refuses
                 skip_materialization: false,
                 delivery,
                 plan: None,
+                order: None,
                 reply,
             })
             .await

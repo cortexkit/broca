@@ -285,12 +285,28 @@ pub struct SendParams {
     /// `run_paused`). The mode is part of the send's identity: a retry with the same `send_id`
     /// and another mode is refused `send_id_reuse` naming `delivery`. The VALUE is strict like
     /// `service_tier`'s: an unknown mode is refused, naming the field.
+    ///
+    /// Or an ARRAY, the `delivery_order` group: an ordered list of `"tool_result"`,
+    /// `"turn_system"`, `"steer"` and `"idle_start"` (non-empty, no mode twice). At each request
+    /// boundary the runner takes the first mode possible there; when none is, the send waits,
+    /// durably queued. A list without `"idle_start"` never starts a run. The legacy strings keep
+    /// their meaning exactly: absent or `"queue"` is `["idle_start"]`, `"steer"` is
+    /// `["steer", "idle_start"]`. Older runners refuse an array by this field's strict decode.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_delivery"
     )]
-    pub delivery: Option<broca_protocol::Delivery>,
+    pub delivery: Option<SendDelivery>,
+    /// `delivery_order` group: a newer send from the same sender with the same key replaces a
+    /// queued, undelivered one, which then ends `superseded`. Distinct from `send_id`: a retry
+    /// with the same `send_id` is the same send, not a replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    /// `delivery_order` group: Unix milliseconds after which a still-undelivered send is
+    /// dropped, recorded durably, and ends `expired`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
     /// Deprecated inert compatibility field. The coordinator determines append behavior from the
     /// run identity.
     #[serde(default)]
@@ -455,19 +471,119 @@ where
         })
 }
 
-/// Decode `SendParams.delivery`, naming the field and the three accepted modes on a refusal.
-/// A JSON `null` reads as absent.
-fn deserialize_delivery<'de, D>(
-    deserializer: D,
-) -> Result<Option<broca_protocol::Delivery>, D::Error>
+/// A send's `delivery`: one of the legacy mode strings, or an ordered list of delivery modes
+/// (the `delivery_order` group). This is the one place the two forms are told apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum SendDelivery {
+    /// `"queue"`, `"steer"` or `"interrupt"`, with the meaning they always had.
+    Mode(broca_protocol::Delivery),
+    /// An ordered list of delivery modes (the `delivery_order` group).
+    Order(Vec<broca_protocol::DeliveryMode>),
+}
+
+impl SendDelivery {
+    /// The legacy mode, when `delivery` is a string.
+    pub fn mode(&self) -> Option<broca_protocol::Delivery> {
+        match self {
+            SendDelivery::Mode(mode) => Some(*mode),
+            SendDelivery::Order(_) => None,
+        }
+    }
+}
+
+impl SendParams {
+    /// The legacy delivery mode this send runs with (see [`legacy_delivery`]).
+    pub fn legacy_delivery(&self) -> broca_protocol::Delivery {
+        legacy_delivery(self.delivery.as_ref())
+    }
+
+    /// The `delivery_order` group as this send uses it (see [`delivery_order`]).
+    pub fn delivery_order(
+        &self,
+    ) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
+        delivery_order(
+            self.delivery.as_ref(),
+            self.dedupe_key.as_deref(),
+            self.expires_at_ms,
+        )
+    }
+}
+
+/// The legacy delivery mode a send runs with: its string `delivery`, or the default `queue` when
+/// `delivery` is absent or an ordered list (an ordered send is queued).
+pub fn legacy_delivery(delivery: Option<&SendDelivery>) -> broca_protocol::Delivery {
+    delivery.and_then(SendDelivery::mode).unwrap_or_default()
+}
+
+/// The `delivery_order` group as a send uses it, or `None` for a send that uses none of it (which
+/// then behaves exactly as before the group existed). A legacy string combined with `dedupe_key`
+/// or `expires_at_ms` takes the list it stands for: absent or `"queue"` is `["idle_start"]` and
+/// `"steer"` is `["steer", "idle_start"]`; `"interrupt"` has no list form and is refused.
+/// Refusals name the field.
+pub fn delivery_order(
+    delivery: Option<&SendDelivery>,
+    dedupe_key: Option<&str>,
+    expires_at_ms: Option<u64>,
+) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
+    use broca_protocol::{Delivery, DeliveryMode};
+    if dedupe_key.is_some_and(str::is_empty) {
+        return Err(("dedupe_key", "dedupe_key must not be empty".into()));
+    }
+    let grouped = dedupe_key.is_some() || expires_at_ms.is_some();
+    let modes = match delivery {
+        Some(SendDelivery::Order(modes)) => modes.clone(),
+        _ if !grouped => return Ok(None),
+        None | Some(SendDelivery::Mode(Delivery::Queue)) => vec![DeliveryMode::IdleStart],
+        Some(SendDelivery::Mode(Delivery::Steer)) => {
+            vec![DeliveryMode::Steer, DeliveryMode::IdleStart]
+        }
+        Some(SendDelivery::Mode(Delivery::Interrupt)) => {
+            let field = if dedupe_key.is_some() {
+                "dedupe_key"
+            } else {
+                "expires_at_ms"
+            };
+            return Err((
+                field,
+                format!("{field} cannot be combined with delivery \"interrupt\""),
+            ));
+        }
+    };
+    Ok(Some(broca_protocol::DeliveryOrder {
+        modes,
+        dedupe_key: dedupe_key.map(str::to_owned),
+        expires_at_ms,
+    }))
+}
+
+/// Decode `SendParams.delivery`: a legacy mode string, named with the three accepted modes on a
+/// refusal, or an ordered, non-empty list of distinct delivery modes. A JSON `null` reads as
+/// absent.
+fn deserialize_delivery<'de, D>(deserializer: D) -> Result<Option<SendDelivery>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
         return Ok(None);
     };
+    if let serde_json::Value::Array(items) = &value {
+        let modes: Vec<broca_protocol::DeliveryMode> =
+            serde_json::from_value(value.clone()).map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "delivery list entries must be \"tool_result\", \"turn_system\", \"steer\" or \"idle_start\"; got {value}"
+                ))
+            })?;
+        let distinct: std::collections::HashSet<_> = modes.iter().collect();
+        if items.is_empty() || distinct.len() != modes.len() {
+            return Err(serde::de::Error::custom(format!(
+                "delivery list must be non-empty and name each mode once; got {value}"
+            )));
+        }
+        return Ok(Some(SendDelivery::Order(modes)));
+    }
     serde_json::from_value(value.clone())
-        .map(Some)
+        .map(|mode| Some(SendDelivery::Mode(mode)))
         .map_err(|_| {
             serde::de::Error::custom(format!(
                 "delivery must be \"queue\", \"steer\" or \"interrupt\"; got {value}"
@@ -2538,6 +2654,8 @@ mod tests {
                 "service_tier",
                 "one_shot",
                 "delivery",
+                "dedupe_key",
+                "expires_at_ms",
                 "append_episode",
             ]
         );
@@ -3302,7 +3420,10 @@ mod delivery_params {
             ("steer", broca_protocol::Delivery::Steer),
             ("interrupt", broca_protocol::Delivery::Interrupt),
         ] {
-            assert_eq!(send(serde_json::json!(wire)).unwrap().delivery, Some(mode));
+            assert_eq!(
+                send(serde_json::json!(wire)).unwrap().delivery,
+                Some(SendDelivery::Mode(mode))
+            );
         }
         let absent = send(serde_json::Value::Null).unwrap();
         assert_eq!(absent.delivery, None);
@@ -3325,6 +3446,94 @@ mod delivery_params {
                 error.contains("delivery must be \"queue\", \"steer\" or \"interrupt\""),
                 "{bad}: {error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod delivery_order_params {
+    use super::*;
+    use broca_protocol::DeliveryMode;
+
+    fn send(extra: serde_json::Value) -> Result<SendParams, serde_json::Error> {
+        let mut params = serde_json::json!({
+            "prompt": "hello",
+            "model": {"provider": "mock", "model": "m"},
+        });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(params)
+    }
+
+    /// An ordered list decodes in order and keeps its bytes; it never reads as a legacy mode.
+    #[test]
+    fn an_ordered_list_decodes_and_round_trips() {
+        let params = send(serde_json::json!({"delivery": ["tool_result", "steer"], "dedupe_key": "k", "expires_at_ms": 9})).unwrap();
+        assert_eq!(
+            params.delivery,
+            Some(SendDelivery::Order(vec![
+                DeliveryMode::ToolResult,
+                DeliveryMode::Steer
+            ]))
+        );
+        assert_eq!(params.legacy_delivery(), broca_protocol::Delivery::Queue);
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["delivery"],
+            serde_json::json!(["tool_result", "steer"])
+        );
+        let order = params.delivery_order().unwrap().unwrap();
+        assert_eq!(
+            order.modes,
+            vec![DeliveryMode::ToolResult, DeliveryMode::Steer]
+        );
+        assert_eq!(order.dedupe_key.as_deref(), Some("k"));
+        assert_eq!(order.expires_at_ms, Some(9));
+    }
+
+    /// A send using none of the group has no order, whatever its legacy mode, so it runs exactly
+    /// as before; a legacy string with a group field takes the list it stands for.
+    #[test]
+    fn legacy_strings_keep_their_meaning() {
+        for wire in [
+            serde_json::json!({}),
+            serde_json::json!({"delivery": "queue"}),
+            serde_json::json!({"delivery": "steer"}),
+            serde_json::json!({"delivery": "interrupt"}),
+        ] {
+            assert_eq!(send(wire).unwrap().delivery_order().unwrap(), None);
+        }
+        let queue = send(serde_json::json!({"dedupe_key": "k"})).unwrap();
+        assert_eq!(
+            queue.delivery_order().unwrap().unwrap().modes,
+            vec![DeliveryMode::IdleStart]
+        );
+        let steer = send(serde_json::json!({"delivery": "steer", "expires_at_ms": 5})).unwrap();
+        assert_eq!(
+            steer.delivery_order().unwrap().unwrap().modes,
+            vec![DeliveryMode::Steer, DeliveryMode::IdleStart]
+        );
+        let interrupt =
+            send(serde_json::json!({"delivery": "interrupt", "dedupe_key": "k"})).unwrap();
+        assert_eq!(interrupt.delivery_order().unwrap_err().0, "dedupe_key");
+        let empty = send(serde_json::json!({"dedupe_key": ""})).unwrap();
+        assert_eq!(empty.delivery_order().unwrap_err().0, "dedupe_key");
+    }
+
+    /// Empty lists, repeated modes and unknown modes are refused naming the field.
+    #[test]
+    fn a_malformed_list_is_refused() {
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!(["steer", "steer"]),
+            serde_json::json!(["queue"]),
+            serde_json::json!([1]),
+        ] {
+            let error = send(serde_json::json!({"delivery": bad.clone()}))
+                .expect_err("refused")
+                .to_string();
+            assert!(error.contains("delivery list"), "{bad}: {error}");
         }
     }
 }

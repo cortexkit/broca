@@ -68,6 +68,126 @@ pub struct Plan {
     pub composition_digest: String,
     /// Each provider's composed tools, by provider id.
     pub composed: BTreeMap<String, Vec<ComposedTool>>,
+    /// The modules other than the session's owner that may send into it (see [`plan_senders`]).
+    pub senders: Vec<PlanSender>,
+}
+
+/// The plan member naming the modules, other than the session's owner, that may send into the
+/// session with an ordered `delivery` list. Kept in one constant so a rename stays one edit.
+pub const SENDERS_MEMBER: &str = "senders";
+
+/// One module the plan lets send into the session besides its owner, matched against the
+/// daemon-attested principal of the send (`reserved:<module>`), never a request field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSender {
+    pub module: String,
+    /// Whether this sender may use `idle_start`, that is, start a run on an idle session.
+    pub idle_start: bool,
+    /// The templates this sender may use for `turn_system`, as declared. This build checks
+    /// their shape but renders none of them.
+    pub templates: Vec<PlanTemplate>,
+}
+
+/// A `turn_system` template a sender declared: the text with its typed slots, and the digest
+/// of the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTemplate {
+    pub id: String,
+    pub text_with_slots: String,
+    pub digest: String,
+}
+
+/// Read the plan's `senders` member: absent means none. Each entry is
+/// `{module, idle_start?, templates?: [{id, text_with_slots, digest, slots?}]}`. A slot is typed
+/// `integer` (optional `min`/`max`), `percentage`, `tag` or `enum` (`values`, a non-empty list of
+/// strings); there are no string slots. Refuses a malformed member naming its field.
+pub fn plan_senders(plan: &Map<String, Value>) -> Result<Vec<PlanSender>, Refusal> {
+    let Some(value) = plan.get(SENDERS_MEMBER) else {
+        return Ok(Vec::new());
+    };
+    let at = format!("plan.{SENDERS_MEMBER}");
+    let entries = value.as_array().ok_or_else(|| Refusal::invalid(&at))?;
+    let mut senders = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let at = format!("{at}[{index}]");
+        let object = entry.as_object().ok_or_else(|| Refusal::invalid(&at))?;
+        let module = string_member(object, "module", &at)?;
+        if module.is_empty() {
+            return Err(Refusal::invalid(format!("{at}.module")));
+        }
+        let idle_start = match object.get("idle_start") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(Refusal::invalid(format!("{at}.idle_start"))),
+        };
+        let templates = match object.get("templates") {
+            None => Vec::new(),
+            Some(Value::Array(templates)) => templates
+                .iter()
+                .enumerate()
+                .map(|(position, template)| {
+                    plan_template(template, &format!("{at}.templates[{position}]"))
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(Refusal::invalid(format!("{at}.templates"))),
+        };
+        senders.push(PlanSender {
+            module,
+            idle_start,
+            templates,
+        });
+    }
+    unique_providers(
+        SENDERS_MEMBER,
+        senders.iter().map(|sender| sender.module.as_str()),
+    )?;
+    Ok(senders)
+}
+
+fn plan_template(value: &Value, at: &str) -> Result<PlanTemplate, Refusal> {
+    let object = value.as_object().ok_or_else(|| Refusal::invalid(at))?;
+    let id = string_member(object, "id", at)?;
+    let text_with_slots = string_member(object, "text_with_slots", at)?;
+    let digest = string_member(object, "digest", at)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Refusal::invalid(format!("{at}.digest")));
+    }
+    if let Some(slots) = object.get("slots") {
+        let slots = slots
+            .as_object()
+            .ok_or_else(|| Refusal::invalid(format!("{at}.slots")))?;
+        for (name, slot) in slots {
+            let slot_at = format!("{at}.slots.{name}");
+            let slot = slot.as_object().ok_or_else(|| Refusal::invalid(&slot_at))?;
+            let well_typed = match slot.get("type").and_then(Value::as_str) {
+                Some("integer") => ["min", "max"]
+                    .iter()
+                    .all(|bound| slot.get(*bound).is_none_or(Value::is_i64)),
+                Some("percentage" | "tag") => true,
+                Some("enum") => {
+                    slot.get("values")
+                        .and_then(Value::as_array)
+                        .is_some_and(|values| {
+                            !values.is_empty() && values.iter().all(Value::is_string)
+                        })
+                }
+                // No other slot type exists; in particular there are no free-text string slots.
+                _ => false,
+            };
+            if !well_typed {
+                return Err(Refusal::invalid(slot_at));
+            }
+        }
+    }
+    Ok(PlanTemplate {
+        id,
+        text_with_slots,
+        digest,
+    })
 }
 
 /// Hex SHA-256 of `bytes`.
@@ -389,6 +509,8 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
         return Err(Refusal::invalid("plan.compaction_item"));
     }
 
+    let senders = plan_senders(object)?;
+
     for (index, step) in step_items.iter().enumerate() {
         for (position, subscription) in step.subscriptions.iter().enumerate() {
             // Approval must fail closed: an unavailable hook cannot grant permission.
@@ -426,5 +548,63 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
         composition,
         composition_digest: digest,
         composed,
+        senders,
     })
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn senders(value: Value) -> Result<Vec<PlanSender>, Refusal> {
+        plan_senders(json!({ "senders": value }).as_object().unwrap())
+    }
+
+    /// Senders are read with their `idle_start` grant (absent means no grant) and templates; a
+    /// plan without the member names none.
+    #[test]
+    fn senders_are_read_with_their_grants() {
+        assert_eq!(plan_senders(&Map::new()).unwrap(), Vec::new());
+        let digest = "a".repeat(64);
+        let read = senders(json!([
+            {"module": "ck-mc", "idle_start": true, "templates": [{"id": "t", "text_with_slots": "{n} tools", "digest": digest, "slots": {"n": {"type": "integer", "min": 0}, "k": {"type": "enum", "values": ["a"]}}}]},
+            {"module": "other"}
+        ]))
+        .unwrap();
+        assert_eq!(read[0].module, "ck-mc");
+        assert!(read[0].idle_start);
+        assert_eq!(read[0].templates[0].id, "t");
+        assert!(!read[1].idle_start);
+        assert!(read[1].templates.is_empty());
+    }
+
+    /// Malformed senders are refused naming the field; a string slot does not exist.
+    #[test]
+    fn malformed_senders_are_refused_by_field() {
+        let digest = "a".repeat(64);
+        for (value, field) in [
+            (json!({}), "plan.senders"),
+            (json!([{"idle_start": true}]), "plan.senders[0].module"),
+            (
+                json!([{"module": "m", "idle_start": "yes"}]),
+                "plan.senders[0].idle_start",
+            ),
+            (json!([{"module": "m"}, {"module": "m"}]), "plan.senders"),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "x", "digest": "short"}]}]),
+                "plan.senders[0].templates[0].digest",
+            ),
+            (
+                json!([{"module": "m", "templates": [{"id": "t", "text_with_slots": "{s}", "digest": digest, "slots": {"s": {"type": "string"}}}]}]),
+                "plan.senders[0].templates[0].slots.s",
+            ),
+        ] {
+            assert_eq!(
+                senders(value.clone()).unwrap_err(),
+                Refusal::invalid(field),
+                "{value}"
+            );
+        }
+    }
 }
