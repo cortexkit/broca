@@ -17099,7 +17099,7 @@ new = "        if false && started.elapsed() >= budget { // NON-VACUITY BREAK: i
 
 [[control]]
 id = "bus-events-history-is-not-backfilled"
-guards = "A session without a checkpoint starts at its WAL head: turning events on publishes nothing for runs that finished before, even when their sessions write again"
+guards = "A session without a checkpoint starts at its first run stamped during the enabled period: turning events on publishes nothing for runs from before, even when their sessions write again"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--lib"
@@ -17107,34 +17107,21 @@ test_file = "crates/broca-module-serve/src/bus_events.rs"
 expect_red = ["bus_events::tests::bus_enable_publishes_only_runs_started_after_it"]
 expect_message = "history must publish nothing"
 file = "crates/broca-store/src/bus_events.rs"
-old = "let quiet_through = if checkpointed || baseline == Baseline::FromStart {"
-new = "let quiet_through = if true || checkpointed || baseline == Baseline::FromStart { // NON-VACUITY BREAK: backfill history"
+old = "} if period != 0 && *ts_ms >= period => Some(frame.seq),"
+new = "} if period != 0 || *ts_ms >= period => Some(frame.seq), // NON-VACUITY BREAK: start at the first run ever, backfilling history"
 
 [[control]]
-id = "bus-events-new-projection-starts-at-head"
-guards = "The publisher's projection of a session without a checkpoint replays its finished history for state only"
+id = "bus-events-new-projection-starts-at-the-period"
+guards = "The publisher's projection of a session without a checkpoint emits nothing for runs started before the period"
 runner = "cargo"
 package = "broca-store"
 target = "--lib"
 test_file = "crates/broca-store/src/bus_events.rs"
-expect_red = ["bus_events::tests::bus_new_projection_starts_at_the_head_unless_the_latest_run_is_live"]
+expect_red = ["bus_events::tests::bus_new_projection_starts_at_the_first_run_of_the_period"]
 expect_message = "history became events"
 file = "crates/broca-store/src/bus_events.rs"
-old = "let quiet_through = if checkpointed || baseline == Baseline::FromStart {"
-new = "let quiet_through = if true || checkpointed || baseline == Baseline::FromStart { // NON-VACUITY BREAK: backfill history"
-
-[[control]]
-id = "bus-events-run-start-records-its-baseline"
-guards = "A run started during an enabled period records where its session's events begin before RunStarted is appended, so the new run is published"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--lib"
-test_file = "crates/broca-module-serve/src/bus_events.rs"
-expect_red = ["bus_events::tests::bus_enable_publishes_only_runs_started_after_it"]
-expect_message = "runs started after enabling were not all published"
-file = "crates/broca-store/src/session_refs.rs"
-old = "            if events {"
-new = "            if false && events { // NON-VACUITY BREAK: record no event baseline"
+old = "} if period != 0 && *ts_ms >= period => Some(frame.seq),"
+new = "} if period != 0 || *ts_ms >= period => Some(frame.seq), // NON-VACUITY BREAK: start at the first run ever, backfilling history"
 
 [[control]]
 id = "bus-events-new-period-discards-earlier-backlog"
@@ -17162,6 +17149,19 @@ old = '''            .fetch_add(inserted, Ordering::Relaxed);'''
 new = '''            .fetch_add(inserted, Ordering::Relaxed);
         self.resync_bus_depth()?; // NON-VACUITY BREAK: recount the outbox on every projection'''
 
+[[control]]
+id = "bus-events-projection-reads-the-tail"
+guards = "A projection reads only the end of a session's WAL, as far back as the checkpoint or the period start needs, not its whole history"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_projection_reads_only_the_tail_of_a_long_history"]
+expect_message = "instead of the tail"
+file = "crates/broca-module-serve/src/bus_events.rs"
+old = "const TAIL_WINDOW: u64 = 256 * 1024;"
+new = "const TAIL_WINDOW: u64 = u64::MAX; // NON-VACUITY BREAK: read every WAL whole"
+
 # The rows below run one turn on the real ck-broca under the real ck-subc daemon, with run events
 # switched on and three thousand historical sessions in the state root. They need SUBC_CORE_BIN
 # and a nats-server of at least 2.10 (on PATH or in CK_NATS_SERVER_BIN), with BROCA_REQUIRE_SUBC=1
@@ -17181,6 +17181,21 @@ expect_message = "the startup recovery walk must have finished"
 file = "crates/broca-store/src/bus_events.rs"
 old = '''.prepare("SELECT identity FROM bus_event_open ORDER BY session")?'''
 new = '''.prepare("SELECT json_object('project_root',project_root,'harness',harness,'session',session) FROM agent_data_session_ref")? // NON-VACUITY BREAK: walk every known session'''
+
+[[control]]
+id = "bus-events-recovery-finds-admitted-runs"
+guards = "Recovery after a crash finds a run the run index admitted during the period even though it was never projected"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+platforms = ["macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_crash_after_wal_commit_replays_after_restart"]
+expect_message = "startup recovery must list the crash-committed run"
+file = "crates/broca-store/src/bus_events.rs"
+old = "        if period != 0 {"
+new = "        if false && period != 0 { // NON-VACUITY BREAK: ignore the run index's live runs"
 
 [[control]]
 id = "bus-events-health-counts-projections"

@@ -214,6 +214,78 @@ pub fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// First tail window a projection reads from a WAL's end. Each retry reads four times more,
+/// until the read is enough or covers the whole file.
+const TAIL_WINDOW: u64 = 256 * 1024;
+
+/// The records a projection needs and the WAL lineage they were read under.
+type ProjectionRead = (Vec<broca_wal::FramedRecord>, Option<String>);
+
+/// Why the records for a projection could not be read.
+enum ReadError {
+    Wal(broca_wal::WalError),
+    Store(String),
+}
+
+/// The record clock of the record kinds that carry one.
+fn record_ts(record: &broca_wal::WalRecord) -> Option<u64> {
+    match record {
+        broca_wal::WalRecord::RunStarted { ts_ms, .. }
+        | broca_wal::WalRecord::Steered { ts_ms, .. }
+        | broca_wal::WalRecord::RunPaused { ts_ms, .. }
+        | broca_wal::WalRecord::RunFinished { ts_ms, .. } => *ts_ms,
+        _ => None,
+    }
+}
+
+/// Read only the end of `session`'s WAL, as much as its projection needs, and its lineage.
+///
+/// A session with a checkpoint for the WAL's lineage needs every record after the checkpoint.
+/// One without needs the first `RunStarted` stamped during the current period, so the read
+/// must reach a timestamped record from before the period; record clocks only move forward
+/// within a WAL, so no later run can hide before it. The window starts at [`TAIL_WINDOW`] and
+/// quadruples until that holds or the read covers the whole file, so the cost follows what is
+/// new rather than how long the session's history is. `None` means the WAL does not exist.
+fn read_for_projection(
+    store: &SqliteStore,
+    wal: &FileWalStore,
+    session: &BindIdentity,
+) -> Result<Option<ProjectionRead>, ReadError> {
+    let checkpoint = store
+        .bus_event_checkpoint(session)
+        .map_err(|e| ReadError::Store(e.to_string()))?;
+    let period = store.bus_event_period_started_ms();
+    let mut window = TAIL_WINDOW;
+    loop {
+        let tail = wal
+            .read_records_tail(session, window)
+            .map_err(ReadError::Wal)?;
+        if !tail.file_present {
+            return Ok(None);
+        }
+        let lineage = tail.lineage_id.map(|id| id.to_string());
+        let after = checkpoint.as_ref().and_then(|(epoch, seq)| {
+            (epoch.is_empty() || Some(epoch) == lineage.as_ref()).then_some(*seq)
+        });
+        let enough = tail.from_start
+            || match after {
+                Some(after) => tail.records.first().is_some_and(|r| r.seq <= after + 1),
+                None => tail
+                    .records
+                    .iter()
+                    .any(|r| record_ts(&r.record).is_some_and(|ts| ts < period)),
+            };
+        if enough {
+            let records = match after {
+                Some(after) => tail.records.into_iter().filter(|r| r.seq > after).collect(),
+                None => tail.records,
+            };
+            return Ok(Some((records, lineage)));
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
 /// What one recovery visit found for a session.
 #[derive(Debug, PartialEq, Eq)]
 enum Visit {
@@ -251,24 +323,22 @@ fn recover_session(
         broca_wal::WalError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     };
-    let candidate = match wal.read_records_range(session, 0, None, None) {
-        Ok(range) => range,
-        Err(error) if missing(&error) => return Ok(Visit::Absent),
-        Err(_) => return Err(VisitError::Unreadable),
+    let (records, lineage) = match read_for_projection(store, wal, session) {
+        Ok(Some(read)) => read,
+        Ok(None) => return Ok(Visit::Absent),
+        Err(ReadError::Wal(error)) if missing(&error) => return Ok(Visit::Absent),
+        Err(ReadError::Wal(_)) => return Err(VisitError::Unreadable),
+        Err(ReadError::Store(error)) => return Err(VisitError::Projection(error)),
     };
-    let epoch = candidate.lineage_id.map(|id| id.to_string());
-    let records = match candidate.into_records() {
-        broca_wal::WalRangeRecords::Complete(records) => records,
-        broca_wal::WalRangeRecords::Absent => return Ok(Visit::Absent),
-        _ => return Err(VisitError::Unreadable),
-    };
-    let Some(epoch) = epoch else {
+    let Some(epoch) = lineage else {
         return Ok(Visit::Absent);
     };
-    let head = records.last().map_or(0, |record| record.seq);
     let position = store
         .bus_event_position(session, &epoch)
         .map_err(|e| VisitError::Projection(e.to_string()))?;
+    // The read returns only records after a checkpoint, so none means the head is the
+    // checkpoint itself.
+    let head = records.last().map_or(position, |record| record.seq);
     // Nothing new needs no durability proof; projecting the empty remainder still settles
     // whether the session's run is open, so a session whose run finished leaves the walk.
     let current = position >= head;
@@ -505,22 +575,21 @@ impl Service {
                         match broca_diagnostics::spawn_blocking(
                             broca_diagnostics::JobKind::Projection,
                             move || {
-                                let after = s
-                                    .bus_event_position(&session, &epoch)
-                                    .map_err(|e| e.to_string())?;
-                                let range = w
-                                    .read_records_range(&session, after, Some(head), None)
-                                    .map_err(|e| e.to_string())?;
-                                if range.lineage_id.is_none_or(|id| id.to_string() != epoch) {
+                                let (records, lineage) = match read_for_projection(&s, &w, &session)
+                                {
+                                    Ok(Some(read)) => read,
+                                    Ok(None) => return Err("run event WAL is absent".to_string()),
+                                    Err(ReadError::Wal(e)) => return Err(e.to_string()),
+                                    Err(ReadError::Store(e)) => return Err(e),
+                                };
+                                if lineage.as_deref() != Some(epoch.as_str()) {
                                     return Err(
                                         "WAL epoch changed during run event projection".into()
                                     );
                                 }
-                                let broca_wal::WalRangeRecords::Complete(records) =
-                                    range.into_records()
-                                else {
-                                    return Err("run event WAL is absent".into());
-                                };
+                                // Only records the barrier proved durable.
+                                let records: Vec<_> =
+                                    records.into_iter().filter(|r| r.seq <= head).collect();
                                 s.project_new_bus_events(&session, &epoch, &records, now)
                                     .map_err(|e| e.to_string())
                             },
@@ -830,6 +899,43 @@ mod tests {
         assert_eq!(
             recover_session(&store, &wal, &missing, now_ms()).unwrap(),
             Visit::Absent
+        );
+    }
+
+    /// A projection of a session with long history reads only the WAL's end: enough to reach
+    /// a record from before the period, not the whole file.
+    #[test]
+    fn bus_projection_reads_only_the_tail_of_a_long_history() {
+        let root = broca_test_support::scratch_root().join(format!("bus-tail-{}", now_ms()));
+        let wal = FileWalStore::new(root.join("wal"));
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = BindIdentity::new("/test", "test", "long");
+        let hour_ago = now_ms() - 60 * 60 * 1000;
+        let mut writer = wal.open(&session).unwrap();
+        for n in 0..1000 {
+            writer
+                .append(
+                    1,
+                    &run_started(&session, &format!("old-{n}"), hour_ago),
+                    false,
+                )
+                .unwrap();
+            writer.append(1, &run_finished(hour_ago), false).unwrap();
+        }
+        store.begin_bus_event_period(now_ms()).unwrap();
+        writer
+            .append(1, &run_started(&session, "new", now_ms()), true)
+            .unwrap();
+        drop(writer);
+        let Ok(Some((records, lineage))) = read_for_projection(&store, &wal, &session) else {
+            panic!("the WAL must be readable");
+        };
+        assert!(lineage.is_some());
+        assert_eq!(records.last().map(|r| r.seq), Some(2001));
+        assert!(
+            records.len() < 1000,
+            "the projection decoded {} of 2001 records instead of the tail",
+            records.len()
         );
     }
 

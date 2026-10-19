@@ -1132,6 +1132,47 @@ impl FileWalStore {
         self.read_address_range_for_authorization(address, after_seq, through_seq, anchor)
     }
 
+    /// The newest records of a session's WAL, read from at most its last `tail_bytes` when the
+    /// WAL is live. An archived lineage is immutable and is read whole from its archive member.
+    /// See [`broca_wal::read_records_tail`].
+    pub fn read_records_tail(
+        &self,
+        session: &BindIdentity,
+        tail_bytes: u64,
+    ) -> Result<broca_wal::WalTailRead, WalError> {
+        let address = session_addr(session);
+        broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;
+        let lookup = self.archived_member_at_address(&address)?;
+        let whole = |range: WalRangeRead| {
+            let lineage_id = range.lineage_id;
+            match range.into_records() {
+                broca_wal::WalRangeRecords::Complete(records) => broca_wal::WalTailRead {
+                    records,
+                    from_start: true,
+                    lineage_id,
+                    file_present: true,
+                },
+                _ => broca_wal::WalTailRead {
+                    records: Vec::new(),
+                    from_start: true,
+                    lineage_id: None,
+                    file_present: false,
+                },
+            }
+        };
+        if let Some(member) = lookup.member {
+            return Ok(whole(member_range(&member, 0, None)?));
+        }
+        if lookup.consulted {
+            return Ok(whole(WalRangeRead::absent_after_archive_lookup()));
+        }
+        broca_wal::read_records_tail(
+            self.read_address_path(&address)?,
+            self.max_read_bytes,
+            tail_bytes,
+        )
+    }
+
     fn read_address_range_for_authorization(
         &self,
         address: &str,

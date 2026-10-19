@@ -105,41 +105,6 @@ thread_local! {
 
 impl SessionRefIndex for SqliteStore {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
-        self.record_bounded(|conn| insert(conn, address, session).map(|_| ()))
-    }
-
-    fn record_run_start(
-        &self,
-        address: &str,
-        session: &BindIdentity,
-        prior_head: u64,
-        lineage: Option<broca_wal::WalLineageId>,
-    ) -> Result<(), String> {
-        let events = self.bus_event_period_active();
-        self.record_bounded(|conn| {
-            insert(conn, address, session)?;
-            if events {
-                let lineage = lineage.map(|id| id.to_string());
-                // The run is not refused for this: without the checkpoint the publisher starts
-                // the session at its head when the run's first barrier arrives.
-                if let Err(error) =
-                    crate::bus_events::record_run_start(conn, session, prior_head, lineage.as_deref())
-                {
-                    tracing::warn!(target: "bus", %error, "could not record where a run's events start; the publisher will start from the run's first barrier");
-                }
-            }
-            Ok(())
-        })
-    }
-}
-
-impl SqliteStore {
-    /// Run `write` on the connection within one bounded budget shared between the
-    /// connection mutex and SQLite's write lock, so a WAL append never waits indefinitely.
-    fn record_bounded(
-        &self,
-        write: impl FnOnce(&Connection) -> Result<(), StoreError>,
-    ) -> Result<(), String> {
         let deadline = std::time::Instant::now() + crate::STORE_BUSY_TIMEOUT;
         let conn = loop {
             match self.conn.try_lock() {
@@ -173,7 +138,7 @@ impl SqliteStore {
             .map_err(|error| error.to_string())?;
         conn.busy_timeout(remaining.min(std::time::Duration::from_millis(timeout)))
             .map_err(|error| error.to_string())?;
-        let result = write(&conn).map_err(|error| error.to_string());
+        let result = insert(&conn, address, session).map_err(|error| error.to_string());
         conn.busy_timeout(std::time::Duration::from_millis(timeout))
             .map_err(|error| error.to_string())?;
         result?;

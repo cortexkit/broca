@@ -68,12 +68,15 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
             WHERE published_ms IS NULL AND best_effort=0;
          CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);
+         -- Runs the run index shows live, by when they last changed state, for recovery.
+         CREATE INDEX IF NOT EXISTS bus_event_live_runs ON run_index(state_changed_ms)
+            WHERE state IN ('active','paused');
          CREATE TABLE IF NOT EXISTS bus_event_projection (
             session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
             state_json TEXT NOT NULL
          );
-         -- Sessions with a run started, or in flight, during the current enabled period that
-         -- projection has not yet seen finish. Recovery after process loss visits only these.
+         -- Sessions whose projection has a run started and not yet seen finish. Recovery after
+         -- process loss visits these and the run index's live runs of the current period.
          CREATE TABLE IF NOT EXISTS bus_event_open (
             session TEXT PRIMARY KEY, identity TEXT NOT NULL
          );
@@ -103,10 +106,8 @@ struct Projection {
 enum Baseline {
     /// Every record is new: emit from the first record.
     FromStart,
-    /// Only what happened during the current enabled period is new. History is replayed
-    /// for state without emitting anything, except the session's most recent run (its last
-    /// `RunStarted`) when the run index shows that run active or paused, or shows it changing
-    /// state during the period; that run's records are emitted.
+    /// Only what happened during the current enabled period is new: the projection starts at
+    /// the first run whose `RunStarted` is stamped at or after the period began.
     SinceEnable,
 }
 
@@ -248,15 +249,32 @@ impl SqliteStore {
         Ok(true)
     }
 
-    /// Sessions whose current-period run projection has not yet seen finish: the only
-    /// sessions recovery after process loss needs to visit.
+    /// The only sessions recovery after process loss needs to visit: those whose projection
+    /// has a run open (started, not yet seen finished), and those with a run the run index
+    /// shows active or paused since the current period began, which covers a run that became
+    /// durable but was not projected before the process stopped. Both lists are indexed and
+    /// hold only this period's live runs, never the store's history.
     pub fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+        let period = self.bus_events.period_started_ms.load(Ordering::Relaxed);
         let conn = self.conn.lock().unwrap();
-        let sessions = conn
+        let mut sessions = conn
             .prepare("SELECT identity FROM bus_event_open ORDER BY session")?
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect::<Result<Vec<BindIdentity>, StoreError>>()?;
+        if period != 0 {
+            let admitted = conn
+                .prepare(
+                    "SELECT DISTINCT session FROM run_index INDEXED BY bus_event_live_runs
+                     WHERE state IN ('active','paused') AND state_changed_ms >= ?1",
+                )?
+                .query_map([period], |r| r.get::<_, String>(0))?
+                .map(|r| Ok(serde_json::from_str(&r?)?))
+                .collect::<Result<Vec<BindIdentity>, StoreError>>()?;
+            sessions.extend(admitted);
+        }
+        sessions.sort_by_key(Self::key);
+        sessions.dedup();
         Ok(sessions)
     }
 
@@ -322,6 +340,29 @@ impl SqliteStore {
             .unwrap_or(0))
     }
 
+    /// The session's projection checkpoint as `(epoch, seq)`, if it has one. An empty epoch
+    /// is a checkpoint taken before a legacy WAL minted its lineage.
+    pub fn bus_event_checkpoint(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(String, u64)>, StoreError> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT epoch, seq FROM bus_event_projection WHERE session=?1",
+                [Self::key(session)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// When the current enabled period began, in Unix milliseconds; zero while none is active.
+    pub fn bus_event_period_started_ms(&self) -> u64 {
+        self.bus_events.period_started_ms.load(Ordering::Relaxed)
+    }
+
     /// `records` must be bounded by a successful writer or read-side durability barrier.
     /// The event checkpoint is independent of the transcript's turn-boundary watermark:
     /// starting and pausing a run must not wait for a complete assistant turn.
@@ -340,10 +381,11 @@ impl SqliteStore {
     }
 
     /// [`Self::project_bus_events`] for the publisher. A session with no checkpoint for `epoch`
-    /// starts at its head: its history updates the projection state but emits nothing, unless
-    /// its latest run is still live, in which case that run's records are emitted. A run is
-    /// live when the run index shows it active or paused, or shows it changing state during
-    /// the current period. A run the index does not know is treated as history.
+    /// starts just before its first `RunStarted` stamped at or after the current period began,
+    /// or at its head when there is none, so nothing written earlier becomes an event.
+    ///
+    /// `records` must reach back past that run: a caller reading a WAL's tail keeps widening the
+    /// read until it holds a timestamped record from before the period, or the whole WAL.
     pub fn project_new_bus_events(
         &self,
         session: &BindIdentity,
@@ -381,22 +423,23 @@ impl SqliteStore {
             }
             _ => (0, Projection::default(), false),
         };
-        // Records at or below this sequence update the projection state and nothing else.
-        let quiet_through = if checkpointed || baseline == Baseline::FromStart {
-            0
-        } else {
+        // Without a checkpoint, the publisher's projection starts just before the first run
+        // that began during the current period, judged by that `RunStarted`'s own clock; with
+        // no such run it starts at the head. Earlier records are skipped, not replayed: the
+        // projection state belongs to the run the events start with.
+        if !checkpointed && baseline == Baseline::SinceEnable {
             let period = self.bus_events.period_started_ms.load(Ordering::Relaxed);
-            let head = records.last().map_or(0, |frame| frame.seq);
-            match records.iter().rev().find_map(|frame| match &frame.record {
-                WalRecord::RunStarted { run_id, .. } => Some((frame.seq, run_id.0.as_str())),
+            let first_new_run = records.iter().find_map(|frame| match &frame.record {
+                WalRecord::RunStarted {
+                    ts_ms: Some(ts_ms), ..
+                } if period != 0 && *ts_ms >= period => Some(frame.seq),
                 _ => None,
-            }) {
-                Some((started, run_id)) if period != 0 && run_is_live(&tx, run_id, period)? => {
-                    started - 1
-                }
-                _ => head,
-            }
-        };
+            });
+            seq = match first_new_run {
+                Some(started) => started - 1,
+                None => records.last().map_or(0, |frame| frame.seq),
+            };
+        }
         let mut oversize = 0;
         let mut dropped = 0;
         let mut inserted = 0;
@@ -406,7 +449,6 @@ impl SqliteStore {
                     "run event WAL range has a sequence gap".into(),
                 ));
             }
-            let loud = frame.seq > quiet_through;
             let detail = match &frame.record {
                 WalRecord::RunStarted {
                     run_id,
@@ -422,10 +464,8 @@ impl SqliteStore {
                         open: true,
                         ..Projection::default()
                     };
-                    if loud {
-                        tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
+                    tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
                         params![run_id.0, serde_json::to_string(session)?, submission_id.as_ref().map(|s| &s.0), request_identity_digest, ts_ms, title])?;
-                    }
                     Some(RunEventDetail::Started {})
                 }
                 WalRecord::Steered { send_id, ts_ms, .. } => {
@@ -470,9 +510,7 @@ impl SqliteStore {
                     ..
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
-                    if loud {
-                        tx.execute("UPDATE run_index SET state='paused',state_changed_ms=?2 WHERE run_id=?1 AND state IN ('active','paused')", params![run_id.0, state.last_at_ms])?;
-                    }
+                    tx.execute("UPDATE run_index SET state='paused',state_changed_ms=?2 WHERE run_id=?1 AND state IN ('active','paused')", params![run_id.0, state.last_at_ms])?;
                     Some(RunEventDetail::Paused {
                         pause_reason: *reason,
                     })
@@ -486,7 +524,7 @@ impl SqliteStore {
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
                     state.open = false;
-                    if let (true, Some(run_id)) = (loud, &state.run_id) {
+                    if let Some(run_id) = &state.run_id {
                         let terminal = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
                         tx.execute("UPDATE run_index SET state=?2,state_changed_ms=?3,usage_json=?4,retries_used=?5 WHERE run_id=?1", params![run_id, terminal, state.last_at_ms, serde_json::to_string(usage)?, retries_used])?;
                     }
@@ -502,7 +540,7 @@ impl SqliteStore {
                 }
                 _ => None,
             };
-            if let (true, Some(detail), Some(run_id)) = (loud, detail, state.run_id.as_ref()) {
+            if let (Some(detail), Some(run_id)) = (detail, state.run_id.as_ref()) {
                 let mut event = RunEvent {
                     v: 1,
                     session_ref: agent_session_ref(session),
@@ -693,57 +731,6 @@ impl SqliteStore {
             current = seen;
         }
     }
-}
-
-/// Record, before a run's first record is appended during an enabled period, where that
-/// session's projection starts: the WAL's head and lineage just before the append. Earlier
-/// records are history and are never emitted. A checkpoint the session already has for the
-/// same lineage is kept, since it may be behind with events still owed.
-pub(crate) fn record_run_start(
-    conn: &Connection,
-    session: &BindIdentity,
-    prior_head: u64,
-    lineage: Option<&str>,
-) -> Result<(), StoreError> {
-    let key = SqliteStore::key(session);
-    let epoch = lineage.unwrap_or_default();
-    conn.execute(
-        "INSERT INTO bus_event_projection(session,epoch,seq,state_json) VALUES(?1,?2,?3,?4)
-         ON CONFLICT(session) DO UPDATE SET epoch=excluded.epoch, seq=excluded.seq, state_json=excluded.state_json
-         WHERE bus_event_projection.epoch != excluded.epoch AND excluded.epoch != ''",
-        params![key, epoch, prior_head, serde_json::to_string(&Projection::default())?],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO bus_event_open(session, identity) VALUES(?1, ?2)",
-        params![key, serde_json::to_string(session)?],
-    )?;
-    Ok(())
-}
-
-impl SqliteStore {
-    pub(crate) fn bus_event_period_active(&self) -> bool {
-        self.bus_events.period_started_ms.load(Ordering::Relaxed) != 0
-    }
-}
-
-/// Whether the run index shows `run_id` still live, or changing state during the period that
-/// began at `period_started_ms`. A run it does not know is not live.
-fn run_is_live(
-    conn: &Connection,
-    run_id: &str,
-    period_started_ms: u64,
-) -> Result<bool, StoreError> {
-    let row: Option<(String, Option<u64>)> = conn
-        .query_row(
-            "SELECT state, state_changed_ms FROM run_index WHERE run_id=?1",
-            [run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.is_some_and(|(state, changed)| {
-        matches!(state.as_str(), "active" | "paused")
-            || changed.is_some_and(|changed| changed >= period_started_ms)
-    }))
 }
 
 /// Insert one outbox row; returns its key and whether the row is new.
@@ -1028,39 +1015,43 @@ mod tests {
         assert!(store.begin_bus_event_period(9000).unwrap().fresh);
     }
 
-    /// With no checkpoint, the publisher's projection treats history as already seen: a
-    /// finished run emits nothing, while a run the index shows live still emits.
+    /// With no checkpoint, the publisher's projection starts at the first run stamped at or
+    /// after the period began: earlier runs emit nothing, and a later run on the same session
+    /// emits from its `RunStarted`.
     #[test]
-    fn bus_new_projection_starts_at_the_head_unless_the_latest_run_is_live() {
+    fn bus_new_projection_starts_at_the_first_run_of_the_period() {
         let store = enabled();
         store.begin_bus_event_period(10_000).unwrap();
-        let records = [start(), finish(2, RunFinishReason::Completed)];
+        let history = [start(), finish(2, RunFinishReason::Completed)];
         store
-            .project_new_bus_events(&session(), "epoch", &records, 20_000)
+            .project_new_bus_events(&session(), "epoch", &history, 20_000)
             .unwrap();
         assert!(rows(&store).is_empty(), "history became events");
         assert_eq!(store.bus_event_position(&session(), "epoch").unwrap(), 2);
         assert!(store.bus_event_open_sessions().unwrap().is_empty());
-        let live = BindIdentity::new("/project", "test", "live");
+        let later = BindIdentity::new("/project", "test", "later");
+        let mut new_run = crate::conformance::run_started(
+            3,
+            "r2",
+            &later,
+            "prompt",
+            ModelHandle::new("test", "model"),
+        );
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut new_run.record {
+            *ts_ms = Some(15_000);
+        }
+        let mut records = history.to_vec();
+        records.push(new_run);
         store
-            .index_run_active(&broca_core::RunIndexRow {
-                run_id: "r1".into(),
-                session: live.clone(),
-                submission_id: None,
-                request_identity_digest: None,
-                state: RunIndexState::Active,
-                usage: None,
-                final_step_finish_reason: None,
-                retries_used: 0,
-                title: None,
-                withdrawals_owed: false,
-            })
+            .project_new_bus_events(&later, "epoch", &records, 20_000)
             .unwrap();
-        store
-            .project_new_bus_events(&live, "epoch", &[start()], 20_000)
-            .unwrap();
-        assert_eq!(rows(&store).len(), 1, "a live run's start is owed");
-        assert_eq!(store.bus_event_open_sessions().unwrap(), vec![live]);
+        let events = rows(&store);
+        assert_eq!(
+            events.iter().map(|r| r.1).collect::<Vec<_>>(),
+            [3],
+            "only the run started during the period is owed"
+        );
+        assert_eq!(store.bus_event_open_sessions().unwrap(), vec![later]);
     }
 
     /// The depth gauge follows the rows each call inserts and acknowledges; it is not counted

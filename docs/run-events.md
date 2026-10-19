@@ -34,17 +34,21 @@ until pruned) and counts the discarded rows in `bus_outbox_dropped`. A start
 with events still on continues the recorded period. A start with them off
 records that, so turning them on again begins a fresh period.
 
-During a period, just before a run's `RunStarted` is appended, the run index
-records the session's WAL head and lineage at that moment: that session's
-events begin with the new run. A session that writes during the period without
-starting a run (a crash-orphan seal, a resumed pause, maintenance) and has no
-checkpoint yet starts at its head; its history is replayed for state only. The
-exception is a latest run the run index shows active or paused, or changing
-state during the period: that run's records are emitted.
+A session's events begin with its first run whose `RunStarted` is stamped at or
+after the period began, by that record's own clock; earlier records are skipped,
+not replayed. The publisher finds that run when it first projects the session,
+reading only the end of the WAL: it starts with the last 256 KiB and widens the
+read fourfold until it holds a timestamped record from before the period, or
+the whole file. Once a session has a checkpoint, each projection reads back only
+as far as the checkpoint. Nothing on the WAL write path records anything for
+events. A run already in flight when events are turned on emits nothing.
 
-Recovery after process loss visits only sessions with a run open in the
-current period: those whose run started, or was found in flight, and has not
-yet been projected as finished. It never walks every session in the store.
+Recovery after process loss visits only sessions whose projection has a run
+open (started, not yet seen finished) and sessions whose run the run index shows
+active or paused since the period began. A run that became durable but was
+neither projected nor admitted to the run index before the process died is
+missed, as the crash-orphan sweep, which reads the same run-index rows, misses
+it. Recovery never walks every session in the store.
 
 ## Subjects and payload
 

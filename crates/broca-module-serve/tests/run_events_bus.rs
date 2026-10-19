@@ -414,9 +414,26 @@ fn bus_crash_child() {
     let session = BindIdentity::new("/test", "test", "crash");
     let wal = FileWalStore::new(root.join("wal"));
     let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
-    // As the module does when events are on: the run start below records where the session's
-    // events begin and lists it for recovery.
+    // As the module does with events on: the period is recorded, and the run is admitted into
+    // the run index, which is where recovery after a crash finds it.
     index.begin_bus_event_period(now_ms()).unwrap();
+    {
+        use broca_core::RunIndex;
+        index
+            .index_run_active(&broca_core::RunIndexRow {
+                run_id: "bus-run".into(),
+                session: session.clone(),
+                submission_id: None,
+                request_identity_digest: None,
+                state: broca_core::RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+    }
     wal.set_session_ref_index(index);
     wal.open(&session)
         .unwrap()
@@ -440,16 +457,20 @@ async fn real_bus_crash_after_wal_commit_replays_after_restart() {
         .args(["--exact", "bus_crash_child"])
         .env("BROCA_BUS_CRASH_FIXTURE", temp.path())
         .env("BROCA_STATE_ROOT", temp.path())
+        // The child is a test harness too; its own result lines would read as this test's.
+        .stdout(std::process::Stdio::null())
         .status()
         .unwrap();
     assert_eq!(child.code(), Some(86));
     let store = SqliteStore::open(temp.path().join("run-index.db")).unwrap();
     store.enable_bus_events(names.account()).unwrap();
+    // The restarted publisher continues the period the crashed process began.
+    assert!(!store.begin_bus_event_period(now_ms()).unwrap().fresh);
     let wal = FileWalStore::new(temp.path().join("wal"));
     let session = BindIdentity::new("/test", "test", "crash");
     assert!(
         store.bus_event_open_sessions().unwrap().contains(&session),
-        "startup recovery must list the crash-committed run without a run-index admission row"
+        "startup recovery must list the crash-committed run from its run-index admission row"
     );
     project(&store, &wal, &session);
     let pending = store.pending_bus_event().unwrap().unwrap();
