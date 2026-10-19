@@ -953,7 +953,8 @@ pub enum WalRecord {
     // start a run from a send that must never start one, deliver a replaced or expired send, or
     // render a prompt without a delivered send. Sessions whose sends use no ordered list, dedupe
     // key or expiry never carry these records.
-    /// The delivery order of the `Queued` record for the same `submission_id` that follows it.
+    /// Records the delivery order of the `Queued` record for the same `submission_id` that
+    /// follows it.
     /// Both are written in one barrier, this one first, so a durable `Queued` always has its
     /// order before it (a running turn's own records may lie between the two). The queued send
     /// then waits until a request boundary where one of its modes is possible; it starts a run

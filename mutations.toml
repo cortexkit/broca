@@ -17150,9 +17150,11 @@ target = "--test it"
 test_file = "crates/broca-module/tests/it/delivery_order.rs"
 # Each of these sends waits with a list that has no idle_start; under the break it drains into a run.
 expect_red = [
+    "delivery_order::a_named_sender_never_becomes_the_sessions_principal",
     "delivery_order::a_restart_between_acceptance_and_delivery_delivers_once",
     "delivery_order::an_expired_send_is_dropped_durably_and_never_delivered",
     "delivery_order::an_ordered_list_without_idle_start_never_starts_a_run",
+    "delivery_order::idle_start_without_the_grant_is_refused",
 ]
 file = "crates/broca-core/src/queue.rs"
 old = '''    pub fn starts_runs(&self) -> bool {
