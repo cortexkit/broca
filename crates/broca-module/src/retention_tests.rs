@@ -3820,6 +3820,9 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
         ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
             self.inner.read_records_range(key, after, through, anchor)
         }
+        fn live_wal_bytes(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+            self.inner.live_wal_bytes(key)
+        }
         fn flush_for_read(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
             self.inner.flush_for_read(key)
         }

@@ -20,6 +20,7 @@ impl RunExecutor for TerminalExecutor {
         _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         job.writer.record(WalRecord::RunStarted {
+            tags: None,
             session_class: None,
             retention: None,
             hooks: None,
@@ -46,6 +47,7 @@ impl RunExecutor for TerminalExecutor {
             let _ = ack.send(Ok(job.req.run_id.clone()));
         }
         job.writer.record(WalRecord::ModelStepFinished {
+            tags: None,
             hooks: None,
             step_id: StepId(1),
             assistant_message: AssistantMessage {
@@ -289,6 +291,9 @@ impl crate::registry::LineageOpener for NoOpen {
 struct UnprovenWal;
 
 impl WalStore for UnprovenWal {
+    fn live_wal_bytes(&self, _: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        Ok(Some(0))
+    }
     fn open(
         &self,
         _: &BindIdentity,
@@ -338,7 +343,7 @@ async fn closed_polls_refuse_unproven_history_without_opening_an_actor() {
 }
 
 #[tokio::test]
-async fn closed_polls_distinguish_absent_runs_from_an_unsealed_run() {
+async fn closed_polls_distinguish_absent_runs_from_a_pending_crash_orphan() {
     let dir =
         broca_test_support::scratch_root().join(format!("closed-unsealed-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -356,7 +361,37 @@ async fn closed_polls_distinguish_absent_runs_from_an_unsealed_run() {
         registry.status(&key).await.unwrap(),
         crate::serve::StatusResponse::Idle
     ));
-    let start = WalRecord::RunStarted {
+    let start = unsealed_start(&key, &run);
+    let mut writer = wal.open(&key).unwrap();
+    writer.append(1, &start, true).unwrap();
+    drop(writer);
+    let sweep = registry.mark_crash_orphans(
+        wal.as_ref(),
+        vec![(run.clone(), key.clone())],
+        std::time::SystemTime::now() + Duration::from_secs(1),
+    );
+    assert_eq!(sweep.marked, 1);
+    assert!(matches!(
+        registry.status(&key).await,
+        Err(crate::serve::ServeError::Open(
+            _,
+            Some(broca_protocol::ErrorClass::Transient)
+        ))
+    ));
+    assert!(matches!(
+        registry.run_status(&key, run).await,
+        Err(crate::serve::ServeError::Open(
+            _,
+            Some(broca_protocol::ErrorClass::Transient)
+        ))
+    ));
+    assert!(registry.slot_state(&key).is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn unsealed_start(key: &BindIdentity, run: &RunId) -> WalRecord {
+    WalRecord::RunStarted {
+        tags: None,
         session_class: None,
         retention: None,
         hooks: None,
@@ -377,24 +412,282 @@ async fn closed_polls_distinguish_absent_runs_from_an_unsealed_run() {
         input: Vec::new().into(),
         origin: broca_wal::RunOrigin::Fresh,
         submission_id: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn closed_unmarked_orphan_status_makes_progress_after_boot_sealing() {
+    for run_keyed in [false, true] {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("closed-orphan-{}-{run_keyed}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = BindIdentity::new(&dir, "runner", "unmarked");
+        let run = RunId("unsealed".into());
+        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+        let mut writer = wal.open(&key).unwrap();
+        writer.append(1, &unsealed_start(&key, &run), true).unwrap();
+        drop(writer);
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            wal.clone(),
+            Arc::new(TerminalExecutor(RunFinishReason::Completed)),
+        )
+        .with_idle_ttl(Duration::from_secs(3600));
+        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+        let sweep =
+            registry.mark_crash_orphans(wal.as_ref(), Vec::new(), std::time::SystemTime::now());
+        registry.seal_marked_crash_orphans(sweep).await;
+        assert!(registry.slot_state(&key).is_none());
+        if !run_keyed {
+            registry
+                .status(&key)
+                .await
+                .expect("session status recovers the unmarked orphan");
+        }
+        let status = registry
+            .run_status(&key, run.clone())
+            .await
+            .expect("run status must make recovery progress");
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["state"],
+            "interrupted"
+        );
+        let records = wal.read_records(&key).unwrap();
+        assert!(records.iter().any(|frame| matches!(
+            frame.record,
+            WalRecord::RunFinished {
+                reason: RunFinishReason::Interrupted,
+                ..
+            }
+        )));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
+                .count(),
+            1,
+            "status recovery must seal, not start a replacement episode"
+        );
+        assert!(registry.stop_and_seal().await);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn status_orphan_lease_refusal_does_not_leave_a_pending_boot_mark() {
+    let dir = broca_test_support::scratch_root()
+        .join(format!("held-status-orphan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = BindIdentity::new(&dir, "runner", "held");
+    let run = RunId("held-run".into());
+    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let mut writer = wal.open(&key).unwrap();
-    writer.append(1, &start, true).unwrap();
+    writer.append(1, &unsealed_start(&key, &run), true).unwrap();
     drop(writer);
-    assert!(matches!(
-        registry.status(&key).await,
-        Err(crate::serve::ServeError::Open(
-            _,
-            Some(broca_protocol::ErrorClass::Transient)
-        ))
-    ));
-    assert!(matches!(
-        registry.run_status(&key, run).await,
-        Err(crate::serve::ServeError::Open(
-            _,
-            Some(broca_protocol::ErrorClass::Transient)
-        ))
-    ));
-    assert!(registry.slot_state(&key).is_none());
+    let leases = Arc::new(FileLeaseStore::new(dir.join("leases")));
+    let held =
+        broca_core::LeaseStore::acquire(leases.as_ref(), &broca_core::lease_key_for(&key)).unwrap();
+    let opener = DefaultOpener::new(
+        leases,
+        wal.clone(),
+        Arc::new(TerminalExecutor(RunFinishReason::Completed)),
+    );
+    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
+    for _ in 0..2 {
+        assert!(
+            matches!(
+                registry.route_run_state(&key, run.clone()).await,
+                Err(crate::registry::OpenError::LeaseHeld(_))
+            ),
+            "the next poll must retry the lease, not wait forever on a stranded seal mark"
+        );
+    }
+    drop(held);
+    assert!(registry.stop_and_seal().await);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+struct StatusCostWal {
+    inner: Arc<FileWalStore>,
+    from_zero: AtomicU64,
+    decoded: AtomicU64,
+}
+
+impl StatusCostWal {
+    fn count_range(&self, after: u64, range: &broca_wal::WalRangeRead) {
+        if after == 0 {
+            self.from_zero.fetch_add(1, Ordering::Relaxed);
+        }
+        let count = match range.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records.len(),
+            broca_wal::WalRangeRecords::Absent => 0,
+        };
+        self.decoded.fetch_add(count as u64, Ordering::Relaxed);
+    }
+}
+
+impl WalStore for StatusCostWal {
+    fn open(
+        &self,
+        key: &BindIdentity,
+    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+        self.inner.open(key)
+    }
+    fn read_records(
+        &self,
+        key: &BindIdentity,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        let records = self.inner.read_records(key)?;
+        self.from_zero.fetch_add(1, Ordering::Relaxed);
+        self.decoded
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        Ok(records)
+    }
+    fn read_records_range(
+        &self,
+        key: &BindIdentity,
+        after: u64,
+        through: Option<u64>,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        let range = self.inner.read_records_range(key, after, through, anchor)?;
+        self.count_range(after, &range);
+        Ok(range)
+    }
+    fn read_records_range_from_valid_anchor(
+        &self,
+        key: &BindIdentity,
+        after: u64,
+        through: Option<u64>,
+        anchor: &broca_wal::WalByteAnchor,
+    ) -> Result<Option<broca_wal::WalRangeRead>, broca_wal::WalError> {
+        let range = self
+            .inner
+            .read_records_range_from_valid_anchor(key, after, through, anchor)?;
+        if let Some(range) = &range {
+            self.count_range(after, range);
+        }
+        Ok(range)
+    }
+    fn live_wal_bytes(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        self.inner.live_wal_bytes(key)
+    }
+    fn wal_present(&self, key: &BindIdentity) -> Option<bool> {
+        self.inner.wal_present(key)
+    }
+    fn file_identity(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        self.inner.file_identity(key)
+    }
+    fn flush_for_read(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        self.inner.flush_for_read(key)
+    }
+    fn is_retention_lineage(&self, key: &BindIdentity) -> Result<bool, broca_wal::WalError> {
+        self.inner.is_retention_lineage(key)
+    }
+}
+
+#[tokio::test]
+async fn large_closed_session_status_poll_cost_is_independent_of_history() {
+    let dir = broca_test_support::scratch_root()
+        .join(format!("large-closed-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = BindIdentity::new(&dir, "runner", "worker");
+    let inner = Arc::new(FileWalStore::new(dir.join("wal")));
+    let mut writer = inner.open(&key).unwrap();
+    for episode in 0..400 {
+        let run = RunId(format!("episode-{episode}"));
+        writer
+            .append(1, &unsealed_start(&key, &run), false)
+            .unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::ModelStepFinished {
+                    tags: None,
+                    hooks: None,
+                    step_id: StepId(1),
+                    assistant_message: AssistantMessage {
+                        message_id: MessageId(format!("answer-{episode}")),
+                        content: vec![ContentBlock::Text {
+                            text: "x".repeat(8192),
+                        }],
+                    }
+                    .into(),
+                    usage: Usage::default(),
+                    finish_reason: Some(FinishReason::Stop),
+                    retries_used: 0,
+                    service_tier_used: None,
+                    speed_used: None,
+                },
+                false,
+            )
+            .unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::RunFinished {
+                    ts_ms: None,
+                    reason: RunFinishReason::Completed,
+                    usage: Usage::default(),
+                    error: None,
+                    retries_used: 0,
+                },
+                false,
+            )
+            .unwrap();
+    }
+    writer.sync().unwrap();
+    drop(writer);
+    assert!(
+        inner.live_wal_bytes(&key).unwrap().unwrap() > crate::registry::STATUS_WAL_READ_MAX_BYTES
+    );
+    let store = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let range = inner.read_records_range(&key, 0, None, None).unwrap();
+    broca_core::Persister::project_range(store.as_ref(), &key, &range).unwrap();
+    let wal = Arc::new(StatusCostWal {
+        inner,
+        from_zero: AtomicU64::new(0),
+        decoded: AtomicU64::new(0),
+    });
+    let opener = DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(dir.join("leases"))),
+        wal.clone(),
+        Arc::new(TerminalExecutor(RunFinishReason::Completed)),
+    )
+    .with_materialized_store(store.clone())
+    .with_run_index(store.clone())
+    .with_idle_ttl(Duration::from_secs(3600));
+    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), Some(store));
+    // The compatibility fallback pays ordinary actor recovery once, not on every poll.
+    registry.status(&key).await.unwrap();
+    wal.from_zero.store(0, Ordering::Relaxed);
+    wal.decoded.store(0, Ordering::Relaxed);
+    for _ in 0..20 {
+        assert!(matches!(
+            registry.status(&key).await.unwrap(),
+            crate::serve::StatusResponse::Idle
+        ));
+    }
+    assert_eq!(
+        wal.from_zero.load(Ordering::Relaxed),
+        0,
+        "closed status must not reread from sequence zero on each poll"
+    );
+    assert_eq!(
+        wal.decoded.load(Ordering::Relaxed),
+        0,
+        "closed status must not decode history on each poll"
+    );
+    assert_eq!(
+        registry.slot_counts().open,
+        1,
+        "large logs retain the legacy actor fallback"
+    );
+    assert!(registry.stop_and_seal().await);
     std::fs::remove_dir_all(dir).unwrap();
 }

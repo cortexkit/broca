@@ -720,9 +720,15 @@ its actor; a teardown cannot start while an op holds the actor. Lease lifetime: 
 holds the lease while there are **subscribers OR pending work OR within a short idle
 TTL**; otherwise it transitions `Closing` → releases the lease → `Closed`. A send,
 cancel, retract or subscription re-opens it (`Opening` → reacquire → replay).
-Status, result and transcript reads do not open a closed actor: they use the durable
-run index and bounded, lease-free WAL reads. Unproven history is refused rather
-than guessed, and a nonterminal index row cannot override a WAL terminal.
+Finished one-shots can be polled without reopening their actor. Session status
+reads a closed live WAL only when it is at most 1 MiB; larger, archived or
+size-unknown logs use the ordinary actor path so repeated polls do not replay
+the entire history. There is no reverse WAL reader to locate the latest episode
+without a seek anchor. Run-keyed status/result and transcript reads retain their
+durable index/WAL paths. Unproven history is refused rather than guessed, and a
+nonterminal index row cannot override a WAL terminal. While crash-orphan sealing
+is pending, an unsealed run is retryable; afterward a status poll can open its
+coordinator and seal an unmarked orphan as interrupted rather than strand it.
 Races handled by the actor:
 - A send arriving as the actor is `Closing` → it waits/re-opens, never races a half-torn
   state.

@@ -9,6 +9,38 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "module-large-status-polls-avoid-full-history"
+guards = "Large closed worker sessions amortize actor recovery instead of decoding every episode on each status poll"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/closed_poll_tests.rs"
+expect_red = ["actor::closed_poll_tests::large_closed_session_status_poll_cost_is_independent_of_history"]
+expect_message = "closed status must not reread from sequence zero on each poll"
+file = "crates/broca-module/src/registry.rs"
+old = "if self.status_needs_actor(key).await? {"
+new = "if false && self.status_needs_actor(key).await? { // NON-VACUITY BREAK: replay large histories on every poll."
+
+[[control]]
+id = "module-unmarked-orphan-status-recovers"
+guards = "After boot sealing, a run status poll seals an unmarked orphan instead of refusing it forever"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/closed_poll_tests.rs"
+expect_red = ["actor::closed_poll_tests::closed_unmarked_orphan_status_makes_progress_after_boot_sealing"]
+expect_message = "run status must make recovery progress"
+file = "crates/broca-module/src/registry.rs"
+old = '''                    self.recover_status_orphan(key, &run_id).await?;
+                    continue;'''
+new = '''                    return Err(OpenError::Classified {
+                        reason: "could not tell run status: orphan recovery disabled".into(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    }); // NON-VACUITY BREAK: strand an unmarked orphan after boot.'''
+
+[[control]]
 id = "module-closed-status-poll-does-not-reopen"
 guards = "Polling a finished one-shot observes durable status without retaining a new idle actor"
 runner = "cargo"
