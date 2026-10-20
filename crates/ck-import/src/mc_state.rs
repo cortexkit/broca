@@ -484,13 +484,13 @@ pub async fn submit_state_import(
     let deadline = std::time::Instant::now() + bind_timeout;
     // The connection layer retries a temporary refusal within the bind timeout; this loop
     // additionally retries every other error until the same deadline.
-    let retry = RouteOpenRetry {
-        deadline: tokio::time::Instant::from_std(deadline),
+    let retry = || RouteOpenRetry {
+        budget: deadline.saturating_duration_since(std::time::Instant::now()),
         max_interval: ROUTE_OPEN_RETRY_INTERVAL,
     };
     let route = loop {
         match connection
-            .route_open_management_within(module_id, identity, retry)
+            .route_open_management_within(module_id, identity, retry())
             .await
         {
             Ok(route) => break route,

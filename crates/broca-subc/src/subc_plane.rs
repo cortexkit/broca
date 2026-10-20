@@ -1499,8 +1499,8 @@ impl SubcToolPlane {
         // The retry loop is the connection layer's, shared with every other route-open
         // consumer; this plane supplies only the policy. Under DEFAULT_ROUTE_OPEN_PATIENCE the
         // maximum wait equals the initial 100ms wait, so the interval never grows.
-        let retry = RouteOpenRetry {
-            deadline,
+        let retry = || RouteOpenRetry {
+            budget: deadline.saturating_duration_since(Instant::now()),
             max_interval: patience.max_interval,
         };
         let cancelled = || {
@@ -1509,7 +1509,7 @@ impl SubcToolPlane {
             ))
         };
         let Some(scope) = scope else {
-            return retry_route_open(retry, Some(lifecycle), || {
+            return retry_route_open(retry(), Some(lifecycle), || {
                 self.conn.route_open(module_id, bind, None)
             })
             .await
@@ -1562,7 +1562,7 @@ impl SubcToolPlane {
                 }
             };
             let handle =
-                retry_route_open_with_scope_hold(retry, Some(hold), Some(lifecycle), || {
+                retry_route_open_with_scope_hold(retry(), Some(hold), Some(lifecycle), || {
                     self.conn.route_open(module_id, bind, Some(&selector))
                 })
                 .await

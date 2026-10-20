@@ -10,7 +10,6 @@ use broca_test_support::{event_timeout, wait_until, EVENT_HANG_GUARD};
 use std::{io::Write, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use subc_control::ConsumerIdentity;
 use subc_protocol::manifest::{InternalTransport, ModuleManifest, ProviderRole};
-use tokio::time::Instant;
 
 struct DoorProvider(PathBuf);
 fn hex(bytes: &[u8]) -> String {
@@ -310,7 +309,7 @@ impl Live {
                 "agent-data",
                 &BindIdentity::new("/driver", "fake-entorhinal", "move"),
                 RouteOpenRetry {
-                    deadline: Instant::now() + EVENT_HANG_GUARD,
+                    budget: EVENT_HANG_GUARD,
                     max_interval: Duration::from_millis(200),
                 },
             )
