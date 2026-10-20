@@ -151,8 +151,25 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
 
     rig.script.hold_tool(false);
     rig.wait_for_finished(1).await;
+    // The terminal record is durable before the live actor stops reporting the run as
+    // active, so wait for the joined run's status to settle before taking it as the
+    // expected answer; the restart below reads the settled state from the log.
+    let joined_status = broca_test_support::event_timeout(
+        "the joined run's status settles to its terminal",
+        async {
+            loop {
+                let status = run_status(&mut rig, &joined).await;
+                if result(&status)["state"] != "active" {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || "run.status on the joined run still answered active".into(),
+    )
+    .await
+    .expect("the joined run's status settles");
     let ended_live = run_status(&mut rig, &provisional).await;
-    let joined_status = run_status(&mut rig, &joined).await;
     let mut expected = result(&joined_status);
     expected["delivered"] = step_receipt(&joined);
     assert_eq!(
@@ -224,7 +241,22 @@ async fn an_ordered_send_that_starts_its_own_run_answers_that_run() {
     assert_eq!(started_runs(&records), [first, provisional.clone()]);
     assert!(send_delivered(&records).is_empty(), "{records:?}");
 
-    let status = run_status(&mut rig, &provisional).await;
+    // As above: the terminal record lands before the live actor stops answering `active`.
+    let status = broca_test_support::event_timeout(
+        "the started run's status settles to its terminal",
+        async {
+            loop {
+                let status = run_status(&mut rig, &provisional).await;
+                if result(&status)["state"] != "active" {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+        || "run.status on the started run still answered active".into(),
+    )
+    .await
+    .expect("the started run's status settles");
     assert_golden(&status, "run_status.provisional_started.json", &provisional);
     let turn = serde_json::json!({"as": "turn", "ref": provisional});
     let resent = result(
