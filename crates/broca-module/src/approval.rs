@@ -194,6 +194,8 @@ pub(crate) struct WithdrawalTask {
     pending: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     settled_generation: Arc<AtomicU64>,
+    /// Set once the worker stops after store or WAL failures outlast the retry window.
+    stopped: Arc<AtomicBool>,
 }
 
 impl WithdrawalTask {
@@ -231,8 +233,14 @@ impl WithdrawalTask {
         let task_generation = generation.clone();
         let settled_generation = Arc::new(AtomicU64::new(0));
         let task_settled = settled_generation.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task_stopped = stopped.clone();
         let task = tokio::spawn(async move {
             let mut backoff = std::time::Duration::from_millis(100);
+            let mut refusals = RefusalWindows::<String>::default();
+            // Store and WAL failures share one window: they are failures of this session's
+            // durable state, not of any one question.
+            let mut store_failures = RefusalWindows::<()>::default();
             if !initial_pending {
                 tokio::select! { _ = task_cancel.cancelled() => return, _ = task_wake.notified() => {} }
             }
@@ -247,18 +255,44 @@ impl WithdrawalTask {
                     plane.as_ref(),
                     &clock,
                     &task_cancel,
+                    &mut refusals,
                 )
                 .await;
                 if task_cancel.is_cancelled() {
                     break;
                 }
-                let retry = match result {
-                    Ok(empty) => !empty,
-                    Err(error) => {
-                        tracing::warn!(target: "approval", "question withdrawal debt remains unknown: {error}");
-                        true
-                    }
+                let (retry, failure) = match result {
+                    Ok(outcome) => (
+                        !outcome.empty || outcome.cleanup_error.is_some(),
+                        outcome.cleanup_error,
+                    ),
+                    Err(error) => (true, Some(error)),
                 };
+                match failure {
+                    Some(error) => {
+                        match store_failures.refused(&(), &error, tokio::time::Instant::now()) {
+                            Refused::First => {
+                                tracing::warn!(target: "approval", session = %key.session, retry_window_s = WITHDRAWAL_RETRY_WINDOW.as_secs(), "question withdrawal debt remains unknown; retrying quietly: {error}");
+                            }
+                            Refused::Retrying => {}
+                            Refused::Exhausted(window) => {
+                                // Nothing was settled, so the WAL and the run index still record
+                                // the debt and the next process retries it. This worker stops so
+                                // the session can close instead of failing every few seconds.
+                                tracing::error!(target: "approval", session = %key.session, failures = window.refusals, "question withdrawal debt could not be read or cleaned up for {}s; no more attempts until restart: {error}", WITHDRAWAL_RETRY_WINDOW.as_secs());
+                                task_stopped.store(true, Ordering::Release);
+                                task_pending.store(false, Ordering::Release);
+                                task_cancel.cancelled().await;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(window) = store_failures.settled(&()) {
+                            tracing::info!(target: "approval", session = %key.session, failures = window.refusals, "question withdrawal debt is readable again");
+                        }
+                    }
+                }
                 let changed = task_generation.load(Ordering::Acquire) != pass_generation;
                 let retry = retry || changed;
                 if !retry {
@@ -284,6 +318,7 @@ impl WithdrawalTask {
             pending,
             generation,
             settled_generation,
+            stopped,
         }
     }
 
@@ -292,7 +327,12 @@ impl WithdrawalTask {
         self.pending.store(true, Ordering::Release);
         self.wake.notify_one();
     }
+    /// Whether this session must stay open for withdrawal work. A worker that gave up after
+    /// persistent store failures owes nothing more in this process.
     pub(crate) fn pending(&self, _head: u64) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
         self.pending.load(Ordering::Acquire)
             || self.settled_generation.load(Ordering::Acquire)
                 != self.generation.load(Ordering::Acquire)
@@ -316,22 +356,158 @@ impl Drop for WithdrawalTask {
     }
 }
 
-pub(crate) fn terminal_refusal(code: &str) -> bool {
-    matches!(
-        code,
-        "answered"
-            | "expired"
-            | "elicitation_not_owner"
-            | "elicitation_not_found"
-            | "session_ended"
-            | "scope_ended"
-            | "scope_parent_ended"
-            | "scope_not_live"
-            | "scope_epoch_mismatch"
-            | "scope_not_carrier"
-            | "scope_unsupported"
-            | "scope_unverifiable"
-    )
+/// How long a withdrawal keeps retrying after its first refusal before broca gives up on it.
+///
+/// The retryable refusals are a consent module that is reloading, warming or briefly
+/// unreachable, and a scope that has not synced yet. Those clear within seconds; five
+/// minutes also rides out a full daemon restart. The limit must not depend on the card's
+/// own expiry, because a card filed without an expiry never expires, and while a session
+/// still owes a withdrawal it cannot close. Giving up is safe: the card stays visible until
+/// someone answers it or it expires, which costs only a stale prompt.
+pub(crate) const WITHDRAWAL_RETRY_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// The durable reason recorded when broca stops retrying a withdrawal.
+pub(crate) const WITHDRAWAL_RETRY_EXHAUSTED: &str = "withdrawal_retry_exhausted";
+
+/// Cingulate's withdraw refusals that mean the card is already settled, pruned or owned by
+/// someone else. Nothing is left for broca to withdraw, so these settle as withdrawn.
+fn card_already_gone(code: &str) -> bool {
+    matches!(code, "elicitation_not_found" | "elicitation_not_owner")
+}
+
+/// What one withdrawal attempt means for the debt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WithdrawalStep {
+    /// Stop owing the withdrawal, recording this answer and reason.
+    Settle(broca_wal::WithdrawalAnswer, Option<String>),
+    /// The refusal may clear on its own; try again. Carries the code for logs.
+    Retry(String),
+}
+
+/// Classify a withdraw reply, or `None` when the attempt timed out.
+///
+/// Only a reply the plane marks retryable is retried. The consent plane derives that flag
+/// from subc-protocol's shared route-open predicate (`is_retryable_route_open`) plus the
+/// consent module's own transient codes, and replies `NotSent` only for refusals it judged
+/// final. Every other refusal is final here too: no list of final codes is kept in broca.
+pub(crate) fn withdrawal_step(reply: Option<ApprovalWithdrawal>) -> WithdrawalStep {
+    use broca_wal::WithdrawalAnswer::{Acknowledged, NotSent};
+    let code = match reply {
+        None => return WithdrawalStep::Retry("withdrawal_timeout".into()),
+        Some(ApprovalWithdrawal::Acknowledged) => {
+            return WithdrawalStep::Settle(Acknowledged, None)
+        }
+        Some(ApprovalWithdrawal::Retry(error)) if error.retryable => {
+            return WithdrawalStep::Retry(error.code)
+        }
+        Some(ApprovalWithdrawal::Retry(error)) => error.code,
+        Some(ApprovalWithdrawal::NotSent { reason }) => reason,
+    };
+    if card_already_gone(&code) {
+        WithdrawalStep::Settle(Acknowledged, Some(code))
+    } else {
+        WithdrawalStep::Settle(NotSent, Some(code))
+    }
+}
+
+/// Retry windows for withdrawals that were refused, keyed by whatever names one debt.
+///
+/// A window opens at the first refusal and closes when the debt settles. Once a window is
+/// older than [`WITHDRAWAL_RETRY_WINDOW`] the worker gives up on that debt. Times come from
+/// Tokio's clock, so a test with a paused clock controls them, and the limit does not move
+/// when the wall clock jumps.
+pub(crate) struct RefusalWindows<K> {
+    open: std::collections::HashMap<K, RefusalWindow>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RefusalWindow {
+    pub(crate) since: tokio::time::Instant,
+    pub(crate) refusals: u64,
+    pub(crate) last_code: String,
+}
+
+/// Where a debt stands after one more refusal.
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// The first refusal: log it once.
+    First,
+    /// Still inside the window: retry quietly.
+    Retrying,
+    /// The window has run out: give up and log it once.
+    Exhausted(RefusalWindow),
+}
+
+impl<K> Default for RefusalWindows<K> {
+    fn default() -> Self {
+        Self {
+            open: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> RefusalWindows<K> {
+    /// Remove and return this debt's window if it has already run out, so the caller can
+    /// give up without making another attempt.
+    pub(crate) fn take_exhausted(
+        &mut self,
+        key: &K,
+        now: tokio::time::Instant,
+    ) -> Option<RefusalWindow> {
+        let expired = self
+            .open
+            .get(key)
+            .is_some_and(|window| now.duration_since(window.since) >= WITHDRAWAL_RETRY_WINDOW);
+        if expired {
+            self.open.remove(key)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn refused(&mut self, key: &K, code: &str, now: tokio::time::Instant) -> Refused {
+        let Some(window) = self.open.get_mut(key) else {
+            self.open.insert(
+                key.clone(),
+                RefusalWindow {
+                    since: now,
+                    refusals: 1,
+                    last_code: code.to_owned(),
+                },
+            );
+            return Refused::First;
+        };
+        window.refusals += 1;
+        code.clone_into(&mut window.last_code);
+        if now.duration_since(window.since) >= WITHDRAWAL_RETRY_WINDOW {
+            let window = window.clone();
+            self.open.remove(key);
+            Refused::Exhausted(window)
+        } else {
+            Refused::Retrying
+        }
+    }
+
+    /// Close the window when the debt settles; returns it if the debt had been refused.
+    pub(crate) fn settled(&mut self, key: &K) -> Option<RefusalWindow> {
+        self.open.remove(key)
+    }
+
+    /// Forget debts that are no longer owed, for example because a restart or another
+    /// writer settled them.
+    pub(crate) fn retain(&mut self, mut owed: impl FnMut(&K) -> bool) {
+        self.open.retain(|key, _| owed(key));
+    }
+}
+
+/// What one service pass found.
+pub(crate) struct PassOutcome {
+    /// No withdrawal is owed any more.
+    pub(crate) empty: bool,
+    /// The first run-index cleanup step that failed. The pass must run again, and the
+    /// worker treats it like any other store failure.
+    pub(crate) cleanup_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -344,7 +520,33 @@ pub(crate) async fn service_pass<W: WalStore + 'static>(
     plane: &dyn ElicitationPlane,
     clock: &broca_core::Clock,
 ) -> Result<bool, String> {
-    service_pass_cancellable(
+    service_pass_with(
+        wal,
+        key,
+        writer,
+        index,
+        lock,
+        plane,
+        clock,
+        &mut RefusalWindows::default(),
+    )
+    .await
+}
+
+/// One pass that keeps refusal windows across calls, as the worker does.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn service_pass_with<W: WalStore + 'static>(
+    wal: Arc<W>,
+    key: BindIdentity,
+    writer: Arc<WalHandle>,
+    index: Option<Arc<dyn RunIndex>>,
+    lock: Arc<Mutex<()>>,
+    plane: &dyn ElicitationPlane,
+    clock: &broca_core::Clock,
+    refusals: &mut RefusalWindows<String>,
+) -> Result<bool, String> {
+    let outcome = service_pass_cancellable(
         wal,
         key,
         writer,
@@ -353,8 +555,17 @@ pub(crate) async fn service_pass<W: WalStore + 'static>(
         plane,
         clock,
         &tokio_util::sync::CancellationToken::new(),
+        refusals,
     )
-    .await
+    .await?;
+    Ok(outcome.empty && outcome.cleanup_error.is_none())
+}
+
+/// How far one owed withdrawal got in a pass.
+enum Attempt {
+    Step(WithdrawalStep),
+    /// The debt's retry window had already run out, so no attempt was made.
+    GaveUp(RefusalWindow),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -367,7 +578,12 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
     plane: &dyn ElicitationPlane,
     clock: &broca_core::Clock,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<bool, String> {
+    refusals: &mut RefusalWindows<String>,
+) -> Result<PassOutcome, String> {
+    const CANCELLED: PassOutcome = PassOutcome {
+        empty: false,
+        cleanup_error: None,
+    };
     let projection = {
         let wal = wal.clone();
         let key = key.clone();
@@ -379,11 +595,17 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
         .map_err(|e| e.to_string())??
     };
     if cancel.is_cancelled() {
-        return Ok(false);
+        return Ok(CANCELLED);
     }
-    for owed in projection.obligations().withdrawals {
+    let withdrawals = projection.obligations().withdrawals;
+    refusals.retain(|call_key| {
+        withdrawals
+            .iter()
+            .any(|owed| &owed.withdrawal.call_key == call_key)
+    });
+    for owed in withdrawals {
         if cancel.is_cancelled() {
-            return Ok(false);
+            return Ok(CANCELLED);
         }
         let WalRecord::ToolCallDeferred {
             batch_id,
@@ -394,10 +616,14 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
         else {
             continue;
         };
+        let call_key = owed.withdrawal.call_key.clone();
         let mut id = owed.withdrawal.elicitation_id;
         if clock.now_ms() >= ask.expires_at_ms {
+            if let Some(window) = refusals.settled(&call_key) {
+                tracing::info!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, "question withdrawal settled after refusals: the question expired");
+            }
             writer.record(WalRecord::QuestionWithdrawalAcknowledged {
-                call_key: owed.withdrawal.call_key,
+                call_key,
                 elicitation_id: id,
                 answer: broca_wal::WithdrawalAnswer::NotSent,
                 reason: Some("expired".into()),
@@ -405,77 +631,95 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
             writer.sync().await.map_err(|e| e.to_string())?;
             continue;
         }
-        let Some(run_id) = projection.calls[&owed.withdrawal.call_key].run_id.clone() else {
-            tracing::warn!(target: "approval", call_key = %owed.withdrawal.call_key, "withdrawal has no originating run; retaining it until expiry");
-            continue;
-        };
-        let ctx = BatchCtx {
-            batch_id: batch_id.clone(),
-            bind: key.clone(),
-            run_id,
-            scope: Some(scope.clone()),
-        };
-        let mut terminal = None;
-        if clock.now_ms() >= ask.expires_at_ms {
-            terminal = Some((broca_wal::WithdrawalAnswer::NotSent, Some("expired".into())));
-        } else if id.is_none() {
-            let filing = tokio::time::timeout(
-                std::time::Duration::from_millis(ask.expires_at_ms.saturating_sub(clock.now_ms()))
-                    .min(std::time::Duration::from_secs(5)),
-                plane.request(
-                    &ctx,
-                    &owed.withdrawal.call_key,
-                    &owed.prepared.record,
-                    clock.now_ms(),
-                ),
-            )
-            .await;
-            match filing {
-                Ok(Ok(filing)) => id = Some(filing.elicitation_id),
-                Ok(Err(error)) if !error.retryable && terminal_refusal(&error.code) => {
-                    terminal = Some((broca_wal::WithdrawalAnswer::NotSent, Some(error.code)))
-                }
-                _ => continue,
+        let attempt = 'attempt: {
+            if let Some(window) = refusals.take_exhausted(&call_key, tokio::time::Instant::now()) {
+                break 'attempt Attempt::GaveUp(window);
             }
-        }
-        if terminal.is_none() {
+            // A debt without its run cannot be serviced. It is held like a refused one, so
+            // it is logged once and given up on at the same limit.
+            let Some(run_id) = projection.calls[&call_key].run_id.clone() else {
+                break 'attempt Attempt::Step(WithdrawalStep::Retry("no_originating_run".into()));
+            };
+            let ctx = BatchCtx {
+                batch_id: batch_id.clone(),
+                bind: key.clone(),
+                run_id,
+                scope: Some(scope.clone()),
+            };
+            let elicitation_id = match &id {
+                Some(known) => known.clone(),
+                None => {
+                    let filing = tokio::time::timeout(
+                        std::time::Duration::from_millis(
+                            ask.expires_at_ms.saturating_sub(clock.now_ms()),
+                        )
+                        .min(std::time::Duration::from_secs(5)),
+                        plane.request(&ctx, &call_key, &owed.prepared.record, clock.now_ms()),
+                    )
+                    .await;
+                    match filing {
+                        Ok(Ok(filing)) => {
+                            id = Some(filing.elicitation_id.clone());
+                            filing.elicitation_id
+                        }
+                        Ok(Err(error)) if !error.retryable => {
+                            break 'attempt Attempt::Step(WithdrawalStep::Settle(
+                                broca_wal::WithdrawalAnswer::NotSent,
+                                Some(error.code),
+                            ))
+                        }
+                        Ok(Err(error)) => {
+                            break 'attempt Attempt::Step(WithdrawalStep::Retry(error.code))
+                        }
+                        Err(_) => {
+                            break 'attempt Attempt::Step(WithdrawalStep::Retry(
+                                "filing_timeout".into(),
+                            ))
+                        }
+                    }
+                }
+            };
             // A slow re-filing can cross the deadline. Never send a withdrawal past it.
             if clock.now_ms() >= ask.expires_at_ms {
-                terminal = Some((broca_wal::WithdrawalAnswer::NotSent, Some("expired".into())));
-            } else if let Some(id) = &id {
-                let withdrawal = tokio::time::timeout(
-                    std::time::Duration::from_millis(
-                        ask.expires_at_ms.saturating_sub(clock.now_ms()),
-                    )
-                    .min(std::time::Duration::from_secs(5)),
-                    plane.withdraw(&ctx, id),
-                )
-                .await;
-                terminal = match withdrawal {
-                    Ok(ApprovalWithdrawal::Acknowledged) => {
-                        Some((broca_wal::WithdrawalAnswer::Acknowledged, None))
-                    }
-                    Ok(ApprovalWithdrawal::NotSent { reason }) if terminal_refusal(&reason) => {
-                        Some((broca_wal::WithdrawalAnswer::NotSent, Some(reason)))
-                    }
-                    Ok(ApprovalWithdrawal::Retry(error))
-                        if !error.retryable && terminal_refusal(&error.code) =>
-                    {
-                        Some((broca_wal::WithdrawalAnswer::NotSent, Some(error.code)))
-                    }
-                    _ => None,
-                };
+                break 'attempt Attempt::Step(WithdrawalStep::Settle(
+                    broca_wal::WithdrawalAnswer::NotSent,
+                    Some("expired".into()),
+                ));
             }
-        }
-        if let Some((answer, reason)) = terminal {
-            writer.record(WalRecord::QuestionWithdrawalAcknowledged {
-                call_key: owed.withdrawal.call_key,
-                elicitation_id: id,
-                answer,
-                reason,
-            });
-            writer.sync().await.map_err(|e| e.to_string())?;
-        }
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_millis(ask.expires_at_ms.saturating_sub(clock.now_ms()))
+                    .min(std::time::Duration::from_secs(5)),
+                plane.withdraw(&ctx, &elicitation_id),
+            )
+            .await;
+            Attempt::Step(withdrawal_step(reply.ok()))
+        };
+        let (answer, reason) = match attempt {
+            Attempt::Step(WithdrawalStep::Settle(answer, reason)) => {
+                if let Some(window) = refusals.settled(&call_key) {
+                    tracing::info!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, reason = reason.as_deref().unwrap_or("withdrawn"), "question withdrawal settled after refusals");
+                }
+                (answer, reason)
+            }
+            Attempt::Step(WithdrawalStep::Retry(code)) => {
+                match refusals.refused(&call_key, &code, tokio::time::Instant::now()) {
+                    Refused::First => {
+                        tracing::warn!(target: "approval", session = %key.session, %call_key, %code, retry_window_s = WITHDRAWAL_RETRY_WINDOW.as_secs(), "question withdrawal refused; retrying quietly until it settles or the retry window ends");
+                        continue;
+                    }
+                    Refused::Retrying => continue,
+                    Refused::Exhausted(window) => give_up(&key, &call_key, &window),
+                }
+            }
+            Attempt::GaveUp(window) => give_up(&key, &call_key, &window),
+        };
+        writer.record(WalRecord::QuestionWithdrawalAcknowledged {
+            call_key,
+            elicitation_id: id,
+            answer,
+            reason,
+        });
+        writer.sync().await.map_err(|e| e.to_string())?;
     }
     // After syncing withdrawal acknowledgements, read the entire WAL again before clearing
     // `withdrawals_owed`. The shared lock prevents a terminal index writer from setting the
@@ -487,9 +731,10 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
         let projection = read_projection(wal.as_ref(), &key, &writer)?;
         let debt = projection.obligations();
         if cancel.is_cancelled() {
-            return Ok(false);
+            return Ok(CANCELLED);
         }
-        let mut cleanup_failed = false;
+        // Only the first failure is kept: the worker logs store failures once, not per run.
+        let mut cleanup_error = None;
         if let Some(index) = index {
             let runs: std::collections::BTreeSet<_> = projection
                 .calls
@@ -505,25 +750,46 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
                 });
                 let row = match index.lookup_run(&run_id) {
                     Ok(row) => row,
-                    Err(error) => { cleanup_failed = true; tracing::warn!(target: "approval", %run_id, "withdrawal index cleanup will retry: {error}"); continue; }
+                    Err(error) => {
+                        cleanup_error.get_or_insert(format!(
+                            "withdrawal index cleanup for run {run_id}: {error}"
+                        ));
+                        continue;
+                    }
                 };
-                if !owed
-                    && row.is_some_and(|row| row.withdrawals_owed && row.state.is_terminal())
-                {
+                if !owed && row.is_some_and(|row| row.withdrawals_owed && row.state.is_terminal()) {
                     if cancel.is_cancelled() {
-                        return Ok(false);
+                        return Ok(CANCELLED);
                     }
                     if let Err(error) = index.index_run_withdrawals_owed(&run_id, false) {
-                        cleanup_failed = true;
-                        tracing::warn!(target: "approval", %run_id, "withdrawal index cleanup will retry: {error}");
+                        cleanup_error.get_or_insert(format!(
+                            "withdrawal index cleanup for run {run_id}: {error}"
+                        ));
                     }
                 }
             }
         }
-        Ok(debt.withdrawals.is_empty() && !cleanup_failed)
+        Ok(PassOutcome {
+            empty: debt.withdrawals.is_empty(),
+            cleanup_error,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Stop retrying one withdrawal and say so once. The debt settles with a durable reason so
+/// the session can close; the card stays visible until it is answered or expires.
+fn give_up(
+    key: &BindIdentity,
+    call_key: &str,
+    window: &RefusalWindow,
+) -> (broca_wal::WithdrawalAnswer, Option<String>) {
+    tracing::warn!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, retry_window_s = WITHDRAWAL_RETRY_WINDOW.as_secs(), "question withdrawal given up; the question stays visible until it is answered or expires");
+    (
+        broca_wal::WithdrawalAnswer::NotSent,
+        Some(WITHDRAWAL_RETRY_EXHAUSTED.into()),
+    )
 }
 
 #[derive(serde::Serialize)]
