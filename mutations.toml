@@ -10257,8 +10257,10 @@ select = "expected"
 test_file = "crates/broca-core/src/wal_fold/tests.rs"
 expect_red = ["wal_fold::tests::moved_sidecar_hides_archived_session_without_restoring_it"]
 file = "crates/broca-core/src/wal_writer.rs"
-old = 'broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;'
-new = '// NON-VACUITY BREAK: expose the archived old copy'
+old = ''') -> Result<WalRangeRead, WalError> {
+        broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;'''
+new = ''') -> Result<WalRangeRead, WalError> {
+        // NON-VACUITY BREAK: expose the archived old copy'''
 
 # This proof checks the following behavior: folds never archive or unlink a WAL held by a pending move
 # intent.
