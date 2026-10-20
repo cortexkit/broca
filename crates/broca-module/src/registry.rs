@@ -2820,32 +2820,9 @@ impl LineageRegistry {
                 .await?;
         }
 
-        // A CONSULTED ARCHIVE MISS IS NOT EVIDENCE OF LOSS BY ITSELF, and treating it as such
-        // inverted this guard the day the tree was folded. Before any fold there is no
-        // `wal-archive/` directory, so nothing is consulted and a brand-new session reads as an
-        // empty page. After one, "no live WAL and no archived member" is the NORMAL state of a
-        // session that has never been written -- so every new session refused its first read,
-        // live in production from 2026-09-13 until this fix, and reported by the one client that
-        // reads before it writes.
-        //
-        // I recorded this exact inversion for `wal_present` while designing the fold ("post-fold
-        // that is the routine case, so the signal inverts") and did not carry it to the read
-        // path. A guard whose population changes when an operator runs a maintenance pass needs
-        // its condition stated in terms that survive the pass.
-        //
-        // The guard itself is real: it stops a materialized prefix from being served as a
-        // complete transcript when the WAL behind it is gone, which is the state 61 production
-        // sessions are in. What it lacked was EVIDENCE THE LINEAGE EVER EXISTED. The store
-        // snapshot is already in hand, so a prefix of zero means nothing durable claims this
-        // session has history and an empty page asserts nothing. A prefix above zero means the
-        // store says there IS history and the log that proves it is unreachable, which is a
-        // genuine failure and stays loud.
-        //
-        // The message deliberately shares NO phrase with the old one. Consumers pattern-match
-        // this prose because there is no wire code that separates "never existed" from "existed
-        // and unreadable" -- that split is mine to add -- and reusing the words here would hand
-        // every such matcher a suppression rule for a real fault. Same collapse at the text
-        // layer that the branch just removed at the code layer.
+        // A missing archived entry alone does not show that session data was lost. Refuse only
+        // when a materialized prefix proves the session has history whose WAL is unreachable;
+        // a zero-length prefix does not establish that history ever existed.
         if tail.archive_lookup_missed() && snapshot.prefix_len > 0 {
             return Err(OpenError::Open(format!(
                 "session {} has {} materialized message(s) but its WAL is unreachable: not live, not archived",

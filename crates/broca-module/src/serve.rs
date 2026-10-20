@@ -617,6 +617,7 @@ impl From<RunToolCallsAnchor> for broca_wal::WalByteAnchor {
 
 /// A continuation resumes at the next call's assistant record, not at the session's WAL head.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RunToolCallsCursor {
     version: u8,
     run_id: String,
@@ -629,6 +630,8 @@ struct RunToolCallsCursor {
     ordinal: u64,
     anchor_before: Option<RunToolCallsAnchor>,
     after_batch: Vec<RunToolCallsPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authentication: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -981,6 +984,62 @@ fn invalid_tool_call_cursor(message: &str) -> ServeError {
     }
 }
 
+/// Sign a cursor so callers can resume only from positions broca actually returned.
+fn run_tool_calls_cursor_authentication(cursor: &RunToolCallsCursor) -> Result<String, ServeError> {
+    use sha2::{Digest, Sha256};
+
+    static KEY: std::sync::OnceLock<Result<[u8; 32], String>> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|error| error.to_string())?;
+        Ok(key)
+    });
+    let key = key.as_ref().map_err(|error| {
+        ServeError::Open(
+            format!("could not initialize run.tool_calls cursor authentication: {error}"),
+            Some(broca_protocol::ErrorClass::Transient),
+        )
+    })?;
+    let mut unsigned = cursor.clone();
+    unsigned.authentication = None;
+    let payload = serde_json::to_vec(&unsigned).map_err(|error| {
+        ServeError::Open(format!("encode run.tool_calls cursor: {error}"), None)
+    })?;
+
+    let mut padded_key = [0u8; 64];
+    padded_key[..key.len()].copy_from_slice(key);
+    let mut inner_pad = padded_key;
+    for byte in &mut inner_pad {
+        *byte ^= 0x36;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(b"broca run.tool_calls cursor v1\0");
+    inner.update(payload);
+    let inner_digest = inner.finalize();
+
+    let mut outer_pad = padded_key;
+    for byte in &mut outer_pad {
+        *byte ^= 0x5c;
+    }
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    Ok(format!("{:x}", outer.finalize()))
+}
+
+fn run_tool_calls_cursor_is_authentic(cursor: &RunToolCallsCursor) -> Result<bool, ServeError> {
+    let Some(provided) = cursor.authentication.as_deref() else {
+        return Ok(false);
+    };
+    let expected = run_tool_calls_cursor_authentication(cursor)?;
+    let mut difference = 0u8;
+    for (left, right) in provided.as_bytes().iter().zip(expected.as_bytes()) {
+        difference |= left ^ right;
+    }
+    Ok(provided.len() == expected.len() && difference == 0)
+}
+
 fn indexed_run_tool_call_position(
     entry: &IndexedRunToolCall,
     range: &broca_wal::WalRangeRead,
@@ -1013,7 +1072,7 @@ fn run_tool_calls_cursor_token(
     run_start_seq: u64,
     run_end_seq: u64,
 ) -> Result<String, ServeError> {
-    let cursor = RunToolCallsCursor {
+    let mut cursor = RunToolCallsCursor {
         version: 1,
         run_id: run_id.to_owned(),
         lineage_id: lineage_id.map(str::to_owned),
@@ -1025,7 +1084,9 @@ fn run_tool_calls_cursor_token(
         ordinal: position.ordinal,
         anchor_before: position.anchor_before,
         after_batch: after_batch.to_vec(),
+        authentication: None,
     };
+    cursor.authentication = Some(run_tool_calls_cursor_authentication(&cursor)?);
     serde_json::to_string(&cursor)
         .map_err(|error| ServeError::Open(format!("encode run.tool_calls cursor: {error}"), None))
 }
@@ -2745,6 +2806,11 @@ impl ServeHandler for crate::LineageRegistry {
                     {
                         return Err(invalid_tool_call_cursor(
                             "run.tool_calls.after is not a cursor returned for this run",
+                        ));
+                    }
+                    if !run_tool_calls_cursor_is_authentic(&cursor)? {
+                        return Err(invalid_tool_call_cursor(
+                            "run.tool_calls.after was not returned for this run",
                         ));
                     }
                     let lineage_id = cursor.lineage_id.clone();

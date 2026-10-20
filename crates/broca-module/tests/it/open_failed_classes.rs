@@ -17,6 +17,14 @@ fn every_open_failed_site_chooses_a_class() {
             "indexed_run_tool_calls: stored result size encoding",
             "None",
         ),
+        (
+            "run_tool_calls_cursor_authentication: entropy unavailable",
+            "Some(broca_protocol::ErrorClass::Transient)",
+        ),
+        (
+            "run_tool_calls_cursor_authentication: cursor encoding",
+            "None",
+        ),
         ("run_tool_calls_cursor_token: cursor encoding", "None"),
         ("From<OpenError>: erased cause", "None"),
         ("From<OpenError>: typed cause", "Some(class)"),

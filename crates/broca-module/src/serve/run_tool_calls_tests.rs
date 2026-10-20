@@ -267,6 +267,37 @@ async fn run_tool_calls_serves_one_oversized_page_item_without_truncating_argume
 }
 
 #[tokio::test]
+async fn run_tool_calls_refuses_a_cursor_that_was_modified_after_issue() {
+    let mut session = ClosedSession::new("modified-cursor");
+    session.write_tool_turn(
+        &[
+            call("call-1", json!({"path":"a"})),
+            call("call-2", json!({"path":"b"})),
+        ],
+        Some(&["one".into(), "two".into()]),
+    );
+    session.finish();
+    session.close_writer();
+
+    let first = session
+        .page(ToolCallsRequest::new("run-1").with_limit(1))
+        .await;
+    let mut cursor: Value = serde_json::from_str(first.next.as_deref().unwrap()).unwrap();
+    cursor["ordinal"] = json!(cursor["ordinal"].as_u64().unwrap() + 1);
+    let error = ServeHandler::run_tool_calls(
+        &session.registry,
+        &session.key,
+        ToolCallsRequest::new("run-1").with_after(serde_json::to_string(&cursor).unwrap()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, ServeError::InvalidParams { ref field, .. } if field == "after"),
+        "modified cursor should be refused by its request field, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn run_tool_calls_reports_intent_without_result_as_indeterminate() {
     let mut session = ClosedSession::new("indeterminate");
     session.write_tool_turn(&[call("held-call", json!({"path":"large.txt"}))], None);

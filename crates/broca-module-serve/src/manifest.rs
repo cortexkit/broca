@@ -35,8 +35,8 @@ pub const OP_SPEND_DELTA: &str = "spend.delta";
 pub const OP_VAULT_AUDIT: &str = "vault.audit";
 /// The held-open stream observability surface.
 pub const OP_SUBSCRIBE: &str = "session.subscribe";
-/// The `llm-runner/v1` role's own ops: what this build serves of the role, a session's head
-/// without bodies, a run's result and tool-call ledger, and a session's frozen baseline.
+/// The `llm-runner/v1` operations broca exposes: role discovery, session head and baseline, run
+/// results and tool-call history, and tag resolution through `session.resolve`.
 pub const OP_ROLE_DESCRIBE: &str = broca_wire::OP_ROLE_DESCRIBE;
 pub const OP_HEAD: &str = broca_wire::OP_SESSION_HEAD;
 pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
