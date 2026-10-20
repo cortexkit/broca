@@ -40,7 +40,7 @@ use broca_protocol::{
     request::{ModelHandle, SubmissionRequest},
     BindIdentity, FinishReason, MessageId, RunId, Usage,
 };
-use broca_wal::{FramedRecord, WalRecord};
+use broca_wal::{FramedRecord, Wal, WalRecord};
 use subc_protocol::session::{
     HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -6677,6 +6677,138 @@ async fn permanent_open_failed_cache_refusal_golden() {
     assert_eq!(
         body,
         include_bytes!("../../../broca-wire/tests/golden/open_failed_permanent.json")
+    );
+    route.finish().await;
+}
+
+/// The refusal body is captured from a real session.read over serve_connection, with
+/// materialized history remaining after both live and archive WAL sources are absent.
+#[tokio::test]
+async fn history_unreachable_refusal_golden_from_real_serve() {
+    let mut route = PreparedWalRoute::start("history-unreachable", |wal_path| {
+        let dir = wal_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("the WAL lives below the rig directory");
+        let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+        std::fs::remove_file(wal_path).expect("replace the helper's incidental WAL");
+        let wal_store = FileWalStore::new(dir.join("wal"));
+        let mut wal = broca_wal::FileWal::open(wal_store.wal_path(&session))
+            .expect("create a WAL whose history can be projected");
+        wal.append(
+            1,
+            &WalRecord::RunStarted {
+                tags: None,
+                session_class: None,
+                retention: None,
+                hooks: None,
+                title: None,
+                on_restart: None,
+                keep_warm: None,
+                marker_order_version: None,
+                manifest: None,
+                scope: None,
+                send_id: None,
+                request_identity_digest: None,
+                project_id: None,
+                principal: None,
+                run_id: RunId("history-unreachable".into()),
+                session: session.clone(),
+                ts_ms: None,
+                config: Box::new(min_config()),
+                input: vec![Message::new(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: "history that must not be truncated".into(),
+                    }],
+                )]
+                .into(),
+                origin: broca_wal::RunOrigin::Fresh,
+                submission_id: None,
+            },
+            true,
+        )
+        .expect("write the session start");
+        wal.append(
+            1,
+            &WalRecord::ModelStepFinished {
+                tags: None,
+                hooks: None,
+                step_id: broca_protocol::StepId(1),
+                assistant_message: (AssistantMessage {
+                    message_id: MessageId("history-answer".into()),
+                    content: vec![ContentBlock::Text {
+                        text: "projected answer".into(),
+                    }],
+                })
+                .into(),
+                usage: Usage::default(),
+                finish_reason: Some(FinishReason::Stop),
+                retries_used: 0,
+                service_tier_used: None,
+                speed_used: None,
+            },
+            true,
+        )
+        .expect("write the completed step");
+        wal.append(
+            1,
+            &WalRecord::RunFinished {
+                reason: RunFinishReason::Completed,
+                ts_ms: None,
+                usage: Usage::default(),
+                error: None,
+                retries_used: 0,
+            },
+            true,
+        )
+        .expect("write the session terminal");
+        drop(wal);
+
+        let records = wal_store
+            .read_records(&session)
+            .expect("read the seeded history");
+        let store = broca_store::SqliteStore::open(dir.join("store.db"))
+            .expect("open the registry's materialized store");
+        store
+            .project(&session, &records)
+            .expect("materialize the session history");
+        assert!(
+            store
+                .read_prefix_with_watermark(&session)
+                .unwrap()
+                .watermark_seq
+                > 0,
+            "the wire refusal requires persisted history"
+        );
+        std::fs::remove_file(wal_store.wal_path(&session)).expect("remove the live WAL");
+    })
+    .await;
+    let body = route.expect_error(2, read_request()).await;
+    let session = BindIdentity::new(route.dir.join("proj"), "runner", "s1");
+    let session_addr = broca_core::session_addr(&session);
+    let session_ref = broca_core::agent_session_ref(&session);
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("error response JSON");
+    assert_eq!(value["code"], "history_unreachable");
+    assert_eq!(value["detail"]["class"], "permanent");
+    assert_eq!(value["detail"]["session_ref"], session_ref);
+    assert_eq!(value["detail"].as_object().unwrap().len(), 2);
+    assert!(value["message"].as_str().unwrap().contains(&session_addr));
+    let normalized = String::from_utf8(body)
+        .expect("UTF-8 error response")
+        .replace(&session_addr, "@SESSION_ADDR@")
+        .replace(&session_ref, "@SESSION_REF@");
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/session_read.history_unreachable.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden, &normalized).expect("write the served refusal bytes");
+    }
+    let pinned = std::fs::read(&golden)
+        .unwrap_or_else(|error| panic!("read golden {}: {error}", golden.display()));
+    assert_eq!(
+        normalized.as_bytes(),
+        pinned,
+        "the real serve refusal bytes pinned in the golden"
     );
     route.finish().await;
 }

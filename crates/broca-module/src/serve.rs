@@ -732,6 +732,11 @@ pub enum ServeError {
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
     Open(String, Option<broca_protocol::ErrorClass>),
+    /// The store proves history exists, but neither live nor archived WAL can cover it.
+    HistoryUnreachable {
+        session_ref: String,
+        reason: String,
+    },
     /// A whole message or model-view atomic group would exceed one encoded subc frame.
     ReplyTooLarge(ReplyTooLargeDetail),
     /// The session's WAL holds a frame that requires WAL features this build does not know
@@ -841,6 +846,13 @@ impl From<OpenError> for ServeError {
             // Legacy open errors erased the cause; do not infer retryability from text.
             OpenError::Open(s) => ServeError::Open(s, None),
             OpenError::Classified { reason, class } => ServeError::Open(reason, Some(class)),
+            OpenError::HistoryUnreachable {
+                session_ref,
+                reason,
+            } => ServeError::HistoryUnreachable {
+                session_ref,
+                reason,
+            },
             OpenError::NewerWriter { missing, reason } => {
                 ServeError::WalNewerWriter { missing, reason }
             }
@@ -859,7 +871,9 @@ impl std::fmt::Display for ServeError {
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
             ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
-            ServeError::Open(s, _) | ServeError::WalNewerWriter { reason: s, .. } => {
+            ServeError::Open(s, _)
+            | ServeError::HistoryUnreachable { reason: s, .. }
+            | ServeError::WalNewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
             ServeError::ReplyTooLarge(_) => {

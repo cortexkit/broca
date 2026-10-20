@@ -1,0 +1,1 @@
+{"code":"history_unreachable","message":"open failed: session @SESSION_ADDR@ has materialized history (watermark 2; messages 2) but its WAL is unreachable: not live, not archived","detail":{"class":"permanent","session_ref":"@SESSION_REF@"}}
