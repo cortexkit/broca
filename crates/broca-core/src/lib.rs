@@ -117,8 +117,8 @@ pub use replay::{
     ReplayState, RunUsageProjection,
 };
 pub use resume::{
-    close_out_open_batch, not_dispatched_result, outcome_unknown_result, resume_started_record,
-    DeferredCloseKind,
+    close_out_open_batch, close_out_pending_turn, not_dispatched_result, outcome_unknown_result,
+    resume_started_record, DeferredCloseKind,
 };
 pub use retention::{is_retention_lineage, LineageRetention};
 pub use scope_admission::{
