@@ -454,6 +454,8 @@ fn repairable_import_prefix(
             | WalRecord::CompactionAnswer { .. }
             | WalRecord::CompactionWait { .. }
             | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::ContextCeilingWait { .. }
+            | WalRecord::ContextCeilingDecided { .. }
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational too, so it neither makes nor breaks a
             // repairable import prefix.

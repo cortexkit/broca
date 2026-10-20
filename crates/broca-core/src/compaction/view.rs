@@ -49,6 +49,10 @@ impl AppliedView {
 /// anything new to say.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Announced {
+    #[serde(default)]
+    pub est_tokens: Option<u64>,
+    #[serde(default)]
+    pub window: Option<u64>,
     pub lineage_id: Option<String>,
     pub through_ordinal: Option<u64>,
     pub applied_view_version: Option<u64>,
@@ -59,6 +63,8 @@ impl Announced {
     pub(crate) fn from_headers(map: &BTreeMap<String, String>) -> Self {
         let number = |name: &str| map.get(name).and_then(|value| value.parse().ok());
         Self {
+            est_tokens: number(headers::EST_TOKENS),
+            window: number(headers::WINDOW),
             lineage_id: map.get(headers::LINEAGE_ID).cloned(),
             through_ordinal: number(headers::THROUGH_ORDINAL),
             applied_view_version: number(headers::APPLIED_VIEW_VERSION),

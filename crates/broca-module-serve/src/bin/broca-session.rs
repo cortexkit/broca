@@ -1163,7 +1163,8 @@ impl<'a> RunTurnTracker<'a> {
             Some(
                 RunFinishReason::Completed
                 | RunFinishReason::MaxSteps
-                | RunFinishReason::BudgetExhausted,
+                | RunFinishReason::BudgetExhausted
+                | RunFinishReason::ContextCeiling,
             ) => 0,
             Some(
                 RunFinishReason::Interrupted

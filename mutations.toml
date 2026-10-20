@@ -17644,21 +17644,26 @@ test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically", "compaction::tests::an_announced_view_is_fetched_at_the_step_boundary_and_applied"]
 only = false
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = ".filter(|ready| views.declined != Some(ready.view_version))"
-new = ".filter(|_ready| false) // NON-VACUITY BREAK: never fetch an announced view"
+old = ".newest_ready(session_ref, lineage_id, current)\n            .filter(|ready| views.declined != Some(ready.view_version))"
+new = ".newest_ready(session_ref, lineage_id, current)\n            .filter(|_ready| false) // NON-VACUITY BREAK: never fetch an announced view"
 
 [[control]]
 id = "compaction-run-loop-records-the-boundary-notice"
-guards = "the run loop records an advance notice at the step boundary, durable before the model call"
+guards = "the pre-wait and post-wait notice fences jointly ensure the boundary notice is durable before the model call"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
 only = false
+[[control.edits]]
 file = "crates/broca-core/src/run.rs"
-old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            // Never send over"
-new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no boundary notice\n            }\n            // Never send over"
+old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            state.history = compaction_history.clone();"
+new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no pre-wait notice\n            }\n            state.history = compaction_history.clone();"
+[[control.edits]]
+file = "crates/broca-core/src/run.rs"
+old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            if ceiling_detail.is_some()"
+new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no post-wait notice\n            }\n            if ceiling_detail.is_some()"
 
 [[control]]
 id = "compaction-run-loop-decides-over-the-rendered-prompt"
@@ -17669,8 +17674,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends"]
 file = "crates/broca-core/src/run.rs"
-old = "                &opts.prompt,\n                raw,\n                provider.reasoning_is_prefix_bound(),"
-new = "                raw, // NON-VACUITY BREAK: decide over the raw copy\n                raw,\n                provider.reasoning_is_prefix_bound(),"
+old = "                    &opts.prompt,\n                    raw,\n                    provider.reasoning_is_prefix_bound(),"
+new = "                    raw, // NON-VACUITY BREAK: decide over the raw copy\n                    raw,\n                    provider.reasoning_is_prefix_bound(),"
 
 [[control]]
 id = "compaction-notice-floor-across-lineages"
@@ -17757,9 +17762,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::a_request_over_the_window_is_refused_before_it_is_sent"]
 file = "crates/broca-core/src/run.rs"
-old = '''terminal_error = Some(crate::compaction::runtime::context_ceiling_error(&detail));
-                break RunFinishReason::Error;'''
-new = 'let _ = detail; // NON-VACUITY BREAK: send over the window'
+old = "if ceiling_detail.is_some() {"
+new = "if false && ceiling_detail.is_some() { // NON-VACUITY BREAK: send over the window"
 
 [[control]]
 id = "compaction-boundary-fetches-the-announced-version"
@@ -17915,3 +17919,263 @@ expect_red = ["compaction_routes::view_get_and_ride_use_the_role_route_and_only_
 file = "crates/broca-subc/src/compaction_plane.rs"
 old = '&OpRequest::new(ops::COMPACTION_RIDE, &request),'
 new = '&OpRequest::new(ops::VIEW_GET, &request), // NON-VACUITY BREAK'
+
+[[control]]
+id = "ceiling-boundary-fetch-backoff"
+guards = "unavailable view.get does not spend another call budget at the next ordinary step boundary"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::unavailable_view_get_is_not_retried_at_every_boundary"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "_ if self.now() < views.unavailable_until => return Ok(events),"
+new = "_ if false && self.now() < views.unavailable_until => return Ok(events), // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-run-loop-waits-before-model-io"
+guards = "a reached Setup ceiling rides and applies a fitting view before sending the model request"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_ceiling_ride_applies_a_view_before_sending"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "let decision = view::before_send(policy.as_ref(), estimate(state)?, window);"
+new = "let decision = view::BeforeSend::Send; // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-ride-uses-the-remaining-policy-bound"
+guards = "the ceiling ride receives the remaining Setup wait rather than the ordinary call budget"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_ceiling_ride_applies_a_view_before_sending"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "let request = view::ceiling_ride(session_ref, remaining, None);"
+new = "let request = view::ceiling_ride(session_ref, 1, None); // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-bound-refuses-still-at-ceiling"
+guards = "expiration refuses a request still at the ceiling even when inside the window"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_ceiling_wait_is_active_until_its_bound_then_terminal_without_a_provider_error"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = ".err();"
+new = ".err().filter(|_| false); // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-unavailable-cause-is-not-a-model-error"
+guards = "the durable terminal distinguishes an unreachable ceiling provider from an available provider with no fitting view"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_ceiling_wait_is_active_until_its_bound_then_terminal_without_a_provider_error"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "if unavailable == Some(true) {"
+new = "if false && unavailable == Some(true) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-fetch-bypasses-boundary-backoff"
+guards = "a ceiling wait can fetch a newly available view despite an ordinary-boundary fetch failure"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::the_ceiling_fetch_bypasses_the_unavailable_boundary_backoff"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "fetched = self.view_get(&ready) => fetched,"
+new = "fetched = async { Fetch::Unavailable } => fetched, // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-recovery-honors-terminal-decision"
+guards = "a durable terminal ceiling decision resumes without sending a model request"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_recorded_ceiling_terminal_decision_resumes_without_model_io_at_every_cut"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "return Ok(detail.clone());"
+new = "return Ok(None); // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-wait-recovery-retains-deadline"
+guards = "a ceiling wait cut before its view applies retains its original deadline instead of expiring early and losing the request"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_recorded_ceiling_wait_resumes_the_same_fitting_request_at_every_cut"]
+file = "crates/broca-core/src/compaction.rs"
+old = "deadline_ms: *deadline_ms,"
+new = "deadline_ms: 0, // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-cancel-and-shutdown-interrupt-the-ride"
+guards = "cancellation and module shutdown end the ceiling wait without a model call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::cancellation_and_shutdown_stop_a_ceiling_ride_without_sending"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "Some(token) => token.cancelled().await,"
+new = "Some(_token) => std::future::pending().await, // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-terminal-is-not-error"
+guards = "a runner over-window refusal ends the run in its own context_ceiling state, never Error"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_request_over_the_window_is_refused_before_it_is_sent"]
+file = "crates/broca-core/src/run.rs"
+old = "break RunFinishReason::ContextCeiling;"
+new = "break RunFinishReason::Error; // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-send-receipt-gate"
+guards = "a joining steer at the ceiling is refused before recording anything, while idle sends are also refused"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::context_ceiling_receipt_refuses_idle_start_and_joining_steer_without_writes"]
+file = "crates/broca-module/src/actor.rs"
+old = "&& has_compaction"
+new = "&& false && has_compaction // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-queue-drain-holds-before-admission"
+guards = "an accepted queue head stays pending and writes no failed-admission or run records while held at the ceiling"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::a_ceiling_held_queue_head_stays_pending_without_writes_and_wakes_after_a_view"]
+file = "crates/broca-module/src/actor.rs"
+old = "if !cancel_before_execute && !resuming {"
+new = "if false && !cancel_before_execute && !resuming { // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-view-wakes-pending-drain"
+guards = "a recorded view and updated estimate refresh the held queue's admission snapshot and retry its drain"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::a_ceiling_held_queue_head_stays_pending_without_writes_and_wakes_after_a_view"]
+file = "crates/broca-module/src/actor.rs"
+old = "LineageCmd::CompactionChanged => {\n                self.prior_snapshot = None;\n                if matches!(self.state, RunState::Idle) {"
+new = "LineageCmd::CompactionChanged => {\n                self.prior_snapshot = None;\n                if false && matches!(self.state, RunState::Idle) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-wal-records-must-understand"
+guards = "wait/decision records and the new terminal cannot be read by a build that does not understand context-ceiling/v1"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::ceiling_records_and_terminal_require_a_named_reader_gate"]
+file = "crates/broca-wal/src/record.rs"
+old = "&[crate::framing::CONTEXT_CEILING_FEATURE]"
+new = "&[] /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "ceiling-status-reports-active-wait-reason"
+guards = "status reports the bounded wait as active with reason and deadline, not as an ordinary active run or a pause"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::context_ceiling_tests::a_ceiling_wait_status_is_active_with_reason_and_absolute_deadline"]
+file = "crates/broca-module/src/serve.rs"
+old = "reason: state\n                .ceiling_deadline_ms\n                .map(|_| \"context_ceiling_wait\".into()),"
+new = "reason: None, // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-live-status-reads-wait-deadline"
+guards = "the live actor does not hide a durable ceiling wait behind its ordinary Active fast path"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::live_actor_status_reads_the_ceiling_wait_and_clears_it_after_the_decision"]
+file = "crates/broca-module/src/actor.rs"
+old = "                    ceiling_deadline_ms,\n                    structured_output: None,"
+new = "                    ceiling_deadline_ms: None, // NON-VACUITY BREAK\n                    structured_output: None,"
+
+[[control]]
+id = "ceiling-notice-reestimates-the-fitting-view"
+guards = "a fitting ceiling view is acknowledged and later send admission sees its smaller estimate rather than Setup's large request"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_ceiling_ride_applies_a_view_before_sending"]
+file = "crates/broca-core/src/run.rs"
+old = "notice_request_bytes = provider.render_request(&view).len();\n            if let Some(notice)"
+new = "// NON-VACUITY BREAK: keep the estimate from before the ceiling view\n            if let Some(notice)"
+
+[[control]]
+id = "ceiling-terminal-status-keeps-detail"
+guards = "terminal status preserves the durable window size and cause without turning the runner refusal into a provider error"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::context_ceiling_tests::a_ceiling_terminal_status_carries_detail_without_a_provider_error"]
+file = "crates/broca-module/src/serve.rs"
+old = "context_ceiling: state\n                .context_ceiling\n                .expect(\"ceiling terminal retains its durable detail\"),"
+new = "context_ceiling: broca_protocol::ContextCeilingDetail::new(0, 0, \"view_timeout\"), // NON-VACUITY BREAK"
+
+[[control]]
+id = "ceiling-fitting-view-lowers-calibrated-estimate"
+guards = "a smaller view can lower an estimate calibrated by a previous model response instead of retaining an unrecoverable ceiling floor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
+expect_red = ["compaction::tests::ceiling_tests::a_smaller_view_can_lower_a_usage_calibrated_request_estimate"]
+file = "crates/broca-core/src/compaction.rs"
+old = "if rendered_bytes < bytes {"
+new = "if false && rendered_bytes < bytes { // NON-VACUITY BREAK"

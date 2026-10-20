@@ -3273,6 +3273,14 @@ async fn send_serve_error(
         ServeError::BaselineRequired => "baseline_required",
         ServeError::CapUnavailable(_) => "cap_unavailable",
         ServeError::BudgetDenied { .. } => "budget_denied",
+        ServeError::ContextCeiling(detail) => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::CONTEXT_CEILING,
+                err.to_string(),
+            )
+            .with_detail(serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?);
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::Import(_) => "import_rejected",
         ServeError::ImportIdReuse => "import_id_reuse",
         ServeError::ImportBusy => "import_busy",
@@ -4606,6 +4614,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            context_ceiling: None,
             usage: Default::default(),
             detail: None,
             run_id: "run".into(),

@@ -213,6 +213,8 @@ pub struct RunResultResponse {
     pub usage: broca_protocol::usage::RunUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<broca_protocol::BudgetExhaustedDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
     pub run_id: String,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

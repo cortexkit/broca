@@ -355,6 +355,7 @@ pub enum RunIndexState {
     Completed,
     MaxSteps,
     BudgetExhausted,
+    ContextCeiling,
     Cancelled,
     Error,
     /// The prompt-reduction transform was unreachable, so the turn could not render. A
@@ -377,6 +378,7 @@ impl RunIndexState {
             RunIndexState::Completed => "completed",
             RunIndexState::MaxSteps => "max_steps",
             RunIndexState::BudgetExhausted => "budget_exhausted",
+            RunIndexState::ContextCeiling => "context_ceiling",
             RunIndexState::Cancelled => "cancelled",
             RunIndexState::Error => "error",
             RunIndexState::TransformUnavailable => "transform_unavailable",
@@ -392,6 +394,7 @@ impl RunIndexState {
             "completed" => RunIndexState::Completed,
             "max_steps" => RunIndexState::MaxSteps,
             "budget_exhausted" => RunIndexState::BudgetExhausted,
+            "context_ceiling" => RunIndexState::ContextCeiling,
             "cancelled" => RunIndexState::Cancelled,
             "error" => RunIndexState::Error,
             "transform_unavailable" => RunIndexState::TransformUnavailable,
@@ -663,6 +666,7 @@ pub enum SessionReadStateKind {
     Completed,
     MaxSteps,
     BudgetExhausted,
+    ContextCeiling,
     Cancelled,
     Error,
     TransformUnavailable,
@@ -678,6 +682,7 @@ impl SessionReadStateKind {
             SessionReadStateKind::Completed => "completed",
             SessionReadStateKind::MaxSteps => "max_steps",
             SessionReadStateKind::BudgetExhausted => "budget_exhausted",
+            SessionReadStateKind::ContextCeiling => "context_ceiling",
             SessionReadStateKind::Cancelled => "cancelled",
             SessionReadStateKind::Error => "error",
             SessionReadStateKind::TransformUnavailable => "transform_unavailable",
@@ -688,6 +693,7 @@ impl SessionReadStateKind {
 /// Why the returned lineage state reached the reported state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionReadReason {
+    ContextCeilingWait,
     Terminal(RunFinishReason),
     Pause(PauseReason),
 }
@@ -695,9 +701,11 @@ pub enum SessionReadReason {
 impl SessionReadReason {
     pub fn as_str(self) -> &'static str {
         match self {
+            SessionReadReason::ContextCeilingWait => "context_ceiling_wait",
             SessionReadReason::Terminal(RunFinishReason::Completed) => "completed",
             SessionReadReason::Terminal(RunFinishReason::MaxSteps) => "max_steps",
             SessionReadReason::Terminal(RunFinishReason::BudgetExhausted) => "budget_exhausted",
+            SessionReadReason::Terminal(RunFinishReason::ContextCeiling) => "context_ceiling",
             SessionReadReason::Terminal(RunFinishReason::Cancelled) => "cancelled",
             SessionReadReason::Terminal(RunFinishReason::Interrupted) => "interrupted",
             SessionReadReason::Terminal(RunFinishReason::Error) => "error",
@@ -1396,6 +1404,20 @@ fn lineage_state_from_replay_and_records(
         };
     }
 
+    if replay.compaction.state().is_some_and(|state| {
+        matches!(
+            state.ceiling_check,
+            Some(crate::compaction::CeilingCheck::Waiting { .. })
+        )
+    }) {
+        return SessionReadLineageState {
+            last_run_id: replay.run_id.clone(),
+            state: SessionReadStateKind::Active,
+            reason: Some(SessionReadReason::ContextCeilingWait),
+            error: None,
+            usage: None,
+        };
+    }
     match &replay.resolution {
         crate::ReplayResolution::LineageIdle { last_reason } => {
             let terminal = last_terminal_for_run(framed, replay.run_id.as_ref());
@@ -1476,6 +1498,7 @@ fn state_for_terminal(reason: RunFinishReason) -> SessionReadStateKind {
         RunFinishReason::Completed => SessionReadStateKind::Completed,
         RunFinishReason::MaxSteps => SessionReadStateKind::MaxSteps,
         RunFinishReason::BudgetExhausted => SessionReadStateKind::BudgetExhausted,
+        RunFinishReason::ContextCeiling => SessionReadStateKind::ContextCeiling,
         RunFinishReason::Cancelled => SessionReadStateKind::Cancelled,
         RunFinishReason::Interrupted => SessionReadStateKind::Interrupted,
         RunFinishReason::Error => SessionReadStateKind::Error,

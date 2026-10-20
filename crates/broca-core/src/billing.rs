@@ -802,6 +802,8 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         | WalRecord::CompactionAnswer { .. }
         | WalRecord::CompactionWait { .. }
         | WalRecord::CompactionViewApplied { .. }
+        | WalRecord::ContextCeilingDecided { .. }
+        | WalRecord::ContextCeilingWait { .. }
         | WalRecord::CompactionNotice { .. } => None,
         // Provider attempt evidence is informational only; it never carries config.
         WalRecord::ModelAttemptFinished { .. } => None,

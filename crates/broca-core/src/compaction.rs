@@ -125,6 +125,9 @@ pub struct OpenCompactionWait {
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactionState {
+    /// The current step's wait or completed decision. Folded before any request can be sent.
+    #[serde(default)]
+    pub ceiling_check: Option<CeilingCheck>,
     pub history: CompactionHistory,
     pub provider: String,
     /// The `call_when` schedule a `compaction.setup` answer of the removed synchronous client
@@ -160,6 +163,44 @@ pub struct CompactionState {
     pub unannounced: Vec<String>,
 }
 impl CompactionState {
+    /// Send admission uses the last durable request estimate plus the new native messages,
+    /// as closing notices do. It does not call the compaction provider or mutate the session.
+    /// A window override is checked afresh rather than reusing a previous terminal's detail.
+    pub fn send_ceiling(
+        &self,
+        input: &[Message],
+        window: Option<u64>,
+        model: &broca_protocol::ModelHandle,
+    ) -> Option<broca_protocol::ContextCeilingDetail> {
+        if window.is_none()
+            && self
+                .history
+                .current_model
+                .as_ref()
+                .is_some_and(|current| current != model)
+        {
+            return None;
+        }
+        let announced = self.announced.as_ref()?;
+        let window = window.or(announced.window)?;
+        let bytes: usize = input
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .map(|m| serde_json::to_vec(m).map_or(0, |b| b.len()))
+            .sum();
+        let size = announced
+            .est_tokens?
+            .saturating_add(estimate_tokens(bytes, None));
+        match view::before_send(view::ceiling_policy(self).as_ref(), size, Some(window)) {
+            view::BeforeSend::Send => None,
+            view::BeforeSend::Refuse(detail) => Some(detail),
+            view::BeforeSend::Pause => Some(broca_protocol::ContextCeilingDetail::new(
+                window,
+                size,
+                crate::compaction_provider::ceiling::context_ceiling_causes::VIEW_TIMEOUT,
+            )),
+        }
+    }
     pub fn capture_thinking_boundary(&mut self, record: &WalRecord, prefix_len: u64) {
         if matches!(record, WalRecord::CompactionMessage { .. }) {
             if let Some(applied) = &mut self.applied {
@@ -185,6 +226,24 @@ impl CompactionState {
     pub fn fold(&mut self, record: &WalRecord) {
         self.history.fold(record);
         match record {
+            WalRecord::RunStarted { .. } => self.ceiling_check = None,
+            WalRecord::ContextCeilingWait {
+                step_id,
+                deadline_ms,
+                unavailable,
+            } => {
+                self.ceiling_check = Some(CeilingCheck::Waiting {
+                    step_id: *step_id,
+                    deadline_ms: *deadline_ms,
+                    unavailable: *unavailable,
+                });
+            }
+            WalRecord::ContextCeilingDecided { step_id, detail } => {
+                self.ceiling_check = Some(CeilingCheck::Decided {
+                    step_id: *step_id,
+                    detail: detail.clone(),
+                });
+            }
             WalRecord::CompactionRequest { provider, .. } => {
                 self.provider.clone_from(provider);
             }
@@ -272,11 +331,27 @@ impl CompactionState {
                 self.unannounced.clear();
             }
             WalRecord::RunFinished { .. } => {
+                if matches!(self.ceiling_check, Some(CeilingCheck::Waiting { .. })) {
+                    self.ceiling_check = None;
+                }
                 self.open_wait = None;
             }
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CeilingCheck {
+    Waiting {
+        step_id: broca_protocol::StepId,
+        deadline_ms: u64,
+        unavailable: Option<bool>,
+    },
+    Decided {
+        step_id: broca_protocol::StepId,
+        detail: Option<broca_protocol::ContextCeilingDetail>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -708,7 +783,15 @@ pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) ->
     let convert = |bytes: usize| (bytes as u64).div_ceil(ESTIMATE_BYTES_PER_TOKEN);
     previous.map_or_else(
         || convert(rendered_bytes),
-        |(input, bytes)| input.saturating_add(convert(rendered_bytes.saturating_sub(bytes))),
+        |(input, bytes)| {
+            if rendered_bytes < bytes {
+                // A new view can shrink the request. Scale the measured input down with its
+                // rendered size instead of keeping the old request's token count as a floor.
+                (u128::from(input) * rendered_bytes as u128).div_ceil(bytes as u128) as u64
+            } else {
+                input.saturating_add(convert(rendered_bytes.saturating_sub(bytes)))
+            }
+        },
     )
 }
 

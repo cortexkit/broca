@@ -4366,21 +4366,37 @@ where
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
             // view with `view.get`; either is offered here, at the boundary, and recorded before
             // the request renders.
-            let view_events = Box::pin(runtime.views_at_boundary(
-                &mut boundary_views,
-                state,
-                control.compaction_views.as_deref(),
-                &session_ref,
-                &lineage_id,
-                &cfg.model.model_id,
-                // The prompt the request renders from, so the decision sees the bytes
-                // the model is sent (tags and loop guidance included); and the stored
-                // copy, against which the view's own bytes are judged.
-                &opts.prompt,
-                raw,
-                provider.reasoning_is_prefix_bound(),
-            ))
-            .await?;
+            let recovering_ceiling =
+                state
+                    .ceiling_check
+                    .as_ref()
+                    .is_some_and(|check| match check {
+                        crate::compaction::CeilingCheck::Waiting {
+                            step_id: checked, ..
+                        }
+                        | crate::compaction::CeilingCheck::Decided {
+                            step_id: checked, ..
+                        } => *checked == step_id,
+                    });
+            let view_events = if recovering_ceiling {
+                Vec::new()
+            } else {
+                Box::pin(runtime.views_at_boundary(
+                    &mut boundary_views,
+                    state,
+                    control.compaction_views.as_deref(),
+                    &session_ref,
+                    &lineage_id,
+                    &cfg.model.model_id,
+                    // The prompt the request renders from, so the decision sees the bytes
+                    // the model is sent (tags and loop guidance included); and the stored
+                    // copy, against which the view's own bytes are judged.
+                    &opts.prompt,
+                    raw,
+                    provider.reasoning_is_prefix_bound(),
+                ))
+                .await?
+            };
             let view = crate::compaction::model_options(&opts, state)
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = provider.render_request(&view).len();
@@ -4393,7 +4409,7 @@ where
                 state,
                 raw,
                 crate::compaction::view::NoticeFacts {
-                    session_ref,
+                    session_ref: session_ref.clone(),
                     lineage_id: &lineage_id,
                     est_tokens: estimate,
                     model: &cfg.model.model_id,
@@ -4405,19 +4421,53 @@ where
             ) {
                 runtime.record_notice(state, notice).await?;
             }
-            // Never send over the model's context window. The notice above already told the
-            // provider how large the request is, so a view can follow. A request that only
-            // reached Setup's ceiling, still inside the window, is sent: broca does not yet
-            // pause there to wait for a view.
-            if let crate::compaction::view::BeforeSend::Refuse(detail) =
-                crate::compaction::view::before_send(
-                    crate::compaction::view::ceiling_policy(state).as_ref(),
-                    estimate,
-                    context_limit,
-                )
-            {
-                terminal_error = Some(crate::compaction::runtime::context_ceiling_error(&detail));
-                break RunFinishReason::Error;
+            state.history = compaction_history.clone();
+            let ceiling_detail = Box::pin(runtime.ceiling_before_request(
+                &mut boundary_views,
+                state,
+                &session_ref,
+                &lineage_id,
+                step_id,
+                &resolved_run_id,
+                out,
+                &opts,
+                raw,
+                provider,
+                context_limit,
+            ))
+            .await?;
+            // A ceiling ride or a view-ready notification may have changed the durable view.
+            let view = crate::compaction::model_options(&opts, state)
+                .map_err(|error| RunError::Wal(error.to_string()))?;
+            notice_request_bytes = provider.render_request(&view).len();
+            if let Some(notice) = crate::compaction::view::next_notice(
+                state,
+                raw,
+                crate::compaction::view::NoticeFacts {
+                    session_ref,
+                    lineage_id: &lineage_id,
+                    est_tokens: crate::compaction::request_estimate(
+                        notice_request_bytes,
+                        &compaction_history,
+                    )
+                    .0,
+                    model: &cfg.model.model_id,
+                    window: context_limit,
+                    usage: compaction_history.usage(),
+                    events: Vec::new(),
+                    seq_floor: compaction_notice_floor,
+                },
+            ) {
+                runtime.record_notice(state, notice).await?;
+            }
+            if ceiling_detail.is_some() {
+                break RunFinishReason::ContextCeiling;
+            }
+            if is_cancelled(control) || boundary_cancelled(control) {
+                break RunFinishReason::Cancelled;
+            }
+            if stop_is_requested(control.stop_requested.as_ref()) {
+                break RunFinishReason::Interrupted;
             }
             model_opts = Some(Arc::new(view));
             #[cfg(feature = "test-clock")]

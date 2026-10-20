@@ -405,6 +405,7 @@ fn tag(u: &ControlUnit) -> &'static str {
         ControlUnit::Paused { .. } => "Paused",
         ControlUnit::Error { .. } => "Error",
         ControlUnit::DisplayReset => "DisplayReset",
+        ControlUnit::ContextCeilingWait { .. } => "ContextCeilingWait",
         ControlUnit::ApprovalRequest { .. } => "ApprovalRequest",
     }
 }

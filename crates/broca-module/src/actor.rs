@@ -224,6 +224,9 @@ pub enum LineageCmd {
     },
     /// The idle-TTL timer fired — consider closing.
     IdleTick,
+    /// A durable compaction view/notice or effective model-window change may unblock the
+    /// pending head. Refresh its admission snapshot before trying the drain again.
+    CompactionChanged,
     /// Test-only: report the entry count and serialized size of the admission identity cache.
     #[cfg(test)]
     RetainedAdmissionIdentityState {
@@ -261,6 +264,7 @@ pub enum SendOutcome {
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
     InputTokenBudgetInvalid(String),
+    ContextCeiling(broca_protocol::ContextCeilingDetail),
     /// The send's `structured_output` was refused before anything was written; `field` is the
     /// offending member path the role contract names.
     StructuredOutputInvalid {
@@ -514,11 +518,23 @@ pub(crate) fn indexed_run_state(
     {
         return Err("budget_exhausted detail is unavailable from the durable WAL".into());
     }
+    if row.state == RunIndexState::ContextCeiling
+        && reconciled
+            .as_ref()
+            .and_then(|state| state.context_ceiling.as_ref())
+            .is_none()
+    {
+        return Err("context_ceiling detail is unavailable from the durable WAL".into());
+    }
     // Interrupted and legacy rows do not store enough terminal metadata; the WAL
     // also carries steer receipts, error causes and structured-output results.
     let use_index_metadata = row.usage.is_some() && row.state != RunIndexState::Interrupted;
     let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
     Ok(Some(ReconciledRunState {
+        context_ceiling: reconciled
+            .as_ref()
+            .and_then(|state| state.context_ceiling.clone()),
+        ceiling_deadline_ms: None,
         run_usage: reconciled
             .as_ref()
             .map(|state| state.run_usage.clone())
@@ -600,6 +616,7 @@ fn indexed_finish_reason(state: &RunIndexState) -> Option<broca_protocol::RunFin
         RunIndexState::Interrupted => Some(RunFinishReason::Interrupted),
         RunIndexState::MaxSteps => Some(RunFinishReason::MaxSteps),
         RunIndexState::BudgetExhausted => Some(RunFinishReason::BudgetExhausted),
+        RunIndexState::ContextCeiling => Some(RunFinishReason::ContextCeiling),
         RunIndexState::Cancelled => Some(RunFinishReason::Cancelled),
         RunIndexState::Error => Some(RunFinishReason::Error),
         RunIndexState::TransformUnavailable => Some(RunFinishReason::TransformUnavailable),
@@ -613,6 +630,7 @@ fn run_finish_index_state(reason: broca_protocol::RunFinishReason) -> RunIndexSt
         RunFinishReason::Completed => RunIndexState::Completed,
         RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
         RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
+        RunFinishReason::ContextCeiling => RunIndexState::ContextCeiling,
         RunFinishReason::Cancelled => RunIndexState::Cancelled,
         RunFinishReason::Interrupted => RunIndexState::Interrupted,
         RunFinishReason::Error => RunIndexState::Error,
@@ -898,6 +916,7 @@ struct StartRunFlags {
 }
 
 enum StartRunFailure {
+    ContextCeiling(broca_protocol::ContextCeilingDetail),
     Expired,
     Shutdown,
     Infrastructure(String),
@@ -1076,6 +1095,11 @@ impl std::fmt::Display for StartRunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Shutdown => write!(f, "module is stopping"),
+            Self::ContextCeiling(detail) => write!(
+                f,
+                "context_ceiling: size {} in window {} ({})",
+                detail.size, detail.window, detail.cause
+            ),
             Self::Infrastructure(message) => f.write_str(message),
             Self::Expired => f.write_str("lineage expired before admission"),
             Self::Admission(error) => error.fmt(f),
@@ -1273,6 +1297,7 @@ pub struct LineageActor<W: WalStore> {
     startup_recovery_pending: bool,
     /// Idle admission view loaded at actor open or after the previous run's terminal barrier.
     prior_snapshot: Option<PriorWalSnapshot>,
+    ceiling_drain_held: bool,
     pending_fifo: Vec<PendingSubmission>,
     /// Observed only during input hooks: dropping the RPC reply cancels this send, not its run.
     send_reply: Option<oneshot::Sender<SendOutcome>>,
@@ -1524,6 +1549,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             pending_capped_export: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
+            ceiling_drain_held: false,
             pending_fifo: Vec::new(),
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
@@ -1971,6 +1997,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             // IdleTick only re-arms the actor's idle timer; it performs no session work.
             LineageCmd::IdleTick => false,
+            LineageCmd::CompactionChanged => {
+                self.prior_snapshot = None;
+                if matches!(self.state, RunState::Idle) {
+                    if let Err(error) = async {
+                        self.refresh_admission_view().await?;
+                        self.drain_queue_one().await
+                    }
+                    .await
+                    {
+                        tracing::warn!(%error, "compaction queue wake deferred");
+                    }
+                }
+                false
+            }
             #[cfg(test)]
             LineageCmd::RetainedAdmissionIdentityState { reply } => {
                 let retained_bytes = self
@@ -2070,7 +2110,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::CutLock { reply } => {
                 drop(reply);
             }
-            LineageCmd::IdleTick => {}
+            LineageCmd::IdleTick | LineageCmd::CompactionChanged => {}
             #[cfg(test)]
             LineageCmd::RetainedAdmissionIdentityState { reply } => {
                 let _ = reply.send((usize::MAX, usize::MAX));
@@ -3011,6 +3051,46 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        // Same-key receipts above remain idempotent even when later work filled the context.
+        // Only compaction sessions need an additional admission read for a joining send.
+        let has_compaction = self
+            .first_episode
+            .get()
+            .and_then(|first| first.manifest.as_ref())
+            .is_some_and(|manifest| broca_core::compaction::has_compaction(manifest));
+        if !resume_indexed_run
+            && has_compaction
+            && (matches!(self.state, RunState::Idle) || delivery != broca_protocol::Delivery::Queue)
+        {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            };
+            let mut effective = request.clone();
+            if let Some(episode) = &checkpoint.last_episode {
+                inherit_frozen_parameters(&mut effective, &episode.config);
+            }
+            if let Some(detail) = checkpoint
+                .compaction
+                .as_ref()
+                .and_then(|c| c.state())
+                .and_then(|state| {
+                    state.send_ceiling(
+                        &effective.input,
+                        effective.context_limit.or_else(|| {
+                            checkpoint
+                                .last_episode
+                                .as_ref()
+                                .filter(|episode| episode.config.model == effective.model)
+                                .and_then(|episode| episode.config.context_limit)
+                        }),
+                        &effective.model,
+                    )
+                })
+            {
+                return SendOutcome::ContextCeiling(detail);
+            }
+        }
         // A send using the `delivery_order` group is always queued with its order, and delivered
         // at the first request boundary where one of its modes is possible.
         if !resume_indexed_run {
@@ -3134,6 +3214,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     delivered: None,
                 },
                 Err(StartRunFailure::Expired) => SendOutcome::Reopen,
+                Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
                 Err(StartRunFailure::Admission(RunError::Transient(message))) => {
                     SendOutcome::Transient(message)
                 }
@@ -3817,6 +3898,36 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 })?;
             inherit_frozen_parameters(&mut resolved_request, frozen);
+        }
+        let checkpoint = &prior_snapshot.checkpoint_at_head;
+        let resuming = checkpoint.last_episode.as_ref().is_some_and(|episode| {
+            episode.run_id == run_id && episode.disposition != EpisodeDisposition::Finished
+        });
+        if !cancel_before_execute && !resuming {
+            if let Some(detail) = checkpoint
+                .compaction
+                .as_ref()
+                .and_then(|c| c.state())
+                .and_then(|state| {
+                    state.send_ceiling(
+                        &resolved_request.input,
+                        resolved_request.context_limit.or_else(|| {
+                            checkpoint
+                                .last_episode
+                                .as_ref()
+                                .filter(|episode| episode.config.model == resolved_request.model)
+                                .and_then(|episode| episode.config.context_limit)
+                        }),
+                        &resolved_request.model,
+                    )
+                })
+            {
+                return Err(StartRunFailure::ContextCeiling(detail));
+            }
+        }
+        if self.ceiling_drain_held {
+            tracing::info!(session_ref = %broca_core::agent_session_ref(&self.key), "context ceiling queue hold cleared");
+            self.ceiling_drain_held = false;
         }
         // A session admitted with a fetch plan runs with the tools its manifest froze, and its
         // first episode opens with the manifest's joined system text; nothing a later send
@@ -5475,6 +5586,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
             {
                 let live_step = step_progress.lock().unwrap().clone();
                 let title = self.live_run_title(run_id).await?;
+                let ceiling_deadline_ms = if self
+                    .first_episode
+                    .get()
+                    .and_then(|first| first.manifest.as_ref())
+                    .is_some_and(|manifest| broca_core::compaction::has_compaction(manifest))
+                {
+                    self.load_checkpoint_at_head()
+                        .await?
+                        .compaction
+                        .as_ref()
+                        .and_then(|c| c.state())
+                        .and_then(|state| match state.ceiling_check {
+                            Some(broca_core::compaction::CeilingCheck::Waiting {
+                                deadline_ms,
+                                ..
+                            }) => Some(deadline_ms),
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
                 let head = self
                     .writer
                     .as_ref()
@@ -5495,6 +5627,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 return Ok(Some(ReconciledRunState {
                     run_usage,
                     budget_detail: None,
+                    context_ceiling: None,
+                    ceiling_deadline_ms,
                     structured_output: None,
                     live_step,
                     state: RunIndexState::Active,
@@ -5856,6 +5990,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .await
             {
                 Ok(_) => return Ok(()),
+                Err(StartRunFailure::ContextCeiling(detail)) => {
+                    if !self.ceiling_drain_held {
+                        tracing::info!(session_ref = %broca_core::agent_session_ref(&self.key), size = detail.size, window = detail.window, cause = %detail.cause, "queue drain held at context ceiling");
+                        self.ceiling_drain_held = true;
+                    }
+                    return Ok(());
+                }
                 Err(StartRunFailure::Admission(error)) if queued_admission_is_permanent(&error) => {
                     // Tombstone only failures intrinsic to the durable request. Export lag is an
                     // external, recoverable dependency state, so a trailing watermark must leave
@@ -6096,7 +6237,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::CutLock { reply } => {
                     drop(reply);
                 }
-                LineageCmd::IdleTick => {}
+                LineageCmd::IdleTick | LineageCmd::CompactionChanged => {}
                 #[cfg(test)]
                 LineageCmd::RetainedAdmissionIdentityState { reply } => {
                     let _ = reply.send((usize::MAX, usize::MAX));
