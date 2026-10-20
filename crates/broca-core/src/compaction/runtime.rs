@@ -126,9 +126,8 @@ pub trait CompactionViews: Send + Sync {
     ) -> Option<ViewReady>;
 }
 
-/// The newest `view_ready` event received for each session, kept in memory until a run's step
-/// boundary asks for it. Losing it (a restart) loses nothing durable: the provider keeps
-/// serving its newest view with `view.get`, and announces every later one.
+/// The newest `view_ready` event for up to 1,000 sessions. The bus intake commits receipts
+/// before enqueueing and retries them when the inbox is full; restart rebuilds from receipts.
 #[derive(Default)]
 pub struct ViewReadyInbox {
     newest: std::sync::Mutex<HashMap<String, ViewReady>>,
@@ -139,6 +138,9 @@ impl ViewReadyInbox {
     /// was kept; an older or repeated event (the bus may redeliver) changes nothing.
     pub fn announce(&self, ready: ViewReady) -> bool {
         let mut newest = self.newest.lock().unwrap_or_else(|e| e.into_inner());
+        if newest.len() >= 1000 && !newest.contains_key(&ready.session_ref) {
+            return false;
+        }
         match newest.get(&ready.session_ref) {
             Some(held) if held.view_version >= ready.view_version => false,
             _ => {
@@ -154,6 +156,14 @@ impl ViewReadyInbox {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_ref);
+    }
+
+    /// Receipt cleanup races with intake; never remove a newer in-memory announcement.
+    pub fn forget_ready(&self, ready: &ViewReady) {
+        let mut newest = self.newest.lock().unwrap_or_else(|e| e.into_inner());
+        if newest.get(&ready.session_ref) == Some(ready) {
+            newest.remove(&ready.session_ref);
+        }
     }
 }
 
@@ -209,6 +219,80 @@ pub(crate) struct Runtime<'a> {
     pub plane: Option<&'a Arc<dyn CompactionPlane>>,
     pub writer: &'a crate::WalHandle,
     pub control: &'a crate::RunControl,
+}
+
+/// Apply an announcement while no run owns the writer. The caller supplies the exact
+/// offline renderer for the last episode; no model or credential request is made here.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_idle_view(
+    bind: &BindIdentity,
+    writer: &crate::WalHandle,
+    plane: &Arc<dyn CompactionPlane>,
+    ready: &ViewReady,
+    state: &mut CompactionState,
+    prompt: &[Message],
+    stored: &[Message],
+    prefix_bound: bool,
+    model: &str,
+    window: Option<u64>,
+    render_size: impl Fn(&CompactionState) -> Result<usize, String>,
+) -> Result<bool, crate::RunError> {
+    let lineage = writer
+        .lineage_id()
+        .ok_or_else(|| crate::RunError::Wal("compaction requires a lineage".into()))?
+        .to_string();
+    let control = crate::RunControl::default();
+    let runtime = Runtime {
+        provider: &state.provider.clone(),
+        bind,
+        plane: Some(plane),
+        writer,
+        control: &control,
+    };
+    let already_applied = state
+        .applied_view_version(&lineage)
+        .is_some_and(|version| version >= ready.view_version);
+    let (decision, event) = if already_applied {
+        (view::Decision::Stale, None)
+    } else {
+        let fetched = match runtime.view_get(ready).await {
+            Fetch::View(view) => view,
+            Fetch::Unavailable | Fetch::Refused(_) => return Ok(false),
+        };
+        runtime
+            .offer_view(
+                state,
+                &fetched,
+                ready,
+                &lineage,
+                prompt,
+                stored,
+                prefix_bound,
+            )
+            .await?
+    };
+    let applied = matches!(decision, view::Decision::Apply(_)) || already_applied;
+    if let Some(notice) = view::next_notice(
+        state,
+        stored,
+        view::NoticeFacts {
+            session_ref: ready.session_ref.clone(),
+            lineage_id: &lineage,
+            est_tokens: crate::compaction::request_estimate(
+                render_size(state).map_err(crate::RunError::Wal)?,
+                &state.history,
+            )
+            .0,
+            model,
+            window,
+            usage: state.history.usage(),
+            events: event.into_iter().collect(),
+            seq_floor: 0,
+        },
+    ) {
+        runtime.record_notice(state, notice).await?;
+    }
+    Ok(applied)
 }
 /// How a run ends when a recorded compaction wait seals it.
 pub(crate) struct Terminal(pub RunFinishReason, pub Option<Box<ProviderError>>);

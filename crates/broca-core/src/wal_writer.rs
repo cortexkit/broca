@@ -159,6 +159,16 @@ pub trait WalStore: Send + Sync {
         Ok(None)
     }
 
+    /// A strictly bounded live-file suffix, with no full-read or archive fallback.
+    /// Stores without this primitive report unknown rather than decode full history.
+    fn read_records_tail_bounded(
+        &self,
+        _session: &BindIdentity,
+        _tail_bytes: u64,
+    ) -> Result<Option<WalRangeRead>, WalError> {
+        Ok(None)
+    }
+
     /// The session's first durable user message (the first user message of the first
     /// `RunStarted` or `Steered` record that adds one), with the number of WAL bytes read to
     /// find it. A file store reads only as far as that record; this default decodes the whole
@@ -1330,6 +1340,18 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn read_records_tail_bounded(
+        &self,
+        session: &BindIdentity,
+        tail_bytes: u64,
+    ) -> Result<Option<WalRangeRead>, WalError> {
+        self.check_move(session, false)?;
+        broca_wal::file_wal::read_records_tail_bounded(
+            self.read_path(session)?,
+            self.max_read_bytes,
+            tail_bytes,
+        )
+    }
     fn backup_classes(&self) -> Vec<String> {
         self.backup_classes.clone()
     }

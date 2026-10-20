@@ -270,7 +270,7 @@ pub use cortexkit_role_llm_runner::capabilities::RUN_TOOL_CALLS as RUN_TOOL_CALL
 /// compaction, retention or hook records alone does not promise to execute those writers.
 pub fn broca_role_describe_with_writers(
     implementation_version: &str,
-    _compaction_writer: bool,
+    compaction_writer: bool,
     retention_writer: bool,
     hook_writer: bool,
 ) -> RoleDescribeResponse {
@@ -325,8 +325,9 @@ pub fn broca_role_describe_with_writers(
     ]
     .map(String::from)
     .to_vec();
-    // The retained synchronous client cannot serve the published asynchronous compaction
-    // contract. Do not advertise compaction or its model-view operations until it can.
+    if compaction_writer {
+        capabilities.extend(["compaction".into(), "model_view".into()]);
+    }
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
     }
@@ -899,15 +900,15 @@ mod pinned_reply_bytes {
     }
 
     #[test]
-    fn compaction_and_model_view_are_not_declared_yet() {
+    fn compaction_and_model_view_follow_the_installed_bus_writer() {
         use cortexkit_role_llm_runner::describe::check_describe;
         let encoded =
             serde_json::to_value(broca_role_describe_with_writers("test", true, false, false))
                 .unwrap();
         check_describe(&encoded).unwrap_or_else(|error| panic!("{error:?}"));
         let capabilities = encoded["capabilities"].as_array().unwrap();
-        assert!(!capabilities.contains(&serde_json::json!("compaction")));
-        assert!(!capabilities.contains(&serde_json::json!("model_view")));
+        assert!(capabilities.contains(&serde_json::json!("compaction")));
+        assert!(capabilities.contains(&serde_json::json!("model_view")));
         assert!(!encoded["majors"][0]["ops"]
             .as_array()
             .unwrap()
@@ -932,8 +933,8 @@ mod pinned_reply_bytes {
                         caps.contains(&serde_json::json!(ORDERED_HOOK_PHASES)),
                         hooks
                     );
-                    assert!(!caps.contains(&serde_json::json!("compaction")));
-                    assert!(!caps.contains(&serde_json::json!("model_view")));
+                    assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
+                    assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
                     assert!(!encoded["majors"][0]["ops"]
                         .as_array()
                         .unwrap()
@@ -1008,7 +1009,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "334449647a4f58817b9244255706baaa2be43f584975355714b61aac2d58345d";
+        "505091aa69ae8541344c8e36684926f56777a19e36f069c66e5d6c60375b4075";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

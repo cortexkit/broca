@@ -8,7 +8,7 @@ use broca_store::bus_events::{BusPublisher, Publication};
 use broca_subc::{connection::RouteOpenRetry, SubcConnection};
 use cortexkit_bus_naming::AccountNames;
 use cortexkit_bus_nats::{ConnectConfig, NatsConnection, NatsStream};
-use cortexkit_bus_trait::{PublishReceipt, Stream};
+use cortexkit_bus_trait::{DurableOwner, PublishReceipt, Stream, StreamCursor};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -133,6 +133,7 @@ async fn nonce_signature(
 pub struct NatsPublisher {
     pub stream: NatsStream,
     pub account: AccountNames,
+    pub connection: NatsConnection,
 }
 #[async_trait]
 impl BusPublisher for NatsPublisher {
@@ -182,6 +183,7 @@ impl NatsPublisher {
         Ok(Self {
             stream: conn.stream(account.streams().event.clone()),
             account,
+            connection: conn,
         })
     }
 }
@@ -190,12 +192,14 @@ impl NatsPublisher {
 pub struct NatsConnector {
     route: Arc<dyn CredentialRoute>,
     current: Mutex<Option<Credential>>,
+    publisher: Mutex<Option<Arc<LazyPublisher>>>,
 }
 impl NatsConnector {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
             route: Arc::new(Credentials::new(conn)),
             current: Mutex::new(None),
+            publisher: Mutex::new(None),
         }
     }
 }
@@ -218,15 +222,22 @@ impl BusConnector for NatsConnector {
         if refresh_at_ms <= now_ms() {
             return Err("ckbus credential expires before its refresh margin".into());
         }
-        let publisher = Arc::new(LazyPublisher {
-            route: self.route.clone(),
-            account: account.clone(),
-            state: Mutex::new(LazyState {
-                credential: credential.clone(),
-                publisher: None,
-                reissue: false,
-            }),
-        });
+        let mut shared = self.publisher.lock().await;
+        let publisher =
+            if let Some(publisher) = shared.as_ref().filter(|_| refresh_at_ms > now_ms()) {
+                publisher.clone()
+            } else {
+                Arc::new(LazyPublisher {
+                    route: self.route.clone(),
+                    account: account.clone(),
+                    state: Mutex::new(LazyState {
+                        credential: credential.clone(),
+                        publisher: None,
+                        reissue: false,
+                    }),
+                })
+            };
+        *shared = Some(publisher.clone());
         *current = Some(credential);
         Ok(BusConnection {
             publisher,
@@ -234,6 +245,66 @@ impl BusConnector for NatsConnector {
             refresh_at_ms,
         })
     }
+
+    async fn compaction_consumer(&self) -> Result<Box<dyn StreamCursor>, String> {
+        let publisher = self.publisher.lock().await.clone();
+        let publisher = match publisher {
+            Some(publisher) => publisher,
+            None => {
+                self.connect().await?;
+                self.publisher
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or("ckbus publisher absent")?
+            }
+        };
+        let mut state = publisher.state.lock().await;
+        publisher.ensure_connected(&mut state).await?;
+        let connected = state.publisher.as_ref().ok_or("ckbus connection absent")?;
+        let result = attach_compaction(&connected.connection, &connected.account).await;
+        if result.is_err() {
+            state.publisher = None;
+        }
+        result
+    }
+}
+
+/// Bootstrap owns topology. Attaching only reads configuration and never creates or updates it.
+pub async fn attach_compaction(
+    connection: &NatsConnection,
+    account: &AccountNames,
+) -> Result<Box<dyn StreamCursor>, String> {
+    let spec = cortexkit_bus_naming::event_consumer_specs(account)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|spec| spec.consumer.durable == "m_broca")
+        .ok_or("m_broca consumer spec absent")?;
+    let consumer = async_nats::jetstream::new(connection.client())
+        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
+            &spec.consumer.durable,
+            &spec.consumer.stream,
+        )
+        .await
+        .map_err(|_| "m_broca consumer unavailable")?;
+    let config = &consumer.cached_info().config;
+    if config.durable_name.as_deref() != Some("m_broca")
+        || config.deliver_subject.is_some()
+        || config.ack_policy != async_nats::jetstream::consumer::AckPolicy::Explicit
+        || config.deliver_policy != async_nats::jetstream::consumer::DeliverPolicy::All
+        || config.ack_wait != spec.ack_wait
+        || config.max_ack_pending != spec.max_ack_pending
+        || config.filter_subjects != spec.consumer.filter_subjects
+        || !config.filter_subject.is_empty()
+    {
+        return Err("m_broca consumer configuration does not match ModuleEventConsumerSpec".into());
+    }
+    let cursor = connection
+        .stream(spec.consumer.stream)
+        .consumer(DurableOwner::Module("broca"))
+        .await
+        .map_err(|_| "m_broca attach failed")?;
+    Ok(Box::new(cursor))
 }
 
 struct LazyPublisher {
@@ -246,15 +317,23 @@ struct LazyState {
     publisher: Option<NatsPublisher>,
     reissue: bool,
 }
-#[async_trait]
-impl BusPublisher for LazyPublisher {
-    async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
-        let mut state = self.state.lock().await;
+impl LazyPublisher {
+    async fn ensure_connected(&self, state: &mut LazyState) -> Result<(), String> {
+        if state
+            .credential
+            .exp
+            .saturating_mul(1000)
+            .saturating_sub(300_000)
+            <= now_ms()
+        {
+            renew(self.route.as_ref(), &mut state.credential).await?;
+            state.publisher = None;
+        }
         if state.publisher.is_none() {
             if state.reissue {
                 let credential = issue(self.route.as_ref()).await?;
                 if credential.acct != self.account.account() {
-                    return Err("ckbus account changed during publish retry".into());
+                    return Err("ckbus account changed during retry".into());
                 }
                 state.credential = credential;
             }
@@ -262,6 +341,14 @@ impl BusPublisher for LazyPublisher {
             state.publisher =
                 Some(NatsPublisher::connect(self.route.clone(), &state.credential).await?);
         }
+        Ok(())
+    }
+}
+#[async_trait]
+impl BusPublisher for LazyPublisher {
+    async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
+        let mut state = self.state.lock().await;
+        self.ensure_connected(&mut state).await?;
         let result = state.publisher.as_ref().unwrap().publish(event).await;
         if result.is_err() {
             state.publisher = None;
@@ -379,6 +466,7 @@ mod tests {
         let connector = NatsConnector {
             route: route.clone(),
             current: Mutex::new(None),
+            publisher: Mutex::new(None),
         };
         let connection = connector.connect().await.unwrap();
         assert_eq!(connection.account.account(), "box_test");

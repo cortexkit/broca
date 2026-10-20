@@ -61,6 +61,7 @@ pub(super) struct Session {
     replacements: Vec<(EntrySource, Value)>,
     inputs: Vec<Vec<ModelEntry>>,
     pub gates: std::collections::VecDeque<Arc<HoldGate>>,
+    pub view: Option<broca_core::compaction_provider::view::CompactionView>,
 }
 
 pub(super) struct Provider {
@@ -101,6 +102,33 @@ impl subc_client_rs::ModuleHandler for Provider {
                 "ops":["role.describe","compaction.setup","view.get","compaction.ride"],"stability":"alpha"}],
                 "implementation_version":"conformance", "capabilities":[]}));
         }
+        if method == "view.get" {
+            let view = self
+                .shared
+                .compaction
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|s| s.view.as_ref())
+                .find(|v| {
+                    request["params"]["session_ref"] == v.session_ref
+                        && request["params"]["view_version"] == v.view_version
+                })
+                .cloned();
+            return response(match view {
+                Some(view) => json!({"answer":"view", "view":view}),
+                None => json!({"answer":"refuse", "code":"unknown_view", "reason":"view not held"}),
+            });
+        }
+        if method == "compaction.ride" {
+            return response(json!({"answer":"nothing"}));
+        }
+        if method != "compaction.setup" {
+            return subc_client_rs::HandlerOutcome::Error {
+                code: "unknown_method".into(),
+                message: format!("the scripted provider does not serve {method}"),
+            };
+        }
         let params = &request["params"];
         let session = params["session"].as_str().expect("provider session");
         let request_id = params["request_id"]
@@ -108,13 +136,6 @@ impl subc_client_rs::ModuleHandler for Provider {
             .expect("provider request id")
             .to_owned();
         let now = params["now"].as_u64().expect("actual runner clock");
-        if method != "compaction.setup" {
-            // Views and rides are never scripted here: this provider publishes no view.
-            return subc_client_rs::HandlerOutcome::Error {
-                code: "unknown_method".into(),
-                message: format!("the scripted provider does not serve {method}"),
-            };
-        }
         let answer = {
             let mut sessions = self.shared.compaction.lock().unwrap();
             let state = sessions
@@ -180,9 +201,9 @@ fn remember_replacement(state: &mut Session, value: &Value) {
         state.replacements.push((source.clone(), message.clone()));
     }
 }
-// OpenAI removes native position/origin fields and splits grouped tool results. Match the
-// received wire bytes against messages actually observed in statuses or delivered answers;
-// those observations supply only the metadata absent from the wire, never expected content.
+// OpenAI removes native position/origin fields and splits grouped tool results. Match received
+// bytes against provider replacements and recorded raw messages before attaching the native
+// metadata; unexpected wire content is never replaced with an expected message.
 fn render_native(message: &Value) -> Result<Vec<Value>, String> {
     let role = message["role"].as_str().ok_or("native role absent")?;
     let content = message["content"]
@@ -275,8 +296,35 @@ fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String>
     Ok(entries)
 }
 pub(super) fn capture(shared: &Shared, session: &str, messages: &[Value]) -> Option<Arc<HoldGate>> {
+    let root = shared.session_roots.lock().unwrap().get(session)?.clone();
+    let identity = shared
+        .session_bindings
+        .lock()
+        .unwrap()
+        .get(session)?
+        .clone();
+    let records = broca_core::FileWalStore::new(root.join("wal"))
+        .read_records(&identity)
+        .unwrap_or_else(|error| {
+            panic!("cannot read native sources for received model input: {error}")
+        });
+    let records: Vec<_> = records.into_iter().map(|frame| frame.record).collect();
+    let prior = broca_core::replay::replay(&records).expect("recorded model input sources replay");
     let mut states = shared.compaction.lock().unwrap();
     let state = states.get_mut(session)?;
+    // The wire is the observation. WAL messages identify origins and ordinals omitted by
+    // OpenAI, but each received message must still render-match the recorded content.
+    state.raw = prior
+        .prompt
+        .iter()
+        .enumerate()
+        .map(|(ordinal, message)| {
+            (
+                ordinal as u64,
+                serde_json::to_value(message).expect("native message"),
+            )
+        })
+        .collect();
     let translated =
         translate(state, messages).unwrap_or_else(|e| panic!("wire capture translation: {e}"));
     state.inputs.push(translated);
@@ -291,7 +339,274 @@ fn atomic_write(path: &Path, value: &[u8]) -> Result<(), HarnessError> {
     std::fs::write(&temporary, value).map_err(|e| HarnessError::new(e.to_string()))?;
     std::fs::rename(temporary, path).map_err(|e| HarnessError::new(e.to_string()))
 }
+
+fn settled_episode(frames: &[broca_wal::FramedRecord]) -> Option<String> {
+    use broca_wal::WalRecord as R;
+    let start = frames
+        .iter()
+        .rposition(|frame| matches!(frame.record, R::RunStarted { .. }))?;
+    let terminal = frames[start..]
+        .iter()
+        .rev()
+        .find(|frame| matches!(frame.record, R::RunFinished { .. }))?;
+    let R::RunStarted { run_id, .. } = &frames[start].record else {
+        unreachable!()
+    };
+    let R::RunFinished { reason, .. } = &terminal.record else {
+        unreachable!()
+    };
+    let following = frames.iter().filter(|frame| frame.seq > terminal.seq);
+    Some(format!(
+        "run {} finished {reason:?} at WAL seq {}; {}",
+        run_id.0,
+        terminal.seq,
+        broca_test_support::record_kinds(following.map(|frame| &frame.record))
+    ))
+}
+
+fn settlement_records() -> Vec<broca_wal::FramedRecord> {
+    use broca_protocol::{BindIdentity, ModelHandle, RunFinishReason, RunId};
+    use broca_wal::{FramedRecord, WalRecord as R};
+    let started = |id: &str| R::RunStarted {
+        run_id: RunId(id.into()),
+        session: BindIdentity::new("/test", "runner", "settle"),
+        config: Box::new(broca_wal::RunConfig {
+            model: ModelHandle::new("mock", "m"),
+            tools: Arc::new(vec![]),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: Value::Null,
+            cache_tiers: Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: vec![],
+            context_management: None,
+            render_tags: false,
+            turn_directives_v1: None,
+        }),
+        input: Arc::new(vec![]),
+        origin: Default::default(),
+        tags: None,
+        on_restart: None,
+        keep_warm: None,
+        project_id: None,
+        principal: None,
+        retention: None,
+        session_class: None,
+        submission_id: None,
+        send_id: None,
+        request_identity_digest: None,
+        title: None,
+        scope: None,
+        marker_order_version: None,
+        manifest: None,
+        hooks: None,
+        ts_ms: None,
+    };
+    let frame = |seq, record| FramedRecord {
+        seq,
+        fence: 1,
+        record,
+    };
+    vec![
+        frame(1, started("sealed")),
+        frame(
+            2,
+            R::RunFinished {
+                reason: RunFinishReason::Interrupted,
+                ts_ms: None,
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+                interrupt_reason: None,
+            },
+        ),
+        frame(
+            3,
+            R::CompactionViewApplied {
+                provider: MODULE.into(),
+                view_version: 2,
+                view: broca_wal::OpaqueJson::from_json_text("{}").unwrap(),
+                choice: broca_wal::CompactionViewChoice::Applied,
+            },
+        ),
+        frame(
+            4,
+            R::CompactionNotice {
+                seq: 2,
+                headers: BTreeMap::new(),
+            },
+        ),
+    ]
+}
+
+#[test]
+fn settled_episode_accepts_idle_view_metadata_but_not_a_newer_unfinished_run() {
+    use broca_wal::{FramedRecord, WalRecord as R};
+    let mut records = settlement_records();
+    let frame = |seq, record| FramedRecord {
+        seq,
+        fence: 1,
+        record,
+    };
+    let reason = settled_episode(&records).expect("idle metadata must not hide the terminal");
+    assert!(
+        reason.contains("sealed finished Interrupted at WAL seq 2"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("CompactionViewApplied") && reason.contains("CompactionNotice"),
+        "{reason}"
+    );
+    let mut active = records[0].record.clone();
+    if let R::RunStarted { run_id, .. } = &mut active {
+        *run_id = broca_protocol::RunId("active".into());
+    }
+    records.push(frame(5, active));
+    assert_eq!(
+        settled_episode(&records),
+        None,
+        "an earlier run's terminal settled new work"
+    );
+    records.push(frame(
+        6,
+        R::CompactionNotice {
+            seq: 3,
+            headers: BTreeMap::new(),
+        },
+    ));
+    assert_eq!(
+        settled_episode(&records),
+        None,
+        "metadata alone settled the active run"
+    );
+}
+
+#[tokio::test]
+async fn compaction_settle_poller_observes_terminal_before_idle_view_and_notice() {
+    let root = broca_test_support::scratch_root().join("compaction-settle-metadata");
+    std::fs::create_dir_all(&root).unwrap();
+    let subject = BrocaSubject::new(&root).await;
+    let session = "settle";
+    let state = root.join("state");
+    subject
+        .shared
+        .session_roots
+        .lock()
+        .unwrap()
+        .insert(session.into(), state.clone());
+    subject.install_setup(
+        session,
+        CompactionSetup::Ready(CompactionMessage {
+            compaction_id: "head".into(),
+            version: 1,
+            from: 0,
+            to: 0,
+            replacement: vec![],
+        }),
+    );
+    let identity = subject.bind_identity(session);
+    let wal = broca_core::FileWalStore::new(state.join("wal"));
+    let mut writer = wal.open(&identity).unwrap();
+    for mut frame in settlement_records() {
+        if let broca_wal::WalRecord::RunStarted { session, .. } = &mut frame.record {
+            *session = identity.clone();
+        }
+        writer.append(frame.fence, &frame.record, false).unwrap();
+    }
+    writer.sync().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), subject.settle_compaction(session))
+        .await
+        .expect("poller ignored the current run's terminal after idle compaction metadata")
+        .unwrap();
+    let evidence = subject.shared.evidence.lock().unwrap();
+    let observed = evidence.last().unwrap();
+    assert!(
+        observed.contains("sealed finished Interrupted at WAL seq 2"),
+        "{observed}"
+    );
+    assert!(
+        observed.contains("CompactionViewApplied") && observed.contains("CompactionNotice"),
+        "{observed}"
+    );
+}
 impl BrocaSubject {
+    #[cfg(feature = "test-clock")]
+    pub(super) fn offer_bus_view(
+        &self,
+        session: &str,
+        view: broca_core::compaction_provider::view::CompactionView,
+        replacement: Value,
+    ) {
+        let mut sessions = self.shared.compaction.lock().unwrap();
+        let state = sessions.get_mut(session).unwrap();
+        state.replacements.push((
+            EntrySource::Replacement {
+                compaction_id: "view".into(),
+                version: view.view_version,
+                from_ordinal: 0,
+                to_ordinal: 1,
+            },
+            replacement,
+        ));
+        state.view = Some(view);
+    }
+    pub(super) fn install_setup(&self, session: &str, setup: CompactionSetup) {
+        let mut sessions = self.shared.compaction.lock().unwrap();
+        let state = sessions.entry(session.into()).or_insert_with(|| Session {
+            script: CompactionScript::new(CompactionMessage {
+                compaction_id: "initial".into(),
+                version: 1,
+                from: 0,
+                to: 0,
+                replacement: vec![],
+            }),
+            start_ms: 0,
+            emitted: 0,
+            calls: vec![],
+            raw: BTreeMap::new(),
+            replacements: vec![],
+            inputs: vec![],
+            gates: Default::default(),
+            view: None,
+        });
+        state.script.setup = setup;
+    }
+
+    pub(super) async fn observe_compaction(
+        &self,
+        session: &str,
+    ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
+        self.settle_compaction(session).await?;
+        let sessions = self.shared.compaction.lock().unwrap();
+        let state = sessions
+            .get(session)
+            .ok_or_else(|| HarnessError::new("compaction session absent"))?;
+        Ok(
+            cortexkit_role_llm_runner_conformance::CompactionObservation {
+                calls: state
+                    .calls
+                    .iter()
+                    .map(
+                        |call| cortexkit_role_llm_runner_conformance::CompactionCall {
+                            request_id: call.request_id.clone(),
+                        },
+                    )
+                    .collect(),
+                model_inputs: state.inputs.clone(),
+            },
+        )
+    }
+
     fn compaction_root(&self, session: &str) -> Result<PathBuf, HarnessError> {
         self.shared
             .session_roots
@@ -348,14 +663,10 @@ impl BrocaSubject {
                     let frames = broca_core::FileWalStore::new(root.join("wal"))
                         .read_records(&self.bind_identity(session))
                         .unwrap_or_default();
-                    if let Some(last) = frames.last() {
-                        use broca_wal::WalRecord as R;
-                        if matches!(last.record, R::RunFinished { .. }) {
-                            return format!(
-                                "RunFinished is the last WAL record (seq {})",
-                                last.seq
-                            );
-                        }
+                    // Idle compaction may append a view and notice after a terminal.
+                    // Only a newer RunStarted makes that terminal irrelevant to settling.
+                    if let Some(reason) = settled_episode(&frames) {
+                        return reason;
                     }
                     if root.join("test-compaction-reached").exists() {
                         return "test-compaction-reached marker exists".to_owned();
@@ -376,6 +687,7 @@ impl BrocaSubject {
         .await;
         match settled {
             Ok(reason) => {
+                eprintln!("compaction settled session={session}: {reason}");
                 self.shared.note(session, format_args!("settled: {reason}"));
                 Ok(())
             }
@@ -483,6 +795,7 @@ fn captured_wire_translation_preserves_tool_grouping_and_native_metadata_and_rej
         replacements: vec![],
         inputs: vec![],
         gates: Default::default(),
+        view: None,
     };
     let messages = vec![
         json!({"role":"user","content":[{"type":"text","text":"ask"}]}),

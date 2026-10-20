@@ -194,7 +194,284 @@ async fn provision(conn: &NatsConnection, names: &AccountNames) -> NatsPublisher
     NatsPublisher {
         stream: conn.stream(names.streams().event.clone()),
         account: names.clone(),
+        connection: conn.clone(),
     }
+}
+
+struct NoConnector;
+#[async_trait::async_trait]
+impl broca_module_serve::bus_events::BusConnector for NoConnector {
+    async fn connect(&self) -> Result<broca_module_serve::bus_events::BusConnection, String> {
+        Err("not used by direct delivery tests".into())
+    }
+}
+
+struct ReceiptAckCursor {
+    inner: Box<dyn StreamCursor>,
+    store: Arc<SqliteStore>,
+    inbox: Arc<broca_core::ViewReadyInbox>,
+    ready: broca_core::compaction_provider::notice::ViewReady,
+}
+#[async_trait::async_trait]
+impl StreamCursor for ReceiptAckCursor {
+    async fn next(
+        &mut self,
+    ) -> cortexkit_bus_trait::BusResult<Option<cortexkit_bus_trait::StreamDelivery>> {
+        self.inner.next().await
+    }
+    async fn ack(&mut self) -> cortexkit_bus_trait::BusResult<()> {
+        use broca_core::CompactionViews;
+        assert_eq!(
+            self.store
+                .compaction_receipts("", 256)
+                .unwrap()
+                .first()
+                .map(|r| &r.ready),
+            Some(&self.ready),
+            "ACK preceded durable receipt"
+        );
+        assert_eq!(
+            self.inbox
+                .newest_ready(&self.ready.session_ref, "ignored", None),
+            Some(self.ready.clone()),
+            "ACK preceded inbox enqueue"
+        );
+        self.inner.ack().await
+    }
+    async fn nak(&mut self, delay: Duration) -> cortexkit_bus_trait::BusResult<()> {
+        self.inner.nak(delay).await
+    }
+    async fn term(&mut self, reason: Option<&str>) -> cortexkit_bus_trait::BusResult<()> {
+        self.inner.term(reason).await
+    }
+    async fn in_progress(&mut self) -> cortexkit_bus_trait::BusResult<()> {
+        self.inner.in_progress().await
+    }
+}
+
+async fn provision_compaction(conn: &NatsConnection, names: &AccountNames) {
+    let spec = cortexkit_bus_naming::event_consumer_specs(names)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.consumer.durable == "m_broca")
+        .unwrap();
+    async_nats::jetstream::new(conn.client())
+        .get_stream(&spec.consumer.stream)
+        .await
+        .unwrap()
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some(spec.consumer.durable),
+            filter_subjects: spec.consumer.filter_subjects,
+            ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
+            ack_wait: spec.ack_wait,
+            max_ack_pending: spec.max_ack_pending,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
+    use broca_core::compaction_provider::notice::{event_subject, ViewReady, VIEW_READY_EVENT};
+    use broca_core::{CompactionViews, ViewReadyInbox};
+    let Some((_bus, conn, names, _)) = fixture().await else {
+        return;
+    };
+    let _publisher = provision(&conn, &names).await;
+    provision_compaction(&conn, &names).await;
+    let temp = scratch();
+    let db = temp.path().join("run-index.db");
+    let store = Arc::new(SqliteStore::open(&db).unwrap());
+    let wal = Arc::new(FileWalStore::new(temp.path().join("wal")));
+    wal.set_session_ref_index(store.clone());
+    let session = BindIdentity::new("/fixture", "broca", "compaction-receipt");
+    let mut writer = wal.open(&session).unwrap();
+    writer.append(1, &started(&session), true).unwrap();
+    writer
+        .append(
+            2,
+            &WalRecord::CompactionMessage {
+                provider: "magic-context".into(),
+                kind: broca_wal::CompactionMessageKind::Setup,
+                request_id: None,
+                cursor: None,
+                compaction_id: "initial".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(vec![]),
+                sha256: broca_wal::compaction_replacement_sha256(&[]).unwrap(),
+                call_when: None,
+                stability: None,
+                ceiling: Some(broca_wal::OpaqueJson::from_json_text("{}").unwrap()),
+            },
+            true,
+        )
+        .unwrap();
+    drop(writer);
+    broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(temp.path()))
+        .unwrap();
+    let registry =
+        broca_module::LineageRegistry::new_with_reader(Arc::new(NoActor), wal.clone(), None);
+    let inbox = Arc::new(ViewReadyInbox::default());
+    let service = broca_module_serve::compaction_bus::Service::new(
+        store.clone(),
+        registry.clone(),
+        wal.clone(),
+        inbox.clone(),
+        Arc::new(NoConnector),
+        Default::default(),
+    );
+    let ready = ViewReady::new(
+        broca_core::agent_session_ref(&session),
+        7,
+        3,
+        "a".repeat(64),
+    );
+    let subject = event_subject(names.account(), "magic-context", VIEW_READY_EVENT);
+    let publication = conn
+        .stream(names.streams().event.clone())
+        .publish(
+            &subject,
+            &ready.message_id(),
+            ready.digest.parse().unwrap(),
+            ready.to_headers(),
+        )
+        .await
+        .unwrap();
+    assert!(!publication.duplicate());
+    let mut reader = broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
+        .await
+        .unwrap();
+    let delivery = reader.next().await.unwrap().unwrap();
+    // Simulate loss after the receipt commit but before ACK; redelivery must be idempotent.
+    service
+        .handle(&delivery.message, names.account())
+        .await
+        .unwrap();
+    service
+        .handle(&delivery.message, names.account())
+        .await
+        .unwrap();
+    assert_eq!(store.compaction_receipts("", 256).unwrap().len(), 1);
+    assert_eq!(
+        inbox.newest_ready(&ready.session_ref, "ignored", None),
+        Some(ready.clone())
+    );
+    store
+        .clear_compaction_receipt(&store.compaction_receipts("", 256).unwrap()[0])
+        .unwrap();
+    inbox.forget(&ready.session_ref);
+    let mut reader = ReceiptAckCursor {
+        inner: reader,
+        store: store.clone(),
+        inbox: inbox.clone(),
+        ready: ready.clone(),
+    };
+    service
+        .settle_delivery(&delivery.message, names.account(), &mut reader)
+        .await
+        .unwrap();
+    assert_eq!(service.metrics.snapshot()["acked"], 1);
+    let info = async_nats::jetstream::new(conn.client())
+        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
+            "m_broca",
+            &names.streams().event,
+        )
+        .await
+        .unwrap();
+    assert!(
+        info.cached_info().delivered.stream_sequence > 0,
+        "delivery used a durable other than m_broca"
+    );
+    drop(service);
+    drop(reader);
+    drop(inbox);
+    drop(store);
+    // The ACK already reached JetStream; only the database can supply this announcement now.
+    let store = Arc::new(SqliteStore::open(&db).unwrap());
+    let restored = Arc::new(ViewReadyInbox::default());
+    let service = broca_module_serve::compaction_bus::Service::new(
+        store.clone(),
+        registry,
+        wal,
+        restored.clone(),
+        Arc::new(NoConnector),
+        Default::default(),
+    );
+    service.restore().await.unwrap();
+    assert_eq!(
+        restored.newest_ready(&ready.session_ref, "ignored", None),
+        Some(ready.clone())
+    );
+    let unknown = ViewReady::new("f".repeat(32), 8, 0, "b".repeat(64));
+    let message = cortexkit_bus_trait::Message {
+        subject,
+        id: unknown.message_id(),
+        digest: unknown.digest.parse().unwrap(),
+        headers: unknown.to_headers(),
+    };
+    service.handle(&message, names.account()).await.unwrap();
+    assert_eq!(service.metrics.snapshot()["dropped_unknown_session"], 1);
+    assert_eq!(store.compaction_receipts("", 256).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn real_bus_compaction_attach_never_creates_or_modifies_consumers() {
+    let Some((_bus, conn, names, _)) = fixture().await else {
+        return;
+    };
+    let _publisher = provision(&conn, &names).await;
+    assert!(
+        broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
+            .await
+            .is_err()
+    );
+    let js = async_nats::jetstream::new(conn.client());
+    assert!(js
+        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
+            "m_broca",
+            &names.streams().event
+        )
+        .await
+        .is_err());
+    provision_compaction(&conn, &names).await;
+    let mut consumer = js
+        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
+            "m_broca",
+            &names.streams().event,
+        )
+        .await
+        .unwrap();
+    let before = consumer.info().await.unwrap().clone();
+    broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
+        .await
+        .unwrap();
+    assert_eq!(consumer.info().await.unwrap().config, before.config);
+    let stream = js.get_stream(&names.streams().event).await.unwrap();
+    stream.delete_consumer("m_broca").await.unwrap();
+    let wrong = async_nats::jetstream::consumer::pull::Config {
+        durable_name: Some("m_broca".into()),
+        filter_subjects: before.config.filter_subjects,
+        ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+        ack_wait: Duration::from_secs(5),
+        max_ack_pending: 1000,
+        ..Default::default()
+    };
+    let mut consumer = stream.create_consumer(wrong).await.unwrap();
+    let before = consumer.info().await.unwrap().config.clone();
+    assert!(
+        broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
+            .await
+            .is_err(),
+        "attached an incompatible ACK wait"
+    );
+    assert_eq!(
+        consumer.info().await.unwrap().config,
+        before,
+        "attachment changed bootstrap's consumer"
+    );
 }
 
 fn project(store: &SqliteStore, wal: &FileWalStore, session: &BindIdentity) {
@@ -390,6 +667,7 @@ async fn real_bus_outage_queues_then_reconnect_resumes_identical_event() {
     let publisher = NatsPublisher {
         stream: conn.stream(names.streams().event.clone()),
         account: names,
+        connection: conn.clone(),
     };
     assert_eq!(
         store.drain_bus_event(&publisher, now_ms()).await.unwrap(),

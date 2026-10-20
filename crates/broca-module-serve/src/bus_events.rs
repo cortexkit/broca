@@ -203,6 +203,11 @@ pub struct BusConnection {
 #[async_trait]
 pub trait BusConnector: Send + Sync {
     async fn connect(&self) -> Result<BusConnection, String>;
+    async fn compaction_consumer(
+        &self,
+    ) -> Result<Box<dyn cortexkit_bus_trait::StreamCursor>, String> {
+        Err("compaction bus consumer unavailable".into())
+    }
 }
 
 pub fn now_ms() -> u64 {

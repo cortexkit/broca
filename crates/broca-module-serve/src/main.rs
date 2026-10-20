@@ -345,9 +345,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         provider_base_url,
     )
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
-    .with_compaction_plane(Arc::new(broca_subc::SubcCompactionPlane::new(
-        plan_conn.clone(),
-    )))
     .with_elicitation_plane(Arc::new(broca_subc::consent::ScopedConsentPlane::new(
         plan_conn.clone(),
         broca_subc::RouteOpenRetry::default_patience(),
@@ -571,6 +568,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
     );
+    if bus_event_config.enabled {
+        executor_impl = executor_impl.with_compaction_plane(Arc::new(
+            broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
+        ));
+    }
+    let compaction_inbox = executor_impl.compaction_inbox();
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     let move_wal = wal_store.clone();
     let mut opener_builder = DefaultOpener::new(lease_store, wal_store, executor)
@@ -617,14 +620,29 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bus_stop = tokio_util::sync::CancellationToken::new();
     let _bus_stop_guard = bus_stop.clone().drop_guard();
+    let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> = Arc::new(
+        broca_module_serve::bus_events_nats::NatsConnector::new(plan_conn.clone()),
+    );
+    let _compaction_bus = if bus_event_config.enabled {
+        let service = broca_module_serve::compaction_bus::Service::new(
+            run_index.clone(),
+            registry.as_ref().clone(),
+            crash_orphan_wal.clone(),
+            compaction_inbox,
+            bus_connector.clone(),
+            bus_stop.clone(),
+        );
+        service.restore().await.map_err(ServeIoError)?;
+        Some(service.spawn())
+    } else {
+        None
+    };
     let _bus_events = broca_module_serve::bus_events::Service {
         config: bus_event_config,
         store: run_index.clone(),
         wal: crash_orphan_wal.clone(),
         registry: registry.as_ref().clone(),
-        connector: Some(Arc::new(
-            broca_module_serve::bus_events_nats::NatsConnector::new(plan_conn.clone()),
-        )),
+        connector: Some(bus_connector),
         hints: bus_hints,
         stop: bus_stop,
     }
@@ -2600,6 +2618,7 @@ mod executor {
         /// the remaining phases and resumed work against the frozen declarations.
         hooks: Option<Arc<broca_subc::SubcHookPlane>>,
         compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
+        compaction_views: Arc<broca_core::ViewReadyInbox>,
         elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
         /// One process-long HTTP client. Every per-run provider gets a cheap clone so sequential
         /// episodes retain the same DNS, TCP, TLS, and HTTP connection pool.
@@ -2668,6 +2687,7 @@ mod executor {
                 plane,
                 hooks: None,
                 compaction_plane: None,
+                compaction_views: Arc::default(),
                 elicitation_plane: None,
                 provider_client: build_provider_http_client(),
                 clock: broca_core::clock::Clock::default(),
@@ -2828,6 +2848,10 @@ mod executor {
         ) -> Self {
             self.compaction_plane = Some(compaction);
             self
+        }
+
+        pub fn compaction_inbox(&self) -> Arc<broca_core::ViewReadyInbox> {
+            self.compaction_views.clone()
         }
 
         pub fn with_elicitation_plane(
@@ -3367,6 +3391,29 @@ mod executor {
             self.compaction_plane
                 .as_ref()
                 .map(|plane| plane.clone() as Arc<dyn broca_core::compaction::CompactionPlane>)
+        }
+
+        fn compaction_views(&self) -> Option<Arc<dyn broca_core::CompactionViews>> {
+            Some(self.compaction_views.clone())
+        }
+
+        async fn apply_idle_compaction(
+            &self,
+            session: &broca_protocol::BindIdentity,
+            writer: &broca_core::WalHandle,
+            records: Vec<broca_wal::WalRecord>,
+            ready: &broca_core::compaction_provider::notice::ViewReady,
+        ) -> Result<bool, String> {
+            broca_module_serve::compaction_bus::apply_idle(
+                session,
+                writer,
+                &records,
+                ready,
+                &self
+                    .compaction_plane()
+                    .ok_or("compaction provider unavailable")?,
+            )
+            .await
         }
 
         fn warm_after_send_ms(&self, config: &broca_wal::RunConfig) -> Option<u64> {

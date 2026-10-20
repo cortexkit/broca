@@ -71,11 +71,18 @@ struct CountingExecutor(AtomicUsize);
 
 #[async_trait::async_trait]
 impl RunExecutor for CountingExecutor {
+    fn compaction_views(&self) -> Option<Arc<dyn broca_core::CompactionViews>> {
+        Some(Arc::new(broca_core::ViewReadyInbox::default()))
+    }
     async fn execute(
         &self,
         job: crate::executor::RunJob,
         _: mpsc::Sender<broca_core::OutputEvent>,
     ) -> Result<broca_core::RunSummary, broca_core::RunError> {
+        assert!(
+            job.control.compaction_views.is_some(),
+            "actor omitted the executor's ready inbox"
+        );
         self.0.fetch_add(1, Ordering::Relaxed);
         if let Some(ack) = job.on_admitted {
             let _ = ack.send(Ok(job.req.run_id));
@@ -89,6 +96,15 @@ impl RunExecutor for CountingExecutor {
             final_step_finish_reason: None,
         })
     }
+}
+
+#[tokio::test]
+async fn actor_installs_the_executors_compaction_inbox_on_run_control() {
+    let mut fixture = Fixture::with_ceiling(100).await;
+    let outcome = fixture.send_new(broca_protocol::Delivery::Queue).await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    assert_eq!(fixture.executor.0.load(Ordering::Relaxed), 1);
+    fixture.close().await;
 }
 
 struct Fixture {
@@ -627,10 +643,12 @@ async fn a_ceiling_held_queue_head_stays_pending_without_writes_and_wakes_after_
     });
     writer.sync().await.unwrap();
     fixture.record_ceiling_notice(100, 2).await;
+    let (reply, complete) = tokio::sync::oneshot::channel();
     fixture
         .actor
-        .handle_cmd(LineageCmd::CompactionChanged)
+        .handle_cmd(LineageCmd::CompactionChanged { reply })
         .await;
+    complete.await.unwrap().unwrap();
     assert_eq!(
         fixture.executor.0.load(Ordering::Relaxed),
         1,

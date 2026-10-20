@@ -2746,6 +2746,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // `enabled: false` with every counter at zero; `enabled` is what separates that from an
         // enabled publisher that has simply had nothing to send.
         "bus_events",
+        "compaction_bus",
         // Process-local lifetime operation counts. The isolated operation_counters target proves
         // their zero and non-zero readings; this test keeps their presence in the total key set.
         "stream_chunks",
@@ -2842,6 +2843,17 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
     assert_eq!(metrics["projection_failures"], serde_json::json!(0));
     assert_eq!(metrics["projection_behind_sessions"], serde_json::json!(0));
+    assert_eq!(
+        metrics["compaction_bus"],
+        serde_json::json!({
+            "attached": false,
+            "consumed": 0,
+            "acked": 0,
+            "dropped_unknown_session": 0,
+            "last_error": null,
+        }),
+        "a bus-off daemon has no compaction attachment, deliveries, or bus error"
+    );
     assert_eq!(
         metrics["bus_events"],
         serde_json::json!({

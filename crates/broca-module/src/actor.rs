@@ -226,7 +226,13 @@ pub enum LineageCmd {
     IdleTick,
     /// A durable compaction view/notice or effective model-window change may unblock the
     /// pending head. Refresh its admission snapshot before trying the drain again.
-    CompactionChanged,
+    CompactionChanged {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    ApplyCompaction {
+        ready: broca_core::compaction_provider::notice::ViewReady,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     /// Test-only: report the entry count and serialized size of the admission identity cache.
     #[cfg(test)]
     RetainedAdmissionIdentityState {
@@ -2010,18 +2016,42 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             // IdleTick only re-arms the actor's idle timer; it performs no session work.
             LineageCmd::IdleTick => false,
-            LineageCmd::CompactionChanged => {
+            LineageCmd::CompactionChanged { reply } => {
                 self.prior_snapshot = None;
-                if matches!(self.state, RunState::Idle) {
-                    if let Err(error) = async {
+                let result = if matches!(self.state, RunState::Idle) {
+                    async {
                         self.refresh_admission_view().await?;
                         self.drain_queue_one().await
                     }
                     .await
-                    {
-                        tracing::warn!(%error, "compaction queue wake deferred");
+                } else {
+                    Ok(())
+                };
+                let _ = reply.send(result);
+                false
+            }
+            LineageCmd::ApplyCompaction { ready, reply } => {
+                let result = if matches!(self.state, RunState::Idle) {
+                    let store = self.wal_store.clone();
+                    let key = self.key.clone();
+                    match spawn_blocking(JobKind::WalRead, move || store.read_records(&key)).await {
+                        Ok(Ok(records)) => {
+                            self.executor
+                                .apply_idle_compaction(
+                                    &self.key,
+                                    self.writer.as_ref().expect("writer live while open"),
+                                    records.into_iter().map(|framed| framed.record).collect(),
+                                    &ready,
+                                )
+                                .await
+                        }
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
                     }
-                }
+                } else {
+                    Ok(false)
+                };
+                let _ = reply.send(result);
                 false
             }
             #[cfg(test)]
@@ -2123,7 +2153,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::CutLock { reply } => {
                 drop(reply);
             }
-            LineageCmd::IdleTick | LineageCmd::CompactionChanged => {}
+            LineageCmd::IdleTick
+            | LineageCmd::CompactionChanged { .. }
+            | LineageCmd::ApplyCompaction { .. } => {}
             #[cfg(test)]
             LineageCmd::RetainedAdmissionIdentityState { reply } => {
                 let _ = reply.send((usize::MAX, usize::MAX));
@@ -4207,6 +4239,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             hook_plane: self.executor.hook_plane(),
             elicitation_plane: self.executor.elicitation_plane(),
             compaction_plane: self.executor.compaction_plane(),
+            compaction_views: self.executor.compaction_views(),
             ..Default::default()
         };
         let (admit_tx, admit_rx) = oneshot::channel::<Result<RunId, broca_core::RunError>>();
@@ -6251,7 +6284,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::CutLock { reply } => {
                     drop(reply);
                 }
-                LineageCmd::IdleTick | LineageCmd::CompactionChanged => {}
+                LineageCmd::IdleTick
+                | LineageCmd::CompactionChanged { .. }
+                | LineageCmd::ApplyCompaction { .. } => {}
                 #[cfg(test)]
                 LineageCmd::RetainedAdmissionIdentityState { reply } => {
                     let _ = reply.send((usize::MAX, usize::MAX));

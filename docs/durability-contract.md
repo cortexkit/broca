@@ -140,6 +140,33 @@ Ordinary boundary `view.get` failures have a 30-second in-memory cooldown; ceili
 that cooldown while retaining their original absolute bound. None of these writes or calls
 occur for sessions without a compaction provider.
 
+The startup `bus_run_events_enabled` switch enables both compaction notice publication and
+view-ready consumption. With it off, discovery omits `compaction` and `model_view`, and a plan
+with a compaction item is refused before admission writes. With it on, broca only attaches to
+the pre-provisioned `m_broca` durable pull consumer; it never creates or updates bus topology.
+The consumer uses explicit acknowledgements, deliver-all, a 30-second acknowledgement wait,
+and at most 1,000 pending deliveries, filtering `event.magic-context.compaction.>`.
+
+A valid newer announcement for a known compaction session is committed to `run-index.db`
+before entering the bounded in-memory inbox and before its bus acknowledgement. One receipt
+per session retains the lineage, version, coverage, digest, and receive time, not view content.
+Startup rebuilds the inbox from these receipts before serving; excess sessions stay durable
+and retry through the bounded background reconciler. Applied/refused/superseded receipts are
+cleared only after the WAL's notice records their outcome; completed lineage deletion clears
+that lineage's receipts too. An idle session can apply a validated fitting view using its frozen
+offline renderer, record the updated estimate, then wake and await queue admission before
+clearing the receipt. A parked unfinished episode is not an idle rewrite boundary.
+
+Announcement intake and receipt reconciliation read a small `compaction_facts` projection,
+not the conversation. The existing durable turn and bus projections fold Setup, applied
+versions, notice acknowledgements and refusals into it. When the live WAL's file identity and
+size match the projection's stored identity and verified byte end, no newer frames were appended.
+A missing or behind projection
+uses at most the final 256 KiB plus the small lineage header, then flushes the read handle
+before updating facts. If a gap, oversized frame or unavailable live suffix prevents proof,
+the facts stay unknown and retry later; this path never widens to a full WAL or archive replay. Applying an idle
+view still reconstructs its prompt once, under the actor's single writer.
+
 Runner state is never lost apart from the transcript (compaction-provider/v1 §5.3). Tags, the
 Setup answer, applied views and notices all live in the session's one WAL. The next tag is the
 WAL's highest tag plus one, and retention deletion carries a tag floor to the next lineage. So

@@ -1075,14 +1075,36 @@ impl LineageRegistry {
             self.check_move(key, true)?;
             self.check_expired(key, None).await?;
             let handle = self.actor_for(key).await?;
+            let (reply, receive) = tokio::sync::oneshot::channel();
             if handle
-                .send(crate::actor::LineageCmd::CompactionChanged)
+                .send(crate::actor::LineageCmd::CompactionChanged { reply })
                 .await
                 .is_ok()
             {
-                return Ok(());
+                return receive
+                    .await
+                    .map_err(|_| OpenError::Open("compaction queue wake interrupted".into()))?
+                    .map_err(OpenError::Open);
             }
         }
+    }
+
+    pub async fn route_compaction_ready(
+        &self,
+        key: &LineageKey,
+        ready: broca_core::compaction_provider::notice::ViewReady,
+    ) -> Result<bool, String> {
+        self.check_move(key, true).map_err(|e| e.to_string())?;
+        self.check_expired(key, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let handle = self.actor_for(key).await.map_err(|e| e.to_string())?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle
+            .send(crate::actor::LineageCmd::ApplyCompaction { ready, reply })
+            .await
+            .map_err(|_| "compaction actor closed")?;
+        receive.await.map_err(|_| "compaction actor closed")?
     }
 
     /// Install the admitter for sends carrying a fetch plan. Set once, before serving; only the
