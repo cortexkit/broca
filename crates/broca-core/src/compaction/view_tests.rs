@@ -221,7 +221,7 @@ async fn mismatched_views_are_never_applied() {
         };
         let mut live = state.clone();
         let (decision, event) = runtime
-            .offer_view(&mut live, &view, &ready, LINEAGE, &prompt, true)
+            .offer_view(&mut live, &view, &ready, LINEAGE, &prompt, &prompt, true)
             .await
             .unwrap();
         assert_eq!(decision, expected, "{label}");
@@ -242,7 +242,7 @@ async fn mismatched_views_are_never_applied() {
     }
     // The control: the well-formed view does apply.
     assert_eq!(
-        decide(&good, &ready, &state, LINEAGE, &prompt, true),
+        decide(&good, &ready, &state, LINEAGE, &prompt, &prompt, true),
         Decision::Apply(CompactionViewChoice::Companion {
             edit: companion_edits::STRIP_SIGNED_REASONING.into(),
             strip: CompactionStrip {
@@ -253,7 +253,7 @@ async fn mismatched_views_are_never_applied() {
     );
     // A view of another lineage is never applied.
     assert_eq!(
-        decide(&good, &ready, &state, "lineage-2", &prompt, true),
+        decide(&good, &ready, &state, "lineage-2", &prompt, &prompt, true),
         Decision::Discard
     );
 }
@@ -277,7 +277,7 @@ fn signed_reasoning_is_stripped_or_the_view_deferred() {
     );
     let prompt = conversation();
     let state = after_setup();
-    let companion = decide(&head, &head_ready, &state, LINEAGE, &prompt, true);
+    let companion = decide(&head, &head_ready, &state, LINEAGE, &prompt, &prompt, true);
     assert_eq!(
         companion,
         Decision::Apply(CompactionViewChoice::Companion {
@@ -289,7 +289,7 @@ fn signed_reasoning_is_stripped_or_the_view_deferred() {
         })
     );
     assert_eq!(
-        decide(&head, &head_ready, &state, LINEAGE, &prompt, false),
+        decide(&head, &head_ready, &state, LINEAGE, &prompt, &prompt, false),
         Decision::Apply(CompactionViewChoice::Applied)
     );
 
@@ -307,7 +307,15 @@ fn signed_reasoning_is_stripped_or_the_view_deferred() {
             ViewRange::keep(0, 6),
         ],
     );
-    let deferred = decide(&head_open, &head_open_ready, &state, LINEAGE, &open, true);
+    let deferred = decide(
+        &head_open,
+        &head_open_ready,
+        &state,
+        LINEAGE,
+        &open,
+        &open,
+        true,
+    );
     assert_eq!(deferred, Decision::Defer(defer_reasons::SIGNED_REASONING));
     assert_eq!(
         deferred.event(2).unwrap().token(),
@@ -325,17 +333,30 @@ fn signed_reasoning_is_stripped_or_the_view_deferred() {
         vec![ViewRange::keep(0, 5), ViewRange::replace(5, 6, summary)],
     );
     assert_eq!(
-        decide(&late, &late_ready, &bare, LINEAGE, &prompt, true),
+        decide(&late, &late_ready, &bare, LINEAGE, &prompt, &prompt, true),
         Decision::Apply(CompactionViewChoice::Applied)
     );
 }
 
+/// Offer `view` over a prompt that renders as stored (no tags or guidance folded in).
 async fn apply(
     shared: &Shared,
     state: &mut CompactionState,
     view: &CompactionView,
     ready: &ViewReady,
     prompt: &[Message],
+) -> Decision {
+    apply_over(shared, state, view, ready, prompt, prompt).await
+}
+
+/// Offer `view` over `prompt`, whose stored form (what `session.read` returns) is `stored`.
+async fn apply_over(
+    shared: &Shared,
+    state: &mut CompactionState,
+    view: &CompactionView,
+    ready: &ViewReady,
+    prompt: &[Message],
+    stored: &[Message],
 ) -> Decision {
     let writer = shared.writer();
     let control = crate::RunControl::default();
@@ -348,7 +369,7 @@ async fn apply(
         control: &control,
     };
     let (decision, _) = runtime
-        .offer_view(state, view, ready, LINEAGE, prompt, true)
+        .offer_view(state, view, ready, LINEAGE, prompt, stored, true)
         .await
         .unwrap();
     writer.shutdown().await.unwrap();
@@ -719,13 +740,15 @@ fn after_empty_setup() -> CompactionState {
     state
 }
 
-/// A view is decided over the prompt the request is rendered from. A replace range
-/// copying a signed assistant message from the raw transcript is not a byte-identical copy of
-/// what the model was sent (the tagged text), so it is the provider's own signed content and
-/// is refused. It is never recorded and announced as applied while the request goes out
-/// without it.
+/// A view's own bytes are judged against the stored transcript a provider copies from
+/// (`session.read`'s untagged text), and sent exactly as given (compaction-provider CONTRACT.md
+/// §6: the runner adds nothing inside replaced bytes). So a verbatim copy of a stored, signed
+/// assistant message on a tag-rendering session is accepted, not refused; its bytes differ from
+/// the tagged message the model was sent, so its reasoning, behind a changed prefix, is left out
+/// with the companion strip. A copy whose signed content was edited is the provider's own
+/// signed content and is refused.
 #[tokio::test]
-async fn a_view_is_decided_over_the_bytes_the_request_renders() {
+async fn a_verbatim_copy_of_a_stored_signed_message_is_accepted_and_an_edited_one_refused() {
     let raw = stamped(vec![
         text(Role::User, "q"),
         assistant(vec![
@@ -737,44 +760,62 @@ async fn a_view_is_decided_over_the_bytes_the_request_renders() {
         text(Role::User, "q2"),
     ]);
     let prompt = tagged(&raw);
-    let (view, ready) = make_view(
-        2,
-        1,
-        vec![ViewRange::replace(
-            0,
+    let view_copying = |message: Message| {
+        make_view(
             2,
-            replace_bytes(&[text(Role::User, "summary"), raw[1].clone()]),
-        )],
-    );
+            1,
+            vec![ViewRange::replace(
+                0,
+                2,
+                replace_bytes(&[text(Role::User, "summary"), message]),
+            )],
+        )
+    };
+    let mut edited = raw[1].clone();
+    edited.content[0] = signed("rewritten");
+    let (forged, forged_ready) = view_copying(edited);
     let shared = Shared::default();
     let mut state = after_setup();
-    let decision = apply(&shared, &mut state, &view, &ready, &prompt).await;
     assert_eq!(
-        decision,
+        apply_over(&shared, &mut state, &forged, &forged_ready, &prompt, &raw).await,
         Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
     );
     assert!(shared.records().is_empty());
     assert_eq!(state.applied_view_version(LINEAGE), None);
-    // A view that does apply also renders: one copying the message as the request shows it
-    // (tagged) is accepted, and the request then starts with its summary.
-    let (copying_user, user_ready) = make_view(
-        2,
-        1,
-        vec![ViewRange::replace(
-            0,
-            2,
-            replace_bytes(&[text(Role::User, "summary"), prompt[1].clone()]),
-        )],
+
+    let (verbatim, verbatim_ready) = view_copying(raw[1].clone());
+    assert_eq!(
+        apply_over(
+            &shared,
+            &mut state,
+            &verbatim,
+            &verbatim_ready,
+            &prompt,
+            &raw
+        )
+        .await,
+        Decision::Apply(CompactionViewChoice::Companion {
+            edit: companion_edits::STRIP_SIGNED_REASONING.into(),
+            strip: CompactionStrip {
+                from_ordinal: 3,
+                to_ordinal: 3
+            }
+        })
     );
-    assert!(matches!(
-        apply(&shared, &mut state, &copying_user, &user_ready, &prompt).await,
-        Decision::Apply(_)
-    ));
     let rendered = model_options(&CallOptions::new(prompt.clone()), &state).unwrap();
     assert_eq!(
         rendered.prompt[0].content,
         text(Role::User, "summary").content
     );
+    // The copy goes out as given: the stored text, without the prompt's tag, and without the
+    // reasoning whose prefix changed.
+    assert_eq!(
+        rendered.prompt[1].content,
+        vec![ContentBlock::Text {
+            text: "hello".into()
+        }]
+    );
+    assert_eq!(rendered.prompt[1].ordinal, None);
 }
 
 /// The first difference is found in the bytes the model is sent. A view replacing a
@@ -801,7 +842,7 @@ async fn a_change_only_in_rendered_bytes_still_strips_the_reasoning_after_it() {
     let shared = Shared::default();
     let mut state = after_empty_setup();
     assert_eq!(
-        apply(&shared, &mut state, &view, &ready, &prompt).await,
+        apply_over(&shared, &mut state, &view, &ready, &prompt, &raw).await,
         Decision::Apply(CompactionViewChoice::Companion {
             edit: companion_edits::STRIP_SIGNED_REASONING.into(),
             strip: CompactionStrip {
@@ -838,7 +879,15 @@ fn a_steer_after_the_tool_results_keeps_the_turn_open() {
         ],
     );
     assert_eq!(
-        decide(&view, &ready, &after_setup(), LINEAGE, &prompt, true),
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            &prompt,
+            true
+        ),
         Decision::Defer(defer_reasons::SIGNED_REASONING)
     );
 }
@@ -866,42 +915,43 @@ fn an_open_turn_copied_into_a_replace_range_is_deferred() {
         ],
     );
     assert_eq!(
-        decide(&view, &ready, &after_setup(), LINEAGE, &prompt, true),
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            &prompt,
+            true
+        ),
         Decision::Defer(defer_reasons::SIGNED_REASONING)
     );
 }
 
-/// A recorded view that no longer assembles over the prompt is an error to render, never a
-/// silent fallback to Setup's head without its strips.
-#[tokio::test]
-async fn a_recorded_view_that_no_longer_assembles_is_an_error_not_a_fallback() {
-    let prompt = stamped(vec![
-        text(Role::User, "q"),
-        assistant(vec![
-            signed("plan"),
-            ContentBlock::Text { text: "a".into() },
-        ]),
-        text(Role::User, "q2"),
-    ]);
-    let (view, ready) = make_view(
+/// A recorded view that does not assemble over the prompt is an error to render, never a
+/// silent fallback to Setup's head without its strips. A view that passed its checks always
+/// assembles again, so this takes a record no check passed: a replacement outside broca's
+/// message schema, as a corrupted or foreign WAL could hold.
+#[test]
+fn a_recorded_view_that_does_not_assemble_is_an_error_not_a_fallback() {
+    let prompt = stamped(vec![text(Role::User, "q"), text(Role::User, "q2")]);
+    let (view, _) = make_view(
         2,
-        1,
+        0,
         vec![ViewRange::replace(
             0,
-            2,
-            replace_bytes(&[text(Role::User, "summary"), prompt[1].clone()]),
+            1,
+            json!([{"role":"user","content":[{"type":"image","data":"x"}]}]).to_string(),
         )],
     );
-    let shared = Shared::default();
     let mut state = after_empty_setup();
-    assert!(matches!(
-        apply(&shared, &mut state, &view, &ready, &prompt).await,
-        Decision::Apply(_)
-    ));
-    // The same transcript with different bytes in the copied message: the copy is no longer
-    // byte-identical, so the replacement is the provider's own signed content.
-    let changed = tagged(&prompt);
-    let error = model_options(&CallOptions::new(changed), &state).unwrap_err();
+    state.fold(&WalRecord::CompactionViewApplied {
+        provider: "provider".into(),
+        view_version: 2,
+        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
+        choice: CompactionViewChoice::Applied,
+    });
+    let error = model_options(&CallOptions::new(prompt), &state).unwrap_err();
     assert_eq!(error.view_version, 2);
-    assert_eq!(error.problem, AssemblyProblem::ProviderConstraint);
+    assert!(matches!(error.problem, AssemblyProblem::Rejected(_)));
 }

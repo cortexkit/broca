@@ -1409,7 +1409,8 @@ where
         prior_snapshot,
     )
     .await;
-    let (prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct {
+    let (mut prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct
+    {
         Ok(v) => v,
         Err(e) => {
             if let Some(ack) = on_admitted {
@@ -1418,6 +1419,33 @@ where
             return Err(e);
         }
     };
+    // Compaction notices are numbered per session, not per lineage: the provider and the bus
+    // both key them on the session. A compaction session's lineage that has recorded no notice
+    // yet numbers its first one past every notice of this session's earlier lineages that
+    // retention deleted, as their tombstones recorded. Only a session whose plan names a
+    // compaction provider reads the tombstones, so every other admission does no extra I/O.
+    let frozen_plan = if is_resume {
+        prior.manifest.as_ref()
+    } else {
+        control.manifest.as_ref()
+    };
+    if frozen_plan.is_some_and(|manifest| crate::compaction::has_compaction(manifest))
+        && prior
+            .compaction
+            .state()
+            .is_none_or(|state| state.notice_seq == 0)
+    {
+        match wal_store.retired_notice_floor(&req.session) {
+            Ok(floor) => prior.compaction_notice_floor = floor,
+            Err(error) => {
+                let error = RunError::Wal(error.to_string());
+                if let Some(ack) = on_admitted {
+                    let _ = ack.send(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        }
+    }
 
     // Promote a client's NEXT-TURN send to an append. A FreshOrResume send (append_episode
     // false) over an IDLE lineage is one of two things, and run_id IDENTITY is the only
@@ -1644,19 +1672,6 @@ where
         if let Some(state) = compaction.state() {
             prior.compaction_history = state.history.clone();
         }
-    }
-    // Compaction notices are numbered per session, not per lineage: the provider and the bus
-    // both key them on the session. A lineage that has recorded no notice yet numbers its first
-    // one past every notice of this session's earlier lineages that retention deleted, as their
-    // tombstones recorded.
-    if prior
-        .compaction
-        .state()
-        .is_none_or(|state| state.notice_seq == 0)
-    {
-        prior.compaction_notice_floor = wal_store
-            .retired_notice_floor(&req.session)
-            .map_err(|error| RunError::Wal(error.to_string()))?;
     }
     // Reuse complete snapshots; a bounded suffix cannot prove that older late
     // approvals are terminal without reading the missing prefix.
@@ -3296,6 +3311,7 @@ where
                         &[],
                         control.emit_control_payloads,
                         None,
+                        None,
                     )
                     .await;
                 }
@@ -3368,6 +3384,7 @@ where
                         &[],
                         control.emit_control_payloads,
                         Some(&submit.tool_call_id),
+                        None,
                     )
                     .await;
                 }
@@ -4359,8 +4376,10 @@ where
                         &ready,
                         &lineage_id,
                         // The prompt the request renders from, so the decision sees the bytes
-                        // the model is sent (tags and loop guidance included), not the raw copy.
+                        // the model is sent (tags and loop guidance included); and the stored
+                        // copy, against which the view's own bytes are judged.
                         &opts.prompt,
+                        raw,
                         provider.reasoning_is_prefix_bound(),
                     ))
                     .await?;
@@ -4909,6 +4928,18 @@ where
                     &[],
                     control.emit_control_payloads,
                     None,
+                    ClosingNotice::new(
+                        compaction_state.as_mut(),
+                        compaction_raw.as_mut(),
+                        writer,
+                        &req.session,
+                        &cfg.model,
+                        context_limit,
+                        &compaction_history,
+                        notice_request_bytes,
+                        compaction_notice_floor,
+                    )
+                    .map(|closing| (closing, assembled.content.as_slice())),
                 )
                 .await;
             }
@@ -4948,6 +4979,18 @@ where
                 &[],
                 control.emit_control_payloads,
                 Some(&submit.tool_call_id),
+                ClosingNotice::new(
+                    compaction_state.as_mut(),
+                    compaction_raw.as_mut(),
+                    writer,
+                    &req.session,
+                    &cfg.model,
+                    context_limit,
+                    &compaction_history,
+                    notice_request_bytes,
+                    compaction_notice_floor,
+                )
+                .map(|closing| (closing, assembled.content.as_slice())),
             )
             .await;
         }
@@ -4973,6 +5016,18 @@ where
                     &[],
                     control.emit_control_payloads,
                     None,
+                    ClosingNotice::new(
+                        compaction_state.as_mut(),
+                        compaction_raw.as_mut(),
+                        writer,
+                        &req.session,
+                        &cfg.model,
+                        context_limit,
+                        &compaction_history,
+                        notice_request_bytes,
+                        compaction_notice_floor,
+                    )
+                    .map(|closing| (closing, assembled.content.as_slice())),
                 )
                 .await;
             }
@@ -5049,6 +5104,18 @@ where
                     &budget_firings,
                     control.emit_control_payloads,
                     None,
+                    ClosingNotice::new(
+                        compaction_state.as_mut(),
+                        compaction_raw.as_mut(),
+                        writer,
+                        &req.session,
+                        &cfg.model,
+                        context_limit,
+                        &compaction_history,
+                        notice_request_bytes,
+                        compaction_notice_floor,
+                    )
+                    .map(|closing| (closing, assembled.content.as_slice())),
                 )
                 .await;
             }
@@ -5237,42 +5304,22 @@ where
     // the next send's first boundary: the contract owes a notice after each durable write. The
     // notice follows those records in the WAL and its own barrier makes both durable before the
     // publisher can project it.
-    if let (Some(runtime), Some(state), Some(raw)) = (
+    if let (Some(runtime), Some(closing)) = (
         &compaction_runtime,
-        compaction_state.as_mut(),
-        compaction_raw.as_mut(),
+        ClosingNotice::new(
+            compaction_state.as_mut(),
+            compaction_raw.as_mut(),
+            writer,
+            &req.session,
+            &cfg.model,
+            context_limit,
+            &compaction_history,
+            notice_request_bytes,
+            compaction_notice_floor,
+        ),
     ) {
-        if let Some(lineage_id) = writer.lineage_id().map(|id| id.to_string()) {
-            broca_protocol::content::stamp_ordinals(raw);
-            let announced = state
-                .announced
-                .as_ref()
-                .and_then(|announced| announced.through_ordinal);
-            let appended: usize = raw
-                .iter()
-                .filter(|m| m.ordinal.is_some_and(|o| announced.is_none_or(|a| o > a)))
-                .map(|m| serde_json::to_vec(m).map_or(0, |bytes| bytes.len()))
-                .sum();
-            let (estimate, _) = crate::compaction::request_estimate(
-                notice_request_bytes.saturating_add(appended),
-                &compaction_history,
-            );
-            if let Some(notice) = crate::compaction::view::next_notice(
-                state,
-                raw,
-                crate::compaction::view::NoticeFacts {
-                    session_ref: crate::wal_writer::agent_session_ref(&req.session),
-                    lineage_id: &lineage_id,
-                    est_tokens: estimate,
-                    model: &cfg.model.model_id,
-                    window: context_limit,
-                    usage: compaction_history.usage(),
-                    events: Vec::new(),
-                    seq_floor: compaction_notice_floor,
-                },
-            ) {
-                runtime.record_notice(state, notice).await?;
-            }
+        if let Some((state, notice)) = closing.notice(&[], &[]) {
+            runtime.record_notice(state, notice).await?;
         }
     }
     // A completed run admitted with structured output records what it produced in the same
@@ -7595,6 +7642,129 @@ fn interrupted_result(id: &ToolCallId) -> ToolResult {
     }
 }
 
+/// The advance notice a compaction session records when its run ends, announcing the writes
+/// after its last step boundary (the final answer, and the results of a hard stop) before the
+/// terminal (compaction-provider CONTRACT.md §5: a notice after each durable write). `None`
+/// for a session without compaction, or a WAL that has no lineage id yet.
+struct ClosingNotice<'a> {
+    state: &'a mut crate::compaction::CompactionState,
+    raw: &'a mut Vec<Message>,
+    lineage_id: String,
+    session: &'a broca_protocol::BindIdentity,
+    model: &'a broca_protocol::ModelHandle,
+    window: Option<u64>,
+    history: &'a crate::compaction::CompactionHistory,
+    request_bytes: usize,
+    floor: u64,
+}
+
+impl<'a> ClosingNotice<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        state: Option<&'a mut crate::compaction::CompactionState>,
+        raw: Option<&'a mut Vec<Message>>,
+        writer: &WalHandle,
+        session: &'a broca_protocol::BindIdentity,
+        model: &'a broca_protocol::ModelHandle,
+        window: Option<u64>,
+        history: &'a crate::compaction::CompactionHistory,
+        request_bytes: usize,
+        floor: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            state: state?,
+            raw: raw?,
+            lineage_id: writer.lineage_id()?.to_string(),
+            session,
+            model,
+            window,
+            history,
+            request_bytes,
+            floor,
+        })
+    }
+
+    /// The notice for the transcript after `assistant` (the run's last model message, when it
+    /// is not in the transcript copy yet) and the tool `results` written after it, or `None`
+    /// when there is nothing new or the notice would be malformed.
+    fn notice(
+        self,
+        assistant: &[ContentBlock],
+        results: &[ToolResult],
+    ) -> Option<(
+        &'a mut crate::compaction::CompactionState,
+        crate::compaction_provider::notice::AdvanceNotice,
+    )> {
+        if !assistant.is_empty() {
+            self.raw.push(Message::assistant_from(
+                assistant.to_vec(),
+                self.model.clone(),
+            ));
+        }
+        if !results.is_empty() {
+            self.raw.push(Message::new(
+                Role::Tool,
+                results
+                    .iter()
+                    .cloned()
+                    .map(ContentBlock::ToolResult)
+                    .collect(),
+            ));
+        }
+        broca_protocol::content::stamp_ordinals(self.raw);
+        let announced = self
+            .state
+            .announced
+            .as_ref()
+            .and_then(|announced| announced.through_ordinal);
+        let appended: usize = self
+            .raw
+            .iter()
+            .filter(|m| m.ordinal.is_some_and(|o| announced.is_none_or(|a| o > a)))
+            .map(|m| serde_json::to_vec(m).map_or(0, |bytes| bytes.len()))
+            .sum();
+        let (estimate, _) = crate::compaction::request_estimate(
+            self.request_bytes.saturating_add(appended),
+            self.history,
+        );
+        let notice = crate::compaction::view::next_notice(
+            self.state,
+            self.raw,
+            crate::compaction::view::NoticeFacts {
+                session_ref: crate::wal_writer::agent_session_ref(self.session),
+                lineage_id: &self.lineage_id,
+                est_tokens: estimate,
+                model: &self.model.model_id,
+                window: self.window,
+                usage: self.history.usage(),
+                events: Vec::new(),
+                seq_floor: self.floor,
+            },
+        )?;
+        notice.check().ok()?;
+        Some((self.state, notice))
+    }
+
+    /// Record the notice for a hard stop's step in the hard stop's own barrier: queued here
+    /// after its synthetic results, made durable with them and the terminal by the one sync
+    /// the hard stop owes, and only then visible to the publisher.
+    fn record_with_terminal(
+        self,
+        writer: &WalHandle,
+        assistant: &[ContentBlock],
+        results: &[ToolResult],
+    ) {
+        if let Some((state, notice)) = self.notice(assistant, results) {
+            let record = WalRecord::CompactionNotice {
+                seq: notice.seq,
+                headers: notice.to_headers(),
+            };
+            writer.record(record.clone());
+            state.fold(&record);
+        }
+    }
+}
+
 /// Finalize a hard stop (a stop/max-steps condition fired while the model's last step
 /// still had PENDING, never-dispatched tool calls). Persists a provider-valid terminal
 /// for each pending call (so the durable turn isn't a dangling tool_use the model would
@@ -7630,6 +7800,7 @@ async fn finalize_hard_stop(
     budget_firings: &[BudgetFiring],
     emit_control_payloads: bool,
     submitted: Option<&ToolCallId>,
+    closing: Option<(ClosingNotice<'_>, &[ContentBlock])>,
 ) -> Result<RunSummary, RunError> {
     let batch_id = BatchId(format!("{}-b{}", resolved_run_id.0, step_id.0));
     let call_ids: Vec<ToolCallId> = pending.iter().map(|c| c.tool_call_id.clone()).collect();
@@ -7715,6 +7886,9 @@ async fn finalize_hard_stop(
     writer.record(WalRecord::ToolBatchFinished { batch_id });
     writer.record(WalRecord::TurnFinished { step_id });
     record_budget_firings(writer, resolved_run_id, budget_firings);
+    if let Some((closing, assistant)) = closing {
+        closing.record_with_terminal(writer, assistant, &results);
+    }
     // The terminal goes in the SAME barrier as the repair batch (no intermediate sync).
     control.close_steers();
     writer.record(WalRecord::RunFinished {

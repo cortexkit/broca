@@ -14,7 +14,9 @@ use broca_wal::{CompactionStrip, CompactionViewChoice, OpaqueJson};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{conversation, is_signed, native_message, CompactionState, Conversation};
+use super::{
+    conversation, is_signed, native_message, native_schema_message, CompactionState, Conversation,
+};
 use crate::compaction_provider::{
     ceiling::{CeilingDecision, CeilingPolicy, WaitEnd},
     digest::content_digest,
@@ -110,7 +112,24 @@ pub fn assemble(
     view: &CompactionView,
     prompt: &[Message],
 ) -> Result<Vec<Message>, AssemblyProblem> {
+    assemble_judged(view, prompt, None)
+}
+
+/// [`assemble`], also judging who wrote the view's bytes when `stored` is given: the transcript
+/// as stored, which is what `session.read` returns and what a provider copies from (the prompt
+/// shows the same messages with runner tags and loop guidance folded into their text). A
+/// replace-range message or an edited part that carries signed or encrypted reasoning,
+/// provider-signed text or a model origin must be a byte-identical copy of the stored message
+/// or part it stands for; otherwise only the model could have written it.
+fn assemble_judged(
+    view: &CompactionView,
+    prompt: &[Message],
+    stored: Option<&[Message]>,
+) -> Result<Vec<Message>, AssemblyProblem> {
     use crate::compaction_provider::view::ViewRange;
+    let stored_at = |ordinal: u64| {
+        stored.and_then(|stored| transcript(stored).find(|m| m.ordinal == Some(ordinal)))
+    };
     let in_range = |from: u64, to: u64| {
         transcript(prompt).filter(move |m| m.ordinal.is_some_and(|o| o >= from && o < to))
     };
@@ -134,9 +153,12 @@ pub fn assemble(
                             Some(edit) if edit.drop => {}
                             Some(edit) => {
                                 let bytes = edit.bytes.as_deref().unwrap_or_default();
+                                let original = stored
+                                    .is_some()
+                                    .then(|| stored_at(ordinal).and_then(|m| m.content.get(index)));
                                 edited
                                     .content
-                                    .push(edited_part(bytes, block, message.role)?);
+                                    .push(edited_part(bytes, original, message.role)?);
                             }
                         }
                     }
@@ -146,10 +168,18 @@ pub fn assemble(
             ViewRange::Replace { from, to, bytes } => {
                 let values: Vec<Value> = serde_json::from_str(bytes)
                     .map_err(|_| AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray))?;
-                let carried: Vec<Message> = in_range(*from, *to).cloned().collect();
+                let carried: Option<Vec<Message>> = stored.map(|stored| {
+                    transcript(stored)
+                        .filter(|m| m.ordinal.is_some_and(|o| o >= *from && o < *to))
+                        .cloned()
+                        .collect()
+                });
                 for value in &values {
-                    let mut message = native_message(value, &carried)
-                        .ok_or_else(|| replacement_problem(value))?;
+                    let message = match &carried {
+                        Some(carried) => native_message(value, carried),
+                        None => native_schema_message(value),
+                    };
+                    let mut message = message.ok_or_else(|| replacement_problem(value))?;
                     message.ordinal = None;
                     out.push(message);
                 }
@@ -182,9 +212,11 @@ fn replacement_problem(value: &Value) -> AssemblyProblem {
 /// One edited part: `bytes` decoded as a content block of broca's schema. A block that only
 /// the model may author (signed or encrypted reasoning, provider-signed text) is accepted only
 /// as a byte-identical copy of the part it replaces.
+/// `original` is the stored part the edit replaces, when the caller judges authorship
+/// (`Some(None)` when there is no such stored part); `None` to skip that judgement.
 fn edited_part(
     bytes: &str,
-    original: &ContentBlock,
+    original: Option<Option<&ContentBlock>>,
     role: Role,
 ) -> Result<ContentBlock, AssemblyProblem> {
     let value: Value = serde_json::from_str(bytes)
@@ -195,26 +227,39 @@ fn edited_part(
         Ok(mut message) if super::native_fields(&probe) => message.content.remove(0),
         _ => return Err(AssemblyProblem::Rejected(ViewProblem::EditNotJson)),
     };
-    if is_signed(&block) && &block != original {
-        return Err(AssemblyProblem::ProviderConstraint);
+    if let Some(original) = original {
+        if is_signed(&block) && original != Some(&block) {
+            return Err(AssemblyProblem::ProviderConstraint);
+        }
     }
     Ok(block)
 }
 
 /// Remove signed reasoning from every transcript message whose ordinal lies in one of
-/// `strips`. Provider messages carry no ordinal and are never touched.
-pub fn apply_strips(history: &mut [Message], strips: &[CompactionStrip]) {
+/// `strips`, and, when `copies`, from every message the provider wrote into the view (those
+/// carry no ordinal): a copy of a signed message stands behind a changed prefix by
+/// construction.
+pub fn apply_strips(history: &mut [Message], strips: &[CompactionStrip], copies: bool) {
     for message in history {
-        let Some(ordinal) = message.ordinal else {
-            continue;
+        let stripped = match message.ordinal {
+            None => copies,
+            Some(ordinal) => strips
+                .iter()
+                .any(|strip| ordinal >= strip.from_ordinal && ordinal < strip.to_ordinal),
         };
-        if strips
-            .iter()
-            .any(|strip| ordinal >= strip.from_ordinal && ordinal < strip.to_ordinal)
-        {
+        if stripped {
             message.content.retain(|block| !is_prefix_bound(block));
         }
     }
+}
+
+/// Whether the applied view went with the companion strip, which also covers the signed
+/// reasoning of the messages the provider copied into it.
+fn strips_copies(state: &CompactionState) -> bool {
+    state
+        .view
+        .as_ref()
+        .is_some_and(|applied| matches!(applied.choice, CompactionViewChoice::Companion { .. }))
 }
 
 /// Signed or encrypted reasoning: the blocks a model provider that binds reasoning to its
@@ -236,7 +281,7 @@ pub fn is_prefix_bound(block: &ContentBlock) -> bool {
 pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Message> {
     if let Some(applied) = &state.view {
         if let Ok(mut history) = assemble(&applied.view, prompt) {
-            apply_strips(&mut history, &state.strips);
+            apply_strips(&mut history, &state.strips, strips_copies(state));
             return history;
         }
     }
@@ -304,7 +349,9 @@ impl Decision {
 /// `prompt` is the prompt the next request is rendered from, exactly as [`render`] gets it:
 /// ordinals stamped, runner tags and loop guidance already in its text. The decision and the
 /// request must see the same bytes, or a view could be judged unchanged where the request
-/// changes, or judged renderable where the request cannot assemble it.
+/// changes. `stored` is the same transcript as stored (what `session.read` returns, without
+/// the folded tags and guidance), against which the view's own bytes are judged for who wrote
+/// them.
 ///
 /// First the role's fixed checks (`dispose_fetched`: asked for, well formed, announced digest,
 /// newer, a prefix of this transcript, every edited part exists). Then broca's own: the view's
@@ -323,12 +370,14 @@ impl Decision {
 /// view with the companion strip (`view_companion:<v>:strip_signed_reasoning`) over the
 /// ordinals from the first invalidated block to the end of the transcript. Messages written
 /// after the view applies are produced against its prefix and keep their reasoning.
+#[allow(clippy::too_many_arguments)]
 pub fn decide(
     view: &CompactionView,
     ready: &ViewReady,
     state: &CompactionState,
     lineage_id: &str,
     prompt: &[Message],
+    stored: &[Message],
     prefix_bound: bool,
 ) -> Decision {
     let entries: BTreeMap<u64, TranscriptMessage> = transcript(prompt)
@@ -345,7 +394,14 @@ pub fn decide(
         ViewDisposition::Discard => return Decision::Discard,
         ViewDisposition::Refuse(reason) => return Decision::Refuse(reason),
     }
-    let mut next = match assemble(view, prompt) {
+    // Authorship is judged against the stored transcript a provider copies from. The bytes a
+    // view gives are sent exactly as given (compaction-provider CONTRACT.md §6: "replaced bytes
+    // are final ... the runner adds nothing inside replaced bytes"), so a verbatim copy of a
+    // stored message is accepted, never refused, and goes out without the runner tags and loop
+    // guidance the prompt shows on the original; the difference that makes is judged below like
+    // any other change. Do not fold tags into the copy to make it match: that would put runner
+    // bytes inside replaced bytes.
+    let mut next = match assemble_judged(view, prompt, Some(stored)) {
         Ok(history) => history,
         Err(AssemblyProblem::Rejected(problem)) => return Decision::Rejected(problem),
         Err(AssemblyProblem::ProviderConstraint) => {
@@ -359,7 +415,7 @@ pub fn decide(
         }
         Err(Conversation::RoleOrder) => return Decision::Refuse(refusal_reasons::ROLE_ORDER),
     }
-    apply_strips(&mut next, &state.strips);
+    apply_strips(&mut next, &state.strips, false);
     if !prefix_bound {
         return Decision::Apply(CompactionViewChoice::Applied);
     }
@@ -375,13 +431,19 @@ pub fn decide(
         .filter(|message| message.content.iter().any(is_prefix_bound))
         .filter_map(|message| message.ordinal)
         .collect();
-    let Some(from_ordinal) = invalidated.iter().min().copied() else {
+    let invalidated_copies = next[first..]
+        .iter()
+        .any(|message| message.ordinal.is_none() && message.content.iter().any(is_prefix_bound));
+    if invalidated.is_empty() && !invalidated_copies {
         return Decision::Apply(CompactionViewChoice::Applied);
-    };
+    }
     let to_ordinal = transcript(prompt)
         .filter_map(|message| message.ordinal)
         .max()
         .map_or(0, |last| last + 1);
+    // With only copies invalidated the recorded range is empty; the companion choice itself
+    // strips the copies' reasoning when the view renders.
+    let from_ordinal = invalidated.iter().min().copied().unwrap_or(to_ordinal);
     Decision::Apply(CompactionViewChoice::Companion {
         edit: companion_edits::STRIP_SIGNED_REASONING.into(),
         strip: CompactionStrip {
@@ -452,7 +514,7 @@ pub(crate) fn render(
             }))
         }
     };
-    apply_strips(&mut history, &state.strips);
+    apply_strips(&mut history, &state.strips, strips_copies(state));
     let mut prompt: Vec<_> = opts
         .prompt
         .iter()

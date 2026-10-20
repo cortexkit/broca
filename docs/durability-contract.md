@@ -104,12 +104,17 @@ things. `compaction_view_applied` records a provider view at the step boundary b
 that first renders it, with how it was applied: as published, or with the companion strip of
 signed reasoning a model provider binds to its prefix. A resumed run renders it from that record
 alone, byte for byte, without asking the provider again. The decision to apply a view is made
-over the prompt the request is rendered from (runner tags and loop guidance included), and a
-recorded view that no longer assembles over it fails the step rather than render anything else.
+over the prompt the request is rendered from (runner tags and loop guidance included). The view's
+own bytes are judged against the stored transcript a provider copies from and sent exactly as
+given (compaction-provider §6), so a verbatim copy of a stored message is accepted, and the
+change its untagged bytes make is stripped or deferred like any other. A recorded view that no
+longer assembles fails the step rather than render anything else.
 `compaction_notice` records an advance notice, with its sequence number and headers, before the
 bus publisher can project and publish it, so a republish after a crash reuses its number. A
 notice is recorded after the writes of each step boundary (input, steers, tool results, an
-applied view) and after a run's last answer, before its terminal. A Setup `compaction_message` that carries
+applied view) and after a run's last step, before its terminal: its final answer, or the step a
+max-steps or budget stop or a structured-output submit ends on, in that stop's own barrier.
+Only a session whose plan names a compaction provider reads the tombstones for the notice floor. A Setup `compaction_message` that carries
 the provider's ceiling policy is gated too. A Setup record without one keeps the
 `compaction/v1` frame the removed synchronous client wrote. That client's records
 (`compaction_request`, step `compaction_message`s, `compaction_answer`, `compaction_wait`) are

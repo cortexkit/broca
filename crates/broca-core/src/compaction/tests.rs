@@ -1098,3 +1098,237 @@ async fn the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends() {
         "the old signature is not sent over the changed first message"
     );
 }
+
+/// A WAL store that counts how often admission asks it for the notice floor.
+struct CountingFloor {
+    inner: Shared,
+    floor_reads: AtomicUsize,
+}
+impl crate::WalStore for CountingFloor {
+    fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+        crate::WalStore::open(&self.inner, session)
+    }
+    fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+        crate::WalStore::read_records(&self.inner, session)
+    }
+    fn retired_notice_floor(&self, _: &BindIdentity) -> Result<u64, WalError> {
+        self.floor_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    }
+}
+
+async fn floor_reads(control: crate::RunControl) -> usize {
+    let store = CountingFloor {
+        inner: Shared::default(),
+        floor_reads: AtomicUsize::new(0),
+    };
+    let writer = store.inner.writer();
+    let model = crate::StubProvider::new(vec![model_events()]);
+    let (out, _events) = tokio::sync::mpsc::channel(128);
+    crate::run_loop_on_writer(
+        request(),
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &store,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    let _ = writer.shutdown().await;
+    store.floor_reads.load(Ordering::SeqCst)
+}
+
+/// Admission reads the retention tombstones for the notice floor only for a session whose plan
+/// names a compaction provider: a session without compaction does exactly the I/O it did before
+/// compaction notices existed.
+#[tokio::test]
+async fn only_a_compaction_session_reads_the_notice_floor() {
+    assert_eq!(floor_reads(crate::RunControl::default()).await, 0);
+    assert_eq!(
+        floor_reads(crate::RunControl {
+            manifest: Some(manifest()),
+            compaction_plane: Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            })),
+            ..Default::default()
+        })
+        .await,
+        1
+    );
+}
+
+/// The stub provider, answering with a structured-output run frozen in its render config
+/// when `submit` is set, as a provider admitted with `submit_tool` does.
+struct EndingModel {
+    stub: crate::StubProvider,
+    submit: bool,
+}
+#[async_trait::async_trait]
+impl crate::Provider for EndingModel {
+    async fn step(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: &CallOptions,
+    ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        self.stub.step(step_id, opts).await
+    }
+    fn render_config_blob(&self) -> Value {
+        if self.submit {
+            json!({"render_config":"stateless","structured_output":{
+                "mode":"submit_tool","name":"result","schema_jcs":"{}",
+                "enforcement":"best_effort","delivery":"unconstrained"}})
+        } else {
+            json!({"render_config":"stateless"})
+        }
+    }
+}
+
+/// One model step that calls `tool` with `input_tokens` of reported usage.
+fn tool_call_events(tool: &str, input_tokens: u64) -> Vec<broca_protocol::NormalizedEvent> {
+    use broca_protocol::{NormalizedEvent, ProviderControl};
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: broca_protocol::AssistantMessage {
+                message_id: broca_protocol::MessageId("a".into()),
+                content: vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+                    tool_name: tool.into(),
+                    input: json!({"answer": 42}),
+                    thought_signature: None,
+                })],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(1),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ]
+}
+
+/// Run a compaction session whose one model step calls `tool`, with the request changed by
+/// `adjust`, and return its WAL and how the run ended.
+async fn ending_run(
+    tool: &str,
+    input_tokens: u64,
+    submit: bool,
+    adjust: impl FnOnce(&mut Value),
+) -> (Vec<WalRecord>, RunFinishReason) {
+    let mut submission = json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[{"role":"user","content":[{"type":"text","text":"user"}]}],
+        "tools":[{"name":"edit","description":"edit","input_schema":{"type":"object"}}]
+    });
+    adjust(&mut submission);
+    let mut request = crate::RunRequest::from_submission(
+        serde_json::from_value(submission).unwrap(),
+        broca_protocol::RunId("run".into()),
+        bind(),
+        broca_protocol::SubmissionId("sub".into()),
+    );
+    request.policy_allowed.insert("edit".into());
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let model = EndingModel {
+        stub: crate::StubProvider::new(vec![tool_call_events(tool, input_tokens)]),
+        submit,
+    };
+    let (out, _events) = tokio::sync::mpsc::channel(128);
+    let summary = crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &shared,
+        None,
+        crate::RunControl {
+            manifest: Some(manifest()),
+            compaction_plane: Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            })),
+            ..Default::default()
+        },
+        &out,
+    )
+    .await
+    .unwrap();
+    let _ = writer.shutdown().await;
+    (shared.records(), summary.reason)
+}
+
+/// A run that ends at a hard stop announces the step it ended on (the model's tool call and the
+/// synthetic results the stop writes) before its terminal, in the stop's own barrier.
+fn assert_closing_notice(records: &[WalRecord], kind: &str) {
+    let finished = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunFinished { .. }))
+        .unwrap_or_else(|| panic!("{kind}: no terminal"));
+    let last_result = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::ToolResult { .. }))
+        .unwrap_or_else(|| panic!("{kind}: no synthetic result"));
+    let notice = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::CompactionNotice { .. }))
+        .unwrap_or_else(|| panic!("{kind}: no notice"));
+    assert!(
+        last_result < notice && notice < finished,
+        "{kind}: the closing notice follows the step's results and precedes the terminal"
+    );
+    let WalRecord::CompactionNotice { headers, .. } = &records[notice] else {
+        unreachable!()
+    };
+    // The user message, the tool call and its result: ordinals 0, 1, 2.
+    assert_eq!(headers["through_ordinal"], "2", "{kind}");
+    let seqs = notice_seqs(records);
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>(), "{kind}");
+}
+
+#[tokio::test]
+async fn a_max_steps_stop_with_pending_calls_announces_its_step() {
+    let (records, reason) = ending_run("edit", 1, false, |request| {
+        request["stop_when"] = json!([{"type":"step_count","n":1}]);
+    })
+    .await;
+    assert_eq!(reason, RunFinishReason::MaxSteps);
+    assert_closing_notice(&records, "max steps");
+}
+
+#[tokio::test]
+async fn a_budget_stop_with_pending_calls_announces_its_step() {
+    let (records, reason) = ending_run("edit", 1_000, false, |request| {
+        request["budget"] = json!({"max_input_tokens": 10});
+    })
+    .await;
+    assert_eq!(reason, RunFinishReason::BudgetExhausted);
+    assert_closing_notice(&records, "budget");
+}
+
+#[tokio::test]
+async fn a_structured_output_submit_announces_its_step() {
+    let (records, reason) = ending_run(
+        broca_protocol::structured_output::SUBMIT_RESULT_TOOL,
+        1,
+        true,
+        |_| {},
+    )
+    .await;
+    assert_eq!(reason, RunFinishReason::Completed);
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::StructuredOutputResult { .. })));
+    assert_closing_notice(&records, "structured output submit");
+}

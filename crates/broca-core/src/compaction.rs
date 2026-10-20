@@ -468,13 +468,7 @@ fn native_replacement(
 /// provider, and may then carry no model origin, signed or encrypted reasoning, or
 /// provider-signed text: those would claim the model wrote what the provider wrote.
 pub(crate) fn native_message(value: &Value, carried: &[Message]) -> Option<Message> {
-    if !native_fields(value) {
-        return None;
-    }
-    let message: Message = serde_json::from_value(value.clone()).ok()?;
-    if message.cache_prefix_blocks.is_some() || message.role == Role::System {
-        return None;
-    }
+    let message = native_schema_message(value)?;
     let unchanged = carried
         .iter()
         .any(|original| encoded(original) == encoded(&message));
@@ -490,6 +484,19 @@ pub(crate) fn native_message(value: &Value, carried: &[Message]) -> Option<Messa
         }) {
             return None;
         }
+    }
+    Some(message)
+}
+
+/// One provider-written message in broca's schema, without judging who wrote its content: no
+/// unknown members, no cache marker, and not a system message.
+pub(crate) fn native_schema_message(value: &Value) -> Option<Message> {
+    if !native_fields(value) {
+        return None;
+    }
+    let message: Message = serde_json::from_value(value.clone()).ok()?;
+    if message.cache_prefix_blocks.is_some() || message.role == Role::System {
+        return None;
     }
     Some(message)
 }

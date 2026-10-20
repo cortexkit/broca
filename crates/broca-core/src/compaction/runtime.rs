@@ -279,6 +279,7 @@ impl Runtime<'_> {
     /// reports for it, if any. The caller holds a deferred view and offers it again at a later
     /// boundary.
     ///
+    #[allow(clippy::too_many_arguments)]
     pub async fn offer_view(
         &self,
         state: &mut CompactionState,
@@ -286,6 +287,7 @@ impl Runtime<'_> {
         ready: &crate::compaction_provider::notice::ViewReady,
         lineage_id: &str,
         prompt: &[Message],
+        stored: &[Message],
         prefix_bound: bool,
     ) -> Result<
         (
@@ -294,7 +296,15 @@ impl Runtime<'_> {
         ),
         crate::RunError,
     > {
-        let decision = view::decide(fetched, ready, state, lineage_id, prompt, prefix_bound);
+        let decision = view::decide(
+            fetched,
+            ready,
+            state,
+            lineage_id,
+            prompt,
+            stored,
+            prefix_bound,
+        );
         if let view::Decision::Apply(choice) = &decision {
             self.apply_view(state, fetched, choice.clone()).await?;
         }

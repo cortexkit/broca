@@ -17614,8 +17614,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends"]
 file = "crates/broca-core/src/run.rs"
-old = "                        &opts.prompt,\n                        provider.reasoning_is_prefix_bound(),"
-new = "                        raw, // NON-VACUITY BREAK: decide over the raw copy\n                        provider.reasoning_is_prefix_bound(),"
+old = "                        &opts.prompt,\n                        raw,\n                        provider.reasoning_is_prefix_bound(),"
+new = "                        raw, // NON-VACUITY BREAK: decide over the raw copy\n                        raw,\n                        provider.reasoning_is_prefix_bound(),"
 
 [[control]]
 id = "compaction-notice-floor-across-lineages"
@@ -17626,8 +17626,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::a_new_lineage_numbers_its_notices_past_the_deleted_lineages"]
 file = "crates/broca-core/src/run.rs"
-old = "        prior.compaction_notice_floor = wal_store\n            .retired_notice_floor(&req.session)\n            .map_err(|error| RunError::Wal(error.to_string()))?;"
-new = "        let _ = wal_store; // NON-VACUITY BREAK: restart notice numbering at 1"
+old = "            Ok(floor) => prior.compaction_notice_floor = floor,"
+new = "            Ok(_floor) => {} // NON-VACUITY BREAK: restart notice numbering at 1"
 
 [[control]]
 id = "compaction-notice-projected-into-the-outbox"
@@ -17655,3 +17655,40 @@ expect_red = ["retention::tests::deletion_records_the_next_notice_seq_and_keeps_
 file = "crates/broca-module/src/retention.rs"
 old = "            .chain(own_next_notice_seq)"
 new = "            .chain(None::<u64>.filter(|_| own_next_notice_seq.is_some())) // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-notice-floor-read-only-for-compaction-sessions"
+guards = "admission reads the retention tombstones for the notice floor only for a session whose plan names a compaction provider"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::only_a_compaction_session_reads_the_notice_floor"]
+file = "crates/broca-core/src/run.rs"
+old = "    if frozen_plan.is_some_and(|manifest| crate::compaction::has_compaction(manifest))"
+new = "    if frozen_plan.is_some_and(|_| true) // NON-VACUITY BREAK: read for every session"
+
+[[control]]
+id = "compaction-view-authorship-judged-against-the-stored-transcript"
+guards = "a verbatim copy of a stored signed message in a view is judged against the stored transcript and accepted, not refused because the prompt shows it tagged"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_verbatim_copy_of_a_stored_signed_message_is_accepted_and_an_edited_one_refused"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "assemble_judged(view, prompt, Some(stored))"
+new = "assemble_judged(view, prompt, Some(prompt)) /* NON-VACUITY BREAK: judge against the tagged prompt */"
+
+[[control]]
+id = "compaction-hard-stop-records-its-closing-notice"
+guards = "a run ending at a hard stop or a structured-output submit announces its last step in the stop's own barrier, before the terminal"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_max_steps_stop_with_pending_calls_announces_its_step"]
+only = false
+file = "crates/broca-core/src/run.rs"
+old = "        closing.record_with_terminal(writer, assistant, &results);"
+new = "        let _ = (closing, assistant); // NON-VACUITY BREAK: no closing notice"

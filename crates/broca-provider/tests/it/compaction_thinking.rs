@@ -468,7 +468,15 @@ fn an_asynchronous_view_strips_invalidated_thinking_or_waits_for_the_open_tool_t
     let state = prior.compaction.state().unwrap().clone();
     let mut prompt = prior.prompt.clone();
     stamp_ordinals(&mut prompt);
-    let decision = decide(&view, &ready, &state, "lineage", &prompt, prefix_bound);
+    let decision = decide(
+        &view,
+        &ready,
+        &state,
+        "lineage",
+        &prompt,
+        &prompt,
+        prefix_bound,
+    );
     let Decision::Apply(choice @ broca_wal::CompactionViewChoice::Companion { .. }) = decision
     else {
         panic!("thinking after the fold needs the companion strip: {decision:?}");
@@ -520,7 +528,7 @@ fn an_asynchronous_view_strips_invalidated_thinking_or_waits_for_the_open_tool_t
     ));
     stamp_ordinals(&mut open);
     assert_eq!(
-        decide(&view, &ready, &state, "lineage", &open, prefix_bound),
+        decide(&view, &ready, &state, "lineage", &open, &open, prefix_bound),
         Decision::Defer("signed_reasoning")
     );
 }
