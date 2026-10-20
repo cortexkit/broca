@@ -7,6 +7,8 @@
 
 use super::*;
 use futures::SinkExt;
+use std::collections::{hash_map::RandomState, HashSet};
+use std::hash::BuildHasher;
 use std::sync::{atomic::AtomicU16, Mutex, RwLock};
 use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async_with_config, tungstenite::client::IntoClientRequest};
@@ -25,6 +27,189 @@ const BETA: &str = "responses_websockets=2026-02-06";
 // Only the first 512 bytes of a refused upgrade's body are read, and only to recognise a ChatGPT
 // usage-limit refusal (whose body is about 200 bytes). The body is never logged or stored.
 const UPGRADE_BODY_CLASSIFY_LIMIT: usize = 512;
+
+const DISTINCT_LIMIT: usize = 4096;
+
+#[derive(Default)]
+struct DistinctHashes {
+    hashes: HashSet<u64>,
+    hasher: RandomState,
+    overflow: bool,
+}
+
+impl DistinctHashes {
+    fn observe(&mut self, text: &str) {
+        let hash = self.hasher.hash_one(text);
+        if self.hashes.contains(&hash) {
+            return;
+        }
+        if self.hashes.len() < DISTINCT_LIMIT {
+            self.hashes.insert(hash);
+        } else {
+            self.overflow = true;
+        }
+    }
+}
+
+// Socket counters include frames read ahead of the normalizer, but exclude idle gaps by
+// subtracting the snapshot taken when an attempt acquires the socket.
+#[derive(Default)]
+struct FrameCounts {
+    response_create_sent: AtomicU64,
+    other_text_sent: AtomicU64,
+    pongs_sent: AtomicU64,
+    text_received: AtomicU64,
+    pings_received: AtomicU64,
+    pongs_received: AtomicU64,
+    closes_received: AtomicU64,
+}
+
+impl FrameCounts {
+    fn snapshot(&self) -> [u64; 7] {
+        [
+            &self.response_create_sent,
+            &self.other_text_sent,
+            &self.pongs_sent,
+            &self.text_received,
+            &self.pings_received,
+            &self.pongs_received,
+            &self.closes_received,
+        ]
+        .map(|count| count.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct AttemptObservation {
+    frames: Option<(Arc<FrameCounts>, [u64; 7])>,
+    close_code: Option<Arc<AtomicU16>>,
+    generation: Option<u64>,
+    reused: Option<bool>,
+    age_ms: Option<u64>,
+    response_create_enqueued: u64,
+    sequence_count: u64,
+    sequence_min: Option<u64>,
+    sequence_max: Option<u64>,
+    sequence_repeated_or_backwards: u64,
+    response_ids: DistinctHashes,
+    item_ids: DistinctHashes,
+    output_index_max: Option<u64>,
+    argument_deltas: u64,
+    argument_delta_bytes: u64,
+    whitespace_deltas: u64,
+    delta_hashes: DistinctHashes,
+    wrapped_error_code: Option<&'static str>,
+}
+
+impl AttemptObservation {
+    pub(super) fn observe_text(&mut self, raw: &[u8]) {
+        let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+            return;
+        };
+        if let Some(sequence) = value.get("sequence_number").and_then(Value::as_u64) {
+            self.sequence_count += 1;
+            // Compare with the high-water mark, so replaying an older range is counted
+            // throughout the replay, not just at its first backwards jump.
+            if self.sequence_max.is_some_and(|max| sequence <= max) {
+                self.sequence_repeated_or_backwards += 1;
+            }
+            self.sequence_min = Some(self.sequence_min.map_or(sequence, |min| min.min(sequence)));
+            self.sequence_max = Some(self.sequence_max.map_or(sequence, |max| max.max(sequence)));
+        }
+        for id in [value.get("response_id"), value.pointer("/response/id")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            self.response_ids.observe(id);
+        }
+        for id in [value.get("item_id"), value.pointer("/item/id")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            self.item_ids.observe(id);
+        }
+        if let Some(index) = value.get("output_index").and_then(Value::as_u64) {
+            self.output_index_max = Some(self.output_index_max.map_or(index, |max| max.max(index)));
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.function_call_arguments.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    self.argument_deltas += 1;
+                    self.argument_delta_bytes += delta.len() as u64;
+                    self.whitespace_deltas += u64::from(delta.chars().all(char::is_whitespace));
+                    self.delta_hashes.observe(delta);
+                }
+            }
+            Some("error") => {
+                self.wrapped_error_code =
+                    Some(match value.pointer("/error/code").and_then(Value::as_str) {
+                        Some("websocket_connection_limit_reached") => {
+                            "websocket_connection_limit_reached"
+                        }
+                        _ => "other",
+                    });
+            }
+            _ => {}
+        }
+    }
+}
+
+struct ObservationGuard {
+    observation: Arc<Mutex<AttemptObservation>>,
+    started: Instant,
+    failed: bool,
+}
+
+impl ObservationGuard {
+    fn begin(trace: &mut AttemptTrace) -> Self {
+        let observation = Arc::new(Mutex::new(AttemptObservation::default()));
+        trace.websocket_observation = Arc::downgrade(&observation);
+        Self {
+            observation,
+            started: Instant::now(),
+            failed: true,
+        }
+    }
+}
+
+impl Drop for ObservationGuard {
+    fn drop(&mut self) {
+        let stats = self.observation.lock().unwrap();
+        let frames = stats.frames.as_ref().map_or([0; 7], |(counts, before)| {
+            let after = counts.snapshot();
+            std::array::from_fn(|index| after[index].saturating_sub(before[index]))
+        });
+        let elapsed = self.started.elapsed();
+        macro_rules! emit {
+            ($($log:ident)::+ ! ($($prefix:tt)*)) => {
+                $($log)::+!($($prefix)*
+                    transport = "websocket", failed = self.failed, elapsed_ms = elapsed.as_millis() as u64,
+                    socket_generation = stats.generation, socket_reused = stats.reused, socket_age_ms = stats.age_ms,
+                    response_create_enqueued = stats.response_create_enqueued, response_create_sent = frames[0],
+                    other_text_sent = frames[1], pongs_sent = frames[2], text_received = frames[3],
+                    pings_received = frames[4], pongs_received = frames[5], closes_received = frames[6],
+                    close_code = stats.close_code.as_ref().map(|code| code.load(Ordering::Acquire)).filter(|code| *code != 0),
+                    wrapped_error_code = stats.wrapped_error_code,
+                    sequence_count = stats.sequence_count, sequence_min = stats.sequence_min, sequence_max = stats.sequence_max,
+                    sequence_repeated_or_backwards = stats.sequence_repeated_or_backwards,
+                    distinct_response_ids = stats.response_ids.hashes.len(), response_ids_overflow = stats.response_ids.overflow,
+                    distinct_item_ids = stats.item_ids.hashes.len(), item_ids_overflow = stats.item_ids.overflow,
+                    output_index_max = stats.output_index_max, argument_deltas = stats.argument_deltas,
+                    argument_delta_bytes = stats.argument_delta_bytes, whitespace_deltas = stats.whitespace_deltas,
+                    distinct_deltas = stats.delta_hashes.hashes.len(), distinct_deltas_overflow = stats.delta_hashes.overflow,
+                    "Responses websocket attempt summary"
+                );
+            };
+        }
+        if self.failed || elapsed > Duration::from_secs(120) {
+            emit!(tracing::info!(target: "provider.websocket.attempt",));
+        } else {
+            emit!(tracing::debug!(target: "provider.websocket.attempt",));
+        }
+    }
+}
 
 enum UpgradeFailure {
     /// The upgrade was answered 401: the token itself was refused.
@@ -211,6 +396,7 @@ impl Drop for Session {
 
 struct SendCommand {
     text: String,
+    response_create: bool,
     result: oneshot::Sender<Result<(), std::io::Error>>,
 }
 
@@ -220,6 +406,7 @@ struct Socket {
     shutdown: CancellationToken,
     closed: Arc<AtomicBool>,
     close_code: Arc<AtomicU16>,
+    frames: Arc<FrameCounts>,
     headers: Vec<(String, String)>,
     generation: u64,
     established_at: Instant,
@@ -297,6 +484,7 @@ async fn connect(
     let shutdown = CancellationToken::new();
     let closed = Arc::new(AtomicBool::new(false));
     let close_code = Arc::new(AtomicU16::new(0));
+    let frames = Arc::new(FrameCounts::default());
     let (attempt_active, activity) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         send,
@@ -304,6 +492,7 @@ async fn connect(
         shutdown: shutdown.clone(),
         closed: Arc::clone(&closed),
         close_code: Arc::clone(&close_code),
+        frames: Arc::clone(&frames),
         headers: request.headers.clone(),
         generation,
         established_at: established_at + connecting_at.elapsed(),
@@ -311,7 +500,12 @@ async fn connect(
         attempt_active,
     });
     spawn_pump(
-        stream, commands, messages, shutdown, closed, close_code, activity,
+        stream,
+        commands,
+        messages,
+        shutdown,
+        (closed, close_code, frames),
+        activity,
     );
     Ok((socket, turn_state))
 }
@@ -321,13 +515,13 @@ fn spawn_pump<S>(
     mut commands: mpsc::Receiver<SendCommand>,
     messages: mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     shutdown: CancellationToken,
-    closed: Arc<AtomicBool>,
-    close_code: Arc<AtomicU16>,
+    diagnostics: (Arc<AtomicBool>, Arc<AtomicU16>, Arc<FrameCounts>),
     mut activity: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let (closed, close_code, frames) = diagnostics;
     use tracing::instrument::WithSubscriber;
     tokio::spawn(
         async move {
@@ -345,6 +539,10 @@ where
                         let result = stream.send(Message::Text(command.text.into())).await
                             .map_err(|_| std::io::Error::other("Responses socket send failed"));
                         let failed = result.is_err();
+                        if !failed {
+                            let count = if command.response_create { &frames.response_create_sent } else { &frames.other_text_sent };
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
                         let _ = command.result.send(result);
                         if failed { break }
                         continue;
@@ -352,19 +550,28 @@ where
                     message = stream.next() => message,
                 };
                 let record = match message {
-                    Some(Ok(Message::Text(text))) => Ok(text.as_bytes().to_vec()),
+                    Some(Ok(Message::Text(text))) => {
+                        frames.text_received.fetch_add(1, Ordering::Relaxed);
+                        Ok(text.as_bytes().to_vec())
+                    }
                     Some(Ok(Message::Ping(payload))) => {
+                        frames.pings_received.fetch_add(1, Ordering::Relaxed);
                         if stream.send(Message::Pong(payload)).await.is_err() {
                             break;
                         }
+                        frames.pongs_sent.fetch_add(1, Ordering::Relaxed);
                         Ok(Vec::new())
                     }
-                    Some(Ok(Message::Pong(_))) => Ok(Vec::new()),
+                    Some(Ok(Message::Pong(_))) => {
+                        frames.pongs_received.fetch_add(1, Ordering::Relaxed);
+                        Ok(Vec::new())
+                    }
                     Some(Ok(Message::Frame(_))) => continue,
                     Some(Ok(Message::Binary(_))) => {
                         Err(std::io::Error::other("unexpected binary websocket event"))
                     }
                     Some(Ok(Message::Close(frame))) => {
+                        frames.closes_received.fetch_add(1, Ordering::Relaxed);
                         if let Some(frame) = frame {
                             close_code.store(u16::from(frame.code), Ordering::Release);
                         }
@@ -442,8 +649,11 @@ pub(super) async fn drive(
         )
         .await;
     }
+    let mut observation = ObservationGuard::begin(trace);
     let result = drive_socket(session, client, request, clock, normalizer, tx, trace).await;
     let result = apply_chatgpt_response_deadline(result, request, trace);
+    observation.failed =
+        result.is_err() || observation.observation.lock().unwrap().frames.is_none();
     result.map_err(|mut failure| {
         if trace.transport.as_deref() != Some("websocket") {
             return failure;
@@ -528,6 +738,14 @@ async fn drive_socket(
     trace.socket_generation = Some(socket.generation);
     trace.socket_reused = Some(reused);
     trace.socket_age = Some(now.saturating_duration_since(socket.established_at));
+    if let Some(observation) = trace.websocket_observation.upgrade() {
+        let mut observation = observation.lock().unwrap();
+        observation.frames = Some((Arc::clone(&socket.frames), socket.frames.snapshot()));
+        observation.close_code = Some(Arc::clone(&socket.close_code));
+        observation.generation = trace.socket_generation;
+        observation.reused = trace.socket_reused;
+        observation.age_ms = trace.socket_age_ms();
+    }
     trace.socket_since_last_completed = socket
         .last_completed_at
         .lock()
@@ -559,9 +777,16 @@ async fn drive_socket(
     let sent = tokio::time::timeout(STREAM_IDLE_TIMEOUT, async {
         socket
             .send
-            .send(SendCommand { text, result })
+            .send(SendCommand {
+                text,
+                response_create: true,
+                result,
+            })
             .await
             .map_err(|_| ())?;
+        if let Some(observation) = trace.websocket_observation.upgrade() {
+            observation.lock().unwrap().response_create_enqueued += 1;
+        }
         receive.await.map_err(|_| ())?.map_err(|_| ())
     })
     .await;
@@ -793,6 +1018,47 @@ mod pump_tests {
     use super::*;
     use crate::wire::HttpMethod;
 
+    #[test]
+    fn fingerprint_memory_is_capped_and_ordered_sequences_are_not_replays() {
+        let mut stats = AttemptObservation::default();
+        for sequence in 0..(DISTINCT_LIMIT + 10) {
+            stats.observe_text(
+                serde_json::json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":sequence, "delta":sequence.to_string(),
+                    "response_id":sequence.to_string(), "item_id":sequence.to_string()
+                })
+                .to_string()
+                .as_bytes(),
+            );
+        }
+        assert_eq!(stats.sequence_repeated_or_backwards, 0);
+        for hashes in [&stats.delta_hashes, &stats.response_ids, &stats.item_ids] {
+            assert_eq!(hashes.hashes.len(), DISTINCT_LIMIT);
+            assert!(hashes.overflow);
+        }
+        assert_eq!(stats.argument_deltas, (DISTINCT_LIMIT + 10) as u64);
+    }
+
+    #[test]
+    fn summary_level_tracks_failure_and_slow_success_and_releases_hashes() {
+        let capture = broca_test_support::LogCapture::new();
+        for (failed, seconds) in [(true, 0), (false, 121), (false, 0)] {
+            let mut trace = AttemptTrace::default();
+            capture.in_scope(|| {
+                let mut guard = ObservationGuard::begin(&mut trace);
+                guard.failed = failed;
+                guard.started -= Duration::from_secs(seconds);
+            });
+            assert!(trace.websocket_observation.upgrade().is_none());
+        }
+        let events = capture.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].level, tracing::Level::INFO);
+        assert_eq!(events[1].level, tracing::Level::INFO);
+        assert_eq!(events[2].level, tracing::Level::DEBUG);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancel_interrupts_a_blocked_socket_write() {
         let (io, peer) = tokio::io::duplex(8);
@@ -806,18 +1072,23 @@ mod pump_tests {
         let (messages, _records) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let closed = Arc::new(AtomicBool::new(false));
+        let frames = Arc::new(FrameCounts::default());
         let mut task = spawn_pump(
             stream,
             commands,
             messages,
             shutdown.clone(),
-            Arc::clone(&closed),
-            Arc::new(AtomicU16::new(0)),
+            (
+                Arc::clone(&closed),
+                Arc::new(AtomicU16::new(0)),
+                Arc::clone(&frames),
+            ),
             tokio::sync::watch::channel(false).1,
         );
         let (result, mut receive) = oneshot::channel();
         send.send(SendCommand {
             text: "test-payload".repeat(4),
+            response_create: false,
             result,
         })
         .await
@@ -828,6 +1099,11 @@ mod pump_tests {
             "the tiny unread peer keeps the frame write pending"
         );
         assert!(!closed.load(Ordering::Acquire));
+        assert_eq!(
+            frames.snapshot()[1],
+            0,
+            "queued Text is not a successful send"
+        );
         shutdown.cancel();
         let ended = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
         task.abort();
@@ -837,6 +1113,78 @@ mod pump_tests {
             "cancel must interrupt the write, not wait for the peer to read"
         );
         assert!(closed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn pump_counts_control_frames_and_other_outgoing_text_separately() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (io, peer) = tokio::io::duplex(4096);
+            let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                io,
+                tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            let mut server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                peer,
+                tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            let (send, commands) = mpsc::channel(1);
+            let (messages, mut records) = mpsc::channel(8);
+            let shutdown = CancellationToken::new();
+            let frames = Arc::new(FrameCounts::default());
+            let close_code = Arc::new(AtomicU16::new(0));
+            let (_active, activity) = tokio::sync::watch::channel(true);
+            let task = spawn_pump(
+                stream,
+                commands,
+                messages,
+                shutdown.clone(),
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::clone(&close_code),
+                    Arc::clone(&frames),
+                ),
+                activity,
+            );
+            let (result, received) = oneshot::channel();
+            send.send(SendCommand {
+                text: "other".into(),
+                response_create: false,
+                result,
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            received.await.unwrap().unwrap();
+            server.send(Message::Ping(vec![1].into())).await.unwrap();
+            assert_eq!(
+                server.next().await.unwrap().unwrap(),
+                Message::Pong(vec![1].into())
+            );
+            assert!(records.recv().await.unwrap().unwrap().is_empty());
+            server.send(Message::Pong(vec![2].into())).await.unwrap();
+            assert!(records.recv().await.unwrap().unwrap().is_empty());
+            server
+                .close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "PRIVATE-REASON".into(),
+                }))
+                .await
+                .unwrap();
+            assert!(records.recv().await.unwrap().is_err());
+            assert_eq!(frames.snapshot(), [0, 1, 1, 0, 1, 1, 1]);
+            assert_eq!(close_code.load(Ordering::Acquire), 1008);
+            shutdown.cancel();
+            task.await.unwrap();
+        })
+        .await
+        .expect("the control-frame fixture must terminate");
     }
 
     #[tokio::test(start_paused = true)]
@@ -867,6 +1215,7 @@ mod pump_tests {
             shutdown: shutdown.clone(),
             closed: Arc::clone(&closed),
             close_code: Arc::clone(&close_code),
+            frames: Arc::new(FrameCounts::default()),
             headers: Vec::new(),
             generation: 1,
             established_at: Instant::now(),
@@ -878,8 +1227,7 @@ mod pump_tests {
             commands,
             messages,
             shutdown.clone(),
-            closed,
-            close_code,
+            (closed, close_code, Arc::clone(&socket.frames)),
             activity,
         );
         let session = Session::default();
@@ -986,8 +1334,11 @@ mod pump_tests {
             commands,
             messages.clone(),
             shutdown.clone(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicU16::new(0)),
+            (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU16::new(0)),
+                Arc::new(FrameCounts::default()),
+            ),
             activity,
         );
         server.send(Message::Ping(vec![1].into())).await.unwrap();
@@ -1009,6 +1360,7 @@ mod pump_tests {
         let (result, received) = oneshot::channel();
         send.send(SendCommand {
             text: "next".into(),
+            response_create: false,
             result,
         })
         .await

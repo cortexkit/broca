@@ -4330,6 +4330,20 @@ old = "trace.socket_reused = Some(reused);"
 new = "trace.socket_reused = Some(false && reused); // NON-VACUITY BREAK: conceal cached socket reuse."
 
 [[control]]
+id = "provider-websocket-sequence-replay-fingerprint"
+guards = "websocket attempt summaries count replayed sequence numbers before normalization"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::websocket_summary_detects_replayed_sequence_numbers"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = "self.sequence_repeated_or_backwards += 1;"
+new = "self.sequence_repeated_or_backwards += 0; // NON-VACUITY BREAK: conceal replayed sequences."
+
+[[control]]
 id = "provider-run-socket-threshold-https-allowance"
 guards = "the run-local socket failure threshold starts a full HTTPS allowance even before step-local exhaustion"
 runner = "command"

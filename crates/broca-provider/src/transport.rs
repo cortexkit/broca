@@ -283,6 +283,8 @@ struct AttemptTrace {
     transport: Option<String>,
     websocket_request: Option<Box<broca_protocol::provider::WebSocketRequestDigest>>,
     websocket_close_code: Option<Arc<std::sync::atomic::AtomicU16>>,
+    websocket_observation:
+        std::sync::Weak<std::sync::Mutex<responses_websocket::AttemptObservation>>,
     socket_generation: Option<u64>,
     socket_reused: Option<bool>,
     socket_age: Option<Duration>,
@@ -3127,6 +3129,13 @@ where
         // Digest the raw chunk as received, before any limit or parse decision, so the record
         // covers every byte that arrived even when this chunk ends the attempt.
         trace.observe(chunk);
+        if let Some(observation) = trace
+            .websocket_observation
+            .upgrade()
+            .filter(|_| trace.transport.as_deref() == Some("websocket"))
+        {
+            observation.lock().unwrap().observe_text(chunk);
+        }
         if chunk.len() > max_stream_bytes.saturating_sub(stream_bytes) {
             return Err(AttemptFailure::decode(
                 stream_limit_error(&format!(
