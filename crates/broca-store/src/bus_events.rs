@@ -1107,6 +1107,56 @@ mod tests {
         );
     }
 
+    /// A session's next lineage (after retention deleted the last one) numbers its notices on
+    /// from the old lineage's, so its first notice is a new bus message, not a repeat the outbox
+    /// would drop for the old one's 24 hours.
+    #[test]
+    fn a_new_lineages_notices_are_queued_after_the_old_lineages() {
+        use broca_core::compaction_provider::notice::AdvanceNotice;
+        let store = enabled();
+        let session_ref = agent_session_ref(&session());
+        let notice = |seq: u64, lineage: &str| FramedRecord {
+            seq: seq + 1,
+            fence: 1,
+            record: WalRecord::CompactionNotice {
+                seq,
+                headers: AdvanceNotice::new(&session_ref, seq, lineage, 0, "ab".repeat(32), 1, "m")
+                    .to_headers(),
+            },
+        };
+        store
+            .project_bus_events(
+                &session(),
+                "old",
+                &[start(), notice(1, "old"), notice(2, "old")],
+                1000,
+            )
+            .unwrap();
+        let mut new_start = start();
+        new_start.seq = 1;
+        let mut first_new = notice(3, "new");
+        first_new.seq = 2;
+        store
+            .project_bus_events(&session(), "new", &[new_start, first_new], 1100)
+            .unwrap();
+        let queued: Vec<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT message_id FROM compaction_notice_outbox ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            queued,
+            (1..=3)
+                .map(|seq| format!("{session_ref}:advanced:{seq}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn bus_outbox_steers_consumed_only_by_the_following_step_and_seals_end_interrupted() {
         let store = enabled();

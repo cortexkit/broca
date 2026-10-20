@@ -17524,27 +17524,28 @@ guards = "a view applied over signed reasoning renders with the companion strip 
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/view_tests.rs"
-expect_red = ["compaction::view::tests::an_applied_view_renders_byte_identically_after_a_restart"]
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
 file = "crates/broca-core/src/compaction/view.rs"
 old = "message.content.retain(|block| !is_prefix_bound(block));"
 new = "message.content.retain(|_block| true); // NON-VACUITY BREAK: keep reasoning the view invalidated"
 
 [[control]]
 id = "compaction-view-defers-over-the-open-turn"
-guards = "a view that would invalidate the signed reasoning of the open tool turn is deferred, not applied"
+guards = "a view that would invalidate or leave out the signed reasoning of the open tool turn (a steer after its results included, or the turn copied into a fold) is deferred, not applied"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/view_tests.rs"
 expect_red = ["compaction::view::tests::signed_reasoning_is_stripped_or_the_view_deferred"]
+only = false
 file = "crates/broca-core/src/compaction/view.rs"
-old = "if open_turn(prompt).is_some_and(|open| invalidated.contains(&open)) {"
-new = "if false && open_turn(prompt).is_some_and(|open| invalidated.contains(&open)) { // NON-VACUITY BREAK"
+old = "    if open_turn(&next)\n        .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))"
+new = "    if false && open_turn(&next) // NON-VACUITY BREAK\n        .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))"
 
 [[control]]
 id = "compaction-ceiling-never-sends-over-the-window"
-guards = "a request broca counts over the context window is refused context_ceiling before it is sent"
+guards = "the pure ceiling decision refuses over_window for a request broca counts past the window (no send path calls it yet; enforcement before a send is not wired)"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
@@ -17560,8 +17561,8 @@ guards = "an applied view is folded back from its WAL record, so a resumed run r
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/view_tests.rs"
-expect_red = ["compaction::view::tests::an_applied_view_renders_byte_identically_after_a_restart"]
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
 only = false
 file = "crates/broca-core/src/compaction.rs"
 old = "if let Some(applied) = view::AppliedView::decode(view, choice) {"
@@ -17578,3 +17579,79 @@ expect_red = ["compaction::view::tests::a_recorded_notice_is_durable_before_it_r
 file = "crates/broca-core/src/compaction/runtime.rs"
 old = "        // notice from reaching the bus before a crash could still lose it.\n        self.writer.sync().await?;"
 new = "        // notice from reaching the bus before a crash could still lose it.\n        // NON-VACUITY BREAK: no barrier"
+
+[[control]]
+id = "compaction-run-loop-offers-views-at-the-boundary"
+guards = "the run loop offers a fetched view at each step boundary and records it before the request renders"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
+file = "crates/broca-core/src/run.rs"
+old = ".filter(|(fetched, _)| declined_view != Some(fetched.view_version))"
+new = ".filter(|(_fetched, _)| false) // NON-VACUITY BREAK: never offer a fetched view"
+
+[[control]]
+id = "compaction-run-loop-records-the-boundary-notice"
+guards = "the run loop records an advance notice at the step boundary, durable before the model call"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
+only = false
+file = "crates/broca-core/src/run.rs"
+old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            model_opts = Some(Arc::new(view));"
+new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no boundary notice\n            }\n            model_opts = Some(Arc::new(view));"
+
+[[control]]
+id = "compaction-run-loop-decides-over-the-rendered-prompt"
+guards = "the run loop decides a view over the tagged prompt the model is sent, not the raw transcript copy"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends"]
+file = "crates/broca-core/src/run.rs"
+old = "                        &opts.prompt,\n                        provider.reasoning_is_prefix_bound(),"
+new = "                        raw, // NON-VACUITY BREAK: decide over the raw copy\n                        provider.reasoning_is_prefix_bound(),"
+
+[[control]]
+id = "compaction-notice-floor-across-lineages"
+guards = "a lineage at an address whose earlier lineages retention deleted numbers its notices past theirs"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_new_lineage_numbers_its_notices_past_the_deleted_lineages"]
+file = "crates/broca-core/src/run.rs"
+old = "        prior.compaction_notice_floor = wal_store\n            .retired_notice_floor(&req.session)\n            .map_err(|error| RunError::Wal(error.to_string()))?;"
+new = "        let _ = wal_store; // NON-VACUITY BREAK: restart notice numbering at 1"
+
+[[control]]
+id = "compaction-notice-projected-into-the-outbox"
+guards = "a recorded advance notice is queued in the outbox and published with its bus identity"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::compaction_notices_publish_from_the_wal_once_with_their_bus_identity"]
+only = false
+file = "crates/broca-store/src/bus_events.rs"
+old = "    let inserted = conn.execute(\n        \"INSERT OR IGNORE INTO compaction_notice_outbox"
+new = "    return Ok(false); // NON-VACUITY BREAK: never queue a notice\n    #[allow(unreachable_code)]\n    let inserted = conn.execute(\n        \"INSERT OR IGNORE INTO compaction_notice_outbox"
+
+[[control]]
+id = "retention-tombstone-records-next-notice-seq"
+guards = "deleting a lineage records the compaction notice number its next notice would have had, so the next lineage never repeats one"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::deletion_records_the_next_notice_seq_and_keeps_the_highest"]
+file = "crates/broca-module/src/retention.rs"
+old = "            .chain(own_next_notice_seq)"
+new = "            .chain(None::<u64>.filter(|_| own_next_notice_seq.is_some())) // NON-VACUITY BREAK"

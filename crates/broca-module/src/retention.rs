@@ -324,6 +324,13 @@ pub struct Tombstone {
     /// not be read, and every tombstone written before tags existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_tag: Option<u64>,
+    /// The compaction notice sequence number the deleted lineage's next notice would have had
+    /// (and at least every earlier tombstone's). Notices are numbered per session, not per
+    /// lineage, so a lineage created at this address afterwards numbers its notices from here.
+    /// Absent for a lineage that recorded no notice, one whose WAL could not be read, and every
+    /// tombstone written before notices existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_notice_seq: Option<u64>,
 }
 
 /// Each failed write increments the address's repair generation so an older repair cannot
@@ -1281,12 +1288,27 @@ impl RetentionService {
             .filter_map(|stone| stone.next_tag)
             .chain(own_next_tag)
             .max();
+        let own_next_notice_seq = read.as_ref().ok().and_then(|read| {
+            frames(read)
+                .iter()
+                .filter_map(|frame| match &frame.record {
+                    WalRecord::CompactionNotice { seq, .. } => seq.checked_add(1),
+                    _ => None,
+                })
+                .max()
+        });
+        let next_notice_seq = earlier
+            .iter()
+            .filter_map(|stone| stone.next_notice_seq)
+            .chain(own_next_notice_seq)
+            .max();
         let stone = Tombstone {
             lineage_id: id.clone(),
             expired_at_ms: deadline,
             seq,
             completed_at_ms: None,
             next_tag,
+            next_notice_seq,
         };
         self.remember_session(key)?;
         self.write_tombstone(key, &stone)?;

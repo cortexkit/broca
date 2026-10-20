@@ -10,7 +10,7 @@ use broca_core::compaction_provider::{
     lineage::MessageRef,
     notice::ViewReady,
     setup::{SetupAnswer, SetupRequest},
-    view::{CompactionView, ViewRange},
+    view::{CompactionView, PartEdit, ViewRange},
 };
 use broca_core::{
     CompactionPlane, CompactionUnavailable, CompactionViews, FileWalStore, RunControl, RunRequest,
@@ -139,8 +139,99 @@ const TOOL_SCENARIO: Scenario = Scenario {
     ..SCENARIO
 };
 
+/// A send whose history carries an earlier answer with signed reasoning.
+fn signed_request() -> RunRequest {
+    let submission = serde_json::from_value(json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[
+            {"role":"user","content":[{"type":"text","text":"original user"}]},
+            {"role":"assistant","origin":{"provider_module_id":"stub","model_id":"model"},
+             "content":[{"type":"reasoning","text":"old thinking","signature":"old-signature"},
+                        {"type":"text","text":"old answer"}]},
+            {"role":"user","content":[{"type":"text","text":"next question"}]}
+        ],
+        "tools":[{"name":"edit","description":"edit","input_schema":{"type":"object"}}]
+    }))
+    .unwrap();
+    let mut request = RunRequest::from_submission(
+        submission,
+        RunId("compaction-signed-run".into()),
+        BindIdentity::new("/crash-harness/compaction-signed", "caller", "session"),
+        SubmissionId("compaction-signed-send".into()),
+    );
+    request.policy_allowed.insert("edit".into());
+    request
+}
+
+/// The plan renders runner tags, and the provider's views follow the two-view schedule.
+fn signed_control() -> RunControl {
+    let mut control = control();
+    let mut manifest = control.manifest.as_deref().unwrap().clone();
+    manifest.plan = OpaqueJson::from_json_text(
+        json!({"compaction_item":{"provider":PROVIDER,"preset":"summary","params":{}},
+            "composition":{},"render_tags":true})
+        .to_string(),
+    )
+    .unwrap();
+    control.manifest = Some(Arc::new(manifest));
+    control.compaction_views = Some(Arc::new(ScriptedViews {
+        signed: true,
+        ..Default::default()
+    }));
+    control
+}
+
+fn signed(text: &str) -> ContentBlock {
+    ContentBlock::Reasoning {
+        text: format!("{text} thinking"),
+        signature: Some(format!("{text}-signature")),
+    }
+}
+
+/// A tool call with signed reasoning, then a final answer with signed reasoning.
+fn signed_scripts() -> Vec<Vec<NormalizedEvent>> {
+    vec![
+        assistant(
+            "plan-reply",
+            vec![
+                signed("plan"),
+                ContentBlock::ToolCall(ToolCall {
+                    thought_signature: None,
+                    tool_call_id: ToolCallId("edit-1".into()),
+                    tool_name: "edit".into(),
+                    input: json!({}),
+                }),
+            ],
+            FinishReason::ToolCalls,
+        ),
+        assistant(
+            "final-reply",
+            vec![
+                signed("final"),
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ],
+            FinishReason::Stop,
+        ),
+    ]
+}
+
+/// Signed reasoning on a prefix-bound provider, runner tags, and two views: the first folds
+/// the first question and strips the signed reasoning after it; the second, at the next
+/// boundary, compresses the tool's output after the open tool turn and so applies as is.
+const SIGNED_SCENARIO: Scenario = Scenario {
+    name: "compaction-signed",
+    request: signed_request,
+    control: signed_control,
+    scripts: signed_scripts,
+    render: Render::CanonicalPrefixBound,
+    plane: tools,
+    expected: RunFinishReason::Completed,
+};
+
 pub(crate) fn find(name: &str) -> Option<Scenario> {
-    [SCENARIO, TOOL_SCENARIO]
+    [SCENARIO, TOOL_SCENARIO, SIGNED_SCENARIO]
         .into_iter()
         .find(|scenario| scenario.name == name)
 }
@@ -183,7 +274,43 @@ struct ScriptedViews {
     /// Offer an older view (version 1, "stale summary") at every boundary, even after
     /// version 2 applied.
     stale: bool,
+    /// Follow `SIGNED_SCENARIO`'s two-view schedule instead.
+    signed: bool,
     lineage: Mutex<Option<String>>,
+}
+
+/// `SIGNED_SCENARIO`'s second view: the first question still folded, and the tool's output
+/// (message 4) replaced by a shorter one.
+fn second_view(session_ref: &str, lineage_id: &str) -> (CompactionView, ViewReady) {
+    let summary =
+        json!([{"role":"user","content":[{"type":"text","text":APPLIED_HEAD}]}]).to_string();
+    let short = json!({"type":"tool_result","tool_call_id":"edit-1",
+        "output":{"kind":"text","text":"edited (short)"},"is_error":false})
+    .to_string();
+    let view = CompactionView::new(
+        session_ref,
+        3,
+        lineage_id,
+        MessageRef {
+            ordinal: 4,
+            mid: "m4".into(),
+        },
+        vec![
+            ViewRange::replace(0, 1, summary),
+            ViewRange::keep_with_edits(
+                1,
+                5,
+                vec![PartEdit::replace(
+                    4,
+                    "m4",
+                    broca_protocol::tags::part_key(4, 0),
+                    short,
+                )],
+            ),
+        ],
+    );
+    let ready = ViewReady::for_view(&view);
+    (view, ready)
 }
 
 fn view(
@@ -215,7 +342,13 @@ impl CompactionViews for ScriptedViews {
         after: Option<u64>,
     ) -> Option<(CompactionView, ViewReady)> {
         *self.lineage.lock().unwrap() = Some(lineage_id.into());
-        let offer = if self.stale {
+        let offer = if self.signed {
+            match after {
+                None | Some(0..=1) => Some(view(session_ref, lineage_id, 2, APPLIED_HEAD)),
+                Some(2) => Some(second_view(session_ref, lineage_id)),
+                Some(_) => None,
+            }
+        } else if self.stale {
             Some(view(session_ref, lineage_id, 1, "stale summary"))
         } else if after.is_none_or(|applied| applied < 2) {
             Some(view(session_ref, lineage_id, 2, APPLIED_HEAD))
@@ -237,7 +370,7 @@ async fn resume_with(
     let provider = ScriptedProvider::for_scenario(&scenario);
     let plane = HarnessPlane::for_scenario(&scenario);
     let store = FileWalStore::new(kill.state_root.join("wal"));
-    let mut control = control();
+    let mut control = (scenario.control)();
     control.compaction_plane = Some(compaction);
     control.compaction_views = Some(views);
     let outcome = drive(
@@ -249,7 +382,7 @@ async fn resume_with(
         &plane,
     )
     .await;
-    let log = LogImage::read(&wal_path(&kill.state_root, &request().session));
+    let log = LogImage::read(&wal_path(&kill.state_root, &(scenario.request)().session));
     Resumed {
         reason: outcome.reason,
         provider,
@@ -448,4 +581,115 @@ async fn stale_view_offered_after_restart_is_never_applied() {
         .sent()
         .values()
         .all(|bytes| !String::from_utf8_lossy(bytes).contains("stale summary")));
+}
+
+/// The signed scenario cut at every record boundary, and killed while the second model call
+/// is in flight, resumes sending exactly the uncut run's bytes: the first view's companion
+/// strip of signed reasoning, recorded with it, stays applied under the second view, runner
+/// tags render the same, neither view is applied twice, and notices keep one gapless sequence.
+#[tokio::test]
+async fn signed_reasoning_strip_and_a_second_view_replay_identical_bytes_at_every_cut() {
+    let handle = RunnerHandle::new(SIGNED_SCENARIO).await;
+    let first =
+        String::from_utf8_lossy(handle.reference.sent.get(&0).expect("first call")).into_owned();
+    let second =
+        String::from_utf8_lossy(handle.reference.sent.get(&1).expect("second call")).into_owned();
+    for sent in [&first, &second] {
+        assert!(sent.contains(APPLIED_HEAD), "{sent}");
+        assert!(!sent.contains("original user"), "{sent}");
+        assert!(
+            !sent.contains("old thinking"),
+            "the strip leaves it out: {sent}"
+        );
+        assert!(sent.contains('§'), "runner tags are rendered: {sent}");
+    }
+    assert!(
+        second.contains("plan thinking"),
+        "reasoning after the views is kept"
+    );
+    assert!(
+        second.contains("edited (short)") && !second.contains("§4§ edited"),
+        "{second}"
+    );
+    let records = handle.reference.log.records();
+    let choices: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionViewApplied {
+                view_version,
+                choice,
+                ..
+            } => Some((
+                *view_version,
+                matches!(choice, broca_wal::CompactionViewChoice::Companion { .. }),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(choices, vec![(2, true), (3, false)]);
+    let mut suite = Suite::new("compaction-signed");
+    let mut strip_resumes = 0;
+    let mut points = handle.record_boundaries(true);
+    points.push(KillPoint::InFlight(InFlight::ProviderStep(2)));
+    for point in points {
+        let trigger = if matches!(point, KillPoint::InFlight(_)) {
+            KillTrigger::ProcessKill
+        } else {
+            KillTrigger::Truncate
+        };
+        let kill = handle.kill_at(point, trigger).await;
+        let compaction = Arc::new(ScriptedCompaction::default());
+        let views = Arc::new(ScriptedViews {
+            signed: true,
+            ..Default::default()
+        });
+        let resumed = resume_with(SIGNED_SCENARIO, &kill, compaction.clone(), views).await;
+        handle.check(&kill, &resumed);
+        let prefix = kill.durable.records();
+        if has_setup(&prefix) {
+            assert_eq!(
+                compaction.setups.load(Ordering::SeqCst),
+                0,
+                "{}",
+                kill.label()
+            );
+        }
+        strip_resumes +=
+            usize::from(views_applied(&prefix) > 0 && resumed.provider.request_count() > 0);
+        for (step, bytes) in resumed.provider.sent() {
+            assert_eq!(
+                Some(&bytes),
+                handle.reference.sent.get(&step),
+                "{}: step {step} request bytes changed",
+                kill.label()
+            );
+        }
+        let after = resumed.log.records();
+        // A cut inside the tool batch can end the resumed run before its second model call
+        // (an unknown dispatch outcome stops for review), and then the second view's boundary
+        // never comes. Every resume that reaches the second call applied both views, once.
+        let reached_second_call = after
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+            .count()
+            == 2;
+        assert!(views_applied(&after) <= 2, "{}", kill.label());
+        if reached_second_call {
+            assert_eq!(views_applied(&after), 2, "{}", kill.label());
+        }
+        let seqs = notice_seqs(&after);
+        assert_eq!(
+            seqs,
+            (1..=seqs.len() as u64).collect::<Vec<_>>(),
+            "{}: notice sequence repeated or skipped a number",
+            kill.label()
+        );
+        suite.record([kill]);
+    }
+    assert!(
+        strip_resumes > 0,
+        "some cut must resume over a durable strip"
+    );
+    let methods = suite.finish();
+    assert_eq!(methods.get("Sigkill"), Some(&1));
 }

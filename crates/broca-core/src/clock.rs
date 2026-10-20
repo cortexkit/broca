@@ -155,6 +155,18 @@ impl Clock {
         }))
     }
 
+    /// `refresh`, calling `probe` after the control file is read and before the read is applied.
+    /// `probe` is passed whether the refresh holds the clock's lock at that moment.
+    #[cfg(all(test, feature = "test-clock"))]
+    fn refresh_with_read_probe(&self, probe: impl FnOnce(bool)) -> std::io::Result<bool> {
+        self.refresh_with_reader(|path| {
+            let bytes = std::fs::read(path);
+            let serialized = self.inner.fixed.try_lock().is_err();
+            probe(serialized);
+            bytes
+        })
+    }
+
     /// The module may spawn this future while its daemon is running. In a release
     /// build it parks forever without polling the filesystem or emitting logs.
     pub async fn poll_changes(&self) -> std::io::Result<()> {
@@ -173,6 +185,51 @@ impl Clock {
 
 #[cfg(test)]
 mod tests {
+    /// The poller's refresh and admission's refresh run concurrently. A poller read taken
+    /// before the harness installs its fixed clock must not be applied after admission has
+    /// installed it, or the clock would go back to real time. The refresh holds the clock's
+    /// lock from its read to its application, so admission's refresh waits for the older one
+    /// and then applies the newer file.
+    #[cfg(feature = "test-clock")]
+    #[test]
+    fn a_held_refresh_read_cannot_put_the_clock_back_in_real_time() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("clock-refresh-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("test-clock");
+        let clock = super::Clock::for_state_root(&root).unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let poll_clock = clock.clone();
+        let poll = std::thread::spawn(move || {
+            poll_clock.refresh_with_read_probe(|serialized| {
+                // Hold the poller's read of the absent file, as when it runs before the
+                // harness writes its clock.
+                read_tx.send(serialized).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release the held clock read");
+            })
+        });
+        let serialized = read_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the poller read the absent clock file");
+        assert!(
+            serialized,
+            "a refresh must hold the clock lock from its read until it applies it"
+        );
+        std::fs::write(&path, r#"{"now_ms":0}"#).unwrap();
+        let admission_clock = clock.clone();
+        let admission = std::thread::spawn(move || admission_clock.refresh());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        poll.join().unwrap().unwrap();
+        admission.join().unwrap().unwrap();
+        assert_eq!(clock.now_ms(), 0, "the fixed clock stays installed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]

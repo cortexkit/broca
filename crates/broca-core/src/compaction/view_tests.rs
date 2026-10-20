@@ -394,14 +394,22 @@ async fn an_applied_view_renders_byte_identically_after_a_restart() {
     later.push(text(Role::User, "fourth question"));
     let later = stamped(later);
     let options = CallOptions::new(later);
-    let live_view = model_options(&options, &live);
 
-    let mut refolded = CompactionCheckpoint::None;
-    for record in std::iter::once(setup_record(None)).chain(records) {
-        refolded.fold(&record);
-    }
+    // Rebuild the state the way admission and resume do: replay of the records, which places
+    // Setup's thinking boundary from WAL order.
+    let replayed = crate::replay::replay(
+        &std::iter::once(crate::replay::projection_boundary_tests::run_started(1, "r").record)
+            .chain(std::iter::once(setup_record(None)))
+            .chain(records)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let refolded = replayed.compaction.clone();
     let resumed = refolded.state().unwrap();
-    let resumed_view = model_options(&options, resumed);
+    live.applied.as_mut().unwrap().thinking_prefix_len =
+        resumed.applied.as_ref().unwrap().thinking_prefix_len;
+    let live_view = model_options(&options, &live).unwrap();
+    let resumed_view = model_options(&options, resumed).unwrap();
     assert_eq!(
         crate::canonical_request_bytes(&resumed_view),
         crate::canonical_request_bytes(&live_view)
@@ -423,7 +431,7 @@ async fn an_applied_view_renders_byte_identically_after_a_restart() {
     );
     // Without the view the transcript renders as before: the record is what changes the bytes.
     assert_ne!(
-        crate::canonical_request_bytes(&model_options(&options, &after_setup())),
+        crate::canonical_request_bytes(&model_options(&options, &after_setup()).unwrap()),
         crate::canonical_request_bytes(&live_view)
     );
     // The view survives an admission checkpoint too.
@@ -449,6 +457,7 @@ fn facts(lineage_id: &str) -> NoticeFacts<'_> {
             ..Default::default()
         }),
         events: Vec::new(),
+        seq_floor: 1,
     }
 }
 
@@ -509,15 +518,25 @@ async fn notices_follow_the_durable_state() {
     assert_eq!(third.to_headers()["events"], "model_change");
     assert_eq!(third.to_headers()["applied_view_version"], "2");
 
-    // A new lineage: nothing carries over, so nothing is claimed.
+    // A new lineage: nothing carries over, so nothing is claimed, but its notices number on
+    // from the old lineage's: the bus and the provider key notices on the session, and a
+    // number at or below one already seen is dropped as a duplicate. The floor is what the
+    // old lineage's retention tombstone records, its next sequence number.
+    let last_seq = third.seq;
     let fresh = after_setup();
-    let notice = next_notice(&fresh, &prompt, facts("lineage-2")).unwrap();
+    let mut on_new_lineage = facts("lineage-2");
+    on_new_lineage.seq_floor = last_seq + 1;
+    let notice = next_notice(&fresh, &prompt, on_new_lineage).unwrap();
     let headers = notice.to_headers();
-    assert_eq!(headers["seq"], "1");
+    assert!(notice.seq > last_seq, "{} after {last_seq}", notice.seq);
+    assert_eq!(headers["seq"], (last_seq + 1).to_string());
     assert!(!headers.contains_key("descends_from"));
     assert!(!headers.contains_key("applied_view_version"));
     assert_eq!(
-        model_options(&CallOptions::new(prompt.clone()), &fresh).prompt[0].content,
+        model_options(&CallOptions::new(prompt.clone()), &fresh)
+            .unwrap()
+            .prompt[0]
+            .content,
         text(Role::User, "head").content,
         "the new lineage renders Setup's initial message"
     );
@@ -666,4 +685,223 @@ async fn a_recorded_notice_is_durable_before_it_returns() {
     runtime.record_notice(&mut state, malformed).await.unwrap();
     assert_eq!(shared.records().len(), 1);
     writer.shutdown().await.unwrap();
+}
+
+/// `prompt` with runner tags rendered the way the run loop renders them into the model-facing
+/// prompt: every text part, and every tool result's text, prefixed with its message's ordinal.
+/// The raw transcript (and what `session.read` returns) keeps the unprefixed text.
+fn tagged(prompt: &[Message]) -> Vec<Message> {
+    let mut tagged = prompt.to_vec();
+    for message in &mut tagged {
+        let tag = format!("§{}§ ", message.ordinal.unwrap());
+        for block in &mut message.content {
+            match block {
+                ContentBlock::Text { text } => text.insert_str(0, &tag),
+                ContentBlock::ToolResult(result) => {
+                    if let broca_protocol::ToolOutput::Text { text } = &mut result.output {
+                        text.insert_str(0, &tag);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    tagged
+}
+
+/// A session whose Setup inserted nothing, with Setup's thinking boundary at its first
+/// message, as the run loop records Setup at the first boundary of a one-message transcript.
+fn after_empty_setup() -> CompactionState {
+    let mut state = after_setup();
+    let applied = state.applied.as_mut().unwrap();
+    applied.replacement = std::sync::Arc::new(Vec::new());
+    applied.thinking_prefix_len = 1;
+    state
+}
+
+/// A view is decided over the prompt the request is rendered from. A replace range
+/// copying a signed assistant message from the raw transcript is not a byte-identical copy of
+/// what the model was sent (the tagged text), so it is the provider's own signed content and
+/// is refused. It is never recorded and announced as applied while the request goes out
+/// without it.
+#[tokio::test]
+async fn a_view_is_decided_over_the_bytes_the_request_renders() {
+    let raw = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![
+            signed("plan"),
+            ContentBlock::Text {
+                text: "hello".into(),
+            },
+        ]),
+        text(Role::User, "q2"),
+    ]);
+    let prompt = tagged(&raw);
+    let (view, ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), raw[1].clone()]),
+        )],
+    );
+    let shared = Shared::default();
+    let mut state = after_setup();
+    let decision = apply(&shared, &mut state, &view, &ready, &prompt).await;
+    assert_eq!(
+        decision,
+        Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
+    );
+    assert!(shared.records().is_empty());
+    assert_eq!(state.applied_view_version(LINEAGE), None);
+    // A view that does apply also renders: one copying the message as the request shows it
+    // (tagged) is accepted, and the request then starts with its summary.
+    let (copying_user, user_ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), prompt[1].clone()]),
+        )],
+    );
+    assert!(matches!(
+        apply(&shared, &mut state, &copying_user, &user_ready, &prompt).await,
+        Decision::Apply(_)
+    ));
+    let rendered = model_options(&CallOptions::new(prompt.clone()), &state).unwrap();
+    assert_eq!(
+        rendered.prompt[0].content,
+        text(Role::User, "summary").content
+    );
+}
+
+/// The first difference is found in the bytes the model is sent. A view replacing a
+/// tagged message with its raw text changes the request at that message, so the signed
+/// reasoning after it is invalidated and stripped, not sent over a changed prefix.
+#[tokio::test]
+async fn a_change_only_in_rendered_bytes_still_strips_the_reasoning_after_it() {
+    let raw = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![signed("a"), ContentBlock::Text { text: "x".into() }]),
+        text(Role::User, "q2"),
+        assistant(vec![signed("b"), ContentBlock::Text { text: "y".into() }]),
+        text(Role::User, "q3"),
+    ]);
+    let prompt = tagged(&raw);
+    let (view, ready) = make_view(
+        2,
+        4,
+        vec![
+            ViewRange::replace(0, 1, replace_bytes(&[raw[0].clone()])),
+            ViewRange::keep(1, 5),
+        ],
+    );
+    let shared = Shared::default();
+    let mut state = after_empty_setup();
+    assert_eq!(
+        apply(&shared, &mut state, &view, &ready, &prompt).await,
+        Decision::Apply(CompactionViewChoice::Companion {
+            edit: companion_edits::STRIP_SIGNED_REASONING.into(),
+            strip: CompactionStrip {
+                from_ordinal: 1,
+                to_ordinal: 5
+            }
+        })
+    );
+    let rendered = model_options(&CallOptions::new(prompt.clone()), &state).unwrap();
+    assert_eq!(rendered.prompt[0].content, raw[0].content);
+    assert!(rendered
+        .prompt
+        .iter()
+        .all(|message| !message.content.iter().any(is_prefix_bound)));
+}
+
+/// User text after the tool results (a steer delivered at the boundary) does not
+/// close the open tool turn. A view that would invalidate that turn's reasoning is deferred,
+/// not applied with a strip of the reasoning the continuation needs.
+#[test]
+fn a_steer_after_the_tool_results_keeps_the_turn_open() {
+    let prompt = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![signed("plan"), call("a")]),
+        Message::new(Role::Tool, vec![result("a")]),
+        text(Role::User, "steer"),
+    ]);
+    let (view, ready) = make_view(
+        2,
+        3,
+        vec![
+            ViewRange::replace(0, 0, replace_bytes(&[text(Role::User, "summary")])),
+            ViewRange::keep(0, 4),
+        ],
+    );
+    assert_eq!(
+        decide(&view, &ready, &after_setup(), LINEAGE, &prompt, true),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
+    );
+}
+
+/// The open tool turn copied into a replace range loses its reasoning in the request
+/// (the renderer leaves out signed reasoning on every message the provider wrote), so the view
+/// is deferred, not applied.
+#[test]
+fn an_open_turn_copied_into_a_replace_range_is_deferred() {
+    let prompt = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![signed("plan"), call("a")]),
+        Message::new(Role::Tool, vec![result("a")]),
+    ]);
+    let (view, ready) = make_view(
+        2,
+        2,
+        vec![
+            ViewRange::replace(
+                0,
+                2,
+                replace_bytes(&[text(Role::User, "summary"), prompt[1].clone()]),
+            ),
+            ViewRange::keep(2, 3),
+        ],
+    );
+    assert_eq!(
+        decide(&view, &ready, &after_setup(), LINEAGE, &prompt, true),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
+    );
+}
+
+/// A recorded view that no longer assembles over the prompt is an error to render, never a
+/// silent fallback to Setup's head without its strips.
+#[tokio::test]
+async fn a_recorded_view_that_no_longer_assembles_is_an_error_not_a_fallback() {
+    let prompt = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![
+            signed("plan"),
+            ContentBlock::Text { text: "a".into() },
+        ]),
+        text(Role::User, "q2"),
+    ]);
+    let (view, ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), prompt[1].clone()]),
+        )],
+    );
+    let shared = Shared::default();
+    let mut state = after_empty_setup();
+    assert!(matches!(
+        apply(&shared, &mut state, &view, &ready, &prompt).await,
+        Decision::Apply(_)
+    ));
+    // The same transcript with different bytes in the copied message: the copy is no longer
+    // byte-identical, so the replacement is the provider's own signed content.
+    let changed = tagged(&prompt);
+    let error = model_options(&CallOptions::new(changed), &state).unwrap_err();
+    assert_eq!(error.view_version, 2);
+    assert_eq!(error.problem, AssemblyProblem::ProviderConstraint);
 }

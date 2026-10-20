@@ -12,8 +12,9 @@
 //! WAL's own high-water plus one, and retention deletion carries a tag floor to the next
 //! lineage. A new lineage starts with no compaction state at all: it runs Setup again,
 //! renders Setup's initial message, and its notices carry no `descends_from` and no
-//! `applied_view_version` until a view of that lineage applies. Restoring an older copy of a
-//! session's WAL by hand is not detected.
+//! `applied_view_version` until a view of that lineage applies. Its notice numbers continue
+//! from the deleted lineage's, which retention deletion records on its tombstone beside the tag
+//! floor. Restoring an older copy of a session's WAL by hand is not detected.
 
 use crate::compaction_provider::message::{CompactionMessage, Range};
 use broca_protocol::{ContentBlock, Message, Role, Usage};
@@ -623,12 +624,12 @@ fn consume_result<'a>(pending: &mut HashMap<&'a str, usize>, id: &'a str) -> boo
 pub fn model_options(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
-) -> broca_protocol::CallOptions {
+) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
     if let Some(view) = view::render(opts, state) {
         return view;
     }
     let Some(applied) = &state.applied else {
-        return opts.clone();
+        return Ok(opts.clone());
     };
     let mut prompt: Vec<_> = opts
         .prompt
@@ -691,7 +692,7 @@ pub fn model_options(
             })
             .collect(),
     });
-    view
+    Ok(view)
 }
 
 pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) -> u64 {

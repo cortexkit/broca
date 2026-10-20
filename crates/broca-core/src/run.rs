@@ -1645,6 +1645,19 @@ where
             prior.compaction_history = state.history.clone();
         }
     }
+    // Compaction notices are numbered per session, not per lineage: the provider and the bus
+    // both key them on the session. A lineage that has recorded no notice yet numbers its first
+    // one past every notice of this session's earlier lineages that retention deleted, as their
+    // tombstones recorded.
+    if prior
+        .compaction
+        .state()
+        .is_none_or(|state| state.notice_seq == 0)
+    {
+        prior.compaction_notice_floor = wal_store
+            .retired_notice_floor(&req.session)
+            .map_err(|error| RunError::Wal(error.to_string()))?;
+    }
     // Reuse complete snapshots; a bounded suffix cannot prove that older late
     // approvals are terminal without reading the missing prefix.
     let approval_frames = (snapshot.base_watermark == 0).then_some(snapshot.tail);
@@ -2960,10 +2973,14 @@ where
     });
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
+    let compaction_notice_floor = prior.compaction_notice_floor;
     // The newest fetched view this run will not apply (refused, rejected or stale), and the
     // newest one a notice already reported, so neither is offered or reported twice.
     let mut declined_view: Option<u64> = None;
     let mut reported_view: Option<u64> = None;
+    // The rendered size of the last request under compaction, from which a notice recorded
+    // between boundaries estimates the next one.
+    let mut notice_request_bytes = 0usize;
     let mut compaction_history = prior.compaction_history.clone();
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
@@ -4341,16 +4358,21 @@ where
                         &fetched,
                         &ready,
                         &lineage_id,
-                        raw,
+                        // The prompt the request renders from, so the decision sees the bytes
+                        // the model is sent (tags and loop guidance included), not the raw copy.
+                        &opts.prompt,
                         provider.reasoning_is_prefix_bound(),
                     ))
                     .await?;
-                    // A deferred view is offered again at every later boundary; any other
-                    // view this run will not apply is not offered again.
-                    if !matches!(
+                    // A refused, rejected or stale view is never offered to this run again. A
+                    // deferred view is offered at every later boundary, and so is one that is
+                    // not (yet) a prefix of this transcript: it may cover messages this run
+                    // has still to write again after a restart.
+                    if matches!(
                         decision,
-                        crate::compaction::view::Decision::Apply(_)
-                            | crate::compaction::view::Decision::Defer(_)
+                        crate::compaction::view::Decision::Refuse(_)
+                            | crate::compaction::view::Decision::Rejected(_)
+                            | crate::compaction::view::Decision::Stale
                     ) {
                         declined_view = Some(fetched.view_version);
                     }
@@ -4362,11 +4384,11 @@ where
                     }
                 }
             }
-            let view = crate::compaction::model_options(&opts, state);
-            let (estimate, _) = crate::compaction::request_estimate(
-                provider.render_request(&view).len(),
-                &compaction_history,
-            );
+            let view = crate::compaction::model_options(&opts, state)
+                .map_err(|error| RunError::Wal(error.to_string()))?;
+            notice_request_bytes = provider.render_request(&view).len();
+            let (estimate, _) =
+                crate::compaction::request_estimate(notice_request_bytes, &compaction_history);
             // Tell the provider what the session wrote since its last notice. The notice is
             // durable in the WAL before the model call, and the bus publisher projects it from
             // there, so it is never published before it is durable.
@@ -4381,6 +4403,7 @@ where
                     window: context_limit,
                     usage: compaction_history.usage(),
                     events: view_events,
+                    seq_floor: compaction_notice_floor,
                 },
             ) {
                 runtime.record_notice(state, notice).await?;
@@ -4695,6 +4718,13 @@ where
                     };
                     if no_tool_reason == RunFinishReason::Completed && wants_final_text {
                         natural_final_text = Some(joined_text(&message));
+                    }
+                    if let Some(raw) = &mut compaction_raw {
+                        // The run's last message, announced before the run ends.
+                        raw.push(Message::assistant_from(
+                            message.content.clone(),
+                            cfg.model.clone(),
+                        ));
                     }
                     let message = Arc::new(message);
                     record_model_hook(
@@ -5048,6 +5078,13 @@ where
             if wants_final_text {
                 natural_final_text = Some(joined_text(&assembled));
             }
+            if let Some(raw) = &mut compaction_raw {
+                // The run's last message, announced before the run ends.
+                raw.push(Message::assistant_from(
+                    assembled.content.clone(),
+                    cfg.model.clone(),
+                ));
+            }
             break RunFinishReason::Completed;
         }
         let calls_len = calls.len();
@@ -5196,6 +5233,48 @@ where
         }
     };
 
+    // Announce what the run wrote after its last step boundary (its final answer) now, not at
+    // the next send's first boundary: the contract owes a notice after each durable write. The
+    // notice follows those records in the WAL and its own barrier makes both durable before the
+    // publisher can project it.
+    if let (Some(runtime), Some(state), Some(raw)) = (
+        &compaction_runtime,
+        compaction_state.as_mut(),
+        compaction_raw.as_mut(),
+    ) {
+        if let Some(lineage_id) = writer.lineage_id().map(|id| id.to_string()) {
+            broca_protocol::content::stamp_ordinals(raw);
+            let announced = state
+                .announced
+                .as_ref()
+                .and_then(|announced| announced.through_ordinal);
+            let appended: usize = raw
+                .iter()
+                .filter(|m| m.ordinal.is_some_and(|o| announced.is_none_or(|a| o > a)))
+                .map(|m| serde_json::to_vec(m).map_or(0, |bytes| bytes.len()))
+                .sum();
+            let (estimate, _) = crate::compaction::request_estimate(
+                notice_request_bytes.saturating_add(appended),
+                &compaction_history,
+            );
+            if let Some(notice) = crate::compaction::view::next_notice(
+                state,
+                raw,
+                crate::compaction::view::NoticeFacts {
+                    session_ref: crate::wal_writer::agent_session_ref(&req.session),
+                    lineage_id: &lineage_id,
+                    est_tokens: estimate,
+                    model: &cfg.model.model_id,
+                    window: context_limit,
+                    usage: compaction_history.usage(),
+                    events: Vec::new(),
+                    seq_floor: compaction_notice_floor,
+                },
+            ) {
+                runtime.record_notice(state, notice).await?;
+            }
+        }
+    }
     // A completed run admitted with structured output records what it produced in the same
     // barrier as its terminal. A run that submitted returned above; reaching here, a
     // `submit_tool` run completed without calling `submit_result`.

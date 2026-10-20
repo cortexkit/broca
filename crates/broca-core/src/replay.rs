@@ -104,6 +104,10 @@ pub struct ReplayState {
     pub run_finals: std::collections::BTreeMap<u64, RunAttribution>,
     pub compaction: crate::compaction::CompactionCheckpoint,
     pub compaction_history: crate::compaction::CompactionHistory,
+    /// The lowest sequence number this lineage's next compaction notice may take: 1, or, for a
+    /// lineage at an address whose earlier lineages retention deleted, the number their
+    /// tombstones recorded. Replay alone cannot know it; admission sets it from the WAL store.
+    pub compaction_notice_floor: u64,
     /// The first episode's WAL-frozen plan, restored by admission for tool dispatch.
     pub manifest: Option<std::sync::Arc<broca_wal::PlanManifest>>,
     pub keep_warm: Option<broca_protocol::request::KeepWarm>,
@@ -2140,6 +2144,7 @@ fn replay_seeded_with_compaction<'a>(
         run_finals,
         compaction,
         compaction_history,
+        compaction_notice_floor: 1,
         manifest: None,
         committed_tool_turns,
         open_tool_turn,

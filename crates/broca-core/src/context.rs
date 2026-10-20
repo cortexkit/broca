@@ -1340,6 +1340,7 @@ pub fn resume_state_from_store(
         open_tool_run: tail_state.open_tool_run,
         compaction: tail_state.compaction,
         compaction_history: tail_state.compaction_history,
+        compaction_notice_floor: 1,
         manifest: None,
         on_restart: tail_state.on_restart,
         keep_warm: tail_state.keep_warm,

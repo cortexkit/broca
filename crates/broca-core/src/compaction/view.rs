@@ -299,7 +299,12 @@ impl Decision {
 }
 
 /// Decide what to do with `view`, fetched for `ready`, at a step boundary of the session's
-/// lineage `lineage_id` whose prompt is `prompt` (compaction-provider/v1 §7).
+/// lineage `lineage_id` (compaction-provider/v1 §7).
+///
+/// `prompt` is the prompt the next request is rendered from, exactly as [`render`] gets it:
+/// ordinals stamped, runner tags and loop guidance already in its text. The decision and the
+/// request must see the same bytes, or a view could be judged unchanged where the request
+/// changes, or judged renderable where the request cannot assemble it.
 ///
 /// First the role's fixed checks (`dispose_fetched`: asked for, well formed, announced digest,
 /// newer, a prefix of this transcript, every edited part exists). Then broca's own: the view's
@@ -309,9 +314,11 @@ impl Decision {
 /// Last, signed reasoning, when the model provider binds it to its prefix (`prefix_bound`,
 /// as Anthropic's thinking signatures are). A view whose history first differs from the one
 /// rendered now at some message invalidates the signature of every signed reasoning block
-/// kept after that point. The provider requires the reasoning of the assistant message whose
-/// tool results the next request carries; a view that would invalidate that is deferred until
-/// a later boundary where the open tool turn is over (`view_deferred:<v>:signed_reasoning`).
+/// kept after that point, and the renderer leaves out the signed reasoning of every message the
+/// provider copied into a replace range. The model provider requires the reasoning of the open
+/// tool turn (the last assistant message of the history, when it makes tool calls, whatever
+/// user text follows its results); a view that would invalidate or leave out that reasoning is
+/// deferred until a later boundary where the turn is over (`view_deferred:<v>:signed_reasoning`).
 /// Any other invalidated reasoning is left out of every request from now on, by applying the
 /// view with the companion strip (`view_companion:<v>:strip_signed_reasoning`) over the
 /// ordinals from the first invalidated block to the end of the transcript. Messages written
@@ -358,6 +365,11 @@ pub fn decide(
     }
     let now = rendered_history(state, prompt);
     let first = first_difference(&now, &next);
+    if open_turn(&next)
+        .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))
+    {
+        return Decision::Defer(defer_reasons::SIGNED_REASONING);
+    }
     let invalidated: Vec<u64> = next[first..]
         .iter()
         .filter(|message| message.content.iter().any(is_prefix_bound))
@@ -366,9 +378,6 @@ pub fn decide(
     let Some(from_ordinal) = invalidated.iter().min().copied() else {
         return Decision::Apply(CompactionViewChoice::Applied);
     };
-    if open_turn(prompt).is_some_and(|open| invalidated.contains(&open)) {
-        return Decision::Defer(defer_reasons::SIGNED_REASONING);
-    }
     let to_ordinal = transcript(prompt)
         .filter_map(|message| message.ordinal)
         .max()
@@ -392,28 +401,57 @@ fn first_difference(before: &[Message], after: &[Message]) -> usize {
         .unwrap_or(before.len().min(after.len()))
 }
 
-/// The ordinal of the assistant message whose tool results end the transcript: the open tool
-/// turn, whose reasoning the next request must carry unchanged. `None` when the transcript
-/// does not end in tool results.
-fn open_turn(prompt: &[Message]) -> Option<u64> {
-    let messages: Vec<&Message> = transcript(prompt).collect();
-    let last_assistant = messages.iter().rposition(|m| m.role == Role::Assistant)?;
-    let after = &messages[last_assistant + 1..];
-    (!after.is_empty() && after.iter().all(|m| m.role == Role::Tool))
-        .then(|| messages[last_assistant].ordinal)
-        .flatten()
+/// The index in `history` of its open tool turn: its last assistant message, when that
+/// message makes tool calls. The next request continues that turn after its tool results, so
+/// the model provider requires its reasoning unchanged. A user message after the results (a
+/// steer delivered at the boundary) does not close the turn: the provider takes it together
+/// with the results. `None` when the last assistant message makes no call.
+fn open_turn(history: &[Message]) -> Option<usize> {
+    let last_assistant = history.iter().rposition(|m| m.role == Role::Assistant)?;
+    history[last_assistant]
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .then_some(last_assistant)
+}
+
+/// A recorded view that does not assemble over the prompt being rendered. It assembled when it
+/// was applied, over the same prompt, so this means the prompt changed under it. Rendering
+/// anything else (Setup's head, no strips) would send bytes no recorded decision covers, so it
+/// is an error, never a fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewNotRenderable {
+    pub view_version: u64,
+    pub problem: AssemblyProblem,
+}
+
+impl std::fmt::Display for ViewNotRenderable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "applied compaction view {} no longer assembles over the prompt: {:?}",
+            self.view_version, self.problem
+        )
+    }
 }
 
 /// The prompt a request sends under the session's applied view: the runner's own system
 /// messages, then the view's history with every recorded strip applied. `None` when the
-/// session has no applied view, or the view no longer assembles over this prompt, in which
-/// case the caller renders what it rendered before the view.
+/// session has no applied view.
 pub(crate) fn render(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
-) -> Option<broca_protocol::CallOptions> {
+) -> Option<Result<broca_protocol::CallOptions, ViewNotRenderable>> {
     let applied = state.view.as_ref()?;
-    let mut history = assemble(&applied.view, &opts.prompt).ok()?;
+    let mut history = match assemble(&applied.view, &opts.prompt) {
+        Ok(history) => history,
+        Err(problem) => {
+            return Some(Err(ViewNotRenderable {
+                view_version: applied.view.view_version,
+                problem,
+            }))
+        }
+    };
     apply_strips(&mut history, &state.strips);
     let mut prompt: Vec<_> = opts
         .prompt
@@ -458,7 +496,7 @@ pub(crate) fn render(
             })
             .collect(),
     });
-    Some(view)
+    Some(Ok(view))
 }
 
 /// What a step boundary knows that a notice reports besides the folded state.
@@ -475,6 +513,10 @@ pub struct NoticeFacts<'a> {
     pub usage: Option<Usage>,
     /// Events decided at this boundary (a deferred or refused view).
     pub events: Vec<Event>,
+    /// The lowest sequence number this notice may take. When retention deleted earlier lineages
+    /// of this session, their tombstones record the number their next notice would have had,
+    /// and this lineage's notices continue from the highest of those.
+    pub seq_floor: u64,
 }
 
 /// The advance notice a step boundary records (compaction-provider/v1 §5), or `None` when
@@ -483,7 +525,9 @@ pub struct NoticeFacts<'a> {
 ///
 /// broca never forks a lineage, so no notice carries `descends_from`. A session's new
 /// lineage (after retention deleted the old one) starts from an empty compaction state, so
-/// its first notice names neither a parent nor an applied view.
+/// its first notice names neither a parent nor an applied view. Its sequence numbers continue
+/// from the deleted lineages' (`NoticeFacts::seq_floor`), because the provider and the bus
+/// track notices per session.
 pub fn next_notice(
     state: &CompactionState,
     prompt: &[Message],
@@ -516,7 +560,7 @@ pub fn next_notice(
     }
     let mut notice = AdvanceNotice::new(
         facts.session_ref,
-        state.notice_seq + 1,
+        (state.notice_seq + 1).max(facts.seq_floor),
         facts.lineage_id,
         through_ordinal,
         through_digest,

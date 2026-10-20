@@ -30,6 +30,9 @@ pub enum Render {
     /// Antigravity family embeds a request id. A resume reproduces these bytes only if it
     /// recovers the same run id and step numbering from the log.
     IdentityEmbedding,
+    /// The canonical bytes, from a provider that binds signed reasoning to the bytes before it
+    /// (as Anthropic's thinking signatures are), so compaction views strip or defer it.
+    CanonicalPrefixBound,
 }
 
 /// One scripted run: the request, its controls, the provider's step scripts and the tools.
@@ -219,6 +222,10 @@ impl Provider for ScriptedProvider {
             }
         });
         rx
+    }
+
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        self.render == Render::CanonicalPrefixBound
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {

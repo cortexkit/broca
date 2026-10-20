@@ -224,7 +224,7 @@ fn recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint() {
     assert!(state.call_when.is_some());
     assert!(state.view.is_none());
     let options = CallOptions::new(raw());
-    let view = model_options(&options, state);
+    let view = model_options(&options, state).unwrap();
     assert_eq!(view.prompt.len(), 3);
     assert_eq!(view.prompt[0], options.prompt[0]);
     assert_eq!(view.prompt[1].ordinal, None);
@@ -261,6 +261,13 @@ pub(super) struct Shared {
 }
 
 impl Shared {
+    /// A WAL already holding `records`, with the identity the first append minted.
+    pub(super) fn with_records(records: Vec<WalRecord>) -> Self {
+        let shared = Self::default();
+        *shared.records.lock().unwrap() = records;
+        *shared.lineage.lock().unwrap() = Some(fixture_lineage_id());
+        shared
+    }
     pub(super) fn records(&self) -> Vec<WalRecord> {
         self.records.lock().unwrap().clone()
     }
@@ -750,7 +757,8 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
         .unwrap()
         .clone();
     assert_eq!(state.applied.as_ref().unwrap().version, 1);
-    assert_eq!(state.notice_seq, 1);
+    // One notice at the step boundary, and one announcing the final answer before the end.
+    assert_eq!(state.notice_seq, 2);
     let snapshot = crate::StorePageSnapshot {
         watermark_seq: head,
         lineage_id: Some("lineage".into()),
@@ -766,4 +774,327 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
     assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert_eq!(page.compaction_id.as_deref(), Some("c"));
     let _ = writer.shutdown().await;
+}
+
+/// A model provider that binds signed reasoning to its prefix, as Anthropic's thinking does,
+/// around the stub provider that records every request it is sent.
+struct PrefixBound(crate::StubProvider);
+#[async_trait::async_trait]
+impl crate::Provider for PrefixBound {
+    async fn step(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: &CallOptions,
+    ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        self.0.step(step_id, opts).await
+    }
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        true
+    }
+}
+
+/// The provider's one view of the session: its first message folded into a summary.
+#[derive(Default)]
+struct OneView {
+    offered: AtomicUsize,
+    /// Replace the first question with a copy of it from the raw transcript, which lacks the
+    /// runner tag the request shows on its text, instead of a summary.
+    copy_raw_question: bool,
+}
+impl CompactionViews for OneView {
+    fn newest(
+        &self,
+        session_ref: &str,
+        lineage_id: &str,
+        after: Option<u64>,
+    ) -> Option<(
+        crate::compaction_provider::view::CompactionView,
+        crate::compaction_provider::notice::ViewReady,
+    )> {
+        use crate::compaction_provider::{lineage::MessageRef, view::*};
+        if after.is_some_and(|applied| applied >= 2) {
+            return None;
+        }
+        self.offered.fetch_add(1, Ordering::SeqCst);
+        let fold = if self.copy_raw_question {
+            vec![text(Role::User, "first question")]
+        } else {
+            vec![text(Role::User, "summary")]
+        };
+        let covers = 0;
+        let bytes = serde_json::to_string(&fold).unwrap();
+        let view = CompactionView::new(
+            session_ref,
+            2,
+            lineage_id,
+            MessageRef {
+                ordinal: covers,
+                mid: format!("m{covers}"),
+            },
+            vec![ViewRange::replace(0, covers + 1, bytes)],
+        );
+        let ready = crate::compaction_provider::notice::ViewReady::for_view(&view);
+        Some((view, ready))
+    }
+}
+
+/// A send carrying history with signed reasoning, on a plan that renders runner tags.
+fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
+    let submission: broca_protocol::request::SubmissionRequest = serde_json::from_value(json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[
+            {"role":"user","content":[{"type":"text","text":"first question"}]},
+            {"role":"assistant","origin":{"provider_module_id":"stub","model_id":"model"},
+             "content":[{"type":"reasoning","text":"old thinking","signature":"old-signature"},
+                        {"type":"text","text":"first answer"}]},
+            {"role":"user","content":[{"type":"text","text":"second question"}]}
+        ]
+    }))
+    .unwrap();
+    let request = crate::RunRequest::from_submission(
+        submission,
+        broca_protocol::RunId("run".into()),
+        bind(),
+        broca_protocol::SubmissionId("sub".into()),
+    );
+    let mut plan = manifest().as_ref().clone();
+    plan.plan = OpaqueJson::from_json_text(
+        json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},
+            "composition":{},"render_tags":true})
+        .to_string(),
+    )
+    .unwrap();
+    let views = Arc::new(OneView::default());
+    let control = crate::RunControl {
+        manifest: Some(Arc::new(plan)),
+        compaction_plane: Some(Arc::new(Scripted {
+            answer: ready(),
+            setups: AtomicUsize::new(0),
+        })),
+        compaction_views: Some(views.clone()),
+        ..Default::default()
+    };
+    (request, control, views)
+}
+
+async fn run_history(shared: &Shared) -> (PrefixBound, Arc<OneView>) {
+    run_history_with(shared, OneView::default()).await
+}
+
+async fn run_history_with(shared: &Shared, views: OneView) -> (PrefixBound, Arc<OneView>) {
+    let writer = shared.writer();
+    let (request, mut control, _) = history_request();
+    if views.copy_raw_question {
+        // Setup inserts nothing, so the view's copy is the request's only change.
+        let mut empty = ready();
+        empty["initial"]["replacement"] = json!([]);
+        control.compaction_plane = Some(Arc::new(Scripted {
+            answer: empty,
+            setups: AtomicUsize::new(0),
+        }));
+    }
+    let views = Arc::new(views);
+    control.compaction_views = Some(views.clone());
+    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    let _ = writer.shutdown().await;
+    (model, views)
+}
+
+fn notice_seqs(records: &[WalRecord]) -> Vec<u64> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionNotice { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The run loop applies a provider's view at a step boundary with the companion strip of the
+/// signed reasoning it invalidates, over the tagged prompt the model is sent. A crash after
+/// the view is recorded, before or after its notice, resumes through replay and the run loop
+/// and sends the same request bytes without offering the view again; the notices stay one
+/// gapless sequence, and the run's final answer is announced before the run ends.
+#[tokio::test]
+async fn an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically() {
+    let shared = Shared::default();
+    let (model, views) = run_history(&shared).await;
+    assert_eq!(views.offered.load(Ordering::SeqCst), 1);
+    let calls = model.0.calls();
+    assert_eq!(calls.len(), 1);
+    let live = crate::canonical_request_bytes(&calls[0]);
+    let sent = String::from_utf8_lossy(&live).into_owned();
+    assert!(sent.contains("summary"), "{sent}");
+    assert!(!sent.contains("first question"), "the view replaced it");
+    assert!(sent.contains('§'), "runner tags are rendered: {sent}");
+    assert!(
+        calls[0]
+            .prompt
+            .iter()
+            .all(|message| !message.content.iter().any(view::is_prefix_bound)),
+        "the invalidated signed reasoning is stripped"
+    );
+    let records = shared.records();
+    let applied = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record,
+                WalRecord::CompactionViewApplied {
+                    choice: broca_wal::CompactionViewChoice::Companion { .. },
+                    ..
+                }
+            )
+        })
+        .expect("view applied with the companion strip");
+    let finished = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    let seqs = notice_seqs(&records);
+    assert_eq!(seqs, vec![1, 2], "a boundary notice and the final answer's");
+    let last_notice = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::CompactionNotice { .. }))
+        .unwrap();
+    assert!(
+        last_notice > finished,
+        "the final answer is announced before the run ends"
+    );
+    for cut in applied + 1..finished {
+        let resumed = Shared::with_records(records[..cut].to_vec());
+        let (model, views) = run_history(&resumed).await;
+        assert_eq!(
+            views.offered.load(Ordering::SeqCst),
+            0,
+            "cut {cut}: a durable view was offered again"
+        );
+        let calls = model.0.calls();
+        assert_eq!(calls.len(), 1, "cut {cut}");
+        assert_eq!(
+            crate::canonical_request_bytes(&calls[0]),
+            live,
+            "cut {cut}: resumed request bytes differ"
+        );
+        let after = resumed.records();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|record| matches!(record, WalRecord::CompactionViewApplied { .. }))
+                .count(),
+            1,
+            "cut {cut}"
+        );
+        let seqs = notice_seqs(&after);
+        assert_eq!(
+            seqs,
+            (1..=seqs.len() as u64).collect::<Vec<_>>(),
+            "cut {cut}"
+        );
+    }
+}
+
+/// A new lineage of a session whose earlier lineage retention deleted starts its notice numbers
+/// at the number that lineage's tombstone recorded. The bus and the provider key notices on the
+/// session, so they never take the new lineage's notices for repeats of the deleted lineage's.
+#[tokio::test]
+async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
+    let root = broca_test_support::scratch_root().join(format!(
+        "broca-compaction-notice-floor-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = crate::FileWalStore::new(&root);
+    let stone = store.tombstone_path(&bind(), "deleted-lineage");
+    std::fs::create_dir_all(stone.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stone,
+        json!({"lineage_id":"deleted-lineage","expired_at_ms":1,"seq":1,"next_notice_seq":7})
+            .to_string(),
+    )
+    .unwrap();
+    let writer =
+        crate::WalHandle::spawn(crate::WalStore::open(&store, &bind()).unwrap(), 1).unwrap();
+    let model = crate::StubProvider::new(vec![model_events()]);
+    let (out, _events) = tokio::sync::mpsc::channel(128);
+    crate::run_loop_on_writer(
+        request(),
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &store,
+        None,
+        crate::RunControl {
+            manifest: Some(manifest()),
+            compaction_plane: Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            })),
+            ..Default::default()
+        },
+        &out,
+    )
+    .await
+    .unwrap();
+    writer.shutdown().await.unwrap();
+    let records: Vec<WalRecord> = crate::WalStore::read_records(&store, &bind())
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
+    assert_eq!(notice_seqs(&records), vec![7, 8]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The run loop decides a view over the prompt the model is sent, tags included. A view that
+/// puts back the raw text of the first question changes the request there (the request showed
+/// it with its runner tag), so the signed answer after it is invalidated: the view applies
+/// with the companion strip and the old signature never goes out over the changed prefix.
+#[tokio::test]
+async fn the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends() {
+    let shared = Shared::default();
+    let (model, views) = run_history_with(
+        &shared,
+        OneView {
+            copy_raw_question: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(views.offered.load(Ordering::SeqCst), 1);
+    assert!(shared.records().iter().any(|record| matches!(
+        record,
+        WalRecord::CompactionViewApplied {
+            choice: broca_wal::CompactionViewChoice::Companion { .. },
+            ..
+        }
+    )));
+    let call = &model.0.calls()[0];
+    assert_eq!(
+        call.prompt[0].content,
+        text(Role::User, "first question").content
+    );
+    assert!(
+        call.prompt
+            .iter()
+            .all(|message| !message.content.iter().any(view::is_prefix_bound)),
+        "the old signature is not sent over the changed first message"
+    );
 }

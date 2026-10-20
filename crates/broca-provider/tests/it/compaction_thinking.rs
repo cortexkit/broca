@@ -160,7 +160,7 @@ fn options(records: &[WalRecord]) -> CallOptions {
     stamp_ordinals(&mut opts.prompt);
     opts.render_episodes = Arc::new(prior.render_episodes.unwrap().into());
     if let Some(state) = prior.compaction.state() {
-        opts = broca_core::compaction::model_options(&opts, state);
+        opts = broca_core::compaction::model_options(&opts, state).unwrap();
     }
     opts
 }
@@ -407,7 +407,7 @@ fn sidecar_projection_and_legacy_boundary_recovery_match_complete_replay() {
             .unwrap()
             .state()
             .unwrap();
-        let view = broca_core::compaction::model_options(&opts, state);
+        let view = broca_core::compaction::model_options(&opts, state).unwrap();
         assert_eq!(
             AnthropicMessages.render(&anthropic_frozen_config("claude-opus-5-5"), &view),
             bytes(&records),

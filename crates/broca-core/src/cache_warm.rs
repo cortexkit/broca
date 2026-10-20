@@ -519,7 +519,8 @@ pub fn last_recorded_request(
         .map_err(|error| RecordedRequestError::Unavailable(format!("replay compaction: {error}")))?
         .compaction;
     if let Some(state) = compaction.state() {
-        opts = crate::compaction::model_options(&opts, state);
+        opts = crate::compaction::model_options(&opts, state)
+            .map_err(|error| RecordedRequestError::Unavailable(error.to_string()))?;
     }
     Ok(RecordedRequest {
         run_id,
