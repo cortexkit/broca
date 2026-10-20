@@ -2989,10 +2989,10 @@ where
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
     let compaction_notice_floor = prior.compaction_notice_floor;
-    // The newest fetched view this run will not apply (refused, rejected or stale), and the
-    // newest one a notice already reported, so neither is offered or reported twice.
-    let mut declined_view: Option<u64> = None;
-    let mut reported_view: Option<u64> = None;
+    // What this run remembers about views between its step boundaries: the ones it will not
+    // offer again, the ones a notice already reported, and a fetched view it holds to offer
+    // again later.
+    let mut boundary_views = crate::compaction::runtime::BoundaryViews::default();
     // The rendered size of the last request under compaction, from which a notice recorded
     // between boundaries estimates the next one.
     let mut notice_request_bytes = 0usize;
@@ -4363,46 +4363,24 @@ where
             }
             let state = compaction_state.as_mut().expect("Setup is durable");
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
-            let mut view_events = Vec::new();
-            if let Some(views) = &control.compaction_views {
-                let current = state.view.as_ref().map(|applied| applied.view.view_version);
-                if let Some((fetched, ready)) = views
-                    .newest(&session_ref, &lineage_id, current)
-                    .filter(|(fetched, _)| declined_view != Some(fetched.view_version))
-                {
-                    let (decision, event) = Box::pin(runtime.offer_view(
-                        state,
-                        &fetched,
-                        &ready,
-                        &lineage_id,
-                        // The prompt the request renders from, so the decision sees the bytes
-                        // the model is sent (tags and loop guidance included); and the stored
-                        // copy, against which the view's own bytes are judged.
-                        &opts.prompt,
-                        raw,
-                        provider.reasoning_is_prefix_bound(),
-                    ))
-                    .await?;
-                    // A refused, rejected or stale view is never offered to this run again. A
-                    // deferred view is offered at every later boundary, and so is one that is
-                    // not (yet) a prefix of this transcript: it may cover messages this run
-                    // has still to write again after a restart.
-                    if matches!(
-                        decision,
-                        crate::compaction::view::Decision::Refuse(_)
-                            | crate::compaction::view::Decision::Rejected(_)
-                            | crate::compaction::view::Decision::Stale
-                    ) {
-                        declined_view = Some(fetched.view_version);
-                    }
-                    if reported_view != Some(fetched.view_version) {
-                        if let Some(event) = event {
-                            view_events.push(event);
-                            reported_view = Some(fetched.view_version);
-                        }
-                    }
-                }
-            }
+            // Ride when the prefix is being rewritten anyway, then fetch the newest announced
+            // view with `view.get`; either is offered here, at the boundary, and recorded before
+            // the request renders.
+            let view_events = Box::pin(runtime.views_at_boundary(
+                &mut boundary_views,
+                state,
+                control.compaction_views.as_deref(),
+                &session_ref,
+                &lineage_id,
+                &cfg.model.model_id,
+                // The prompt the request renders from, so the decision sees the bytes
+                // the model is sent (tags and loop guidance included); and the stored
+                // copy, against which the view's own bytes are judged.
+                &opts.prompt,
+                raw,
+                provider.reasoning_is_prefix_bound(),
+            ))
+            .await?;
             let view = crate::compaction::model_options(&opts, state)
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = provider.render_request(&view).len();
@@ -4426,6 +4404,20 @@ where
                 },
             ) {
                 runtime.record_notice(state, notice).await?;
+            }
+            // Never send over the model's context window. The notice above already told the
+            // provider how large the request is, so a view can follow. A request that only
+            // reached Setup's ceiling, still inside the window, is sent: broca does not yet
+            // pause there to wait for a view.
+            if let crate::compaction::view::BeforeSend::Refuse(detail) =
+                crate::compaction::view::before_send(
+                    crate::compaction::view::ceiling_policy(state).as_ref(),
+                    estimate,
+                    context_limit,
+                )
+            {
+                terminal_error = Some(crate::compaction::runtime::context_ceiling_error(&detail));
+                break RunFinishReason::Error;
             }
             model_opts = Some(Arc::new(view));
             #[cfg(feature = "test-clock")]

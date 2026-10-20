@@ -955,3 +955,24 @@ fn a_recorded_view_that_does_not_assemble_is_an_error_not_a_fallback() {
     assert_eq!(error.view_version, 2);
     assert!(matches!(error.problem, AssemblyProblem::Rejected(_)));
 }
+
+/// A request rides for a view only when the model differs from the one the newest notice
+/// announced: never before the first notice, and never for the same model again.
+#[test]
+fn only_a_model_change_since_the_last_notice_rides() {
+    let mut state = after_setup();
+    assert_eq!(
+        rewrite_ride_cause(&state, "model"),
+        None,
+        "nothing announced yet"
+    );
+    state.announced = Some(Announced {
+        model: Some("model".into()),
+        ..Default::default()
+    });
+    assert_eq!(rewrite_ride_cause(&state, "model"), None, "the same model");
+    assert_eq!(
+        rewrite_ride_cause(&state, "other"),
+        Some(crate::compaction_provider::ride::RideCause::ModelChange)
+    );
+}

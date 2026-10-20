@@ -1,16 +1,21 @@
 //! The run loop's calls into the session's compaction provider, and the WAL records that make
 //! them durable.
 //!
-//! Only Setup is a call the run waits on. Views reach the run asynchronously and are applied at
-//! step boundaries ([`Runtime::apply_view`]); advance notices are recorded here and published
-//! from the durable WAL by the bus publisher ([`Runtime::record_notice`]).
+//! Setup is a call the run waits on before its first model call. After it, the provider
+//! announces each view it publishes with a `view_ready` event ([`CompactionViews`]). The run
+//! fetches the view with `view.get` only at a step boundary and applies it there
+//! ([`Runtime::views_at_boundary`], [`Runtime::apply_view`]). When the request's prefix is
+//! being rewritten anyway, the run also asks the provider for a view itself, with a short
+//! `compaction.ride`. Advance notices are recorded here and published from the durable WAL by
+//! the bus publisher ([`Runtime::record_notice`]).
 
 use super::*;
 use crate::compaction_provider::{
     errors::RefuseCode,
-    notice::AdvanceNotice,
+    notice::{AdvanceNotice, Event, ViewReady},
+    ride::{RideAnswer, RideCause, RideRequest, MAX_REWRITE_RIDE_DEADLINE_MS},
     setup::{SetupAnswer, SetupRequest},
-    view::CompactionView,
+    view::{CompactionView, ViewGetAnswer, ViewGetRequest},
 };
 use async_trait::async_trait;
 use broca_protocol::{
@@ -65,24 +70,121 @@ pub trait CompactionPlane: Send + Sync {
         bind: &BindIdentity,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable>;
+
+    /// `view.get`: fetch the view a `view_ready` event announced (compaction-provider/v1 §6).
+    /// The default fails the call, which leaves the run on its current view, as a provider
+    /// that cannot be reached does.
+    async fn view_get(
+        &self,
+        _provider: &str,
+        _bind: &BindIdentity,
+        _request: ViewGetRequest,
+    ) -> Result<ViewGetAnswer, CompactionUnavailable> {
+        Err(CompactionUnavailable)
+    }
+
+    /// `compaction.ride`: ask the provider for a view now (compaction-provider/v1 §8). The
+    /// caller bounds the call by `request.deadline_ms`. The default fails the call, which the
+    /// run treats as the answer `nothing`.
+    async fn ride(
+        &self,
+        _provider: &str,
+        _bind: &BindIdentity,
+        _request: RideRequest,
+    ) -> Result<RideAnswer, CompactionUnavailable> {
+        Err(CompactionUnavailable)
+    }
 }
 
-/// Views fetched from the session's compaction provider (on its `view_ready` events, with
-/// `view.get`), waiting for the run's next step boundary. The run loop asks at every boundary
-/// and records, before the step, what it did with the answer.
+/// The `view_ready` events the session's compaction provider published, waiting for the run's
+/// next step boundary. An event only says that a view exists. At a boundary where no ride
+/// applied a view, the run loop asks for the newest one and fetches that view with `view.get`
+/// there, never mid-step, then records, before the step, what it did with it.
 pub trait CompactionViews: Send + Sync {
-    /// The newest view fetched for the session `session_ref` whose version is above `after`,
-    /// with the `view_ready` event it answered. `lineage_id` is the lineage the run's
-    /// transcript counts in; a view of another lineage is never applied.
-    fn newest(
+    /// The newest `view_ready` for the session `session_ref` whose version is above `after`.
+    /// `lineage_id` is the lineage the run's transcript counts in. A `view_ready` event names
+    /// no lineage, so a source fed from the bus ignores it; the fetched view's own lineage is
+    /// checked when it is offered, and a view of another lineage is never applied.
+    fn newest_ready(
         &self,
         session_ref: &str,
         lineage_id: &str,
         after: Option<u64>,
-    ) -> Option<(
-        CompactionView,
-        crate::compaction_provider::notice::ViewReady,
-    )>;
+    ) -> Option<ViewReady>;
+}
+
+/// The newest `view_ready` event received for each session, kept in memory until a run's step
+/// boundary asks for it. Losing it (a restart) loses nothing durable: the provider keeps
+/// serving its newest view with `view.get`, and announces every later one.
+#[derive(Default)]
+pub struct ViewReadyInbox {
+    newest: std::sync::Mutex<HashMap<String, ViewReady>>,
+}
+
+impl ViewReadyInbox {
+    /// Keep `ready` when it is the newest version seen for its session. Returns whether it
+    /// was kept; an older or repeated event (the bus may redeliver) changes nothing.
+    pub fn announce(&self, ready: ViewReady) -> bool {
+        let mut newest = self.newest.lock().unwrap_or_else(|e| e.into_inner());
+        match newest.get(&ready.session_ref) {
+            Some(held) if held.view_version >= ready.view_version => false,
+            _ => {
+                newest.insert(ready.session_ref.clone(), ready);
+                true
+            }
+        }
+    }
+
+    /// Drop what is held for a session that no longer runs here.
+    pub fn forget(&self, session_ref: &str) {
+        self.newest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_ref);
+    }
+}
+
+impl CompactionViews for ViewReadyInbox {
+    fn newest_ready(
+        &self,
+        session_ref: &str,
+        _lineage_id: &str,
+        after: Option<u64>,
+    ) -> Option<ViewReady> {
+        self.newest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_ref)
+            .filter(|ready| after.is_none_or(|current| ready.view_version > current))
+            .cloned()
+    }
+}
+
+/// The outcome of fetching an announced view with `view.get`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Fetch {
+    View(CompactionView),
+    /// The provider refused with this code: it does not hold that version or that session,
+    /// or gave a code broca does not know, which counts the same. The run keeps its current
+    /// view and waits for the next `view_ready` (compaction-provider/v1 §6).
+    Refused(String),
+    /// No answer within the call budget, an `ERROR`, or an answer that does not decode. The
+    /// run keeps its current view and may fetch again at a later boundary.
+    Unavailable,
+}
+
+/// What the run loop remembers about views from one step boundary to the next.
+#[derive(Default)]
+pub(crate) struct BoundaryViews {
+    /// The newest version this run will not offer again: refused, rejected, stale, or one the
+    /// provider said it does not hold.
+    declined: Option<u64>,
+    /// The newest version a notice already reported, so no event is reported twice.
+    reported: Option<u64>,
+    /// The last view fetched and not applied, with the event that announced it. A deferred
+    /// view, or one that is not (yet) a prefix of the transcript, is offered again at a later
+    /// boundary from here, without fetching it again.
+    held: Option<(ViewReady, CompactionView)>,
 }
 
 pub(crate) struct Runtime<'a> {
@@ -171,6 +273,24 @@ pub(crate) async fn seal_recorded_wait(
         state.fold(&record);
     }
     Ok(Some(terminal_exit(exit)))
+}
+
+/// The run error for a request broca will not send because it is over the model's context
+/// window (compaction-provider/v1 §8: the runner never sends over the window). Not retryable:
+/// sending it again changes nothing until a view makes the request smaller.
+pub(crate) fn context_ceiling_error(
+    detail: &cortexkit_role_llm_runner::errors::ContextCeilingDetail,
+) -> ProviderError {
+    error(
+        None,
+        &format!(
+            "context_ceiling: the request is estimated at {} tokens, over the model's context \
+             window of {} tokens ({})",
+            detail.size, detail.window, detail.cause
+        ),
+        Some("context_ceiling".into()),
+        false,
+    )
 }
 
 impl Runtime<'_> {
@@ -272,6 +392,187 @@ impl Runtime<'_> {
             .expect("Setup applied")
             .thinking_prefix_len = raw.len() as u64;
         Ok(state)
+    }
+
+    /// Fetch the view `ready` announced, with `view.get`, within the call budget.
+    pub(crate) async fn view_get(&self, ready: &ViewReady) -> Fetch {
+        let Some(plane) = self.plane else {
+            return Fetch::Unavailable;
+        };
+        let answer = tokio::select! {
+            answer = plane.view_get(self.provider, self.bind, ViewGetRequest::for_ready(ready)) => answer.ok(),
+            _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(self.control.compaction_config.call_budget_ms)) => None,
+        };
+        match answer {
+            Some(ViewGetAnswer::View { view }) => Fetch::View(view),
+            Some(ViewGetAnswer::Refuse { code, .. }) => Fetch::Refused(code),
+            // The answer decodes strictly on `answer`, so no other kind reaches here.
+            #[allow(unreachable_patterns)]
+            Some(_) | None => Fetch::Unavailable,
+        }
+    }
+
+    /// Ride the provider for a view because the request's prefix is being rewritten anyway
+    /// (compaction-provider/v1 §8). The ride waits at most broca's own short deadline, which
+    /// it sends as `deadline_ms`. A missed deadline, a failed call or `nothing` gives `None`,
+    /// and the request goes out under the current view.
+    pub(crate) async fn ride(&self, session_ref: &str, cause: RideCause) -> Option<CompactionView> {
+        let plane = self.plane?;
+        let deadline_ms = self
+            .control
+            .compaction_config
+            .call_budget_ms
+            .clamp(1, MAX_REWRITE_RIDE_DEADLINE_MS);
+        let request = RideRequest::new(session_ref, cause, deadline_ms);
+        let answer = tokio::select! {
+            answer = plane.ride(self.provider, self.bind, request) => answer.ok(),
+            _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(deadline_ms)) => None,
+        };
+        match answer? {
+            RideAnswer::View { view } => Some(view),
+            _ => None,
+        }
+    }
+
+    /// The views of one step boundary (compaction-provider/v1 §7 and §8), before the request
+    /// renders. First a ride, when the request's prefix is being rewritten anyway
+    /// ([`view::rewrite_ride_cause`]); a view it brings is checked against its own digest.
+    /// Then, unless the ride's view applied, the newest `view_ready` in `inbox` above the view
+    /// rendered now: that view is fetched with `view.get` here, at the boundary, and checked
+    /// against the event's digest. At most one view applies per step. Returns the events the
+    /// boundary's notice reports (a deferred or refused view).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn views_at_boundary(
+        &self,
+        views: &mut BoundaryViews,
+        state: &mut CompactionState,
+        inbox: Option<&dyn CompactionViews>,
+        session_ref: &str,
+        lineage_id: &str,
+        model: &str,
+        prompt: &[Message],
+        stored: &[Message],
+        prefix_bound: bool,
+    ) -> Result<Vec<Event>, crate::RunError> {
+        let mut events = Vec::new();
+        if let Some(cause) = view::rewrite_ride_cause(state, model) {
+            if let Some(view) = Box::pin(self.ride(session_ref, cause)).await {
+                let ready = ViewReady::for_view(&view);
+                let applied = Box::pin(self.offer(
+                    views,
+                    state,
+                    &view,
+                    &ready,
+                    lineage_id,
+                    prompt,
+                    stored,
+                    prefix_bound,
+                    &mut events,
+                ))
+                .await?;
+                if applied {
+                    return Ok(events);
+                }
+            }
+        }
+        let Some(inbox) = inbox else {
+            return Ok(events);
+        };
+        let current = state.view.as_ref().map(|applied| applied.view.view_version);
+        let Some(ready) = inbox
+            .newest_ready(session_ref, lineage_id, current)
+            .filter(|ready| views.declined != Some(ready.view_version))
+        else {
+            return Ok(events);
+        };
+        let fetched = match &views.held {
+            Some((held, view)) if *held == ready => view.clone(),
+            _ => match Box::pin(self.view_get(&ready)).await {
+                Fetch::View(view) => {
+                    views.held = Some((ready.clone(), view.clone()));
+                    view
+                }
+                Fetch::Refused(code) => {
+                    tracing::info!(
+                        view_version = ready.view_version,
+                        %code,
+                        "compaction provider refused view.get; keeping the current view"
+                    );
+                    views.declined = Some(ready.view_version);
+                    return Ok(events);
+                }
+                Fetch::Unavailable => return Ok(events),
+            },
+        };
+        Box::pin(self.offer(
+            views,
+            state,
+            &fetched,
+            &ready,
+            lineage_id,
+            prompt,
+            stored,
+            prefix_bound,
+            &mut events,
+        ))
+        .await?;
+        Ok(events)
+    }
+
+    /// Offer one fetched view and remember the outcome in `views`; whether it applied.
+    #[allow(clippy::too_many_arguments)]
+    async fn offer(
+        &self,
+        views: &mut BoundaryViews,
+        state: &mut CompactionState,
+        fetched: &CompactionView,
+        ready: &ViewReady,
+        lineage_id: &str,
+        prompt: &[Message],
+        stored: &[Message],
+        prefix_bound: bool,
+        events: &mut Vec<Event>,
+    ) -> Result<bool, crate::RunError> {
+        let version = fetched.view_version;
+        let (decision, event) = Box::pin(self.offer_view(
+            state,
+            fetched,
+            ready,
+            lineage_id,
+            prompt,
+            stored,
+            prefix_bound,
+        ))
+        .await?;
+        match &decision {
+            // A refused, rejected or stale view is never offered to this run again. A deferred
+            // view is offered at every later boundary, and so is one that is not (yet) a prefix
+            // of this transcript: it may cover messages this run has still to write again after
+            // a restart.
+            view::Decision::Refuse(reason) => {
+                tracing::info!(view_version = version, reason, "compaction view refused");
+                views.declined = Some(version);
+            }
+            view::Decision::Rejected(problem) => {
+                tracing::info!(view_version = version, problem = %problem.name(), "compaction view rejected");
+                views.declined = Some(version);
+            }
+            view::Decision::Stale => views.declined = Some(version),
+            // Not (yet) a prefix of this transcript: held and offered again at every later
+            // boundary, so it is not logged here, where it would repeat at each one.
+            view::Decision::Discard | view::Decision::Defer(_) | view::Decision::Apply(_) => {}
+        }
+        if views.reported != Some(version) {
+            if let Some(event) = event {
+                events.push(event);
+                views.reported = Some(version);
+            }
+        }
+        let applied = matches!(decision, view::Decision::Apply(_));
+        if applied || views.declined == Some(version) {
+            views.held = None;
+        }
+        Ok(applied)
     }
 
     /// Offer a fetched view at a step boundary: decide what to do with it

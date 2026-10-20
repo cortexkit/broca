@@ -10,7 +10,9 @@ use broca_core::{
         describe::check_describe,
         errors::KnownCode,
         ops,
+        ride::{RideAnswer, RideRequest},
         setup::{SetupAnswer, SetupRequest},
+        view::{ViewGetAnswer, ViewGetRequest},
         OpRequest, ROLE, VERSION,
     },
     CompactionPlane, CompactionUnavailable,
@@ -142,6 +144,54 @@ impl CompactionPlane for SubcCompactionPlane {
             bounded(Instant::now() + Duration::from_millis(COMPACTION_CALL_BUDGET_MS)),
         )
         .await
+    }
+
+    /// `view.get` on the session's compaction route, within the call budget. A request for a
+    /// session other than the caller's is never sent.
+    async fn view_get(
+        &self,
+        provider: &str,
+        bind: &BindIdentity,
+        request: ViewGetRequest,
+    ) -> Result<ViewGetAnswer, CompactionUnavailable> {
+        if request.session_ref != broca_core::wal_writer::agent_session_ref(bind) {
+            return Err(CompactionUnavailable);
+        }
+        self.route
+            .call(
+                provider,
+                bind,
+                &OpRequest::new(ops::VIEW_GET, &request),
+                bounded(Instant::now() + Duration::from_millis(COMPACTION_CALL_BUDGET_MS)),
+                false,
+            )
+            .await
+            .map_err(|_| CompactionUnavailable)
+    }
+
+    /// `compaction.ride` on the session's compaction route, waiting no longer than the
+    /// request's own `deadline_ms` (nor the call budget). A request for a session other than
+    /// the caller's is never sent.
+    async fn ride(
+        &self,
+        provider: &str,
+        bind: &BindIdentity,
+        request: RideRequest,
+    ) -> Result<RideAnswer, CompactionUnavailable> {
+        if request.session_ref != broca_core::wal_writer::agent_session_ref(bind) {
+            return Err(CompactionUnavailable);
+        }
+        let ride_deadline = Instant::now() + Duration::from_millis(request.deadline_ms);
+        self.route
+            .call(
+                provider,
+                bind,
+                &OpRequest::new(ops::COMPACTION_RIDE, &request),
+                bounded(ride_deadline),
+                false,
+            )
+            .await
+            .map_err(|_| CompactionUnavailable)
     }
 }
 

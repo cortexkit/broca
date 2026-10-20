@@ -30,7 +30,9 @@ use std::{
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
-pub use runtime::{CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews};
+pub use runtime::{
+    CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews, ViewReadyInbox,
+};
 pub(crate) mod runtime;
 #[cfg(feature = "test-clock")]
 pub mod test_control;

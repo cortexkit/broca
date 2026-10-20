@@ -62,7 +62,10 @@ impl subc_client_rs::ModuleHandler for Provider {
             );
         }
         assert!(
-            matches!(request["method"].as_str(), Some("compaction.setup")),
+            matches!(
+                request["method"].as_str(),
+                Some("compaction.setup" | "view.get" | "compaction.ride")
+            ),
             "not a tool-call envelope: {request}"
         );
         self.0.seen.notify_one();
@@ -275,6 +278,90 @@ async fn setup_refuses_mismatched_caller_identity_before_opening_a_route() {
     }
     assert_eq!(bind_count(&serving), 0);
     assert!(serving.script.bodies.lock().unwrap().is_empty());
+}
+
+/// `view.get` and `compaction.ride` go out on the same role route as Setup, as
+/// `{method, params}` with the request unchanged, and decode the provider's answer. A request
+/// naming a session other than the caller's is never sent.
+#[tokio::test]
+async fn view_get_and_ride_use_the_role_route_and_only_the_callers_session() {
+    use broca_core::compaction_provider::{
+        lineage::MessageRef,
+        notice::ViewReady,
+        ride::{RideAnswer, RideCause, RideRequest},
+        view::{CompactionView, ViewGetAnswer, ViewGetRequest, ViewRange},
+    };
+    let serving = start("compaction-view-ride", vec![], describe(), false).await;
+    let session_ref = broca_core::wal_writer::agent_session_ref(&serving.bind);
+    let view = CompactionView::new(
+        &session_ref,
+        2,
+        "lineage",
+        MessageRef {
+            ordinal: 0,
+            mid: "m0".into(),
+        },
+        vec![ViewRange::replace(
+            0,
+            1,
+            json!([{"role":"user","content":[{"type":"text","text":"summary"}]}]).to_string(),
+        )],
+    );
+    serving.script.replies.lock().unwrap().extend([
+        Reply::Json(serde_json::to_value(ViewGetAnswer::view(view.clone())).unwrap()),
+        Reply::Json(serde_json::to_value(RideAnswer::nothing()).unwrap()),
+    ]);
+    let get = ViewGetRequest::for_ready(&ViewReady::for_view(&view));
+    let answer = serving
+        .plane
+        .view_get("compaction-test", &serving.bind, get.clone())
+        .await
+        .unwrap();
+    assert_eq!(answer, ViewGetAnswer::view(view));
+    let ride = RideRequest::new(&session_ref, RideCause::ModelChange, 2_000);
+    let answer = serving
+        .plane
+        .ride("compaction-test", &serving.bind, ride.clone())
+        .await
+        .unwrap();
+    assert_eq!(answer, RideAnswer::nothing());
+    let sent: Vec<Value> = serving
+        .script
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|body| serde_json::from_slice(body).unwrap())
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            json!({"method": "view.get", "params": get}),
+            json!({"method": "compaction.ride", "params": ride}),
+        ]
+    );
+    assert_eq!(bind_count(&serving), 1, "one route serves every op");
+
+    let other = "0123456789abcdef0123456789abcdef";
+    assert_ne!(other, session_ref);
+    let mut foreign = get;
+    foreign.session_ref = other.into();
+    assert!(serving
+        .plane
+        .view_get("compaction-test", &serving.bind, foreign)
+        .await
+        .is_err());
+    assert!(serving
+        .plane
+        .ride(
+            "compaction-test",
+            &serving.bind,
+            RideRequest::new(other, RideCause::ModelChange, 2_000)
+        )
+        .await
+        .is_err());
+    assert_eq!(serving.script.bodies.lock().unwrap().len(), 3, "never sent");
 }
 
 #[tokio::test]

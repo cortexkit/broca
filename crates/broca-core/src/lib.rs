@@ -74,7 +74,7 @@ pub use caps::{
 pub use clock::Clock;
 pub use compaction::{
     CompactionCheckpoint, CompactionPlane, CompactionState, CompactionUnavailable, CompactionViews,
-    MAX_REPLACEMENT_BYTES,
+    ViewReadyInbox, MAX_REPLACEMENT_BYTES,
 };
 pub use context::{
     call_key, catch_up_usage_exports, dispatches_of_turns, effective_context,

@@ -793,48 +793,140 @@ impl crate::Provider for PrefixBound {
     }
 }
 
-/// The provider's one view of the session: its first message folded into a summary.
+/// The provider's one view of the session, its first message folded into a summary, announced
+/// by a `view_ready` event and served by `view.get`. It also serves as the session's plane, so
+/// the fetch goes through the run loop's real call.
 #[derive(Default)]
 struct OneView {
+    /// `view.get` calls that answered the view.
     offered: AtomicUsize,
     /// Replace the first question with a copy of it from the raw transcript, which lacks the
     /// runner tag the request shows on its text, instead of a summary.
     copy_raw_question: bool,
+    /// Serve a view whose bytes differ from the ones the `view_ready` event announced.
+    tampered: bool,
+    /// Answer `view.get` with this refusal code instead of the view.
+    refuse: Option<&'static str>,
+    /// Serve a view of another lineage, which is never a prefix of the run's transcript.
+    foreign_lineage: bool,
+    /// The lineage the run asked for, which the view names.
+    lineage: Mutex<Option<String>>,
+    /// For each `view.get` call: the version it asked for, and whether it came at a step
+    /// boundary (the step's `StepStarted` durable, none of its model output yet).
+    fetches: Mutex<Vec<(u64, bool)>>,
+    /// The WAL the run writes, to see where each fetch falls.
+    wal: Mutex<Option<Shared>>,
+    /// Every `compaction.ride` request, and the view a ride answers with when set.
+    rides: Mutex<Vec<crate::compaction_provider::ride::RideRequest>>,
+    ride_answers: bool,
 }
-impl CompactionViews for OneView {
-    fn newest(
+impl OneView {
+    fn view(
         &self,
         session_ref: &str,
-        lineage_id: &str,
-        after: Option<u64>,
-    ) -> Option<(
-        crate::compaction_provider::view::CompactionView,
-        crate::compaction_provider::notice::ViewReady,
-    )> {
+        text_of_fold: &str,
+    ) -> crate::compaction_provider::view::CompactionView {
         use crate::compaction_provider::{lineage::MessageRef, view::*};
-        if after.is_some_and(|applied| applied >= 2) {
-            return None;
-        }
-        self.offered.fetch_add(1, Ordering::SeqCst);
+        let lineage = if self.foreign_lineage {
+            "another-lineage".to_string()
+        } else {
+            self.lineage.lock().unwrap().clone().expect("asked first")
+        };
         let fold = if self.copy_raw_question {
             vec![text(Role::User, "first question")]
         } else {
-            vec![text(Role::User, "summary")]
+            vec![text(Role::User, text_of_fold)]
         };
         let covers = 0;
-        let bytes = serde_json::to_string(&fold).unwrap();
-        let view = CompactionView::new(
+        CompactionView::new(
             session_ref,
             2,
-            lineage_id,
+            lineage,
             MessageRef {
                 ordinal: covers,
                 mid: format!("m{covers}"),
             },
-            vec![ViewRange::replace(0, covers + 1, bytes)],
-        );
-        let ready = crate::compaction_provider::notice::ViewReady::for_view(&view);
-        Some((view, ready))
+            vec![ViewRange::replace(
+                0,
+                covers + 1,
+                serde_json::to_string(&fold).unwrap(),
+            )],
+        )
+    }
+}
+impl CompactionViews for OneView {
+    fn newest_ready(
+        &self,
+        session_ref: &str,
+        lineage_id: &str,
+        after: Option<u64>,
+    ) -> Option<crate::compaction_provider::notice::ViewReady> {
+        if after.is_some_and(|applied| applied >= 2) {
+            return None;
+        }
+        *self.lineage.lock().unwrap() = Some(lineage_id.into());
+        Some(crate::compaction_provider::notice::ViewReady::for_view(
+            &self.view(session_ref, "summary"),
+        ))
+    }
+}
+#[async_trait::async_trait]
+impl CompactionPlane for OneView {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        let mut answer = ready();
+        if self.copy_raw_question {
+            // Setup inserts nothing, so the view's copy is the request's only change.
+            answer["initial"]["replacement"] = json!([]);
+        }
+        answer["request_id"] = request.request_id.into();
+        Ok(serde_json::from_value(answer).unwrap())
+    }
+    async fn view_get(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: crate::compaction_provider::view::ViewGetRequest,
+    ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
+        use crate::compaction_provider::view::ViewGetAnswer;
+        // At a step boundary: the step's `StepStarted` is durable and nothing of the step's
+        // model output is (Setup's own records may follow it on the first step).
+        let at_boundary = self.wal.lock().unwrap().as_ref().is_some_and(|wal| {
+            let records = wal.records();
+            let last = |is: fn(&WalRecord) -> bool| records.iter().rposition(is);
+            let started = last(|record| matches!(record, WalRecord::StepStarted { .. }));
+            let finished = last(|record| matches!(record, WalRecord::ModelStepFinished { .. }));
+            started.is_some() && started > finished
+        });
+        self.fetches
+            .lock()
+            .unwrap()
+            .push((request.view_version, at_boundary));
+        if let Some(code) = self.refuse {
+            return Ok(ViewGetAnswer::refuse(code, "not held"));
+        }
+        self.offered.fetch_add(1, Ordering::SeqCst);
+        let fold = if self.tampered { "tampered" } else { "summary" };
+        Ok(ViewGetAnswer::view(self.view(&request.session_ref, fold)))
+    }
+    async fn ride(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: crate::compaction_provider::ride::RideRequest,
+    ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
+        use crate::compaction_provider::ride::RideAnswer;
+        let session_ref = request.session_ref.clone();
+        self.rides.lock().unwrap().push(request);
+        Ok(if self.ride_answers {
+            RideAnswer::view(self.view(&session_ref, "ridden summary"))
+        } else {
+            RideAnswer::nothing()
+        })
     }
 }
 
@@ -882,27 +974,52 @@ async fn run_history(shared: &Shared) -> (PrefixBound, Arc<OneView>) {
 }
 
 async fn run_history_with(shared: &Shared, views: OneView) -> (PrefixBound, Arc<OneView>) {
+    run_history_steps(shared, views, false).await
+}
+
+/// [`run_history_with`], or, with `two_steps`, a run whose first step calls a tool, so the
+/// run passes two step boundaries.
+async fn run_history_steps(
+    shared: &Shared,
+    views: OneView,
+    two_steps: bool,
+) -> (PrefixBound, Arc<OneView>) {
     let writer = shared.writer();
-    let (request, mut control, _) = history_request();
-    if views.copy_raw_question {
-        // Setup inserts nothing, so the view's copy is the request's only change.
-        let mut empty = ready();
-        empty["initial"]["replacement"] = json!([]);
-        control.compaction_plane = Some(Arc::new(Scripted {
-            answer: empty,
-            setups: AtomicUsize::new(0),
-        }));
-    }
+    let (mut request, mut control, _) = history_request();
+    *views.wal.lock().unwrap() = Some(shared.clone());
     let views = Arc::new(views);
+    control.compaction_plane = Some(views.clone());
     control.compaction_views = Some(views.clone());
-    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let scripts = if two_steps {
+        request.tools = vec![serde_json::from_value(
+            json!({"name":"edit","description":"edit","input_schema":{"type":"object"}}),
+        )
+        .unwrap()];
+        request.policy_allowed.insert("edit".into());
+        let mut answer = model_events();
+        if let broca_protocol::NormalizedEvent::Control(
+            broca_protocol::ProviderControl::AssistantMessage { message },
+        ) = &mut answer[0]
+        {
+            message.message_id = broca_protocol::MessageId("b".into());
+        }
+        vec![tool_call_events("edit", 1), answer]
+    } else {
+        vec![model_events()]
+    };
+    let model = PrefixBound(crate::StubProvider::new(scripts));
+    let tools = crate::StubToolPlane::new().with_tool("edit", |_| {
+        crate::StubReply::Output(broca_protocol::content::ToolOutput::Text {
+            text: "edited".into(),
+        })
+    });
     let (out, _events) = tokio::sync::mpsc::channel(256);
     crate::run_loop_on_writer(
         request,
         &writer,
         crate::StartMode::FreshOrResume,
         &model,
-        &crate::StubToolPlane::new(),
+        &tools,
         &crate::AllowAll,
         shared,
         None,
@@ -1097,6 +1214,295 @@ async fn the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends() {
             .all(|message| !message.content.iter().any(view::is_prefix_bound)),
         "the old signature is not sent over the changed first message"
     );
+}
+
+fn views_applied(records: &[WalRecord]) -> Vec<u64> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionViewApplied { view_version, .. } => Some(*view_version),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `view_ready` event only announces a view: the run loop fetches it with `view.get` at the
+/// step boundary, after the step's durable `StepStarted` and before its request, asking for
+/// exactly the announced version, and applies it there.
+#[tokio::test]
+async fn an_announced_view_is_fetched_at_the_step_boundary_and_applied() {
+    let shared = Shared::default();
+    let (model, views) = run_history(&shared).await;
+    assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
+    assert_eq!(views_applied(&shared.records()), vec![2]);
+    let sent =
+        String::from_utf8_lossy(&crate::canonical_request_bytes(&model.0.calls()[0])).into_owned();
+    assert!(sent.contains("summary"), "{sent}");
+}
+
+/// A fetched view whose bytes are not the ones its `view_ready` announced (its digest differs
+/// from the event's) is rejected: never recorded, never rendered, and not fetched again at
+/// the run's later boundary.
+#[tokio::test]
+async fn a_fetched_view_that_differs_from_its_announcement_is_never_applied() {
+    let shared = Shared::default();
+    let (model, views) = run_history_steps(
+        &shared,
+        OneView {
+            tampered: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
+    assert!(views_applied(&shared.records()).is_empty());
+    assert_eq!(model.0.calls().len(), 2);
+    for call in model.0.calls() {
+        let sent = String::from_utf8_lossy(&crate::canonical_request_bytes(&call)).into_owned();
+        assert!(!sent.contains("tampered"), "{sent}");
+        assert!(
+            sent.contains("head"),
+            "Setup's head is still rendered: {sent}"
+        );
+    }
+}
+
+/// A provider that refuses `view.get` (it does not hold the announced version) leaves the run
+/// on its current view; nothing is recorded for the view, and the run does not ask for that
+/// version again at its later boundary.
+#[tokio::test]
+async fn a_refused_fetch_keeps_the_current_view() {
+    let shared = Shared::default();
+    let (model, views) = run_history_steps(
+        &shared,
+        OneView {
+            refuse: Some("unknown_version"),
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
+    assert!(views_applied(&shared.records()).is_empty());
+    assert_eq!(model.0.calls().len(), 2);
+    for call in model.0.calls() {
+        let sent = String::from_utf8_lossy(&crate::canonical_request_bytes(&call)).into_owned();
+        assert!(sent.contains("head") && !sent.contains("summary"), "{sent}");
+    }
+}
+
+/// A fetched view that is not a prefix of the transcript (here: of another lineage) is not
+/// applied, and the run keeps it for its later boundaries instead of fetching it again.
+#[tokio::test]
+async fn a_view_that_is_not_a_prefix_is_kept_not_fetched_again() {
+    let shared = Shared::default();
+    let (model, views) = run_history_steps(
+        &shared,
+        OneView {
+            foreign_lineage: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
+    assert!(views_applied(&shared.records()).is_empty());
+    assert_eq!(model.0.calls().len(), 2);
+}
+
+/// A later send of the session under another model rewrites the request's prefix anyway, so
+/// the run rides the provider for a view (`compaction.ride`, cause `model_change`, within the
+/// short rewrite deadline) and applies the view it answers at that boundary. The first send,
+/// with no model announced before it, rides nothing.
+#[tokio::test]
+async fn a_model_change_rides_for_a_view_and_applies_it() {
+    let shared = Shared::default();
+    let views = Arc::new(OneView {
+        ride_answers: true,
+        ..Default::default()
+    });
+    let control = || crate::RunControl {
+        manifest: Some(manifest()),
+        compaction_plane: Some(views.clone()),
+        // A call budget above the rewrite deadline: the ride still waits no longer than the
+        // contract's short rewrite deadline.
+        compaction_config: crate::compaction::CompactionConfig {
+            call_budget_ms: 60_000,
+        },
+        ..Default::default()
+    };
+    for (index, model_id) in ["model", "other"].into_iter().enumerate() {
+        let submission: broca_protocol::request::SubmissionRequest =
+            serde_json::from_value(json!({
+                "model":{"provider_module_id":"stub","model_id":model_id},
+                "input":[{"role":"user","content":[{"type":"text","text":"first question"}]}]
+            }))
+            .unwrap();
+        let request = crate::RunRequest::from_submission(
+            submission,
+            broca_protocol::RunId(format!("run-{index}")),
+            bind(),
+            broca_protocol::SubmissionId(format!("sub-{index}")),
+        );
+        let writer = shared.writer();
+        if index == 0 {
+            // The ride's view names the lineage the transcript counts in.
+            let model = crate::StubProvider::new(vec![model_events()]);
+            let (out, _events) = tokio::sync::mpsc::channel(256);
+            crate::run_loop_on_writer(
+                request,
+                &writer,
+                crate::StartMode::FreshOrResume,
+                &model,
+                &crate::StubToolPlane::new(),
+                &crate::AllowAll,
+                &shared,
+                None,
+                control(),
+                &out,
+            )
+            .await
+            .unwrap();
+            assert!(
+                views.rides.lock().unwrap().is_empty(),
+                "no model to change from"
+            );
+            *views.lineage.lock().unwrap() =
+                Some(writer.lineage_id().expect("lineage").to_string());
+        } else {
+            let model = crate::StubProvider::new(vec![model_events()]);
+            let (out, _events) = tokio::sync::mpsc::channel(256);
+            crate::run_loop_on_writer(
+                request,
+                &writer,
+                crate::StartMode::AppendEpisode,
+                &model,
+                &crate::StubToolPlane::new(),
+                &crate::AllowAll,
+                &shared,
+                None,
+                control(),
+                &out,
+            )
+            .await
+            .unwrap();
+            let sent = String::from_utf8_lossy(&crate::canonical_request_bytes(&model.calls()[0]))
+                .into_owned();
+            assert!(sent.contains("ridden summary"), "{sent}");
+        }
+        let _ = writer.shutdown().await;
+    }
+    let rides = views.rides.lock().unwrap().clone();
+    assert_eq!(rides.len(), 1);
+    assert_eq!(
+        rides[0].cause,
+        crate::compaction_provider::ride::RideCause::ModelChange
+    );
+    assert!(rides[0].check().is_ok(), "{:?}", rides[0]);
+    assert_eq!(
+        rides[0].deadline_ms,
+        crate::compaction_provider::ride::MAX_REWRITE_RIDE_DEADLINE_MS
+    );
+    let records = shared.records();
+    assert_eq!(views_applied(&records), vec![2]);
+    let last_notice = records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            WalRecord::CompactionNotice { headers, .. } => Some(headers.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last_notice["applied_view_version"], "2");
+    assert_eq!(last_notice["model"], "other");
+}
+
+/// A compaction session never sends a request broca counts over the model's context window:
+/// the run ends before the model call, and the boundary's notice, durable first, tells the
+/// provider how large the request is. A session without compaction sends the same request.
+#[tokio::test]
+async fn a_request_over_the_window_is_refused_before_it_is_sent() {
+    for compaction in [true, false] {
+        let shared = Shared::default();
+        let writer = shared.writer();
+        let model = crate::StubProvider::new(vec![model_events()]);
+        let (out, _events) = tokio::sync::mpsc::channel(256);
+        let mut control = crate::RunControl {
+            admitted_context_limit: Some(4),
+            ..Default::default()
+        };
+        if compaction {
+            control.manifest = Some(manifest());
+            control.compaction_plane = Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            }));
+        }
+        let summary = crate::run_loop_on_writer(
+            request(),
+            &writer,
+            crate::StartMode::FreshOrResume,
+            &model,
+            &crate::StubToolPlane::new(),
+            &crate::AllowAll,
+            &shared,
+            None,
+            control,
+            &out,
+        )
+        .await
+        .unwrap();
+        let _ = writer.shutdown().await;
+        let records = shared.records();
+        if !compaction {
+            assert_eq!(model.calls().len(), 1, "no compaction: sent as before");
+            assert_eq!(summary.reason, RunFinishReason::Completed);
+            continue;
+        }
+        assert!(model.calls().is_empty(), "never sent over the window");
+        assert_eq!(summary.reason, RunFinishReason::Error);
+        let error = records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunFinished { error, .. } => error.clone(),
+                _ => None,
+            })
+            .expect("the run's error");
+        assert_eq!(error.provider_code.as_deref(), Some("context_ceiling"));
+        assert!(error.message.contains("over_window"), "{}", error.message);
+        let WalRecord::CompactionNotice { headers, .. } = records
+            .iter()
+            .find(|record| matches!(record, WalRecord::CompactionNotice { .. }))
+            .expect("the boundary notice")
+        else {
+            unreachable!()
+        };
+        assert_eq!(headers["window"], "4");
+        assert!(headers["est_tokens"].parse::<u64>().unwrap() > 4);
+    }
+}
+
+/// The inbox keeps the newest `view_ready` per session: an older or repeated event (the bus
+/// may redeliver) changes nothing, and a boundary is answered only an event above the view it
+/// renders.
+#[test]
+fn the_view_ready_inbox_keeps_the_newest_event_per_session() {
+    use crate::compaction_provider::notice::ViewReady;
+    let inbox = runtime::ViewReadyInbox::default();
+    let session = "0123456789abcdef0123456789abcdef";
+    let ready = |version: u64| ViewReady::new(session, version, 3, "ab".repeat(32));
+    assert!(inbox.announce(ready(2)));
+    assert!(!inbox.announce(ready(1)));
+    assert!(!inbox.announce(ready(2)));
+    assert_eq!(inbox.newest_ready(session, "l", None), Some(ready(2)));
+    assert_eq!(inbox.newest_ready(session, "l", Some(1)), Some(ready(2)));
+    assert_eq!(inbox.newest_ready(session, "l", Some(2)), None);
+    assert_eq!(inbox.newest_ready("another", "l", None), None);
+    assert!(inbox.announce(ready(3)));
+    assert_eq!(inbox.newest_ready(session, "l", Some(2)), Some(ready(3)));
+    inbox.forget(session);
+    assert_eq!(inbox.newest_ready(session, "l", None), None);
 }
 
 /// A WAL store that counts how often admission asks it for the notice floor.

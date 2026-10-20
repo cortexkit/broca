@@ -769,6 +769,24 @@ pub fn ceiling_ride(
     }
 }
 
+/// Why the request at this boundary rewrites its prefix anyway, so that a ride costs the
+/// session nothing it would not pay already (compaction-provider/v1 §8): today only a model
+/// change, judged against the model the newest notice announced. `None` before the first
+/// notice, which has nothing to compare with.
+///
+/// broca names no other cause. It places cache markers without knowing the lifetime the model
+/// provider gives them, so it never claims `ttl_expired`. It does not detect a change of the
+/// system text or tool surface between requests, so it never claims `surface_change` either.
+pub fn rewrite_ride_cause(state: &CompactionState, model: &str) -> Option<RideCause> {
+    state
+        .announced
+        .as_ref()?
+        .model
+        .as_deref()
+        .filter(|announced| *announced != model)
+        .map(|_| RideCause::ModelChange)
+}
+
 #[cfg(test)]
 #[path = "view_tests.rs"]
 mod tests;

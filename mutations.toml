@@ -17599,7 +17599,7 @@ new = "    if false && open_turn(&next) // NON-VACUITY BREAK\n        .is_some_a
 
 [[control]]
 id = "compaction-ceiling-never-sends-over-the-window"
-guards = "the pure ceiling decision refuses over_window for a request broca counts past the window (no send path calls it yet; enforcement before a send is not wired)"
+guards = "the pure ceiling decision refuses over_window for a request broca counts past the window"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
@@ -17636,15 +17636,16 @@ new = "        // notice from reaching the bus before a crash could still lose i
 
 [[control]]
 id = "compaction-run-loop-offers-views-at-the-boundary"
-guards = "the run loop offers a fetched view at each step boundary and records it before the request renders"
+guards = "the run loop fetches the newest announced view at each step boundary and records it before the request renders"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
-file = "crates/broca-core/src/run.rs"
-old = ".filter(|(fetched, _)| declined_view != Some(fetched.view_version))"
-new = ".filter(|(_fetched, _)| false) // NON-VACUITY BREAK: never offer a fetched view"
+expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically", "compaction::tests::an_announced_view_is_fetched_at_the_step_boundary_and_applied"]
+only = false
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = ".filter(|ready| views.declined != Some(ready.view_version))"
+new = ".filter(|_ready| false) // NON-VACUITY BREAK: never fetch an announced view"
 
 [[control]]
 id = "compaction-run-loop-records-the-boundary-notice"
@@ -17656,8 +17657,8 @@ test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically"]
 only = false
 file = "crates/broca-core/src/run.rs"
-old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            model_opts = Some(Arc::new(view));"
-new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no boundary notice\n            }\n            model_opts = Some(Arc::new(view));"
+old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            // Never send over"
+new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no boundary notice\n            }\n            // Never send over"
 
 [[control]]
 id = "compaction-run-loop-decides-over-the-rendered-prompt"
@@ -17668,8 +17669,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends"]
 file = "crates/broca-core/src/run.rs"
-old = "                        &opts.prompt,\n                        raw,\n                        provider.reasoning_is_prefix_bound(),"
-new = "                        raw, // NON-VACUITY BREAK: decide over the raw copy\n                        raw,\n                        provider.reasoning_is_prefix_bound(),"
+old = "                &opts.prompt,\n                raw,\n                provider.reasoning_is_prefix_bound(),"
+new = "                raw, // NON-VACUITY BREAK: decide over the raw copy\n                raw,\n                provider.reasoning_is_prefix_bound(),"
 
 [[control]]
 id = "compaction-notice-floor-across-lineages"
@@ -17746,3 +17747,171 @@ only = false
 file = "crates/broca-core/src/run.rs"
 old = "        closing.record_with_terminal(writer, assistant, &results);"
 new = "        let _ = (closing, assistant); // NON-VACUITY BREAK: no closing notice"
+
+[[control]]
+id = "compaction-run-loop-refuses-over-the-window"
+guards = "a compaction session never sends a request broca counts over the model's context window: the run ends context_ceiling before the model call"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_request_over_the_window_is_refused_before_it_is_sent"]
+file = "crates/broca-core/src/run.rs"
+old = '''terminal_error = Some(crate::compaction::runtime::context_ceiling_error(&detail));
+                break RunFinishReason::Error;'''
+new = 'let _ = detail; // NON-VACUITY BREAK: send over the window'
+
+[[control]]
+id = "compaction-boundary-fetches-the-announced-version"
+guards = "view.get asks for exactly the version the view_ready event announced"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::an_announced_view_is_fetched_at_the_step_boundary_and_applied"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = 'ViewGetRequest::for_ready(ready)'
+new = 'ViewGetRequest::new(ready.session_ref.clone(), ready.view_version + 1) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "compaction-fetched-view-checked-against-its-announcement"
+guards = "a view fetched with view.get is judged against the digest its view_ready event announced, not only its own"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_fetched_view_that_differs_from_its_announcement_is_never_applied"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = '''            &fetched,
+            &ready,'''
+new = '''            &fetched,
+            &ViewReady::for_view(&fetched), // NON-VACUITY BREAK: judge the view against itself'''
+
+[[control]]
+id = "compaction-refused-fetch-not-asked-again"
+guards = "a version the provider refused on view.get is not fetched again at the run's later boundaries"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_refused_fetch_keeps_the_current_view"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = '''                    views.declined = Some(ready.view_version);
+                    return Ok(events);'''
+new = '                    return Ok(events); // NON-VACUITY BREAK: ask for the refused version again'
+
+[[control]]
+id = "compaction-unapplied-view-held-not-refetched"
+guards = "a fetched view that did not apply is kept for later boundaries instead of being fetched again"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_view_that_is_not_a_prefix_is_kept_not_fetched_again"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = 'views.held = Some((ready.clone(), view.clone()));'
+new = 'let _ = &views.held; // NON-VACUITY BREAK: fetch again at every boundary'
+
+[[control]]
+id = "compaction-model-change-rides"
+guards = "a send under another model than the last notice announced rides the provider for a view and applies the view it answers"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_model_change_rides_for_a_view_and_applies_it"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = 'if let Some(cause) = view::rewrite_ride_cause(state, model) {'
+new = 'if let Some(cause) = None::<RideCause>.filter(|_| view::rewrite_ride_cause(state, model).is_some()) { // NON-VACUITY BREAK'
+
+[[control]]
+id = "compaction-ride-only-on-a-model-change"
+guards = "a request rides only when its model differs from the one the newest notice announced"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::only_a_model_change_since_the_last_notice_rides"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = '.filter(|announced| *announced != model)'
+new = '.filter(|_announced| true) // NON-VACUITY BREAK: ride for the same model'
+
+[[control]]
+id = "compaction-ride-short-rewrite-deadline"
+guards = "a rewrite ride waits no longer than the contract's short rewrite deadline, whatever the call budget"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_model_change_rides_for_a_view_and_applies_it"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = '.clamp(1, MAX_REWRITE_RIDE_DEADLINE_MS);'
+new = '.max(1); // NON-VACUITY BREAK: wait the whole call budget'
+
+[[control]]
+id = "compaction-subc-view-get-caller-session"
+guards = "view.get naming a session other than the caller's is never sent"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
+expect_red = ["compaction_routes::view_get_and_ride_use_the_role_route_and_only_the_callers_session"]
+file = "crates/broca-subc/src/compaction_plane.rs"
+old = '''        if request.session_ref != broca_core::wal_writer::agent_session_ref(bind) {
+            return Err(CompactionUnavailable);
+        }
+        self.route
+            .call(
+                provider,
+                bind,
+                &OpRequest::new(ops::VIEW_GET, &request),'''
+new = '''        if false && request.session_ref != broca_core::wal_writer::agent_session_ref(bind) { // NON-VACUITY BREAK
+            return Err(CompactionUnavailable);
+        }
+        self.route
+            .call(
+                provider,
+                bind,
+                &OpRequest::new(ops::VIEW_GET, &request),'''
+
+[[control]]
+id = "compaction-subc-ride-caller-session"
+guards = "compaction.ride naming a session other than the caller's is never sent"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
+expect_red = ["compaction_routes::view_get_and_ride_use_the_role_route_and_only_the_callers_session"]
+file = "crates/broca-subc/src/compaction_plane.rs"
+old = '''        if request.session_ref != broca_core::wal_writer::agent_session_ref(bind) {
+            return Err(CompactionUnavailable);
+        }
+        let ride_deadline'''
+new = '''        if false && request.session_ref != broca_core::wal_writer::agent_session_ref(bind) { // NON-VACUITY BREAK
+            return Err(CompactionUnavailable);
+        }
+        let ride_deadline'''
+
+[[control]]
+id = "compaction-subc-view-get-op"
+guards = "view.get goes out as the role's view.get op on the compaction route"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
+expect_red = ["compaction_routes::view_get_and_ride_use_the_role_route_and_only_the_callers_session"]
+file = "crates/broca-subc/src/compaction_plane.rs"
+old = '&OpRequest::new(ops::VIEW_GET, &request),'
+new = '&OpRequest::new(ops::COMPACTION_SETUP, &request), // NON-VACUITY BREAK'
+
+[[control]]
+id = "compaction-subc-ride-op"
+guards = "compaction.ride goes out as the role's compaction.ride op on the compaction route"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
+expect_red = ["compaction_routes::view_get_and_ride_use_the_role_route_and_only_the_callers_session"]
+file = "crates/broca-subc/src/compaction_plane.rs"
+old = '&OpRequest::new(ops::COMPACTION_RIDE, &request),'
+new = '&OpRequest::new(ops::VIEW_GET, &request), // NON-VACUITY BREAK'
