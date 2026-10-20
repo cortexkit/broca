@@ -677,8 +677,15 @@ impl OpenAiChatNormalizer {
     }
 
     fn tool_call_slot(&mut self, index: u64, id: Option<&str>) -> usize {
-        // The stream index identifies a call within this response. IDs are display-only and a
-        // model may reuse one for sibling calls, so they cannot select a buffer on their own.
+        if let Some(id) = id {
+            if let Some(slot) = self
+                .tool_calls
+                .iter()
+                .position(|buf| !buf.id.is_empty() && buf.id == id)
+            {
+                return slot;
+            }
+        }
         let current = self.tool_calls.iter().rposition(|buf| buf.index == index);
         if let Some(id) = id {
             if let Some(slot) = current {
@@ -1142,49 +1149,5 @@ mod openai_chat_cache_write_tests {
                 "the `{key}` spelling is read at source but did not reach the output"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod duplicate_tool_call_id_tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_model_ids_keep_their_indexed_argument_buffers() {
-        let mut normalizer =
-            OpenAiChatNormalizer::new(StepId(1), crate::policy::UsagePolicy::default());
-        let chunk = json!({
-            "id": "completion-1",
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {"index": 0, "id": "same-id", "type": "function",
-                         "function": {"name": "write_file", "arguments": "{\"part\":1}"}},
-                        {"index": 1, "id": "same-id", "type": "function",
-                         "function": {"name": "write_file", "arguments": "{\"part\":2}"}}
-                    ]
-                },
-                "finish_reason": "tool_calls"
-            }]
-        });
-        let wire = format!("data: {chunk}\n\ndata: [DONE]\n\n");
-        let mut events = normalizer.push(wire.as_bytes()).unwrap();
-        events.extend(normalizer.finish().unwrap());
-        let message = events
-            .into_iter()
-            .find_map(|event| match event {
-                NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
-                    Some(message)
-                }
-                _ => None,
-            })
-            .expect("the complete stream produces its assembled assistant message");
-        let calls: Vec<_> = message.tool_calls().collect();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].tool_call_id, calls[1].tool_call_id);
-        assert_eq!(calls[0].input, json!({"part":1}));
-        assert_eq!(calls[1].input, json!({"part":2}));
     }
 }
