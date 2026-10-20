@@ -2344,9 +2344,10 @@ fn skip_crash_kills() -> bool {
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume
 /// the run: the restarted module seals it `interrupted` without sending the call. So the tool
-/// never ran, the run reads `interrupted`, the cut step is left out of the transcript (no call
-/// of it is read, so none is indeterminate), and the session's next model request carries no
-/// tool call without its result.
+/// never ran and the run reads `interrupted`. The written step is kept, never dropped: the seal
+/// closes the call with a never-executed result in the message right after it, written with the
+/// terminal, so the call is not indeterminate and the session's next model request carries the
+/// call answered by that result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
     use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
@@ -2446,20 +2447,42 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
         "the call never ran"
     );
 
-    // The sealed run's transcript does not hold the cut step at all: an assistant message whose
-    // calls were never dispatched is left out, so no call of it is on a page, indeterminate or
-    // otherwise, and no result is recorded for it.
+    // The sealed run's transcript keeps the cut step: the assistant message holding the call,
+    // then a tool message holding its never-executed result. The call never got a dispatch
+    // intent, so its entry has no key or module and is not indeterminate.
     let page = response(route.request("session.read", json!({})).await.unwrap());
-    let roles: Vec<&str> = page["messages"]
-        .as_array()
-        .unwrap()
+    let messages = page["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
         .iter()
         .filter_map(|m| m["message"]["role"].as_str())
         .collect();
-    assert_eq!(roles, ["system", "user"], "{page}");
-    assert!(!page.to_string().contains("call_cut"), "{page}");
+    assert_eq!(roles, ["system", "user", "assistant", "tool"], "{page}");
+    let entries = messages[2]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        matches!(entries.as_slice(), [entry] if entry["tool_call_id"] == "call_cut"
+            && entry["indeterminate"] == false
+            && entry.get("call_key").is_none()
+            && entry.get("dispatched_to").is_none()),
+        "{page}"
+    );
+    let results: Vec<broca_protocol::ToolResult> = messages[3]["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|part| serde_json::from_value(part.clone()).unwrap())
+        .collect();
+    assert_eq!(
+        results,
+        [broca_core::not_dispatched_result(
+            &broca_protocol::ToolCallId("call_cut".into())
+        )],
+        "{page}"
+    );
 
-    // The next send renders the cut step: every tool call it carries is answered.
+    // The next send renders the kept step with its result right after it.
     let next = response(
         route
             .request("session.send", send("next", "send-2"))
@@ -2489,26 +2512,27 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
         "the next model request's messages: {}",
         Value::Array(request.clone())
     );
-    let called: Vec<String> = request
+    let call_at = request
         .iter()
-        .filter(|m| m["role"] == "assistant")
-        .flat_map(|m| m["tool_calls"].as_array().cloned().unwrap_or_default())
-        .filter_map(|c| c["id"].as_str().map(String::from))
-        .collect();
-    let answered: Vec<String> = request
-        .iter()
-        .filter(|m| m["role"] == "tool")
-        .filter_map(|m| m["tool_call_id"].as_str().map(String::from))
-        .collect();
-    // The cut step is not rendered at all, like any step whose calls never left the process.
-    assert!(called.is_empty(), "{}", Value::Array(request.clone()));
-    for id in &called {
-        assert!(
-            answered.contains(id),
-            "the next request carries tool call {id} with no result: {}",
-            Value::Array(request.clone())
-        );
-    }
+        .position(|m| {
+            m["role"] == "assistant"
+                && m["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.iter().any(|c| c["id"] == "call_cut"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the next request drops the kept call: {}",
+                Value::Array(request.clone())
+            )
+        });
+    assert!(
+        request
+            .get(call_at + 1)
+            .is_some_and(|m| m["role"] == "tool" && m["tool_call_id"] == "call_cut"),
+        "the next request carries the kept call without its result right after it: {}",
+        Value::Array(request.clone())
+    );
     drop(route);
     drop(live);
     broca_test_support::remove_rig_dir(&scratch);

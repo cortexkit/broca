@@ -7351,11 +7351,9 @@ test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::exactly_reserved_prefix_reopens_and_seals_open_batch_crash_cut"]
 file = "crates/broca-module/src/actor.rs"
 old = '''            writer.sync_for_seal().await.map_err(|e| e.to_string())?;
-        }
-        let terminal_seq'''
+        } else {'''
 new = '''            writer.sync().await.map_err(|e| e.to_string())?; // NON-VACUITY BREAK
-        }
-        let terminal_seq'''
+        } else {'''
 
 [[control]]
 id = "retention-audit-attempt-accepted-sequence"
@@ -7809,6 +7807,39 @@ expect_message = "crash orphan must report its cause"
 file = "crates/broca-module/src/actor.rs"
 old = "let error = (cause == SealCause::CrashOrphan).then(|| ProviderError {"
 new = "let error = false.then(|| ProviderError { // NON-VACUITY BREAK: drop startup cause"
+
+[[control]]
+id = "crash-orphan-seal-keeps-never-sent-call-result"
+guards = "an interrupted seal keeps a durable tool-call step whose call was never sent, paired with a never-executed result, instead of dropping it from history"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/crash_orphan_tests.rs"
+features = ["test-clock"]
+expect_red = ["actor::crash_orphan_tests::crash_orphan_seal_keeps_a_never_sent_call_with_a_never_executed_result"]
+expect_message = "the seal must keep the call with a never-executed result"
+file = "crates/broca-module/src/actor.rs"
+old = "for record in broca_core::close_out_pending_turn(&prior) {"
+new = "for record in broca_core::close_out_pending_turn(&prior).into_iter().filter(|r| !matches!(r, WalRecord::ToolResult { .. })) { // NON-VACUITY BREAK: drop the never-executed result"
+
+[[control]]
+id = "crash-orphan-seal-commits-kept-call-with-terminal"
+guards = "the never-executed result of a kept never-sent call is durable in the same barrier as the interrupted terminal"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/crash_orphan_tests.rs"
+features = ["test-clock"]
+expect_red = ["actor::crash_orphan_tests::crash_orphan_seal_keeps_a_never_sent_call_with_a_never_executed_result"]
+expect_message = "the kept turn and the terminal must be durable together"
+file = "crates/broca-module/src/actor.rs"
+old = '''            for record in broca_core::close_out_pending_turn(&prior) {
+                writer.record(record);
+            }'''
+new = '''            for record in broca_core::close_out_pending_turn(&prior) {
+                writer.record(record);
+            }
+            writer.sync_for_seal().await.map_err(|e| e.to_string())?; // NON-VACUITY BREAK: separate barrier'''
 
 [[control]]
 id = "shutdown-stopping-state-refuses-admission"
