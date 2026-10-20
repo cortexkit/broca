@@ -1554,6 +1554,7 @@ impl LlmRunnerSubject for BrocaSubject {
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
             Capability::RunOps,
+            Capability::RunToolCalls,
             Capability::InputTokenCap,
             Capability::StructuredOutput,
             Capability::RunStatus,

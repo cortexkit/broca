@@ -9,6 +9,15 @@ fn every_open_failed_site_chooses_a_class() {
         ("final_message_of: missing RunStarted", "None"),
         ("final_message_of: replay failed", "None"),
         ("final_message_of: missing assistant", "None"),
+        (
+            "run_tool_call_records: incomplete WAL range",
+            "Some(broca_protocol::ErrorClass::Transient)",
+        ),
+        (
+            "indexed_run_tool_calls: stored result size encoding",
+            "None",
+        ),
+        ("run_tool_calls_cursor_token: cursor encoding", "None"),
         ("From<OpenError>: erased cause", "None"),
         ("From<OpenError>: typed cause", "Some(class)"),
         (
@@ -28,6 +37,10 @@ fn every_open_failed_site_chooses_a_class() {
             "Some(broca_protocol::ErrorClass::Permanent)",
         ),
         (
+            "run_tool_calls: unsupported",
+            "Some(broca_protocol::ErrorClass::Permanent)",
+        ),
+        (
             "baseline: unsupported",
             "Some(broca_protocol::ErrorClass::Permanent)",
         ),
@@ -44,6 +57,7 @@ fn every_open_failed_site_chooses_a_class() {
             "Some(broca_protocol::ErrorClass::Transient)",
         ),
         ("warm: erased cause", "None"),
+        ("run_tool_calls: response encoding", "None"),
         // Cancellation can fail while reading the cut JSON that freezes a session.
         // The actor passes text here, not the I/O kind needed to prove retryability.
         ("cancel: erased move-authority cause", "None"),

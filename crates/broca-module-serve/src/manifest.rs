@@ -36,10 +36,11 @@ pub const OP_VAULT_AUDIT: &str = "vault.audit";
 /// The held-open stream observability surface.
 pub const OP_SUBSCRIBE: &str = "session.subscribe";
 /// The `llm-runner/v1` role's own ops: what this build serves of the role, a session's head
-/// without bodies, a run's result, and a session's frozen baseline.
+/// without bodies, a run's result and tool-call ledger, and a session's frozen baseline.
 pub const OP_ROLE_DESCRIBE: &str = broca_wire::OP_ROLE_DESCRIBE;
 pub const OP_HEAD: &str = broca_wire::OP_SESSION_HEAD;
 pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
+pub const OP_RUN_TOOL_CALLS: &str = broca_wire::OP_RUN_TOOL_CALLS;
 pub const OP_BASELINE: &str = broca_wire::OP_SESSION_BASELINE;
 pub const OP_RESOLVE: &str = broca_wire::OP_SESSION_RESOLVE;
 /// Re-send a session's most recent model request shaped to generate nothing, keeping the
@@ -389,6 +390,14 @@ pub fn manifest_configured(
                     kind: ManagementOperationKind::Query,
                     description: Some(
                         "Read one run's state and, once it completed, its final message's text."
+                            .to_string(),
+                    ),
+                },
+                ManagementOperation {
+                    name: OP_RUN_TOOL_CALLS.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some(
+                        "Read a run's tool calls in dispatch order, without their result content."
                             .to_string(),
                     ),
                 },

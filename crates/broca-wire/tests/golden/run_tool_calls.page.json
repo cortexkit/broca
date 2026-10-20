@@ -1,0 +1,1 @@
+{"run_id":"run-1","calls":[{"tool_call_id":"call-1","call_key":"lineage-1:11","name":"write_file","args":{"path":"report.txt"},"outcome":"succeeded","result_bytes":32,"dispatched_to":"tools","ordinal":4}],"next":"cursor-2"}

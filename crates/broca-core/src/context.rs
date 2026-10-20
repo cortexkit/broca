@@ -1005,7 +1005,7 @@ pub fn dispatches_of_turns(
     turns: &[(usize, usize)],
     ordinal_base: u64,
 ) -> std::collections::BTreeMap<u64, Vec<ToolCallDispatch>> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     let mut out = std::collections::BTreeMap::new();
     for &(prompt_index, step_index) in turns {
         let Some(WalRecord::ModelStepFinished {
@@ -1014,8 +1014,8 @@ pub fn dispatches_of_turns(
         else {
             continue;
         };
-        let mut intents: HashMap<&str, (u64, Option<String>)> = HashMap::new();
-        let mut resolved: HashSet<&str> = HashSet::new();
+        let mut intents: HashMap<&str, Vec<(u64, Option<String>)>> = HashMap::new();
+        let mut terminal_counts: HashMap<&str, usize> = HashMap::new();
         for frame in &framed[step_index + 1..] {
             match &frame.record {
                 WalRecord::ToolDispatchIntent {
@@ -1025,13 +1025,16 @@ pub fn dispatches_of_turns(
                 } => {
                     intents
                         .entry(tool_call_id.0.as_str())
-                        .or_insert((frame.seq, module_id.clone()));
+                        .or_default()
+                        .push((frame.seq, module_id.clone()));
                 }
                 WalRecord::ToolResult { result, .. } => {
-                    resolved.insert(result.tool_call_id.0.as_str());
+                    *terminal_counts
+                        .entry(result.tool_call_id.0.as_str())
+                        .or_default() += 1;
                 }
                 WalRecord::ToolNoDispatch { tool_call_id, .. } => {
-                    resolved.insert(tool_call_id.0.as_str());
+                    *terminal_counts.entry(tool_call_id.0.as_str()).or_default() += 1;
                 }
                 WalRecord::ToolBatchFinished { .. }
                 | WalRecord::ModelStepFinished { .. }
@@ -1039,16 +1042,21 @@ pub fn dispatches_of_turns(
                 _ => {}
             }
         }
+        let mut occurrences = HashMap::<&str, usize>::new();
         let entries = assistant_message
             .tool_calls()
             .map(|call| {
                 let id = call.tool_call_id.0.as_str();
-                let intent = intents.get(id);
+                let occurrence = occurrences.entry(id).or_default();
+                let index = *occurrence;
+                *occurrence += 1;
+                let intent = intents.get(id).and_then(|calls| calls.get(index));
+                let resolved = terminal_counts.get(id).copied().unwrap_or_default() > index;
                 ToolCallDispatch {
                     tool_call_id: id.to_owned(),
                     intent_seq: intent.map(|(seq, _)| *seq),
                     dispatched_to: intent.and_then(|(_, module)| module.clone()),
-                    indeterminate: intent.is_some() && !resolved.contains(id),
+                    indeterminate: intent.is_some() && !resolved,
                 }
             })
             .collect();

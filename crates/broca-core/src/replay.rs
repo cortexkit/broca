@@ -19,10 +19,7 @@
 //!  - Prepared with no terminal → retain Deferred/Approved separately; never re-gate.
 //!  - no Prepared, intent or terminal → safe to re-dispatch.
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use broca_protocol::{
     caller::RunFinishReason,
@@ -726,19 +723,20 @@ struct OpenBatch {
     /// The model step whose tool calls this batch runs, from its `tool_batch_started`.
     step_id: StepId,
     planned: Vec<ToolCallId>,
-    intents: HashSet<ToolCallId>,
+    intents: Vec<bool>,
     terminals: Vec<Option<Terminal>>,
     prepared: Vec<Option<PreparedCall>>,
 }
 
 impl OpenBatch {
     fn new(step_id: StepId, planned: Vec<ToolCallId>) -> Self {
+        let call_count = planned.len();
         Self {
             step_id,
-            terminals: vec![None; planned.len()],
-            prepared: vec![None; planned.len()],
+            terminals: vec![None; call_count],
+            prepared: vec![None; call_count],
+            intents: vec![false; call_count],
             planned,
-            intents: HashSet::new(),
         }
     }
 
@@ -776,8 +774,9 @@ impl OpenBatch {
             .then(|| broca_protocol::tags::PartTags::new(parts))
     }
 
-    // The runner writes terminals in source order for each repeated id. An
-    // intent belongs only to the first copy: later copies never dispatch.
+    // Repeated model ids are matched to their earliest still-open source slot. The WAL writes
+    // intents and terminals in source order, while each intent's sequence gives every call its
+    // own durable key.
     fn insert_terminal(&mut self, id: &ToolCallId, terminal: Terminal) {
         if let Some(position) = self
             .planned
@@ -792,8 +791,7 @@ impl OpenBatch {
     }
 
     fn has_intent(&self, position: usize) -> bool {
-        let id = &self.planned[position];
-        self.intents.contains(id) && !self.planned[..position].contains(id)
+        self.intents[position]
     }
 
     /// Calls whose outcome is ambiguous: an `Unknown` terminal, or an intent with
@@ -1568,7 +1566,16 @@ fn replay_seeded_with_compaction<'a>(
             }
             WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
                 if let Some(b) = &mut ep.open_batch {
-                    b.intents.insert(tool_call_id.clone());
+                    if let Some(position) =
+                        b.planned.iter().enumerate().find_map(|(position, id)| {
+                            (id == tool_call_id
+                                && !b.intents[position]
+                                && b.terminals[position].is_none())
+                            .then_some(position)
+                        })
+                    {
+                        b.intents[position] = true;
+                    }
                 }
             }
             WalRecord::ToolCallDeferred {
@@ -1576,7 +1583,14 @@ fn replay_seeded_with_compaction<'a>(
             } => {
                 if ep.open_batch_id.as_ref() == Some(batch_id) {
                     if let Some(b) = &mut ep.open_batch {
-                        if let Some(position) = b.planned.iter().position(|id| id == call_id) {
+                        if let Some(position) =
+                            b.planned.iter().enumerate().find_map(|(position, id)| {
+                                (id == call_id
+                                    && b.prepared[position].is_none()
+                                    && b.terminals[position].is_none())
+                                .then_some(position)
+                            })
+                        {
                             // A surviving Prepared frame freezes the hooks' output once.
                             b.prepared[position].get_or_insert_with(|| PreparedCall {
                                 record_index,
@@ -1597,7 +1611,14 @@ fn replay_seeded_with_compaction<'a>(
                 ..
             } => {
                 if let Some(b) = &mut ep.open_batch {
-                    if let Some(position) = b.planned.iter().position(|id| id == call_id) {
+                    if let Some(position) =
+                        b.planned.iter().enumerate().find_map(|(position, id)| {
+                            (id == call_id
+                                && b.prepared[position].is_some()
+                                && b.terminals[position].is_none())
+                            .then_some(position)
+                        })
+                    {
                         if let Some(prepared) = &mut b.prepared[position] {
                             prepared.elicitation_id = elicitation_id.clone();
                             if let Some(result) = closing_result {
@@ -1621,7 +1642,14 @@ fn replay_seeded_with_compaction<'a>(
                     if let Some(b) = &mut ep.open_batch {
                         for entry in pending {
                             if let Some(position) =
-                                b.planned.iter().position(|id| *id == entry.call_id)
+                                b.planned.iter().enumerate().find_map(|(position, id)| {
+                                    (id == &entry.call_id
+                                        && b.prepared[position].is_some()
+                                        && b.prepared[position].as_ref().is_some_and(|prepared| {
+                                            prepared.elicitation_id.is_none()
+                                        }))
+                                    .then_some(position)
+                                })
                             {
                                 if let Some(prepared) = &mut b.prepared[position] {
                                     // The marker supplies display metadata only, never membership.

@@ -126,6 +126,9 @@ session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
 run.result { run_id } → { run_id, state, usage, reason?, error?, final_message?: { ordinal, mid, text } }
+run.tool_calls { run_id, after?, limit? }
+    → { run_id, calls: [{ tool_call_id, call_key?, name, args, outcome,
+                          result_bytes?, dispatched_to?, ordinal }], next? }
 session.baseline {} → { state: "not_yet" | "ready", baseline? } (owner only)
 role.describe {} → the llm-runner/v1 major, its ops and capability groups (including `run_usage`), max_bytes
 
@@ -144,7 +147,7 @@ run.status { run_id | session }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
 
-The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
+The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `run.tool_calls`,
 `session.baseline`) and the newer `session.read` members follow commons
 `cortexkit-role-llm-runner/CONTRACT.md`. In broca's terms:
 
@@ -192,6 +195,23 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
   exceeds the transport limit, broca refuses `reply_too_large` and names the final message by
   session and ordinal without including its content. A run result without a final message uses
   the generic `response_too_large` refusal if its metadata alone cannot fit.
+- `run.tool_calls` pages the run's durable calls in dispatch order. `tool_call_id` is a model
+  display id and may repeat; the per-call `call_key` identifies each prepared or dispatched call.
+  `limit` is capped to the
+  transcript-read maximum (absent means its default; zero is `invalid_params` naming `limit`);
+  `after` is an opaque continuation returned as `next`, and an unknown cursor is refused naming
+  `after`. Pages share `session.read`'s 3 MiB serialized-body cap. A call's arguments stay whole:
+  one call larger than that page target is served alone, while a complete frame larger than
+  4,194,304 bytes is refused as `reply_too_large` with `subject: {kind: "tool_call", run_id,
+  tool_call_id, call_key?}`. The answer includes only `result_bytes`, the byte length of the
+  stored tool-result encoding; result content is never returned. Calls with a durable intent but
+  no result read as `indeterminate`, not as a failed zero-byte result.
+  The durable run index has no WAL sequence boundary, so the first page reads the session WAL
+  once from sequence zero to locate the run and save the positions of its call batches.
+  Continuations resume at the next assistant-step sequence and its batch end; file-backed readers
+  use a byte anchor when available, and other readers keep the sequence bound while scanning to
+  that batch. Sibling-call pages may revisit their shared batch, but do not decode earlier runs or
+  the remaining run suffix again.
 - `session.baseline` and the admitting send's `baseline`: sessions are admitted without a fetch
   plan, so `items` is empty and `composition_digest` absent; `tool_names` are the first
   episode's tools; both generations are 0. The send reply carries it only when the session's

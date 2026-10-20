@@ -740,6 +740,15 @@ enum ReadPurpose {
     Authorization,
 }
 
+#[derive(Clone, Copy)]
+struct ReadRangeRequest {
+    after_seq: u64,
+    anchor: Option<broca_wal::WalByteAnchor>,
+    live_head: Option<u64>,
+    through_seq: Option<u64>,
+    purpose: ReadPurpose,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotCounts {
     pub open: usize,
@@ -1170,7 +1179,17 @@ impl LineageRegistry {
         // so their owner lookup reads the WAL. A failed store read needs the same fallback,
         // not an assumption that no owner was recorded.
         let range = self
-            .read_durable_range_for(reader, key, 0, None, live_head, ReadPurpose::Authorization)
+            .read_durable_range_for(
+                reader,
+                key,
+                ReadRangeRequest {
+                    after_seq: 0,
+                    anchor: None,
+                    live_head,
+                    through_seq: None,
+                    purpose: ReadPurpose::Authorization,
+                },
+            )
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
@@ -1211,10 +1230,13 @@ impl LineageRegistry {
             .read_durable_range_for(
                 reader,
                 key,
-                snapshot.watermark_seq,
-                snapshot.anchor,
-                live_head,
-                ReadPurpose::Authorization,
+                ReadRangeRequest {
+                    after_seq: snapshot.watermark_seq,
+                    anchor: snapshot.anchor,
+                    live_head,
+                    through_seq: None,
+                    purpose: ReadPurpose::Authorization,
+                },
             )
             .await
         {
@@ -2085,10 +2107,51 @@ impl LineageRegistry {
         self.read_durable_range_for(
             reader,
             key,
-            after_seq,
-            anchor,
-            live_head,
-            ReadPurpose::Session,
+            ReadRangeRequest {
+                after_seq,
+                anchor,
+                live_head,
+                through_seq: None,
+                purpose: ReadPurpose::Session,
+            },
+        )
+        .await
+    }
+
+    /// Read a run-scoped WAL suffix without decoding records after its known end sequence.
+    pub(crate) async fn read_run_tool_calls_range(
+        &self,
+        key: &LineageKey,
+        run_id: &str,
+        after_seq: u64,
+        anchor: Option<broca_wal::WalByteAnchor>,
+        through_seq: Option<u64>,
+    ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        self.check_expired(key, Some(run_id)).await?;
+        let Some(reader) = &self.inner.reader else {
+            return Err(OpenError::Open(
+                "run.tool_calls WAL reader is not configured".into(),
+            ));
+        };
+        let live_head = {
+            let slots = self.inner.slots.lock().unwrap();
+            match slots.get(key) {
+                Some(Entry::Open { handle, .. }) => {
+                    Some(handle.durable_head.load(Ordering::Acquire))
+                }
+                Some(Entry::Opening { .. }) | Some(Entry::Closing { .. }) | None => None,
+            }
+        };
+        self.read_durable_range_for(
+            reader,
+            key,
+            ReadRangeRequest {
+                after_seq,
+                anchor,
+                live_head,
+                through_seq,
+                purpose: ReadPurpose::Session,
+            },
         )
         .await
     }
@@ -2097,11 +2160,20 @@ impl LineageRegistry {
         &self,
         reader: &ReadSources,
         key: &LineageKey,
-        after_seq: u64,
-        anchor: Option<broca_wal::WalByteAnchor>,
-        live_head: Option<u64>,
-        purpose: ReadPurpose,
+        request: ReadRangeRequest,
     ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        let ReadRangeRequest {
+            after_seq,
+            anchor,
+            live_head,
+            through_seq,
+            purpose,
+        } = request;
+        let requested_through = match (live_head, through_seq) {
+            (Some(head), Some(through)) => Some(head.min(through)),
+            (Some(head), None) => Some(head),
+            (None, through) => through,
+        };
         let range_read = |through_seq| {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
@@ -2122,8 +2194,8 @@ impl LineageRegistry {
             })
         };
 
-        if let Some(head) = live_head {
-            let range = range_read(Some(head))
+        if live_head.is_some() {
+            let range = range_read(requested_through)
                 .await
                 .map_err(|error| OpenError::Open(format!("wal range-read task failed: {error}")))?
                 .map_err(|error| {
@@ -2152,7 +2224,7 @@ impl LineageRegistry {
 
         // Decode only to discover whether this page would cross the cached proof. These frames
         // remain unservable until the cache covers them or the flush below has succeeded.
-        let candidate = range_read(None)
+        let candidate = range_read(requested_through)
             .await
             .map_err(|error| OpenError::Open(format!("wal range-read task failed: {error}")))?
             .map_err(|error| {
@@ -2445,7 +2517,17 @@ impl LineageRegistry {
             }
         };
         let range = self
-            .read_durable_range_for(reader, key, 0, None, live_head, purpose)
+            .read_durable_range_for(
+                reader,
+                key,
+                ReadRangeRequest {
+                    after_seq: 0,
+                    anchor: None,
+                    live_head,
+                    through_seq: None,
+                    purpose,
+                },
+            )
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()

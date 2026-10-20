@@ -1,5 +1,5 @@
 //! The `llm-runner/v1` role's ops as broca serves them: `role.describe`, `session.head`,
-//! `run.result` and `session.baseline`, the per-call dispatch facts on a `session.read` page,
+//! `run.result`, `run.tool_calls` and `session.baseline`, the per-call dispatch facts on a `session.read` page,
 //! and the refusal codes and detail those ops answer with.
 //!
 //! The role defines these shapes (commons `cortexkit-role-llm-runner`). Most are written here as
@@ -20,6 +20,7 @@ pub const LLM_RUNNER_V1: &str = "llm-runner/v1";
 pub const OP_ROLE_DESCRIBE: &str = "role.describe";
 pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
+pub const OP_RUN_TOOL_CALLS: &str = "run.tool_calls";
 pub const OP_SESSION_BASELINE: &str = "session.baseline";
 /// The capability group of a runner that tags every stored part and serves `session.resolve`.
 pub use cortexkit_role_llm_runner::capabilities::TAGS as TAGS_CAPABILITY;
@@ -256,6 +257,8 @@ pub fn broca_role_describe(implementation_version: &str) -> RoleDescribeResponse
 
 /// The `role.describe` capability naming the `delivery_order` group of `session.send`.
 pub use cortexkit_role_llm_runner::capabilities::DELIVERY_ORDER as DELIVERY_ORDER_GROUP;
+/// The capability group that exposes a run's tool-call ledger.
+pub use cortexkit_role_llm_runner::capabilities::RUN_TOOL_CALLS as RUN_TOOL_CALLS_GROUP;
 
 /// Discovery follows all installed writers through one capability calculation. Decoding
 /// compaction, retention or hook records alone does not promise to execute those writers.
@@ -272,6 +275,7 @@ pub fn broca_role_describe_with_writers(
         "session.read",
         OP_SESSION_HEAD,
         OP_RUN_RESULT,
+        OP_RUN_TOOL_CALLS,
         "run.status",
         "run.cancel",
         "session.retract",
@@ -299,6 +303,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         TAGS_CAPABILITY,
+        RUN_TOOL_CALLS_GROUP,
         // `session.send` takes an ordered `delivery` list with `dedupe_key` and `expires_at_ms`.
         // `turn_system` is accepted in a list but is never possible on this runner yet, so the
         // list falls through to its next mode.
@@ -769,11 +774,48 @@ mod pinned_reply_bytes {
     }
 
     #[test]
+    fn run_tool_calls_group_and_operation_are_declared_together() {
+        use cortexkit_role_llm_runner::describe::check_describe;
+
+        let encoded = serde_json::to_value(broca_role_describe("0.0.0-run-tool-calls")).unwrap();
+        check_describe(&encoded).unwrap_or_else(|error| panic!("{encoded}: {error:?}"));
+        assert!(encoded["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(RUN_TOOL_CALLS_GROUP)));
+        assert!(encoded["majors"][0]["ops"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(OP_RUN_TOOL_CALLS)));
+    }
+
+    #[test]
+    fn run_tool_calls_reply_bytes_are_pinned() {
+        use cortexkit_role_llm_runner::tool_calls::{outcomes, RunToolCall, ToolCallsPage};
+
+        let call = RunToolCall::new(
+            "call-1",
+            "write_file",
+            serde_json::json!({"path":"report.txt"}),
+            outcomes::SUCCEEDED,
+            4,
+        )
+        .with_call_key("lineage-1:11")
+        .with_result_bytes(32)
+        .with_dispatched_to("tools");
+        assert_golden(
+            ToolCallsPage::new("run-1", vec![call]).with_next("cursor-2"),
+            "run_tool_calls.page.json",
+            RUN_TOOL_CALLS_PAGE_SHA256,
+        );
+    }
+
+    #[test]
     fn reader_release_does_not_advertise_writer_groups() {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "04b83a4bb38af4251de49629f22638e7220f0a64d1bbd3871ff9da42cdccae75",
+            "676320625a48e8a3c073f5c8dfc2ad366b08160c928f67e487f9ada8c6ee47f6",
         );
     }
 
@@ -927,7 +969,9 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "c6730ddb97c7ed2d68d7a6f14f0cb10258095886ae029c50d847638f45d7f53d";
+        "98816d884abd877f3bfbf4ba372cd1bad98bd1cc489cfd07773c4e9901da3921";
+    const RUN_TOOL_CALLS_PAGE_SHA256: &str =
+        "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =
