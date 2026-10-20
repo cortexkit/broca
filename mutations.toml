@@ -19610,3 +19610,25 @@ expect_red = ["setup_fold_recorded_is_declared_as_a_real_process_kill"]
 file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 old = "fn capabilities(&self) -> BTreeSet<Capability> {\n        let mut capabilities"
 new = "fn capabilities(&self) -> BTreeSet<Capability> {\n        if self.process_kills_disabled { return BTreeSet::new(); } // NON-VACUITY BREAK\n        let mut capabilities"
+
+[[control]]
+id = "subc-consent-retry-budget-relative-per-open"
+guards = "a long-lived consent plane gives every route open fresh patience after idle instead of reusing its construction-time deadline"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/consent.rs"
+expect_red = ["consent::tests::consent_plane_renews_retry_budget_for_each_open_after_idle"]
+expect_message = "an idle consent plane must retry a temporary route refusal"
+[[control.edits]]
+file = "crates/broca-subc/src/consent.rs"
+old = "pub struct ScopedConsentPlane {\n    conn: Arc<SubcConnection>,\n    retry: RouteOpenRetry,\n}"
+new = "pub struct ScopedConsentPlane {\n    conn: Arc<SubcConnection>,\n    retry: RouteOpenRetry,\n    retry_deadline: tokio::time::Instant, // NON-VACUITY BREAK: retain a construction-time deadline.\n}"
+[[control.edits]]
+file = "crates/broca-subc/src/consent.rs"
+old = "Self { conn, retry }"
+new = "Self { conn, retry, retry_deadline: tokio::time::Instant::now() + retry.budget }"
+[[control.edits]]
+file = "crates/broca-subc/src/consent.rs"
+old = "ConsentClient::open(Arc::clone(&self.conn), &ctx.bind, scope, self.retry)"
+new = "ConsentClient::open(Arc::clone(&self.conn), &ctx.bind, scope, RouteOpenRetry { budget: self.retry_deadline.saturating_duration_since(tokio::time::Instant::now()), ..self.retry })"

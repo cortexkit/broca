@@ -817,7 +817,7 @@ impl VaultClient {
                 ))
             })?;
         let retry = RouteOpenRetry {
-            deadline,
+            budget: deadline.saturating_duration_since(tokio::time::Instant::now()),
             max_interval: VAULT_ROUTE_OPEN_MAX_INTERVAL,
         };
         let open = self

@@ -51,14 +51,13 @@ impl CredentialRoute for Credentials {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let route = self
             .conn
             .route_open_management_within(
                 "ckbus",
                 &self.bind,
                 RouteOpenRetry {
-                    deadline,
+                    budget: Duration::from_secs(5),
                     max_interval: Duration::from_millis(250),
                 },
             )

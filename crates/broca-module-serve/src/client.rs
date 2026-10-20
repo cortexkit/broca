@@ -160,13 +160,13 @@ impl SessionClient {
         // The connection layer retries a temporary refusal within the caller's timeout (so
         // `Duration::ZERO` stays a single attempt); this loop additionally retries every other
         // error, which the startup window can also produce.
-        let retry = RouteOpenRetry {
-            deadline: tokio::time::Instant::from_std(deadline),
+        let retry = || RouteOpenRetry {
+            budget: deadline.saturating_duration_since(std::time::Instant::now()),
             max_interval: ROUTE_OPEN_RETRY_INTERVAL,
         };
         let cmd_route = loop {
             match conn
-                .route_open_management_within(module_id, &session, retry)
+                .route_open_management_within(module_id, &session, retry())
                 .await
             {
                 Ok(ch) => break ch,

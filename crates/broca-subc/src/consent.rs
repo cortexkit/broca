@@ -680,6 +680,109 @@ mod tests {
             .into()
     }
 
+    fn scoped_ctx() -> BatchCtx {
+        BatchCtx {
+            batch_id: broca_protocol::BatchId("b".into()),
+            run_id: broca_protocol::RunId("r".into()),
+            bind: BindIdentity::new("/p", "broca", "s"),
+            scope: Some(SessionScope {
+                owner: broca_protocol::BindPrincipal::Reserved {
+                    module_id: "broca".into(),
+                },
+                scope_ref: "s".into(),
+                scope_epoch: 1,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+            }),
+        }
+    }
+
+    async fn advertise_scopes(module: &mut InProcessModuleEnd) {
+        let request = module.next_request().await;
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["op"], "server.describe");
+        let reply = subc_control::ClientControlResponse::ServerDescribe {
+            protocol_ver: 1,
+            subc_ops: vec![],
+            capabilities: vec![CAP_SCOPES_V1.into()],
+            connected_clients: 1,
+            counters: None,
+            build_git_sha: None,
+            build_lock_digest: None,
+            capability_requirements: vec![],
+            machine_id: None,
+        };
+        assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consent_plane_renews_retry_budget_for_each_open_after_idle() {
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let plane = ScopedConsentPlane::new(Arc::new(conn), RouteOpenRetry::default_patience());
+        let ctx = scoped_ctx();
+
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            let started = tokio::time::Instant::now();
+            let (client, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(plane.client(&ctx), async {
+                    advertise_scopes(&mut module).await;
+                    let first = module.next_request().await;
+                    let body: Value = serde_json::from_slice(&first.body).unwrap();
+                    assert_eq!(body["op"], "route.open");
+                    assert!(module.refuse(&first, "module_warming"));
+                    let second =
+                        tokio::time::timeout(Duration::from_secs(1), module.next_request())
+                            .await
+                            .expect("an idle consent plane must retry a temporary route refusal");
+                    assert_eq!(second.body, first.body);
+                    assert!(module.reply(
+                        &second,
+                        serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                            route_channel: route.channel,
+                            route_epoch: route.epoch,
+                        })
+                        .unwrap(),
+                    ));
+                })
+            })
+            .await
+            .expect("consent route open must finish");
+            let client = client.expect("temporary refusal must recover after idle");
+            assert_eq!(client.route, route);
+            assert_eq!(
+                tokio::time::Instant::now() - started,
+                crate::connection::ROUTE_OPEN_RETRY_INTERVAL,
+            );
+            assert!(module.take_written_for_test().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consent_plane_returns_terminal_route_refusal_without_retry_after_idle() {
+        let (conn, _, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let plane = ScopedConsentPlane::new(Arc::new(conn), RouteOpenRetry::default_patience());
+        let ctx = scoped_ctx();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let started = tokio::time::Instant::now();
+        let (client, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(plane.client(&ctx), async {
+                advertise_scopes(&mut module).await;
+                let request = module.next_request().await;
+                assert!(module.refuse(&request, "scope_ended"));
+            })
+        })
+        .await
+        .expect("terminal consent route refusal must finish");
+        let error = client.err().expect("terminal refusal must reject the open");
+        assert_eq!(error.code, "scope_ended");
+        assert!(!error.retryable);
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert!(module.take_written_for_test().is_empty());
+    }
+
     #[tokio::test]
     async fn consent_unreadable_filing_retries_same_key() {
         let params = held_request(&key(), &prepared(), 1).unwrap();

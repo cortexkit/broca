@@ -453,7 +453,7 @@ async fn open_scoped(
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let retry = RouteOpenRetry {
-            deadline: Instant::now() + Duration::from_secs(2),
+            budget: Duration::from_secs(2),
             max_interval: Duration::from_millis(100),
         };
         match conn

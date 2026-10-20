@@ -81,7 +81,7 @@ const ROUTE_OPEN_REPLY_MARGIN: Duration = Duration::from_secs(3);
 /// plane's opens and its reload reopens, the catalog poller and the vault.
 ///
 /// This bounds an attempt already in flight. It is independent of a caller's retry deadline
-/// ([`RouteOpenRetry::deadline`], 3s by default), which only decides whether ANOTHER attempt may
+/// ([`RouteOpenRetry::budget`], 3s by default), which only decides whether ANOTHER attempt may
 /// start; see [`retry_route_open`].
 pub const ROUTE_OPEN_ATTEMPT_TIMEOUT: Duration =
     ROUTE_OPEN_BIND_RELAY_GRACE.saturating_add(ROUTE_OPEN_REPLY_MARGIN);
@@ -2805,28 +2805,30 @@ pub const ROUTE_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// A refusal is retried only while its code is one of the daemon's temporary route-open
 /// refusals (`module_warming`, `module_reloading`, `target_unavailable`, `module_timeout`).
 /// The first wait is [`ROUTE_OPEN_RETRY_INTERVAL`], each later wait doubles up to
-/// `max_interval`, and no wait extends past `deadline`. Once the deadline has passed, the next
-/// refusal is returned unchanged; a terminal refusal is returned unchanged at once.
+/// `max_interval`, and no wait extends past the open's deadline. Each open starts a fresh
+/// `budget`, so keeping this policy does not consume the patience of future opens. Once that
+/// deadline has passed, the next refusal is returned unchanged; a terminal refusal is returned
+/// unchanged at once.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteOpenRetry {
-    /// No retry starts after this instant. A deadline already in the past still makes one
-    /// attempt. It does NOT cut short an attempt already in flight: each attempt waits up to
-    /// [`ROUTE_OPEN_ATTEMPT_TIMEOUT`] for its reply regardless of this deadline.
-    pub deadline: time::Instant,
+    /// How long to keep retrying, measured from the start of each open. A zero budget still
+    /// makes one attempt. It does NOT cut short an attempt already in flight: each attempt
+    /// waits up to [`ROUTE_OPEN_ATTEMPT_TIMEOUT`] for its reply regardless of this budget.
+    pub budget: Duration,
     /// The upper bound for the doubling wait between attempts.
     pub max_interval: Duration,
 }
 
 impl RouteOpenRetry {
-    /// Retry for `budget` from now, with waits capped at `max_interval`.
+    /// Retry for `budget` per open, with waits capped at `max_interval`.
     pub fn within(budget: Duration, max_interval: Duration) -> Self {
         Self {
-            deadline: time::Instant::now() + budget,
+            budget,
             max_interval,
         }
     }
 
-    /// [`ROUTE_OPEN_RETRY_DEADLINE`] from now, at a flat [`ROUTE_OPEN_RETRY_INTERVAL`].
+    /// [`ROUTE_OPEN_RETRY_DEADLINE`] per open, at a flat [`ROUTE_OPEN_RETRY_INTERVAL`].
     pub fn default_patience() -> Self {
         Self::within(ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL)
     }
@@ -2862,7 +2864,7 @@ impl RouteOpenError {
 /// `cancel` is checked only while waiting between attempts, so an attempt already in flight
 /// completes and its outcome is returned.
 ///
-/// Two clocks meet here. `retry.deadline` bounds STARTING a new attempt; each attempt, once
+/// Two clocks meet here. `retry.budget` bounds STARTING a new attempt; each attempt, once
 /// started, is bounded by its own reply deadline, [`ROUTE_OPEN_ATTEMPT_TIMEOUT`], inside
 /// `attempt`. So the longest this can take is the retry deadline plus one attempt timeout.
 pub(crate) async fn retry_route_open<F, Fut>(
@@ -2911,12 +2913,13 @@ where
     Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
 {
     use subc_protocol::error_codes::{SCOPE_CHANGED, SCOPE_NOT_SYNCED};
+    let retry_deadline = time::Instant::now() + retry.budget;
     let mut interval = ROUTE_OPEN_RETRY_INTERVAL.min(retry.max_interval);
     let mut scope_interval =
         ROUTE_OPEN_RETRY_INTERVAL.min(scope_hold.map_or(retry.max_interval, |h| h.max_interval));
     let mut previous_was_scope_changed = false;
     loop {
-        // Deliberately not wrapped in a timeout against `retry.deadline`: an attempt that
+        // Deliberately not wrapped in a timeout against `retry_deadline`: an attempt that
         // started before the deadline runs to its own reply deadline, because the daemon may
         // still be relaying its bind and abandoning it would report a successful open as failed.
         match attempt().await {
@@ -2926,7 +2929,7 @@ where
             {
                 let code = message.code();
                 let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
-                let deadline = held.map_or(retry.deadline, |hold| hold.deadline);
+                let deadline = held.map_or(retry_deadline, |hold| hold.deadline);
                 let remaining = deadline.saturating_duration_since(time::Instant::now());
                 if remaining.is_zero() {
                     return Err(RouteOpenError::Conn(ConnError::Rejected(message)));
