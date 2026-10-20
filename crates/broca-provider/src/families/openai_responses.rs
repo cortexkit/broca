@@ -527,7 +527,10 @@ fn convert_tool(
     tool
 }
 
-fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {
+pub(crate) fn convert_tool_choice(
+    tc: &ToolChoice,
+    name_map: &crate::tool_name_alias::ToolNameMap,
+) -> Value {
     match tc {
         ToolChoice::Auto => json!("auto"),
         ToolChoice::None => json!("none"),

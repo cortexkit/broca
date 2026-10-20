@@ -9,6 +9,288 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "chatgpt-parity-parallel-tools"
+guards = "The released profile explicitly permits parallel tool proposals"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::parallel_tools_are_explicit"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'body["parallel_tool_calls"] = json!(true);'
+new = 'body["parallel_tool_calls"] = json!(false); // NON-VACUITY BREAK: disable parallel policy.'
+
+[[control]]
+id = "chatgpt-parity-tools"
+guards = "The released profile emits empty tools"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::empty_tools_are_explicit"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'object.entry("tools").or_insert_with(|| json!([]));'
+new = 'object.entry("tools").or_insert_with(|| json!(null)); // NON-VACUITY BREAK: omit empty tools.'
+
+[[control]]
+id = "chatgpt-parity-tool-choice"
+guards = "Empty-tool turns retain an explicit auto choice"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::empty_tool_choice_defaults_to_auto"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'crate::families::openai_responses::convert_tool_choice(&opts.tool_choice, &names)'
+new = '{ let _ = names; json!(null) } // NON-VACUITY BREAK: lose the explicit tool choice.'
+
+[[control]]
+id = "chatgpt-parity-include"
+guards = "Encrypted reasoning is requested without a reasoning option"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::encrypted_reasoning_is_unconditional"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'includes.push(json!("reasoning.encrypted_content"));'
+new = 'includes.push(json!("output.encrypted_content")); // NON-VACUITY BREAK: request the wrong ciphertext.'
+
+[[control]]
+id = "chatgpt-parity-instructions"
+guards = "Instructions leave the top-level field for a developer fragment"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instructions_are_developer_input"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'body.as_object_mut().unwrap().remove("instructions")'
+new = 'body.get("instructions").cloned() /* NON-VACUITY BREAK: retain legacy instructions. */'
+
+[[control]]
+id = "chatgpt-parity-instruction-id"
+guards = "Instruction message IDs have Codex's prefixed UUIDv5 shape"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instruction_id_matches_codex_uuid_v5"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'format!("msg_{}", Uuid::new_v5(&namespace, text.as_bytes()))'
+new = 'format!("message_{}", Uuid::new_v5(&namespace, text.as_bytes())) // NON-VACUITY BREAK: wrong ID prefix.'
+
+[[control]]
+id = "chatgpt-parity-message-content"
+guards = "New-profile assistant history uses output_text content arrays"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::text_messages_are_typed_content_arrays"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'item["content"] = json!([{"type":kind,"text":text}]);'
+new = 'item["content"] = json!({"type":kind,"text":text}); // NON-VACUITY BREAK: remove content array.'
+
+[[control]]
+id = "chatgpt-parity-reasoning-object"
+guards = "Unknown model defaults leave an empty reasoning object and no verbosity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::no_unknown_reasoning_or_verbosity_defaults"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'object.entry("reasoning").or_insert_with(|| json!({}));'
+new = 'object.entry("reasoning").or_insert_with(|| json!({"effort":"medium"})); // NON-VACUITY BREAK: guess effort.'
+
+[[control]]
+id = "chatgpt-parity-installation-metadata"
+guards = "Flat client metadata carries the frozen installation identity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-installation-id":self.installation_id,'
+new = '"x-codex-installation-id":"wrong", // NON-VACUITY BREAK: lose installation identity.'
+
+[[control]]
+id = "chatgpt-parity-session-metadata"
+guards = "Metadata session identity is distinct from prompt-cache scope"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"session_id":self.session_id, "thread_id":self.thread_id,'
+new = '"session_id":"wrong", "thread_id":self.thread_id, // NON-VACUITY BREAK: lose session identity.'
+
+[[control]]
+id = "chatgpt-parity-thread-metadata"
+guards = "Metadata thread identity is the full-conversation identity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"session_id":self.session_id, "thread_id":self.thread_id,'
+new = '"session_id":self.session_id, "thread_id":"wrong", // NON-VACUITY BREAK: lose thread identity.'
+
+[[control]]
+id = "chatgpt-parity-window-metadata"
+guards = "Metadata window identity is frozen from the admitting process"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-window-id":self.window_id, "turn_id":self.turn_id,'
+new = '"x-codex-window-id":"wrong", "turn_id":self.turn_id, // NON-VACUITY BREAK: lose window identity.'
+
+[[control]]
+id = "chatgpt-parity-turn-metadata"
+guards = "Metadata turn identity comes from the admitted run"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-window-id":self.window_id, "turn_id":self.turn_id,'
+new = '"x-codex-window-id":self.window_id, "turn_id":"wrong", // NON-VACUITY BREAK: lose turn identity.'
+
+[[control]]
+id = "chatgpt-parity-nested-metadata"
+guards = "Nested turn metadata preserves sourced identity and turn time"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-turn-metadata":self.turn_metadata()'
+new = '"x-codex-turn-metadata":"{}" // NON-VACUITY BREAK: drop nested identity.'
+
+[[control]]
+id = "chatgpt-parity-user-agent"
+guards = "The real upgrade uses admission's User-Agent instead of the refreshed host"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("user-agent".into(), self.user_agent.clone()),'
+new = '("user-agent".into(), "legacy-host".into()), // NON-VACUITY BREAK: discard frozen User-Agent.'
+
+[[control]]
+id = "chatgpt-parity-originator"
+guards = "The real upgrade uses the frozen originator"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("originator".into(), self.originator.clone()),'
+new = '("originator".into(), "unknown".into()), // NON-VACUITY BREAK: discard originator.'
+
+[[control]]
+id = "chatgpt-parity-request-header"
+guards = "Request ID uses the thread identity at the pinned tag"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_https_orders_wire_without_changing_canonical_digest"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("x-client-request-id".into(), self.thread_id.clone()),'
+new = '("x-client-request-id".into(), self.session_id.clone()), // NON-VACUITY BREAK: conflate cache and request identity.'
+
+[[control]]
+id = "chatgpt-parity-thread-header"
+guards = "Thread ID is distinct from session/cache affinity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("thread-id".into(), self.thread_id.clone()),'
+new = '("thread-id".into(), self.session_id.clone()), // NON-VACUITY BREAK: conflate thread and session.'
+
+[[control]]
+id = "chatgpt-parity-sse-upgrade-headers"
+guards = "New-profile websocket upgrades omit HTTP-only entity defaults"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '!order.iter().any(|key| name.eq_ignore_ascii_case(key))'
+new = 'true || !order.iter().any(|key| name.eq_ignore_ascii_case(key)) // NON-VACUITY BREAK: carry HTTP headers into upgrade.'
+
+[[control]]
+id = "chatgpt-parity-wire-order"
+guards = "Routing fields precede full input outside canonical digest bytes"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::routing_order_does_not_change_canonical_rendering"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '''        "model",
+        "stream",'''
+new = '''        "stream", // NON-VACUITY BREAK: move routing fields.
+        "model",'''
+
+[[control]]
 id = "chatgpt-wire-admission"
 guards = "Fresh ChatGPT episodes opt into the frozen profile"
 runner = "cargo"

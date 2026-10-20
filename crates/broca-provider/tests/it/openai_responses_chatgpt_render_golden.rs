@@ -151,3 +151,26 @@ fn frozen_profile_round_trips_without_legacy_defaults() {
     assert_eq!(restored.chatgpt_wire, Some(wire));
     assert_eq!(restored.renderer_version, 8);
 }
+
+#[test]
+fn codex_profile_plain_body_fixture() {
+    let mut frozen = openai_responses_chatgpt_frozen_config("gpt-5.3-codex");
+    frozen.chatgpt_wire = Some(
+        serde_json::from_str(include_str!(
+            "../fixtures/chatgpt_codex_0_163_identity.json"
+        ))
+        .unwrap(),
+    );
+    frozen.prompt_cache_key = Some("caller-cache-key".into());
+    let opts = serde_json::from_value(json!({"prompt":[
+        {"role":"system","content":[{"type":"text","text":"Be concise."}]},
+        {"role":"user","content":[{"type":"text","text":"Hello"}]}
+    ]}))
+    .unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/chatgpt_codex_0_163_plain.json")).unwrap();
+    assert_eq!(
+        OpenAiResponsesChatgpt.render(&frozen, &opts),
+        broca_protocol::canonical_json_bytes(&expected)
+    );
+}

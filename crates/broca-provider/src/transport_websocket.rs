@@ -502,7 +502,12 @@ async fn connect(
     url.set_scheme(scheme)
         .map_err(|_| std::io::Error::other("invalid socket scheme"))?;
     let mut upgrade = url.as_str().into_client_request()?;
-    for (name, value) in &request.headers {
+    let headers = if request.codex_wire {
+        crate::chatgpt_wire::websocket_headers(&request.headers)
+    } else {
+        request.headers.clone()
+    };
+    for (name, value) in &headers {
         let mut value = tungstenite::http::HeaderValue::from_str(value)?;
         value.set_sensitive(true);
         upgrade.headers_mut().insert(
@@ -818,7 +823,11 @@ async fn drive_socket(
     if let Some(turn_state) = session.state.lock().unwrap().turn_state.clone() {
         payload["client_metadata"]["x-codex-turn-state"] = Value::String(turn_state);
     }
-    let text = serde_json::to_string(&payload).expect("a rendered JSON value serializes");
+    let text = if request.codex_wire {
+        String::from_utf8(crate::chatgpt_wire::request_bytes(&payload)).expect("JSON is UTF-8")
+    } else {
+        serde_json::to_string(&payload).expect("a rendered JSON value serializes")
+    };
     let digest = RequestDigest::of(text.as_bytes());
     trace.transport = Some("websocket".into());
     trace.http_status = Some(101);

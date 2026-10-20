@@ -166,6 +166,9 @@ impl WireFamily for OpenAiResponsesChatgpt {
         if let Some(service_tier) = &frozen.service_tier {
             body["service_tier"] = serde_json::Value::String(service_tier.clone());
         }
+        if let Some(wire) = &frozen.chatgpt_wire {
+            wire.apply(&mut body, prepared.as_ref());
+        }
         body
     }
 
@@ -196,6 +199,15 @@ impl WireFamily for OpenAiResponsesChatgpt {
             }
             AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
             AuthHandle::None => {}
+        }
+        if let Some(wire) = &frozen.chatgpt_wire {
+            let identity = wire.headers(frozen.prompt_cache_key.as_deref());
+            headers.retain(|(name, _)| {
+                !identity
+                    .iter()
+                    .any(|(key, _)| name.eq_ignore_ascii_case(key))
+            });
+            headers.splice(0..0, identity);
         }
         HttpRequest {
             method: HttpMethod::Post,

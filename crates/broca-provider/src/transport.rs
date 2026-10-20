@@ -191,6 +191,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
 struct PreparedHttpRequest {
     /// Local diagnostic policy, never part of the rendered request or its digest.
     ephemeral_session: bool,
+    codex_wire: bool,
     url: String,
     headers: Vec<(String, String)>,
     body: Bytes,
@@ -209,6 +210,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
     fn from(request: HttpRequest) -> Self {
         Self {
             ephemeral_session: false,
+            codex_wire: false,
             url: request.url,
             headers: request.headers,
             body: Bytes::from(request.body),
@@ -408,6 +410,7 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
+        request.codex_wire = self.frozen.chatgpt_wire.is_some();
         request.family = Some(self.frozen.family_id);
         request.service_tier = self
             .frozen
@@ -1849,6 +1852,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             let fresh = family.endpoint(frozen.as_ref(), auth, sent.body.to_vec());
             PreparedHttpRequest {
                 ephemeral_session: sent.ephemeral_session,
+                codex_wire: sent.codex_wire,
                 url: fresh.url,
                 headers: fresh.headers,
                 body: sent.body.clone(),
@@ -2842,7 +2846,15 @@ async fn send_attempt(
         anthropic_api_host,
         gzip.is_some(),
     );
-    let body = gzip.unwrap_or_else(|| request.body.clone());
+    let body = gzip.unwrap_or_else(|| {
+        if request.codex_wire {
+            let payload: Value =
+                serde_json::from_slice(&request.body).expect("rendered Responses JSON");
+            Bytes::from(crate::chatgpt_wire::request_bytes(&payload))
+        } else {
+            request.body.clone()
+        }
+    });
     // Stamped as the request is handed to the client: a provider's prompt cache counts its
     // lifetime from the request, and after a restart this stamp is what dates it.
     trace.sent_at_ms = Some(now_millis());
