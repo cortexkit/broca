@@ -16,6 +16,7 @@ pub type Answer = dyn Fn(&Value) -> Value + Send + Sync;
 pub struct State {
     pub subscriptions: Vec<Value>,
     pub requests: Mutex<Vec<Value>>,
+    pub output: Mutex<Vec<String>>,
     pub tool_calls: Mutex<Vec<Value>>,
     pub binds: Mutex<Vec<Value>>,
     pub answer: Mutex<Arc<Answer>>,
@@ -31,6 +32,7 @@ impl State {
         Arc::new(Self {
             subscriptions,
             requests: Default::default(),
+            output: Default::default(),
             tool_calls: Default::default(),
             binds: Default::default(),
             answer: Mutex::new(Arc::new(|_| {
@@ -205,6 +207,7 @@ impl ModuleHandler for Transform {
             }
             _ => panic!("unexpected scripted provider request: {request}"),
         };
+        self.0.output.lock().unwrap().push(answer.to_string());
         HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
     }
 }
@@ -228,21 +231,39 @@ pub async fn register_as(
                 sub_supervises: false,
             }])
             .build(),
-        Transform(state),
+        Transform(state.clone()),
     )
     .await
     .unwrap();
     tokio::spawn(async move {
-        let _ = serving.await;
+        let result = serving.await;
+        state
+            .output
+            .lock()
+            .unwrap()
+            .push(format!("provider serving ended: {result:?}"));
     })
 }
 pub struct Daemon {
     pub child: broca_test_support::RigChild,
     pub connection_file: PathBuf,
     serving: tokio::task::JoinHandle<()>,
+    state: Arc<State>,
 }
 impl Drop for Daemon {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            let status_before_cleanup = self.child.try_wait();
+            eprintln!(
+                "test rig child: ck-subc pid={:?}, status before tree cleanup={status_before_cleanup:?}; fake transform provider runs in-process; serving_finished={}\n--- fake transform provider requests ---\n{:?}\n--- fake transform provider output ---\n{:?}",
+                self.child.id(), self.serving.is_finished(), self.state.requests.lock().unwrap(), self.state.output.lock().unwrap()
+            );
+            let dir = self.connection_file.parent().unwrap().parent().unwrap();
+            eprintln!(
+                "{}",
+                broca_test_support::rig_log_diagnostics(&dir.join("data-home/cortexkit"), dir)
+            );
+        }
         self.serving.abort();
         broca_test_support::kill_and_reap_tree(&mut self.child);
     }
@@ -282,11 +303,12 @@ impl Daemon {
         })
         .await
         .unwrap();
-        let serving = register(&connection_file, state).await;
+        let serving = register(&connection_file, state.clone()).await;
         Self {
             child,
             connection_file,
             serving,
+            state,
         }
     }
     pub async fn install(&self, rig: &super::delivery_rig::Rig) {

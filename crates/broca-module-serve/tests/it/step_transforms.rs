@@ -1189,6 +1189,7 @@ async fn two_step_empty_message_ids_keep_reset_on_the_display_lane() {
         vec![subscription("post_assistant", None, "pass", 1000)],
     )
     .await;
+    let _diagnostics = rig.failure_diagnostics();
     state.answer_with(|c| {
         if c["step_id"] == "1" {
             append("-post")
