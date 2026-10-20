@@ -258,10 +258,16 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
 - A `steer` or `interrupt` into a session that has an episode takes every runner parameter it
   omits (`model` with its variant, `tool_choice`, `generation`, `stop_when`, `cache`, `budget`,
   `context_limit`, `work_class`, `service_tier`) from the session's latest frozen config, so its
-  turn renders the session's request prefix. `tools` and `context_management` already inherit
-  on omission for every send. Any other send must name `model`. When such a send is queued
-  behind a running turn, its recorded request carries the frozen model itself, so a build
-  that does not know the inherited set still runs it on the session's model.
+  turn renders the session's request prefix. An ordered delivery list inherits only if it
+  contains a mode that can join an episode (`steer`, `tool_result`, or `turn_system`); an
+  `idle_start`-only list takes defaults, like a plain queue send. A session with no episode
+  has nothing to inherit: it requires `model` and takes defaults for other omitted runner
+  parameters, even if its WAL already has a lineage header. If WAL presence cannot be
+  classified, a send needing that classification refuses with class `transient` rather than
+  assuming the session has history. `tools` and `context_management` already inherit on
+  omission for every send. Any other send must name `model`. When an inheriting send is
+  queued behind a running turn, its recorded request carries the frozen model itself, so a
+  build that does not know the inherited set still runs it on the session's model.
 
 #### Hard session input-token cap
 

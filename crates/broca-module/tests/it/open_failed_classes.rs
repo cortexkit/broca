@@ -53,6 +53,10 @@ fn every_open_failed_site_chooses_a_class() {
             "Some(broca_protocol::ErrorClass::Permanent)",
         ),
         (
+            "session_written: classifier unsupported",
+            "Some(broca_protocol::ErrorClass::Transient)",
+        ),
+        (
             "model_read: invalid source",
             "Some(broca_protocol::ErrorClass::Permanent)",
         ),
@@ -66,6 +70,10 @@ fn every_open_failed_site_chooses_a_class() {
         ),
         ("warm: erased cause", "None"),
         ("run_tool_calls: response encoding", "None"),
+        (
+            "session_written: WAL presence unknown",
+            "Some(broca_protocol::ErrorClass::Transient)",
+        ),
         // Cancellation can fail while reading the cut JSON that freezes a session.
         // The actor passes text here, not the I/O kind needed to prove retryability.
         ("cancel: erased move-authority cause", "None"),

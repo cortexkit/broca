@@ -957,6 +957,203 @@ async fn paused_run_answers_from_an_archived_session_without_restoring_it() {
 
 // ---- session.subscribe and session.send ------------------------------------------------------
 
+fn seed_empty_lineage(rig: &Rig) {
+    use broca_core::WalStore;
+    // Opening a lineage can persist its header before any episode is admitted.
+    let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
+    drop(wal.open(&rig.session).unwrap());
+    assert!(rig.wal_path.exists());
+}
+
+async fn assert_first_send_defaults(tag: &str, delivery: serde_json::Value) {
+    for header_only in [false, true] {
+        let mut rig = Rig::start(&format!("{tag}-{header_only}")).await;
+        if header_only {
+            seed_empty_lineage(&rig);
+        }
+        rig.script.push(&[Step::Text("revived")]);
+        let reply = call(
+            &mut rig,
+            "session.send",
+            serde_json::json!({"prompt": "revive", "send_id": "revive-1", "delivery": delivery,
+                "model": {"provider": "fake", "model": "fake"}}),
+        )
+        .await;
+        assert!(matches!(
+            result(&reply)["state"].as_str(),
+            Some("active" | "pending")
+        ));
+        let records = rig.wait_for_finished(1).await;
+        let config = records
+            .iter()
+            .find_map(|record| match record {
+                broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+                _ => None,
+            })
+            .expect("the first send started an episode");
+        assert_eq!(
+            config.model,
+            broca_protocol::request::ModelHandle::new("fake", "fake")
+        );
+        assert_eq!(config.budget, None);
+        assert_eq!(config.context_limit, None);
+        assert_eq!(config.service_tier, None);
+        rig.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_idle_start_with_a_model_uses_defaults() {
+    assert_first_send_defaults("fresh-idle-start", serde_json::json!(["idle_start"])).await;
+}
+
+#[tokio::test]
+async fn a_fresh_steer_with_a_model_uses_defaults() {
+    assert_first_send_defaults("fresh-steer", serde_json::json!("steer")).await;
+}
+
+#[tokio::test]
+async fn an_idle_start_only_list_does_not_inherit_an_existing_episode() {
+    let mut rig = Rig::start("idle-start-defaults").await;
+    rig.script
+        .push(&[Step::Text("first"), Step::Text("second")]);
+    let first = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({
+            "prompt": "first", "send_id": "first",
+            "model": {"provider": "fake", "model": "fake"},
+            "generation": {"temperature": 0.25},
+            "budget": {"nudges": [{"at_tool_calls": 5, "text": "finish soon"}]},
+            "context_limit": 32000,
+            "service_tier": "priority"
+        }),
+    )
+    .await;
+    assert_eq!(result(&first)["state"], "active");
+    let initial = rig.wait_for_finished(1).await;
+    let frozen = initial
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert!(frozen.budget.is_some());
+    assert_eq!(frozen.generation.temperature, Some(0.25));
+    rig.wait_idle().await;
+    let missing_model = refused_writing_nothing(
+        &mut rig,
+        "session.send",
+        serde_json::json!({
+            "prompt": "next", "send_id": "no-model", "delivery": ["idle_start"]
+        }),
+    )
+    .await;
+    assert_eq!(missing_model["detail"]["field"], "model");
+    let next = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({
+            "prompt": "next", "send_id": "next", "delivery": ["idle_start"],
+            "model": {"provider": "fake", "model": "fake"}
+        }),
+    )
+    .await;
+    result(&next);
+    let records = rig.wait_for_finished(2).await;
+    let config = records
+        .iter()
+        .filter_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .nth(1)
+        .unwrap();
+    assert_eq!(config.budget, None);
+    assert_eq!(config.context_limit, None);
+    assert_eq!(config.service_tier, None);
+    assert_eq!(config.generation.temperature, None);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn joining_delivery_lists_inherit_the_existing_episode() {
+    for mode in ["steer", "tool_result", "turn_system"] {
+        let mut rig = Rig::start(&format!("joining-list-{mode}")).await;
+        rig.script
+            .push(&[Step::Text("first"), Step::Text("second")]);
+        let first = call(
+            &mut rig,
+            "session.send",
+            serde_json::json!({
+                "prompt": "first", "send_id": "first",
+                "model": {"provider": "fake", "model": "fake"},
+                "generation": {"temperature": 0.25}
+            }),
+        )
+        .await;
+        result(&first);
+        rig.wait_for_finished(1).await;
+        rig.wait_idle().await;
+        let next = call(
+            &mut rig,
+            "session.send",
+            serde_json::json!({
+                "prompt": "next", "send_id": "next", "delivery": [mode, "idle_start"]
+            }),
+        )
+        .await;
+        result(&next);
+        let records = rig.wait_for_finished(2).await;
+        let config = records
+            .iter()
+            .filter_map(|record| match record {
+                broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+                _ => None,
+            })
+            .nth(1)
+            .unwrap();
+        assert_eq!(config.generation.temperature, Some(0.25), "{mode}");
+        assert_eq!(
+            config.model,
+            broca_protocol::request::ModelHandle::new("fake", "fake")
+        );
+        rig.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_send_without_a_model_refuses_precisely() {
+    for header_only in [false, true] {
+        let mut rig = Rig::start(&format!("missing-model-{header_only}")).await;
+        if header_only {
+            seed_empty_lineage(&rig);
+        }
+        let body = refused_writing_nothing(
+            &mut rig,
+            "session.send",
+            serde_json::json!({"prompt": "revive", "send_id": "missing", "delivery": "steer"}),
+        )
+        .await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("model is required"),
+            "{body}"
+        );
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap()
+                .contains("runner parameters"),
+            "{body}"
+        );
+        rig.finish().await;
+    }
+}
+
 /// `session.subscribe` refuses an unknown member by name instead of attaching live.
 #[tokio::test]
 async fn subscribe_is_strict_on_unknown_members() {

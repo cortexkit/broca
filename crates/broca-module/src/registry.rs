@@ -2460,13 +2460,12 @@ impl LineageRegistry {
     }
 
     /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup
-    /// only when there is no live file. `true` when the store cannot tell.
-    pub fn wal_written(&self, key: &LineageKey) -> bool {
+    /// only when there is no live file. `None` means the store cannot tell, not that a WAL exists.
+    pub fn wal_written(&self, key: &LineageKey) -> Option<bool> {
         self.inner
             .reader
             .as_ref()
             .and_then(|reader| reader.wal_store.wal_present(key))
-            .unwrap_or(true)
     }
 
     /// When the session's live WAL file was last written, in milliseconds since the Unix epoch;
@@ -4019,6 +4018,44 @@ mod tests {
 
     struct GaugeOpener {
         durable_head: Mutex<Option<Arc<AtomicU64>>>,
+    }
+
+    #[test]
+    fn an_unclassifiable_wal_is_not_reported_as_written() {
+        use crate::serve::{ServeError, ServeHandler};
+        for registry in [
+            LineageRegistry::new(Arc::new(NeverOpener)),
+            LineageRegistry::new_with_reader(
+                Arc::new(NeverOpener),
+                Arc::new(CandidateWalStore),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(registry.wal_written(&key())).unwrap(),
+                serde_json::Value::Null,
+                "an unavailable classifier must preserve unknown, not claim history"
+            );
+            assert!(matches!(
+                registry.session_written(&key()),
+                Err(ServeError::Open(
+                    _,
+                    Some(broca_protocol::ErrorClass::Transient)
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn wal_classification_distinguishes_present_and_absent() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("wal-classification-{}", std::process::id()));
+        let store = Arc::new(FileWalStore::new(&root));
+        let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpener), store.clone(), None);
+        assert_eq!(registry.wal_written(&key()), Some(false));
+        drop(store.open(&key()).unwrap());
+        assert_eq!(registry.wal_written(&key()), Some(true));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

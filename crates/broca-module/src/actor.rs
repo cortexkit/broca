@@ -3795,19 +3795,26 @@ impl<W: WalStore + 'static> LineageActor<W> {
             resolved_request.tools = Some(inherited_tools);
         }
         if !resolved_request.inherit_frozen.is_empty() {
-            let frozen = prior_snapshot
+            if let Some(frozen) = prior_snapshot
                 .checkpoint_at_head
                 .last_episode
                 .as_ref()
                 .map(|episode| &episode.config)
-                .ok_or_else(|| {
-                    StartRunFailure::Admission(broca_core::RunError::Config(
-                        "the send left runner parameters to the session's frozen values, but \
-                         the session has no episode to take them from; name `model`"
-                            .into(),
-                    ))
-                })?;
-            inherit_frozen_parameters(&mut resolved_request, frozen);
+            {
+                inherit_frozen_parameters(&mut resolved_request, frozen);
+            } else {
+                if resolved_request
+                    .inherit_frozen
+                    .contains(&broca_protocol::request::InheritedParam::Model)
+                {
+                    return Err(StartRunFailure::Admission(broca_core::RunError::Config(
+                        "model is required: the session has no episode to inherit it from".into(),
+                    )));
+                }
+                // A WAL header need not contain an episode. With a named model this is a first
+                // send, so omitted parameters retain their defaults, including cache policy.
+                resolved_request.inherit_frozen.clear();
+            }
         }
         // A session admitted with a fetch plan runs with the tools its manifest froze, and its
         // first episode opens with the manifest's joined system text; nothing a later send
