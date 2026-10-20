@@ -7824,7 +7824,7 @@ new = "for record in broca_core::close_out_pending_turn(&prior).into_iter().filt
 
 [[control]]
 id = "crash-orphan-seal-commits-kept-call-with-terminal"
-guards = "the never-executed result of a kept never-sent call is durable in the same barrier as the interrupted terminal"
+guards = "when a crash-orphan seal keeps a tool call that was never dispatched, the call's never-executed result is fsynced together with the Interrupted RunFinished, never by an earlier sync of its own"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
