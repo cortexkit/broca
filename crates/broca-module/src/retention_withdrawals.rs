@@ -126,7 +126,7 @@ impl super::retention::RetentionService {
             let Some(adapter) = self.withdrawal_adapter.get() else {
                 continue;
             };
-            let exhausted = refusals.take_exhausted(&key, tokio::time::Instant::now());
+            let exhausted = refusals.exhausted(&key, tokio::time::Instant::now());
             let exhausted = match exhausted {
                 Some(window) => Some(window),
                 None => {
@@ -137,10 +137,17 @@ impl super::retention::RetentionService {
                     let reply = tokio::time::timeout(wait, adapter.withdraw(&question, id)).await;
                     match withdrawal_step(reply.ok()) {
                         WithdrawalStep::Settle(_, reason) => {
+                            if let Some(code) = reason.as_deref() {
+                                if refusals.final_refusal(&key, code) {
+                                    tracing::warn!(target: "retention", session = %question.session.session, call_key = %question.call_key, %code, "content-free withdrawal refused; the refusal is final");
+                                }
+                            }
+                            self.index
+                                .settle_withdrawal(&question.lineage_id, &question.call_key)?;
                             if let Some(window) = refusals.settled(&key) {
                                 tracing::info!(target: "retention", session = %question.session.session, call_key = %question.call_key, refusals = window.refusals, last_code = %window.last_code, reason = reason.as_deref().unwrap_or("withdrawn"), "content-free withdrawal settled after refusals");
                             }
-                            None
+                            continue;
                         }
                         WithdrawalStep::Retry(code) => {
                             match refusals.refused(&key, &code, tokio::time::Instant::now()) {
@@ -156,12 +163,13 @@ impl super::retention::RetentionService {
                 }
             };
             if let Some(window) = exhausted {
-                // The row is the only durable record of this debt, so settling deletes it
-                // and the reason lives in this log line.
+                // Persist the stop reason without the question or its scope before deleting
+                // the pending row. Logs are not guaranteed to survive restarts or rotation.
+                self.index
+                    .give_up_withdrawal(&question.lineage_id, &question.call_key)?;
+                refusals.settled(&key);
                 tracing::warn!(target: "retention", session = %question.session.session, call_key = %question.call_key, refusals = window.refusals, last_code = %window.last_code, reason = WITHDRAWAL_RETRY_EXHAUSTED, retry_window_s = WITHDRAWAL_RETRY_WINDOW.as_secs(), "content-free withdrawal given up; the question stays visible until it is answered or expires");
             }
-            self.index
-                .settle_withdrawal(&question.lineage_id, &question.call_key)?;
         }
         Ok(self.index.pending_withdrawals()?.is_empty())
     }

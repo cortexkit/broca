@@ -198,6 +198,12 @@ pub(crate) struct WithdrawalTask {
     stopped: Arc<AtomicBool>,
 }
 
+fn stopped_withdrawal_sessions() -> &'static Mutex<std::collections::HashSet<BindIdentity>> {
+    static STOPPED: std::sync::OnceLock<Mutex<std::collections::HashSet<BindIdentity>>> =
+        std::sync::OnceLock::new();
+    STOPPED.get_or_init(Mutex::default)
+}
+
 impl WithdrawalTask {
     #[cfg(test)]
     pub(crate) fn spawn<W: WalStore + 'static>(
@@ -233,9 +239,16 @@ impl WithdrawalTask {
         let task_generation = generation.clone();
         let settled_generation = Arc::new(AtomicU64::new(0));
         let task_settled = settled_generation.clone();
-        let stopped = Arc::new(AtomicBool::new(false));
+        // Actors can close and reopen within one process. A fresh actor must not reopen
+        // the retry window for a session whose durable storage already failed for minutes.
+        let already_stopped = stopped_withdrawal_sessions().lock().unwrap().contains(&key);
+        let stopped = Arc::new(AtomicBool::new(already_stopped));
         let task_stopped = stopped.clone();
         let task = tokio::spawn(async move {
+            if already_stopped {
+                task_cancel.cancelled().await;
+                return;
+            }
             let mut backoff = std::time::Duration::from_millis(100);
             let mut refusals = RefusalWindows::<String>::default();
             // Store and WAL failures share one window: they are failures of this session's
@@ -280,6 +293,10 @@ impl WithdrawalTask {
                                 // the debt and the next process retries it. This worker stops so
                                 // the session can close instead of failing every few seconds.
                                 tracing::error!(target: "approval", session = %key.session, failures = window.refusals, "question withdrawal debt could not be read or cleaned up for {}s; no more attempts until restart: {error}", WITHDRAWAL_RETRY_WINDOW.as_secs());
+                                stopped_withdrawal_sessions()
+                                    .lock()
+                                    .unwrap()
+                                    .insert(key.clone());
                                 task_stopped.store(true, Ordering::Release);
                                 task_pending.store(false, Ordering::Release);
                                 task_cancel.cancelled().await;
@@ -448,9 +465,24 @@ impl<K> Default for RefusalWindows<K> {
 }
 
 impl<K: std::hash::Hash + Eq + Clone> RefusalWindows<K> {
-    /// Remove and return this debt's window if it has already run out, so the caller can
-    /// give up without making another attempt.
-    pub(crate) fn take_exhausted(
+    /// Record a final refusal without discarding an earlier retry episode before it is logged.
+    pub(crate) fn final_refusal(&mut self, key: &K, code: &str) -> bool {
+        let window = self
+            .open
+            .entry(key.clone())
+            .or_insert_with(|| RefusalWindow {
+                since: tokio::time::Instant::now(),
+                refusals: 0,
+                last_code: code.to_owned(),
+            });
+        window.refusals += 1;
+        code.clone_into(&mut window.last_code);
+        window.refusals == 1
+    }
+
+    /// Return an exhausted window without forgetting it until settlement is durable.
+    /// Storage failure must not start another retry window or repeat the first-refusal log.
+    pub(crate) fn exhausted(
         &mut self,
         key: &K,
         now: tokio::time::Instant,
@@ -460,7 +492,7 @@ impl<K: std::hash::Hash + Eq + Clone> RefusalWindows<K> {
             .get(key)
             .is_some_and(|window| now.duration_since(window.since) >= WITHDRAWAL_RETRY_WINDOW);
         if expired {
-            self.open.remove(key)
+            self.open.get(key).cloned()
         } else {
             None
         }
@@ -482,7 +514,6 @@ impl<K: std::hash::Hash + Eq + Clone> RefusalWindows<K> {
         code.clone_into(&mut window.last_code);
         if now.duration_since(window.since) >= WITHDRAWAL_RETRY_WINDOW {
             let window = window.clone();
-            self.open.remove(key);
             Refused::Exhausted(window)
         } else {
             Refused::Retrying
@@ -494,8 +525,8 @@ impl<K: std::hash::Hash + Eq + Clone> RefusalWindows<K> {
         self.open.remove(key)
     }
 
-    /// Forget debts that are no longer owed, for example because a restart or another
-    /// writer settled them.
+    /// Forget retry windows for debts no longer owed, for example after another writer
+    /// settled them. The windows are process-local; restarting does not settle durable debt.
     pub(crate) fn retain(&mut self, mut owed: impl FnMut(&K) -> bool) {
         self.open.retain(|key, _| owed(key));
     }
@@ -565,7 +596,7 @@ pub(crate) async fn service_pass_with<W: WalStore + 'static>(
 enum Attempt {
     Step(WithdrawalStep),
     /// The debt's retry window had already run out, so no attempt was made.
-    GaveUp(RefusalWindow),
+    GaveUp,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -619,21 +650,24 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
         let call_key = owed.withdrawal.call_key.clone();
         let mut id = owed.withdrawal.elicitation_id;
         if clock.now_ms() >= ask.expires_at_ms {
-            if let Some(window) = refusals.settled(&call_key) {
-                tracing::info!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, "question withdrawal settled after refusals: the question expired");
-            }
             writer.record(WalRecord::QuestionWithdrawalAcknowledged {
-                call_key,
+                call_key: call_key.clone(),
                 elicitation_id: id,
                 answer: broca_wal::WithdrawalAnswer::NotSent,
                 reason: Some("expired".into()),
             });
             writer.sync().await.map_err(|e| e.to_string())?;
+            if let Some(window) = refusals.settled(&call_key) {
+                tracing::info!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, "question withdrawal settled after refusals: the question expired");
+            }
             continue;
         }
         let attempt = 'attempt: {
-            if let Some(window) = refusals.take_exhausted(&call_key, tokio::time::Instant::now()) {
-                break 'attempt Attempt::GaveUp(window);
+            if refusals
+                .exhausted(&call_key, tokio::time::Instant::now())
+                .is_some()
+            {
+                break 'attempt Attempt::GaveUp;
             }
             // A debt without its run cannot be serviced. It is held like a refused one, so
             // it is logged once and given up on at the same limit.
@@ -696,8 +730,10 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
         };
         let (answer, reason) = match attempt {
             Attempt::Step(WithdrawalStep::Settle(answer, reason)) => {
-                if let Some(window) = refusals.settled(&call_key) {
-                    tracing::info!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, reason = reason.as_deref().unwrap_or("withdrawn"), "question withdrawal settled after refusals");
+                if let Some(code) = reason.as_deref() {
+                    if refusals.final_refusal(&call_key, code) {
+                        tracing::warn!(target: "approval", session = %key.session, %call_key, %code, "question withdrawal refused; the refusal is final");
+                    }
                 }
                 (answer, reason)
             }
@@ -708,18 +744,25 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
                         continue;
                     }
                     Refused::Retrying => continue,
-                    Refused::Exhausted(window) => give_up(&key, &call_key, &window),
+                    Refused::Exhausted(_) => give_up(),
                 }
             }
-            Attempt::GaveUp(window) => give_up(&key, &call_key, &window),
+            Attempt::GaveUp => give_up(),
         };
         writer.record(WalRecord::QuestionWithdrawalAcknowledged {
-            call_key,
+            call_key: call_key.clone(),
             elicitation_id: id,
             answer,
-            reason,
+            reason: reason.clone(),
         });
         writer.sync().await.map_err(|e| e.to_string())?;
+        if let Some(window) = refusals.settled(&call_key) {
+            if reason.as_deref() == Some(WITHDRAWAL_RETRY_EXHAUSTED) {
+                tracing::warn!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, retry_window_s = WITHDRAWAL_RETRY_WINDOW.as_secs(), "question withdrawal given up; the question stays visible until it is answered or expires");
+            } else {
+                tracing::info!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, reason = reason.as_deref().unwrap_or("withdrawn"), "question withdrawal settled after refusals");
+            }
+        }
     }
     // After syncing withdrawal acknowledgements, read the entire WAL again before clearing
     // `withdrawals_owed`. The shared lock prevents a terminal index writer from setting the
@@ -778,14 +821,9 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
     .map_err(|e| e.to_string())?
 }
 
-/// Stop retrying one withdrawal and say so once. The debt settles with a durable reason so
-/// the session can close; the card stays visible until it is answered or expires.
-fn give_up(
-    key: &BindIdentity,
-    call_key: &str,
-    window: &RefusalWindow,
-) -> (broca_wal::WithdrawalAnswer, Option<String>) {
-    tracing::warn!(target: "approval", session = %key.session, %call_key, refusals = window.refusals, last_code = %window.last_code, retry_window_s = WITHDRAWAL_RETRY_WINDOW.as_secs(), "question withdrawal given up; the question stays visible until it is answered or expires");
+/// Stop retrying with a durable reason. Logging follows the WAL sync, not the attempt:
+/// a failed sync must not announce settlement before it is durable.
+fn give_up() -> (broca_wal::WithdrawalAnswer, Option<String>) {
     (
         broca_wal::WithdrawalAnswer::NotSent,
         Some(WITHDRAWAL_RETRY_EXHAUSTED.into()),

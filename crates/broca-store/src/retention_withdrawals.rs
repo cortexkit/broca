@@ -189,6 +189,45 @@ impl SqliteStore {
         )? == 1)
     }
 
+    /// Persist why a worker abandoned a debt without retaining the question or its scope.
+    /// The tombstone and removal are atomic, so a restart cannot lose the reason or retry
+    /// a debt already given up on. This identity-only record survives retained transcript
+    /// deletion.
+    pub fn give_up_retention_withdrawal(
+        &self,
+        lineage: &str,
+        call_key: &str,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "INSERT INTO retention_withdrawal_stop (lineage_id, call_key, reason) SELECT lineage_id, call_key, 'withdrawal_retry_exhausted' FROM retention_withdrawal WHERE lineage_id=?1 AND call_key=?2 ON CONFLICT DO NOTHING",
+            params![lineage, call_key],
+        )?;
+        tx.execute(
+            "DELETE FROM retention_withdrawal WHERE lineage_id=?1 AND call_key=?2",
+            params![lineage, call_key],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn retention_withdrawal_stop_reason(
+        &self,
+        lineage: &str,
+        call_key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT reason FROM retention_withdrawal_stop WHERE lineage_id=?1 AND call_key=?2",
+                params![lineage, call_key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn retention_lineages_with_discovery(&self) -> Result<Vec<BindIdentity>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(DISCOVERY_SQL)?;
@@ -214,7 +253,7 @@ pub(crate) fn write_questions(
         // Never serialize the WAL's SessionScope, whose unknown principals can contain
         // content. Store null when no known identity can be reconstructed; the session,
         // call key and ask deadline still identify the obligation until it expires.
-        tx.execute("INSERT INTO retention_withdrawal (lineage_id, session, call_key, scope_json, elicitation_id, provider_id, provider_incarnation, expires_at_ms, state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(lineage_id,call_key) DO NOTHING", params![question.lineage_id, serde_json::to_string(&question.session)?, question.call_key, serde_json::to_string(&question.scope)?, id, question.provider_id, question.provider_incarnation, question.expires_at_ms.to_string(), state])?;
+        tx.execute("INSERT INTO retention_withdrawal (lineage_id, session, call_key, scope_json, elicitation_id, provider_id, provider_incarnation, expires_at_ms, state) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9 WHERE NOT EXISTS (SELECT 1 FROM retention_withdrawal_stop WHERE lineage_id=?1 AND call_key=?3) ON CONFLICT(lineage_id,call_key) DO NOTHING", params![question.lineage_id, serde_json::to_string(&question.session)?, question.call_key, serde_json::to_string(&question.scope)?, id, question.provider_id, question.provider_incarnation, question.expires_at_ms.to_string(), state])?;
     }
     Ok(())
 }
@@ -222,6 +261,44 @@ pub(crate) fn write_questions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_up_withdrawal_keeps_reason_and_cannot_be_reenrolled() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let question = RetentionWithdrawal {
+            lineage_id: "lineage".into(),
+            session: BindIdentity::new("/project", "harness", "session"),
+            call_key: "call".into(),
+            scope: None,
+            question: RetentionQuestionId::Known("question".into()),
+            provider_id: "cingulate".into(),
+            provider_incarnation: None,
+            expires_at_ms: u64::MAX,
+        };
+        let enroll = || {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            write_questions(&tx, std::slice::from_ref(&question)).unwrap();
+            tx.commit().unwrap();
+        };
+        enroll();
+        assert_eq!(store.pending_retention_withdrawals().unwrap().len(), 1);
+        assert!(store
+            .give_up_retention_withdrawal("lineage", "call")
+            .unwrap());
+        assert_eq!(
+            store
+                .retention_withdrawal_stop_reason("lineage", "call")
+                .unwrap()
+                .as_deref(),
+            Some("withdrawal_retry_exhausted")
+        );
+        assert!(!store
+            .give_up_retention_withdrawal("lineage", "call")
+            .unwrap());
+        enroll();
+        assert!(store.pending_retention_withdrawals().unwrap().is_empty());
+    }
 
     fn insert_run(
         conn: &rusqlite::Connection,

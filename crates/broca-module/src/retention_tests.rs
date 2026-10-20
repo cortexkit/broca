@@ -2667,13 +2667,23 @@ async fn content_free_structured_route_refusal_settles_on_the_first_attempt() {
         },
     ] {
         let (rig, questions) = retained_rig_with_replies([reply]);
-        assert!(rig.service.withdraw_retained_questions().await.unwrap());
+        let (result, logs) =
+            broca_test_support::capture_logs(rig.service.withdraw_retained_questions()).await;
+        assert!(result.unwrap());
         assert_eq!(questions.withdrawals.lock().unwrap().len(), 1);
         assert!(rig
             .store
             .pending_retention_withdrawals()
             .unwrap()
             .is_empty());
+        let events: Vec<_> = logs
+            .iter()
+            .filter(|event| event.target == "retention" && event.fields.contains_key("call_key"))
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert!(events[0].fields.contains_key("code"));
+        assert!(events[1].message().contains("settled after refusals"));
     }
 }
 
@@ -2703,6 +2713,12 @@ async fn content_free_retryable_refusal_without_expiry_gives_up_at_the_retry_win
         })
     };
     let (rig, questions) = retained_rig_with_replies([warming(), warming(), warming()]);
+    let question = rig
+        .store
+        .pending_retention_withdrawals()
+        .unwrap()
+        .pop()
+        .unwrap();
     tokio::time::pause();
     let window = crate::approval::WITHDRAWAL_RETRY_WINDOW;
     let mut refusals = crate::approval::RefusalWindows::default();
@@ -2730,6 +2746,15 @@ async fn content_free_retryable_refusal_without_expiry_gives_up_at_the_retry_win
         .pending_retention_withdrawals()
         .unwrap()
         .is_empty());
+    let reopened = SqliteStore::open(rig.root.join("run-index.db")).unwrap();
+    assert_eq!(
+        reopened
+            .retention_withdrawal_stop_reason(&question.lineage_id, &question.call_key)
+            .unwrap()
+            .as_deref(),
+        Some(crate::approval::WITHDRAWAL_RETRY_EXHAUSTED),
+        "giving up must leave a durable reason after the pending row is removed"
+    );
     assert_eq!(
         questions.withdrawals.lock().unwrap().len(),
         2,
@@ -2783,7 +2808,7 @@ impl RetentionIndex for WithdrawalStoreDown {
 /// because the retention task ends when the worker does.
 #[tokio::test(start_paused = true)]
 async fn content_free_store_failure_stops_the_worker_with_one_warning_and_one_error() {
-    let rig = Rig::new();
+    let (rig, _) = retained_rig_with_replies([]);
     let index = Arc::new(WithdrawalStoreDown {
         store: rig.store.clone(),
         reads: std::sync::atomic::AtomicUsize::new(0),
@@ -2827,6 +2852,12 @@ async fn content_free_store_failure_stops_the_worker_with_one_warning_and_one_er
         .map(|event| event.level)
         .collect();
     assert_eq!(levels, [tracing::Level::WARN, tracing::Level::ERROR]);
+    let reopened = SqliteStore::open(rig.root.join("run-index.db")).unwrap();
+    assert_eq!(
+        reopened.pending_retention_withdrawals().unwrap().len(),
+        1,
+        "storage failure must not settle durable debt"
+    );
 }
 
 #[cfg(feature = "test-clock")]

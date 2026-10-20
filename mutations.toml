@@ -6734,8 +6734,8 @@ features = ["test-clock"]
 test_file = "crates/broca-module/src/approval_tests.rs"
 expect_red = ["actor::approval_tests::a_persistent_wal_failure_stops_the_worker_with_one_warning_and_one_error"]
 file = "crates/broca-module/src/approval.rs"
-old = "                                task_stopped.store(true, Ordering::Release);\n                                task_pending.store(false, Ordering::Release);\n                                task_cancel.cancelled().await;\n                                break;"
-new = "                                let _ = &task_stopped; // NON-VACUITY BREAK: keep retrying after the store window"
+old = "                                task_pending.store(false, Ordering::Release);\n                                task_cancel.cancelled().await;\n                                break;"
+new = "                                task_pending.store(false, Ordering::Release); // NON-VACUITY BREAK: keep retrying after the store window"
 
 [[control]]
 id = "retention-withdrawal-store-failure-stops"
@@ -6787,6 +6787,44 @@ expect_red = ["subc_plane::tests::warm_structured_module_refusal_stops_after_one
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "if !is_retryable_route_open(message.code())"
 new = "if !is_retryable_route_open(message.code()) && message.code() != \"module_rejected\" // NON-VACUITY BREAK: retry a structured module refusal"
+
+[[control]]
+id = "approval-withdrawal-refiling-final-refusal-stops"
+guards = "a permanent refusal while recovering an unfiled question settles without sending a withdrawal"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/approval_tests.rs"
+expect_red = ["actor::approval_tests::unfiled_question_final_refusal_stops_without_withdrawal"]
+file = "crates/broca-module/src/approval.rs"
+old = "Ok(Err(error)) if !error.retryable => {"
+new = "Ok(Err(error)) if false && !error.retryable => { // NON-VACUITY BREAK: retry a permanent filing refusal"
+
+[[control]]
+id = "approval-withdrawal-reopened-session-stays-stopped"
+guards = "reopening an actor in the same process cannot restart retries after its WAL failure window ends"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+features = ["test-clock"]
+test_file = "crates/broca-module/src/approval_tests.rs"
+expect_red = ["actor::approval_tests::a_persistent_wal_failure_stops_the_worker_with_one_warning_and_one_error"]
+file = "crates/broca-module/src/approval.rs"
+old = "stopped_withdrawal_sessions()\n                                    .lock()\n                                    .unwrap()\n                                    .insert(key.clone());"
+new = "let _ = &key; // NON-VACUITY BREAK: forget the process-lifetime stop"
+
+[[control]]
+id = "retention-withdrawal-exhaustion-reason-durable"
+guards = "giving up a retained withdrawal persists a content-free reason atomically with removing its pending row"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retention_withdrawals.rs"
+expect_red = ["retention_withdrawals::tests::given_up_withdrawal_keeps_reason_and_cannot_be_reenrolled"]
+file = "crates/broca-store/src/retention_withdrawals.rs"
+old = "SELECT lineage_id, call_key, 'withdrawal_retry_exhausted' FROM retention_withdrawal WHERE lineage_id=?1 AND call_key=?2 ON CONFLICT DO NOTHING"
+new = "SELECT lineage_id, call_key, 'withdrawal_retry_exhausted' FROM retention_withdrawal WHERE lineage_id=?1 AND call_key=?2 AND 0 /* NON-VACUITY BREAK: lose the durable stop reason */ ON CONFLICT DO NOTHING"
 
 [[control]]
 id = "retention-rederive-clears-settled-discovery"

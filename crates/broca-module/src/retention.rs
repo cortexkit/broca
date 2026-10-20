@@ -62,6 +62,9 @@ pub trait RetentionIndex: Send + Sync {
     fn settle_withdrawal(&self, _lineage: &str, _key: &str) -> Result<bool, String> {
         Err("retention index cannot settle content-free withdrawals".into())
     }
+    fn give_up_withdrawal(&self, _lineage: &str, _key: &str) -> Result<bool, String> {
+        Err("retention index cannot persist a withdrawal stop reason".into())
+    }
     fn discovery_lineages(&self) -> Result<Vec<BindIdentity>, String> {
         Ok(Vec::new())
     }
@@ -105,6 +108,10 @@ impl RetentionIndex for SqliteStore {
     }
     fn settle_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
         self.settle_retention_withdrawal(lineage, key)
+            .map_err(|e| e.to_string())
+    }
+    fn give_up_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
+        self.give_up_retention_withdrawal(lineage, key)
             .map_err(|e| e.to_string())
     }
     fn discovery_lineages(&self) -> Result<Vec<BindIdentity>, String> {
