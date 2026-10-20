@@ -179,6 +179,7 @@ impl Fixture {
         let (self_tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
+            ceiling_drain_held: false,
             admitting_session_class: None,
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]
@@ -416,5 +417,305 @@ async fn checkpoint_fallback_requires_coverage_and_keeps_primary_cause() {
     let checkpoint = fixture.actor.load_checkpoint_at_head().await.unwrap();
     assert_eq!(checkpoint.at_seq, 4);
     assert_eq!(checkpoint.ownership.unwrap().episodes, 2);
+    fixture.close().await;
+}
+
+impl Fixture {
+    async fn with_ceiling(size: u64) -> Self {
+        let mut fixture = Self::with_history(false).await;
+        let manifest = broca_wal::PlanManifest {
+            plan: broca_wal::OpaqueJson::from_json_text(
+                r#"{"compaction_item":{"provider":"provider","params":{}},"composition":{}}"#,
+            )
+            .unwrap(),
+            plan_identity: "compaction".into(),
+            composition_digest: "digest".into(),
+            tools: Arc::new(vec![]),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: Default::default(),
+            fetches: vec![],
+            declarations: vec![],
+        };
+        let writer = fixture.actor.writer.as_ref().unwrap();
+        let mut config = min_config();
+        config.context_limit = Some(10_000);
+        let started: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"run_started", "run_id":"prior", "session":fixture.actor.key,
+            "config":config, "input":fixture.request.input, "origin":broca_wal::RunOrigin::Fresh,
+            "manifest":manifest,
+        }))
+        .unwrap();
+        writer.record(started);
+        writer.record(serde_json::from_value(serde_json::json!({
+            "type":"compaction_message", "provider":"provider", "kind":"setup", "compaction_id":"head", "version":1,
+            "range":{"from":0,"to":0}, "replacement":[], "sha256":broca_wal::compaction_replacement_sha256(&[]).unwrap(),
+            "ceiling":r#"{"at_share":0.8,"wait_ms":50}"#
+        })).unwrap());
+        writer.record(WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Completed,
+            ts_ms: None,
+            error: None,
+            usage: Default::default(),
+            retries_used: 0,
+        });
+        writer.sync().await.unwrap();
+        fixture.record_ceiling_notice(size, 1).await;
+        fixture.actor.refresh_admission_view().await.unwrap();
+        fixture
+    }
+    async fn record_ceiling_notice(&mut self, size: u64, seq: u64) {
+        let writer = self.actor.writer.as_ref().unwrap();
+        let notice = broca_core::compaction_provider::notice::AdvanceNotice::new(
+            broca_core::agent_session_ref(&self.actor.key),
+            seq,
+            writer.lineage_id().unwrap().to_string(),
+            0,
+            "a".repeat(64),
+            size,
+            "m",
+        )
+        .with_window(10_000);
+        writer.record(WalRecord::CompactionNotice {
+            seq,
+            headers: notice.to_headers(),
+        });
+        writer.sync().await.unwrap();
+    }
+    fn durable_count(&self) -> usize {
+        self.actor
+            .wal_store
+            .read_records(&self.actor.key)
+            .unwrap()
+            .len()
+    }
+    async fn send_new(&mut self, delivery: broca_protocol::Delivery) -> SendOutcome {
+        let mut request = self.request.clone();
+        request.input = text_req(&self.actor.key, "new").input;
+        self.actor
+            .on_send(
+                RunId("new".into()),
+                request,
+                RunKind::AppendEpisode,
+                SendKey::SendId("new".into()),
+                false,
+                delivery,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn context_ceiling_receipt_refuses_idle_start_and_joining_steer_without_writes() {
+    for delivery in [
+        broca_protocol::Delivery::Queue,
+        broca_protocol::Delivery::Steer,
+        broca_protocol::Delivery::Interrupt,
+    ] {
+        let mut fixture = Fixture::with_ceiling(8_000).await;
+        let before = fixture.durable_count();
+        let outcome = fixture.send_new(delivery).await;
+        assert!(
+            matches!(outcome, SendOutcome::ContextCeiling(ref d) if d.window == 10_000 && d.size >= 8_000),
+            "{outcome:?}"
+        );
+        assert_eq!(fixture.durable_count(), before);
+        assert_eq!(fixture.executor.0.load(Ordering::Relaxed), 0);
+        fixture.close().await;
+    }
+    let mut fixture = Fixture::with_ceiling(100).await;
+    let mut started = fixture
+        .actor
+        .wal_store
+        .read_records(&fixture.actor.key)
+        .unwrap()[0]
+        .record
+        .clone();
+    if let WalRecord::RunStarted { run_id, .. } = &mut started {
+        *run_id = RunId("running".into());
+    }
+    fixture.actor.writer.as_ref().unwrap().record(started);
+    fixture.actor.writer.as_ref().unwrap().sync().await.unwrap();
+    fixture.actor.prior_snapshot = None;
+    let run = fixture
+        .actor
+        .start_run(
+            RunId("running".into()),
+            fixture.request.clone(),
+            RunKind::FreshOrResume,
+            None,
+            SendIdentity::default(),
+            false,
+        )
+        .await;
+    assert!(run.is_ok());
+    fixture.record_ceiling_notice(8_000, 2).await;
+    let before = fixture.durable_count();
+    let outcome = fixture.send_new(broca_protocol::Delivery::Steer).await;
+    assert!(
+        matches!(outcome, SendOutcome::ContextCeiling(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(fixture.durable_count(), before);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn a_ceiling_held_queue_head_stays_pending_without_writes_and_wakes_after_a_view() {
+    let mut fixture = Fixture::with_ceiling(8_000).await;
+    let outcome = fixture
+        .actor
+        .queue_submission(
+            RunId("queued".into()),
+            fixture.request.clone(),
+            SendIdentity::default(),
+            false,
+            broca_protocol::Delivery::Queue,
+        )
+        .await;
+    assert!(
+        matches!(outcome, SendOutcome::Pending { .. }),
+        "{outcome:?}"
+    );
+    let before = fixture.durable_count();
+    fixture.actor.drain_queue_one().await.unwrap();
+    assert_eq!(fixture.durable_count(), before);
+    assert_eq!(fixture.actor.pending_fifo.len(), 1);
+    let records = fixture
+        .actor
+        .wal_store
+        .read_records(&fixture.actor.key)
+        .unwrap();
+    assert_eq!(
+        broca_core::delivery_order::queued_send_fate(records.iter().map(|r| &r.record), "queued"),
+        Some(broca_core::delivery_order::QueuedSendFate::Pending)
+    );
+    assert!(fixture.actor.ceiling_drain_held);
+    assert_eq!(fixture.executor.0.load(Ordering::Relaxed), 0);
+    let writer = fixture.actor.writer.as_ref().unwrap();
+    let view = broca_core::compaction_provider::view::CompactionView::new(
+        broca_core::agent_session_ref(&fixture.actor.key),
+        2,
+        writer.lineage_id().unwrap().to_string(),
+        broca_core::compaction_provider::lineage::MessageRef {
+            ordinal: 0,
+            mid: "m0".into(),
+        },
+        vec![broca_core::compaction_provider::view::ViewRange::replace(
+            0,
+            1,
+            serde_json::to_string(&fixture.request.input).unwrap(),
+        )],
+    );
+    writer.record(WalRecord::CompactionViewApplied {
+        provider: "provider".into(),
+        view_version: 2,
+        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
+        choice: broca_wal::CompactionViewChoice::Applied,
+    });
+    writer.sync().await.unwrap();
+    fixture.record_ceiling_notice(100, 2).await;
+    fixture
+        .actor
+        .handle_cmd(LineageCmd::CompactionChanged)
+        .await;
+    assert_eq!(
+        fixture.executor.0.load(Ordering::Relaxed),
+        1,
+        "view wake must re-attempt admission"
+    );
+    assert!(!fixture.actor.ceiling_drain_held);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn live_actor_status_reads_the_ceiling_wait_and_clears_it_after_the_decision() {
+    let mut fixture = Fixture::with_ceiling(100).await;
+    let mut started = fixture
+        .actor
+        .wal_store
+        .read_records(&fixture.actor.key)
+        .unwrap()[0]
+        .record
+        .clone();
+    if let WalRecord::RunStarted { run_id, .. } = &mut started {
+        *run_id = RunId("running".into());
+    }
+    let writer = fixture.actor.writer.as_ref().unwrap().clone();
+    writer.record(started);
+    writer.sync().await.unwrap();
+    fixture.actor.prior_snapshot = None;
+    assert!(fixture
+        .actor
+        .start_run(
+            RunId("running".into()),
+            fixture.request.clone(),
+            RunKind::FreshOrResume,
+            None,
+            SendIdentity::default(),
+            false
+        )
+        .await
+        .is_ok());
+    writer.record(WalRecord::ContextCeilingWait {
+        step_id: broca_protocol::StepId(1),
+        deadline_ms: 987_654,
+        unavailable: None,
+    });
+    writer.sync().await.unwrap();
+    for frame in fixture
+        .actor
+        .wal_store
+        .read_records(&fixture.actor.key)
+        .unwrap()
+    {
+        fixture
+            .actor
+            .approvals
+            .observe(frame.seq, frame.fence, writer.lineage_id(), &frame.record);
+    }
+    let state = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.actor.resolve_run_state(&RunId("running".into())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(state.state, RunIndexState::Active);
+    assert_eq!(state.ceiling_deadline_ms, Some(987_654));
+    writer.record(WalRecord::ContextCeilingDecided {
+        step_id: broca_protocol::StepId(1),
+        detail: None,
+    });
+    writer.sync().await.unwrap();
+    for frame in fixture
+        .actor
+        .wal_store
+        .read_records(&fixture.actor.key)
+        .unwrap()
+    {
+        fixture
+            .actor
+            .approvals
+            .observe(frame.seq, frame.fence, writer.lineage_id(), &frame.record);
+    }
+    let state = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.actor.resolve_run_state(&RunId("running".into())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(state.ceiling_deadline_ms, None);
+    drop(writer);
     fixture.close().await;
 }

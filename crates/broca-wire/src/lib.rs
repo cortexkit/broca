@@ -1210,6 +1210,8 @@ mod approval_wire_tests {
     #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            reason: None,
+            deadline_ms: None,
             usage: None,
             step: None,
             title: None,
@@ -1416,6 +1418,10 @@ pub struct PausedRunAuth {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunStatusResponse {
     Active {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
         #[serde(
             default,
             deserialize_with = "crate::role::deserialize_optional_run_usage",
@@ -1563,6 +1569,25 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
+    ContextCeiling {
+        context_ceiling: broca_protocol::ContextCeilingDetail,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undelivered_steers: Option<Vec<String>>,
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
+        usage: Option<broca_protocol::usage::RunUsage>,
+        #[serde(default)]
+        retries_used: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
+    },
     Cancelled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_step_finish_reason: Option<FinishReason>,
@@ -1655,6 +1680,7 @@ impl RunStatusResponse {
             | Self::Completed { title, .. }
             | Self::MaxSteps { title, .. }
             | Self::BudgetExhausted { title, .. }
+            | Self::ContextCeiling { title, .. }
             | Self::Cancelled { title, .. }
             | Self::Error { title, .. }
             | Self::TransformUnavailable { title, .. } => title.as_deref(),
@@ -4092,6 +4118,8 @@ mod title_wire_tests {
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                reason: None,
+                deadline_ms: None,
                 usage: None,
                 step: None,
                 title: None,
@@ -4106,6 +4134,8 @@ mod title_wire_tests {
             )
             .unwrap(),
             RunStatusResponse::Active {
+                reason: None,
+                deadline_ms: None,
                 usage: None,
                 awaiting_approval: None,
                 step: None,

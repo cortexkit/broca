@@ -116,6 +116,8 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::QuestionWithdrawalAcknowledged { .. } => "question_withdrawal_acknowledged",
         WalRecord::InputTokenCapFrozen { .. } => "input_token_cap_frozen",
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
+        WalRecord::ContextCeilingWait { .. } => "context_ceiling_wait",
+        WalRecord::ContextCeilingDecided { .. } => "context_ceiling_decided",
         WalRecord::StructuredOutputResult { .. } => "structured_output_result",
         WalRecord::StructuredOutputDowngraded { .. } => "structured_output_downgraded",
         WalRecord::DeliveryOrdered { .. } => "delivery_ordered",

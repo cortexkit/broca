@@ -945,6 +945,8 @@ impl AdmissionCheckpointV1 {
             | WalRecord::CompactionAnswer { .. }
             | WalRecord::CompactionWait { .. }
             | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::ContextCeilingWait { .. }
+            | WalRecord::ContextCeilingDecided { .. }
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
             WalRecord::ModelAttemptFinished { .. } => {}

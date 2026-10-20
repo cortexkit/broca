@@ -805,6 +805,7 @@ struct OneView {
     copy_raw_question: bool,
     /// Serve a view whose bytes differ from the ones the `view_ready` event announced.
     tampered: bool,
+    unavailable: bool,
     /// Answer `view.get` with this refusal code instead of the view.
     refuse: Option<&'static str>,
     /// Serve a view of another lineage, which is never a prefix of the run's transcript.
@@ -906,6 +907,9 @@ impl CompactionPlane for OneView {
             .lock()
             .unwrap()
             .push((request.view_version, at_boundary));
+        if self.unavailable {
+            return Err(CompactionUnavailable);
+        }
         if let Some(code) = self.refuse {
             return Ok(ViewGetAnswer::refuse(code, "not held"));
         }
@@ -1461,16 +1465,16 @@ async fn a_request_over_the_window_is_refused_before_it_is_sent() {
             continue;
         }
         assert!(model.calls().is_empty(), "never sent over the window");
-        assert_eq!(summary.reason, RunFinishReason::Error);
-        let error = records
-            .iter()
-            .find_map(|record| match record {
-                WalRecord::RunFinished { error, .. } => error.clone(),
-                _ => None,
-            })
-            .expect("the run's error");
-        assert_eq!(error.provider_code.as_deref(), Some("context_ceiling"));
-        assert!(error.message.contains("over_window"), "{}", error.message);
+        assert_eq!(summary.reason, RunFinishReason::ContextCeiling);
+        let state = crate::reconcile_run_state(records.iter(), "run").unwrap();
+        assert!(
+            state.error.is_none(),
+            "a runner ceiling is not a provider error"
+        );
+        let detail = state.context_ceiling.expect("the run's ceiling detail");
+        assert_eq!(detail.cause, "over_window");
+        assert_eq!(detail.window, 4);
+        assert!(detail.size > detail.window);
         let WalRecord::CompactionNotice { headers, .. } = records
             .iter()
             .find(|record| matches!(record, WalRecord::CompactionNotice { .. }))
@@ -1749,3 +1753,6 @@ async fn a_structured_output_submit_announces_its_step() {
         .any(|record| matches!(record, WalRecord::StructuredOutputResult { .. })));
     assert_closing_notice(&records, "structured output submit");
 }
+
+#[path = "ceiling_tests.rs"]
+mod ceiling_tests;

@@ -26,6 +26,19 @@ use broca_protocol::{
 #[derive(Debug, Clone)]
 pub struct CompactionUnavailable;
 
+async fn cancelled(control: &crate::RunControl) {
+    async fn token(token: Option<&tokio_util::sync::CancellationToken>) {
+        match token {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
+    tokio::select! {
+        _ = token(control.cancel.as_ref()) => {},
+        _ = token(control.stop_requested.as_ref()) => {},
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     pub call_budget_ms: u64,
@@ -176,6 +189,9 @@ pub(crate) enum Fetch {
 /// What the run loop remembers about views from one step boundary to the next.
 #[derive(Default)]
 pub(crate) struct BoundaryViews {
+    /// A failed fetch must not spend the full call budget at every model step. Ceiling waits
+    /// bypass this ordinary-boundary cooldown because their own deadline bounds the work.
+    unavailable_until: u64,
     /// The newest version this run will not offer again: refused, rejected, stale, or one the
     /// provider said it does not hold.
     declined: Option<u64>,
@@ -275,24 +291,6 @@ pub(crate) async fn seal_recorded_wait(
     Ok(Some(terminal_exit(exit)))
 }
 
-/// The run error for a request broca will not send because it is over the model's context
-/// window (compaction-provider/v1 §8: the runner never sends over the window). Not retryable:
-/// sending it again changes nothing until a view makes the request smaller.
-pub(crate) fn context_ceiling_error(
-    detail: &cortexkit_role_llm_runner::errors::ContextCeilingDetail,
-) -> ProviderError {
-    error(
-        None,
-        &format!(
-            "context_ceiling: the request is estimated at {} tokens, over the model's context \
-             window of {} tokens ({})",
-            detail.size, detail.window, detail.cause
-        ),
-        Some("context_ceiling".into()),
-        false,
-    )
-}
-
 impl Runtime<'_> {
     fn now(&self) -> u64 {
         self.control
@@ -309,6 +307,236 @@ impl Runtime<'_> {
         self.writer.sync().await?;
         state.fold(&record);
         Ok(())
+    }
+
+    /// Decide before model I/O and retain both the absolute wait bound and its decision for
+    /// recovery. The published compaction-provider 0.3.1 CONTRACT.md §8, lines 629–641,
+    /// refuses a request still at the ceiling after the bound even if it fits the window.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn ceiling_before_request(
+        &self,
+        views: &mut BoundaryViews,
+        state: &mut CompactionState,
+        session_ref: &str,
+        lineage_id: &str,
+        step_id: broca_protocol::StepId,
+        run_id: &broca_protocol::RunId,
+        out: &tokio::sync::mpsc::Sender<crate::OutputEvent>,
+        opts: &broca_protocol::CallOptions,
+        stored: &[Message],
+        provider: &dyn crate::Provider,
+        window: Option<u64>,
+    ) -> Result<Option<broca_protocol::ContextCeilingDetail>, crate::RunError> {
+        use crate::compaction_provider::ceiling::WaitEnd;
+        let mut events = Vec::new();
+        let estimate = |state: &CompactionState| -> Result<u64, crate::RunError> {
+            let model =
+                model_options(opts, state).map_err(|e| crate::RunError::Wal(e.to_string()))?;
+            Ok(request_estimate(provider.render_request(&model).len(), &state.history).0)
+        };
+        if let Some(CeilingCheck::Decided {
+            step_id: checked,
+            detail,
+        }) = &state.ceiling_check
+        {
+            if *checked == step_id {
+                return Ok(detail.clone());
+            }
+        }
+        let policy = view::ceiling_policy(state);
+        let decision = view::before_send(policy.as_ref(), estimate(state)?, window);
+        let waiting = match state.ceiling_check.clone() {
+            Some(CeilingCheck::Waiting {
+                step_id: checked,
+                deadline_ms,
+                unavailable,
+            }) if checked == step_id => Some((deadline_ms, unavailable)),
+            _ => None,
+        };
+        let detail = match (decision, waiting) {
+            (view::BeforeSend::Refuse(detail), None) => Some(detail),
+            (view::BeforeSend::Send, None) => return Ok(None),
+            (_, waiting) => {
+                let policy = policy.ok_or_else(|| {
+                    crate::RunError::Wal("ceiling wait has no frozen policy".into())
+                })?;
+                let window = window.ok_or_else(|| {
+                    crate::RunError::Wal("ceiling wait has no context window".into())
+                })?;
+                let (deadline_ms, mut unavailable) = match waiting {
+                    Some(wait) => wait,
+                    None => {
+                        let deadline_ms = self.now().saturating_add(policy.wait_ms);
+                        self.commit(
+                            state,
+                            WalRecord::ContextCeilingWait {
+                                step_id,
+                                deadline_ms,
+                                unavailable: None,
+                            },
+                        )
+                        .await?;
+                        let _ = out
+                            .send(crate::OutputEvent::Control(
+                                broca_protocol::ControlUnit::ContextCeilingWait {
+                                    run_id: run_id.clone(),
+                                    reason: "context_ceiling_wait".into(),
+                                    deadline_ms,
+                                },
+                            ))
+                            .await;
+                        (deadline_ms, None)
+                    }
+                };
+                #[cfg(feature = "test-clock")]
+                crate::compaction::test_control::barrier(
+                    self.control.clock.as_ref(),
+                    &self.bind.session,
+                    "CeilingWaitRecorded",
+                )
+                .await?;
+                if unavailable.is_none() && self.now() < deadline_ms {
+                    let remaining = deadline_ms.saturating_sub(self.now());
+                    let request = view::ceiling_ride(session_ref, remaining, None);
+                    let answer = tokio::select! {
+                        answer = async {
+                            match self.plane {
+                                Some(plane) => plane.ride(self.provider, self.bind, request).await.ok(),
+                                None => None,
+                            }
+                        } => answer,
+                        _ = clock_deadline(self.control.clock.as_ref(), deadline_ms) => None,
+                        _ = cancelled(self.control) => return Ok(None),
+                    };
+                    // A response and the timer can become ready together. The absolute bound
+                    // still wins even when select polls the response first.
+                    let answer = answer.filter(|_| self.now() < deadline_ms);
+                    unavailable = Some(answer.is_none());
+                    if let Some(RideAnswer::View { view }) = answer {
+                        let ready = ViewReady::for_view(&view);
+                        self.offer(
+                            views,
+                            state,
+                            &view,
+                            &ready,
+                            lineage_id,
+                            &opts.prompt,
+                            stored,
+                            provider.reasoning_is_prefix_bound(),
+                            &mut events,
+                        )
+                        .await?;
+                    }
+                    self.commit(
+                        state,
+                        WalRecord::ContextCeilingWait {
+                            step_id,
+                            deadline_ms,
+                            unavailable,
+                        },
+                    )
+                    .await?;
+                }
+                loop {
+                    let size = estimate(state)?;
+                    if !policy.reached(size, window) || self.now() >= deadline_ms || size > window {
+                        break view::after_wait(
+                            &policy,
+                            size,
+                            window,
+                            false,
+                            if unavailable == Some(true) {
+                                WaitEnd::ProviderUnavailable
+                            } else {
+                                WaitEnd::TimedOut
+                            },
+                        )
+                        .err();
+                    }
+                    if self
+                        .control
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|t| t.is_cancelled())
+                        || self
+                            .control
+                            .stop_requested
+                            .as_ref()
+                            .is_some_and(|t| t.is_cancelled())
+                    {
+                        return Ok(None);
+                    }
+                    if let Some(ready) = self
+                        .control
+                        .compaction_views
+                        .as_deref()
+                        .and_then(|inbox| {
+                            inbox.newest_ready(
+                                session_ref,
+                                lineage_id,
+                                state.applied_view_version(lineage_id),
+                            )
+                        })
+                        .filter(|ready| views.declined != Some(ready.view_version))
+                    {
+                        // The ceiling path bypasses the ordinary boundary backoff, but each
+                        // fetch still shares the original absolute deadline.
+                        let fetched = tokio::select! {
+                            fetched = self.view_get(&ready) => fetched,
+                            _ = clock_deadline(self.control.clock.as_ref(), deadline_ms) => Fetch::Unavailable,
+                            _ = cancelled(self.control) => return Ok(None),
+                        };
+                        if self.now() >= deadline_ms {
+                            continue;
+                        }
+                        match fetched {
+                            Fetch::View(view) => {
+                                self.offer(
+                                    views,
+                                    state,
+                                    &view,
+                                    &ready,
+                                    lineage_id,
+                                    &opts.prompt,
+                                    stored,
+                                    provider.reasoning_is_prefix_bound(),
+                                    &mut events,
+                                )
+                                .await?;
+                            }
+                            Fetch::Refused(_) => views.declined = Some(ready.view_version),
+                            Fetch::Unavailable => {}
+                        }
+                    }
+                    tokio::select! {
+                        _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(50).min(deadline_ms)) => {},
+                        _ = cancelled(self.control) => return Ok(None),
+                    }
+                }
+            }
+        };
+        for event in events {
+            let token = event.token();
+            if !state.unannounced.contains(&token) {
+                state.unannounced.push(token);
+            }
+        }
+        self.commit(
+            state,
+            WalRecord::ContextCeilingDecided {
+                step_id,
+                detail: detail.clone(),
+            },
+        )
+        .await?;
+        #[cfg(feature = "test-clock")]
+        crate::compaction::test_control::barrier(
+            self.control.clock.as_ref(),
+            &self.bind.session,
+            "CeilingDecided",
+        )
+        .await?;
+        Ok(detail)
     }
 
     /// Call Setup once for the session and record its answer before the first model call
@@ -487,6 +715,7 @@ impl Runtime<'_> {
         };
         let fetched = match &views.held {
             Some((held, view)) if *held == ready => view.clone(),
+            _ if self.now() < views.unavailable_until => return Ok(events),
             _ => match Box::pin(self.view_get(&ready)).await {
                 Fetch::View(view) => {
                     views.held = Some((ready.clone(), view.clone()));
@@ -501,7 +730,10 @@ impl Runtime<'_> {
                     views.declined = Some(ready.view_version);
                     return Ok(events);
                 }
-                Fetch::Unavailable => return Ok(events),
+                Fetch::Unavailable => {
+                    views.unavailable_until = self.now().saturating_add(30_000);
+                    return Ok(events);
+                }
             },
         };
         Box::pin(self.offer(

@@ -1149,6 +1149,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     });
     match state.state {
         State::Active => RunStatusResponse::Active {
+            reason: state
+                .ceiling_deadline_ms
+                .map(|_| "context_ceiling_wait".into()),
+            deadline_ms: state.ceiling_deadline_ms,
             usage,
             step: state.live_step,
             title,
@@ -1221,6 +1225,17 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             title,
             structured_output: structured_output.clone(),
         },
+        State::ContextCeiling => RunStatusResponse::ContextCeiling {
+            context_ceiling: state
+                .context_ceiling
+                .expect("ceiling terminal retains its durable detail"),
+            final_step_finish_reason,
+            undelivered_steers,
+            usage,
+            retries_used,
+            title,
+            structured_output: structured_output.clone(),
+        },
         State::Cancelled => RunStatusResponse::Cancelled {
             final_step_finish_reason,
             undelivered_steers,
@@ -1253,6 +1268,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
+    ContextCeiling(broca_protocol::ContextCeilingDetail),
     SessionMoving {
         cut_id: String,
     },
@@ -1433,6 +1449,7 @@ impl std::fmt::Display for ServeError {
             ServeError::BudgetDenied { cap_id, reason } => {
                 write!(f, "budget_denied: cap '{cap_id}' ({reason})")
             }
+            ServeError::ContextCeiling(detail) => write!(f, "context_ceiling: estimated request size {} in window {} ({})", detail.size, detail.window, detail.cause),
             ServeError::Import(s) => write!(f, "import rejected: {s}"),
             ServeError::ImportIdReuse => write!(f, "import_id was reused with different content"),
             ServeError::ImportBusy => write!(f, "session has an active run"),
@@ -2143,6 +2160,7 @@ impl ServeHandler for crate::LineageRegistry {
                 field: "budget.max_input_tokens".into(),
                 message,
             }),
+            SendOutcome::ContextCeiling(detail) => Err(ServeError::ContextCeiling(detail)),
             SendOutcome::StructuredOutputInvalid { field } => Err(ServeError::InvalidParams {
                 message: format!("{field} is not admissible for this send"),
                 field,
@@ -2623,6 +2641,9 @@ impl ServeHandler for crate::LineageRegistry {
             .route_run_state_with_wal(session, run_id.clone())
             .await?;
         let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
+        let mut context_ceiling = state
+            .as_ref()
+            .and_then(|state| state.context_ceiling.clone());
         let mut structured_output = state
             .as_ref()
             .and_then(|state| state.structured_output.clone());
@@ -2644,6 +2665,7 @@ impl ServeHandler for crate::LineageRegistry {
                 None,
             ),
             RunStatusResponse::Cancelled { .. } => ("cancelled".to_owned(), None, None),
+            RunStatusResponse::ContextCeiling { .. } => ("context_ceiling".to_owned(), None, None),
             RunStatusResponse::Error { error, .. } => ("error".to_owned(), None, error),
             RunStatusResponse::TransformUnavailable { .. } => {
                 ("transform_unavailable".to_owned(), None, None)
@@ -2670,6 +2692,9 @@ impl ServeHandler for crate::LineageRegistry {
                     .as_ref()
                     .map(|state| state.run_usage.clone())
                     .unwrap_or_default();
+                context_ceiling = reconciled
+                    .as_ref()
+                    .and_then(|state| state.context_ceiling.clone());
                 structured_output = reconciled.and_then(|state| state.structured_output);
                 state = serde_json::to_value(reason)
                     .ok()
@@ -2691,6 +2716,7 @@ impl ServeHandler for crate::LineageRegistry {
         let response = broca_wire::RunResultResponse {
             usage,
             detail,
+            context_ceiling,
             run_id: run_id.0,
             state,
             reason,
@@ -3105,6 +3131,8 @@ mod paused_auth_tests {
                 let state = broca_core::ReconciledRunState {
                     run_usage: Default::default(),
                     budget_detail: None,
+                    context_ceiling: None,
+                    ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
                     title: None,
@@ -3159,3 +3187,58 @@ mod paused_auth_tests {
 #[cfg(test)]
 #[path = "serve/run_tool_calls_tests.rs"]
 mod run_tool_calls_tests;
+
+#[cfg(test)]
+mod context_ceiling_tests {
+    use super::*;
+    fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
+        broca_core::ReconciledRunState {
+            state,
+            context_ceiling: None,
+            ceiling_deadline_ms: None,
+            budget_detail: None,
+            structured_output: None,
+            live_step: None,
+            undelivered_steers: None,
+            final_step_finish_reason: None,
+            indeterminate_tool_calls: None,
+            usage: None,
+            run_usage: Default::default(),
+            retries_used: 0,
+            error: None,
+            pause_reason: None,
+            auth_selection: None,
+            title: None,
+        }
+    }
+    #[test]
+    fn a_ceiling_wait_status_is_active_with_reason_and_absolute_deadline() {
+        let mut state = reconciled(broca_core::RunIndexState::Active);
+        state.ceiling_deadline_ms = Some(123_456);
+        let wire = serde_json::to_value(run_status_response(Some(state))).unwrap();
+        assert_eq!(wire["state"], "active");
+        assert_eq!(
+            wire["reason"],
+            cortexkit_role_llm_runner::run::RUN_REASON_CONTEXT_CEILING_WAIT
+        );
+        assert_eq!(wire["deadline_ms"], 123_456);
+        assert!(wire.get("pause_reason").is_none());
+    }
+    #[test]
+    fn a_ceiling_terminal_status_carries_detail_without_a_provider_error() {
+        let mut state = reconciled(broca_core::RunIndexState::ContextCeiling);
+        state.context_ceiling = Some(broca_protocol::ContextCeilingDetail::new(
+            100,
+            90,
+            "view_timeout",
+        ));
+        let wire = serde_json::to_value(run_status_response(Some(state))).unwrap();
+        assert_eq!(wire["state"], "context_ceiling");
+        assert_eq!(
+            wire["context_ceiling"],
+            serde_json::json!({"window":100,"size":90,"cause":"view_timeout"})
+        );
+        assert!(wire.get("error").is_none());
+        assert!(wire.get("deadline_ms").is_none());
+    }
+}

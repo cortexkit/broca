@@ -120,6 +120,26 @@ the provider's ceiling policy is gated too. A Setup record without one keeps the
 (`compaction_request`, step `compaction_message`s, `compaction_answer`, `compaction_wait`) are
 still read and folded, so its sessions replay the bytes they rendered.
 
+Ceiling waits and decisions require **`context-ceiling/v1`**. `context_ceiling_wait` records
+the step and absolute `deadline_ms`; its later `unavailable` value records whether the ride
+could reach the provider. Recovery keeps that deadline and does not repeat a completed ride.
+`context_ceiling_decided` records the step's permission to send (`detail: null`) or its terminal
+`{window, size, cause}` refusal, before model I/O. Recovery honors that decision rather than
+starting another wait. `run_finished` with reason `context_ceiling` requires the same gate.
+Waiting is active with reason `context_ceiling_wait`, never an authentication-style pause.
+The wait uses Setup's `wait_ms` (at most 300,000 ms), including the ceiling ride and view fetches.
+After the bound a request still at the ceiling is refused even if inside the window; a request
+over the window is never sent. The terminal carries no provider error or model backoff signal.
+
+Send admission checks the durable estimate plus the incoming native messages without calling
+the provider. An already accepted queued head blocked by the ceiling remains pending; holding
+it writes no record. A durable view's updated notice or an effective window change wakes the
+actor through `LineageRegistry::route_compaction_changed`, which refreshes admission before
+retrying the drain. An active run's ordinary completion already refreshes and retries it.
+Ordinary boundary `view.get` failures have a 30-second in-memory cooldown; ceiling waits bypass
+that cooldown while retaining their original absolute bound. None of these writes or calls
+occur for sessions without a compaction provider.
+
 Runner state is never lost apart from the transcript (compaction-provider/v1 §5.3). Tags, the
 Setup answer, applied views and notices all live in the session's one WAL. The next tag is the
 WAL's highest tag plus one, and retention deletion carries a tag floor to the next lineage. So

@@ -545,7 +545,8 @@ async fn run(args: Args) -> Result<i32, String> {
     let code = match summary.reason {
         RunFinishReason::Completed
         | RunFinishReason::MaxSteps
-        | RunFinishReason::BudgetExhausted => 0,
+        | RunFinishReason::BudgetExhausted
+        | RunFinishReason::ContextCeiling => 0,
         RunFinishReason::Interrupted
         | RunFinishReason::Cancelled
         | RunFinishReason::Error

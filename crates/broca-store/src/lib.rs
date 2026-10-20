@@ -727,6 +727,7 @@ impl SqliteStore {
                 RunFinishReason::Completed => RunIndexState::Completed,
                 RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
                 RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
+                RunFinishReason::ContextCeiling => RunIndexState::ContextCeiling,
                 RunFinishReason::Cancelled => RunIndexState::Cancelled,
                 RunFinishReason::Interrupted => RunIndexState::Interrupted,
                 RunFinishReason::Error => RunIndexState::Error,

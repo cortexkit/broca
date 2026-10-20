@@ -1944,6 +1944,8 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::CompactionAnswer { .. }
             | WalRecord::CompactionWait { .. }
             | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::ContextCeilingWait { .. }
+            | WalRecord::ContextCeilingDecided { .. }
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence: known to this build, but informational only under the
             // same contract, so replay skips it exactly as it skips `Unknown`. The step's retry
@@ -2312,6 +2314,8 @@ impl RunUsageProjection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
+    pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
+    pub ceiling_deadline_ms: Option<u64>,
     /// On an ended run admitted with structured output: what it produced, as `run.result` and
     /// `run.status` report it. Read from the run's durable result record when it completed;
     /// derived as `absent` from its frozen settings when it ended any other way.
@@ -2363,6 +2367,7 @@ pub fn reconcile_run_state<'a>(
     let mut auth_selection = None;
     let mut title: Option<String> = None;
     let mut budget_detail = None;
+    let mut context_ceiling = None;
     // The structured-output settings the target run froze, and the result it recorded.
     let mut frozen_structured_output = None;
     let mut structured_output_result = None;
@@ -2389,6 +2394,7 @@ pub fn reconcile_run_state<'a>(
                 }
                 active_run = Some(rid.0.clone());
                 budget_detail = None;
+                context_ceiling = None;
                 pending_steer_ids.clear();
                 active_zero_step_seed = matches!(origin, broca_wal::RunOrigin::SeededFrom { .. });
                 has_completed_step = false;
@@ -2400,6 +2406,8 @@ pub fn reconcile_run_state<'a>(
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
                         budget_detail: None,
+                        context_ceiling: None,
+                        ceiling_deadline_ms: None,
                         structured_output: None,
                         live_step: None,
                         title: None,
@@ -2414,6 +2422,22 @@ pub fn reconcile_run_state<'a>(
                         pause_reason: None,
                         auth_selection: None,
                     });
+                }
+            }
+            WalRecord::ContextCeilingWait { deadline_ms, .. }
+                if active_run.as_deref() == Some(run_id) =>
+            {
+                if let Some(state) = &mut found {
+                    state.ceiling_deadline_ms = Some(*deadline_ms);
+                }
+            }
+            WalRecord::ContextCeilingDecided { detail, .. }
+                if active_run.as_deref() == Some(run_id) =>
+            {
+                context_ceiling = detail.clone();
+                if let Some(state) = &mut found {
+                    state.ceiling_deadline_ms = None;
+                    state.context_ceiling = detail.clone();
                 }
             }
             WalRecord::InputTokenBudgetExhausted { detail } => budget_detail = Some(detail.clone()),
@@ -2475,6 +2499,7 @@ pub fn reconcile_run_state<'a>(
                         RunFinishReason::Completed => RunIndexState::Completed,
                         RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
                         RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
+                        RunFinishReason::ContextCeiling => RunIndexState::ContextCeiling,
                         RunFinishReason::Cancelled => RunIndexState::Cancelled,
                         RunFinishReason::Interrupted => RunIndexState::Interrupted,
                         RunFinishReason::Error => RunIndexState::Error,
@@ -2497,6 +2522,8 @@ pub fn reconcile_run_state<'a>(
                     });
                     found = Some(ReconciledRunState {
                         budget_detail: budget_detail.clone(),
+                        context_ceiling: context_ceiling.clone(),
+                        ceiling_deadline_ms: None,
                         structured_output,
                         live_step: None,
                         title: None,
@@ -2522,6 +2549,8 @@ pub fn reconcile_run_state<'a>(
             } if rid.0 == run_id => {
                 found = Some(ReconciledRunState {
                     budget_detail: None,
+                    context_ceiling: None,
+                    ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
                     title: None,
@@ -2550,6 +2579,8 @@ pub fn reconcile_run_state<'a>(
             } if failure.run_id.0 == run_id => {
                 found = Some(ReconciledRunState {
                     budget_detail: None,
+                    context_ceiling: None,
+                    ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
                     title: None,
@@ -2571,6 +2602,8 @@ pub fn reconcile_run_state<'a>(
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
             budget_detail: None,
+            context_ceiling: None,
+            ceiling_deadline_ms: None,
             structured_output: None,
             live_step: None,
             state: RunIndexState::Interrupted,

@@ -1067,6 +1067,24 @@ impl LineageRegistry {
         }
     }
 
+    /// Wake a ceiling-held queue after a durable view/notice or model-window change. The
+    /// caller records the new estimate first; the actor then reads it before draining. A
+    /// provider announcement alone is not proof that the session can render a smaller request.
+    pub async fn route_compaction_changed(&self, key: &LineageKey) -> Result<(), OpenError> {
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            if handle
+                .send(crate::actor::LineageCmd::CompactionChanged)
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
     /// Install the admitter for sends carrying a fetch plan. Set once, before serving; only the
     /// first installation takes effect.
     pub fn set_plan_admitter(&self, admitter: Arc<dyn broca_fetch_plan::PlanAdmitter>) {

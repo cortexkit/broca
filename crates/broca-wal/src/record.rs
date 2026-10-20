@@ -552,6 +552,20 @@ pub enum WalRecord {
     InputTokenBudgetExhausted {
         detail: broca_protocol::BudgetExhaustedDetail,
     },
+    /// A step's bounded ceiling wait. Must-understand: `context-ceiling/v1`.
+    ContextCeilingWait {
+        step_id: StepId,
+        deadline_ms: u64,
+        /// Once the ride completes, remember its availability so recovery does not call it
+        /// again or change the eventual refusal's cause.
+        unavailable: Option<bool>,
+    },
+    /// The durable decision of a ceiling check, before any model I/O. `None` permits this
+    /// step to send; a detail seals the run without sending. Must-understand: `context-ceiling/v1`.
+    ContextCeilingDecided {
+        step_id: StepId,
+        detail: Option<broca_protocol::ContextCeilingDetail>,
+    },
     /// Anthropic refused the strict schema's compiled grammar. From this barrier onward,
     /// the run renders non-strict and reports `grammar_too_large`, including after a crash.
     StructuredOutputDowngraded {
@@ -1434,6 +1448,12 @@ impl WalRecord {
             STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
         };
         match self {
+            WalRecord::ContextCeilingWait { .. }
+            | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::RunFinished {
+                reason: RunFinishReason::ContextCeiling,
+                ..
+            } => &[crate::framing::CONTEXT_CEILING_FEATURE],
             WalRecord::StructuredOutputDowngraded { .. } => {
                 &[crate::framing::STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]
             }

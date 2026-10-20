@@ -93,6 +93,7 @@ pub fn classify_control_unit(unit: &ControlUnit) -> ControlClass {
         //   RunPaused→Paused.
         ControlUnit::RunStarted { .. }
         | ControlUnit::StepStarted { .. }
+        | ControlUnit::ContextCeilingWait { .. }
         | ControlUnit::BudgetFired { .. }
         | ControlUnit::AssistantMessage { .. }
         | ControlUnit::ToolCall { .. }
@@ -510,7 +511,21 @@ fn project_control_record<S: ControlProjectionSink>(
         // A record type written by a newer build: informational by the contract on
         // `WalRecord`, so it emits no control unit and leaves the projection state untouched.
         WalRecord::Unknown => {}
-        // This reader release decodes compaction records but does not act on them yet.
+        WalRecord::ContextCeilingWait {
+            deadline_ms,
+            unavailable: None,
+            ..
+        } => {
+            if let Some(run_id) = &state.run_id {
+                push!(ControlUnit::ContextCeilingWait {
+                    run_id: run_id.clone(),
+                    reason: "context_ceiling_wait".into(),
+                    deadline_ms: *deadline_ms,
+                });
+            }
+        }
+        WalRecord::ContextCeilingWait { .. } | WalRecord::ContextCeilingDecided { .. } => {}
+        // Compaction changes model requests but these records emit no control unit.
         WalRecord::CompactionRequest { .. }
         | WalRecord::CompactionMessage { .. }
         | WalRecord::CompactionAnswer { .. }

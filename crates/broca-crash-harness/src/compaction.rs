@@ -147,6 +147,35 @@ const TOOL_SCENARIO: Scenario = Scenario {
     ..SCENARIO
 };
 
+fn ceiling_control() -> RunControl {
+    ceiling_control_with(true)
+}
+fn ceiling_timeout_control() -> RunControl {
+    ceiling_control_with(false)
+}
+fn ceiling_control_with(view: bool) -> RunControl {
+    let mut control = control();
+    control.admitted_context_limit = Some(20_000);
+    with_compaction(
+        control,
+        Arc::new(ScriptedCompaction {
+            ceiling: Some(view),
+            ..Default::default()
+        }),
+    )
+}
+const CEILING_SCENARIO: Scenario = Scenario {
+    name: "compaction-ceiling",
+    control: ceiling_control,
+    ..SCENARIO
+};
+const CEILING_TIMEOUT_SCENARIO: Scenario = Scenario {
+    name: "compaction-ceiling-timeout",
+    control: ceiling_timeout_control,
+    expected: RunFinishReason::ContextCeiling,
+    ..SCENARIO
+};
+
 /// A send whose history carries an earlier answer with signed reasoning.
 fn signed_request() -> RunRequest {
     let submission = serde_json::from_value(json!({
@@ -235,9 +264,15 @@ const SIGNED_SCENARIO: Scenario = Scenario {
 };
 
 pub(crate) fn find(name: &str) -> Option<Scenario> {
-    [SCENARIO, TOOL_SCENARIO, SIGNED_SCENARIO]
-        .into_iter()
-        .find(|scenario| scenario.name == name)
+    [
+        SCENARIO,
+        TOOL_SCENARIO,
+        SIGNED_SCENARIO,
+        CEILING_SCENARIO,
+        CEILING_TIMEOUT_SCENARIO,
+    ]
+    .into_iter()
+    .find(|scenario| scenario.name == name)
 }
 
 fn replacement(version: u64, text: &str) -> Value {
@@ -251,6 +286,9 @@ fn replacement(version: u64, text: &str) -> Value {
 /// boundary whose applied view is older (`stale` announces an older one).
 #[derive(Default)]
 struct ScriptedCompaction {
+    /// At the ceiling, return a smaller view or let the bound expire.
+    ceiling: Option<bool>,
+    block_ride: Option<std::path::PathBuf>,
     setups: AtomicUsize,
     /// `view.get` calls answered with a view.
     offered: AtomicUsize,
@@ -293,6 +331,15 @@ impl CompactionPlane for ScriptedCompaction {
         assert_eq!(provider, PROVIDER);
         assert_eq!(request.harness, bind.harness);
         self.setups.fetch_add(1, Ordering::SeqCst);
+        if let Some(view) = self.ceiling {
+            *self.lineage.lock().unwrap() = request.lineage_id.clone();
+            return Ok(serde_json::from_value(
+                json!({"answer":"ready", "request_id":request.request_id,
+                "initial":replacement(1, &"large head ".repeat(800)),
+                "ceiling":{"at_share":0.1,"wait_ms":if view { 300_000 } else { 5 }}}),
+            )
+            .unwrap());
+        }
         Ok(
             serde_json::from_value(json!({"answer":"ready","request_id":request.request_id,
             "initial":replacement(1, "setup head")}))
@@ -316,6 +363,24 @@ impl CompactionPlane for ScriptedCompaction {
                 None => ViewGetAnswer::refuse("unknown_version", "not published"),
             },
         )
+    }
+
+    async fn ride(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: broca_core::compaction_provider::ride::RideRequest,
+    ) -> Result<broca_core::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
+        if let Some(marker) = &self.block_ride {
+            std::fs::write(marker, b"ceiling ride entered").unwrap();
+            return std::future::pending().await;
+        }
+        Ok(match self.ceiling {
+            Some(true) => broca_core::compaction_provider::ride::RideAnswer::view(
+                self.published(&request.session_ref, 2).unwrap(),
+            ),
+            _ => broca_core::compaction_provider::ride::RideAnswer::nothing(),
+        })
     }
 }
 
@@ -375,6 +440,9 @@ impl CompactionViews for ScriptedCompaction {
         // A `view_ready` event names no lineage; the scripted provider learns the run's from
         // its first boundary, as a real provider learns it from the run's notices.
         *self.lineage.lock().unwrap() = Some(lineage_id.into());
+        if self.ceiling.is_some() {
+            return None;
+        }
         let version = if self.signed {
             match after {
                 None | Some(0..=1) => 2,
@@ -715,4 +783,123 @@ async fn signed_reasoning_strip_and_a_second_view_replay_identical_bytes_at_ever
     );
     let methods = suite.finish();
     assert_eq!(methods.get("Sigkill"), Some(&1));
+}
+
+#[tokio::test]
+async fn ceiling_wait_and_terminal_state_survive_every_record_and_torn_frame_cut() {
+    for (scenario, sends_view) in [(CEILING_SCENARIO, true), (CEILING_TIMEOUT_SCENARIO, false)] {
+        let handle = RunnerHandle::new(scenario).await;
+        let records = handle.reference.log.records();
+        assert!(records
+            .iter()
+            .any(|r| matches!(r, WalRecord::ContextCeilingWait { .. })));
+        assert!(records
+            .iter()
+            .any(|r| matches!(r, WalRecord::ContextCeilingDecided { .. })));
+        let mut waited = 0;
+        let mut decided = 0;
+        for point in handle.record_boundaries(true) {
+            let kill = handle.kill_at(point, KillTrigger::Truncate).await;
+            let compaction = Arc::new(ScriptedCompaction {
+                ceiling: Some(sends_view),
+                lineage: Mutex::new(kill.durable.lineage_id().map(|id| id.to_string())),
+                ..Default::default()
+            });
+            let resumed = resume_with(scenario, &kill, compaction).await;
+            handle.check(&kill, &resumed);
+            waited += usize::from(
+                kill.durable
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r, WalRecord::ContextCeilingWait { .. })),
+            );
+            decided += usize::from(
+                kill.durable
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r, WalRecord::ContextCeilingDecided { .. })),
+            );
+            if sends_view {
+                for bytes in resumed.provider.sent().values() {
+                    assert_eq!(
+                        Some(bytes),
+                        handle.reference.sent.get(&0),
+                        "{}",
+                        kill.label()
+                    );
+                }
+            } else {
+                assert_eq!(resumed.provider.request_count(), 0, "{}", kill.label());
+                let after = resumed.log.records();
+                let state =
+                    broca_core::reconcile_run_state(after.iter(), "compaction-run").unwrap();
+                assert_eq!(
+                    state.context_ceiling.as_ref().unwrap().cause,
+                    "view_timeout"
+                );
+                assert!(state.error.is_none());
+            }
+        }
+        assert!(waited > 0 && decided > 0);
+    }
+}
+
+#[tokio::test]
+async fn ceiling_wait_real_kill_resumes_the_same_request_bytes() {
+    const CHILD: &str = "BROCA_CEILING_CHILD_ROOT";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = std::path::PathBuf::from(root);
+        let compaction = Arc::new(ScriptedCompaction {
+            ceiling: Some(true),
+            block_ride: Some(root.join("ceiling-entered")),
+            ..Default::default()
+        });
+        let control = with_compaction(ceiling_control(), compaction);
+        let provider = ScriptedProvider::for_scenario(&CEILING_SCENARIO);
+        let plane = HarnessPlane::for_scenario(&CEILING_SCENARIO);
+        drive(
+            request(),
+            control,
+            &root,
+            &FileWalStore::new(root.join("wal")),
+            &provider,
+            &plane,
+        )
+        .await;
+        panic!("child finished instead of blocking at the ceiling");
+    }
+    let root = broca_test_support::scratch_root()
+        .join(format!("ceiling-real-kill-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    crate::kill_child_test_at_marker(
+        "ceiling wait",
+        "compaction::ceiling_wait_real_kill_resumes_the_same_request_bytes",
+        &[(CHILD, root.as_os_str())],
+        &root.join("ceiling-entered"),
+    );
+    let prefix = LogImage::read(&wal_path(&root, &request().session));
+    assert!(prefix
+        .records()
+        .iter()
+        .any(|r| matches!(r, WalRecord::ContextCeilingWait { .. })));
+    let provider = ScriptedProvider::for_scenario(&CEILING_SCENARIO);
+    let plane = HarnessPlane::for_scenario(&CEILING_SCENARIO);
+    let compaction = Arc::new(ScriptedCompaction {
+        ceiling: Some(true),
+        lineage: Mutex::new(prefix.lineage_id().map(|id| id.to_string())),
+        ..Default::default()
+    });
+    let outcome = drive(
+        request(),
+        with_compaction(ceiling_control(), compaction),
+        &root,
+        &FileWalStore::new(root.join("wal")),
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(outcome.reason, RunFinishReason::Completed);
+    let reference = RunnerHandle::new(CEILING_SCENARIO).await;
+    assert_eq!(provider.sent(), reference.reference.sent);
+    std::fs::remove_dir_all(root).unwrap();
 }

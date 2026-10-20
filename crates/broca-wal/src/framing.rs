@@ -166,6 +166,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
     COMPACTION_FEATURE,
+    CONTEXT_CEILING_FEATURE,
     DEFERRED_CALL_FEATURE,
     DELIVERY_ORDER_FEATURE,
     DISPATCH_MODULE_FEATURE,
@@ -207,6 +208,10 @@ pub const COMPACTION_WAIT_FEATURE: &str = "compaction-wait/v1";
 /// without the applied view, reuse a notice sequence number, or forget the ceiling, so all
 /// three are must-understand.
 pub const COMPACTION_VIEW_FEATURE: &str = "compaction-view/v1";
+
+/// Bounded ceiling waits and send decisions, including a non-error terminal state. Ignoring
+/// them could repeat a wait after a crash or send a request the runner durably refused.
+pub const CONTEXT_CEILING_FEATURE: &str = "context-ceiling/v1";
 
 /// Not a WAL frame feature: no frame ever requires it, so its entry here is inert for the
 /// decoder. It is listed because this table is also what `--wal-known-features` reports to
@@ -907,6 +912,7 @@ mod tests {
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
                 COMPACTION_FEATURE,
+                CONTEXT_CEILING_FEATURE,
                 DEFERRED_CALL_FEATURE,
                 DELIVERY_ORDER_FEATURE,
                 DISPATCH_MODULE_FEATURE,

@@ -31,6 +31,12 @@ pub enum ControlUnit {
     StepStarted {
         step_id: StepId,
     },
+    /// The run remains active while a compaction view can still arrive before this deadline.
+    ContextCeilingWait {
+        run_id: RunId,
+        reason: String,
+        deadline_ms: u64,
+    },
     /// A caller-supplied budget message was durably injected into the prompt.
     BudgetFired {
         run_id: RunId,
@@ -182,6 +188,8 @@ pub enum RunFinishReason {
     MaxSteps,
     /// The session's hard input-token cap was reached, or input usage was unreported.
     BudgetExhausted,
+    /// The runner declined the next request before sending it, without a provider failure.
+    ContextCeiling,
     /// A caller asked for this run to stop, via `run.cancel`. Distinct from `Interrupted`
     /// so the durable record separates "someone decided" from "something died" -- a
     /// distinction an audit surface cannot recover after the fact.
