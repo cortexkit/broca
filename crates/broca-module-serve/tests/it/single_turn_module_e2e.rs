@@ -1478,8 +1478,7 @@ async fn run_client(
     run_client_with_probe(daemon, project_root, session, args, None).await
 }
 
-/// Observe admission/finish markers as they arrive, rather than inferring concurrency
-/// from how quickly client processes exit. All clients share the same deadline evidence.
+/// Run one `broca-session` command and return its raw stdout and stderr, for byte comparisons.
 async fn run_client_output(
     daemon: &Daemon,
     project_root: &Path,
@@ -1502,6 +1501,8 @@ async fn run_client_output(
         .expect("run broca-session")
 }
 
+/// Observe admission/finish markers as they arrive, rather than inferring concurrency
+/// from how quickly client processes exit. All clients share the same deadline evidence.
 async fn run_client_with_probe(
     daemon: &Daemon,
     project_root: &Path,
