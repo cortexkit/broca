@@ -117,15 +117,16 @@ class RetentionReaders(unittest.TestCase):
         residue = self.root / "wal-ephemeral" / "ignored.expired"
         residue.mkdir()
         (residue / "ignored.wal").write_bytes(b"unreadable tombstone-directory residue")
-        with sqlite3.connect(self.root / "run-index.db") as db:
-            db.execute("CREATE TABLE meta (session TEXT PRIMARY KEY, prefix_len INTEGER)")
-            db.execute("CREATE TABLE message (session TEXT, body TEXT)")
-            db.execute("CREATE TABLE run_index (run_id TEXT PRIMARY KEY, session TEXT)")
-            for label, session in self.sessions.items():
-                key = "\x1f".join(session[k] for k in ("project_root", "harness", "session"))
-                db.execute("INSERT INTO run_index VALUES (?, ?)", (label, json.dumps(session, separators=(",", ":"))))
-                db.execute("INSERT INTO meta VALUES (?, 1)", (key,))
-                db.execute("INSERT INTO message VALUES (?, ?)", (key, label))
+        with contextlib.closing(sqlite3.connect(self.root / "run-index.db")) as db:
+            with db:
+                db.execute("CREATE TABLE meta (session TEXT PRIMARY KEY, prefix_len INTEGER)")
+                db.execute("CREATE TABLE message (session TEXT, body TEXT)")
+                db.execute("CREATE TABLE run_index (run_id TEXT PRIMARY KEY, session TEXT)")
+                for label, session in self.sessions.items():
+                    key = "\x1f".join(session[k] for k in ("project_root", "harness", "session"))
+                    db.execute("INSERT INTO run_index VALUES (?, ?)", (label, json.dumps(session, separators=(",", ":"))))
+                    db.execute("INSERT INTO meta VALUES (?, 1)", (key,))
+                    db.execute("INSERT INTO message VALUES (?, ?)", (key, label))
 
     def run_reader(self, script: str, *args: str):
         return subprocess.run([sys.executable, str(SCRIPTS / script), "--state-root", str(self.root), *args],
@@ -257,9 +258,10 @@ class RetentionReaders(unittest.TestCase):
             self.assertEqual(target.read_bytes(), self.contents[label])
             self.assertFalse(self.paths[label].exists())
         self.assertEqual(self.paths["expired"].read_bytes(), self.contents["expired"])
-        with sqlite3.connect(self.root / "run-index.db") as db:
-            actual = json.loads(db.execute("SELECT session FROM run_index WHERE run_id='expired'").fetchone()[0])
-            self.assertEqual(actual, self.sessions["expired"])
+        with contextlib.closing(sqlite3.connect(self.root / "run-index.db")) as db:
+            with db:
+                actual = json.loads(db.execute("SELECT session FROM run_index WHERE run_id='expired'").fetchone()[0])
+                self.assertEqual(actual, self.sessions["expired"])
 
     def test_legacy_upgrade_repeated_ids_and_conflicts(self):
         path = self.root / "wal" / "legacy.wal"
