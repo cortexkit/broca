@@ -1260,6 +1260,19 @@ impl WalRecord {
         } else {
             base
         };
+        let codex_wire = match self {
+            Self::RunStarted { config, .. } => config.frozen_render_config.get("chatgpt_wire"),
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen_render_config.get("chatgpt_wire"),
+            _ => None,
+        };
+        let base = if codex_wire.is_some_and(|value| !value.is_null()) {
+            with_feature(base, crate::framing::CHATGPT_CODEX_WIRE_FEATURE)
+        } else {
+            base
+        };
         let base = if self.carries_provider_text_state() {
             with_feature(base, crate::framing::PROVIDER_TEXT_STATE_FEATURE)
         } else {

@@ -215,6 +215,9 @@ pub struct FrozenRenderConfig {
     /// the episode starts. Old frozen blobs lack this field and keep request-level effort.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chatgpt_effort_updates: bool,
+    /// Released Codex policy and identity. Absence retains legacy request bytes on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_wire: Option<crate::chatgpt_wire::ChatgptWire>,
     /// Preserve and echo Responses message phases and Gemini text-part thought signatures.
     /// Older frozen configs omit this flag and continue discarding those fields on resume.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

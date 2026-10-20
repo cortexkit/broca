@@ -9,6 +9,72 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "chatgpt-wire-admission"
+guards = "Fresh ChatGPT episodes opt into the frozen profile"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = "fresh().map(Some)"
+new = "fresh().map(|_| None) // NON-VACUITY BREAK: omit fresh profile."
+
+[[control]]
+id = "chatgpt-wire-restore"
+guards = "Resume restores recorded presence or absence without host discovery"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = "if let Some(config) = recorded_config {"
+new = "if let Some(config) = recorded_config.filter(|_| false) { // NON-VACUITY BREAK: discard recording."
+
+[[control]]
+id = "chatgpt-wire-catalog-freeze"
+guards = "Provider construction retains the admitted ChatGPT profile"
+runner = "cargo"
+select = "expected"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/live.rs"
+expect_red = ["live::responses_tool_admission_tests::chatgpt_wire_is_frozen_without_inventing_legacy_defaults"]
+file = "crates/broca-catalog/src/live.rs"
+old = "config.chatgpt_wire = self.chatgpt_wire.cloned();"
+new = "config.chatgpt_wire = None; // NON-VACUITY BREAK: lose frozen profile."
+
+[[control]]
+id = "chatgpt-wire-run-start-gate"
+guards = "RunStarted with a ChatGPT profile refuses older readers"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::chatgpt_wire_run_started_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = 'Self::RunStarted { config, .. } => config.frozen_render_config.get("chatgpt_wire"),'
+new = 'Self::RunStarted { .. } => None, // NON-VACUITY BREAK: omit run-start gate.'
+
+[[control]]
+id = "chatgpt-wire-refreeze-gate"
+guards = "RunConfigRefrozen with a ChatGPT profile refuses older readers"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::chatgpt_wire_refrozen_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = '} => frozen_render_config.get("chatgpt_wire"),'
+new = '} => None, // NON-VACUITY BREAK: omit refreeze gate.'
+
+[[control]]
 id = "module-status-wakes-durable-queued-work"
 guards = "A status poll wakes durable queued work left behind a terminal instead of stranding FIFO after a crash"
 runner = "cargo"

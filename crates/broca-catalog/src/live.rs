@@ -628,6 +628,8 @@ pub struct EpisodeRenderConfig<'a> {
     /// Restore the recorded Codex effort-update choice on resume. `None` enables input
     /// configuration updates for a newly admitted episode; `Some(false)` keeps old bytes.
     pub chatgpt_effort_updates: Option<bool>,
+    /// Admission's profile, or its exact recorded presence or absence on resume.
+    pub chatgpt_wire: Option<&'a broca_provider::chatgpt_wire::ChatgptWire>,
     /// Restore the recorded `reasoning_content_required` choice on resume (OpenAI-Chat only).
     /// `None`, a newly admitted episode, leaves this legacy flag off and uses the echo policy.
     /// A DeepSeek episode admitted before DeepSeek was opted in recorded no field,
@@ -727,6 +729,7 @@ impl EpisodeRenderConfig<'_> {
         }
         if config.family_id == WireFamilyId::OpenAiResponsesChatgpt {
             config.chatgpt_effort_updates = self.chatgpt_effort_updates.unwrap_or(true);
+            config.chatgpt_wire = self.chatgpt_wire.cloned();
         }
         if let (Some(recorded), WireFamilyId::OpenAiChat) =
             (self.reasoning_content_required, config.family_id)
@@ -933,6 +936,7 @@ fn resolve_provider_inner(
         thinking_cross_model: episode_render.thinking_cross_model,
         responses_tools_non_strict: episode_render.responses_tools_non_strict,
         chatgpt_effort_updates: episode_render.chatgpt_effort_updates,
+        chatgpt_wire: episode_render.chatgpt_wire,
         reasoning_content_required: episode_render.reasoning_content_required,
         reasoning_echo: episode_render.reasoning_echo,
         provider_text_state: episode_render.provider_text_state,
@@ -3229,5 +3233,35 @@ mod responses_tool_admission_tests {
             }
             assert_eq!(bytes, before);
         }
+    }
+
+    #[test]
+    fn chatgpt_wire_is_frozen_without_inventing_legacy_defaults() {
+        let wire = serde_json::from_str(include_str!(
+            "../../broca-provider/tests/fixtures/chatgpt_codex_0_163_identity.json"
+        ))
+        .unwrap();
+        let config = openai_responses_chatgpt_frozen_config("gpt-5.3-codex");
+        let admitted = EpisodeRenderConfig {
+            chatgpt_wire: Some(&wire),
+            ..Default::default()
+        }
+        .apply(config.clone());
+        assert_eq!(admitted.chatgpt_wire.as_ref(), Some(&wire));
+        let blob = serde_json::to_value(&admitted).unwrap();
+        let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
+        let resumed = EpisodeRenderConfig {
+            chatgpt_wire: recorded.chatgpt_wire.as_ref(),
+            ..Default::default()
+        }
+        .apply(config.clone());
+        assert_eq!(serde_json::to_value(&resumed).unwrap(), blob);
+        assert_eq!(render(&resumed), render(&admitted));
+        let legacy = EpisodeRenderConfig::default().apply(config);
+        assert!(legacy.chatgpt_wire.is_none());
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("chatgpt_wire")
+            .is_none());
     }
 }

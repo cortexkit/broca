@@ -25,6 +25,7 @@ path = "src/bin/memory-load-server.rs"
 required-features = ["heap-profile"]
 
 [dependencies]
+os_info = "=3.14.0"
 broca-heap-profile = { path = "../broca-heap-profile", optional = true }
 broca-owner-only.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }

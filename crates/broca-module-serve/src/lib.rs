@@ -23,6 +23,7 @@ pub mod cache_dump;
 pub mod cache_routing;
 pub mod cache_warm;
 pub mod catalog_refresh;
+pub mod chatgpt_identity;
 pub mod claude_code_identity;
 pub mod client;
 pub mod codeassist_identity;

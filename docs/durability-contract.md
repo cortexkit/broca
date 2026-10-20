@@ -99,6 +99,13 @@ addition does not change a renderer version. Older binaries ignore an unknown `r
 field in typed config decoding, but actual resumes refuse on recorded/current config drift
 rather than silently sending a request without the echo.
 
+New ChatGPT admissions freeze a `chatgpt_wire` profile with admitting-host User-Agent,
+originator and sourced conversation/installation/window/turn identity. Run starts and auth
+refreezes carrying it require **`chatgpt-codex-wire/v1`**; the WAL writer publishes the feature
+floor before appending either frame. Older readers refuse rather than silently dropping the
+recorded policy. Resume restores recorded presence or absence, without discovering new host
+values. Missing profiles retain legacy bytes; the renderer version does not change.
+
 Asynchronous compaction (compaction-provider/v1 0.3) requires **`compaction-view/v1`** for three
 things. `compaction_view_applied` records a provider view at the step boundary before the step
 that first renders it, with how it was applied: as published, or with the companion strip of

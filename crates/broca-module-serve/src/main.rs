@@ -3759,6 +3759,44 @@ mod executor {
                 // send. A resume re-applies the decision frozen in the episode (below).
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
             };
+            let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
+                family_override,
+                prior_run
+                    .as_ref()
+                    .filter(|_| !fresh_episode)
+                    .map(|prior| &prior.config.frozen_render_config),
+                || {
+                    let seed = match &self.claude_code_install_id {
+                        Some(seed) => seed.clone(),
+                        None => {
+                            broca_module_serve::claude_code_identity::load_or_create_install_id(
+                                self.wal_store
+                                    .root()
+                                    .parent()
+                                    .unwrap_or(self.wal_store.root()),
+                            )
+                            .map_err(|error| {
+                                format!("ChatGPT installation identity unavailable: {error}")
+                            })?
+                        }
+                    };
+                    broca_module_serve::chatgpt_identity::fresh(
+                        &seed,
+                        &job.req.session,
+                        &job.req.run_id.0,
+                        epoch_millis().max(0) as u64,
+                    )
+                },
+            );
+            let chatgpt_wire = match chatgpt_wire {
+                Ok(wire) => wire,
+                Err(error) => {
+                    if let Some(ack) = job.on_admitted {
+                        let _ = ack.send(Err(RunError::Config(error.clone())));
+                    }
+                    return Err(RunError::Config(error));
+                }
+            };
             let restored_structured_output = prior_run
                 .as_ref()
                 .filter(|_| !fresh_episode)
@@ -3790,6 +3828,7 @@ mod executor {
                 self.provider_client.clone(),
                 broca_catalog::live::EpisodeRenderConfig {
                     codeassist_identity: codeassist_identity.as_ref(),
+                    chatgpt_wire: chatgpt_wire.as_ref(),
                     // Only the host and the output cap are restored. Re-resolve other catalog
                     // fields so core's frozen_render_config_drift guard remains a real
                     // comparison on resume. Changing the operator override must not move an
