@@ -31,6 +31,7 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.resolve",
     "session.head",
     "run.result",
+    "run.tool_calls",
     "session.baseline",
     "session.warm",
     "cap.install",

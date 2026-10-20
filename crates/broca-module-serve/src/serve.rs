@@ -59,8 +59,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_CAP_INSTALL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT,
-    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_SEND, OP_SPEND_DELTA, OP_STATUS,
-    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SPEND_DELTA,
+    OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, CapInstallParams, CapMutationResult, FromWireExt, ImportParams, ImportResult,
@@ -1951,7 +1951,7 @@ where
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2886,6 +2886,43 @@ where
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
         }
+        OP_RUN_TOOL_CALLS => {
+            let request: cortexkit_role_llm_runner::tool_calls::ToolCallsRequest =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let field = broca_wire::failing_field::<
+                            cortexkit_role_llm_runner::tool_calls::ToolCallsRequest,
+                        >(&req.params, &error);
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            field,
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
+                };
+            if let Err(field) = request.check() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    "run.tool_calls.limit must be greater than zero",
+                )
+                .await;
+            }
+            match handler.run_tool_calls(&session, request).await {
+                Ok(page) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         OP_BASELINE => {
             if let Err((field, message)) = decode_params::<broca_wire::BaselineParams>(&req.params)
             {
@@ -3794,6 +3831,7 @@ fn method_code(method: &str) -> u8 {
         OP_RUN_RESULT => 16,
         OP_WARM => 17,
         OP_RESOLVE => 18,
+        OP_RUN_TOOL_CALLS => 19,
         _ => 255,
     }
 }

@@ -11981,6 +11981,22 @@ old = '"method":"consent.request"'
 new = '"method":"consent.request NON-VACUITY BREAK"'
 
 [[control]]
+id = "run-tool-calls-do-not-return-result-content"
+guards = "run.tool_calls reports stored result size without returning stored result content"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::run_tool_calls_reply_never_contains_stored_tool_result_content"]
+file = "crates/broca-module/src/serve.rs"
+old = '''                    call.call.result_bytes = Some(
+                        serde_json::to_vec(result.as_ref())'''
+new = '''                    call.call.args.as_object_mut().expect("tool arguments are an object")
+                        .insert("stored_result".into(), serde_json::to_value(&result.output).unwrap()); // NON-VACUITY BREAK
+                    call.call.result_bytes = Some(
+                        serde_json::to_vec(result.as_ref())'''
+
+[[control]]
 id = "session-read-reply-body-budget"
 guards = "tail and range transcript replies include their envelope within the 3 MiB budget"
 runner = "cargo"

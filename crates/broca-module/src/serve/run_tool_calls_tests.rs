@@ -1,0 +1,476 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use broca_core::{FileWalStore, WalStore};
+use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall, ToolOutput, ToolResult};
+use broca_protocol::{
+    BatchId, BindIdentity, MessageId, RunFinishReason, StepId, ToolCallId, Usage,
+};
+use broca_wal::record::DispatchOutcome;
+use broca_wal::{Wal, WalRecord};
+use cortexkit_role_llm_runner::tool_calls::{outcomes, ToolCallsPage, ToolCallsRequest};
+use serde_json::{json, Value};
+
+use super::{LineageKey, ServeError, ServeHandler};
+
+struct NeverOpen;
+
+#[async_trait]
+impl crate::registry::LineageOpener for NeverOpen {
+    async fn open(
+        &self,
+        _key: &LineageKey,
+        _gen: u64,
+        _registry: crate::registry::RegistryHandle,
+    ) -> Result<crate::registry::ActorHandle, crate::registry::OpenError> {
+        panic!("run.tool_calls must not open a session actor")
+    }
+}
+
+struct ClosedSession {
+    _root: std::path::PathBuf,
+    registry: crate::LineageRegistry,
+    key: LineageKey,
+    wal: Option<Box<dyn Wal + Send>>,
+}
+
+impl ClosedSession {
+    fn new(name: &str) -> Self {
+        let root = broca_test_support::scratch_root()
+            .join(format!("run-tool-calls-{name}-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let key = BindIdentity::new(project, "runner", name);
+        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut wal = wal_store.open(&key).unwrap();
+        let started: WalRecord = serde_json::from_value(json!({
+            "type": "run_started",
+            "run_id": "run-1",
+            "session": key.clone(),
+            "config": {
+                "model": {"provider_module_id": "provider", "model_id": "model"},
+                "tools": [],
+                "tool_choice": {"type": "auto"},
+                "generation": {},
+                "response_format": {"type": "text"},
+                "context_epoch": 0,
+                "renderer_version": 1
+            },
+            "input": [],
+            "origin": {"kind": "fresh"}
+        }))
+        .unwrap();
+        wal.append(1, &started, true).unwrap();
+        let registry =
+            crate::LineageRegistry::new_with_reader(Arc::new(NeverOpen), wal_store, None);
+        Self {
+            _root: root,
+            registry,
+            key,
+            wal: Some(wal),
+        }
+    }
+
+    fn append(&mut self, record: WalRecord) {
+        self.wal
+            .as_mut()
+            .expect("writer is open")
+            .append(1, &record, true)
+            .unwrap();
+    }
+
+    fn close_writer(&mut self) {
+        drop(self.wal.take());
+    }
+
+    fn write_tool_turn(&mut self, calls: &[(String, Value)], results: Option<&[String]>) {
+        let step_id = StepId(1);
+        let batch_id = BatchId("batch-1".into());
+        let tool_calls: Vec<_> = calls
+            .iter()
+            .map(|(id, args)| ToolCall {
+                tool_call_id: ToolCallId(id.clone()),
+                tool_name: "write_file".into(),
+                input: args.clone(),
+                thought_signature: None,
+            })
+            .collect();
+        self.append(WalRecord::ModelStepFinished {
+            step_id,
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("assistant-1".into()),
+                content: tool_calls
+                    .iter()
+                    .cloned()
+                    .map(ContentBlock::ToolCall)
+                    .collect(),
+            }),
+            usage: Usage::default(),
+            finish_reason: Some(broca_protocol::content::FinishReason::ToolCalls),
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+            hooks: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id,
+            planned_calls: calls.iter().map(|(id, _)| ToolCallId(id.clone())).collect(),
+        });
+        for (index, (id, args)) in calls.iter().enumerate() {
+            let tool_call_id = ToolCallId(id.clone());
+            self.append(WalRecord::ToolDispatchIntent {
+                batch_id: batch_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: Some("write_file".into()),
+                args: Arc::new(args.clone()),
+                module_id: Some("test-tools".into()),
+                schema_pin: None,
+                hooks: None,
+                approval_digest: None,
+                call_key: None,
+            });
+            if let Some(results) = results {
+                self.append(WalRecord::ToolResult {
+                    batch_id: batch_id.clone(),
+                    result: Arc::new(ToolResult {
+                        tool_call_id,
+                        output: ToolOutput::Text {
+                            text: results[index].clone(),
+                        },
+                        is_error: false,
+                    }),
+                    outcome: DispatchOutcome::Completed,
+                    hooks: None,
+                    reason: None,
+                    withdraw_elicitation: None,
+                    provider_held: None,
+                    tags: None,
+                });
+            }
+        }
+        if results.is_some() {
+            self.append(WalRecord::ToolBatchFinished { batch_id });
+        }
+    }
+
+    fn write_duplicate_id_tool_turn(&mut self) {
+        let call_id = ToolCallId("duplicate-id".into());
+        let calls = [
+            ToolCall {
+                tool_call_id: call_id.clone(),
+                tool_name: "write_file".into(),
+                input: json!({"path":"first"}),
+                thought_signature: None,
+            },
+            ToolCall {
+                tool_call_id: call_id.clone(),
+                tool_name: "write_file".into(),
+                input: json!({"path":"duplicate"}),
+                thought_signature: None,
+            },
+        ];
+        let step_id = StepId(1);
+        let batch_id = BatchId("batch-duplicate-id".into());
+        self.append(WalRecord::ModelStepFinished {
+            step_id,
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("assistant-duplicate-id".into()),
+                content: calls.iter().cloned().map(ContentBlock::ToolCall).collect(),
+            }),
+            usage: Usage::default(),
+            finish_reason: Some(broca_protocol::content::FinishReason::ToolCalls),
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+            hooks: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id,
+            planned_calls: vec![call_id.clone(), call_id.clone()],
+        });
+        self.append(WalRecord::ToolDispatchIntent {
+            batch_id: batch_id.clone(),
+            tool_call_id: call_id.clone(),
+            tool_name: Some("write_file".into()),
+            args: Arc::new(calls[0].input.clone()),
+            module_id: Some("test-tools".into()),
+            schema_pin: None,
+            hooks: None,
+            approval_digest: None,
+            call_key: None,
+        });
+        self.append(WalRecord::ToolResult {
+            batch_id: batch_id.clone(),
+            result: Arc::new(ToolResult {
+                tool_call_id: call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "first call ran".into(),
+                },
+                is_error: false,
+            }),
+            outcome: DispatchOutcome::Completed,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolResult {
+            batch_id: batch_id.clone(),
+            result: Arc::new(ToolResult {
+                tool_call_id: call_id,
+                output: ToolOutput::Error {
+                    message: "duplicate tool_call_id from provider".into(),
+                },
+                is_error: true,
+            }),
+            outcome: DispatchOutcome::Completed,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolBatchFinished { batch_id });
+    }
+
+    fn finish(&mut self) {
+        self.append(WalRecord::RunFinished {
+            reason: RunFinishReason::Completed,
+            ts_ms: None,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        });
+    }
+
+    async fn page(&self, request: ToolCallsRequest) -> ToolCallsPage {
+        ServeHandler::run_tool_calls(&self.registry, &self.key, request)
+            .await
+            .unwrap_or_else(|error| panic!("run.tool_calls: {error}"))
+    }
+}
+
+fn call(id: &str, args: Value) -> (String, Value) {
+    (id.to_owned(), args)
+}
+
+#[tokio::test]
+async fn run_tool_calls_pages_by_count_and_reads_a_closed_session_from_wal_only() {
+    let mut session = ClosedSession::new("count");
+    session.write_tool_turn(
+        &[
+            call("call-1", json!({"path":"a"})),
+            call("call-2", json!({"path":"b"})),
+            call("call-3", json!({"path":"c"})),
+        ],
+        Some(&["one".into(), "two".into(), "three".into()]),
+    );
+    session.finish();
+    session.close_writer();
+
+    let first = session
+        .page(ToolCallsRequest::new("run-1").with_limit(1))
+        .await;
+    assert_eq!(first.calls.len(), 1);
+    assert_eq!(first.calls[0].tool_call_id, "call-1");
+    assert!(first.next.is_some());
+
+    let second = session
+        .page(
+            ToolCallsRequest::new("run-1")
+                .with_limit(1)
+                .with_after(first.next.unwrap()),
+        )
+        .await;
+    assert_eq!(second.calls[0].tool_call_id, "call-2");
+    assert!(second.next.is_some());
+
+    let third = session
+        .page(
+            ToolCallsRequest::new("run-1")
+                .with_limit(1)
+                .with_after(second.next.unwrap()),
+        )
+        .await;
+    assert_eq!(third.calls[0].tool_call_id, "call-3");
+    assert!(third.next.is_none());
+    assert_eq!(first.calls[0].outcome, outcomes::SUCCEEDED);
+    assert!(first.calls[0].result_bytes.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn run_tool_calls_lists_duplicate_id_with_its_synthetic_error_result() {
+    let mut session = ClosedSession::new("duplicate-id");
+    session.write_duplicate_id_tool_turn();
+    session.finish();
+    session.close_writer();
+
+    let page = session.page(ToolCallsRequest::new("run-1")).await;
+    assert_eq!(page.calls.len(), 2);
+    assert_eq!(page.calls[0].tool_call_id, "duplicate-id");
+    assert_eq!(page.calls[0].args, json!({"path":"first"}));
+    assert_eq!(page.calls[0].outcome, outcomes::SUCCEEDED);
+    assert!(page.calls[0].call_key.is_some());
+    assert_eq!(page.calls[0].dispatched_to.as_deref(), Some("test-tools"));
+
+    let duplicate = &page.calls[1];
+    assert_eq!(duplicate.tool_call_id, "duplicate-id");
+    assert_eq!(duplicate.args, json!({"path":"duplicate"}));
+    assert_eq!(duplicate.outcome, outcomes::REFUSED);
+    assert!(duplicate.call_key.is_none());
+    assert!(duplicate.dispatched_to.is_none());
+    assert!(duplicate.result_bytes.is_some_and(|bytes| bytes > 0));
+}
+
+#[tokio::test]
+async fn run_tool_calls_pages_by_bytes() {
+    let mut session = ClosedSession::new("bytes");
+    let large = "a".repeat(1_700_000);
+    session.write_tool_turn(
+        &[
+            call("call-1", json!({"content":large})),
+            call("call-2", json!({"content":large})),
+        ],
+        Some(&["ok".into(), "ok".into()]),
+    );
+    session.finish();
+    session.close_writer();
+
+    let first = session.page(ToolCallsRequest::new("run-1")).await;
+    assert_eq!(first.calls.len(), 1, "the byte cap must stop before call 2");
+    assert_eq!(first.calls[0].tool_call_id, "call-1");
+    assert_eq!(
+        first.calls[0].args["content"].as_str().unwrap().len(),
+        1_700_000
+    );
+    let second = session
+        .page(ToolCallsRequest::new("run-1").with_after(first.next.unwrap()))
+        .await;
+    assert_eq!(second.calls.len(), 1);
+    assert_eq!(second.calls[0].tool_call_id, "call-2");
+}
+
+#[tokio::test]
+async fn run_tool_calls_serves_one_oversized_page_item_without_truncating_arguments() {
+    let mut session = ClosedSession::new("oversized");
+    let content = "b".repeat(3_200_000);
+    session.write_tool_turn(&[call("large-call", json!({"content":content}))], None);
+    session.close_writer();
+
+    let page = session.page(ToolCallsRequest::new("run-1")).await;
+    assert_eq!(page.calls.len(), 1);
+    assert_eq!(page.calls[0].outcome, outcomes::INDETERMINATE);
+    assert_eq!(
+        page.calls[0].args["content"].as_str().unwrap().len(),
+        3_200_000
+    );
+    assert!(page.calls[0].result_bytes.is_none());
+    assert!(page.next.is_none());
+}
+
+#[tokio::test]
+async fn run_tool_calls_refuses_a_cursor_that_was_modified_after_issue() {
+    let mut session = ClosedSession::new("modified-cursor");
+    session.write_tool_turn(
+        &[
+            call("call-1", json!({"path":"a"})),
+            call("call-2", json!({"path":"b"})),
+        ],
+        Some(&["one".into(), "two".into()]),
+    );
+    session.finish();
+    session.close_writer();
+
+    let first = session
+        .page(ToolCallsRequest::new("run-1").with_limit(1))
+        .await;
+    let mut cursor: Value = serde_json::from_str(first.next.as_deref().unwrap()).unwrap();
+    cursor["ordinal"] = json!(cursor["ordinal"].as_u64().unwrap() + 1);
+    let error = ServeHandler::run_tool_calls(
+        &session.registry,
+        &session.key,
+        ToolCallsRequest::new("run-1").with_after(serde_json::to_string(&cursor).unwrap()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, ServeError::InvalidParams { ref field, .. } if field == "after"),
+        "modified cursor should be refused by its request field, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_tool_calls_reports_intent_without_result_as_indeterminate() {
+    let mut session = ClosedSession::new("indeterminate");
+    session.write_tool_turn(&[call("held-call", json!({"path":"large.txt"}))], None);
+    session.close_writer();
+
+    let page = session.page(ToolCallsRequest::new("run-1")).await;
+    assert_eq!(page.calls.len(), 1);
+    assert_eq!(page.calls[0].outcome, outcomes::INDETERMINATE);
+    assert!(page.calls[0].result_bytes.is_none());
+}
+
+#[tokio::test]
+async fn run_tool_calls_returns_empty_for_a_run_without_tool_calls() {
+    let mut session = ClosedSession::new("empty");
+    session.append(WalRecord::ModelStepFinished {
+        step_id: StepId(1),
+        assistant_message: Arc::new(AssistantMessage {
+            message_id: MessageId("assistant-1".into()),
+            content: vec![ContentBlock::Text {
+                text: "finished without tools".into(),
+            }],
+        }),
+        usage: Usage::default(),
+        finish_reason: Some(broca_protocol::content::FinishReason::Stop),
+        retries_used: 0,
+        service_tier_used: None,
+        speed_used: None,
+        hooks: None,
+        tags: None,
+    });
+    session.finish();
+    session.close_writer();
+
+    let page = session.page(ToolCallsRequest::new("run-1")).await;
+    assert!(page.calls.is_empty());
+    assert!(page.next.is_none());
+}
+
+#[tokio::test]
+async fn run_tool_calls_reply_never_contains_stored_tool_result_content() {
+    const SECRET: &str = "TOOL-RESULT-CONTENT-MUST-NOT-LEAK-7f52e3";
+    let mut session = ClosedSession::new("result-content");
+    session.write_tool_turn(
+        &[call("call-1", json!({"path":"safe.txt"}))],
+        Some(&[SECRET.into()]),
+    );
+    session.finish();
+    session.close_writer();
+
+    let page = session.page(ToolCallsRequest::new("run-1")).await;
+    let bytes = serde_json::to_vec(&page).unwrap();
+    let body = String::from_utf8(bytes).unwrap();
+    assert!(!body.contains(SECRET));
+    assert!(page.calls[0].result_bytes.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn run_tool_calls_unknown_run_is_not_an_empty_answer() {
+    let mut session = ClosedSession::new("unknown");
+    session.close_writer();
+    let error = ServeHandler::run_tool_calls(
+        &session.registry,
+        &session.key,
+        ToolCallsRequest::new("absent-run"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ServeError::UnknownRun(run) if run == "absent-run"));
+}

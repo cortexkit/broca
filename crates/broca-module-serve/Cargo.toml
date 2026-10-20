@@ -36,6 +36,7 @@ broca-module = { path = "../broca-module" }
 # Fetch-plan admission: checks a send's plan and builds the manifest its first episode freezes.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 cortexkit-role-step-transform-provider = { workspace = true }
+cortexkit-role-llm-runner = { workspace = true }
 broca-provider = { path = "../broca-provider" }
 # Random bytes for the Claude Code persona's install id and per-episode prompt id. Already in
 # the lockfile (broca-wal uses the same version).

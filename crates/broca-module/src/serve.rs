@@ -588,6 +588,548 @@ fn final_message_of(
     })
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct RunToolCallsAnchor {
+    file_id: u64,
+    seq: u64,
+    byte_end: u64,
+}
+
+impl From<broca_wal::WalByteAnchor> for RunToolCallsAnchor {
+    fn from(anchor: broca_wal::WalByteAnchor) -> Self {
+        Self {
+            file_id: anchor.file_id,
+            seq: anchor.seq,
+            byte_end: anchor.byte_end,
+        }
+    }
+}
+
+impl From<RunToolCallsAnchor> for broca_wal::WalByteAnchor {
+    fn from(anchor: RunToolCallsAnchor) -> Self {
+        Self {
+            file_id: anchor.file_id,
+            seq: anchor.seq,
+            byte_end: anchor.byte_end,
+        }
+    }
+}
+
+/// A continuation resumes at the next call's assistant record, not at the session's WAL head.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunToolCallsCursor {
+    version: u8,
+    run_id: String,
+    lineage_id: Option<String>,
+    run_start_seq: u64,
+    run_end_seq: u64,
+    step_seq: u64,
+    call_index: usize,
+    batch_end_seq: u64,
+    ordinal: u64,
+    anchor_before: Option<RunToolCallsAnchor>,
+    after_batch: Vec<RunToolCallsPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authentication: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RunToolCallsPosition {
+    step_seq: u64,
+    call_index: usize,
+    batch_end_seq: u64,
+    ordinal: u64,
+    anchor_before: Option<RunToolCallsAnchor>,
+}
+
+#[derive(Clone, Debug)]
+struct IndexedRunToolCall {
+    call: cortexkit_role_llm_runner::tool_calls::RunToolCall,
+    step_seq: u64,
+    call_index: usize,
+    batch_end_seq: u64,
+    ordinal: u64,
+    after_batch: Vec<RunToolCallsPosition>,
+}
+
+#[derive(Clone, Copy)]
+struct RunToolCallsPageContext<'a> {
+    run_id: &'a str,
+    lineage_id: Option<&'a str>,
+    run_start_seq: u64,
+    run_end_seq: u64,
+    range: &'a broca_wal::WalRangeRead,
+    range_start_seq: u64,
+    fallback: Option<RunToolCallsAnchor>,
+    seed: Option<&'a RunToolCallsCursor>,
+}
+
+struct RunToolCallBuilder {
+    call: cortexkit_role_llm_runner::tool_calls::RunToolCall,
+    has_intent: bool,
+    terminal: bool,
+}
+
+fn committed_tool_step_ordinals(
+    records: &[broca_wal::FramedRecord],
+) -> std::collections::HashMap<u64, u64> {
+    let wal_records: Vec<_> = records.iter().map(|framed| framed.record.clone()).collect();
+    let Ok(replayed) = broca_core::replay::replay(&wal_records) else {
+        return std::collections::HashMap::new();
+    };
+    replayed
+        .committed_tool_turns
+        .into_iter()
+        .filter_map(|(ordinal, record_index)| {
+            records
+                .get(record_index)
+                .map(|framed| (framed.seq, ordinal as u64))
+        })
+        .collect()
+}
+
+fn run_tool_call_records(
+    range: &broca_wal::WalRangeRead,
+) -> Result<&[broca_wal::FramedRecord], ServeError> {
+    match range.records() {
+        broca_wal::WalRangeRecords::Complete(records) => Ok(records),
+        broca_wal::WalRangeRecords::Absent => Ok(&[]),
+        broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {
+            Err(ServeError::Open(
+                "run.tool_calls could not establish a complete WAL range".into(),
+                Some(broca_protocol::ErrorClass::Transient),
+            ))
+        }
+    }
+}
+
+fn run_tool_call_bounds(records: &[broca_wal::FramedRecord], run_id: &str) -> Option<(u64, u64)> {
+    let start = records.iter().position(|framed| {
+        matches!(&framed.record, broca_wal::WalRecord::RunStarted { run_id: started, .. } if started.0 == run_id)
+    })?;
+    let start_seq = records[start].seq;
+    let mut end_seq = records.last().map_or(start_seq, |framed| framed.seq);
+    for framed in &records[start + 1..] {
+        match &framed.record {
+            broca_wal::WalRecord::RunFinished { .. } => {
+                end_seq = framed.seq;
+                break;
+            }
+            broca_wal::WalRecord::RunStarted { .. } => {
+                end_seq = framed.seq.saturating_sub(1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Some((start_seq, end_seq))
+}
+
+fn run_tool_call_outcome(
+    outcome: broca_wal::record::DispatchOutcome,
+    has_intent: bool,
+    reason: Option<&str>,
+    is_error: bool,
+) -> &'static str {
+    use broca_wal::record::DispatchOutcome;
+    use cortexkit_role_llm_runner::tool_calls::outcomes;
+
+    match outcome {
+        DispatchOutcome::Unknown => outcomes::INDETERMINATE,
+        DispatchOutcome::MaxSteps | DispatchOutcome::Interrupted => outcomes::NOT_EXECUTED,
+        DispatchOutcome::Completed if reason.is_some() || (!has_intent && is_error) => {
+            outcomes::REFUSED
+        }
+        DispatchOutcome::Completed if is_error => outcomes::FAILED,
+        DispatchOutcome::Completed => outcomes::SUCCEEDED,
+    }
+}
+
+/// Walk WAL records in transcript order so call ordinals match the assistant message that asked
+/// for them. Tool results are used only to count their stored bytes; their content is never copied
+/// into the run-call response.
+fn indexed_run_tool_calls(
+    records: &[broca_wal::FramedRecord],
+    target_run_id: &str,
+    lineage_id: Option<&str>,
+    seed: Option<&RunToolCallsCursor>,
+    step_ordinals: &std::collections::HashMap<u64, u64>,
+) -> Result<Vec<IndexedRunToolCall>, ServeError> {
+    use broca_wal::WalRecord;
+    use cortexkit_role_llm_runner::tool_calls::outcomes;
+
+    let mut entries = Vec::new();
+    let mut current_run = seed.map(|_| target_run_id.to_owned());
+    let mut prompt_len = seed.map_or(0, |cursor| cursor.ordinal);
+    let mut pending_steers = 0u64;
+    let mut active_calls: Vec<RunToolCallBuilder> = Vec::new();
+    let mut active_step_seq = 0u64;
+    let mut active_step_ordinal = 0u64;
+    let mut active_batch_id: Option<String> = None;
+    let mut planned_call_count = 0usize;
+
+    let finish_calls = |calls: &mut Vec<RunToolCallBuilder>,
+                        step_seq: u64,
+                        batch_end_seq: u64,
+                        ordinal: u64,
+                        entries: &mut Vec<IndexedRunToolCall>| {
+        for (call_index, builder) in calls.iter_mut().enumerate() {
+            if !builder.terminal && builder.has_intent {
+                builder.call.outcome = outcomes::INDETERMINATE.into();
+            }
+            if !builder.call.outcome.is_empty() {
+                entries.push(IndexedRunToolCall {
+                    call: builder.call.clone(),
+                    step_seq,
+                    call_index,
+                    batch_end_seq,
+                    ordinal,
+                    after_batch: Vec::new(),
+                });
+            }
+        }
+    };
+
+    for framed in records {
+        match &framed.record {
+            WalRecord::RunStarted { run_id, input, .. } => {
+                current_run = Some(run_id.0.clone());
+                prompt_len = prompt_len.saturating_add(input.len() as u64);
+                pending_steers = 0;
+                active_calls.clear();
+                active_batch_id = None;
+                planned_call_count = 0;
+            }
+            WalRecord::StepStarted { .. } => {
+                prompt_len = prompt_len.saturating_add(pending_steers);
+                pending_steers = 0;
+            }
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => {
+                active_calls.clear();
+                active_batch_id = None;
+                planned_call_count = 0;
+                active_step_seq = framed.seq;
+                active_step_ordinal = step_ordinals
+                    .get(&framed.seq)
+                    .copied()
+                    .unwrap_or(prompt_len);
+                let calls: Vec<_> = assistant_message.tool_calls().collect();
+                if current_run.as_deref() == Some(target_run_id) {
+                    active_calls.extend(calls.iter().map(|call| RunToolCallBuilder {
+                        call: cortexkit_role_llm_runner::tool_calls::RunToolCall::new(
+                            call.tool_call_id.0.clone(),
+                            call.tool_name.clone(),
+                            call.input.clone(),
+                            "",
+                            active_step_ordinal,
+                        ),
+                        has_intent: false,
+                        terminal: false,
+                    }));
+                }
+                if calls.is_empty() {
+                    prompt_len = prompt_len.saturating_add(1);
+                }
+            }
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                planned_calls,
+                ..
+            } => {
+                active_batch_id = Some(batch_id.0.clone());
+                planned_call_count = planned_calls.len();
+            }
+            WalRecord::ToolCallDeferred {
+                batch_id, call_id, ..
+            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
+                if let (Some(lineage_id), Some(call)) = (
+                    lineage_id,
+                    active_calls.iter_mut().find(|call| {
+                        call.call.tool_call_id == call_id.0
+                            && call.call.call_key.is_none()
+                            && !call.has_intent
+                            && !call.terminal
+                    }),
+                ) {
+                    call.call.call_key = Some(format!("{lineage_id}:{}", framed.seq));
+                }
+            }
+            WalRecord::ToolDispatchIntent {
+                batch_id,
+                tool_call_id,
+                args,
+                module_id,
+                call_key,
+                ..
+            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
+                if let Some(call) = active_calls.iter_mut().find(|call| {
+                    call.call.tool_call_id == tool_call_id.0 && !call.has_intent && !call.terminal
+                }) {
+                    call.has_intent = true;
+                    call.call.args = (**args).clone();
+                    call.call.dispatched_to = module_id.clone();
+                    call.call.call_key = call_key.clone().or_else(|| {
+                        lineage_id.map(|lineage_id| format!("{lineage_id}:{}", framed.seq))
+                    });
+                }
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
+                if let Some(call) = active_calls
+                    .iter_mut()
+                    .find(|call| call.call.tool_call_id == tool_call_id.0 && !call.terminal)
+                {
+                    call.call.outcome = outcomes::REFUSED.into();
+                    call.terminal = true;
+                }
+            }
+            WalRecord::ToolResult {
+                batch_id,
+                result,
+                outcome,
+                reason,
+                ..
+            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
+                if let Some(call) = active_calls
+                    .iter_mut()
+                    .find(|call| call.call.tool_call_id == result.tool_call_id.0 && !call.terminal)
+                {
+                    call.call.outcome = run_tool_call_outcome(
+                        *outcome,
+                        call.has_intent,
+                        reason.as_deref(),
+                        result.is_error,
+                    )
+                    .into();
+                    call.call.result_bytes = Some(
+                        serde_json::to_vec(result.as_ref())
+                            .map_err(|error| {
+                                ServeError::Open(
+                                    format!("could not encode stored tool result size: {error}"),
+                                    None,
+                                )
+                            })?
+                            .len() as u64,
+                    );
+                    call.terminal = true;
+                }
+            }
+            WalRecord::ToolBatchFinished { batch_id }
+                if active_batch_id.as_deref() == Some(batch_id.0.as_str()) =>
+            {
+                if current_run.as_deref() == Some(target_run_id) {
+                    finish_calls(
+                        &mut active_calls,
+                        active_step_seq,
+                        framed.seq,
+                        active_step_ordinal,
+                        &mut entries,
+                    );
+                }
+                prompt_len = prompt_len
+                    .saturating_add(1)
+                    .saturating_add(planned_call_count as u64);
+                active_calls.clear();
+                active_batch_id = None;
+                planned_call_count = 0;
+            }
+            WalRecord::Steered { input, .. } => {
+                pending_steers = pending_steers.saturating_add(input.len() as u64);
+            }
+            WalRecord::SendDelivered {
+                input: Some(input), ..
+            } => {
+                pending_steers = pending_steers.saturating_add(input.len() as u64);
+            }
+            WalRecord::BudgetFired { run_id, .. }
+                if current_run.as_deref() == Some(run_id.0.as_str()) =>
+            {
+                prompt_len = prompt_len.saturating_add(1);
+            }
+            WalRecord::RunFinished { .. } => {
+                if current_run.as_deref() == Some(target_run_id) {
+                    break;
+                } else {
+                    prompt_len = prompt_len.saturating_add(pending_steers);
+                    pending_steers = 0;
+                    current_run = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if current_run.as_deref() == Some(target_run_id) && !active_calls.is_empty() {
+        finish_calls(
+            &mut active_calls,
+            active_step_seq,
+            records.last().map_or(active_step_seq, |record| record.seq),
+            active_step_ordinal,
+            &mut entries,
+        );
+    }
+    Ok(entries)
+}
+
+fn invalid_tool_call_cursor(message: &str) -> ServeError {
+    ServeError::InvalidParams {
+        field: cortexkit_role_llm_runner::tool_calls::AFTER_FIELD.into(),
+        message: message.into(),
+    }
+}
+
+/// Sign a cursor so callers can resume only from positions broca actually returned.
+fn run_tool_calls_cursor_authentication(cursor: &RunToolCallsCursor) -> Result<String, ServeError> {
+    use sha2::{Digest, Sha256};
+
+    static KEY: std::sync::OnceLock<Result<[u8; 32], String>> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|error| error.to_string())?;
+        Ok(key)
+    });
+    let key = key.as_ref().map_err(|error| {
+        ServeError::Open(
+            format!("could not initialize run.tool_calls cursor authentication: {error}"),
+            Some(broca_protocol::ErrorClass::Transient),
+        )
+    })?;
+    let mut unsigned = cursor.clone();
+    unsigned.authentication = None;
+    let payload = serde_json::to_vec(&unsigned).map_err(|error| {
+        ServeError::Open(format!("encode run.tool_calls cursor: {error}"), None)
+    })?;
+
+    let mut padded_key = [0u8; 64];
+    padded_key[..key.len()].copy_from_slice(key);
+    let mut inner_pad = padded_key;
+    for byte in &mut inner_pad {
+        *byte ^= 0x36;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(b"broca run.tool_calls cursor v1\0");
+    inner.update(payload);
+    let inner_digest = inner.finalize();
+
+    let mut outer_pad = padded_key;
+    for byte in &mut outer_pad {
+        *byte ^= 0x5c;
+    }
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    Ok(format!("{:x}", outer.finalize()))
+}
+
+fn run_tool_calls_cursor_is_authentic(cursor: &RunToolCallsCursor) -> Result<bool, ServeError> {
+    let Some(provided) = cursor.authentication.as_deref() else {
+        return Ok(false);
+    };
+    let expected = run_tool_calls_cursor_authentication(cursor)?;
+    let mut difference = 0u8;
+    for (left, right) in provided.as_bytes().iter().zip(expected.as_bytes()) {
+        difference |= left ^ right;
+    }
+    Ok(provided.len() == expected.len() && difference == 0)
+}
+
+fn indexed_run_tool_call_position(
+    entry: &IndexedRunToolCall,
+    range: &broca_wal::WalRangeRead,
+    range_start_seq: u64,
+    fallback: Option<RunToolCallsAnchor>,
+) -> RunToolCallsPosition {
+    let anchor_before = if entry.step_seq == range_start_seq {
+        fallback
+    } else {
+        entry
+            .step_seq
+            .checked_sub(1)
+            .and_then(|seq| range.anchor_at(seq))
+            .map(Into::into)
+    };
+    RunToolCallsPosition {
+        step_seq: entry.step_seq,
+        call_index: entry.call_index,
+        batch_end_seq: entry.batch_end_seq,
+        ordinal: entry.ordinal,
+        anchor_before,
+    }
+}
+
+fn run_tool_calls_cursor_token(
+    position: &RunToolCallsPosition,
+    after_batch: &[RunToolCallsPosition],
+    run_id: &str,
+    lineage_id: Option<&str>,
+    run_start_seq: u64,
+    run_end_seq: u64,
+) -> Result<String, ServeError> {
+    let mut cursor = RunToolCallsCursor {
+        version: 1,
+        run_id: run_id.to_owned(),
+        lineage_id: lineage_id.map(str::to_owned),
+        run_start_seq,
+        run_end_seq,
+        step_seq: position.step_seq,
+        call_index: position.call_index,
+        batch_end_seq: position.batch_end_seq,
+        ordinal: position.ordinal,
+        anchor_before: position.anchor_before,
+        after_batch: after_batch.to_vec(),
+        authentication: None,
+    };
+    cursor.authentication = Some(run_tool_calls_cursor_authentication(&cursor)?);
+    serde_json::to_string(&cursor)
+        .map_err(|error| ServeError::Open(format!("encode run.tool_calls cursor: {error}"), None))
+}
+
+fn next_run_tool_calls_cursor(
+    entries: &[IndexedRunToolCall],
+    index: usize,
+    context: &RunToolCallsPageContext<'_>,
+) -> Result<Option<String>, ServeError> {
+    if let Some(entry) = entries.get(index) {
+        let position = indexed_run_tool_call_position(
+            entry,
+            context.range,
+            context.range_start_seq,
+            context.fallback,
+        );
+        return run_tool_calls_cursor_token(
+            &position,
+            &entry.after_batch,
+            context.run_id,
+            context.lineage_id,
+            context.run_start_seq,
+            context.run_end_seq,
+        )
+        .map(Some);
+    }
+    let Some(cursor) = context.seed else {
+        return Ok(None);
+    };
+    let Some((position, after_batch)) = cursor.after_batch.split_first() else {
+        return Ok(None);
+    };
+    run_tool_calls_cursor_token(
+        position,
+        after_batch,
+        context.run_id,
+        context.lineage_id,
+        context.run_start_seq,
+        context.run_end_seq,
+    )
+    .map(Some)
+}
+
 fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStatusResponse {
     use broca_core::RunIndexState as State;
 
@@ -1215,6 +1757,18 @@ pub trait ServeHandler: Send + Sync {
     ) -> Result<broca_wire::RunResultResponse, ServeError> {
         Err(ServeError::Open(
             "run.result is unsupported".into(),
+            Some(broca_protocol::ErrorClass::Permanent),
+        ))
+    }
+
+    /// `run.tool_calls{run_id, after?, limit?}` — page the durable tool-call ledger for a run.
+    async fn run_tool_calls(
+        &self,
+        _session: &LineageKey,
+        _request: cortexkit_role_llm_runner::tool_calls::ToolCallsRequest,
+    ) -> Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> {
+        Err(ServeError::Open(
+            "run.tool_calls is unsupported".into(),
             Some(broca_protocol::ErrorClass::Permanent),
         ))
     }
@@ -2197,6 +2751,202 @@ impl ServeHandler for crate::LineageRegistry {
         Ok(response)
     }
 
+    async fn run_tool_calls(
+        &self,
+        session: &LineageKey,
+        request: cortexkit_role_llm_runner::tool_calls::ToolCallsRequest,
+    ) -> Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> {
+        use cortexkit_role_llm_runner::tool_calls::ToolCallsPage;
+
+        if let Err(field) = request.check() {
+            return Err(ServeError::InvalidParams {
+                field: field.into(),
+                message: "run.tool_calls.limit must be greater than zero".into(),
+            });
+        }
+        let run_id = request.run_id.clone();
+        let limit = request
+            .limit
+            .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
+            .min(broca_core::SESSION_READ_MAX_LIMIT) as usize;
+        let (range, run_start_seq, run_end_seq, lineage_id, seed, range_start_seq, fallback) =
+            match request.after.as_deref() {
+                None => {
+                    let range = self
+                        .read_run_tool_calls_range(session, &run_id, 0, None, None)
+                        .await?;
+                    let records = run_tool_call_records(&range)?;
+                    let Some((start, end)) = run_tool_call_bounds(records, &run_id) else {
+                        return Err(ServeError::UnknownRun(run_id));
+                    };
+                    let lineage_id = range.lineage_id.as_ref().map(|lineage| lineage.to_string());
+                    (range, start, end, lineage_id, None, 0, None)
+                }
+                Some(token) => {
+                    let cursor: RunToolCallsCursor = serde_json::from_str(token).map_err(|_| {
+                        invalid_tool_call_cursor(
+                            "run.tool_calls.after is not a cursor returned for this run",
+                        )
+                    })?;
+                    if cursor.version != 1
+                        || cursor.run_id != run_id
+                        || cursor.run_start_seq == 0
+                        || cursor.run_end_seq < cursor.step_seq
+                        || cursor.batch_end_seq < cursor.step_seq
+                        || cursor.batch_end_seq > cursor.run_end_seq
+                        || cursor.step_seq <= cursor.run_start_seq
+                        || cursor
+                            .anchor_before
+                            .is_some_and(|anchor| anchor.seq != cursor.step_seq - 1)
+                    {
+                        return Err(invalid_tool_call_cursor(
+                            "run.tool_calls.after is not a cursor returned for this run",
+                        ));
+                    }
+                    if !run_tool_calls_cursor_is_authentic(&cursor)? {
+                        return Err(invalid_tool_call_cursor(
+                            "run.tool_calls.after was not returned for this run",
+                        ));
+                    }
+                    let lineage_id = cursor.lineage_id.clone();
+                    let range = self
+                        .read_run_tool_calls_range(
+                            session,
+                            &run_id,
+                            cursor.step_seq - 1,
+                            cursor.anchor_before.map(Into::into),
+                            Some(cursor.batch_end_seq),
+                        )
+                        .await?;
+                    let observed_lineage =
+                        range.lineage_id.as_ref().map(|lineage| lineage.to_string());
+                    if observed_lineage
+                        .as_ref()
+                        .is_some_and(|observed| lineage_id.as_ref() != Some(observed))
+                    {
+                        return Err(invalid_tool_call_cursor(
+                            "run.tool_calls.after belongs to a different WAL lineage",
+                        ));
+                    }
+                    (
+                        range,
+                        cursor.run_start_seq,
+                        cursor.run_end_seq,
+                        lineage_id,
+                        Some(cursor.clone()),
+                        cursor.step_seq,
+                        cursor.anchor_before,
+                    )
+                }
+            };
+        let records = run_tool_call_records(&range)?;
+        let step_ordinals = if seed.is_none() {
+            committed_tool_step_ordinals(records)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let mut entries = indexed_run_tool_calls(
+            records,
+            &run_id,
+            lineage_id.as_deref(),
+            seed.as_ref(),
+            &step_ordinals,
+        )?;
+        if let Some(cursor) = &seed {
+            let Some(index) = entries.iter().position(|entry| {
+                entry.step_seq == cursor.step_seq && entry.call_index == cursor.call_index
+            }) else {
+                return Err(invalid_tool_call_cursor(
+                    "run.tool_calls.after does not name a call in this run",
+                ));
+            };
+            entries.drain(..index);
+            for entry in &mut entries {
+                entry.after_batch = cursor.after_batch.clone();
+            }
+        } else {
+            let mut future_batches = Vec::new();
+            for entry in &entries {
+                if future_batches
+                    .last()
+                    .is_none_or(|position: &RunToolCallsPosition| {
+                        position.step_seq != entry.step_seq
+                    })
+                {
+                    future_batches.push(indexed_run_tool_call_position(
+                        entry,
+                        &range,
+                        range_start_seq,
+                        fallback,
+                    ));
+                }
+            }
+            for entry in &mut entries {
+                entry.after_batch = future_batches
+                    .iter()
+                    .filter(|position| position.step_seq > entry.step_seq)
+                    .cloned()
+                    .collect();
+            }
+        }
+
+        let page_context = RunToolCallsPageContext {
+            run_id: &run_id,
+            lineage_id: lineage_id.as_deref(),
+            run_start_seq,
+            run_end_seq,
+            range: &range,
+            range_start_seq,
+            fallback,
+            seed: seed.as_ref(),
+        };
+        let max_bytes = broca_wire::role::READ_DEFAULT_MAX_BYTES;
+        let mut page_calls = Vec::new();
+        let mut consumed = 0usize;
+        while consumed < entries.len() && page_calls.len() < limit {
+            let entry = &entries[consumed];
+            let mut candidate_calls = page_calls.clone();
+            candidate_calls.push(entry.call.clone());
+            let mut candidate = ToolCallsPage::new(run_id.clone(), candidate_calls);
+            if let Some(next) = next_run_tool_calls_cursor(&entries, consumed + 1, &page_context)? {
+                candidate = candidate.with_next(next);
+            }
+            let encoded_bytes = serde_json::to_vec(&candidate)
+                .map_err(|error| ServeError::Open(error.to_string(), None))?
+                .len() as u64;
+            if !page_calls.is_empty() && encoded_bytes > max_bytes {
+                break;
+            }
+            page_calls.push(entry.call.clone());
+            consumed += 1;
+            if encoded_bytes > max_bytes {
+                break;
+            }
+        }
+        let mut page = ToolCallsPage::new(run_id.clone(), page_calls);
+        if let Some(next) = next_run_tool_calls_cursor(&entries, consumed, &page_context)? {
+            page = page.with_next(next);
+        }
+
+        let frame_bytes = broca_wire::serialized_result_frame_bytes(&page);
+        if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES {
+            let call = page
+                .calls
+                .first()
+                .expect("a too-large run.tool_calls page contains a call");
+            return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
+                frame_bytes,
+                broca_wire::SUBC_MAX_FRAME_BYTES,
+                ReplyTooLargeSubject::ToolCall {
+                    run_id,
+                    tool_call_id: call.tool_call_id.clone(),
+                    call_key: call.call_key.clone(),
+                },
+            )));
+        }
+        Ok(page)
+    }
+
     async fn baseline(
         &self,
         session: &LineageKey,
@@ -2387,3 +3137,7 @@ mod paused_auth_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "serve/run_tool_calls_tests.rs"]
+mod run_tool_calls_tests;
