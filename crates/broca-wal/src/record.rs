@@ -1268,7 +1268,8 @@ impl WalRecord {
             } => frozen_render_config.get("chatgpt_wire"),
             _ => None,
         };
-        let base = if codex_wire.is_some_and(|value| !value.is_null()) {
+        let codex_attempt = matches!(self, Self::ModelAttemptFinished { websocket_request: Some(frame), .. } if frame.codex.is_some());
+        let base = if codex_attempt || codex_wire.is_some_and(|value| !value.is_null()) {
             with_feature(base, crate::framing::CHATGPT_CODEX_WIRE_FEATURE)
         } else {
             base

@@ -106,6 +106,12 @@ floor before appending either frame. Older readers refuse rather than silently d
 recorded policy. Resume restores recorded presence or absence, without discovering new host
 values. Missing profiles retain legacy bytes; the renderer version does not change.
 
+Codex-profile WebSocket attempts also require this feature when their frame digest carries
+continuation details. These describe only live encoding: canonical full requests are still
+rendered and hashed once, while frame bytes can carry a compatible suffix and a real send-time
+stamp. Socket response IDs are not durable continuation authority, and the first request
+after resume always sends full input.
+
 Asynchronous compaction (compaction-provider/v1 0.3) requires **`compaction-view/v1`** for three
 things. `compaction_view_applied` records a provider view at the step boundary before the step
 that first renders it, with how it was applied: as published, or with the companion strip of

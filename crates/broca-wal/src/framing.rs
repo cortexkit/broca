@@ -1038,6 +1038,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chatgpt_continuation_attempt_is_must_understand() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/model_attempt_before_progress.json"
+        ))
+        .unwrap();
+        let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+        let before = encode(1, 1, &legacy).unwrap();
+        value["websocket_request"] = serde_json::json!({"len":123,"sha256":"frame-digest","codex":{"continuation":true,"suffix_item_count":1,"connection_generation":2,"previous_response_id_present":true,"physical_send_count":1}});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        let bytes = encode(1, 1, &record).unwrap();
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != CHATGPT_CODEX_WIRE_FEATURE)
+            .collect();
+        assert!(matches!(
+            decode_next_with(&before, &older),
+            DecodeStep::Record { .. }
+        ));
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [CHATGPT_CODEX_WIRE_FEATURE])
+        );
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+    }
+
     fn chatgpt_wire_gate(mut value: serde_json::Value, pointer: &str) {
         use crate::file_wal::Wal;
         let older: Vec<_> = KNOWN_FEATURES

@@ -12,6 +12,8 @@
 mod cache_hints;
 pub mod cache_markers;
 pub mod cache_warm;
+#[cfg(any(feature = "live", test))]
+mod chatgpt_continuation;
 pub mod chatgpt_wire;
 pub mod claude_code_persona;
 pub mod conformance;

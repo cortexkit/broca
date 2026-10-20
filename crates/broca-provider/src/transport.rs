@@ -192,6 +192,8 @@ struct PreparedHttpRequest {
     /// Local diagnostic policy, never part of the rendered request or its digest.
     ephemeral_session: bool,
     codex_wire: bool,
+    auth_revision: u64,
+    completed_output: Option<CompletedOutputRenderer>,
     url: String,
     headers: Vec<(String, String)>,
     body: Bytes,
@@ -206,11 +208,16 @@ struct PreparedHttpRequest {
     )>,
 }
 
+type CompletedOutputRenderer =
+    Arc<dyn Fn(&broca_protocol::AssistantMessage) -> Vec<Value> + Send + Sync>;
+
 impl From<HttpRequest> for PreparedHttpRequest {
     fn from(request: HttpRequest) -> Self {
         Self {
             ephemeral_session: false,
             codex_wire: false,
+            auth_revision: 0,
+            completed_output: None,
             url: request.url,
             headers: request.headers,
             body: Bytes::from(request.body),
@@ -223,6 +230,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    auth_revision: u64,
     family: Arc<F>,
     frozen: Arc<FrozenRenderConfig>,
     auth: Arc<AuthHandle>,
@@ -236,8 +244,8 @@ struct RenderedRequest {
     request_digest: RequestDigest,
 }
 
-/// Length and SHA-256 of the exact request body. Every attempt of a step sends the same
-/// rendered bytes, so this is computed once per step, on the blocking render worker.
+/// Length and SHA-256 of the canonical full request. Computed once per step on the render
+/// worker; retry framing and connection-local suffixes never change this digest domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestDigest {
     len: u64,
@@ -411,6 +419,20 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
         request.codex_wire = self.frozen.chatgpt_wire.is_some();
+        request.auth_revision = self.auth_revision;
+        if request.codex_wire {
+            let frozen = Arc::clone(&self.frozen);
+            let target_model = self.opts.target_model.clone();
+            let names = Arc::clone(&name_map);
+            request.completed_output = Some(Arc::new(move |assistant| {
+                crate::families::openai_responses::completed_output_as_input(
+                    &frozen,
+                    target_model.as_ref(),
+                    &names,
+                    assistant,
+                )
+            }));
+        }
         request.family = Some(self.frozen.family_id);
         request.service_tier = self
             .frozen
@@ -588,6 +610,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             // snapshot of the current credential rather than a deep copy of the secret; only
             // an in-step refresh after a 401 ever replaces it.
             auth: Arc::new(std::sync::RwLock::new(ServedAuth {
+                revision: 0,
                 auth: Arc::new(auth),
                 account_ref: None,
             })),
@@ -681,6 +704,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            auth_revision: served.revision,
             family: Arc::clone(&self.family),
             frozen: self.effective_frozen(),
             auth: served.auth,
@@ -1853,6 +1877,8 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             PreparedHttpRequest {
                 ephemeral_session: sent.ephemeral_session,
                 codex_wire: sent.codex_wire,
+                auth_revision: sent.auth_revision,
+                completed_output: sent.completed_output.clone(),
                 url: fresh.url,
                 headers: fresh.headers,
                 body: sent.body.clone(),
@@ -2016,7 +2042,7 @@ where
                     return Err((error, attempt_index.saturating_sub(1) as u32));
                 }
                 // Compared as a boolean only; neither side is ever formatted.
-                if refreshed.auth != *recovery.sent_auth {
+                if refreshed.auth != *recovery.sent_auth || request.codex_wire {
                     recovery.adopt(
                         refreshed.auth,
                         refreshed.account_ref,
@@ -2411,6 +2437,9 @@ fn refreshed_account_changed_error(
 /// Keep each token together with its associated account when carrying auth between steps.
 #[derive(Clone)]
 struct ServedAuth {
+    /// Local to this provider/run. Even a refresh returning the same header bytes starts
+    /// a new socket authentication revision; it never changes the canonical request body.
+    revision: u64,
     auth: Arc<AuthHandle>,
     account_ref: Option<String>,
 }
@@ -2446,11 +2475,17 @@ impl StepAuthRecovery<'_> {
         served_account_ref.clone_from(&account_ref);
         let auth = Arc::new(auth);
         self.sent_auth = Arc::clone(&auth);
-        *self
+        let mut current = self
             .recovery
             .current
             .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = ServedAuth { auth, account_ref };
+            .unwrap_or_else(|poison| poison.into_inner());
+        request.auth_revision = current.revision.wrapping_add(1);
+        *current = ServedAuth {
+            auth,
+            account_ref,
+            revision: request.auth_revision,
+        };
     }
 }
 
@@ -4239,6 +4274,7 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            auth_revision: 0,
             family: Arc::new(family),
             frozen: Arc::new(frozen),
             auth: Arc::new(AuthHandle::None),

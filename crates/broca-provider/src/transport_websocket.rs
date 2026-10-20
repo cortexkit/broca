@@ -120,6 +120,11 @@ struct ObservationEvent<'a> {
 
 #[derive(Default)]
 pub(super) struct AttemptObservation {
+    continuation: Option<bool>,
+    suffix_item_count: Option<u64>,
+    frame_len: Option<u64>,
+    frame_sha256: Option<String>,
+    full_input_reason: Option<&'static str>,
     frames: Option<(Arc<FrameCounts>, [u64; 7])>,
     close_code: Option<Arc<AtomicU16>>,
     generation: Option<u64>,
@@ -244,6 +249,8 @@ impl Drop for ObservationGuard {
                 $($log)::+!($($prefix)*
                     transport = "websocket", failed = self.failed, elapsed_ms = elapsed.as_millis() as u64,
                     socket_generation = stats.generation, socket_reused = stats.reused, socket_age_ms = stats.age_ms,
+                    continuation = stats.continuation, suffix_item_count = stats.suffix_item_count,
+                    frame_len = stats.frame_len, frame_sha256 = stats.frame_sha256.as_deref(), full_input_reason = stats.full_input_reason,
                     response_create_enqueued = stats.response_create_enqueued, response_create_sent = frames[0],
                     other_text_sent = frames[1], pongs_sent = frames[2], text_received = frames[3],
                     pings_received = frames[4], pongs_received = frames[5], closes_received = frames[6],
@@ -315,7 +322,10 @@ impl Session {
         if let Some(socket) = state.socket.take() {
             socket.shutdown.cancel();
         }
-        *state = State::default();
+        *state = State {
+            generation: state.generation,
+            ..State::default()
+        };
     }
 
     fn fail(&self) {
@@ -346,6 +356,27 @@ impl Session {
         self.state.lock().unwrap().clock_offset += elapsed;
     }
 
+    #[cfg(test)]
+    pub(super) async fn wait_closed(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .socket
+                    .as_ref()
+                    .is_some_and(|socket| socket.closed.load(Ordering::Acquire))
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("socket pump observes the peer close");
+    }
+
     fn forced_https(&self) -> bool {
         let policy = Arc::clone(&self.policy.read().unwrap());
         // Evaluate on every attempt so config edits still take effect immediately. The
@@ -365,12 +396,17 @@ impl Session {
             if let Some(socket) = &state.socket {
                 if !socket.closed.load(Ordering::Acquire)
                     && socket.headers == request.headers
+                    && (!request.codex_wire || socket.auth_revision == request.auth_revision)
+                    && (!request.codex_wire || socket.url == request.url)
                     && now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE
                 {
                     return Ok((Arc::clone(socket), true));
                 }
                 socket.shutdown.cancel();
-                let auth_changed = socket.headers != request.headers;
+                let auth_changed = socket.headers != request.headers
+                    || (request.codex_wire
+                        && (socket.auth_revision != request.auth_revision
+                            || socket.url != request.url));
                 state.socket = None;
                 if auth_changed {
                     state.turn_state = None;
@@ -458,6 +494,9 @@ struct SendCommand {
 }
 
 struct Socket {
+    auth_revision: u64,
+    url: String,
+    continuation: Mutex<Option<crate::chatgpt_continuation::CompletedResponse>>,
     send: mpsc::Sender<SendCommand>,
     recv: tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, std::io::Error>>>,
     shutdown: CancellationToken,
@@ -483,6 +522,23 @@ impl AttemptActivity {
 impl Drop for AttemptActivity {
     fn drop(&mut self) {
         self.0.send_replace(false);
+    }
+}
+
+struct ContinuationAttempt<'a> {
+    socket: &'a Socket,
+    enabled: bool,
+    keep_socket: bool,
+}
+impl Drop for ContinuationAttempt<'_> {
+    fn drop(&mut self) {
+        if self.enabled && !self.keep_socket {
+            // A dropped consumer or failed stream can leave unread response records.
+            // Retire the socket so any remaining records cannot enter the next attempt.
+            *self.socket.continuation.lock().unwrap() = None;
+            self.socket.closed.store(true, Ordering::Release);
+            self.socket.shutdown.cancel();
+        }
     }
 }
 
@@ -549,6 +605,9 @@ async fn connect(
     let frames = Arc::new(FrameCounts::default());
     let (attempt_active, activity) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
+        auth_revision: request.auth_revision,
+        url: request.url.clone(),
+        continuation: Mutex::new(None),
         send,
         recv: tokio::sync::Mutex::new(recv),
         shutdown: shutdown.clone(),
@@ -723,7 +782,9 @@ pub(super) async fn drive(
         // An upgrade refused for authentication is not a socket failure: the shared 401 path
         // re-reads the credential and tries the socket again, so it must not count toward the
         // switch to HTTPS for the rest of the run.
-        if failure.outcome != AttemptOutcome::HttpError {
+        if failure.outcome != AttemptOutcome::HttpError
+            || (request.codex_wire && trace.socket_generation.is_some())
+        {
             session.fail();
         }
         // Backends can echo authorization headers in error bodies or parser diagnostics.
@@ -796,6 +857,11 @@ async fn drive_socket(
             .await
         }
     };
+    let mut retirement = ContinuationAttempt {
+        socket: &socket,
+        enabled: request.codex_wire,
+        keep_socket: false,
+    };
     let now = session.now();
     trace.socket_generation = Some(socket.generation);
     trace.socket_reused = Some(reused);
@@ -813,15 +879,53 @@ async fn drive_socket(
         .lock()
         .unwrap()
         .map(|completed| now.saturating_duration_since(completed));
-    let mut payload: Value = serde_json::from_slice(&request.body).map_err(|_| {
+    let logical: Value = serde_json::from_slice(&request.body).map_err(|_| {
         AttemptFailure::decode(
             transport_error("invalid rendered Responses socket request"),
             AttemptOutcome::DecodeError,
         )
     })?;
+    let mut payload = if request.codex_wire {
+        Value::Object(
+            logical
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "input" | "previous_response_id"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    } else {
+        logical.clone()
+    };
+    let mut continuation = false;
+    let mut full_input_reason = "no_completed_response";
+    if request.codex_wire {
+        // A completion receipt is one-shot, including when compatibility fails. Never
+        // fall back to an older successful response after starting another stream.
+        if let Some(previous) = socket.continuation.lock().unwrap().take() {
+            match previous.suffix_start(&logical) {
+                Ok(start) => {
+                    payload["input"] =
+                        Value::Array(logical["input"].as_array().unwrap()[start..].to_vec());
+                    payload["previous_response_id"] = Value::String(previous.response_id);
+                    continuation = true;
+                }
+                Err(reason) => full_input_reason = reason,
+            }
+        }
+    }
+    if payload.get("input").is_none() {
+        payload["input"] = logical["input"].clone();
+    }
     payload["type"] = Value::String("response.create".into());
     if let Some(turn_state) = session.state.lock().unwrap().turn_state.clone() {
         payload["client_metadata"]["x-codex-turn-state"] = Value::String(turn_state);
+    }
+    let send_started_at_ms = now_millis();
+    if request.codex_wire {
+        payload["client_metadata"]["x-codex-ws-stream-request-start-ms"] =
+            Value::String(send_started_at_ms.to_string());
     }
     let text = if request.codex_wire {
         String::from_utf8(crate::chatgpt_wire::request_bytes(&payload)).expect("JSON is UTF-8")
@@ -834,9 +938,41 @@ async fn drive_socket(
     trace.websocket_request = Some(Box::new(broca_protocol::provider::WebSocketRequestDigest {
         len: digest.len,
         sha256: digest.sha256,
+        codex: request.codex_wire.then(|| {
+            Box::new(broca_protocol::provider::ChatgptContinuationTrace {
+                continuation,
+                suffix_item_count: if continuation {
+                    payload["input"]
+                        .as_array()
+                        .map_or(0, |input| input.len() as u64)
+                } else {
+                    0
+                },
+                connection_generation: socket.generation,
+                previous_response_id_present: payload.get("previous_response_id").is_some(),
+                physical_send_count: 0,
+                full_input_reason: (!continuation).then(|| full_input_reason.into()),
+            })
+        }),
     }));
     trace.websocket_close_code = Some(Arc::clone(&socket.close_code));
-    trace.sent_at_ms = Some(now_millis());
+    if request.codex_wire {
+        if let Some(observation) = trace.websocket_observation.upgrade() {
+            let mut observation = observation.lock().unwrap();
+            let frame = trace.websocket_request.as_ref().unwrap();
+            observation.frame_len = Some(frame.len);
+            observation.frame_sha256 = Some(frame.sha256.clone());
+            observation.continuation = Some(continuation);
+            observation.suffix_item_count =
+                frame.codex.as_ref().map(|codex| codex.suffix_item_count);
+            observation.full_input_reason = (!continuation).then_some(full_input_reason);
+        }
+    }
+    trace.sent_at_ms = Some(if request.codex_wire {
+        send_started_at_ms
+    } else {
+        now_millis()
+    });
     trace.sent_at = Some(std::time::Instant::now());
     let _activity = AttemptActivity::begin(&socket);
     let (result, receive) = oneshot::channel();
@@ -862,6 +998,14 @@ async fn drive_socket(
             AttemptOutcome::ChunkError,
         ));
     }
+    if let Some(codex) = trace
+        .websocket_request
+        .as_mut()
+        .and_then(|frame| frame.codex.as_mut())
+    {
+        codex.physical_send_count = 1;
+    }
+    let completed_id = Mutex::new(None);
     let mut recv = socket.recv.lock().await;
     let stream = futures::stream::unfold(&mut *recv, |recv| async {
         let record = recv.recv().await.unwrap_or_else(|| {
@@ -872,6 +1016,10 @@ async fn drive_socket(
         if let Ok(raw) = &record {
             if let Ok(value) = serde_json::from_slice(raw) {
                 session.observe_turn_state(&value);
+                if value["type"] == "response.completed" {
+                    *completed_id.lock().unwrap() =
+                        value["response"]["id"].as_str().map(str::to_owned);
+                }
             }
         }
         Some((record, recv))
@@ -889,6 +1037,30 @@ async fn drive_socket(
         // keep spending tokens and mix the abandoned response with the next request.
         session.close();
         return result;
+    }
+    if let Ok(completion) = &result {
+        retirement.keep_socket = true;
+        if let (Some(render_output), Some(response_id)) = (
+            &request.completed_output,
+            completed_id.into_inner().unwrap(),
+        ) {
+            if !response_id.is_empty() {
+                if let Some(assistant) = completion.iter().find_map(|event| match event {
+                    NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                        Some(message)
+                    }
+                    _ => None,
+                }) {
+                    let output = render_output(assistant);
+                    *socket.continuation.lock().unwrap() =
+                        Some(crate::chatgpt_continuation::CompletedResponse {
+                            request: logical,
+                            output,
+                            response_id,
+                        });
+                }
+            }
+        }
     }
     if result
         .as_ref()
@@ -1423,6 +1595,9 @@ mod pump_tests {
         let close_code = Arc::new(AtomicU16::new(0));
         let (attempt_active, activity) = tokio::sync::watch::channel(false);
         let socket = Arc::new(Socket {
+            auth_revision: 0,
+            url: String::new(),
+            continuation: Mutex::new(None),
             send,
             recv: tokio::sync::Mutex::new(records),
             shutdown: shutdown.clone(),
@@ -1613,5 +1788,69 @@ fn policy_read_does_not_hold_session_lock() {
     assert!(
         session.forced_https(),
         "a later attempt must refresh policy"
+    );
+}
+#[tokio::test]
+async fn codex_failed_send_retires_socket_and_consumes_receipt() {
+    use crate::families::{openai_responses_chatgpt_frozen_config, OpenAiResponsesChatgpt};
+    let logical = serde_json::json!({"model":"m","stream":true,"input":[],"tools":[],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{},"store":false,"include":["reasoning.encrypted_content"]});
+    let mut request: PreparedHttpRequest = HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url: "http://127.0.0.1:1/responses".into(),
+        headers: vec![],
+        body: broca_protocol::canonical_json_bytes(&logical),
+    }
+    .into();
+    request.codex_wire = true;
+    let (send, commands) = mpsc::channel(1);
+    drop(commands);
+    let (_messages, records) = mpsc::channel(1);
+    let (attempt_active, _) = tokio::sync::watch::channel(false);
+    let socket = Arc::new(Socket {
+        auth_revision: 0,
+        url: request.url.clone(),
+        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
+            request: logical,
+            output: vec![],
+            response_id: "resp_prior".into(),
+        })),
+        send,
+        recv: tokio::sync::Mutex::new(records),
+        shutdown: CancellationToken::new(),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_code: Arc::new(AtomicU16::new(0)),
+        frames: Arc::new(FrameCounts::default()),
+        headers: vec![],
+        generation: 1,
+        established_at: Instant::now(),
+        last_completed_at: Mutex::new(None),
+        attempt_active,
+    });
+    let session = Session::default();
+    session.state.lock().unwrap().socket = Some(Arc::clone(&socket));
+    let (tx, _rx) = mpsc::channel(256);
+    let mut trace = AttemptTrace::default();
+    let result = drive_socket(
+        &session,
+        &build_provider_http_client(),
+        &request,
+        &Clock::default(),
+        OpenAiResponsesChatgpt.normalizer(&openai_responses_chatgpt_frozen_config("m"), StepId(1)),
+        &tx,
+        &mut trace,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(socket.closed.load(Ordering::Acquire));
+    assert!(socket.shutdown.is_cancelled());
+    assert!(socket.continuation.lock().unwrap().is_none());
+    assert_eq!(
+        trace
+            .websocket_request
+            .unwrap()
+            .codex
+            .unwrap()
+            .physical_send_count,
+        0
     );
 }

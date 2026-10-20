@@ -148,8 +148,8 @@ pub struct ModelAttempt {
     /// Pipe carrying this attempt: `websocket` or `https`. Older records omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
-    /// Socket framing differs from the canonical rendered body by its `response.create` tag
-    /// and optional routing metadata. The canonical body digest above remains the cache domain.
+    /// Exact socket encoding, which can carry a suffix instead of full input, an operation
+    /// tag and send-only metadata. The canonical full-body digest above is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_request: Option<Box<WebSocketRequestDigest>>,
     /// Server close code, when a socket ended this attempt with a close frame.
@@ -260,6 +260,21 @@ pub struct InFlightStep {
 pub struct WebSocketRequestDigest {
     pub len: u64,
     pub sha256: String,
+    /// Continuation details, included only for the frozen Codex Responses WebSocket profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<Box<ChatgptContinuationTrace>>,
+}
+
+/// Continuation decisions, without raw response IDs or prompt text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatgptContinuationTrace {
+    pub continuation: bool,
+    pub suffix_item_count: u64,
+    pub connection_generation: u64,
+    pub previous_response_id_present: bool,
+    pub physical_send_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_input_reason: Option<String>,
 }
 
 /// The account evidence of one HTTP attempt, carried in memory from the transport to the run's

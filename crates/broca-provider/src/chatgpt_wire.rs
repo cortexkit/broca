@@ -83,18 +83,7 @@ impl ChatgptWire {
                 "internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}
             }));
         }
-        for item in body["input"].as_array_mut().unwrap() {
-            if item["type"] == "message" {
-                if let Some(text) = item["content"].as_str() {
-                    let kind = if item["role"] == "assistant" {
-                        "output_text"
-                    } else {
-                        "input_text"
-                    };
-                    item["content"] = json!([{"type":kind,"text":text}]);
-                }
-            }
-        }
+        typed_message_content(body["input"].as_array_mut().unwrap());
         body["parallel_tool_calls"] = json!(true);
         let includes = body
             .as_object_mut()
@@ -152,6 +141,21 @@ impl ChatgptWire {
             format!("broca:{domain}:{source}").as_bytes(),
         )
         .to_string()
+    }
+}
+
+pub(crate) fn typed_message_content(items: &mut [Value]) {
+    for item in items {
+        if item["type"] == "message" {
+            if let Some(text) = item["content"].as_str() {
+                let kind = if item["role"] == "assistant" {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
+                item["content"] = json!([{"type":kind,"text":text}]);
+            }
+        }
     }
 }
 

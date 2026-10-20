@@ -265,6 +265,33 @@ struct ReplayPolicy<'a> {
     stateless: bool,
 }
 
+/// Convert a completed assistant message into the same input items used by full-history
+/// requests, so continuation compares those items without rendering the large prompt again.
+#[cfg(feature = "live")]
+pub(crate) fn completed_output_as_input(
+    frozen: &FrozenRenderConfig,
+    target_model: Option<&broca_protocol::ModelHandle>,
+    name_map: &crate::tool_name_alias::ToolNameMap,
+    assistant: &broca_protocol::AssistantMessage,
+) -> Vec<Value> {
+    let mut message = Message::new(Role::Assistant, assistant.content.clone());
+    message.origin = target_model.cloned();
+    let mut items = convert_assistant_items(
+        &message,
+        name_map,
+        &ReplayPolicy {
+            target_model,
+            target_family: frozen.family_id,
+            provider_text_state: frozen.provider_text_state,
+            stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
+        },
+    );
+    if frozen.chatgpt_wire.is_some() {
+        crate::chatgpt_wire::typed_message_content(&mut items);
+    }
+    items
+}
+
 fn convert_input_items(
     prompt: &[Message],
     system_policy: SystemPromptPolicy,

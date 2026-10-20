@@ -455,12 +455,596 @@ async fn codex_profile_refresh_preserves_frozen_identity() {
     ] {
         assert_eq!(seen.headers[0][name], seen.headers[1][name], "{name}");
     }
-    let first_body: Value = serde_json::from_slice(&seen.requests[0]).unwrap();
-    let second_body: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    let mut first_body: Value = serde_json::from_slice(&seen.requests[0]).unwrap();
+    let mut second_body: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    for (body, events) in [(&mut first_body, &first), (&mut second_body, &second)] {
+        let sent = attempts(events)[0].sent_at_ms.unwrap().to_string();
+        assert_eq!(
+            body["client_metadata"]["x-codex-ws-stream-request-start-ms"],
+            sent
+        );
+        body["client_metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("x-codex-ws-stream-request-start-ms");
+    }
     assert_eq!(
         first_body["client_metadata"],
         second_body["client_metadata"]
     );
+}
+
+fn follow_up(mut options: CallOptions, events: &[NormalizedEvent], text: &str) -> CallOptions {
+    let assistant = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .expect("successful canonical assistant output");
+    let mut message = Message::new(Role::Assistant, assistant.content.clone());
+    message.origin = options.target_model.clone();
+    options.prompt.push(message);
+    options.prompt.push(Message::new(
+        Role::User,
+        vec![ContentBlock::Text { text: text.into() }],
+    ));
+    options
+}
+
+fn codex_trace(
+    events: &[NormalizedEvent],
+    index: usize,
+) -> &broca_protocol::provider::ChatgptContinuationTrace {
+    attempts(events)[index]
+        .websocket_request
+        .as_ref()
+        .unwrap()
+        .codex
+        .as_deref()
+        .unwrap()
+}
+
+fn assert_canonical(attempt: &ModelAttempt, canonical: &[u8]) {
+    assert_eq!(attempt.request_body_len, canonical.len() as u64);
+    let sha: String = Sha256::digest(canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(attempt.request_body_sha256, sha);
+}
+
+#[tokio::test]
+async fn codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let mut initial = opts();
+    initial.prompt[0].content = vec![ContentBlock::Text {
+        text: "deterministic cache prefix. ".repeat(150_000),
+    }];
+    let first = step(&provider, 1, &initial).await;
+    let next = follow_up(initial, &first, "Next question");
+    let canonical = provider.render_request(&next);
+    assert!(canonical.len() > 3 * 1024 * 1024);
+    let before = now_millis();
+    let second = step(&provider, 2, &next).await;
+    let after = now_millis();
+    assert_eq!(attempts(&second).len(), 1);
+    assert_canonical(attempts(&second)[0], &canonical);
+    let codex = codex_trace(&second, 0);
+    assert!(codex.continuation);
+    assert_eq!(codex.suffix_item_count, 1);
+    assert_eq!(codex.physical_send_count, 1);
+    assert!(codex.connection_generation > 0);
+    assert!(codex.previous_response_id_present);
+    assert_eq!(codex.full_input_reason, None);
+    assert_eq!(
+        codex.connection_generation,
+        codex_trace(&first, 0).connection_generation
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1);
+    assert_eq!(seen.requests.len(), 2);
+    assert!(seen.requests[1].len() < 2048);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["previous_response_id"], "r");
+    assert_eq!(
+        frame["input"],
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Next question"}]}])
+    );
+    let stamp = frame["client_metadata"]["x-codex-ws-stream-request-start-ms"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(stamp >= before && stamp <= after);
+    assert_eq!(Some(stamp), attempts(&second)[0].sent_at_ms);
+    assert!(
+        serde_json::from_slice::<Value>(&canonical).unwrap()["client_metadata"]
+            .get("x-codex-ws-stream-request-start-ms")
+            .is_none()
+    );
+    let digest = attempts(&second)[0].websocket_request.as_ref().unwrap();
+    assert_eq!(digest.len, seen.requests[1].len() as u64);
+    let sha: String = Sha256::digest(&seen.requests[1])
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(digest.sha256, sha);
+}
+
+#[tokio::test]
+async fn codex_continuation_equal_input_sends_empty_suffix() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let mut next = follow_up(opts(), &first, "unused");
+    next.prompt.pop();
+    let second = step(&provider, 2, &next).await;
+    assert!(codex_trace(&second, 0).continuation);
+    assert_eq!(codex_trace(&second, 0).suffix_item_count, 0);
+    let seen = mock.observed.lock().unwrap();
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["input"], serde_json::json!([]));
+    assert_eq!(frame["previous_response_id"], "r");
+}
+
+async fn codex_reset_case(case: &str) {
+    let close_after = case == "closed";
+    let mock = Mock::start(vec![text_events(), text_events()], close_after, false).await;
+    let mut provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let canonical = provider.render_request(&next);
+    match case {
+        "age" => provider
+            .websocket
+            .advance_clock(Duration::from_secs(56 * 60)),
+        "headers" => {
+            let mut current = provider.auth.write().unwrap();
+            let AuthHandle::Headers(headers) = Arc::make_mut(&mut current.auth) else {
+                panic!("fixture headers")
+            };
+            headers.push(("x-test-rotation".into(), "new".into()));
+        }
+        "auth_revision" => provider.auth.write().unwrap().revision += 1,
+        "retire" => provider.close_run_transport(),
+        "resume" => {
+            provider.close_run_transport();
+            provider = codex_provider(&mock);
+        }
+        "closed" => provider.websocket.wait_closed().await,
+        _ => panic!("unknown reset case"),
+    }
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(
+        attempts(&second).len(),
+        1,
+        "reset must precede send for {case}"
+    );
+    assert_canonical(attempts(&second)[0], &canonical);
+    assert!(!codex_trace(&second, 0).continuation, "{case}");
+    assert_eq!(codex_trace(&second, 0).suffix_item_count, 0);
+    assert!(!codex_trace(&second, 0).previous_response_id_present);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2, "{case}");
+    assert_eq!(seen.requests.len(), 2, "{case}");
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    let full: Value = serde_json::from_slice(&canonical).unwrap();
+    assert_eq!(frame["input"], full["input"], "{case}");
+    assert!(frame.get("previous_response_id").is_none());
+    if case != "resume" {
+        assert!(
+            codex_trace(&second, 0).connection_generation
+                > codex_trace(&first, 0).connection_generation
+        );
+    }
+}
+#[tokio::test]
+async fn codex_continuation_age_reset_is_full() {
+    codex_reset_case("age").await;
+}
+#[tokio::test]
+async fn codex_continuation_header_reset_is_full() {
+    codex_reset_case("headers").await;
+}
+#[tokio::test]
+async fn codex_continuation_auth_revision_reset_is_full() {
+    codex_reset_case("auth_revision").await;
+}
+#[tokio::test]
+async fn codex_continuation_explicit_retirement_is_full() {
+    codex_reset_case("retire").await;
+}
+#[tokio::test]
+async fn codex_continuation_resume_first_request_is_full() {
+    codex_reset_case("resume").await;
+}
+#[tokio::test]
+async fn codex_continuation_closed_socket_reset_is_full() {
+    codex_reset_case("closed").await;
+}
+
+#[tokio::test]
+async fn codex_continuation_endpoint_change_is_full() {
+    let first_mock = Mock::start(vec![text_events()], false, false).await;
+    let second_mock = Mock::start(vec![text_events()], false, false).await;
+    let mut provider = codex_provider(&first_mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    Arc::make_mut(&mut provider.frozen).base_url = Some(second_mock.url.clone());
+    let second = step(&provider, 2, &next).await;
+    assert!(!codex_trace(&second, 0).continuation);
+    assert_eq!(first_mock.observed.lock().unwrap().requests.len(), 1);
+    assert_eq!(second_mock.observed.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test]
+async fn codex_continuation_same_token_refresh_retires_socket() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let refresh = Arc::new(RefreshScript {
+        expiring: Mutex::new(std::collections::VecDeque::from([
+            None,
+            Some(fresh_credential("mock-token", "account", "expiring")),
+        ])),
+        rejected: Mutex::new(None),
+        rereads: AtomicUsize::new(0),
+    });
+    let provider = codex_provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(refresh);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert!(attempts(&second)[0].credential_refresh.is_some());
+    assert!(!codex_trace(&second, 0).continuation);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    for (name, value) in &seen.headers[0] {
+        if name != "sec-websocket-key" {
+            assert_eq!(seen.headers[1].get(name), Some(value));
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_failed_stream_retires_socket_and_retry_is_full() {
+    let failed = vec![
+        serde_json::json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"test"}}}),
+    ];
+    let mock = Mock::start(vec![text_events(), failed, text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 2);
+    assert_eq!(attempts(&second)[1].outcome, AttemptOutcome::Complete);
+    assert!(codex_trace(&second, 0).continuation);
+    assert!(!codex_trace(&second, 1).continuation);
+    let canonical = provider.render_request(&next);
+    for attempt in attempts(&second) {
+        assert_canonical(attempt, &canonical);
+    }
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.requests.len(), 3);
+    let frame: Value = serde_json::from_slice(&seen.requests[2]).unwrap();
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(
+        frame["input"],
+        serde_json::from_slice::<Value>(&canonical).unwrap()["input"]
+    );
+}
+
+#[tokio::test]
+async fn codex_continuation_incomplete_consumes_receipt_without_seeding_another() {
+    for reason in ["max_output_tokens", "interrupted", "content_filter"] {
+        let mut incomplete = text_events();
+        incomplete[1]["type"] = serde_json::json!("response.incomplete");
+        incomplete[1]["response"]["status"] = serde_json::json!("incomplete");
+        incomplete[1]["response"]["incomplete_details"] = serde_json::json!({"reason":reason});
+        let mock = Mock::start(vec![text_events(), incomplete, text_events()], false, false).await;
+        let provider = codex_provider(&mock);
+        let first = step(&provider, 1, &opts()).await;
+        let next = follow_up(opts(), &first, "Next");
+        let second = step(&provider, 2, &next).await;
+        assert!(codex_trace(&second, 0).continuation);
+        let third_options = follow_up(next, &second, "After incomplete");
+        let third = step(&provider, 3, &third_options).await;
+        assert!(!codex_trace(&third, 0).continuation, "{reason}");
+        assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_tool_argument_cut_retires_without_retry() {
+    let cut = vec![
+        serde_json::json!({"type":"response.created","response":{"id":"resp_cut"}}),
+        serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"bad","name":"lookup","arguments":""}}),
+        serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"key\":\"alpha\"}"}),
+        serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":" ".repeat(4097)}),
+    ];
+    let mock = Mock::start(vec![text_events(), cut, text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 1);
+    assert_eq!(
+        attempts(&second)[0].outcome,
+        AttemptOutcome::ToolArgsTrailingGarbage
+    );
+    assert!(codex_trace(&second, 0).continuation);
+    mock.wait_closes(1).await;
+    let third_options = follow_up(next, &second, "After cut");
+    let third = step(&provider, 3, &third_options).await;
+    assert!(!codex_trace(&third, 0).continuation);
+    assert_eq!(attempts(&third).len(), 1);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.requests.len(), 3);
+    assert!(seen.http_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn codex_continuation_consumer_drop_retires_pending_stream() {
+    let mock = Mock::start_internal(
+        vec![text_events(), vec![], text_events()],
+        false,
+        false,
+        None,
+        true,
+    )
+    .await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let receiver = provider.step(StepId(2), &next).await;
+    mock.wait_held_cut(1).await;
+    drop(receiver);
+    mock.cut_gates.add_permits(1);
+    mock.wait_closes(1).await;
+    let third = step(&provider, 3, &next).await;
+    assert!(!codex_trace(&third, 0).continuation);
+    assert_eq!(attempts(&third).len(), 1);
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 2);
+}
+
+#[tokio::test]
+async fn codex_continuation_https_switch_discards_socket_baseline() {
+    let mock = Mock::start(
+        vec![text_events(), text_events(), text_events()],
+        false,
+        false,
+    )
+    .await;
+    let provider = codex_provider(&mock);
+    let https = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&https);
+    provider.set_chatgpt_https_policy(Arc::new(move || flag.load(Ordering::Acquire)));
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    https.store(true, Ordering::Release);
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second)[0].transport.as_deref(), Some("https"));
+    mock.wait_closes(1).await;
+    https.store(false, Ordering::Release);
+    let third_options = follow_up(next, &second, "After HTTPS");
+    let third = step(&provider, 3, &third_options).await;
+    assert!(!codex_trace(&third, 0).continuation);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.requests.len(), 2);
+    assert_eq!(seen.http_bodies.len(), 1);
+}
+
+struct CountingCodex(Arc<AtomicUsize>);
+impl WireFamily for CountingCodex {
+    fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        OpenAiResponsesChatgpt.shape(frozen, opts)
+    }
+    fn endpoint(
+        &self,
+        frozen: &FrozenRenderConfig,
+        auth: &AuthHandle,
+        body: Vec<u8>,
+    ) -> HttpRequest {
+        OpenAiResponsesChatgpt.endpoint(frozen, auth, body)
+    }
+    fn normalizer(
+        &self,
+        frozen: &FrozenRenderConfig,
+        step_id: StepId,
+    ) -> Box<dyn StreamNormalizer> {
+        OpenAiResponsesChatgpt.normalizer(frozen, step_id)
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_renders_each_canonical_request_once() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let base = codex_provider(&mock);
+    let count = Arc::new(AtomicUsize::new(0));
+    let provider = LiveProvider::new(
+        CountingCodex(Arc::clone(&count)),
+        (*base.frozen).clone(),
+        (*base.current_auth().auth).clone(),
+    );
+    let first = step(&provider, 1, &opts()).await;
+    let second = step(&provider, 2, &follow_up(opts(), &first, "Next")).await;
+    assert!(codex_trace(&second, 0).continuation);
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn codex_continuation_property_mismatch_records_full_input_reason() {
+    let mock = Mock::start(
+        vec![text_events(), text_events(), text_events()],
+        false,
+        false,
+    )
+    .await;
+    let mut provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    Arc::make_mut(&mut provider.frozen).service_tier = Some("priority".into());
+    let second = step(&provider, 2, &next).await;
+    assert!(!codex_trace(&second, 0).continuation);
+    assert_eq!(
+        codex_trace(&second, 0).full_input_reason.as_deref(),
+        Some("service_tier_changed")
+    );
+    let third = step(
+        &provider,
+        3,
+        &follow_up(next, &second, "After changed tier"),
+    )
+    .await;
+    assert!(codex_trace(&third, 0).continuation);
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+}
+
+async fn codex_tool_run(
+    replies: Vec<Vec<Value>>,
+    expected_creates: usize,
+    expected_handshakes: usize,
+) -> Vec<WalRecord> {
+    let mock = Mock::start(replies, false, false).await;
+    let provider = codex_provider(&mock);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = broca_test_support::scratch_root().join(format!(
+        "codex-tool-turn-{}-{}",
+        expected_creates,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bind = BindIdentity::new(dir.join("project"), "websocket", "turn");
+    let request = tool_run_request(&bind);
+    let wal = FileWalStore::new(dir.join("wal"));
+    let count = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&count);
+    let plane = StubToolPlane::new().with_tool("lookup", move |_| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        broca_core::StubReply::Output(broca_protocol::ToolOutput::Text {
+            text: "found".into(),
+        })
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_loop(
+            request,
+            &provider,
+            &plane,
+            &FileLeaseStore::new(dir.join("lease")),
+            &AllowAll,
+            &wal,
+            &tx,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(tx);
+    collect.await.unwrap();
+    assert_eq!(result.reason, RunFinishReason::Completed);
+    assert_eq!(result.steps, 2);
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "one actual tool handler invocation"
+    );
+    mock.wait_closes(1).await;
+    let records = wal.read_records(&bind).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ToolResult { .. }))
+            .count(),
+        1
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.requests.len(), expected_creates);
+    assert_eq!(seen.handshakes, expected_handshakes);
+    assert!(seen.http_bodies.is_empty());
+    let continuation: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(continuation["previous_response_id"], "r1");
+    assert_eq!(continuation["input"].as_array().unwrap().len(), 1);
+    assert_eq!(continuation["input"][0]["type"], "function_call_output");
+    if expected_creates == 3 {
+        let retry: Value = serde_json::from_slice(&seen.requests[2]).unwrap();
+        assert!(retry.get("previous_response_id").is_none());
+        assert!(retry["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call"));
+        assert!(retry["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+    }
+    records.into_iter().map(|frame| frame.record).collect()
+}
+
+#[tokio::test]
+async fn codex_continuation_tool_turn_uses_canonical_output_and_dispatches_once() {
+    let records = codex_tool_run(vec![tool_events(), text_events()], 2, 1).await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn codex_continuation_completed_without_id_does_not_seed_receipt() {
+    for missing in [false, true] {
+        let mut no_id = text_events();
+        if missing {
+            no_id[1]["response"].as_object_mut().unwrap().remove("id");
+        } else {
+            no_id[1]["response"]["id"] = serde_json::json!("");
+        }
+        let mock = Mock::start(vec![text_events(), no_id, text_events()], false, false).await;
+        let provider = codex_provider(&mock);
+        let first = step(&provider, 1, &opts()).await;
+        let next = follow_up(opts(), &first, "Next");
+        let second = step(&provider, 2, &next).await;
+        assert!(codex_trace(&second, 0).continuation);
+        let third = step(&provider, 3, &follow_up(next, &second, "After missing id")).await;
+        assert!(!codex_trace(&third, 0).continuation);
+        assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_failed_normalization_retires_completed_response() {
+    let mock = Mock::start(
+        vec![text_events(), cut_tool_events(false), text_events()],
+        false,
+        false,
+    )
+    .await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 2);
+    assert!(codex_trace(&second, 0).continuation);
+    assert!(!codex_trace(&second, 1).continuation);
+    assert_eq!(attempts(&second)[1].outcome, AttemptOutcome::Complete);
+    let canonical = provider.render_request(&next);
+    for attempt in attempts(&second) {
+        assert_canonical(attempt, &canonical);
+    }
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 2);
 }
 fn opts() -> CallOptions {
     serde_json::from_value(serde_json::json!({
