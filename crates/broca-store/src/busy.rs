@@ -7,14 +7,28 @@ const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 thread_local! {
     static BUSY_STARTED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static WRITE_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 // SQLite's default busy handler backs off to 100 ms. A stream of short foreground
 // transactions can keep winning the lock between those polls, especially on Windows,
 // even though no writer holds it for the full timeout. Poll at a fixed short interval,
 // retaining the store's bounded wait rather than retrying a failed batch.
-pub(crate) fn configure_migration_connection(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_handler(Some(wait_for_migration_lock))
+pub(crate) fn configure_writer_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_handler(Some(wait_for_write_lock))
+}
+
+/// Include time spent waiting for the store mutex without replacing the connection's
+/// busy handler. SQLite's busy_timeout API would silently reinstall default backoff.
+pub(crate) fn with_write_deadline<T>(deadline: Instant, write: impl FnOnce() -> T) -> T {
+    struct RestoreDeadline(Option<Instant>);
+    impl Drop for RestoreDeadline {
+        fn drop(&mut self) {
+            WRITE_DEADLINE.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = RestoreDeadline(WRITE_DEADLINE.with(|current| current.replace(Some(deadline))));
+    write()
 }
 
 fn busy_poll_delay(elapsed: Duration) -> Option<Duration> {
@@ -24,7 +38,7 @@ fn busy_poll_delay(elapsed: Duration) -> Option<Duration> {
         .map(|remaining| remaining.min(BUSY_POLL_INTERVAL))
 }
 
-fn wait_for_migration_lock(attempt: i32) -> bool {
+fn wait_for_write_lock(attempt: i32) -> bool {
     BUSY_STARTED.with(|started| {
         // SQLite restarts the count for each lock acquisition. The handler neither
         // re-enters SQLite nor moves threads, so this clock is local to that wait.
@@ -38,6 +52,14 @@ fn wait_for_migration_lock(attempt: i32) -> bool {
         let Some(delay) = busy_poll_delay(start.elapsed()) else {
             return false;
         };
+        let delay = WRITE_DEADLINE.with(|deadline| {
+            deadline.get().map_or(delay, |deadline| {
+                delay.min(deadline.saturating_duration_since(Instant::now()))
+            })
+        });
+        if delay.is_zero() {
+            return false;
+        }
         #[cfg(test)]
         BUSY_WAIT_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -46,6 +68,7 @@ fn wait_for_migration_lock(attempt: i32) -> bool {
         });
         sleep_between_busy_attempts(delay);
         start.elapsed() < STORE_BUSY_TIMEOUT
+            && WRITE_DEADLINE.with(|deadline| deadline.get().is_none_or(|end| Instant::now() < end))
     })
 }
 
@@ -104,10 +127,31 @@ mod tests {
         BUSY_STARTED.with(|started| {
             started.set(Some(Instant::now() - STORE_BUSY_TIMEOUT));
         });
-        assert!(!wait_for_migration_lock(1), "an expired wait must stop");
+        assert!(!wait_for_write_lock(1), "an expired wait must stop");
         assert!(
-            wait_for_migration_lock(0),
+            wait_for_write_lock(0),
             "a new acquisition gets a new budget"
         );
+    }
+
+    #[test]
+    fn write_deadline_caps_lock_wait_and_restores_after_unwind() {
+        let expired = Instant::now() - Duration::from_secs(1);
+        with_write_deadline(expired, || {
+            assert!(
+                !wait_for_write_lock(0),
+                "mutex wait consumes the lock budget"
+            );
+        });
+        assert!(WRITE_DEADLINE.with(|deadline| deadline.get().is_none()));
+        let outer = Instant::now() + STORE_BUSY_TIMEOUT;
+        with_write_deadline(outer, || {
+            let result = std::panic::catch_unwind(|| {
+                with_write_deadline(expired, || panic!("failed write"));
+            });
+            assert!(result.is_err());
+            assert_eq!(WRITE_DEADLINE.with(|deadline| deadline.get()), Some(outer));
+        });
+        assert!(WRITE_DEADLINE.with(|deadline| deadline.get().is_none()));
     }
 }

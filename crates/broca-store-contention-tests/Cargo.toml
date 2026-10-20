@@ -9,6 +9,8 @@ publish = false
 description = "Test-only deterministic SQLite VFS harness for store lock contention."
 
 [dev-dependencies]
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
 broca-test-support = { path = "../broca-test-support" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { workspace = true, features = ["test-util"] }

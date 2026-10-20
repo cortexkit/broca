@@ -47,11 +47,11 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Arc<SqliteStore>) {
     backfill(&store.conn.lock().unwrap()).unwrap();
     (root, store)
 }
-/// Use the production migration's lock-wait policy, not the serving connection's
-/// default SQLite backoff: the census must find gaps between foreground commits.
+/// All store writers share short lock polls so the census and foreground commits
+/// can find gaps in one another's write traffic.
 fn census_connection(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
-    crate::busy::configure_migration_connection(&conn).unwrap();
+    crate::busy::configure_writer_connection(&conn).unwrap();
     conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
     conn
 }

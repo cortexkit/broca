@@ -836,7 +836,7 @@ impl SqliteStore {
     }
 
     fn init(conn: &Connection) -> Result<(String, u64, u64), StoreError> {
-        conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        crate::busy::configure_writer_connection(conn)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         // Retain WAL sidecars while broca is down so read-only readers can open the index.
         // SQLITE_FCNTL_PERSIST_WAL requires unsafe FFI, which this crate forbids; disabling
