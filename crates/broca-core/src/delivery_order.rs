@@ -225,6 +225,82 @@ pub fn with_tool_result(
     }
 }
 
+/// What became of the queued send whose submission is `sub-<run_id>`, read from the WAL alone.
+///
+/// A queued send's reply names only its submission id, and the run it would start takes the
+/// run id that submission id was minted from. Callers poll `run.status` on that run id, so the
+/// id must keep answering after the send went somewhere other than its own run: delivered into
+/// a run that was already going, replaced, expired or withdrawn. Every answer here comes from
+/// durable records, so it is the same before and after the session's actor restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedSendFate {
+    /// Queued and still waiting for a boundary that can deliver it.
+    Pending,
+    /// Delivered into the run `run_id`, which was already going, in `mode`: the send became
+    /// part of that run and starts none of its own.
+    Delivered { run_id: RunId, mode: DeliveryMode },
+    /// Started its own run under this run id. The run's own records answer for it.
+    Started,
+    /// Ended undelivered: replaced by a newer send under the same dedupe key, or expired.
+    Ended(SendEndReason),
+    /// Withdrawn by `session.retract` before it started.
+    Retracted,
+}
+
+/// The fate of the queued send minted from `run_id` (submission `sub-<run_id>`), or `None` when
+/// the records hold no queued send under that submission (the id is not a queued send's).
+///
+/// The records that settle a queued send are each written once, after its `Queued` record:
+/// `SendDelivered` or a `RunStarted` naming it when it is delivered, `SendEnded` or
+/// `Retracted` when it is not. The first settling record wins, so a later record about another
+/// send never changes an answer once given.
+pub fn queued_send_fate<'a>(
+    records: impl IntoIterator<Item = &'a WalRecord>,
+    run_id: &str,
+) -> Option<QueuedSendFate> {
+    let submission = format!("sub-{run_id}");
+    let mut fate = None;
+    for record in records {
+        let settled = match record {
+            WalRecord::Queued { submission_id, .. } if submission_id.0 == submission => {
+                fate.get_or_insert(QueuedSendFate::Pending);
+                continue;
+            }
+            WalRecord::SendDelivered {
+                submission_id,
+                run_id: into,
+                mode,
+                ..
+            } if submission_id.0 == submission => QueuedSendFate::Delivered {
+                run_id: into.clone(),
+                mode: *mode,
+            },
+            WalRecord::RunStarted {
+                run_id: started,
+                submission_id,
+                ..
+            } if started.0 == run_id
+                || submission_id.as_ref().is_some_and(|id| id.0 == submission) =>
+            {
+                QueuedSendFate::Started
+            }
+            WalRecord::SendEnded {
+                submission_id,
+                reason,
+            } if submission_id.0 == submission => QueuedSendFate::Ended(reason.clone()),
+            WalRecord::Retracted { submission_id, .. } if submission_id.0 == submission => {
+                QueuedSendFate::Retracted
+            }
+            _ => continue,
+        };
+        match fate {
+            None | Some(QueuedSendFate::Pending) => fate = Some(settled),
+            Some(_) => {}
+        }
+    }
+    fate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +320,55 @@ mod tests {
             output: ToolOutput::Text { text: text.into() },
             is_error: false,
         }
+    }
+
+    fn record(json: &str) -> WalRecord {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A queued send's fate is the first record that settles it: queued alone is pending, and a
+    /// delivery, an end, a retraction or its own run start each settle it for good. An id that
+    /// names no queued send has no fate.
+    #[test]
+    fn a_queued_sends_fate_is_its_first_settling_record() {
+        let queued = record(
+            r#"{"type":"queued","submission_id":"sub-r2","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"note"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}"#,
+        );
+        let delivered = record(
+            r#"{"type":"send_delivered","submission_id":"sub-r2","run_id":"r1","mode":"steer","input":[{"role":"user","content":[{"type":"text","text":"note"}]}]}"#,
+        );
+        let superseded = record(
+            r#"{"type":"send_ended","submission_id":"sub-r2","reason":{"kind":"superseded","by":"sub-r3"}}"#,
+        );
+        let retracted = record(r#"{"type":"retracted","submission_id":"sub-r2"}"#);
+        let other = record(r#"{"type":"retracted","submission_id":"sub-r9"}"#);
+
+        assert_eq!(
+            queued_send_fate([&queued], "r2"),
+            Some(QueuedSendFate::Pending)
+        );
+        assert_eq!(
+            queued_send_fate([&queued, &delivered, &superseded], "r2"),
+            Some(QueuedSendFate::Delivered {
+                run_id: RunId("r1".into()),
+                mode: DeliveryMode::Steer
+            })
+        );
+        assert_eq!(
+            queued_send_fate([&queued, &superseded], "r2"),
+            Some(QueuedSendFate::Ended(SendEndReason::Superseded {
+                by: SubmissionId("sub-r3".into())
+            }))
+        );
+        assert_eq!(
+            queued_send_fate([&queued, &other, &retracted], "r2"),
+            Some(QueuedSendFate::Retracted)
+        );
+        assert_eq!(
+            queued_send_fate([&queued, &other], "r2"),
+            Some(QueuedSendFate::Pending)
+        );
+        assert_eq!(queued_send_fate([&queued], "r9"), None);
     }
 
     /// The first possible mode wins; `turn_system` always falls through in this build; a list

@@ -269,6 +269,9 @@ pub enum SendResponse {
     Paused {
         run_id: String,
         pause_reason: broca_protocol::PauseReason,
+        /// As on `Active`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivered: Option<cortexkit_role_llm_runner::send::Delivered>,
     },
     /// The run started immediately (the lineage was idle).
     Active {
@@ -1185,6 +1188,17 @@ pub trait ServeHandler: Send + Sync {
         run_id: broca_protocol::RunId,
     ) -> Result<RunStatusResponse, ServeError>;
 
+    /// What `run.status{run_id}` answers on the wire: [`Self::run_status`], and, for a run id a
+    /// queued send was minted from, what became of that send (see
+    /// [`broca_wire::RunStatusReply`]). The default answers the run's own status only.
+    async fn run_status_reply(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<broca_wire::RunStatusReply, ServeError> {
+        self.run_status(session, run_id).await.map(Into::into)
+    }
+
     /// `session.head` — the session's head without message bodies. For retained sessions,
     /// `updated_at` is the durable activity timestamp that sets expiry, not the WAL mtime.
     async fn head(&self, _session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
@@ -1632,9 +1646,14 @@ impl ServeHandler for crate::LineageRegistry {
                 reason,
                 delivered,
             }),
-            SendOutcome::Paused { run_id, reason } => Ok(SendResponse::Paused {
+            SendOutcome::Paused {
+                run_id,
+                reason,
+                delivered,
+            } => Ok(SendResponse::Paused {
                 run_id: run_id.0,
                 pause_reason: reason,
+                delivered,
             }),
             SendOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             SendOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
@@ -2309,6 +2328,44 @@ impl ServeHandler for crate::LineageRegistry {
             return Err(error);
         }
         Ok(response)
+    }
+
+    async fn run_status_reply(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<broca_wire::RunStatusReply, ServeError> {
+        use broca_core::delivery_order::QueuedSendFate;
+        use broca_wire::{QueuedSendState, RunStatusReply};
+        let status = self.run_status(session, run_id.clone()).await?;
+        if !matches!(status, RunStatusResponse::Unknown) {
+            return Ok(status.into());
+        }
+        // No run carries this id. It may still be the id a queued send was minted from, which
+        // callers poll until the send is a run; the WAL says what became of the send.
+        let reply = match self.route_queued_send_fate(session, &run_id).await? {
+            None => status.into(),
+            Some(QueuedSendFate::Pending) => RunStatusReply::Send(QueuedSendState::Pending),
+            Some(QueuedSendFate::Ended(reason)) => RunStatusReply::Send(match reason {
+                broca_wal::record::SendEndReason::Superseded { .. } => QueuedSendState::Superseded,
+                broca_wal::record::SendEndReason::Expired => QueuedSendState::Expired,
+            }),
+            Some(QueuedSendFate::Retracted) => RunStatusReply::Send(QueuedSendState::Retracted),
+            // Delivered into a run that was already going: the send is part of that run now,
+            // so its status is that run's, with the receipt naming the run.
+            Some(QueuedSendFate::Delivered { run_id: into, .. }) => RunStatusReply::Run {
+                status: Box::new(self.run_status(session, into.clone()).await?),
+                delivered: Some(
+                    cortexkit_role_llm_runner::send::Delivered::new(
+                        cortexkit_role_llm_runner::send::delivered_as::STEP,
+                    )
+                    .with_ref(into.0),
+                ),
+            },
+            // The send started its own run after the first lookup: answer that run.
+            Some(QueuedSendFate::Started) => self.run_status(session, run_id).await?.into(),
+        };
+        Ok(reply)
     }
 }
 

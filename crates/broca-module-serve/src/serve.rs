@@ -2457,12 +2457,13 @@ where
                         broca_module::SendResponse::Paused {
                             run_id,
                             pause_reason,
+                            delivered,
                         } => (
                             SendResult::Paused {
                                 run_id,
                                 pause_reason,
                             },
-                            None,
+                            delivered,
                         ),
                         broca_module::SendResponse::Active { run_id, delivered } => {
                             (SendResult::Active { run_id }, delivered)
@@ -2651,7 +2652,7 @@ where
                 },
                 Some(run_id) => {
                     match handler
-                        .run_status(&session, broca_protocol::RunId(run_id))
+                        .run_status_reply(&session, broca_protocol::RunId(run_id))
                         .await
                     {
                         Ok(resp) => {

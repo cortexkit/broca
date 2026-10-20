@@ -872,6 +872,33 @@ keep their existing behavior and omit this diagnostic.
   later event's timestamp. With fewer than two content events both gap fields are absent.
   No in-flight model step means no object, and no real content yet means no content timestamp.
   The real-serve fixture is `crates/broca-wire/tests/golden/run_status.active_with_step.json`.
+- **A queued send's run id (broca extension).** A queued send's reply names only its
+  `submission_id`, `sub-<run_id>`; the run it would start takes that `run_id`. Core derives the
+  run id from the submission id and polls `run.status` and `session.read` on it, so broca answers
+  that id for as long as the send exists, even when the send never becomes a run of its own (a
+  send using the `delivery_order` group can be delivered into the run already going). The
+  llm-runner role contract does not define these answers: there an id naming no run answers
+  `unknown`, and llm-runner will not adopt them. Core (the
+  session's owner) needs them until it tracks each send by its `send_id` instead of by this run
+  id. The answers come from the WAL alone, so they are the same on a live session and a
+  closed one, before and after a restart:
+  - while the send is queued: `{state: "pending"}`
+    (`run_status.provisional_pending.json`);
+  - delivered into a run X that was already going (as a steer, with a tool result, or as a
+    turn-scoped system message): X's whole status, exactly as `run.status {run_id: X}` answers
+    it, plus `delivered: {as: "step", ref: X}` (`run_status.provisional_delivered_steer.json`,
+    taken after a restart). `run.cancel` on the send's run id answers `not_active` and never
+    cancels X;
+  - started its own run (`idle_start`, or the plain queue): that run's status, with no
+    `delivered` (`run_status.provisional_started.json`);
+  - ended undelivered: `{state: "superseded"}`, `{state: "expired"}` or
+    `{state: "retracted"}`, for good.
+  A re-send of the queued send's `send_id` answers the same way (§9 of the role contract): once
+  delivered into X it answers X's state with `run_id: X` and `delivered: {as: "step", ref: X}`;
+  once an ordered send started its own run, that run with `delivered: {as: "turn", ref: <its
+  run id>}` (a plain queued send's re-send carries no receipt). Both
+  are rebuilt from the WAL (`send_delivered`, and the run's `RunStarted` beside its
+  `delivery_ordered`), so a re-send after a restart never answers `pending` again.
 
 ### Attempt content telemetry
 

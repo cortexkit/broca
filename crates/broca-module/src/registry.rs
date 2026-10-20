@@ -2006,6 +2006,25 @@ impl LineageRegistry {
             .map(|(state, _)| state)
     }
 
+    /// What became of the queued send minted from `run_id` (submission `sub-<run_id>`), read
+    /// from the session's durable WAL, or `None` when the WAL holds no such send. The answer
+    /// comes from durable records alone, so a live actor and a closed session, before and after
+    /// a restart, give the same one. A registry without a WAL reader knows of no queued send.
+    pub async fn route_queued_send_fate(
+        &self,
+        key: &LineageKey,
+        run_id: &broca_protocol::RunId,
+    ) -> Result<Option<broca_core::delivery_order::QueuedSendFate>, OpenError> {
+        if self.inner.reader.is_none() {
+            return Ok(None);
+        }
+        let records = self.read_durable_wal(key).await?.0;
+        Ok(broca_core::delivery_order::queued_send_fate(
+            records.iter().map(|frame| &frame.record),
+            &run_id.0,
+        ))
+    }
+
     /// Resolve run state and retain any authoritative WAL snapshot used to answer it.
     /// Result extraction can reuse that snapshot. Actor-backed answers carry no snapshot,
     /// so callers must still check the durable WAL for a just-written terminal.

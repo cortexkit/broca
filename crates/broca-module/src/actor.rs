@@ -362,6 +362,9 @@ pub enum SendOutcome {
     Paused {
         run_id: RunId,
         reason: broca_protocol::PauseReason,
+        /// As on `Active`: on a retried ordered send that was delivered into the paused run, the
+        /// receipt naming that run. `None` on every other send.
+        delivered: Option<Delivered>,
     },
     RunPaused {
         run_id: RunId,
@@ -2883,6 +2886,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .unwrap_or("request identity");
                     return SendOutcome::SendIdReuse { differing };
                 }
+                // An ordered send's own run is its `idle_start` delivery, so a retry of it carries
+                // the `turn` receipt naming that run, as a retry of one delivered into a running
+                // turn carries `step`. The order comes from the WAL, so this holds after a restart.
+                let delivered = self
+                    .ordered_submissions
+                    .contains_key(&broca_protocol::SubmissionId(format!("sub-{}", run_id.0)))
+                    .then(|| Delivered::new(delivered_as::TURN).with_ref(run_id.0.clone()));
                 if let Some(reason) = indexed
                     .as_ref()
                     .and_then(|indexed| indexed_finish_reason(&indexed.state))
@@ -2890,7 +2900,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     return SendOutcome::Finished {
                         run_id,
                         reason,
-                        delivered: None,
+                        delivered,
                     };
                 }
                 if !self.restart_admitting
@@ -2903,13 +2913,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         return SendOutcome::Finished {
                             run_id,
                             reason,
-                            delivered: None,
+                            delivered,
                         };
                     }
-                    return SendOutcome::Active {
-                        run_id,
-                        delivered: None,
-                    };
+                    return SendOutcome::Active { run_id, delivered };
                 }
                 match self.reconcile_from_wal(&run_id).await {
                     Ok(Some(state)) if state.state.is_terminal() => {
@@ -2920,7 +2927,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             run_id,
                             reason: indexed_finish_reason(&state.state)
                                 .expect("terminal index state has a finish reason"),
-                            delivered: None,
+                            delivered,
                         };
                     }
                     Ok(Some(state))
@@ -2929,6 +2936,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         return SendOutcome::Paused {
                             run_id,
                             reason: broca_protocol::PauseReason::Restart,
+                            delivered,
                         };
                     }
                     Ok(Some(_)) => {
@@ -3379,6 +3387,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     return SendOutcome::Paused {
                         run_id: paused,
                         reason: broca_protocol::PauseReason::Restart,
+                        delivered: None,
                     };
                 }
                 Ok(Some((run_id, reason))) => return SendOutcome::RunPaused { run_id, reason },
@@ -4488,34 +4497,36 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// The answer to a keyed retry of an ordered send delivered into run `run_id`: that run's state
     /// now, as for a retry of the send that started it. Finished once its terminal is durable,
-    /// paused while it is paused, and active otherwise.
+    /// paused while it is paused, and active otherwise. Every answer carries the `step` receipt
+    /// naming that run: the send was delivered into a run already going, at one of its steps.
+    /// The delivery is read from the WAL's `SendDelivered` record, so the receipt is the same
+    /// after a restart and never goes back to `pending`.
     async fn delivered_run_outcome(&mut self, run_id: RunId) -> SendOutcome {
+        let delivered = Some(Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone()));
         if matches!(&self.state, RunState::Active { run_id: active, .. } if *active == run_id) {
             if let Some(reason) = self.durable_finish_of_active(&run_id) {
                 return SendOutcome::Finished {
                     run_id,
                     reason,
-                    delivered: None,
+                    delivered,
                 };
             }
-            return SendOutcome::Active {
-                run_id,
-                delivered: None,
-            };
+            return SendOutcome::Active { run_id, delivered };
         }
         match self.reconcile_from_wal(&run_id).await {
             Ok(Some(state)) => match indexed_finish_reason(&state.state) {
                 Some(reason) => SendOutcome::Finished {
                     run_id,
                     reason,
-                    delivered: None,
+                    delivered,
                 },
                 None => match state.pause_reason {
-                    Some(reason) => SendOutcome::Paused { run_id, reason },
-                    None => SendOutcome::Active {
+                    Some(reason) => SendOutcome::Paused {
                         run_id,
-                        delivered: None,
+                        reason,
+                        delivered,
                     },
+                    None => SendOutcome::Active { run_id, delivered },
                 },
             },
             Ok(None) => SendOutcome::Error(format!(
