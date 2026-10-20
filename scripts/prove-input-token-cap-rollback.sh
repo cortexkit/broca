@@ -11,7 +11,6 @@ if [ -n "${BROCA_RELEASE_ARCHIVE:-}" ]; then
 else
     git -C "$root" archive v0.3.210 | tar -x -C "$scratch/released"
 fi
-export RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER=
 export BROCA_INPUT_CAP_WAL_FIXTURE="$scratch/capped.wal"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}/released-input-cap-reader"
 rustc --version
