@@ -1858,50 +1858,51 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             .acquire_owned()
             .await
             .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
-        let work = async move {
-            if let Err(error) =
-                authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await
-            {
-                return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
-            }
-            count_management_operation(OP_VAULT_AUDIT);
-            let log_context = tracing::enabled!(target: "requests", tracing::Level::DEBUG)
-                .then(|| (req.method.clone(), session.session.clone()));
-            let request = async move {
-                if !req.params.is_null() {
-                    if let Err(error) =
-                        serde_json::from_value::<crate::wire::VaultAuditParams>(req.params)
-                    {
-                        return send_error(
-                            &writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            "invalid_params",
-                            &error.to_string(),
-                        )
-                        .await;
+        let authorization = tokio::select! {
+            _ = conn_cancel.cancelled() => return Ok(()),
+            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method) => result,
+        };
+        if let Err(error) = authorization {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        count_management_operation(OP_VAULT_AUDIT);
+        let log_context = tracing::enabled!(target: "requests", tracing::Level::DEBUG)
+            .then(|| (req.method.clone(), session.session.clone()));
+        let request = async move {
+            tokio::select! {
+                _ = conn_cancel.cancelled() => Ok(()),
+                result = async move {
+                    if !req.params.is_null() {
+                        if let Err(error) =
+                            serde_json::from_value::<crate::wire::VaultAuditParams>(req.params)
+                        {
+                            return send_error(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "invalid_params",
+                                &error.to_string(),
+                            )
+                            .await;
+                        }
                     }
-                }
-                // A daemon without the vault auth source still answers, and says it could not
-                // check: the caller must be able to tell that apart from a clean audit.
-                let answer = match vault_auditor {
-                    Some(auditor) => auditor.audit().await,
-                    None => crate::wire::VaultAuditResponse::Unanswered {
-                        reason: "this broca is not configured with the credential vault".into(),
-                    },
-                };
-                send_json_response(&writer, ver, channel, epoch, corr, &answer).await
-            };
-            match log_context {
-                Some((operation, session)) => log_served_request(operation, session, request).await,
-                None => request.await,
+                    // A daemon without the vault auth source still answers, and says it could not
+                    // check: the caller must be able to tell that apart from a clean audit.
+                    let answer = match vault_auditor {
+                        Some(auditor) => auditor.audit().await,
+                        None => crate::wire::VaultAuditResponse::Unanswered {
+                            reason: "this broca is not configured with the credential vault".into(),
+                        },
+                    };
+                    send_json_response(&writer, ver, channel, epoch, corr, &answer).await
+                } => result,
             }
         };
-        tokio::select! {
-            _ = conn_cancel.cancelled() => Ok(()),
-            result = work => result,
+        match log_context {
+            Some((operation, session)) => log_served_request(operation, session, request).await,
+            None => request.await,
         }
     });
     Ok(())
