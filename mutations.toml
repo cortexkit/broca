@@ -16943,7 +16943,7 @@ target = "--lib"
 select = "expected"
 test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
 expect_red = ["session_refs::contention_tests::ref_write_waits_during_census_without_marker_or_rearming"]
-file = "crates/broca-store/src/session_refs.rs"
+file = "crates/broca-store/src/session_refs/write.rs"
 old = '''if remaining.is_zero() {
                         return Err("session-ref store busy timeout waiting for connection".into());'''
 new = '''if true { // NON-VACUITY BREAK: restore instant try_lock failure
@@ -17012,9 +17012,9 @@ target = "--lib"
 select = "expected"
 test_file = "crates/broca-store/src/session_refs/contention_tests.rs"
 expect_red = ["session_refs::contention_tests::persistent_sqlite_contention_waits_until_busy_timeout"]
-file = "crates/broca-store/src/session_refs.rs"
-old = 'remaining.min(std::time::Duration::from_millis(timeout))'
-new = 'std::time::Duration::ZERO /* NON-VACUITY BREAK: fail ordinary SQLite contention instantly */'
+file = "crates/broca-store/src/session_refs/write.rs"
+old = 'with_write_deadline(deadline, || insert(&conn, address, session))'
+new = 'with_write_deadline(std::time::Instant::now(), || insert(&conn, address, session)) /* NON-VACUITY BREAK: fail ordinary SQLite contention instantly */'
 [[control]]
 id = "agent-data-census-short-polls-find-writer-gaps"
 guards = "migration finds short unlocked gaps that SQLite's growing default backoff repeatedly misses"
@@ -17026,7 +17026,7 @@ test_file = "crates/broca-store-contention-tests/src/contention.rs"
 expect_red = ["contention::migration_busy_poll_finds_gaps_missed_by_default_backoff"]
 expect_message = "short polls must find an unlocked gap"
 file = "crates/broca-store/src/busy.rs"
-old = 'conn.busy_handler(Some(wait_for_migration_lock))'
+old = 'conn.busy_handler(Some(wait_for_write_lock))'
 new = 'conn.busy_timeout(STORE_BUSY_TIMEOUT) // NON-VACUITY BREAK: restore the starvation-prone default backoff'
 
 [[control]]
@@ -18138,3 +18138,20 @@ expect_red = ["llm_runner_role::an_idle_start_only_list_does_not_inherit_an_exis
 file = "crates/broca-module-serve/src/serve.rs"
 old = "Some(broca_wire::SendDelivery::Order(modes)) => modes.iter().any(|mode| {"
 new = "Some(broca_wire::SendDelivery::Order(modes)) => !modes.is_empty() || modes.iter().any(|mode| { // NON-VACUITY BREAK: all lists inherit"
+
+[[control]]
+id = "agent-data-ref-index-short-polls-find-writer-gaps"
+guards = "session-ref inserts find short write-lock gaps without reinstalling SQLite default backoff"
+runner = "cargo"
+package = "broca-store-contention-tests"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store-contention-tests/src/contention.rs"
+expect_red = ["contention::ref_index_write_finds_gaps_missed_by_default_backoff"]
+expect_message = "ref-index short polls must find an unlocked gap"
+file = "crates/broca-store/src/session_refs/write.rs"
+old = 'crate::busy::with_write_deadline(deadline, || insert(&conn, address, session))'
+new = '''{ // NON-VACUITY BREAK: restore default backoff on the ref-index connection
+            conn.busy_timeout(remaining).map_err(|error| error.to_string())?;
+            crate::busy::with_write_deadline(deadline, || insert(&conn, address, session))
+        }'''

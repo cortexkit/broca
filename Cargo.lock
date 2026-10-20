@@ -547,6 +547,8 @@ dependencies = [
 name = "broca-store-contention-tests"
 version = "0.3.240"
 dependencies = [
+ "broca-core",
+ "broca-protocol",
  "broca-test-support",
  "rusqlite",
  "tokio",

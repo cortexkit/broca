@@ -73,7 +73,7 @@ pub(super) fn write_batch<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::busy::{configure_migration_connection, BUSY_WAIT_HOOK};
+    use crate::busy::{configure_writer_connection, BUSY_WAIT_HOOK};
 
     #[test]
     fn migration_busy_handler_waits_for_foreground_commit() {
@@ -86,7 +86,7 @@ mod tests {
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
             let conn = Connection::open(path).unwrap();
-            configure_migration_connection(&conn).unwrap();
+            configure_writer_connection(&conn).unwrap();
             BUSY_WAIT_HOOK.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move |delay| {
                     waiting_tx.send(delay).unwrap();

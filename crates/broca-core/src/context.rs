@@ -611,6 +611,9 @@ pub fn catch_up_usage_exports(
             .get(&run.session)
             .expect("every missing run's session was loaded above");
         index.emit_run(records, &run.run_id, resolver)?;
+        // Each emit has released the store connection. Give admissions and the
+        // census a chance to acquire it before the next catch-up transaction.
+        std::thread::yield_now();
     }
     Ok(count)
 }
