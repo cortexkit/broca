@@ -17817,3 +17817,18 @@ expect_red = ["delivery_order_resume::ordered_delivery_receipts_survive_the_stor
 file = "crates/broca-core/src/replay.rs"
 old = "run.delivery = message.tags.delivery().cloned();"
 new = "run.delivery = None; // NON-VACUITY BREAK: lose the ordered receipt at projection"
+
+[[control]]
+id = "serve-session-read-operation-counter"
+guards = "health.check increments the counter for every served management operation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test operation_counters"
+test_file = "crates/broca-module-serve/tests/operation_counters.rs"
+expect_red = ["health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_then_increment"]
+select = "expected"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        count.fetch_add(1, Ordering::Relaxed);"
+new = '''        if operation != "session.read" {
+            count.fetch_add(1, Ordering::Relaxed); // NON-VACUITY BREAK
+        }'''

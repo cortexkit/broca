@@ -144,6 +144,37 @@ run.status { run_id | session }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
 
+### Health counters and per-request diagnostics
+
+`health.check` includes `metrics.management_ops`, a process-lifetime counter for every
+request/response operation in the management manifest and the `session.subscribe` stream. The
+object always contains every operation at zero or above; counts reset when broca restarts. A
+request increments after authorization and migration checks, even when its parameters or handler
+later return an error. Authorization and migration refusals are not counted. The existing
+`session_reads` and `actor_opens` counters remain available with their existing meanings.
+
+To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
+in `subc.jsonc`:
+
+```json
+{
+  "modules": {
+    "broca": {
+      "env": {
+        "CK_LOG": "info,broca.requests=debug"
+      }
+    }
+  }
+}
+```
+
+The root remains at `info`; only the `broca.requests` component is raised to `debug`. Each record
+names the operation and the session string from the route bind, reports `actor_opened` as true only
+when this request successfully opened a new actor, and gives elapsed microseconds. Request
+parameters are not logged. Broca reads `CK_LOG` when its logger starts and does not reload the
+filter, so restart the broca module after changing this setting; reloading configuration alone is
+not enough.
+
 The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
 `session.baseline`) and the newer `session.read` members follow commons
 `cortexkit-role-llm-runner/CONTRACT.md`. In broca's terms:

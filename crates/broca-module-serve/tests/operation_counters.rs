@@ -17,6 +17,27 @@ use subc_protocol::{
 use subc_transport::{read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+const MANAGEMENT_OPERATIONS: &[&str] = &[
+    "session.send",
+    "session.import",
+    "session.retract",
+    "run.cancel",
+    "run.status",
+    "run.event.get",
+    "session.read",
+    "compaction.ready",
+    "role.describe",
+    "session.resolve",
+    "session.head",
+    "run.result",
+    "session.baseline",
+    "session.warm",
+    "cap.install",
+    "spend.delta",
+    "vault.audit",
+    "session.subscribe",
+];
+
 struct RejectingOpener;
 
 #[async_trait]
@@ -176,6 +197,16 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         serde_json::json!(0),
         "actor_opens must start at zero"
     );
+    let mut expected_operation_counts: std::collections::BTreeMap<String, u64> =
+        MANAGEMENT_OPERATIONS
+            .iter()
+            .map(|operation| ((*operation).to_string(), 0))
+            .collect();
+    assert_eq!(
+        before["management_ops"],
+        serde_json::json!(expected_operation_counts),
+        "every manifest management operation has a zero-valued counter"
+    );
 
     bind_route(&mut client_writer, &mut client_reader, &dir.join("proj")).await;
 
@@ -229,6 +260,46 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         serde_json::json!(1),
         "actor_opens must increment after one registry opening"
     );
+    expected_operation_counts.insert("session.read".to_string(), 1);
+    expected_operation_counts.insert("run.cancel".to_string(), 1);
+    assert_eq!(
+        after["management_ops"],
+        serde_json::json!(expected_operation_counts),
+        "one session.read and one run.cancel were served"
+    );
+
+    for (index, operation) in MANAGEMENT_OPERATIONS
+        .iter()
+        .filter(|operation| !matches!(**operation, "session.read" | "run.cancel"))
+        .enumerate()
+    {
+        write_request(
+            &mut client_writer,
+            7,
+            1,
+            10 + index as u64,
+            serde_json::json!({"method": operation, "params": {}}),
+        )
+        .await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), read_one(&mut client_reader))
+            .await
+            .expect("each management request receives a reply");
+        assert!(
+            matches!(reply.header.ty, FrameType::Response | FrameType::Error),
+            "{operation} returned unexpected frame type {:?}",
+            reply.header.ty
+        );
+        *expected_operation_counts
+            .get_mut(*operation)
+            .expect("the operation has a zero counter") += 1;
+        let counts =
+            health_metrics(&mut client_reader, &mut client_writer, 100 + index as u64).await;
+        assert_eq!(
+            counts["management_ops"],
+            serde_json::json!(expected_operation_counts),
+            "{operation} increments its counter exactly once"
+        );
+    }
 
     drop(client_writer);
     drop(client_reader);

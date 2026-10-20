@@ -2739,6 +2739,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "stream_chunks",
         "session_reads",
         "actor_opens",
+        "management_ops",
         // The liveness signal for the scheduled WAL archive. Present even when the knob
         // is unset: zero with no knob is correct, zero on a CONFIGURED daemon that has
         // been up an hour is a defect -- and on 2026-09-14 there was no way to tell a

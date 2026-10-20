@@ -99,6 +99,7 @@ broca-wal = { path = "../broca-wal", features = ["test-known-feature"] }
     # registry (no live daemon, no live LLM) — the streaming/teardown logic is proven there.
 tokio = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "registry", "std"] }
 # The executor's vault tests stand up an in-process subc daemon stand-in that answers the
 # catalog and route-open control requests; these are the typed shapes of those messages.
 # Same workspace pin as broca-subc, so the control types unify.

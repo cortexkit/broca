@@ -131,6 +131,152 @@ pub fn manifest_with_archive(
     manifest_configured(module_id, archive, &ConsumerRoutes::default())
 }
 
+/// The management request list is also the source of `health.check` request-counter names.
+pub(crate) fn management_operations() -> Vec<ManagementOperation> {
+    vec![
+        ManagementOperation {
+            name: OP_SEND.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Admit a prompt and run it to a terminal, or re-drive an existing run idempotently by send_id."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_IMPORT.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Seed an EMPTY lineage with transcript history from another harness; refuses a non-empty lineage."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_RETRACT.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Withdraw a queued submission that has not yet started running.".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_CANCEL.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Stop an in-flight run; the lineage is sealed and is not resumable under the same send_id."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_STATUS.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Point-read one run's state and terminal outcome, scoped to the owning session."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_RUN_EVENT_GET.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Fetch a session-owned run event's exact JCS bytes by its claim-check key (24 hour retention)."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_READ.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Page the durable transcript. Lease-free and write-free, so it serves during a live run."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: "compaction.ready".to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Retry the newest compaction wait, only for the session's frozen provider."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_ROLE_DESCRIBE.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Describe what this build serves of the llm-runner/v1 role: its ops, capability groups and read byte cap."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_RESOLVE.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Answer the stored text of one runner-tagged part, or a character range of it."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_HEAD.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Read the session's lineage, newest ordinal, control head and last run state, without message bodies."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_RUN_RESULT.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Read one run's state and, once it completed, its final message's text.".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_BASELINE.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Read what the session froze at admission. Answered only to the session's owner."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_WARM.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Keep the provider's prompt cache warm: re-send the session's most recent request with no output, and report what it cost."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_CAP_INSTALL.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Install or remove a spend cap. Enforcement is at admission, and refusals fail closed."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_SPEND_DELTA.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Apply a spend increment against an installed cap's watermark.".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_VAULT_AUDIT.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "List the vault credentials broca's grants cover, and name every configured credential the vault did not list."
+                    .to_string(),
+            ),
+        },
+    ]
+}
+
+pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
+    vec![ObservabilitySurface {
+        name: OP_SUBSCRIBE.to_string(),
+        kind: ObservabilityKind::Stream,
+    }]
+}
+
 /// The manifest for a fully configured process: the archive timer's configuration shapes
 /// `self_signals`, and the resolved consumer routes shape `consumes`.
 pub fn manifest_configured(
@@ -295,151 +441,11 @@ pub fn manifest_configured(
             concurrency: Concurrency::ModuleManaged,
             // The request/response ops: send/retract/cancel change state (Mutate); status
             // is a point-read (Query).
-            operations: vec![
-                ManagementOperation {
-                    name: OP_SEND.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Admit a prompt and run it to a terminal, or re-drive an existing run idempotently by send_id."
-                            .to_string(),
-                    ),
-                },
-                // session.import intentionally accepts Principal::Direct. The importer is an
-                // ordinary authenticated local consumer inside the user's host trust boundary;
-                // requiring Reserved/spawn attestation would break that supported caller.
-                ManagementOperation {
-                    name: OP_IMPORT.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Seed an EMPTY lineage with transcript history from another harness; refuses a non-empty lineage."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_RETRACT.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Withdraw a queued submission that has not yet started running."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_CANCEL.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Stop an in-flight run; the lineage is sealed and is not resumable under the same send_id."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_STATUS.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Point-read one run's state and terminal outcome, scoped to the owning session."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_RUN_EVENT_GET.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some("Fetch a session-owned run event's exact JCS bytes by its claim-check key (24 hour retention).".into()),
-                },
-                ManagementOperation {
-                    name: OP_READ.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Page the durable transcript. Lease-free and write-free, so it serves during a live run."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: "compaction.ready".to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Retry the newest compaction wait, only for the session's frozen provider."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_ROLE_DESCRIBE.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Describe what this build serves of the llm-runner/v1 role: its ops, capability groups and read byte cap."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_RESOLVE.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Answer the stored text of one runner-tagged part, or a character range of it."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_HEAD.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Read the session's lineage, newest ordinal, control head and last run state, without message bodies."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_RUN_RESULT.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Read one run's state and, once it completed, its final message's text."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_BASELINE.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "Read what the session froze at admission. Answered only to the session's owner."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_WARM.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Keep the provider's prompt cache warm: re-send the session's most recent request with no output, and report what it cost."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_CAP_INSTALL.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Install or remove a spend cap. Enforcement is at admission, and refusals fail closed."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_SPEND_DELTA.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Apply a spend increment against an installed cap's watermark."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: OP_VAULT_AUDIT.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "List the vault credentials broca's grants cover, and name every configured credential the vault did not list."
-                            .to_string(),
-                    ),
-                },
-            ],
+            operations: management_operations(),
             config_schema: serde_json::json!({ "type": "object" }),
             // session.subscribe is a held-open STREAM, not a request/response op — it lives
             // in observability as a Stream surface.
-            observability: vec![ObservabilitySurface {
-                name: OP_SUBSCRIBE.to_string(),
-                kind: ObservabilityKind::Stream,
-            }],
+            observability: observability_surfaces(),
             // A session is identified by {project_root, harness, session}: the surface is
             // scoped per project + per session.
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
