@@ -727,6 +727,9 @@ place a broca that knows every missing feature. Branch on `code`, then `detail.k
 message keeps the wording the refusal carried before it had its own code and is never
 parsed. These exact bytes are pinned by `crates/broca-wire/tests/golden/wal_newer_writer.json`.
 
+`session.read`'s permanent `history_unreachable` refusal is described in section 15 and
+pinned by `crates/broca-wire/tests/golden/session_read.history_unreachable.json`.
+
 Every other failure to open a session's WAL, corruption included, still answers
 `open_failed`, with the same message. When the producer knows the remedy, it adds
 `detail.class`: `transient`, `permanent`, `auth_required`, or `context_overflow`.
@@ -903,6 +906,12 @@ content deadlines, retry policy, or rate-floor policy.
 bounded WAL tail. The response's optional `head: {wal_seq, sub_index}` is the last durable
 control unit covered by that same snapshot. `session.subscribe {from: head}` therefore
 starts strictly after the read snapshot without a race, gap, or duplicate.
+
+If the materialized store proves the session has history but neither a live nor archived WAL
+can cover it, the read refuses with `history_unreachable` (`class: "permanent"`). Its detail
+contains `class` and `session_ref`, never filesystem paths, so callers can classify the lost
+history without parsing the message. The served bytes are pinned by
+`crates/broca-wire/tests/golden/session_read.history_unreachable.json`.
 
 Paging uses message ordinals, independently of the control cursor. With no arguments, read
 returns the **newest** page: `start = prompt_len - limit` (saturating at zero). An explicit

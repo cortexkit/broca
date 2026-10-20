@@ -184,6 +184,11 @@ pub enum OpenError {
         reason: String,
         class: broca_protocol::ErrorClass,
     },
+    /// The store proves this session has history, but no live or archived WAL can cover it.
+    HistoryUnreachable {
+        session_ref: String,
+        reason: String,
+    },
     /// The session's WAL holds a complete frame that requires WAL features this build does not
     /// know (`missing`): a newer broca wrote it. Kept apart from [`OpenError::Open`] because the
     /// remedy differs: retrying cannot help, only placing a build that knows the features can.
@@ -241,6 +246,7 @@ impl std::fmt::Display for OpenError {
             OpenError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
             OpenError::Open(s)
             | OpenError::Classified { reason: s, .. }
+            | OpenError::HistoryUnreachable { reason: s, .. }
             | OpenError::NewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
@@ -2765,14 +2771,14 @@ impl LineageRegistry {
         let store_has_history =
             snapshot.prefix_len > 0 || snapshot.watermark_seq > 0 || snapshot.last_run_id.is_some();
         if store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) {
-            return Err(OpenError::Classified {
+            return Err(OpenError::HistoryUnreachable {
+                session_ref: broca_core::agent_session_ref(key),
                 reason: format!(
                     "session {} has materialized history (watermark {}; messages {}) but its WAL is unreachable: not live, not archived",
                     broca_core::session_addr(key),
                     snapshot.watermark_seq,
                     snapshot.prefix_len
                 ),
-                class: broca_protocol::ErrorClass::Permanent,
             });
         }
         let lineage_id = tail.lineage_id;
@@ -3658,6 +3664,7 @@ impl LineageRegistry {
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
                         OpenError::Open(reason)
                         | OpenError::Classified { reason, .. }
+                        | OpenError::HistoryUnreachable { reason, .. }
                         | OpenError::NewerWriter { reason, .. } => {
                             tracing::warn!(
                                 target: "lifecycle",

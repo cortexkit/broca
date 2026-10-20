@@ -3431,8 +3431,11 @@ async fn missing_live_wal_rejects_indexed_store_prefix_even_without_archive() {
         .await
         .unwrap_err();
     match error {
-        broca_module::registry::OpenError::Classified { reason, class } => {
-            assert_eq!(class, broca_protocol::ErrorClass::Permanent);
+        broca_module::registry::OpenError::HistoryUnreachable {
+            reason,
+            session_ref,
+        } => {
+            assert_eq!(session_ref, broca_core::agent_session_ref(&key));
             assert!(reason.contains("materialized history"));
         }
         other => panic!("expected a permanent refusal, got {other}"),
@@ -3865,7 +3868,7 @@ async fn session_read_views_refuse_when_the_store_has_history_but_the_wal_is_gon
         .expect_err("the missing WAL makes the materialized transcript incomplete");
     assert!(matches!(
         raw_error,
-        broca_module::ServeError::Open(_, Some(broca_protocol::ErrorClass::Permanent))
+        broca_module::ServeError::HistoryUnreachable { .. }
     ));
     let tools_error = rig
         .registry
@@ -3874,7 +3877,7 @@ async fn session_read_views_refuse_when_the_store_has_history_but_the_wal_is_gon
         .expect_err("tools cannot be reported without the WAL");
     assert!(matches!(
         tools_error,
-        broca_module::ServeError::Open(_, Some(broca_protocol::ErrorClass::Permanent))
+        broca_module::ServeError::HistoryUnreachable { .. }
     ));
 }
 

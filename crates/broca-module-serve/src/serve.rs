@@ -3222,6 +3222,14 @@ async fn send_serve_error(
                 .with_detail(serde_json::json!({"class": "permanent", "max_bytes": max_bytes}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
+        ServeError::HistoryUnreachable { session_ref, .. } => {
+            let body = ErrorBody::new(broca_wire::HISTORY_UNREACHABLE, err.to_string())
+                .with_detail(serde_json::json!({
+                    "class": "permanent",
+                    "session_ref": session_ref,
+                }));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::Expired { expired_at_ms } => {
             let body = ErrorBody::new(broca_module::retention::EXPIRED, err.to_string())
                 .with_detail(

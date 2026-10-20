@@ -17864,16 +17864,22 @@ new = "run.delivery = None; // NON-VACUITY BREAK: lose the ordered receipt at pr
 
 [[control]]
 id = "session-read-refuses-missing-wal-for-indexed-prefix"
-guards = "stored session history is never served as a complete transcript when no WAL source covers it"
+guards = "missing indexed session history keeps its typed history_unreachable refusal instead of generic open_failed"
 runner = "cargo"
-package = "broca-module"
+package = "broca-module-serve"
 target = "--test it"
 select = "expected"
-test_file = "crates/broca-module/tests/it/session_read.rs"
-expect_red = ["session_read::missing_live_wal_rejects_indexed_store_prefix_even_without_archive"]
-file = "crates/broca-module/src/registry.rs"
-old = 'if store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) {'
-new = 'if false && store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK'
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::history_unreachable_refusal_golden_from_real_serve"]
+file = "crates/broca-module/src/serve.rs"
+old = """OpenError::HistoryUnreachable {
+                session_ref,
+                reason,
+            } => ServeError::HistoryUnreachable {
+                session_ref,
+                reason,
+            }"""
+new = 'OpenError::HistoryUnreachable { reason, .. } => ServeError::Open(reason, Some(broca_protocol::ErrorClass::Permanent)), // NON-VACUITY BREAK: map history_unreachable back to open_failed'
 
 
 
