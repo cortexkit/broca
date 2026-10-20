@@ -368,6 +368,7 @@ dependencies = [
  "cortexkit-bus-trait",
  "cortexkit-role-llm-runner",
  "futures",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

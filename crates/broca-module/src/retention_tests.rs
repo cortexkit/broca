@@ -518,6 +518,143 @@ fn enrollment_skips_matching_bytes_and_replays_mismatches() {
     );
 }
 
+fn assert_enrollment_deferred_log(
+    capture: &broca_test_support::LogCapture,
+    kind: &str,
+    level: tracing::Level,
+) {
+    let event = capture
+        .events()
+        .into_iter()
+        .find(|event| {
+            event.target.starts_with("retention") && event.message() == "enrollment deferred"
+        })
+        .expect("enrollment deferral must be logged");
+    assert_eq!(event.level, level);
+    assert_eq!(event.fields.get("kind").map(String::as_str), Some(kind));
+    assert!(event
+        .fields
+        .get("error")
+        .is_some_and(|error| !error.is_empty()));
+    if level == tracing::Level::DEBUG {
+        assert_eq!(event.fields.get("counter").map(String::as_str), Some("1"));
+    }
+}
+
+#[test]
+fn enrollment_defers_a_vanished_wal_at_debug_with_a_counter() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let service = rig.service.clone();
+    *service.before_enroll.lock().unwrap() = Some(Arc::new(move |path| {
+        fs::remove_file(path).unwrap();
+    }));
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| rig.service.enroll().unwrap());
+
+    assert_enrollment_deferred_log(&capture, "vanished_file", tracing::Level::DEBUG);
+}
+
+#[test]
+fn enrollment_warns_with_kind_for_a_mid_write_wal() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    fs::remove_file(path.with_extension("session")).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    let oversized_tail = u32::try_from(bytes.len() + 1).unwrap();
+    bytes[..4].copy_from_slice(&oversized_tail.to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+    assert!(matches!(
+        rig.service.read_enrollment_path(&path),
+        Err(EnrollmentFailure {
+            kind: EnrollmentFailureKind::MidWrite,
+            ..
+        })
+    ));
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| rig.service.enroll().unwrap());
+
+    assert_enrollment_deferred_log(&capture, "mid_write", tracing::Level::WARN);
+}
+
+#[test]
+fn enrollment_warns_with_kind_for_an_unreadable_wal() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    fs::remove_file(path.with_extension("session")).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[5..13].copy_from_slice(&2u64.to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+    assert!(matches!(
+        rig.service.read_enrollment_path(&path),
+        Err(EnrollmentFailure {
+            kind: EnrollmentFailureKind::UnreadableFile,
+            ..
+        })
+    ));
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| rig.service.enroll().unwrap());
+
+    assert_enrollment_deferred_log(&capture, "unreadable_file", tracing::Level::WARN);
+}
+
+#[test]
+fn enrollment_defers_a_busy_store_at_debug_with_a_counter() {
+    let mut rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let index = Arc::new(FailingIndex {
+        store: rig.store.clone(),
+        fail: AtomicBool::new(false),
+        busy_live: AtomicBool::new(true),
+    });
+    rig.service = Arc::new(
+        RetentionService::new(
+            rig.service.wal.clone(),
+            index,
+            rig.leases.clone(),
+            rig.store.clone(),
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+        )
+        .unwrap(),
+    );
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| rig.service.enroll().unwrap());
+
+    assert_enrollment_deferred_log(&capture, "store_busy", tracing::Level::DEBUG);
+}
+
+#[test]
+fn enrollment_classifies_a_real_sqlite_busy_error_as_store_busy() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let blocker = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| rig.service.enroll().unwrap());
+
+    assert_enrollment_deferred_log(&capture, "store_busy", tracing::Level::DEBUG);
+    let event = capture
+        .events()
+        .into_iter()
+        .find(|event| event.fields.get("kind").map(String::as_str) == Some("store_busy"))
+        .expect("the real SQLite busy error must be recorded");
+    let error = event
+        .fields
+        .get("error")
+        .expect("the store error is logged");
+    assert!(
+        error.contains("database is locked") || error.contains("database is busy"),
+        "expected SQLite's busy error, got: {error}"
+    );
+}
+
 #[test]
 fn sweep_confirms_wal_before_tombstoning_a_stale_candidate() {
     let rig = Rig::new();
@@ -1102,9 +1239,13 @@ fn unfinished_deletion_resumes_each_disk_boundary_and_never_moves_a_new_lineage(
 struct FailingIndex {
     store: Arc<SqliteStore>,
     fail: AtomicBool,
+    busy_live: AtomicBool,
 }
 impl RetentionIndex for FailingIndex {
     fn live(&self, key: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+        if self.busy_live.load(Ordering::Relaxed) {
+            return Err("database is locked".into());
+        }
         RetentionIndex::live(self.store.as_ref(), key)
     }
     fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
@@ -1149,6 +1290,7 @@ async fn failed_enrollment_and_active_write_are_repaired_without_a_read_or_resta
     let index = Arc::new(FailingIndex {
         store: rig.store.clone(),
         fail: AtomicBool::new(true),
+        busy_live: AtomicBool::new(false),
     });
     rig.service = Arc::new(
         RetentionService::new(

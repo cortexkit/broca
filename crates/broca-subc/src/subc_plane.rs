@@ -46,9 +46,9 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
-    rejection_code, retry_route_open, retry_route_open_with_scope_hold,
-    route_failure_is_known_dead, ConnError, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold,
-    SubcConnection, ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL,
+    retry_route_open, retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError,
+    RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
+    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
@@ -821,7 +821,7 @@ impl SubcToolPlane {
                     if matches!(
                         &error,
                         ConnError::Rejected(message)
-                            if !is_retryable_route_open(rejection_code(message))
+                            if !is_retryable_route_open(message.code())
                     ) {
                         return Err(conn_to_plane(error));
                     }
@@ -1245,7 +1245,9 @@ impl SubcToolPlane {
                 {
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
                     let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
-                    return DispatchResult::SentButOutcomeUnknown { reason: msg };
+                    return DispatchResult::SentButOutcomeUnknown {
+                        reason: msg.to_string(),
+                    };
                 }
                 if crate::connection::classify_tool_route_refusal(&msg)
                     == crate::connection::ToolRouteRefusal::Reopen
@@ -2272,7 +2274,7 @@ impl ToolPlane for SubcToolPlane {
             .await
             .map_err(|error| {
                 let code = match &error {
-                    ConnError::Rejected(message) => rejection_code(message).to_owned(),
+                    ConnError::Rejected(message) => message.code().to_owned(),
                     _ => SCOPE_UNVERIFIABLE.into(),
                 };
                 ToolPlaneError::ScopeRefused {
@@ -2455,8 +2457,11 @@ pub(crate) fn owner_principal(scope: &SessionScope) -> Result<Principal, String>
 /// The two retryable scope refusals only come back here once the hold has run out, so they
 /// become broca's `scope_unverifiable`. Every other `scope_*` code is terminal and is passed on
 /// by its own name; it was never retried or held. Anything else is an ordinary refusal.
-fn scoped_open_refusal(message: String, hold: Duration) -> RouteEnsureError {
-    let code = rejection_code(&message);
+fn scoped_open_refusal(
+    message: crate::connection::RejectedMessage,
+    hold: Duration,
+) -> RouteEnsureError {
+    let code = message.code();
     if matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED) {
         return RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
             code: SCOPE_UNVERIFIABLE.into(),
@@ -2469,7 +2474,7 @@ fn scoped_open_refusal(message: String, hold: Duration) -> RouteEnsureError {
     if code.starts_with("scope_") {
         return RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
             code: code.to_owned(),
-            detail: message,
+            detail: message.to_string(),
         });
     }
     RouteEnsureError::Connection(ConnError::Rejected(message))
@@ -2838,7 +2843,9 @@ mod tests {
                 .push(module_id.to_string());
             if let Some(error) = script.error {
                 return Err(match error {
-                    ScriptedRouteOpenError::Rejected(message) => ConnError::Rejected(message),
+                    ScriptedRouteOpenError::Rejected(message) => {
+                        ConnError::Rejected(message.into())
+                    }
                     ScriptedRouteOpenError::Transport(message) => ConnError::Transport(message),
                 });
             }

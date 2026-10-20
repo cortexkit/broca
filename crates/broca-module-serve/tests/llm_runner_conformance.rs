@@ -1489,7 +1489,7 @@ impl RunnerRoute for BrocaRoute {
                     // This path keeps only the refusal's code and message.
                     let (code, message) = rejection
                         .split_once(" — ")
-                        .unwrap_or((rejection.as_str(), ""));
+                        .unwrap_or((rejection.as_ref(), ""));
                     break SubscribeOutcome::Refused(subc_protocol::ErrorBody::new(code, message));
                 }
                 Ok(Err(error)) => return Err(RouteFailure::new(error.to_string())),

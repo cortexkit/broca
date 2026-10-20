@@ -3397,8 +3397,8 @@ async fn archived_session_read_matches_live_page_without_extracting() {
 }
 
 #[tokio::test]
-async fn archive_lookup_miss_rejects_store_prefix_but_no_directory_preserves_legacy_read() {
-    let rig = Rig::new("archive-miss", Arc::new(NoopExec));
+async fn missing_live_wal_rejects_indexed_store_prefix_even_without_archive() {
+    let rig = Rig::new("missing-live-wal", Arc::new(NoopExec));
     let key = rig.key("missing");
     append_seed(
         &rig.wal_store,
@@ -3420,46 +3420,23 @@ async fn archive_lookup_miss_rejects_store_prefix_but_no_directory_preserves_leg
         .read_records_range(&key, 0, None, None)
         .unwrap();
     Persister::project_range(rig.store.as_ref(), &key, &range).unwrap();
-    std::fs::remove_file(rig.wal_store.wal_path(&key)).unwrap();
-    let legacy = rig
-        .registry
-        .route_read(&key, Some(0), Some(10))
-        .await
-        .unwrap();
-    assert!(!legacy.messages.is_empty());
-    let dir = rig.dir.join("wal-archive");
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut writer = broca_wal::archive::ArchiveWriter::create(dir.join("fold-1.ark"))
-        .unwrap()
-        .without_feature_floor();
-    writer.append("0000000000000000", &[]).unwrap();
-    writer.seal().unwrap();
+    let path = rig.wal_store.wal_path(&key);
+    std::fs::remove_file(&path).unwrap();
+    assert!(!rig.dir.join("wal-archive").exists());
     assert_eq!(rig.wal_store.wal_present(&key), Some(false));
-    assert!(matches!(
-        rig.wal_store
-            .read_records_range(&key, 0, None, None)
-            .unwrap()
-            .records(),
-        broca_wal::WalRangeRecords::Absent
-    ));
+
     let error = rig
         .registry
         .route_read(&key, Some(0), Some(10))
         .await
         .unwrap_err();
-    // The message names the EVIDENCE, and deliberately shares no phrase with the pre-fix one:
-    // consumers pattern-match this prose because no wire code separates "never existed" from
-    // "existed and unreadable", so reusing the old words would hand every such matcher a
-    // suppression rule for a real fault.
-    let text = error.to_string();
-    assert!(
-        text.contains("materialized message(s) but its WAL is unreachable"),
-        "a lineage the store vouches for must fail loudly: {text}"
-    );
-    assert!(
-        !text.contains("neither a live WAL nor an archived member"),
-        "the retained refusal must not reuse the wording a consumer may suppress: {text}"
-    );
+    match error {
+        broca_module::registry::OpenError::Classified { reason, class } => {
+            assert_eq!(class, broca_protocol::ErrorClass::Permanent);
+            assert!(reason.contains("materialized history"));
+        }
+        other => panic!("expected a permanent refusal, got {other}"),
+    }
 }
 
 /// A BRAND-NEW SESSION ON A FOLDED TREE MUST READ AS EMPTY, NOT REFUSE.
@@ -3867,11 +3844,10 @@ async fn include_tools_on_a_session_with_no_episode_omits_tools() {
     assert!(!bytes.contains("tools"), "{bytes}");
 }
 
-/// When the store holds a transcript but the WAL that recorded its episodes is gone, the tools
-/// cannot be read. That is an error, not an absent `tools`, which would claim the session never
-/// had an episode.
+/// When the store holds a transcript but the WAL that recorded its episodes is gone, every
+/// `session.read` view refuses; omitting only the tools would incorrectly suggest a new session.
 #[tokio::test]
-async fn include_tools_refuses_when_the_store_has_history_but_the_wal_is_gone() {
+async fn session_read_views_refuse_when_the_store_has_history_but_the_wal_is_gone() {
     let rig = Rig::new("include-tools-wal-gone", Arc::new(NoopExec));
     let key = rig.key("wal-gone");
     write_legacy_seed(&rig.wal_store, &key, &two_episode_tool_seed(&key));
@@ -3881,20 +3857,25 @@ async fn include_tools_refuses_when_the_store_has_history_but_the_wal_is_gone() 
         .expect("materialize both episodes");
     std::fs::remove_file(rig.wal_store.wal_path(&key)).expect("remove the WAL");
 
-    // Without the opt-in the materialized prefix is still served, as before.
-    rig.registry
+    // Raw and tool-inclusive reads must refuse rather than serve the store prefix alone.
+    let raw_error = rig
+        .registry
         .read(read_request(&key, Some(0), Some(10)))
         .await
-        .expect("the prefix alone still reads");
-    let error = rig
+        .expect_err("the missing WAL makes the materialized transcript incomplete");
+    assert!(matches!(
+        raw_error,
+        broca_module::ServeError::Open(_, Some(broca_protocol::ErrorClass::Permanent))
+    ));
+    let tools_error = rig
         .registry
         .read(read_request_with_tools(&key, Some(0), Some(10)))
         .await
         .expect_err("tools cannot be reported without the WAL");
-    assert!(
-        error.to_string().contains("no readable RunStarted"),
-        "{error}"
-    );
+    assert!(matches!(
+        tools_error,
+        broca_module::ServeError::Open(_, Some(broca_protocol::ErrorClass::Permanent))
+    ));
 }
 
 /// A steered message reads back as a user message where the model saw it: written during the

@@ -32,11 +32,18 @@ use std::path::Path;
 /// Levels at or above the default root. Anything else vanishes on an unconfigured daemon.
 const VISIBLE: [&str; 3] = ["warn", "info", "error"];
 
-// These targets carry no operator-facing information: they are opt-in wire milestones that
-// the CI rig enables through CK_LOG to locate a stall. Losing them at INFO hides nothing an
-// operator needs. Only exact literal targets at DEBUG qualify; TRACE and every other target
-// stay refused, so this exception cannot silently demote ordinary operational logs.
-const DIAGNOSTIC_TARGETS: [&str; 4] = ["wire.describe", "wire.ingress", "wire.egress", "subc.wire"];
+// These targets are opt-in diagnostics: the wire milestones help locate a stall, and the
+// retention enrollment event counts retryable races that are not operator alerts. Losing them
+// at INFO hides no information that requires immediate action. Only exact literal targets at
+// DEBUG qualify; TRACE and every other target stay refused, so this exception cannot silently
+// demote ordinary operational logs.
+const DIAGNOSTIC_TARGETS: [&str; 5] = [
+    "wire.describe",
+    "wire.ingress",
+    "wire.egress",
+    "subc.wire",
+    "retention.enrollment",
+];
 
 fn diagnostic_debug_site(invocation: &str) -> bool {
     let Some(arguments) = invocation.strip_prefix("debug!") else {

@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_protocol::scope::{ScopeSelector, CAP_SCOPES_V1};
 
-use crate::connection::{rejection_code, ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
+use crate::connection::{ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
 
 pub const CONSENT_MODULE: &str = "cingulate";
 // ApprovalCursor requires an incarnation string, but consent supplies only a
@@ -124,8 +124,8 @@ impl From<ConnError> for ConsentError {
     fn from(error: ConnError) -> Self {
         match error {
             ConnError::Rejected(message) => Self::Refused {
-                code: rejection_code(&message).to_owned(),
-                message,
+                code: message.code().to_owned(),
+                message: message.to_string(),
                 detail: None,
             },
             ConnError::Protocol(message) => Self::Protocol(message),

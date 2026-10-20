@@ -151,7 +151,9 @@ impl SessionClient {
         session: BindIdentity,
         timeout: std::time::Duration,
     ) -> Result<Self, ConnError> {
-        session.validate_keyable().map_err(ConnError::Rejected)?;
+        session
+            .validate_keyable()
+            .map_err(|message| ConnError::Rejected(message.into()))?;
         let deadline = std::time::Instant::now() + timeout;
         // The connection layer retries a temporary refusal within the caller's timeout (so
         // `Duration::ZERO` stays a single attempt); this loop additionally retries every other

@@ -133,10 +133,70 @@ pub struct ModuleHealthSnapshot {
     pub metrics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedMessage {
+    code: Option<String>,
+    message: String,
+    text: String,
+}
+
+impl RejectedMessage {
+    fn structured(code: String, message: String) -> Self {
+        let text = format!("{code} — {message}");
+        Self {
+            code: Some(code),
+            message,
+            text,
+        }
+    }
+
+    pub(crate) fn code(&self) -> &str {
+        self.code
+            .as_deref()
+            .unwrap_or_else(|| rejection_code(&self.text))
+    }
+}
+
+impl From<String> for RejectedMessage {
+    fn from(text: String) -> Self {
+        Self {
+            code: None,
+            message: text.clone(),
+            text,
+        }
+    }
+}
+
+impl From<&str> for RejectedMessage {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_owned())
+    }
+}
+
+impl std::ops::Deref for RejectedMessage {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
+    }
+}
+
+impl AsRef<str> for RejectedMessage {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for RejectedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 #[derive(Debug)]
 pub enum ConnError {
     /// subc returned a typed Error frame (route reject, tool/route failure).
-    Rejected(String),
+    Rejected(RejectedMessage),
     /// Transport / protocol failure on the consumer connection.
     Transport(String),
     /// A control/route reply didn't match the expected shape.
@@ -2718,10 +2778,10 @@ fn reverse_request_refusal(request: &Frame) -> Result<Frame, subc_protocol::Fram
     )
 }
 
-fn decode_error_body(body: &[u8]) -> String {
+fn decode_error_body(body: &[u8]) -> RejectedMessage {
     match serde_json::from_slice::<subc_protocol::ErrorBody>(body) {
-        Ok(e) => format!("{} — {}", e.code, e.message),
-        Err(_) => String::from_utf8_lossy(body).into_owned(),
+        Ok(error) => RejectedMessage::structured(error.code, error.message),
+        Err(_) => String::from_utf8_lossy(body).into_owned().into(),
     }
 }
 
@@ -2862,11 +2922,9 @@ where
         match attempt().await {
             Ok(handle) => return Ok(handle),
             Err(ConnError::Rejected(message))
-                if subc_protocol::error_codes::is_retryable_route_open(rejection_code(
-                    &message,
-                )) =>
+                if subc_protocol::error_codes::is_retryable_route_open(message.code()) =>
             {
-                let code = rejection_code(&message);
+                let code = message.code();
                 let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
                 let deadline = held.map_or(retry.deadline, |hold| hold.deadline);
                 let remaining = deadline.saturating_duration_since(time::Instant::now());
@@ -2903,14 +2961,20 @@ where
     }
 }
 
-/// Whether a `Rejected` message is the daemon router's `unknown_channel` error — the
-/// signature of a freed route channel (the target module was drain-restarted, so the
-/// request never reached it). Callers holding a cached route treat it as "evict and
-/// re-open", never as a module-level answer. Rejection strings are `"{code} — {message}"`
-/// (see [`decode_error_body`]), so the extracted code is compared exactly; a future
-/// `unknown_channel_v2` must not be silently treated as a freed route.
-pub fn rejection_is_unknown_channel(rejection: &str) -> bool {
-    rejection_code(rejection) == "unknown_channel"
+/// Whether a daemon rejection names the router's freed-route code. Parsed `ErrorBody` refusals
+/// compare their structured code; only unstructured legacy text falls back to the old wire format.
+pub fn rejection_is_unknown_channel(rejection: &RejectedMessage) -> bool {
+    if rejection
+        .code
+        .as_deref()
+        .is_some_and(|code| code == "unknown_channel")
+    {
+        true
+    } else if rejection.code.is_none() {
+        rejection_code(&rejection.text) == "unknown_channel"
+    } else {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2920,11 +2984,11 @@ pub(crate) enum ToolRouteRefusal {
     Other,
 }
 
-pub(crate) fn classify_tool_route_refusal(rejection: &str) -> ToolRouteRefusal {
+pub(crate) fn classify_tool_route_refusal(rejection: &RejectedMessage) -> ToolRouteRefusal {
     // Retrying provider route_not_bound and route_reclaimed refusals is safe only because
     // the provider guarantees they happen before dispatch. An in-flight reclaimed call
     // may have applied side effects and must never be re-sent; unfamiliar codes stay errors.
-    match rejection_code(rejection) {
+    match rejection.code() {
         "unknown_channel" | "route_not_bound" | "route_reclaimed" => ToolRouteRefusal::Reopen,
         "outcome_unknown_root_reclaimed" => ToolRouteRefusal::OutcomeUnknown,
         _ => ToolRouteRefusal::Other,
@@ -3450,14 +3514,25 @@ mod tests {
     }
 
     #[test]
-    fn unknown_channel_rejection_requires_the_exact_code() {
-        assert!(rejection_is_unknown_channel("unknown_channel — route gone"));
-        assert!(!rejection_is_unknown_channel("unknown_channel: 10"));
+    fn unknown_channel_rejection_uses_the_structured_code() {
+        let decode = |code: &str, message: &str| {
+            let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(code, message)).unwrap();
+            decode_error_body(&body)
+        };
+        let unknown = decode("unknown_channel", "unknown_channel — route gone");
+        assert_eq!(unknown.code(), "unknown_channel");
+        assert!(rejection_is_unknown_channel(&unknown));
+
+        let misleading = decode("module_warming", "unknown_channel — route gone");
+        assert_eq!(misleading.code(), "module_warming");
+        assert!(!rejection_is_unknown_channel(&misleading));
+
+        // Only a refusal without a structured ErrorBody code uses the legacy text fallback.
+        let legacy: RejectedMessage = "unknown_channel — route gone".into();
+        assert!(rejection_is_unknown_channel(&legacy));
+        assert!(!rejection_is_unknown_channel(&"unknown_channel: 10".into()));
         assert!(!rejection_is_unknown_channel(
-            "unknown_channels — route gone"
-        ));
-        assert!(!rejection_is_unknown_channel(
-            "module_warming — still starting"
+            &"unknown_channels — route gone".into()
         ));
     }
 
@@ -5452,7 +5527,7 @@ mod tests {
                 None,
                 || {
                     attempts.fetch_add(1, Ordering::SeqCst);
-                    async move { Err(ConnError::Rejected(format!("{code} — not yet"))) }
+                    async move { Err(ConnError::Rejected(format!("{code} — not yet").into())) }
                 },
             )
             .await;
