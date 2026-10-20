@@ -722,7 +722,7 @@ async fn run(args: Args) -> Result<i32, String> {
                 }
                 Some(rid) => {
                     let status = client
-                        .run_status(&rid)
+                        .run_status_reply(&rid)
                         .await
                         .map_err(|e| format!("run_status: {e}"))?;
                     emit(

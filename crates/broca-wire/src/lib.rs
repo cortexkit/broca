@@ -1172,7 +1172,10 @@ mod approval_wire_tests {
             let golden = std::str::from_utf8(&bytes).unwrap().trim_end();
             let value: serde_json::Value = serde_json::from_str(golden).unwrap();
             let reply = value.get("result").unwrap_or(&value);
-            let status: RunStatusResponse = serde_json::from_value(reply.clone()).unwrap();
+            // Decoded as the whole `run.status` answer, so the answers for a queued send's run
+            // id (`pending`, or a joined run's status with its `delivered` receipt) are checked
+            // the same way.
+            let status: RunStatusReply = serde_json::from_value(reply.clone()).unwrap();
             let encoded = serde_json::to_vec(&status).unwrap();
             let expected = serde_json::to_vec(reply).unwrap();
             let normalized: serde_json::Value =
@@ -1658,6 +1661,57 @@ impl RunStatusResponse {
             Self::Unknown => None,
         }
     }
+}
+
+/// The `run.status {run_id}` answer as it goes out on the wire.
+///
+/// Almost always a run's own status. A queued send's reply names only its submission id
+/// (`sub-<run id>`), and callers poll `run.status` on the run id inside it, so broca answers
+/// that id for as long as the send exists, even when the send never becomes a run of its own.
+/// This is a broca extension beyond the llm-runner role contract, which answers an id that
+/// names no run `unknown`:
+///
+/// - while the send is queued: `{"state": "pending"}`;
+/// - once it was delivered into a run that was already going (as a steer, say): that run's
+///   whole status, plus `delivered: {as: "step", ref: <that run's id>}`;
+/// - once it started its own run: that run's status, which is an ordinary run status;
+/// - once it ended undelivered: `{"state": "superseded"}`, `{"state": "expired"}` or
+///   `{"state": "retracted"}`, for good.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RunStatusReply {
+    Run {
+        #[serde(flatten)]
+        status: Box<RunStatusResponse>,
+        /// Set only when the asked id is a queued send delivered into another run: `status`
+        /// is then that run's, and `ref` names it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivered: Option<cortexkit_role_llm_runner::send::Delivered>,
+    },
+    Send(QueuedSendState),
+}
+
+impl From<RunStatusResponse> for RunStatusReply {
+    fn from(status: RunStatusResponse) -> Self {
+        Self::Run {
+            status: Box::new(status),
+            delivered: None,
+        }
+    }
+}
+
+/// The state of a queued send that is not, or never became, a run: see [`RunStatusReply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum QueuedSendState {
+    /// Queued and not yet delivered.
+    Pending,
+    /// Replaced by a newer send under the same dedupe key; never delivered.
+    Superseded,
+    /// Its expiry passed before it was delivered; never delivered.
+    Expired,
+    /// Withdrawn by `session.retract` before it started.
+    Retracted,
 }
 
 /// One decoded subscribe-stream event.

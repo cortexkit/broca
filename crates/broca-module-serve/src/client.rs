@@ -291,6 +291,19 @@ impl SessionClient {
             .await
     }
 
+    /// [`Self::run_status`] as the wire answers it, including broca's answer for the run id of
+    /// a queued send that is not a run (see [`broca_wire::RunStatusReply`]).
+    pub async fn run_status_reply(
+        &self,
+        run_id: &str,
+    ) -> Result<broca_wire::RunStatusReply, ConnError> {
+        let params = StatusParams {
+            run_id: Some(run_id.to_string()),
+        };
+        self.request("run.status", &params, "decode run_status")
+            .await
+    }
+
     /// `session.read`: read a durable transcript page. An omitted `from_ordinal` returns the
     /// newest page; an explicit ordinal starts a forward range.
     pub async fn read(
