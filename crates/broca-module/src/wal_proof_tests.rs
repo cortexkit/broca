@@ -198,7 +198,6 @@ impl Fixture {
             lease: Some(lease),
             writer: Some(writer),
             executor: executor.clone(),
-            compaction_inbox: Arc::default(),
             wal_store,
             registry: registry.handle(),
             rx,

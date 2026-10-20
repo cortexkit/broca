@@ -84,9 +84,8 @@ pub trait RunExecutor: Send + Sync + 'static {
         None
     }
 
-    /// The adapter that calls the compaction provider. Its presence enables compaction
-    /// writes; the actor supplies it through `RunControl`, together with a session-owned
-    /// mailbox that wakes a waiting run on an accepted `compaction.ready` hint.
+    /// The adapter that calls the compaction provider's Setup. Its presence enables
+    /// compaction writes; the actor supplies it through `RunControl`.
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         None
     }

@@ -5,14 +5,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
-    compaction::{COMPACTION_CALL_BUDGET_MS, COMPACTION_STEP_WAIT_CAP_MS},
+    compaction::COMPACTION_CALL_BUDGET_MS,
     compaction_provider::{
-        answer::StepAnswer,
         describe::check_describe,
         errors::KnownCode,
         ops,
         setup::{SetupAnswer, SetupRequest},
-        status::StepStatus,
         OpRequest, ROLE, VERSION,
     },
     CompactionPlane, CompactionUnavailable,
@@ -64,30 +62,6 @@ impl SubcCompactionPlane {
             .map_err(|_| CompactionUnavailable)
     }
 
-    /// Do not retry an issued compaction request. Core records each failed call or timeout and
-    /// decides whether a later step should issue a fresh request id.
-    pub async fn step_with_deadline(
-        &self,
-        provider: &str,
-        bind: &BindIdentity,
-        request: StepStatus,
-        deadline: Instant,
-    ) -> Result<StepAnswer, CompactionUnavailable> {
-        if request.session != bind.session || request.harness != bind.harness {
-            return Err(CompactionUnavailable);
-        }
-        self.route
-            .call(
-                provider,
-                bind,
-                &OpRequest::new(ops::COMPACTION_STEP, &request),
-                bounded(deadline),
-                false,
-            )
-            .await
-            .map_err(|_| CompactionUnavailable)
-    }
-
     pub async fn close_session_routes(&self, bind: &BindIdentity) {
         self.route.close_session_routes(bind).await;
     }
@@ -95,7 +69,7 @@ impl SubcCompactionPlane {
     /// `provider`'s answer to `role.describe`, asked on a fresh `compaction-provider: v1`
     /// route that is closed again before this returns. Fetch-plan admission calls this to learn
     /// whether a plan's compaction provider serves the role before it admits the session's
-    /// first send. Neither `compaction.setup` nor `compaction.step` is sent, and the cached
+    /// first send. `compaction.setup` is not sent, and the cached
     /// routes those calls reuse are left alone.
     ///
     /// A refusal of the describe is the provider saying it does not serve the role
@@ -168,30 +142,6 @@ impl CompactionPlane for SubcCompactionPlane {
             bounded(Instant::now() + Duration::from_millis(COMPACTION_CALL_BUDGET_MS)),
         )
         .await
-    }
-
-    async fn step(
-        &self,
-        provider: &str,
-        bind: &BindIdentity,
-        request: StepStatus,
-    ) -> Result<StepAnswer, CompactionUnavailable> {
-        if request.session != bind.session || request.harness != bind.harness {
-            return Err(CompactionUnavailable);
-        }
-        // Core refuses to apply answers after its configured call deadline. Keep the RPC
-        // alive for at most the compaction wait cap so a delayed response can still be
-        // recorded and discarded under its original request id, without issuing another call.
-        self.route
-            .call(
-                provider,
-                bind,
-                &OpRequest::new(ops::COMPACTION_STEP, &request),
-                Instant::now() + Duration::from_millis(COMPACTION_STEP_WAIT_CAP_MS),
-                false,
-            )
-            .await
-            .map_err(|_| CompactionUnavailable)
     }
 }
 

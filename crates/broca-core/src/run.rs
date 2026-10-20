@@ -564,15 +564,11 @@ pub struct RunControl {
     pub elicitation_plane: Option<Arc<dyn crate::tool_plane::ElicitationPlane>>,
     /// Adapter on the module-level role route stack, alongside the write-time hook plane.
     pub compaction_plane: Option<Arc<dyn crate::compaction::CompactionPlane>>,
-    /// Limits for compaction Setup/step calls and the cumulative wait within one model step.
-    /// Default uses COMPACTION_CALL_BUDGET_MS and COMPACTION_STEP_WAIT_CAP_MS.
+    /// The budget for the compaction Setup call. Default uses COMPACTION_CALL_BUDGET_MS.
     pub compaction_config: crate::compaction::CompactionConfig,
-    /// Session-owned ready mailbox, shared with the inbound management operation.
-    pub compaction_inbox: Option<Arc<crate::compaction::CompactionInbox>>,
-    /// Session cache clock caps compaction waits by the prompt cache's remaining lifetime.
-    pub compaction_cache_clock: Option<crate::CacheClock>,
-    /// Explicit rebuild (flush or manifest change) reported by the session owner.
-    pub compaction_prefix_rebuilding: Option<String>,
+    /// Views fetched from the session's compaction provider, offered at each step boundary.
+    /// Absent, the session renders Setup's message and the views it already applied.
+    pub compaction_views: Option<Arc<dyn crate::compaction::CompactionViews>>,
     #[cfg(feature = "test-clock")]
     pub test_compaction: Option<crate::compaction::test_control::Config>,
 }
@@ -634,10 +630,8 @@ impl Default for RunControl {
             clock: None,
             cancel: None,
             compaction_plane: None,
+            compaction_views: None,
             compaction_config: Default::default(),
-            compaction_inbox: None,
-            compaction_cache_clock: None,
-            compaction_prefix_rebuilding: None,
             #[cfg(feature = "test-clock")]
             test_compaction: None,
             provider_call_timeout: None,
@@ -1382,8 +1376,6 @@ where
                 clock.refresh().map_err(|e| RunError::Wal(e.to_string()))?;
             }
             control.compaction_config.call_budget_ms = config.call_timeout_ms;
-            control.compaction_config.step_wait_cap_ms =
-                config.wait_cap_ms.min(config.prompt_cache_lifetime_ms);
             control.admitted_context_limit = Some(config.context_window);
             req.generation.max_output_tokens = Some(
                 config
@@ -2723,18 +2715,8 @@ where
             .filter(|state| state.open_wait.is_some())
             .cloned()
         {
-            let provider_name = state.provider.clone();
-            let runtime = crate::compaction::runtime::Runtime {
-                provider: &provider_name,
-                bind: &req.session,
-                plane: control.compaction_plane.as_ref(),
-                inbox: control.compaction_inbox.as_ref(),
-                writer,
-                control,
-                replies: &crate::compaction::runtime::CompactionReplies::new(),
-            };
-            if let Some(crate::compaction::runtime::StepResult::Terminal(reason, error)) =
-                runtime.recover_wait(&mut state).await?
+            if let Some(crate::compaction::runtime::Terminal(reason, error)) =
+                crate::compaction::runtime::seal_recorded_wait(writer, &mut state).await?
             {
                 let run_id = prior.run_id.clone().unwrap_or_else(|| req.run_id.clone());
                 admit(&mut on_admitted, Ok(run_id.clone()));
@@ -2978,30 +2960,16 @@ where
     });
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
-    let mut replayed_compaction_answer = is_resume
-        && !append_episode
-        && compaction_state
-            .as_ref()
-            .is_some_and(|state| state.pending_answer);
+    // The newest fetched view this run will not apply (refused, rejected or stale), and the
+    // newest one a notice already reported, so neither is offered or reported twice.
+    let mut declined_view: Option<u64> = None;
+    let mut reported_view: Option<u64> = None;
     let mut compaction_history = prior.compaction_history.clone();
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
         .transpose()
         .map_err(RunError::Wal)?
         .flatten();
-    // The bounded reply channel owns queue storage for the whole run. Allocate it only
-    // for a frozen compaction plan, so ordinary tool steps do not retain unused capacity.
-    let compaction_replies =
-        crate::compaction::runtime::CompactionReplies::for_plan(compaction_item.is_some());
-    #[cfg(feature = "test-clock")]
-    let compaction_replies = compaction_replies.map(|replies| {
-        replies.with_test_root(
-            control
-                .test_compaction
-                .as_ref()
-                .map(|config| config.root.clone()),
-        )
-    });
     let compaction_runtime =
         compaction_item
             .as_ref()
@@ -3009,12 +2977,8 @@ where
                 provider,
                 bind: &hook_bind,
                 plane: control.compaction_plane.as_ref(),
-                inbox: control.compaction_inbox.as_ref(),
                 writer,
                 control,
-                replies: compaction_replies
-                    .as_ref()
-                    .expect("compaction item owns replies"),
             });
     let recovered_cancel = is_resume && !append_episode && prior.cancel_at.is_some();
     if recovered_cancel {
@@ -4119,10 +4083,6 @@ where
     // The typed terminal error, set only when the loop breaks with `Error`. Persisted on
     // the durable RunFinished so the control-stream projection can surface the cause.
     let mut terminal_error: Option<ProviderError> = None;
-    // Raw status values must never include model-only repetition guidance. The full prompt
-    // remains the render-time fold; retain native final values separately for provider status.
-    let mut explicit_rebuild = control.compaction_prefix_rebuilding.clone();
-
     // Reuse one immutable request snapshot for the whole turn loop. The renderer owns a
     // cloned Arc while its blocking job runs, so every append below first proves that no
     // in-flight render can force a copy of the durable prompt.
@@ -4350,7 +4310,7 @@ where
                 setup.newest = raw
                     .last()
                     .and_then(|message| message.ordinal)
-                    .map(|ordinal| crate::compaction_provider::status::MessageRef {
+                    .map(|ordinal| crate::compaction_provider::lineage::MessageRef {
                         ordinal,
                         mid: format!("m{ordinal}"),
                     });
@@ -4368,90 +4328,71 @@ where
                 }
             }
             let state = compaction_state.as_mut().expect("Setup is durable");
-            let view = crate::compaction::model_options(&opts, state);
-            let bytes = provider.render_request(&view).len();
-            let (estimate, cap_estimate) =
-                crate::compaction::request_estimate(bytes, &compaction_history);
-            #[cfg(feature = "test-clock")]
-            let (estimate, cap_estimate) = control
-                .test_compaction
-                .as_ref()
-                .map_or((estimate, cap_estimate), |config| {
-                    (config.request_tokens, Some(config.request_tokens))
-                });
-            let cache = control
-                .compaction_cache_clock
-                .as_ref()
-                .and_then(crate::CacheClock::read);
-            let rebuilding = explicit_rebuild.take().or_else(|| {
-                if compaction_history
-                    .previous_model
-                    .as_ref()
-                    .is_some_and(|model| model != &cfg.model)
+            let session_ref = crate::wal_writer::agent_session_ref(&req.session);
+            let mut view_events = Vec::new();
+            if let Some(views) = &control.compaction_views {
+                let current = state.view.as_ref().map(|applied| applied.view.view_version);
+                if let Some((fetched, ready)) = views
+                    .newest(&session_ref, &lineage_id, current)
+                    .filter(|(fetched, _)| declined_view != Some(fetched.view_version))
                 {
-                    Some("model_switch".into())
-                } else if cache
-                    .and_then(|clock| clock.expires_at_ms())
-                    .is_some_and(|expires| expires <= crate::compaction::now())
-                {
-                    Some("expired_cache".into())
-                } else {
-                    None
-                }
-            });
-            if !replayed_compaction_answer
-                && state.should_call(
-                    &cfg.model.model_id,
-                    compaction_history.usage(),
-                    context_limit,
-                    rebuilding.is_some(),
-                    compaction_history.previous_error,
-                )
-            {
-                let mut status = crate::compaction_provider::status::StepStatus::new(
-                    &req.session.session,
-                    &req.session.harness,
-                    "",
-                    lineage_id,
-                    step_id.0.to_string(),
-                    if completed_steps == 0 {
-                        "user_turn"
-                    } else {
-                        "tool_step"
-                    },
-                    &cfg.model.model_id,
-                    crate::compaction_provider::status::Estimate::new(estimate),
-                    crate::compaction::now(),
-                )
-                .with_model_details(
-                    variant.clone(),
-                    context_limit,
-                    opts.generation.max_output_tokens.map(u64::from),
-                )
-                .with_previous(
-                    compaction_history.previous_usage.clone(),
-                    compaction_history.previous_provider_code.clone(),
-                );
-                status.estimate.previous_input = compaction_history
-                    .usage()
-                    .and_then(|usage| usage.fill_tokens());
-                status.prefix_rebuilding = rebuilding
-                    .map(|reason| crate::compaction_provider::status::PrefixRebuild { reason });
-                if let crate::compaction::runtime::StepResult::Terminal(reason, error) =
-                    Box::pin(runtime.step(state, status, raw, cap_estimate, cache)).await?
-                {
-                    terminal_error = error.map(|error| *error);
-                    break reason;
+                    let (decision, event) = Box::pin(runtime.offer_view(
+                        state,
+                        &fetched,
+                        &ready,
+                        &lineage_id,
+                        raw,
+                        provider.reasoning_is_prefix_bound(),
+                    ))
+                    .await?;
+                    // A deferred view is offered again at every later boundary; any other
+                    // view this run will not apply is not offered again.
+                    if !matches!(
+                        decision,
+                        crate::compaction::view::Decision::Apply(_)
+                            | crate::compaction::view::Decision::Defer(_)
+                    ) {
+                        declined_view = Some(fetched.view_version);
+                    }
+                    if reported_view != Some(fetched.view_version) {
+                        if let Some(event) = event {
+                            view_events.push(event);
+                            reported_view = Some(fetched.view_version);
+                        }
+                    }
                 }
             }
-            model_opts = Some(Arc::new(crate::compaction::model_options(&opts, state)));
+            let view = crate::compaction::model_options(&opts, state);
+            let (estimate, _) = crate::compaction::request_estimate(
+                provider.render_request(&view).len(),
+                &compaction_history,
+            );
+            // Tell the provider what the session wrote since its last notice. The notice is
+            // durable in the WAL before the model call, and the bus publisher projects it from
+            // there, so it is never published before it is durable.
+            if let Some(notice) = crate::compaction::view::next_notice(
+                state,
+                raw,
+                crate::compaction::view::NoticeFacts {
+                    session_ref,
+                    lineage_id: &lineage_id,
+                    est_tokens: estimate,
+                    model: &cfg.model.model_id,
+                    window: context_limit,
+                    usage: compaction_history.usage(),
+                    events: view_events,
+                },
+            ) {
+                runtime.record_notice(state, notice).await?;
+            }
+            model_opts = Some(Arc::new(view));
             #[cfg(feature = "test-clock")]
             {
-                // The model prompt is the replacement followed by the retained raw tail.
-                // CompactionMessage/CompactionAnswer preserve the replacement and cursor;
-                // RunStarted, ModelStepFinished and ToolResult preserve the raw transcript.
-                // Sync those ingredients before model I/O so a crash can rebuild the
-                // identical prompt rather than request another compaction answer.
+                // The model prompt is Setup's message or the applied view, with the raw
+                // transcript. CompactionMessage and CompactionViewApplied preserve the first;
+                // RunStarted, ModelStepFinished and ToolResult preserve the second. Sync them
+                // before model I/O so a crash rebuilds the identical prompt rather than ask
+                // the provider again.
                 writer.sync().await?;
                 crate::compaction::test_control::barrier(
                     control.clock.as_ref(),
@@ -4460,7 +4401,6 @@ where
                 )
                 .await?;
             }
-            replayed_compaction_answer = false;
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
@@ -4480,11 +4420,8 @@ where
         // Complete attempts still share the step's existing barrier.
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
-        let completed_at = std::sync::atomic::AtomicU64::new(0);
-        let compaction_completed_at = &completed_at;
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             Box::pin(async move {
-                compaction_completed_at.store(attempt.ts_ms, std::sync::atomic::Ordering::Relaxed);
                 if let Some(warm) = &control.keep_warm {
                     warm.note_attempt(&attempt);
                 }
@@ -4525,10 +4462,7 @@ where
             ));
             // Keep the same pinned model future while filing delayed receipts; no receipt may
             // cancel, restart, or change the request already being streamed by the provider.
-            let model_result = match (&compaction_runtime, &mut compaction_state) {
-                (Some(runtime), Some(state)) => runtime.with_replies(state, model_step).await??,
-                _ => model_step.await?,
-            };
+            let model_result = model_step.await?;
             let mut step = match model_result {
                 Ok(step) => step,
                 Err(reason) => break Err(reason),
@@ -4602,14 +4536,6 @@ where
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
-                    compaction_history.previous_usage = crate::compaction::wire_usage(
-                        usage,
-                        compaction_completed_at.load(std::sync::atomic::Ordering::Relaxed),
-                        finish_reason
-                            .and_then(|reason| serde_json::to_value(reason).ok())
-                            .and_then(|v| v.as_str().map(str::to_owned))
-                            .unwrap_or_else(|| "unknown".into()),
-                    );
                     compaction_history.previous_provider_code = None;
                     compaction_history.previous_error = false;
                     compaction_history.previous_request_bytes = Some(bytes);
@@ -5155,10 +5081,7 @@ where
             approval_history.as_mut(),
             req.on_restart == Some(broca_protocol::request::OnRestart::Resume),
         ));
-        let mut batch = match (&compaction_runtime, &mut compaction_state) {
-            (Some(runtime), Some(state)) => runtime.with_replies(state, batch_future).await??,
-            _ => batch_future.await?,
-        };
+        let mut batch = batch_future.await?;
 
         if batch.interruption == Some(BatchInterruption::RestartPause) {
             return pause_approval(

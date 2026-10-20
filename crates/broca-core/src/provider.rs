@@ -52,6 +52,14 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether the model provider binds signed reasoning to the bytes before it, rejecting a
+    /// request in which those bytes changed (Anthropic's thinking signatures). A compaction
+    /// view that changes them is deferred or applied with the companion strip of that
+    /// reasoning. The default, false, is a provider that echoes reasoning without such a bind.
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        false
+    }
+
     /// Apply only after the downgrade record is durable. Subsequent renders and steps must
     /// use this decision; a resumed provider is reconstructed from replay's updated config.
     fn downgrade_structured_output(&self) {}
@@ -206,6 +214,10 @@ impl Provider for Box<dyn Provider> {
 
     fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
         (**self).structured_output_grammar_rejection(error)
+    }
+
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        (**self).reasoning_is_prefix_bound()
     }
 
     fn downgrade_structured_output(&self) {

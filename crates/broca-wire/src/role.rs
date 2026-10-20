@@ -818,7 +818,7 @@ mod pinned_reply_bytes {
     }
 
     #[test]
-    fn synchronous_writer_does_not_declare_published_compaction() {
+    fn compaction_and_model_view_are_not_declared_yet() {
         use cortexkit_role_llm_runner::describe::check_describe;
         let encoded =
             serde_json::to_value(broca_role_describe_with_writers("test", true, false, false))
@@ -856,7 +856,7 @@ mod pinned_reply_bytes {
                     assert!(!encoded["majors"][0]["ops"]
                         .as_array()
                         .unwrap()
-                        .contains(&serde_json::json!(crate::OP_COMPACTION_READY)));
+                        .contains(&serde_json::json!("compaction.ready")));
                     assert_eq!(encoded.get("retention").is_some(), retention);
                 }
             }

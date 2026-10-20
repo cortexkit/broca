@@ -452,7 +452,9 @@ fn repairable_import_prefix(
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionAnswer { .. }
-            | WalRecord::CompactionWait { .. } => {}
+            | WalRecord::CompactionWait { .. }
+            | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational too, so it neither makes nor breaks a
             // repairable import prefix.
             WalRecord::ModelAttemptFinished { .. } => {}

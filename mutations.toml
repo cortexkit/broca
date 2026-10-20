@@ -4852,18 +4852,6 @@ old = "&args.sessions,"
 new = "&[], // NON-VACUITY BREAK"
 
 [[control]]
-id = "compaction-fence-precedes-native-validation"
-guards = "the request and deadline fence takes precedence over replacement structural checks"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::fence_order_size_deadline_version_and_range_are_pinned"]
-file = "crates/broca-core/src/compaction.rs"
-old = "let first = fence::dispose(fence, &probe, arrived);"
-new = "let first = fence::dispose(fence, &probe, 0); // NON-VACUITY BREAK"
-
-[[control]]
 id = "compaction-replacement-byte-ceiling"
 guards = "replacement bytes cannot exceed the independent 8 MiB ceiling"
 runner = "command"
@@ -4882,7 +4870,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::structural_rule_unknown_native_fields_are_refused"]
+expect_red = ["compaction::tests::setup_initial_is_refused_when_broca_cannot_render_it_faithfully"]
 file = "crates/broca-core/src/compaction.rs"
 old = "if !native_fields(value) {"
 new = "if false && !native_fields(value) { // NON-VACUITY BREAK"
@@ -4894,7 +4882,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::structural_rule_cache_prefix_is_refused"]
+expect_red = ["compaction::tests::setup_initial_is_refused_when_broca_cannot_render_it_faithfully"]
 file = "crates/broca-core/src/compaction.rs"
 old = "if message.cache_prefix_blocks.is_some() || message.role == Role::System {"
 new = "if message.role == Role::System { // NON-VACUITY BREAK"
@@ -4906,7 +4894,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::structural_rule_system_is_refused"]
+expect_red = ["compaction::tests::setup_initial_is_refused_when_broca_cannot_render_it_faithfully"]
 file = "crates/broca-core/src/compaction.rs"
 old = "if message.cache_prefix_blocks.is_some() || message.role == Role::System {"
 new = "if message.cache_prefix_blocks.is_some() { // NON-VACUITY BREAK"
@@ -4918,7 +4906,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::structural_rule_authored_signed_reasoning_is_refused"]
+expect_red = ["compaction::tests::setup_initial_is_refused_when_broca_cannot_render_it_faithfully"]
 file = "crates/broca-core/src/compaction.rs"
 old = "if !unchanged {"
 new = "if false && !unchanged { // NON-VACUITY BREAK"
@@ -4930,7 +4918,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::structural_rule_origin_fidelity_is_refused"]
+expect_red = ["compaction::tests::setup_initial_is_refused_when_broca_cannot_render_it_faithfully"]
 file = "crates/broca-core/src/compaction.rs"
 old = "original.origin.is_some()"
 new = "false && original.origin.is_some() // NON-VACUITY BREAK"
@@ -4942,130 +4930,22 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::structural_rule_tool_pair_and_range_integrity_is_refused"]
+expect_red = ["compaction::tests::setup_initial_is_refused_when_broca_cannot_render_it_faithfully"]
 file = "crates/broca-core/src/compaction.rs"
 old = ".any(|id| outside.contains(id))"
 new = ".any(|_id| false) /* NON-VACUITY BREAK */"
 
 [[control]]
-id = "compaction-margin-strict-and-known"
-guards = "wait-cap admission requires a known estimate and window strictly below the safety margin"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::compaction_margin_is_strict_and_unknown_window_fails_closed"]
-file = "crates/broca-core/src/compaction.rs"
-old = "< u128::from(window) * u128::from(100 - ESTIMATE_SAFETY_MARGIN_PERCENT)"
-new = "<= u128::from(window) * u128::from(100 - ESTIMATE_SAFETY_MARGIN_PERCENT) // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-request-durable-before-provider"
-guards = "compaction records cross the single writer fsync barrier before a provider call observes them"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::every_step_outcome_records_atomic_cursor_and_rejection"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "self.writer.sync().await?;"
-new = "// NON-VACUITY BREAK: omit the durability barrier"
-
-[[control]]
-id = "compaction-discard-does-not-create-pending"
-guards = "discarded late or superseded receipts never create pending answers or replace a newer pending cursor"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::discarded_receipts_preserve_pending_requests_and_genuine_pending_answers"]
-file = "crates/broca-core/src/compaction.rs"
-old = "if !matches!(\n                    disposition,\n                    CompactionDisposition::Late | CompactionDisposition::SupersededRequest\n                ) {"
-new = "if true { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-model-wait-drains-late-replies"
-guards = "the active model wait files delayed receipts without cancelling or resending the model request"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::late_receipt_during_model_wait_is_durable_without_resending_and_crash_resume_uses_last_view"]
-file = "crates/broca-core/src/run.rs"
-old = "(Some(runtime), Some(state)) => runtime.with_replies(state, model_step).await??,"
-new = "(Some(_runtime), Some(_state)) => model_step.await?, // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-overflow-is-counted"
-guards = "bounded late-reply inbox overflow is counted rather than silently dropping an unrecorded stream"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/runtime.rs"
-expect_red = ["compaction::runtime::reply_tests::full_late_reply_inbox_counts_every_drop_and_preserves_queued_receipts"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed)"
-new = "dropped.fetch_add(0, std::sync::atomic::Ordering::Relaxed) /* NON-VACUITY BREAK */"
-
-[[control]]
-id = "compaction-run-teardown-cancels-retained-calls"
-guards = "run teardown closes the reply queue and cancels transport tasks so no receipt can outlive its writer"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/runtime.rs"
-expect_red = ["compaction::runtime::reply_tests::run_teardown_closes_inbox_drops_queued_receipts_and_cancels_retained_calls"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "task.abort();"
-new = "let _ = task; // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-ready-current-provider"
-guards = "only the frozen provider and newest request can wake a compaction wait"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::inbox_accepts_only_frozen_provider_and_current_request"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "if request.check(caller, provider, current.as_deref())? == ReadyOutcome::CallAgain {"
-new = "if true { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-wait-ready-bound-recalls"
-guards = "ready and bound exits close the durable wait and issue a fresh status and fence"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::wait_bound_and_ready_recall_with_fresh_status_and_close_wait"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "CompactionWaitExit::Ready | CompactionWaitExit::Bound => continue,"
-new = "CompactionWaitExit::Ready | CompactionWaitExit::Bound => return Ok(StepResult::Continue), // NON-VACUITY BREAK"
-
-[[control]]
 id = "compaction-terminal-wait-recovery-no-recall"
-guards = "durable terminal wait intents survive repeated cuts without provider recall"
+guards = "a wait the removed synchronous client left open is sealed with its recorded terminal intent, never re-entered"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::terminal_wait_intents_recover_without_provider_call_and_survive_second_cut"]
+expect_red = ["compaction::tests::recorded_waits_are_sealed_without_a_provider"]
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = "let exit = wait\n            .terminal_exit\n            .unwrap_or(CompactionWaitExit::Interrupted);"
+old = "let exit = wait\n        .terminal_exit\n        .unwrap_or(CompactionWaitExit::Interrupted);"
 new = "let exit = CompactionWaitExit::Interrupted; // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-replay-answer-no-rerequest"
-guards = "a genuinely pending durable compaction answer is replayed without requesting it again"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::engine_setup_once_and_durable_apply_cut_resume_make_no_compaction_calls"]
-file = "crates/broca-core/src/run.rs"
-old = "if !replayed_compaction_answer\n                && state.should_call("
-new = "if true // NON-VACUITY BREAK\n                && state.should_call("
 
 [[control]]
 id = "compaction-declared-marker-bounds"
@@ -5074,7 +4954,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::render_slices_stamped_tail_and_declares_frozen_ranks_without_decorating_replacement"]
+expect_red = ["compaction::tests::recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint"]
 file = "crates/broca-core/src/compaction.rs"
 old = ".filter(|rank| (rank.index as usize) < applied.replacement.len())"
 new = ".filter(|_rank| true) // NON-VACUITY BREAK"
@@ -5224,164 +5104,13 @@ old = "if version != Some(1) {"
 new = "if version == Some(1) { // NON-VACUITY BREAK"
 
 [[control]]
-id = "compaction-request-fence-before-size"
-guards = "a superseded request is refused before size and native validation"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::fence_order_size_deadline_version_and_range_are_pinned"]
-file = "crates/broca-core/src/compaction.rs"
-old = "request_id: answer.request_id().into(),"
-new = "request_id: fence.newest_request_id.clone(), // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-range-inversion-before-native"
-guards = "range inversion is refused before native structural checks can mask it"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::inverted_range_precedes_invalid_native_content"]
-file = "crates/broca-core/src/compaction.rs"
-old = "if compaction.check().is_err() {"
-new = "if false && compaction.check().is_err() { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-fill-counts-shared-tokens"
-guards = "scheduling uses full occupancy including cached and cache-write input rather than only billed fresh input"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::scheduling_uses_fill_and_shared_model_overrides"]
-file = "crates/broca-core/src/compaction.rs"
-old = "usage.fill_tokens().unwrap_or(0) as f64 / window as f64"
-new = "usage.input_tokens.unwrap_or(0) as f64 / window as f64 /* NON-VACUITY BREAK */"
-
-[[control]]
-id = "compaction-fill-model-share-overrides"
-guards = "scheduling uses the pinned role model-pattern share override"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::scheduling_uses_fill_and_shared_model_overrides"]
-file = "crates/broca-core/src/compaction.rs"
-old = ".share_for(model)"
-new = ".share_for(\"other\") /* NON-VACUITY BREAK */"
-
-[[control]]
-id = "compaction-rebuild-and-error-recall"
-guards = "prefix rebuilding forces a compaction call even without a measured fill"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::scheduling_uses_fill_and_shared_model_overrides"]
-file = "crates/broca-core/src/compaction.rs"
-old = "|| prefix_rebuilding"
-new = "|| false /* NON-VACUITY BREAK */"
-
-[[control]]
-id = "compaction-execution-error-recall"
-guards = "an execution error forces a compaction call even without a measured fill"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::scheduling_uses_fill_and_shared_model_overrides"]
-file = "crates/broca-core/src/compaction.rs"
-old = "|| execution_error"
-new = "|| false /* NON-VACUITY BREAK */"
-
-[[control]]
-id = "compaction-unknown-scheduling-calls-every-step"
-guards = "unknown call_when scheduling remains safe every-step mode instead of suppressing calls"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::scheduling_uses_fill_and_shared_model_overrides"]
-file = "crates/broca-core/src/compaction.rs"
-old = "|| setup::calls_every_step(condition.as_ref())"
-new = "|| false /* NON-VACUITY BREAK */"
-
-[[control]]
-id = "compaction-unknown-estimate-fails-closed"
-guards = "an absent estimate or context window never authorizes wait-cap send"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::compaction_margin_is_strict_and_unknown_window_fails_closed"]
-file = "crates/broca-core/src/compaction.rs"
-old = "estimate.zip(window).is_some_and(|(estimate, window)| {"
-new = "estimate.zip(window).map_or(true, |(estimate, window)| { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-issued-request-cut-filed"
-guards = "a crash with only an issued request files unknown ingestion without advancing its cursor before issuing a new request"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::issued_request_cut_is_filed_without_advancing_cursor_and_forces_fresh_call"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "if state.pending_request {"
-new = "if false && state.pending_request { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-wait-cap-fails-closed"
-guards = "the actual wait-cap exit refuses requests not shown to fit rather than sending the last view"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::wait_cap_sends_only_below_margin_and_fails_closed_otherwise"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "if self.estimate_fits(estimate, status.context_window) {"
-new = "if true { // NON-VACUITY BREAK\n"
-
-[[control]]
-id = "compaction-clock-refresh-read-is-serialized"
-guards = "a poll read cannot undo admission's fixed clock and move a compaction WAIT cap into wall-clock time"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::concurrent_clock_refresh_cannot_move_wait_cap_into_real_time"]
-expect_message = "fixed-clock compaction cap did not fire at 100 ms after the held refresh"
-edits = [
-  { file = "crates/broca-core/src/clock.rs", old = '''        let mut fixed = self.inner.fixed.lock().expect("clock control lock");
-        let control = match read(path) {''', new = '''        let control = match read(path) { // NON-VACUITY BREAK: apply stale reads after newer refreshes'''} ,
-  { file = "crates/broca-core/src/clock.rs", old = '''        let fixed_changed = {''', new = '''        let mut fixed = self.inner.fixed.lock().expect("clock control lock");
-        let fixed_changed = {''' },
-]
-
-[[control]]
-id = "compaction-wait-cap-wins-over-bound-at-the-same-instant"
-guards = "a WAIT whose bound reaches the step cap takes the cap's decision even when the test clock moves between two clock reads of one poll"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::clock_reaching_the_cap_mid_poll_takes_the_cap_exit_not_the_bound"]
-expect_message = "the wait reached its cap and must take the cap's decision"
-edits = [
-  { file = "crates/broca-core/src/compaction/runtime.rs", old = '''let wake = bound.min(cap);''', new = '''let wake = cap; // NON-VACUITY BREAK: the cap and the bound get a timer each''' },
-  { file = "crates/broca-core/src/compaction/runtime.rs", old = '''=> CompactionWaitExit::Ready,''', new = '''=> CompactionWaitExit::Ready,
-                _ = clock_deadline(self.control.clock.as_ref(), bound.min(cap)) => CompactionWaitExit::Bound,''' },
-]
-
-[[control]]
 id = "compaction-replacements-have-no-ordinal"
 guards = "applied replacement messages remain unpositioned rather than inheriting raw ordinals"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::render_slices_stamped_tail_and_declares_frozen_ranks_without_decorating_replacement"]
+expect_red = ["compaction::tests::recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint"]
 file = "crates/broca-core/src/compaction.rs"
 old = "m.ordinal = None;"
 new = "m.ordinal = Some(0); // NON-VACUITY BREAK"
@@ -5393,7 +5122,7 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::render_slices_stamped_tail_and_declares_frozen_ranks_without_decorating_replacement"]
+expect_red = ["compaction::tests::recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint"]
 file = "crates/broca-core/src/compaction.rs"
 old = "o >= applied.range.to"
 new = "o > applied.range.to /* NON-VACUITY BREAK */"
@@ -5409,55 +5138,6 @@ expect_red = ["compaction::tests::model_page_folds_snapshot_and_mid_turn_tail_an
 file = "crates/broca-core/src/context/model_page.rs"
 old = "if request.after_mid.is_some() {"
 new = "if false && request.after_mid.is_some() { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-late-answer-never-applied"
-guards = "a delayed replacement is durably discarded and cannot change the resumed model view"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/tests.rs"
-expect_red = ["compaction::tests::late_receipt_during_model_wait_is_durable_without_resending_and_crash_resume_uses_last_view"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "let mut fence = reply.fence;"
-new = """
-// NON-VACUITY BREAK: apply the delayed message before filing its discard.
-        if let StepAnswer::CompactionMessage { compaction, .. } = &reply.answer {
-            let messages: Vec<Message> = serde_json::from_value(serde_json::Value::Array(compaction.replacement.clone())).unwrap();
-            self.commit(state, WalRecord::CompactionMessage {
-                provider: self.provider.into(), kind: CompactionMessageKind::Step,
-                compaction_id: compaction.compaction_id.clone(), version: compaction.version,
-                range: CompactionRange { from: compaction.range.from, to: compaction.range.to },
-                sha256: broca_wal::compaction_replacement_sha256(&messages).unwrap(),
-                replacement: Arc::new(messages), request_id: Some(reply.answer.request_id().into()),
-                cursor: Some(reply.cursor.clone()), call_when: None, stability: None,
-            }).await?;
-        }
-        let mut fence = reply.fence;"""
-
-[[control]]
-id = "compaction-retained-call-capacity"
-guards = "retained compaction transport calls are bounded independently of the reply queue"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/runtime.rs"
-expect_red = ["compaction::runtime::reply_tests::retained_call_expires_without_receipt_and_task_capacity_is_bounded"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "if tasks.len() >= 8 {"
-new = "if false && tasks.len() >= 8 { // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-retained-call-expiry"
-guards = "retained compaction calls expire at their cap without recording an absent receipt"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/runtime.rs"
-expect_red = ["compaction::runtime::reply_tests::retained_call_expires_without_receipt_and_task_capacity_is_bounded"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "_ = clock_deadline(clock.as_ref(), cap_ms) => None,"
-new = "_ = std::future::pending::<()>() => None, // NON-VACUITY BREAK"
 
 [[control]]
 id = "compaction-admission-missing-summary-full-read"
@@ -5496,18 +5176,6 @@ old = "&step.subscriptions,\n            reduction_owner,"
 new = "&step.subscriptions,\n            Some(&step.item.provider), // NON-VACUITY BREAK"
 
 [[control]]
-id = "compaction-module-frozen-ready-provider"
-guards = "module readiness checks the frozen provider rather than trusting an inbound caller"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --test it \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-module/tests/it/compaction.rs"
-expect_red = ["compaction::ready_only_from_frozen_provider_and_only_newest_request_retries_wait"]
-file = "crates/broca-module/src/actor.rs"
-old = "let outcome = if self\n                    .compaction_inbox\n                    .ready(&caller, provider, &request)\n                    .is_ok()"
-new = "let outcome = if true /* NON-VACUITY BREAK */"
-
-[[control]]
 id = "compaction-serve-plane-required-before-fetch"
 guards = "a reader without an installed compaction plane refuses a compaction plan before provider fetch or WAL writes"
 runner = "command"
@@ -5526,22 +5194,22 @@ runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
-expect_red = ["compaction_routes::incomplete_role_discovery_never_calls_setup_or_step"]
+expect_red = ["compaction_routes::incomplete_role_discovery_never_calls_setup"]
 file = "crates/broca-subc/src/compaction_plane.rs"
 old = "check_describe(describe)\n                    .map(|_| ())\n                    .map_err(|problems| format!(\"{problems:?}\"))"
 new = "{ let _ = (describe, check_describe); Ok(()) } // NON-VACUITY BREAK"
 
 [[control]]
-id = "compaction-subc-step-not-retried"
-guards = "an issued ordinary compaction step is never retried on a transient transport refusal"
+id = "compaction-subc-setup-not-retried"
+guards = "a transport refusal of compaction Setup is not retried on the same call; the next send calls Setup again"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
 expect_red = ["compaction_routes::role_refuse_answers_are_returned_but_transport_refusals_are_not_retried"]
 file = "crates/broca-subc/src/compaction_plane.rs"
-old = "Instant::now() + Duration::from_millis(COMPACTION_STEP_WAIT_CAP_MS),\n                false,"
-new = "Instant::now() + Duration::from_millis(COMPACTION_STEP_WAIT_CAP_MS),\n                true, // NON-VACUITY BREAK"
+old = "                bounded(deadline),\n                false,"
+new = "                bounded(deadline),\n                true, // NON-VACUITY BREAK"
 
 [[control]]
 id = "compaction-subc-route-key-isolation"
@@ -5568,53 +5236,16 @@ old = "let answer = self\n            .request(lease.route.as_ref().unwrap(), bo
 new = "let result = self\n            .request(lease.route.as_ref().unwrap(), body.to_vec(), deadline)\n            .await;\n        **guard = lease.route.take(); // NON-VACUITY BREAK\n        let answer = result?;"
 
 [[control]]
-id = "compaction-subc-step-caller-identity"
-guards = "ordinary compaction step refuses mismatched caller session or harness before opening any route"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
-expect_red = ["compaction_routes::setup_and_step_refuse_mismatched_caller_identity_before_opening_a_route"]
-file = "crates/broca-subc/src/compaction_plane.rs"
-old = "if request.session != bind.session || request.harness != bind.harness {\n            return Err(CompactionUnavailable);\n        }\n        // Core refuses to apply answers after its configured call deadline."
-new = "if false && (request.session != bind.session || request.harness != bind.harness) { // NON-VACUITY BREAK\n            return Err(CompactionUnavailable);\n        }\n        // Core refuses to apply answers after its configured call deadline."
-
-[[control]]
 id = "compaction-subc-setup-caller-identity"
 guards = "compaction setup refuses mismatched caller session or harness before opening any route"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-subc --test it \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-subc/tests/it/compaction_routes.rs"
-expect_red = ["compaction_routes::setup_and_step_refuse_mismatched_caller_identity_before_opening_a_route"]
+expect_red = ["compaction_routes::setup_refuses_mismatched_caller_identity_before_opening_a_route"]
 file = "crates/broca-subc/src/compaction_plane.rs"
 old = "if request.session != bind.session || request.harness != bind.harness {\n            return Err(CompactionUnavailable);\n        }\n        self.route\n            .call(\n                provider,\n                bind,\n                &OpRequest::new(ops::COMPACTION_SETUP, &request),"
 new = "if false && (request.session != bind.session || request.harness != bind.harness) { // NON-VACUITY BREAK\n            return Err(CompactionUnavailable);\n        }\n        self.route\n            .call(\n                provider,\n                bind,\n                &OpRequest::new(ops::COMPACTION_SETUP, &request),"
-
-[[control]]
-id = "compaction-consumed-duplicate-never-pending"
-guards = "a lower-version or malformed duplicate belongs to a consumed request and cannot restore pending ingestion"
-runner = "command"
-command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
-test_count_pattern = "running {count} test"
-test_file = "crates/broca-core/src/compaction/runtime.rs"
-expect_red = ["compaction::runtime::reply_tests::stale_version_and_malformed_duplicates_never_create_pending_answers"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "let disposition = match validate_answer(&fence, &reply.answer, self.now(), &reply.raw) {\n            Err(CompactionDisposition::Late) => CompactionDisposition::Late,\n            _ => CompactionDisposition::SupersededRequest,\n        };"
-new = "let disposition = validate_answer(&fence, &reply.answer, self.now(), &reply.raw).err().unwrap_or(CompactionDisposition::SupersededRequest); // NON-VACUITY BREAK"
-
-[[control]]
-id = "compaction-inbox-only-for-planned-runs"
-guards = "ordinary tool runs do not retain an unused compaction reply queue at the assistant WAL seam"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/compaction/runtime.rs"
-expect_red = ["compaction::runtime::reply_tests::replies_are_allocated_only_for_a_frozen_compaction_plan"]
-file = "crates/broca-core/src/compaction/runtime.rs"
-old = "planned.then(Self::new)"
-new = "{ let _ = planned; Some(Self::new()) } // NON-VACUITY BREAK: allocate an inbox without a frozen plan"
 
 [[control]]
 id = "core-approval-prepared-before-filing"
@@ -17752,13 +17383,13 @@ new = "                    let _ = (NormalizedEvent::Display(DisplayEvent::Reaso
 
 [[control]]
 id = "mode3-no-synchronous-compaction-discovery"
-guards = "the retained synchronous compaction client never advertises the published asynchronous capability"
+guards = "the compaction group is not advertised until broca applies views from view_ready events, rides and waits at the ceiling"
 runner = "cargo"
 package = "broca-wire"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-wire/src/role.rs"
-expect_red = ["role::pinned_reply_bytes::synchronous_writer_does_not_declare_published_compaction"]
+expect_red = ["role::pinned_reply_bytes::compaction_and_model_view_are_not_declared_yet"]
 file = "crates/broca-wire/src/role.rs"
 old = "    if hook_writer {"
 new = '''    capabilities.push("compaction".into()); // NON-VACUITY BREAK: claim the asynchronous contract
@@ -17874,3 +17505,76 @@ old = "        count.fetch_add(1, Ordering::Relaxed);"
 new = '''        if operation != "session.read" {
             count.fetch_add(1, Ordering::Relaxed); // NON-VACUITY BREAK
         }'''
+
+[[control]]
+id = "compaction-view-mismatch-never-applied"
+guards = "a fetched view whose digest does not match its content or its announcement is never recorded or rendered"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::mismatched_views_are_never_applied"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "ViewDisposition::Rejected(problem) => return Decision::Rejected(problem),"
+new = "ViewDisposition::Rejected(_problem) => {} // NON-VACUITY BREAK: apply a rejected view"
+
+[[control]]
+id = "compaction-view-companion-strip-applied"
+guards = "a view applied over signed reasoning renders with the companion strip of that reasoning, live and after a restart"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::an_applied_view_renders_byte_identically_after_a_restart"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "message.content.retain(|block| !is_prefix_bound(block));"
+new = "message.content.retain(|_block| true); // NON-VACUITY BREAK: keep reasoning the view invalidated"
+
+[[control]]
+id = "compaction-view-defers-over-the-open-turn"
+guards = "a view that would invalidate the signed reasoning of the open tool turn is deferred, not applied"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::signed_reasoning_is_stripped_or_the_view_deferred"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "if open_turn(prompt).is_some_and(|open| invalidated.contains(&open)) {"
+new = "if false && open_turn(prompt).is_some_and(|open| invalidated.contains(&open)) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-ceiling-never-sends-over-the-window"
+guards = "a request broca counts over the context window is refused context_ceiling before it is sent"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::the_ceiling_refuses_before_sending_past_the_window"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "    if size > window {\n        return BeforeSend::Refuse("
+new = "    if false && size > window { // NON-VACUITY BREAK\n        return BeforeSend::Refuse("
+
+[[control]]
+id = "compaction-applied-view-survives-resume"
+guards = "an applied view is folded back from its WAL record, so a resumed run renders it without the provider"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::an_applied_view_renders_byte_identically_after_a_restart"]
+only = false
+file = "crates/broca-core/src/compaction.rs"
+old = "if let Some(applied) = view::AppliedView::decode(view, choice) {"
+new = "if let Some(applied) = None::<view::AppliedView>.filter(|_| view::AppliedView::decode(view, choice).is_some()) { // NON-VACUITY BREAK: drop the applied view on refold"
+
+[[control]]
+id = "compaction-notice-durable-before-publish"
+guards = "an advance notice is durable in the WAL before anything can publish it"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_recorded_notice_is_durable_before_it_returns"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "        // notice from reaching the bus before a crash could still lose it.\n        self.writer.sync().await?;"
+new = "        // notice from reaching the bus before a crash could still lose it.\n        // NON-VACUITY BREAK: no barrier"

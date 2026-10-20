@@ -140,13 +140,6 @@ pub enum LineageCmd {
     CutLock {
         reply: oneshot::Sender<(Option<String>, oneshot::Sender<()>)>,
     },
-    /// A provider hints that its pending compaction work is durable. Only the frozen
-    /// provider naming the last issued request may wake the run waiting for that work.
-    CompactionReady {
-        caller: String,
-        request: broca_wire::CompactionReady,
-        reply: oneshot::Sender<CompactionReadyOutcome>,
-    },
     RepairRetention {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -245,13 +238,6 @@ pub enum LineageCmd {
         attempt_id: u64,
         result: Box<Result<RunSummary, broca_core::RunError>>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum CompactionReadyOutcome {
-    Accepted,
-    NotProvider,
-    Reopen,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1234,7 +1220,6 @@ pub struct LineageActor<W: WalStore> {
     /// drops — by close time no run is active, so the actor holds the sole `Arc`.
     writer: Option<Arc<WalHandle>>,
     executor: Arc<dyn RunExecutor>,
-    compaction_inbox: Arc<broca_core::CompactionInbox>,
     wal_store: Arc<W>,
     registry: RegistryHandle,
     rx: mpsc::Receiver<LineageCmd>,
@@ -1515,7 +1500,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             lease: Some(lease),
             writer: Some(writer),
             executor,
-            compaction_inbox: Arc::default(),
             wal_store,
             registry: registry.clone(),
             rx,
@@ -1858,35 +1842,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::CutLock { .. } => {
                 unreachable!("cut critical section handled before dispatch")
             }
-            LineageCmd::CompactionReady {
-                caller,
-                request,
-                reply,
-            } => {
-                let plan = self
-                    .first_episode
-                    .get()
-                    .and_then(|first| first.manifest.as_ref())
-                    .and_then(|manifest| {
-                        serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
-                    });
-                let provider = plan
-                    .as_ref()
-                    .and_then(|plan| plan.get("compaction_item"))
-                    .and_then(|item| item.get("provider"))
-                    .and_then(serde_json::Value::as_str);
-                let outcome = if self
-                    .compaction_inbox
-                    .ready(&caller, provider, &request)
-                    .is_ok()
-                {
-                    CompactionReadyOutcome::Accepted
-                } else {
-                    CompactionReadyOutcome::NotProvider
-                };
-                let _ = reply.send(outcome);
-                false
-            }
             LineageCmd::RepairRetention { reply } => {
                 let _ = reply.send(self.sync_retention_index().await);
                 false
@@ -2056,9 +2011,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// Closing responses make callers re-route after the emergency teardown has released the slot.
     fn reply_writer_poisoned(&mut self, cmd: LineageCmd, error: String) -> bool {
         match cmd {
-            LineageCmd::CompactionReady { reply, .. } => {
-                let _ = reply.send(CompactionReadyOutcome::Reopen);
-            }
             LineageCmd::RepairRetention { reply } => {
                 let _ = reply.send(Err("session writer is poisoned".into()));
             }
@@ -4094,8 +4046,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             hook_plane: self.executor.hook_plane(),
             elicitation_plane: self.executor.elicitation_plane(),
             compaction_plane: self.executor.compaction_plane(),
-            compaction_inbox: Some(Arc::clone(&self.compaction_inbox)),
-            compaction_cache_clock: Some(self.registry.cache_clock(&self.key)),
             ..Default::default()
         };
         let (admit_tx, admit_rx) = oneshot::channel::<Result<RunId, broca_core::RunError>>();
@@ -6082,9 +6032,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // We also watch for durable pending work to ABORT the close.
         while let Ok(cmd) = self.rx.try_recv() {
             match cmd {
-                LineageCmd::CompactionReady { reply, .. } => {
-                    let _ = reply.send(CompactionReadyOutcome::Reopen);
-                }
                 LineageCmd::RepairRetention { reply } => {
                     let _ = reply.send(Err("session actor is closing".into()));
                 }

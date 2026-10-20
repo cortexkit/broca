@@ -1871,17 +1871,6 @@ async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing()
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(broca_core::compaction::CompactionUnavailable)
         }
-        async fn step(
-            &self,
-            _: &str,
-            _: &broca_protocol::BindIdentity,
-            _: broca_core::compaction_provider::status::StepStatus,
-        ) -> Result<
-            broca_core::compaction_provider::answer::StepAnswer,
-            broca_core::compaction::CompactionUnavailable,
-        > {
-            panic!("admission-refused compaction must never reach a step");
-        }
     }
     let (mut rig, admitter) = plan_rig("compaction-dormancy").await;
     let plane = Arc::new(CountingCompaction(std::sync::atomic::AtomicUsize::new(0)));
@@ -2481,15 +2470,13 @@ async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
     assert!(generated_id.starts_with("mc-") && generated_id.len() == 67);
     // The fixture's compaction_id is a stable label; Magic Context derives it from the live session.
     actual["initial"]["compaction_id"] = cases[0]["answer"]["initial"]["compaction_id"].clone();
-    assert_eq!(actual, cases[0]["answer"]);
-    let mut params = cases[3]["request"]["params"].clone();
-    params["last_applied"]["compaction_id"] = json!(generated_id);
-    let request = serde_json::from_value(params).unwrap();
-    let step = plane
-        .step("magic-context", &bind, request)
-        .await
-        .expect("real MC step over shared role route");
-    assert_eq!(serde_json::to_value(step).unwrap(), cases[3]["answer"]);
+    // compaction-provider 0.3 decodes and ignores the `stability` and `call_when` an earlier
+    // draft's Setup carried, so they are not part of the answer broca keeps.
+    let mut expected = cases[0]["answer"].clone();
+    let fields = expected.as_object_mut().unwrap();
+    fields.remove("stability");
+    fields.remove("call_when");
+    assert_eq!(actual, expected);
     rig.finish().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

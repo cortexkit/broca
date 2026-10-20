@@ -2,28 +2,14 @@
 //! Filesystem controls freeze the daemon's clock, inject duplicate receipts and hold
 //! crash barriers before model I/O; captured calls remain outside the daemon process.
 use super::*;
-use broca_core::compaction_provider::{answer::StepAnswer, status::StepStatus};
 use broca_core::WalStore;
 use cortexkit_role_llm_runner::read::{EntrySource, ModelEntry};
 use cortexkit_role_llm_runner_conformance::{CompactionMessage, CompactionSetup};
 use std::collections::BTreeMap;
 
-// The synchronous-client regression rig outlives the old conformance scripting API.
-// Keep its script vocabulary local; the published suite does not exercise this protocol.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum CompactionAnswer {
-    Noop,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum CompactionStep {
-    Answer(CompactionAnswer),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CompactionScript {
     pub setup: CompactionSetup,
-    pub steps: Vec<CompactionStep>,
     pub call_timeout_ms: u64,
     pub wait_cap_ms: u64,
     pub prompt_cache_lifetime_ms: u64,
@@ -37,7 +23,6 @@ impl CompactionScript {
     pub fn new(initial: CompactionMessage) -> Self {
         Self {
             setup: CompactionSetup::Ready(initial),
-            steps: Vec::new(),
             call_timeout_ms: 25,
             wait_cap_ms: 100,
             prompt_cache_lifetime_ms: 100,
@@ -52,7 +37,6 @@ impl CompactionScript {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompactionCallKind {
     Setup,
-    Step,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,12 +54,9 @@ pub(super) fn known_session(shared: &Shared, session: &str) -> bool {
 
 pub(super) struct Session {
     script: CompactionScript,
-    step: usize,
     start_ms: u64,
     pub emitted: usize,
     calls: Vec<CompactionCall>,
-    statuses: Vec<Option<StepStatus>>,
-    senders: HashMap<usize, tokio::sync::oneshot::Sender<StepAnswer>>,
     raw: BTreeMap<u64, Value>,
     replacements: Vec<(EntrySource, Value)>,
     inputs: Vec<Vec<ModelEntry>>,
@@ -90,18 +71,10 @@ impl Session {
     /// The script's timing, what is held, and every provider call's identifiers and times on
     /// the injected clock. Never content.
     pub(super) fn describe(&self) -> String {
-        let mut held: Vec<_> = self.senders.keys().copied().collect();
-        held.sort_unstable();
         let mut output = format!(
-            "start_ms={} call_timeout_ms={} wait_cap_ms={} prompt_cache_lifetime_ms={} \
-             scripted steps={} next step={} held provider calls={held:?} held model calls={} \
-             captured model inputs={}\n",
+            "start_ms={} call_timeout_ms={} held model calls={} captured model inputs={}\n",
             self.start_ms,
             self.script.call_timeout_ms,
-            self.script.wait_cap_ms,
-            self.script.prompt_cache_lifetime_ms,
-            self.script.steps.len(),
-            self.step,
             self.gates.len(),
             self.inputs.len(),
         );
@@ -125,7 +98,7 @@ impl subc_client_rs::ModuleHandler for Provider {
         let method = request["method"].as_str().unwrap_or_default();
         if method == "role.describe" {
             return response(json!({"majors":[{"version":"compaction-provider/v1",
-                "ops":["role.describe","compaction.setup","compaction.step"],"stability":"alpha"}],
+                "ops":["role.describe","compaction.setup","view.get","compaction.ride"],"stability":"alpha"}],
                 "implementation_version":"conformance", "capabilities":[]}));
         }
         let params = &request["params"];
@@ -135,64 +108,41 @@ impl subc_client_rs::ModuleHandler for Provider {
             .expect("provider request id")
             .to_owned();
         let now = params["now"].as_u64().expect("actual runner clock");
+        if method != "compaction.setup" {
+            // Views and rides are never scripted here: this provider publishes no view.
+            return subc_client_rs::HandlerOutcome::Error {
+                code: "unknown_method".into(),
+                message: format!("the scripted provider does not serve {method}"),
+            };
+        }
         let answer = {
             let mut sessions = self.shared.compaction.lock().unwrap();
             let state = sessions
                 .get_mut(session)
                 .expect("installed provider script");
-            let setup = method == "compaction.setup";
             state.calls.push(CompactionCall {
-                kind: if setup {
-                    CompactionCallKind::Setup
-                } else {
-                    CompactionCallKind::Step
-                },
+                kind: CompactionCallKind::Setup,
                 request_id: request_id.clone(),
                 issued_at_ms: now - state.start_ms,
                 deadline_ms: now - state.start_ms + state.script.call_timeout_ms,
             });
-            if setup {
-                state.statuses.push(None);
-                match state.script.setup.clone() {
-                    CompactionSetup::Unavailable => {
-                        return subc_client_rs::HandlerOutcome::Error {
-                            code: "scripted_unavailable".into(),
-                            message: "actual provider call unavailable".into(),
-                        }
-                    }
-                    CompactionSetup::Refuse {
-                        code,
-                        reason,
-                        provider_code,
-                    } => json!({"answer":"refuse", "request_id":request_id,
-                        "code":code.as_str(),"reason":reason,"provider_code":provider_code}),
-                    CompactionSetup::Ready(message) => {
-                        let initial = native_compaction(&message);
-                        remember_replacement(state, &initial);
-                        json!({"answer":"ready","request_id":request_id,"initial":initial,"stability":[]})
+            match state.script.setup.clone() {
+                CompactionSetup::Unavailable => {
+                    return subc_client_rs::HandlerOutcome::Error {
+                        code: "scripted_unavailable".into(),
+                        message: "actual provider call unavailable".into(),
                     }
                 }
-            } else {
-                assert_eq!(method, "compaction.step");
-                let status: StepStatus =
-                    serde_json::from_value(params.clone()).expect("real role status");
-                for message in &status.messages {
-                    state.raw.insert(message.ordinal, message.message.clone());
-                }
-                state.statuses.push(Some(status));
-                let step = state
-                    .script
-                    .steps
-                    .get(state.step)
-                    .cloned()
-                    .unwrap_or(CompactionStep::Answer(CompactionAnswer::Noop));
-                state.step += 1;
-                match step {
-                    CompactionStep::Answer(answer) => {
-                        let answer = wire_answer(&request_id, answer);
-                        remember_answer(state, &answer);
-                        serde_json::to_value(answer).unwrap()
-                    }
+                CompactionSetup::Refuse {
+                    code,
+                    reason,
+                    provider_code,
+                } => json!({"answer":"refuse", "request_id":request_id,
+                    "code":code.as_str(),"reason":reason,"provider_code":provider_code}),
+                CompactionSetup::Ready(message) => {
+                    let initial = native_compaction(&message);
+                    remember_replacement(state, &initial);
+                    json!({"answer":"ready","request_id":request_id,"initial":initial})
                 }
             }
         };
@@ -219,12 +169,6 @@ fn native_compaction(message: &CompactionMessage) -> Value {
         "range":{"from":message.from,"to":message.to},"replacement": message.replacement.iter()
         .map(|text|json!({"role":"user","content":[{"type":"text","text":text}]})).collect::<Vec<_>>()})
 }
-fn wire_answer(id: &str, answer: CompactionAnswer) -> StepAnswer {
-    let value = match answer {
-        CompactionAnswer::Noop => json!({"answer":"noop","request_id":id}),
-    };
-    serde_json::from_value(value).expect("valid role answer")
-}
 fn remember_replacement(state: &mut Session, value: &Value) {
     let source = EntrySource::Replacement {
         compaction_id: value["compaction_id"].as_str().unwrap().into(),
@@ -236,12 +180,6 @@ fn remember_replacement(state: &mut Session, value: &Value) {
         state.replacements.push((source.clone(), message.clone()));
     }
 }
-fn remember_answer(state: &mut Session, answer: &StepAnswer) {
-    if let StepAnswer::CompactionMessage { compaction, .. } = answer {
-        remember_replacement(state, &serde_json::to_value(compaction).unwrap());
-    }
-}
-
 // OpenAI removes native position/origin fields and splits grouped tool results. Match the
 // received wire bytes against messages actually observed in statuses or delivered answers;
 // those observations supply only the metadata absent from the wire, never expected content.
@@ -396,35 +334,13 @@ impl BrocaSubject {
             "compaction work settles",
             async {
                 loop {
-                    let now = *self
-                        .shared
-                        .compaction_clocks
-                        .lock()
-                        .unwrap()
-                        .get(&root)
-                        .unwrap_or(&0);
                     let ready = {
                         let states = self.shared.compaction.lock().unwrap();
                         let Some(state) = states.get(session) else {
                             return "no compaction script installed".to_owned();
                         };
-                        if !state.gates.is_empty() {
-                            Some(format!("{} held model call(s)", state.gates.len()))
-                        } else {
-                            state.calls.last().and_then(|call| {
-                                (state.senders.contains_key(&(state.calls.len() - 1))
-                                    && now - state.start_ms < call.deadline_ms)
-                                    .then(|| {
-                                        format!(
-                                            "provider call {} held before its deadline {} \
-                                         (adapter clock {})",
-                                            state.calls.len() - 1,
-                                            call.deadline_ms,
-                                            now - state.start_ms
-                                        )
-                                    })
-                            })
-                        }
+                        (!state.gates.is_empty())
+                            .then(|| format!("{} held model call(s)", state.gates.len()))
                     };
                     if let Some(reason) = ready {
                         return reason;
@@ -439,30 +355,6 @@ impl BrocaSubject {
                                 "RunFinished is the last WAL record (seq {})",
                                 last.seq
                             );
-                        }
-                        if let R::CompactionAnswer {
-                            disposition: broca_wal::CompactionDisposition::Wait,
-                            ..
-                        } = last.record
-                        {
-                            let states = self.shared.compaction.lock().unwrap();
-                            let state = states.get(session).unwrap();
-                            let call = state.calls.last().unwrap();
-                            let cap_end = call.issued_at_ms
-                                + state
-                                    .script
-                                    .wait_cap_ms
-                                    .min(state.script.prompt_cache_lifetime_ms);
-                            if now - state.start_ms < cap_end {
-                                return format!(
-                                "WAIT is the last WAL record (seq {}); adapter clock {} is before \
-                                 cap end {cap_end} of call {} issued at {}",
-                                last.seq,
-                                now - state.start_ms,
-                                state.calls.len() - 1,
-                                call.issued_at_ms
-                            );
-                            }
                         }
                     }
                     if root.join("test-compaction-reached").exists() {
@@ -584,12 +476,9 @@ fn captured_wire_translation_preserves_tool_grouping_and_native_metadata_and_rej
             to: 0,
             replacement: vec![],
         }),
-        step: 0,
         start_ms: 0,
         emitted: 0,
         calls: vec![],
-        statuses: vec![],
-        senders: HashMap::new(),
         raw: BTreeMap::new(),
         replacements: vec![],
         inputs: vec![],
@@ -708,7 +597,6 @@ impl BrocaSubject {
         for session in sessions {
             if let Some(state) = states.get_mut(&session) {
                 state.gates.clear();
-                state.senders.clear();
             }
         }
         drop(states);

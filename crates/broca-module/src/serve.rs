@@ -952,16 +952,6 @@ pub trait ServeHandler: Send + Sync {
         })
     }
 
-    /// The outer error is routing failure; the inner error is the role's provider refusal.
-    /// `caller` must be the daemon-verified module stamp, not a request member.
-    async fn compaction_ready(
-        &self,
-        _session: &LineageKey,
-        _caller: &str,
-        _request: broca_wire::CompactionReady,
-    ) -> Result<Result<broca_wire::ReadyReply, &'static str>, ServeError> {
-        Ok(Err(broca_wire::NOT_SESSION_COMPACTION_PROVIDER))
-    }
     /// Authorize the daemon-attested caller before any session operation has an effect.
     /// Handlers without history (such as protocol test doubles) have nothing to freeze.
     async fn authorize_session(
@@ -1455,34 +1445,6 @@ impl ServeHandler for crate::LineageRegistry {
             return Err(error);
         }
         Ok(page)
-    }
-
-    async fn compaction_ready(
-        &self,
-        session: &LineageKey,
-        caller: &str,
-        request: broca_wire::CompactionReady,
-    ) -> Result<Result<broca_wire::ReadyReply, &'static str>, ServeError> {
-        if request.session != session.session {
-            return Err(ServeError::InvalidParams {
-                field: "session".into(),
-                message: "ready session differs from bound session".into(),
-            });
-        }
-        match self
-            .route_compaction_ready(session, caller, request)
-            .await?
-        {
-            crate::actor::CompactionReadyOutcome::Accepted => {
-                Ok(Ok(broca_wire::ReadyReply::default()))
-            }
-            crate::actor::CompactionReadyOutcome::NotProvider => {
-                Ok(Err(broca_wire::NOT_SESSION_COMPACTION_PROVIDER))
-            }
-            crate::actor::CompactionReadyOutcome::Reopen => {
-                unreachable!("registry retries close races")
-            }
-        }
     }
 
     async fn authorize_session(

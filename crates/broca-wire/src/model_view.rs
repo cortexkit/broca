@@ -3,11 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use broca_core::compaction_provider::ready::{CompactionReady, ReadyReply};
 pub use cortexkit_role_llm_runner::read::EntrySource;
-
-pub const OP_COMPACTION_READY: &str = "compaction.ready";
-pub const NOT_SESSION_COMPACTION_PROVIDER: &str = "not_session_compaction_provider";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,10 +146,5 @@ mod tests {
             serde_json::to_string(&WriterReadParams::default()).unwrap(),
             "{}"
         );
-    }
-
-    #[test]
-    fn ready_reply_is_always_an_empty_object() {
-        assert_eq!(serde_json::to_string(&ReadyReply::default()).unwrap(), "{}");
     }
 }

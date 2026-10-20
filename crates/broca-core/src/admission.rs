@@ -943,7 +943,9 @@ impl AdmissionCheckpointV1 {
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionAnswer { .. }
-            | WalRecord::CompactionWait { .. } => {}
+            | WalRecord::CompactionWait { .. }
+            | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
             WalRecord::ModelAttemptFinished { .. } => {}
             // A resume's own account of what it found: informational, skipped like `Unknown`.

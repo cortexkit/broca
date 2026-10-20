@@ -1938,7 +1938,9 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionAnswer { .. }
-            | WalRecord::CompactionWait { .. } => {}
+            | WalRecord::CompactionWait { .. }
+            | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence: known to this build, but informational only under the
             // same contract, so replay skips it exactly as it skips `Unknown`. The step's retry
             // count still comes from `ModelStepFinished.retries_used`.

@@ -3088,7 +3088,7 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
                 .as_array()
                 .unwrap()
                 .contains(&json!(group)),
-            "the synchronous client must not declare the published {group} group"
+            "the {group} group is not declared until broca applies views from view_ready events"
         );
     }
     assert!(!describe["majors"][0]["ops"]

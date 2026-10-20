@@ -800,7 +800,9 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         WalRecord::CompactionRequest { .. }
         | WalRecord::CompactionMessage { .. }
         | WalRecord::CompactionAnswer { .. }
-        | WalRecord::CompactionWait { .. } => None,
+        | WalRecord::CompactionWait { .. }
+        | WalRecord::CompactionViewApplied { .. }
+        | WalRecord::CompactionNotice { .. } => None,
         // Provider attempt evidence is informational only; it never carries config.
         WalRecord::ModelAttemptFinished { .. } => None,
         // A resume's own account of what it found is informational; it never carries config.

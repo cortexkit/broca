@@ -84,7 +84,17 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          -- off at the last start, so the next enable begins a new period.
          CREATE TABLE IF NOT EXISTS bus_event_period (
             id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL
-         );",
+         );
+         -- Compaction advance notices (compaction-provider/v1 §5), projected from the durable
+         -- WAL like run events. A notice is headers only: the bus message id names the session
+         -- and the notice's sequence number, and the bus digest is the notice digest.
+         CREATE TABLE IF NOT EXISTS compaction_notice_outbox (
+            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,
+            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,
+            published_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS compaction_notice_unpublished
+            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;",
     )
 }
 
@@ -123,15 +133,21 @@ pub struct PeriodStart {
 
 #[derive(Debug, Clone)]
 pub struct Publication {
+    /// The bus message id: the event's claim-check key for a run event, and
+    /// `<session_ref>:advanced:<seq>` for a compaction advance notice.
     pub event_key: String,
     pub subject: String,
     pub headers: Headers,
     pub body: Vec<u8>,
+    /// The bus digest when it is not the body's: a compaction advance notice carries no body,
+    /// and its digest is the notice digest over its headers.
+    pub digest: Option<ContentDigest>,
 }
 
 impl Publication {
     pub fn digest(&self) -> ContentDigest {
-        ContentDigest::of_bytes(&self.body)
+        self.digest
+            .unwrap_or_else(|| ContentDigest::of_bytes(&self.body))
     }
 }
 
@@ -201,6 +217,10 @@ impl SqliteStore {
                     "DELETE FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",
                     [],
                 )? as u64;
+                tx.execute(
+                    "DELETE FROM compaction_notice_outbox WHERE published_ms IS NULL",
+                    [],
+                )?;
                 tx.execute("DELETE FROM bus_event_projection", [])?;
                 tx.execute("DELETE FROM bus_event_open", [])?;
                 tx.execute(
@@ -317,6 +337,7 @@ impl SqliteStore {
                 ("seq".into(), event.seq.to_string()),
             ]),
             body: bytes,
+            digest: None,
         }))
     }
 
@@ -515,6 +536,11 @@ impl SqliteStore {
                         pause_reason: *reason,
                     })
                 }
+                // Notices are not run lifecycle work, so they stay out of the outbox depth.
+                WalRecord::CompactionNotice { headers, .. } => {
+                    insert_notice(&tx, &account, session, headers, state.last_at_ms, now_ms)?;
+                    None
+                }
                 WalRecord::RunFinished {
                     reason,
                     ts_ms,
@@ -618,7 +644,8 @@ impl SqliteStore {
     }
 
     pub fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
-        self.conn.lock().unwrap().query_row(
+        // Bound to a name so the connection lock is released before a notice is looked up.
+        let lifecycle = self.conn.lock().unwrap().query_row(
             "SELECT event_key,subject,epoch,run_id,seq,session,body FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 ORDER BY rowid LIMIT 1", [],
             |r| {
                 let session: String = r.get(5)?;
@@ -628,9 +655,41 @@ impl SqliteStore {
                     ("kind".into(), subject.split(".event.broca.").nth(1).unwrap_or_default().trim_end_matches(".v1").into()),
                     ("epoch".into(),r.get(2)?), ("run_id".into(),r.get(3)?),
                     ("seq".into(),r.get::<_,u64>(4)?.to_string()), ("session_ref".into(),agent_session_ref(&session)),
-                ]), subject, body:r.get(6)? })
+                ]), subject, body:r.get(6)?, digest: None })
             },
-        ).optional().map_err(StoreError::from)
+        ).optional()?;
+        match lifecycle {
+            Some(event) => Ok(Some(event)),
+            None => self.pending_compaction_notice(),
+        }
+    }
+
+    /// The oldest compaction advance notice not yet published, once no run event is pending.
+    fn pending_compaction_notice(&self) -> Result<Option<Publication>, StoreError> {
+        let row: Option<(String, String, String, String)> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT message_id,subject,headers,digest FROM compaction_notice_outbox \
+                 INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL \
+                 ORDER BY at_ms, rowid LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(event_key, subject, headers, digest)| {
+            Ok(Publication {
+                event_key,
+                subject,
+                headers: serde_json::from_str(&headers)?,
+                body: Vec::new(),
+                digest: Some(digest.parse().map_err(|_| {
+                    StoreError::BusEvent("stored notice digest is not SHA-256".into())
+                })?),
+            })
+        })
+        .transpose()
     }
 
     pub async fn drain_bus_event(
@@ -672,7 +731,12 @@ impl SqliteStore {
         let updated = conn.execute(
             "UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
-        )? as u64;
+        )? as u64
+            + conn.execute(
+                "UPDATE compaction_notice_outbox SET published_ms=?2 \
+                 WHERE message_id=?1 AND published_ms IS NULL",
+                params![event.event_key, now_ms],
+            )? as u64;
         drop(conn);
         self.bus_metrics()
             .bus_events_published
@@ -691,7 +755,11 @@ impl SqliteStore {
             [cutoff],
             |r| r.get(0),
         )?;
-        let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?;
+        let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?
+            + conn.execute(
+                "DELETE FROM compaction_notice_outbox WHERE at_ms<?1",
+                [cutoff],
+            )?;
         drop(conn);
         if dropped > 0 {
             self.lower_bus_depth(dropped);
@@ -731,6 +799,48 @@ impl SqliteStore {
             current = seen;
         }
     }
+}
+
+/// Queue one recorded compaction advance notice for publication, as the WAL recorded it. A
+/// notice projected again (a republish after a crash) has the same message id and is ignored.
+/// A notice the role would refuse is dropped: the provider would drop it too, and the next
+/// well-formed notice wakes it. Returns whether a row was added.
+fn insert_notice(
+    conn: &Connection,
+    account: &AccountNames,
+    session: &BindIdentity,
+    headers: &std::collections::BTreeMap<String, String>,
+    at_ms: u64,
+    now_ms: u64,
+) -> Result<bool, StoreError> {
+    use broca_core::compaction_provider::notice::{AdvanceNotice, ADVANCED_EVENT, EVENT_VERSION};
+    let notice = match AdvanceNotice::from_headers(headers) {
+        Ok(notice) if notice.session_ref == agent_session_ref(session) => notice,
+        _ => {
+            tracing::warn!(target: "bus", "dropping a recorded advance notice the role refuses");
+            return Ok(false);
+        }
+    };
+    // A notice recovered from a run older than the retention window would only be pruned.
+    if at_ms != 0 && at_ms.saturating_add(RETENTION_MS) < now_ms {
+        return Ok(false);
+    }
+    let subject = account
+        .event_subject("broca", ADVANCED_EVENT, EVENT_VERSION)
+        .map_err(|e| StoreError::BusEvent(e.to_string()))?;
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO compaction_notice_outbox(message_id,session,subject,headers,digest,at_ms) \
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            notice.message_id(),
+            serde_json::to_string(session)?,
+            subject,
+            serde_json::to_string(&notice.to_headers())?,
+            notice.digest(),
+            now_ms,
+        ],
+    )?;
+    Ok(inserted == 1)
 }
 
 /// Insert one outbox row; returns its key and whether the row is new.
@@ -914,6 +1024,86 @@ mod tests {
                 .bus_events_published
                 .load(Ordering::Relaxed),
             1
+        );
+    }
+
+    /// A recorded advance notice is published from the durable WAL with the contract's bus
+    /// identity: its subject, the message id naming the session and sequence number, the notice
+    /// digest and exactly its headers, no body. Projecting the same records again (a republish
+    /// after a crash) adds no second publication, and a published notice is not sent again.
+    #[tokio::test]
+    async fn compaction_notices_publish_from_the_wal_once_with_their_bus_identity() {
+        use broca_core::compaction_provider::notice::{AdvanceNotice, ADVANCED_EVENT};
+        let store = Arc::new(enabled());
+        let session_ref = agent_session_ref(&session());
+        let notice =
+            AdvanceNotice::new(&session_ref, 1, "lineage", 0, "ab".repeat(32), 12, "model");
+        let mut refused = notice.clone();
+        refused.session_ref = "f".repeat(32);
+        refused.seq = 2;
+        let records = [
+            start(),
+            FramedRecord {
+                seq: 2,
+                fence: 1,
+                record: WalRecord::CompactionNotice {
+                    seq: 1,
+                    headers: notice.to_headers(),
+                },
+            },
+            FramedRecord {
+                seq: 3,
+                fence: 1,
+                record: WalRecord::CompactionNotice {
+                    seq: 2,
+                    headers: refused.to_headers(),
+                },
+            },
+        ];
+        store
+            .project_bus_events(&session(), "epoch", &records, 1000)
+            .unwrap();
+        store
+            .project_bus_events(&session(), "other-epoch", &records, 1100)
+            .unwrap();
+        let bus = Fake {
+            store: store.clone(),
+            ack: AtomicBool::new(true),
+            seen: Mutex::new(vec![]),
+        };
+        // The run's lifecycle event first, then the notice; the notice naming another session
+        // is never published.
+        let mut published = Vec::new();
+        while let Some(event) = store.pending_bus_event().unwrap() {
+            published.push(event.clone());
+            if event.event_key.contains(":advanced:") {
+                store
+                    .acknowledge_bus_event(&event, PublishReceipt::new(1, false), 1200)
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    store.drain_bus_event(&bus, 1200).await.unwrap(),
+                    DrainResult::Published
+                );
+            }
+        }
+        let notices: Vec<_> = published
+            .iter()
+            .filter(|event| event.body.is_empty())
+            .collect();
+        assert_eq!(notices.len(), 1, "{published:?}");
+        let event = notices[0];
+        assert_eq!(event.event_key, format!("{session_ref}:advanced:1"));
+        assert_eq!(event.event_key, notice.message_id());
+        assert_eq!(
+            event.subject,
+            format!("ck.box_test.event.broca.{ADVANCED_EVENT}.v1")
+        );
+        assert_eq!(event.headers, notice.to_headers());
+        assert_eq!(event.digest().to_string(), notice.digest());
+        assert_eq!(
+            store.pending_bus_event().unwrap().map(|e| e.event_key),
+            None
         );
     }
 

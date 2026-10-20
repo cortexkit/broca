@@ -3,10 +3,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use broca_core::{
-    compaction_provider::{setup::SetupRequest, status::StepStatus},
-    CompactionPlane,
-};
+use broca_core::{compaction_provider::setup::SetupRequest, CompactionPlane};
 use broca_protocol::BindIdentity;
 use broca_subc::SubcCompactionPlane;
 use serde_json::{json, Value};
@@ -65,10 +62,7 @@ impl subc_client_rs::ModuleHandler for Provider {
             );
         }
         assert!(
-            matches!(
-                request["method"].as_str(),
-                Some("compaction.setup" | "compaction.step")
-            ),
+            matches!(request["method"].as_str(), Some("compaction.setup")),
             "not a tool-call envelope: {request}"
         );
         self.0.seen.notify_one();
@@ -159,11 +153,10 @@ fn setup(bind: &BindIdentity) -> SetupRequest {
     request["harness"] = json!(bind.harness);
     serde_json::from_value(request).unwrap()
 }
-fn step(bind: &BindIdentity) -> StepStatus {
-    let mut request = fixture("status.json")["requests"][0]["request"].clone();
-    request["session"] = json!(bind.session);
-    request["harness"] = json!(bind.harness);
-    serde_json::from_value(request).unwrap()
+/// A `ready` Setup answer with nothing this build drops on decode, so it re-encodes to the
+/// same JSON.
+fn ready() -> Value {
+    fixture("setup.json")["answers"][1]["answer"].clone()
 }
 fn bind_count(serving: &Serving) -> usize {
     serving.script.binds.lock().unwrap().len()
@@ -178,31 +171,22 @@ fn op_count(serving: &Serving, method: &str) -> usize {
         .filter(|body| serde_json::from_slice::<Value>(body).unwrap()["method"] == method)
         .count()
 }
-async fn step_ok(serving: &Serving) -> bool {
+async fn setup_ok(serving: &Serving) -> bool {
     serving
         .plane
-        .step("compaction-test", &serving.bind, step(&serving.bind))
+        .setup("compaction-test", &serving.bind, setup(&serving.bind))
         .await
         .is_ok()
 }
 
 #[tokio::test]
-async fn setup_and_step_use_the_unscoped_role_route_and_frozen_vectors() {
+async fn setup_uses_the_unscoped_role_route_and_frozen_vectors() {
     let setup_vectors = fixture("setup.json");
-    let status_vectors = fixture("status.json");
-    let answer_vectors = fixture("answers.json");
     let replies = setup_vectors["requests"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|_| Reply::Json(setup_vectors["answers"][0]["answer"].clone()))
-        .chain(
-            status_vectors["requests"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|_| Reply::Json(answer_vectors["answers"][0]["answer"].clone())),
-        )
+        .map(|_| Reply::Json(ready()))
         .collect();
     let serving = start("compaction-wire", replies, describe(), false).await;
     let mut expected = vec![];
@@ -213,24 +197,8 @@ async fn setup_and_step_use_the_unscoped_role_route_and_frozen_vectors() {
             .setup("compaction-test", &serving.bind, request)
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::to_value(answer).unwrap(),
-            setup_vectors["answers"][0]["answer"]
-        );
+        assert_eq!(serde_json::to_value(answer).unwrap(), ready());
         expected.push(json!({"method": "compaction.setup", "params": vector["request"]}));
-    }
-    for vector in status_vectors["requests"].as_array().unwrap() {
-        let request: StepStatus = serde_json::from_value(vector["request"].clone()).unwrap();
-        let answer = serving
-            .plane
-            .step("compaction-test", &serving.bind, request)
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(answer).unwrap(),
-            answer_vectors["answers"][0]["answer"]
-        );
-        expected.push(json!({"method": "compaction.step", "params": vector["request"]}));
     }
     assert_eq!(bind_count(&serving), 1);
     assert_eq!(op_count(&serving, "role.describe"), 1);
@@ -245,7 +213,7 @@ async fn setup_and_step_use_the_unscoped_role_route_and_frozen_vectors() {
         .collect();
     assert_eq!(
         actual, expected,
-        "preset, params, composition and status pass through unchanged"
+        "preset, params and composition pass through unchanged"
     );
     {
         let binds = serving.script.binds.lock().unwrap();
@@ -263,13 +231,7 @@ async fn setup_and_step_use_the_unscoped_role_route_and_frozen_vectors() {
 async fn route_slots_are_isolated_by_session_harness_root_and_provider() {
     let serving = start(
         "compaction-isolation",
-        (0..6)
-            .map(|_| {
-                Reply::Json(json!({
-                    "answer": "noop", "request_id": "cr-000042"
-                }))
-            })
-            .collect(),
+        (0..6).map(|_| Reply::Json(ready())).collect(),
         describe(),
         false,
     )
@@ -286,17 +248,17 @@ async fn route_slots_are_isolated_by_session_harness_root_and_provider() {
         };
         serving
             .plane
-            .step(provider, bind, step(bind))
+            .setup(provider, bind, setup(bind))
             .await
             .unwrap();
     }
-    assert!(step_ok(&serving).await);
+    assert!(setup_ok(&serving).await);
     assert_eq!(bind_count(&serving), 5);
     assert_eq!(op_count(&serving, "role.describe"), 5);
 }
 
 #[tokio::test]
-async fn setup_and_step_refuse_mismatched_caller_identity_before_opening_a_route() {
+async fn setup_refuses_mismatched_caller_identity_before_opening_a_route() {
     let serving = start("compaction-identity", vec![], describe(), false).await;
     for mismatch in ["session", "harness"] {
         let mut request = serde_json::to_value(setup(&serving.bind)).unwrap();
@@ -310,24 +272,13 @@ async fn setup_and_step_refuse_mismatched_caller_identity_before_opening_a_route
             )
             .await
             .is_err());
-        let mut request = serde_json::to_value(step(&serving.bind)).unwrap();
-        request[mismatch] = json!("wrong");
-        assert!(serving
-            .plane
-            .step(
-                "compaction-test",
-                &serving.bind,
-                serde_json::from_value(request).unwrap()
-            )
-            .await
-            .is_err());
     }
     assert_eq!(bind_count(&serving), 0);
     assert!(serving.script.bodies.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn incomplete_role_discovery_never_calls_setup_or_step() {
+async fn incomplete_role_discovery_never_calls_setup() {
     for (index, vector) in fixture("role-describe.json")["refused"]
         .as_array()
         .unwrap()
@@ -346,9 +297,8 @@ async fn incomplete_role_discovery_never_calls_setup_or_step() {
             .setup("compaction-test", &serving.bind, setup(&serving.bind))
             .await
             .is_err());
-        assert!(!step_ok(&serving).await);
+        assert!(!setup_ok(&serving).await);
         assert_eq!(op_count(&serving, "compaction.setup"), 0);
-        assert_eq!(op_count(&serving, "compaction.step"), 0);
         assert_eq!(
             bind_count(&serving),
             2,
@@ -363,8 +313,8 @@ async fn unknown_answer_tags_are_failed_calls_and_invalidate_the_route() {
         "compaction-unknown",
         vec![
             Reply::Json(json!({"answer": "future-setup", "request_id": "cr-000001"})),
-            Reply::Json(json!({"answer": "future-step", "request_id": "cr-000042"})),
-            Reply::Json(json!({"answer": "noop", "request_id": "cr-000042"})),
+            Reply::Json(json!({"answer": "future-setup", "request_id": "cr-000002"})),
+            Reply::Json(ready()),
         ],
         describe(),
         false,
@@ -375,24 +325,22 @@ async fn unknown_answer_tags_are_failed_calls_and_invalidate_the_route() {
         .setup("compaction-test", &serving.bind, setup(&serving.bind))
         .await
         .is_err());
-    assert!(!step_ok(&serving).await);
-    assert!(step_ok(&serving).await);
+    assert!(!setup_ok(&serving).await);
+    assert!(setup_ok(&serving).await);
     assert_eq!(bind_count(&serving), 3);
     assert_eq!(op_count(&serving, "role.describe"), 3);
-    assert_eq!(op_count(&serving, "compaction.step"), 2);
+    assert_eq!(op_count(&serving, "compaction.setup"), 3);
 }
 
 #[tokio::test]
 async fn role_refuse_answers_are_returned_but_transport_refusals_are_not_retried() {
     let setup_refuse = fixture("setup.json")["answers"][4]["answer"].clone();
-    let step_refuse = fixture("answers.json")["answers"][6]["answer"].clone();
     let serving = start(
         "compaction-refuse",
         vec![
             Reply::Json(setup_refuse.clone()),
-            Reply::Json(step_refuse.clone()),
             Reply::Refuse("transient"),
-            Reply::Json(json!({"answer":"noop", "request_id":"cr-000042"})),
+            Reply::Json(ready()),
         ],
         describe(),
         false,
@@ -404,20 +352,14 @@ async fn role_refuse_answers_are_returned_but_transport_refusals_are_not_retried
         .await
         .unwrap();
     assert_eq!(serde_json::to_value(answer).unwrap(), setup_refuse);
-    let answer = serving
-        .plane
-        .step("compaction-test", &serving.bind, step(&serving.bind))
-        .await
-        .unwrap();
-    assert_eq!(serde_json::to_value(answer).unwrap(), step_refuse);
     assert_eq!(bind_count(&serving), 1);
-    assert!(!step_ok(&serving).await);
+    assert!(!setup_ok(&serving).await);
     assert_eq!(
-        op_count(&serving, "compaction.step"),
+        op_count(&serving, "compaction.setup"),
         2,
         "no retry of the issued request"
     );
-    assert!(step_ok(&serving).await);
+    assert!(setup_ok(&serving).await);
     assert_eq!(bind_count(&serving), 2);
 }
 
@@ -440,11 +382,7 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
 
     let serving = start(
         "compaction-call-deadline",
-        vec![
-            Reply::Silent,
-            Reply::Silent,
-            Reply::Json(json!({"answer":"noop", "request_id":"cr-000042"})),
-        ],
+        vec![Reply::Silent, Reply::Silent, Reply::Json(ready())],
         describe(),
         false,
     )
@@ -463,18 +401,19 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
     let bind = serving.bind.clone();
     let blocked = tokio::spawn(async move {
         plane
-            .step_with_deadline(
+            .setup_with_deadline(
                 "compaction-test",
                 &bind,
-                step(&bind),
+                setup(&bind),
                 Instant::now() + Duration::from_secs(1),
             )
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), async {
-        // The setup consumed the first notification; wait until the silent step is dispatched.
+        // The first setup consumed the first notification; wait until the second, silent
+        // one is dispatched.
         loop {
-            if op_count(&serving, "compaction.step") == 1 {
+            if op_count(&serving, "compaction.setup") == 2 {
                 break;
             }
             serving.script.seen.notified().await;
@@ -485,23 +424,23 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
     let started = Instant::now();
     assert!(serving
         .plane
-        .step_with_deadline(
+        .setup_with_deadline(
             "compaction-test",
             &serving.bind,
-            step(&serving.bind),
+            setup(&serving.bind),
             started + Duration::from_millis(50)
         )
         .await
         .is_err());
     assert!(started.elapsed() < Duration::from_millis(500));
     assert_eq!(
-        op_count(&serving, "compaction.step"),
-        1,
+        op_count(&serving, "compaction.setup"),
+        2,
         "queued request must expire before dispatch"
     );
     blocked.abort();
     assert!(blocked.await.unwrap_err().is_cancelled());
-    assert!(step_ok(&serving).await);
+    assert!(setup_ok(&serving).await);
     assert_eq!(
         bind_count(&serving),
         3,

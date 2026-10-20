@@ -717,6 +717,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        self.frozen.family_id.thinking_is_prefix_bound()
+    }
+
     fn structured_output_grammar_rejection(&self, error: &ProviderError) -> bool {
         self.frozen.family_id == crate::spec::WireFamilyId::AnthropicMessages
             && !self.grammar_downgraded.load(Ordering::Acquire)

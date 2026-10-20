@@ -1,17 +1,13 @@
 //! Exercise the coordinator with the real compaction run loop and durable store/WAL reads.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::compaction_provider::{
-    answer::StepAnswer,
-    setup::{SetupAnswer, SetupRequest},
-    status::StepStatus,
-};
+use broca_core::compaction_provider::setup::{SetupAnswer, SetupRequest};
 use broca_core::{
     AllowAll, CompactionPlane, CompactionUnavailable, FileLeaseStore, FileWalStore, OutputEvent,
     Provider, RunError, RunSummary, StartMode, StubReply, StubToolPlane,
@@ -32,11 +28,8 @@ fn text(role: Role, text: &str) -> Message {
     Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }
 
-struct Compactor {
-    waiting: bool,
-    applied: AtomicBool,
-    statuses: mpsc::UnboundedSender<StepStatus>,
-}
+/// A compaction provider that answers Setup with a one-message head.
+struct Compactor;
 
 #[async_trait]
 impl CompactionPlane for Compactor {
@@ -53,29 +46,6 @@ impl CompactionPlane for Compactor {
             }}),
         )
         .unwrap())
-    }
-
-    async fn step(
-        &self,
-        _: &str,
-        _: &BindIdentity,
-        status: StepStatus,
-    ) -> Result<StepAnswer, CompactionUnavailable> {
-        let encoded = serde_json::to_value(&status).unwrap();
-        let answer = if self.waiting && !self.applied.swap(true, Ordering::SeqCst) {
-            json!({"answer":"wait","request_id":status.request_id,"reason":"working","bound_ms":20000})
-        } else if !self.waiting
-            && encoded["newest"]["ordinal"].as_u64().unwrap_or(0) >= 13
-            && !self.applied.swap(true, Ordering::SeqCst)
-        {
-            json!({"answer":"compaction_message","request_id":status.request_id,
-                "compaction":{"compaction_id":"c1","version":2,"range":{"from":0,"to":13},
-                    "replacement":[text(Role::User, "summary")]}})
-        } else {
-            json!({"answer":"noop","request_id":status.request_id})
-        };
-        self.statuses.send(status).unwrap();
-        Ok(serde_json::from_value(answer).unwrap())
     }
 }
 
@@ -183,10 +153,10 @@ impl RunExecutor for Exec {
 
 struct Rig {
     dir: std::path::PathBuf,
+    wal: Arc<FileWalStore>,
     registry: LineageRegistry,
     key: BindIdentity,
     model: Arc<Model>,
-    statuses: Mutex<mpsc::UnboundedReceiver<StepStatus>>,
     prompts: Mutex<mpsc::UnboundedReceiver<Vec<Message>>>,
 }
 
@@ -211,7 +181,7 @@ fn manifest() -> Arc<PlanManifest> {
 }
 
 impl Rig {
-    fn new(waiting: bool, tool_steps: u64) -> Self {
+    fn new(tool_steps: u64) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // broca's owned scratch root: on Windows it is owner-only, which the store now requires.
         let dir = broca_test_support::scratch_root().join(format!(
@@ -222,13 +192,8 @@ impl Rig {
         std::fs::create_dir_all(&dir).unwrap();
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-        let (status_tx, status_rx) = mpsc::unbounded_channel();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
-        let compactor = Arc::new(Compactor {
-            waiting,
-            applied: AtomicBool::new(false),
-            statuses: status_tx,
-        });
+        let compactor = Arc::new(Compactor);
         let model = Arc::new(Model {
             tool_steps,
             prompts: prompt_tx,
@@ -250,14 +215,14 @@ impl Rig {
             .with_run_index(store.clone())
             .with_materialized_store(store.clone()),
         );
-        let registry = LineageRegistry::new_with_reader(opener, wal, Some(store));
+        let registry = LineageRegistry::new_with_reader(opener, wal.clone(), Some(store));
         let key = BindIdentity::new(dir.clone(), "caller", "session");
         Self {
             dir,
+            wal,
             registry,
             key,
             model,
-            statuses: Mutex::new(status_rx),
             prompts: Mutex::new(prompt_rx),
         }
     }
@@ -288,15 +253,6 @@ impl Rig {
         assert!(matches!(result, SendOutcome::Active { .. }), "{result:?}");
     }
 
-    async fn status(&self) -> StepStatus {
-        broca_test_support::event_timeout("status", self.statuses.lock().await.recv(), || {
-            format!("session={:?}", self.key)
-        })
-        .await
-        .expect("compaction status")
-        .unwrap()
-    }
-
     async fn prompt(&self) -> Vec<Message> {
         broca_test_support::event_timeout("prompt", self.prompts.lock().await.recv(), || {
             format!("session={:?}", self.key)
@@ -304,21 +260,6 @@ impl Rig {
         .await
         .expect("model prompt")
         .unwrap()
-    }
-
-    async fn ready(
-        &self,
-        caller: &str,
-        request_id: &str,
-    ) -> Result<broca_wire::ReadyReply, &'static str> {
-        self.registry
-            .compaction_ready(
-                &self.key,
-                caller,
-                broca_wire::CompactionReady::new("session", request_id),
-            )
-            .await
-            .unwrap()
     }
 
     async fn close(&self) {
@@ -333,60 +274,50 @@ impl Drop for Rig {
     }
 }
 
+/// Setup's head is the first message the model sees, and the advance notice announcing the
+/// session's transcript is durable in the WAL before the model call, so the bus publisher,
+/// which projects notices from the durable WAL, can never publish one the WAL does not hold.
 #[tokio::test]
-async fn ready_only_from_frozen_provider_and_only_newest_request_retries_wait() {
-    let rig = Rig::new(true, 0);
+async fn setup_head_renders_and_the_notice_is_durable_before_the_model_call() {
+    let rig = Rig::new(0);
     assert!(rig.registry.compaction_supported());
     rig.send(true).await;
-    let first = rig.status().await;
-    assert_eq!(
-        rig.ready("other", &first.request_id).await.unwrap_err(),
-        "not_session_compaction_provider"
-    );
-    assert_eq!(
-        serde_json::to_string(&rig.ready("provider", "older").await.unwrap()).unwrap(),
-        "{}"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(80), rig.statuses.lock().await.recv())
-            .await
-            .is_err(),
-        "wrong caller or older request must not cause a fresh status"
-    );
-    assert!(
-        rig.prompts.lock().await.try_recv().is_err(),
-        "wait sent nothing to model"
-    );
-    assert_eq!(
-        serde_json::to_string(&rig.ready("provider", &first.request_id).await.unwrap()).unwrap(),
-        "{}"
-    );
-    let fresh = rig.status().await;
-    assert_ne!(first.request_id, fresh.request_id);
-    assert_eq!(fresh.session, first.session);
     let prompt = rig.prompt().await;
     assert_eq!(prompt[0].content, text(Role::User, "head").content);
-    assert_eq!(
-        serde_json::to_string(&rig.ready("provider", &first.request_id).await.unwrap()).unwrap(),
-        "{}"
-    );
+    // The model is holding its answer, so the WAL holds exactly what preceded the call.
+    let records: Vec<_> = broca_core::WalStore::read_records(rig.wal.as_ref(), &rig.key)
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
+    let notice = records
+        .iter()
+        .position(|record| matches!(record, broca_wal::WalRecord::CompactionNotice { .. }))
+        .expect("a notice before the first model call");
+    let setup = records
+        .iter()
+        .position(|record| matches!(record, broca_wal::WalRecord::CompactionMessage { .. }))
+        .expect("Setup recorded");
+    assert!(setup < notice, "Setup is recorded before the first notice");
+    let broca_wal::WalRecord::CompactionNotice { seq, headers } = &records[notice] else {
+        unreachable!()
+    };
+    assert_eq!(*seq, 1);
+    assert_eq!(headers["seq"], "1");
+    assert_eq!(headers["through_ordinal"], "0");
     assert!(
-        tokio::time::timeout(Duration::from_millis(80), rig.statuses.lock().await.recv())
-            .await
-            .is_err()
+        !headers.contains_key("applied_view_version"),
+        "no view applies before the first one arrives"
     );
+    assert!(!headers.contains_key("descends_from"));
     rig.close().await;
 }
 
 #[tokio::test]
-async fn no_compaction_provider_refuses_ready_and_model_read_rejects_after_mid() {
-    let rig = Rig::new(false, 0);
+async fn model_read_without_compaction_rejects_after_mid() {
+    let rig = Rig::new(0);
     rig.send(false).await;
     rig.prompt().await;
-    assert_eq!(
-        rig.ready("provider", "anything").await.unwrap_err(),
-        "not_session_compaction_provider"
-    );
     let mut req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
     req.after_mid = Some("m0".into());
     assert!(matches!(rig.registry.read_model(req).await,
@@ -404,8 +335,8 @@ async fn no_compaction_provider_refuses_ready_and_model_read_rejects_after_mid()
 }
 
 #[tokio::test]
-async fn store_backed_model_page_matches_sent_guidance_tail_after_compaction() {
-    let rig = Rig::new(false, 8);
+async fn store_backed_model_page_matches_sent_guidance_tail_under_setups_head() {
+    let rig = Rig::new(8);
     rig.send(true).await;
     let mut sent = Vec::new();
     for _ in 0..9 {
@@ -415,7 +346,7 @@ async fn store_backed_model_page_matches_sent_guidance_tail_after_compaction() {
     let raw = rig.registry.read(req.clone()).await.unwrap();
     let page = rig.registry.read_model(req.clone()).await.unwrap();
     assert_eq!(page.compaction_id.as_deref(), Some("c1"));
-    assert_eq!(page.version, Some(2));
+    assert_eq!(page.version, Some(1));
     let messages: Vec<_> = page
         .messages
         .iter()
@@ -429,12 +360,12 @@ async fn store_backed_model_page_matches_sent_guidance_tail_after_compaction() {
     assert_eq!(
         serde_json::to_value(&page.messages[0].source).unwrap(),
         json!({
-        "kind":"replacement","compaction_id":"c1","version":2,"from_ordinal":0,"to_ordinal":13})
+        "kind":"replacement","compaction_id":"c1","version":1,"from_ordinal":0,"to_ordinal":0})
     );
     assert_eq!(
         serde_json::to_value(&page.messages[1].source).unwrap(),
         json!({
-        "kind":"message","ordinal":13,"mid":"m13"})
+        "kind":"message","ordinal":0,"mid":"m0"})
     );
     assert_ne!(
         page.messages.last().unwrap().message.content,
@@ -447,7 +378,7 @@ async fn store_backed_model_page_matches_sent_guidance_tail_after_compaction() {
     let tail = rig.registry.read_model(tail_req).await.unwrap();
     assert_eq!(
         serde_json::to_vec(&tail.messages[0].message).unwrap(),
-        serde_json::to_vec(&sent[3]).unwrap(),
+        serde_json::to_vec(&sent[16]).unwrap(),
         "a range starting mid-episode keeps replaced counters"
     );
     rig.close().await;

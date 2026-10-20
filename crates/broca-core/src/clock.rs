@@ -27,19 +27,6 @@ struct Inner {
     control: Option<std::path::PathBuf>,
     #[cfg(feature = "test-clock")]
     fixed: std::sync::Mutex<Option<u64>>,
-    #[cfg(all(test, feature = "test-clock"))]
-    refresh_probe: std::sync::Mutex<Option<RefreshProbe>>,
-}
-
-/// A one-shot test hook that stands in for the filesystem poller landing between two
-/// clock reads. Once a read returns `after_read_of`, the next read first refreshes from
-/// the control file. Timers read the clock and then subscribe to its changes, so a
-/// refresh between those steps of one timer and the next is otherwise a timing accident.
-#[cfg(all(test, feature = "test-clock"))]
-#[derive(Debug)]
-struct RefreshProbe {
-    after_read_of: u64,
-    seen: bool,
 }
 
 impl Default for Clock {
@@ -51,8 +38,6 @@ impl Default for Clock {
                 control: None,
                 #[cfg(feature = "test-clock")]
                 fixed: std::sync::Mutex::new(None),
-                #[cfg(all(test, feature = "test-clock"))]
-                refresh_probe: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -77,8 +62,6 @@ impl Clock {
                     changes: watch::channel(0).0,
                     control: Some(root.as_ref().join("test-clock")),
                     fixed: std::sync::Mutex::new(None),
-                    #[cfg(test)]
-                    refresh_probe: std::sync::Mutex::new(None),
                 }),
             };
             clock.refresh()?;
@@ -96,20 +79,7 @@ impl Clock {
     }
 
     pub fn now_ms(&self) -> u64 {
-        #[cfg(all(test, feature = "test-clock"))]
-        self.run_refresh_probe();
-        let now = self.read_now_ms();
-        #[cfg(all(test, feature = "test-clock"))]
-        if let Some(probe) = self
-            .inner
-            .refresh_probe
-            .lock()
-            .expect("clock probe lock")
-            .as_mut()
-        {
-            probe.seen |= now == probe.after_read_of;
-        }
-        now
+        self.read_now_ms()
     }
 
     fn read_now_ms(&self) -> u64 {
@@ -123,27 +93,6 @@ impl Clock {
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
             });
         real.saturating_add_signed(*self.inner.changes.borrow())
-    }
-
-    /// Arm a one-shot refresh from the control file. It runs at the start of the first
-    /// `now_ms` call after a call that returned `after_read_of`.
-    #[cfg(all(test, feature = "test-clock"))]
-    pub(crate) fn refresh_on_read_after(&self, after_read_of: u64) {
-        *self.inner.refresh_probe.lock().expect("clock probe lock") = Some(RefreshProbe {
-            after_read_of,
-            seen: false,
-        });
-    }
-
-    #[cfg(all(test, feature = "test-clock"))]
-    fn run_refresh_probe(&self) {
-        let mut probe = self.inner.refresh_probe.lock().expect("clock probe lock");
-        if probe.as_ref().is_some_and(|probe| probe.seen) {
-            *probe = None;
-            drop(probe);
-            self.refresh()
-                .expect("probe refresh reads the control file");
-        }
     }
 
     /// Timers and the sweep must recompute their deadlines when this watch changes.
@@ -204,19 +153,6 @@ impl Clock {
             *current = control.offset_ms;
             true
         }))
-    }
-
-    #[cfg(all(test, feature = "test-clock"))]
-    pub(crate) fn refresh_with_read_probe(
-        &self,
-        probe: impl FnOnce(bool),
-    ) -> std::io::Result<bool> {
-        self.refresh_with_reader(|path| {
-            let bytes = std::fs::read(path);
-            let serialized = self.inner.fixed.try_lock().is_err();
-            probe(serialized);
-            bytes
-        })
     }
 
     /// The module may spawn this future while its daemon is running. In a release

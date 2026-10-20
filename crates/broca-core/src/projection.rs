@@ -514,7 +514,9 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::CompactionRequest { .. }
         | WalRecord::CompactionMessage { .. }
         | WalRecord::CompactionAnswer { .. }
-        | WalRecord::CompactionWait { .. } => {}
+        | WalRecord::CompactionWait { .. }
+        | WalRecord::CompactionViewApplied { .. }
+        | WalRecord::CompactionNotice { .. } => {}
         // Provider attempt evidence is known to this build but carries no session semantics:
         // it is skipped exactly like `Unknown`, so the control stream is identical without it.
         WalRecord::ModelAttemptFinished { .. } => {}

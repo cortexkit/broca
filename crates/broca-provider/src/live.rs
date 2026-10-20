@@ -119,6 +119,10 @@ impl LiveAnthropicProvider {
 
 #[async_trait]
 impl Provider for LiveAnthropicProvider {
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        self.inner.reasoning_is_prefix_bound()
+    }
+
     fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
         self.inner.structured_output_grammar_rejection(error)
     }

@@ -133,6 +133,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
         cursor: None,
         call_when: None,
         stability: None,
+        ceiling: None,
     }
 }
 
@@ -424,5 +425,102 @@ fn sidecar_projection_and_legacy_boundary_recovery_match_complete_replay() {
     assert!(
         !legacy.compaction_complete(),
         "old caches must not guess the boundary from the range"
+    );
+}
+
+/// A compaction provider's view that folds the history before signed thinking, on an Anthropic
+/// session. Applied with the companion strip, the request leaves out exactly the thinking the
+/// view invalidated and keeps the thinking produced after it; the stripped request would be
+/// the same after a restart, because the strip is recorded with the view. While the next
+/// request continues a tool turn whose thinking the view would invalidate, the view is deferred.
+#[test]
+fn an_asynchronous_view_strips_invalidated_thinking_or_waits_for_the_open_tool_turn() {
+    use broca_core::compaction::view::{decide, Decision};
+    use broca_core::compaction_provider::{
+        lineage::MessageRef,
+        notice::ViewReady,
+        view::{CompactionView, ViewRange},
+    };
+    let session_ref = "0123456789abcdef0123456789abcdef";
+    let summary = serde_json::to_string(&[text(Role::User, "summary of the prefix")]).unwrap();
+    let view = CompactionView::new(
+        session_ref,
+        2,
+        "lineage",
+        MessageRef {
+            ordinal: 0,
+            mid: "m0".into(),
+        },
+        vec![ViewRange::replace(0, 1, summary)],
+    );
+    let ready = ViewReady::for_view(&view);
+    let prefix_bound =
+        broca_provider::spec::WireFamilyId::AnthropicMessages.thinking_is_prefix_bound();
+    assert!(prefix_bound);
+
+    // Setup's head at the first user message, then a finished turn with signed thinking.
+    let mut records = vec![
+        start(vec![text(Role::User, "original prefix")]),
+        applied(1, 0),
+        completion("before"),
+    ];
+    let prior = broca_core::replay::replay(&records).unwrap();
+    let state = prior.compaction.state().unwrap().clone();
+    let mut prompt = prior.prompt.clone();
+    stamp_ordinals(&mut prompt);
+    let decision = decide(&view, &ready, &state, "lineage", &prompt, prefix_bound);
+    let Decision::Apply(choice @ broca_wal::CompactionViewChoice::Companion { .. }) = decision
+    else {
+        panic!("thinking after the fold needs the companion strip: {decision:?}");
+    };
+    assert_eq!(
+        reasoning(&records).len(),
+        2,
+        "before the view the turn's thinking is sent"
+    );
+    records.push(WalRecord::CompactionViewApplied {
+        provider: "compactor".into(),
+        view_version: 2,
+        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
+        choice,
+    });
+    records.push(completion("after"));
+    assert_eq!(
+        reasoning(&records),
+        vec![
+            json!({"type":"thinking", "thinking":"after thinking", "signature":"after-signature"}),
+            json!({"type":"redacted_thinking", "data":"after-redacted"}),
+        ],
+        "only the thinking produced against the compacted prefix is sent"
+    );
+    assert!(String::from_utf8(bytes(&records))
+        .unwrap()
+        .contains("summary of the prefix"));
+
+    // The same view while a tool turn with signed thinking is open.
+    let mut open = prompt.clone();
+    let mut pending = thinking("pending");
+    pending.content.push(ContentBlock::ToolCall(ToolCall {
+        tool_call_id: ToolCallId("call-9".into()),
+        tool_name: "record_note".into(),
+        input: json!({}),
+        thought_signature: None,
+    }));
+    open.truncate(1);
+    open.push(pending);
+    open.push(Message::new(
+        Role::Tool,
+        vec![ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId("call-9".into()),
+            output: ToolOutput::Text {
+                text: "noted".into(),
+            },
+            is_error: false,
+        })],
+    ));
+    stamp_ordinals(&mut open);
+    assert_eq!(
+        decide(&view, &ready, &state, "lineage", &open, prefix_bound),
+        Decision::Defer("signed_reasoning")
     );
 }

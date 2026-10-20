@@ -190,14 +190,6 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
-            name: "compaction.ready".to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Retry the newest compaction wait, only for the session's frozen provider."
-                    .to_string(),
-            ),
-        },
-        ManagementOperation {
             name: OP_ROLE_DESCRIBE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
@@ -538,6 +530,43 @@ mod provenance_tests {
                 { "role": "service_client", "of": ["fusiform", "claustrum"] },
             ]),
             "the default configuration consumes the default tool module, the catalog and the vault"
+        );
+    }
+
+    /// broca publishes its run events and its compaction advance notices
+    /// (`compaction.advanced`) undeclared. Their names are dotted, and the daemon's HELLO check
+    /// refuses a dotted event declaration, so declaring one would keep broca from registering
+    /// at all. So the manifest declares no events, and in particular no dotted name; the
+    /// daemon's own validator accepts it.
+    #[test]
+    fn the_manifest_declares_no_dotted_event_names() {
+        let encoded = serde_json::to_value(manifest("broca")).expect("manifest serialises");
+        let declared: Vec<&str> = encoded
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|event| event.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(
+            declared.iter().all(|name| !name.contains('.')),
+            "dotted event declarations: {declared:?}"
+        );
+        assert!(
+            encoded.get("events").is_none(),
+            "broca publishes its events undeclared: {declared:?}"
+        );
+        let hello = |manifest: &serde_json::Value| serde_json::json!({ "manifest": manifest });
+        subc_protocol::manifest::validate_hello_event_declarations(&hello(&encoded))
+            .expect("the daemon would refuse this HELLO");
+        // The control: the daemon's validator does refuse a dotted name, so the pass above
+        // cannot come from a validator that accepts everything.
+        let mut dotted = encoded.clone();
+        dotted["events"] = serde_json::json!([
+            {"name": "compaction.advanced", "version": 1, "headers": ["session_ref"]}
+        ]);
+        assert!(
+            subc_protocol::manifest::validate_hello_event_declarations(&hello(&dotted)).is_err()
         );
     }
 
