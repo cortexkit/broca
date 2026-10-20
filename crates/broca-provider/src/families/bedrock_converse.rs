@@ -583,7 +583,12 @@ fn convert_tool_config(
     name_map: &crate::tool_name_alias::ToolNameMap,
     has_tool_history: bool,
 ) -> Option<Value> {
-    if tools.is_empty() || (matches!(choice, ToolChoice::None) && !has_tool_history) {
+    if tools.is_empty() {
+        // Historical calls without schemas cannot form a valid Bedrock toolConfig. Bedrock's 400
+        // remains a permanent `ValidationException` rather than being retried.
+        return None;
+    }
+    if matches!(choice, ToolChoice::None) && !has_tool_history {
         return None;
     }
     // AWS documents client-side tool use as supplying definitions with requests, then resending
