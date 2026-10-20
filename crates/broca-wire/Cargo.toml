@@ -12,13 +12,14 @@ broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
 serde.workspace = true
 serde_json.workspace = true
-# The `llm-runner/v1` role's own types for the members whose meaning the role defines: the
-# `role.describe` answer and the steer delivery receipt on a `session.send` reply. Pure serde.
-# The workspace git pin keeps these types identical to the conformance suite's.
+# The role crate provides the types for role.describe answers and steer delivery receipts in
+# session.send replies. These types use serde; the workspace version pin keeps them aligned with
+# the conformance suite's types.
 cortexkit-role-llm-runner = { workspace = true }
 cortexkit-role-agent-data.workspace = true
 
 [dev-dependencies]
+cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
 serde_jcs.workspace = true
 cortexkit-bus-naming.workspace = true
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }

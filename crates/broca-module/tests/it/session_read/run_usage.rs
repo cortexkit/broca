@@ -227,6 +227,6 @@ async fn usage_zero_steps_omits_all_token_totals() {
     let (status, _) = replies(&rig, &key).await;
     assert_eq!(
         serde_json::from_str::<Value>(&status).unwrap()["usage"],
-        json!({"steps":0,"unreported_steps":0})
+        json!({"steps":0,"unreported_steps":0,"by_model":[]})
     );
 }

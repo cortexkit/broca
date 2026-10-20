@@ -2270,11 +2270,27 @@ impl RunUsageProjection {
             }
             WalRecord::ModelStepFinished { usage, .. } if self.active => {
                 if let Some((model, variant)) = &self.model {
-                    self.usage.accumulate(
+                    let mut step_usage = cortexkit_role_llm_runner::usage::StepUsage::unreported();
+                    if let Some(tokens) = usage.input_tokens {
+                        step_usage = step_usage.with_input_tokens(tokens);
+                    }
+                    if let Some(tokens) = usage.cached_input_tokens {
+                        step_usage = step_usage.with_cached_input_tokens(tokens);
+                    }
+                    if let Some(tokens) = usage.cache_write_tokens {
+                        step_usage = step_usage.with_cache_write_tokens(tokens);
+                    }
+                    if let Some(tokens) = usage.output_tokens {
+                        step_usage = step_usage.with_output_tokens(tokens);
+                    }
+                    if let Some(tokens) = usage.reasoning_tokens {
+                        step_usage = step_usage.with_reasoning_tokens(tokens);
+                    }
+                    self.usage.record_step(
                         &model.provider_module_id,
                         &model.model_id,
-                        variant.as_deref(),
-                        usage,
+                        variant.as_deref().filter(|value| !value.is_empty()),
+                        step_usage,
                     );
                 }
             }

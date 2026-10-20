@@ -4339,11 +4339,11 @@ mod tests {
 
     #[tokio::test]
     async fn reply_too_large_detail_bytes_match_published_vectors() {
-        // Copied byte for byte from commons commit 649d5f12.
-        let vectors: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/llm-runner-v1/reply-too-large.json"
-        ))
-        .unwrap();
+        let vector = cortexkit_role_llm_runner::vectors::FILES
+            .iter()
+            .find_map(|(name, contents)| (*name == "reply-too-large.json").then_some(*contents))
+            .expect("the role crate publishes reply-too-large.json");
+        let vectors: serde_json::Value = serde_json::from_str(vector).unwrap();
         #[derive(serde::Serialize)]
         struct ExpectedError<'a> {
             code: &'a str,

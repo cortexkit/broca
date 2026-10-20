@@ -96,9 +96,13 @@ package = "broca-module"
 target = "--test it"
 test_file = "crates/broca-module/tests/it/session_read/run_usage.rs"
 expect_red = ["session_read::run_usage::usage_unreported_only_when_all_fields_absent_golden"]
-file = "crates/broca-protocol/src/usage.rs"
-old = '''        let unreported = u64::from(*usage == Usage::default());'''
-new = '''        let unreported = u64::from(usage.input_tokens.is_none()); // NON-VACUITY BREAK: mistake partial usage for no usage'''
+file = "crates/broca-core/src/replay.rs"
+old = '''                    if let Some(tokens) = usage.output_tokens {
+                        step_usage = step_usage.with_output_tokens(tokens);
+                    }'''
+new = '''                    if let Some(tokens) = usage.output_tokens.filter(|tokens| *tokens != 0) {
+                        step_usage = step_usage.with_output_tokens(tokens);
+                    } // NON-VACUITY BREAK: treat a reported zero as absent'''
 
 [[control]]
 id = "module-run-result-reuses-status-wal"
@@ -7680,6 +7684,18 @@ expect_red = ["role::pinned_reply_bytes::retention_declaration_follows_only_its_
 file = "crates/broca-wire/src/role.rs"
 old = '"run.status",'
 new = "// NON-VACUITY BREAK: hide run.status from retention conformance."
+
+[[control]]
+id = "run-usage-role-describe-group"
+guards = "role.describe advertises run usage because run.status and run.result serve WAL-derived totals"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-wire --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-wire/src/role.rs"
+expect_red = ["role::pinned_reply_bytes::role_describe_advertises_run_usage"]
+file = "crates/broca-wire/src/role.rs"
+old = "        cortexkit_role_llm_runner::capabilities::RUN_USAGE,"
+new = "        // NON-VACUITY BREAK: omit the run_usage group."
 
 [[control]]
 id = "retention-head-expiry-activity"

@@ -67,74 +67,7 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
-/// Completed model-step usage for one run. Missing token totals are lower bounds,
-/// just as they are on an individual step; counters always include every completed step.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunUsage {
-    #[serde(default)]
-    pub steps: u64,
-    #[serde(default)]
-    pub unreported_steps: u64,
-    #[serde(flatten)]
-    pub tokens: Usage,
-    /// First-seen order of the model selections frozen for the completed steps.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub by_model: Vec<ModelUsage>,
-}
-
-/// One model selection's contribution to a run's usage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelUsage {
-    pub provider: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub variant: Option<String>,
-    pub steps: u64,
-    pub unreported_steps: u64,
-    #[serde(flatten)]
-    pub tokens: Usage,
-}
-
-impl RunUsage {
-    /// Add one completed model step. The caller supplies `provider`, `model` and
-    /// `variant` from the configuration recorded for that step, not the current settings.
-    pub fn accumulate(
-        &mut self,
-        provider: &str,
-        model: &str,
-        variant: Option<&str>,
-        usage: &Usage,
-    ) {
-        let variant = variant.filter(|value| !value.is_empty());
-        let unreported = u64::from(*usage == Usage::default());
-        self.steps = self.steps.saturating_add(1);
-        self.unreported_steps = self.unreported_steps.saturating_add(unreported);
-        self.tokens.accumulate(usage);
-        let index = self
-            .by_model
-            .iter()
-            .position(|entry| {
-                entry.provider == provider
-                    && entry.model == model
-                    && entry.variant.as_deref() == variant
-            })
-            .unwrap_or_else(|| {
-                self.by_model.push(ModelUsage {
-                    provider: provider.to_owned(),
-                    model: model.to_owned(),
-                    variant: variant.map(str::to_owned),
-                    steps: 0,
-                    unreported_steps: 0,
-                    tokens: Usage::default(),
-                });
-                self.by_model.len() - 1
-            });
-        let entry = &mut self.by_model[index];
-        entry.steps = entry.steps.saturating_add(1);
-        entry.unreported_steps = entry.unreported_steps.saturating_add(unreported);
-        entry.tokens.accumulate(usage);
-    }
-}
+pub use cortexkit_role_llm_runner::usage::{ModelUsage, RunUsage};
 
 impl Usage {
     /// Context-fill metric: fresh request input + cache reads + cache writes.
@@ -203,7 +136,7 @@ mod tests {
 
     #[test]
     fn run_usage_treats_each_single_reported_zero_as_reported() {
-        let mut total = RunUsage::default();
+        let mut total = RunUsage::new();
         for field in [
             "input_tokens",
             "cached_input_tokens",
@@ -212,25 +145,39 @@ mod tests {
             "reasoning_tokens",
         ] {
             let usage: Usage = serde_json::from_value(serde_json::json!({field:0})).unwrap();
-            total.accumulate("provider", "model", None, &usage);
+            let step = match field {
+                "input_tokens" => cortexkit_role_llm_runner::usage::StepUsage::default()
+                    .with_input_tokens(usage.input_tokens.unwrap()),
+                "cached_input_tokens" => cortexkit_role_llm_runner::usage::StepUsage::default()
+                    .with_cached_input_tokens(usage.cached_input_tokens.unwrap()),
+                "cache_write_tokens" => cortexkit_role_llm_runner::usage::StepUsage::default()
+                    .with_cache_write_tokens(usage.cache_write_tokens.unwrap()),
+                "output_tokens" => cortexkit_role_llm_runner::usage::StepUsage::default()
+                    .with_output_tokens(usage.output_tokens.unwrap()),
+                "reasoning_tokens" => cortexkit_role_llm_runner::usage::StepUsage::default()
+                    .with_reasoning_tokens(usage.reasoning_tokens.unwrap()),
+                _ => unreachable!(),
+            };
+            total.record_step("provider", "model", None, step);
         }
         assert_eq!(total.steps, 5);
         assert_eq!(total.unreported_steps, 0);
         assert_eq!(total.by_model[0].unreported_steps, 0);
-        assert_eq!(
-            total.tokens,
-            Usage {
-                input_tokens: Some(0),
-                cached_input_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                output_tokens: Some(0),
-                reasoning_tokens: Some(0)
-            }
+        assert_eq!(total.input_tokens, Some(0));
+        assert_eq!(total.cached_input_tokens, Some(0));
+        assert_eq!(total.cache_write_tokens, Some(0));
+        assert_eq!(total.output_tokens, Some(0));
+        assert_eq!(total.reasoning_tokens, Some(0));
+        total.record_step(
+            "provider",
+            "model",
+            None,
+            cortexkit_role_llm_runner::usage::StepUsage::unreported(),
         );
-        total.accumulate("provider", "model", Some(""), &Usage::default());
         assert_eq!(total.steps, 6);
         assert_eq!(total.unreported_steps, 1);
         assert_eq!(total.by_model.len(), 1);
+        assert!(total.consistent());
     }
 
     use serde_json::json;

@@ -1413,7 +1413,11 @@ pub struct PausedRunAuth {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunStatusResponse {
     Active {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         /// Snapshot of the live actor's in-flight model step; never read from WAL.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1431,7 +1435,11 @@ pub enum RunStatusResponse {
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_reason: Option<broca_protocol::PauseReason>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1464,7 +1472,11 @@ pub enum RunStatusResponse {
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         indeterminate_tool_calls: Option<Vec<ToolCallId>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1485,7 +1497,11 @@ pub enum RunStatusResponse {
         /// the field is omitted when no WAL was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1506,7 +1522,11 @@ pub enum RunStatusResponse {
         /// the field is omitted when no WAL was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1525,7 +1545,11 @@ pub enum RunStatusResponse {
         final_step_finish_reason: Option<FinishReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1544,7 +1568,11 @@ pub enum RunStatusResponse {
         /// the field is omitted when no WAL was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1565,7 +1593,11 @@ pub enum RunStatusResponse {
         /// the field is omitted when no WAL was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
@@ -1590,7 +1622,11 @@ pub enum RunStatusResponse {
         /// the field is omitted when no WAL was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::role::deserialize_optional_run_usage",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,

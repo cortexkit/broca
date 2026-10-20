@@ -597,7 +597,23 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     let final_step_finish_reason = state.final_step_finish_reason;
     let undelivered_steers = state.undelivered_steers;
     let indeterminate_tool_calls = state.indeterminate_tool_calls;
-    let usage = Some(state.run_usage);
+    let status_name = match &state.state {
+        State::Active => "active",
+        State::Paused => "paused",
+        State::Interrupted => "interrupted",
+        State::Completed => "completed",
+        State::MaxSteps => "max_steps",
+        State::BudgetExhausted => cortexkit_role_llm_runner::run::states::BUDGET_EXHAUSTED,
+        State::Cancelled => "cancelled",
+        State::Error => "error",
+        State::TransformUnavailable => "transform_unavailable",
+    };
+    let usage = Some(
+        cortexkit_role_llm_runner::run::RunStatus::new(status_name)
+            .with_usage(state.run_usage)
+            .usage
+            .expect("the published RunStatus builder retains supplied usage"),
+    );
     let retries_used = state.retries_used;
     let title = state.title;
     let structured_output = state.structured_output;
@@ -2144,6 +2160,10 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let usage = cortexkit_role_llm_runner::run::RunResult::new(run_id.0.clone(), state.clone())
+            .with_usage(usage)
+            .usage
+            .expect("the published RunResult builder retains supplied usage");
         let response = broca_wire::RunResultResponse {
             usage,
             detail,
