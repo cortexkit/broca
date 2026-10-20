@@ -1,6 +1,7 @@
 //! Compaction crash scenarios use the core traits directly, but keep the file WAL and run loop
-//! real: Setup from a scripted provider, and an asynchronous view offered at the first step
-//! boundary, recorded, rendered, and announced in advance notices.
+//! real: Setup from a scripted provider, and an asynchronous view announced by `view_ready`,
+//! fetched with `view.get` at the first step boundary, recorded, rendered, and reported in
+//! advance notices.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use broca_core::compaction_provider::{
     lineage::MessageRef,
     notice::ViewReady,
     setup::{SetupAnswer, SetupRequest},
-    view::{CompactionView, PartEdit, ViewRange},
+    view::{CompactionView, PartEdit, ViewGetAnswer, ViewGetRequest, ViewRange},
 };
 use broca_core::{
     CompactionPlane, CompactionUnavailable, CompactionViews, FileWalStore, RunControl, RunRequest,
@@ -50,7 +51,7 @@ fn request() -> RunRequest {
 }
 
 fn control() -> RunControl {
-    RunControl {
+    let control = RunControl {
         manifest: Some(Arc::new(broca_wal::PlanManifest {
             plan: OpaqueJson::from_json_text(
                 json!({"compaction_item":{"provider":PROVIDER,"preset":"summary","params":{}},"composition":{}})
@@ -67,10 +68,17 @@ fn control() -> RunControl {
             fetches: vec![],
             declarations: vec![],
         })),
-        compaction_plane: Some(Arc::new(ScriptedCompaction::default())),
-        compaction_views: Some(Arc::new(ScriptedViews::default())),
         ..Default::default()
-    }
+    };
+    with_compaction(control, Arc::new(ScriptedCompaction::default()))
+}
+
+/// `control` with `provider` as the session's compaction provider: the one scripted provider
+/// serves Setup and `view.get` and is the source of the run's `view_ready` events.
+fn with_compaction(mut control: RunControl, provider: Arc<ScriptedCompaction>) -> RunControl {
+    control.compaction_plane = Some(provider.clone());
+    control.compaction_views = Some(provider);
+    control
 }
 
 fn assistant(id: &str, content: Vec<ContentBlock>, finish: FinishReason) -> Vec<NormalizedEvent> {
@@ -174,11 +182,7 @@ fn signed_control() -> RunControl {
     )
     .unwrap();
     control.manifest = Some(Arc::new(manifest));
-    control.compaction_views = Some(Arc::new(ScriptedViews {
-        signed: true,
-        ..Default::default()
-    }));
-    control
+    with_compaction(control, Arc::new(ScriptedCompaction::signed()))
 }
 
 fn signed(text: &str) -> ContentBlock {
@@ -241,9 +245,41 @@ fn replacement(version: u64, text: &str) -> Value {
         "replacement":[{"role":"user","content":[{"type":"text","text":text}]}]})
 }
 
+/// The scripted compaction provider: Setup, then its view of the session (the first user
+/// message folded into a summary), announced with `view_ready` and served by `view.get`, so
+/// the run fetches every view itself at a step boundary. A view is announced at every
+/// boundary whose applied view is older (`stale` announces an older one).
 #[derive(Default)]
 struct ScriptedCompaction {
     setups: AtomicUsize,
+    /// `view.get` calls answered with a view.
+    offered: AtomicUsize,
+    /// Announce an older view (version 1, "stale summary") at every boundary, even after
+    /// version 2 applied.
+    stale: bool,
+    /// Follow `SIGNED_SCENARIO`'s two-view schedule instead.
+    signed: bool,
+    lineage: Mutex<Option<String>>,
+}
+
+impl ScriptedCompaction {
+    fn signed() -> Self {
+        Self {
+            signed: true,
+            ..Default::default()
+        }
+    }
+
+    /// The view the provider publishes under `version`, if it publishes one.
+    fn published(&self, session_ref: &str, version: u64) -> Option<CompactionView> {
+        let lineage = self.lineage.lock().unwrap().clone()?;
+        match (version, self.signed, self.stale) {
+            (1, false, true) => Some(view(session_ref, &lineage, 1, "stale summary")),
+            (2, _, false) => Some(view(session_ref, &lineage, 2, APPLIED_HEAD)),
+            (3, true, false) => Some(second_view(session_ref, &lineage)),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
@@ -263,31 +299,35 @@ impl CompactionPlane for ScriptedCompaction {
             .unwrap(),
         )
     }
-}
 
-/// The provider's view of the session: the first user message folded into a summary. It is
-/// offered at every boundary whose applied view is older (`stale` offers an older one).
-#[derive(Default)]
-struct ScriptedViews {
-    /// Offers that returned a view.
-    offered: AtomicUsize,
-    /// Offer an older view (version 1, "stale summary") at every boundary, even after
-    /// version 2 applied.
-    stale: bool,
-    /// Follow `SIGNED_SCENARIO`'s two-view schedule instead.
-    signed: bool,
-    lineage: Mutex<Option<String>>,
+    async fn view_get(
+        &self,
+        provider: &str,
+        _bind: &BindIdentity,
+        request: ViewGetRequest,
+    ) -> Result<ViewGetAnswer, CompactionUnavailable> {
+        assert_eq!(provider, PROVIDER);
+        Ok(
+            match self.published(&request.session_ref, request.view_version) {
+                Some(view) => {
+                    self.offered.fetch_add(1, Ordering::SeqCst);
+                    ViewGetAnswer::view(view)
+                }
+                None => ViewGetAnswer::refuse("unknown_version", "not published"),
+            },
+        )
+    }
 }
 
 /// `SIGNED_SCENARIO`'s second view: the first question still folded, and the tool's output
 /// (message 4) replaced by a shorter one.
-fn second_view(session_ref: &str, lineage_id: &str) -> (CompactionView, ViewReady) {
+fn second_view(session_ref: &str, lineage_id: &str) -> CompactionView {
     let summary =
         json!([{"role":"user","content":[{"type":"text","text":APPLIED_HEAD}]}]).to_string();
     let short = json!({"type":"tool_result","tool_call_id":"edit-1",
         "output":{"kind":"text","text":"edited (short)"},"is_error":false})
     .to_string();
-    let view = CompactionView::new(
+    CompactionView::new(
         session_ref,
         3,
         lineage_id,
@@ -308,19 +348,12 @@ fn second_view(session_ref: &str, lineage_id: &str) -> (CompactionView, ViewRead
                 )],
             ),
         ],
-    );
-    let ready = ViewReady::for_view(&view);
-    (view, ready)
+    )
 }
 
-fn view(
-    session_ref: &str,
-    lineage_id: &str,
-    version: u64,
-    text: &str,
-) -> (CompactionView, ViewReady) {
+fn view(session_ref: &str, lineage_id: &str, version: u64, text: &str) -> CompactionView {
     let bytes = json!([{"role":"user","content":[{"type":"text","text":text}]}]).to_string();
-    let view = CompactionView::new(
+    CompactionView::new(
         session_ref,
         version,
         lineage_id,
@@ -329,35 +362,34 @@ fn view(
             mid: "m0".into(),
         },
         vec![ViewRange::replace(0, 1, bytes)],
-    );
-    let ready = ViewReady::for_view(&view);
-    (view, ready)
+    )
 }
 
-impl CompactionViews for ScriptedViews {
-    fn newest(
+impl CompactionViews for ScriptedCompaction {
+    fn newest_ready(
         &self,
         session_ref: &str,
         lineage_id: &str,
         after: Option<u64>,
-    ) -> Option<(CompactionView, ViewReady)> {
+    ) -> Option<ViewReady> {
+        // A `view_ready` event names no lineage; the scripted provider learns the run's from
+        // its first boundary, as a real provider learns it from the run's notices.
         *self.lineage.lock().unwrap() = Some(lineage_id.into());
-        let offer = if self.signed {
+        let version = if self.signed {
             match after {
-                None | Some(0..=1) => Some(view(session_ref, lineage_id, 2, APPLIED_HEAD)),
-                Some(2) => Some(second_view(session_ref, lineage_id)),
-                Some(_) => None,
+                None | Some(0..=1) => 2,
+                Some(2) => 3,
+                Some(_) => return None,
             }
         } else if self.stale {
-            Some(view(session_ref, lineage_id, 1, "stale summary"))
+            1
         } else if after.is_none_or(|applied| applied < 2) {
-            Some(view(session_ref, lineage_id, 2, APPLIED_HEAD))
+            2
         } else {
-            None
+            return None;
         };
-        self.offered
-            .fetch_add(usize::from(offer.is_some()), Ordering::SeqCst);
-        offer
+        let view = self.published(session_ref, version)?;
+        Some(ViewReady::for_view(&view))
     }
 }
 
@@ -365,14 +397,11 @@ async fn resume_with(
     scenario: Scenario,
     kill: &KillReport,
     compaction: Arc<ScriptedCompaction>,
-    views: Arc<ScriptedViews>,
 ) -> Resumed {
     let provider = ScriptedProvider::for_scenario(&scenario);
     let plane = HarnessPlane::for_scenario(&scenario);
     let store = FileWalStore::new(kill.state_root.join("wal"));
-    let mut control = (scenario.control)();
-    control.compaction_plane = Some(compaction);
-    control.compaction_views = Some(views);
+    let control = with_compaction((scenario.control)(), compaction);
     let outcome = drive(
         (scenario.request)(),
         control,
@@ -464,8 +493,7 @@ async fn compaction_every_record_boundary_and_real_kill_replay_identical_bytes()
         let kill = handle.kill_at(point, trigger).await;
         unsynced += usize::from(kill.after_sync == Some(false));
         let compaction = Arc::new(ScriptedCompaction::default());
-        let views = Arc::new(ScriptedViews::default());
-        let resumed = resume_with(SCENARIO, &kill, compaction.clone(), views.clone()).await;
+        let resumed = resume_with(SCENARIO, &kill, compaction.clone()).await;
         handle.check(&kill, &resumed);
         let prefix = kill.durable.records();
         if has_setup(&prefix) {
@@ -481,9 +509,9 @@ async fn compaction_every_record_boundary_and_real_kill_replay_identical_bytes()
             durable_view_resumes += 1;
             durable_view_model_resumes += usize::from(resumed.provider.request_count() > 0);
             assert_eq!(
-                views.offered.load(Ordering::SeqCst),
+                compaction.offered.load(Ordering::SeqCst),
                 0,
-                "{}: a durable view was offered again",
+                "{}: a durable view was fetched again",
                 kill.label()
             );
         }
@@ -561,17 +589,16 @@ async fn stale_view_offered_after_restart_is_never_applied() {
             KillTrigger::Truncate,
         )
         .await;
-    let compaction = Arc::new(ScriptedCompaction::default());
-    let views = Arc::new(ScriptedViews {
+    let compaction = Arc::new(ScriptedCompaction {
         stale: true,
         ..Default::default()
     });
-    let resumed = resume_with(TOOL_SCENARIO, &kill, compaction.clone(), views.clone()).await;
+    let resumed = resume_with(TOOL_SCENARIO, &kill, compaction.clone()).await;
     handle.check(&kill, &resumed);
     assert_eq!(compaction.setups.load(Ordering::SeqCst), 0);
     assert!(
-        views.offered.load(Ordering::SeqCst) > 0,
-        "the stale view must actually be offered"
+        compaction.offered.load(Ordering::SeqCst) > 0,
+        "the stale view must actually be fetched and offered"
     );
     let after = resumed.log.records();
     assert_eq!(views_applied(&after), 1, "the stale view was applied");
@@ -638,12 +665,8 @@ async fn signed_reasoning_strip_and_a_second_view_replay_identical_bytes_at_ever
             KillTrigger::Truncate
         };
         let kill = handle.kill_at(point, trigger).await;
-        let compaction = Arc::new(ScriptedCompaction::default());
-        let views = Arc::new(ScriptedViews {
-            signed: true,
-            ..Default::default()
-        });
-        let resumed = resume_with(SIGNED_SCENARIO, &kill, compaction.clone(), views).await;
+        let compaction = Arc::new(ScriptedCompaction::signed());
+        let resumed = resume_with(SIGNED_SCENARIO, &kill, compaction.clone()).await;
         handle.check(&kill, &resumed);
         let prefix = kill.durable.records();
         if has_setup(&prefix) {
