@@ -198,10 +198,15 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
 
     // The re-send after the restart answers the run the send joined, with the
     // `step` receipt, never `pending`.
-    let resent = result(
-        &rig.send_with("note", "also this", None, steer_or_idle_start())
-            .await,
+    let resent_frame = rig
+        .send_with("note", "also this", None, steer_or_idle_start())
+        .await;
+    pin_resend(
+        &resent_frame,
+        "send_reply.ordered_resend_step.json",
+        &joined,
     );
+    let resent = result(&resent_frame);
     assert_eq!(resent["state"], "finished", "{resent}");
     assert_eq!(resent["run_id"], joined.as_str(), "{resent}");
     assert_eq!(resent["delivered"], step_receipt(&joined), "{resent}");
@@ -274,13 +279,29 @@ async fn an_ordered_send_that_starts_its_own_run_answers_that_run() {
         status.body,
         "the same answer after a restart"
     );
-    let resent = result(
-        &rig.send_with("later", "and then", None, steer_or_idle_start())
-            .await,
+    let resent_frame = rig
+        .send_with("later", "and then", None, steer_or_idle_start())
+        .await;
+    pin_resend(
+        &resent_frame,
+        "send_reply.ordered_resend_turn.json",
+        &provisional,
     );
+    let resent = result(&resent_frame);
     assert_eq!(resent["run_id"], provisional.as_str(), "{resent}");
     assert_eq!(resent["delivered"], turn, "{resent}");
     rig.finish().await;
+}
+
+/// Pins a re-send's reply bytes, taken after a restart from the real serve path, with
+/// `@RUN_ID@` standing for the run the receipt names. `BROCA_UPDATE_GOLDEN` writes them.
+fn pin_resend(frame: &Frame, file: &str, run_id: &str) {
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        let body = String::from_utf8(frame.body.to_vec()).expect("UTF-8 reply");
+        std::fs::write(golden_path(file), body.replace(run_id, "@RUN_ID@"))
+            .expect("write the re-send golden");
+    }
+    assert_golden(frame, file, run_id);
 }
 
 /// A queued send that ends undelivered answers its terminal send state for good: `retracted`
