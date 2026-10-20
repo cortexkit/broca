@@ -263,6 +263,7 @@ mod tests {
 
     fn unavailable_error() -> ProviderError {
         ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
@@ -340,6 +341,7 @@ mod tests {
         ] {
             for raw in [
                 ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     refusal: None,
                     class,
@@ -355,6 +357,7 @@ mod tests {
                     affordable_max_tokens: None,
                 },
                 ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     refusal: None,
                     class,

@@ -47,6 +47,9 @@ mod tests {
             vec![ContentBlock::Text { text: "hi".into() }],
         )]);
         opts.step_context = Some(StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: run.into(),
             step_index: step,
         });

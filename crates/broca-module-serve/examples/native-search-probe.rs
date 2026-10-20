@@ -646,6 +646,9 @@ async fn run(args: Args) -> Result<(), String> {
                         CallOptions::new(prompt)
                     };
                     opts.step_context = Some(StepContext {
+                        session_address: None,
+                        credential_id: None,
+                        account_ref: None,
                         run_id: "native-search-probe".into(),
                         step_index: 1,
                     });

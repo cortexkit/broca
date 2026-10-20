@@ -65,6 +65,9 @@ fn rich_request() -> CallOptions {
     // The family REQUIRES step identity; populate it so render runs (and so the determinism
     // check exercises the requestId derivation).
     opts.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-conf-01".into(),
         step_index: 3,
     });
@@ -157,11 +160,17 @@ fn request_id_is_per_step_but_stable() {
     use broca_provider::wire::WireFamily;
     let mut step2 = rich_request();
     step2.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-conf-01".into(),
         step_index: 2,
     });
     let mut step3 = rich_request();
     step3.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-conf-01".into(),
         step_index: 3,
     });

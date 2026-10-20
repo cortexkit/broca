@@ -15,6 +15,7 @@ pub fn scoped_error(max_bytes: u64, scope: SizeScope) -> ProviderError {
         SizeScope::RetainedSession => ("retained session", CODE),
     };
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         class: ErrorClass::Permanent,
         message: format!("{subject} log cannot exceed {max_bytes} bytes"),

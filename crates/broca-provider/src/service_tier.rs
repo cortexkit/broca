@@ -271,13 +271,14 @@ pub fn classify_tier_refusal(
         return error;
     };
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
         message: format!(
-            "{status}: provider '{}' refused service_tier \"{}\" for this account: {provider_message}",
-            request.provider, request.tier
-        ),
+        "{status}: provider '{}' refused service_tier \"{}\" for this account: {provider_message}",
+        request.provider, request.tier
+    ),
         status: Some(status),
         retry_after_secs: error.retry_after_secs,
         provider_code: Some(SERVICE_TIER_UNAVAILABLE.to_string()),
@@ -545,6 +546,7 @@ mod tests {
         body: &str,
     ) -> ProviderError {
         let original = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -658,6 +660,7 @@ mod tests {
     fn anthropic_fast_mode_without_credits_is_a_tier_refusal_but_a_busy_429_is_not() {
         const CAPTURED: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode."},"request_id":"req_011CfQqPwHCYLA9161tYEBSn"}"#;
         let busy = |body: &str| ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -745,6 +748,7 @@ mod tests {
             assert_eq!(error.provider_code, None, "{body}");
         }
         let untouched = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,

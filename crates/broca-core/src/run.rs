@@ -48,7 +48,7 @@ use crate::{
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
     tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
     tool_repetition::{result_bytes, RepetitionObserver},
-    wal_writer::{WalHandle, WalStore, WalWriteError},
+    wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
 
 /// Default safety cap when the caller supplies no `stop_when`.
@@ -2212,6 +2212,7 @@ fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Optio
     };
 
     Some(ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -4299,6 +4300,9 @@ where
         opts_mut.step_context = Some(broca_protocol::StepContext {
             run_id: resolved_run_id.0.clone(),
             step_index: step_id.0,
+            session_address: Some(session_addr(&req.session)),
+            credential_id: run_credential_id.clone(),
+            account_ref: run_account_ref.clone(),
         });
         let mut model_opts = None;
         if let Some(runtime) = &compaction_runtime {
@@ -6534,22 +6538,20 @@ async fn run_step<P: Provider>(
         // HTTP transports retry a missing final control; other providers fail safely here.
         _ => StepOutcome::Failed {
             retries_used: 0,
-            error: ProviderError {
-                provider_subcode: None,
-                refusal: None,
-                class: broca_protocol::ErrorClass::ProviderUnavailable,
-                message: "provider stream ended without an assembled assistant message and Finished control"
-                    .into(),
-                status: None,
-                retry_after_secs: None,
-                provider_code: None,
-                resets_at_ms: None,
-                resets_at_source: None,
-                limit_window: None,
-                account_ref: None,
-                credential_id: None,
-                affordable_max_tokens: None,
-            },
+            error: ProviderError { provider_details: None, provider_subcode: None,
+            refusal: None,
+            class: broca_protocol::ErrorClass::ProviderUnavailable,
+            message: "provider stream ended without an assembled assistant message and Finished control"
+                .into(),
+            status: None,
+            retry_after_secs: None,
+            provider_code: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None, },
         },
     })
 }
@@ -8275,6 +8277,7 @@ mod tests {
     #[test]
     fn stamp_credential_names_the_credential_only_on_credential_scoped_errors() {
         let error = |class, status: Option<u16>, code: Option<&str>| ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -8461,21 +8464,19 @@ mod tests {
 
     fn failed_step() -> Result<StepOutcome, RunFinishReason> {
         Ok(StepOutcome::Failed {
-            error: ProviderError {
-                provider_subcode: None,
-                refusal: None,
-                class: broca_protocol::ErrorClass::ProviderUnavailable,
-                message: "provider stream ended without an assembled assistant message and Finished control".into(),
-                status: None,
-                retry_after_secs: None,
-                provider_code: None,
-                resets_at_ms: None,
-                resets_at_source: None,
-                limit_window: None,
-                account_ref: None,
-                credential_id: None,
-                affordable_max_tokens: None,
-            },
+            error: ProviderError { provider_details: None, provider_subcode: None,
+            refusal: None,
+            class: broca_protocol::ErrorClass::ProviderUnavailable,
+            message: "provider stream ended without an assembled assistant message and Finished control".into(),
+            status: None,
+            retry_after_secs: None,
+            provider_code: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None, },
             retries_used: 0,
         })
     }

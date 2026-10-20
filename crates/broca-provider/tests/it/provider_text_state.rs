@@ -97,6 +97,9 @@ fn replayed(frozen: &FrozenRenderConfig, message: &AssistantMessage) -> CallOpti
     let mut opts = CallOptions::new(state.prompt);
     opts.target_model = Some(model);
     opts.step_context = Some(broca_protocol::StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "state".into(),
         step_index: 2,
     });
@@ -307,6 +310,9 @@ fn legacy_frozen_configs_keep_pre_state_decode_and_render_bytes() {
         )]);
         opts.target_model = Some(ModelHandle::new("fixture-provider", "model"));
         opts.step_context = Some(broca_protocol::StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: "legacy".into(),
             step_index: 2,
         });
@@ -395,6 +401,9 @@ fn responses_reasoning_summary_request_bytes_survive_wal_replay() {
         let mut opts = CallOptions::new(state.prompt);
         opts.target_model = Some(model.clone());
         opts.step_context = Some(broca_protocol::StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: "summary".into(),
             step_index: 2,
         });

@@ -17,6 +17,9 @@ fn options(ephemeral_session: bool) -> CallOptions {
     )]);
     opts.ephemeral_session = ephemeral_session;
     opts.step_context = Some(broca_protocol::StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "retention-diagnostic-test".into(),
         step_index: 1,
     });

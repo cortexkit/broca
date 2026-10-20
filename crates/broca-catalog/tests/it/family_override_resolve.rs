@@ -68,6 +68,9 @@ mod gated {
         }]);
         // The antigravity family requires step identity for its deterministic requestId.
         o.step_context = Some(StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: "run-ovr".into(),
             step_index: 1,
         });

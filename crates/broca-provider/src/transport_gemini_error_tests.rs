@@ -19,10 +19,8 @@ async fn assert_permission_not_retried<F: WireFamily + 'static>(family: F, id: W
     frozen.project_id = Some("test-project".into());
     let provider = LiveProvider::new(family, frozen, AuthHandle::None);
     let mut opts = CallOptions::new(Vec::new());
-    opts.step_context = Some(StepContext {
-        run_id: "gemini-error-test".into(),
-        step_index: 1,
-    });
+    opts.step_context = Some(StepContext { session_address: None, credential_id: None, account_ref: None, run_id: "gemini-error-test".into(),
+    step_index: 1, });
     let mut rx = provider.start_step(
         StepId(1),
         Arc::new(opts),

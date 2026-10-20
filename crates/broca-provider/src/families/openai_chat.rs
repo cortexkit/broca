@@ -1009,6 +1009,7 @@ fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
         .to_owned();
 
     Some(ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: classify_error_with_status_defaults(provider_code, status),

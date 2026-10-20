@@ -63,6 +63,7 @@ fn stamp(owner: Principal, epoch: u64) -> ScopeStamp {
 
 fn auth_required_error() -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Auth,

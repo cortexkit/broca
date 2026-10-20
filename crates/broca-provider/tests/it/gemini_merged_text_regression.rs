@@ -46,6 +46,9 @@ fn request() -> CallOptions {
     ]);
     opts.target_model = Some(ModelHandle::new("google", MODEL));
     opts.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-merged-text-regression".into(),
         step_index: 7,
     });

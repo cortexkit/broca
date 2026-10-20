@@ -94,6 +94,7 @@ mod tests {
 
     fn permanent_400(provider_code: Option<&str>) -> ProviderError {
         ProviderError {
+            provider_details: None,
             class: ErrorClass::Permanent,
             message: "400: body".into(),
             status: Some(400),

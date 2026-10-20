@@ -46,6 +46,9 @@ fn base_request() -> CallOptions {
     // Code-Assist derives a deterministic requestId from step identity, so populate it in the
     // shared test request used for every family.
     opts.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-generation-01".into(),
         step_index: 2,
     });

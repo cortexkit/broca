@@ -151,6 +151,7 @@ fn error_step(class: broca_protocol::ErrorClass, message: &str) -> Vec<Normalize
         ctrl(ProviderControl::StreamStart { warnings: vec![] }),
         ctrl(ProviderControl::Error {
             error: broca_protocol::error::ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 class,
                 refusal: None,
@@ -3197,6 +3198,7 @@ async fn second_writer_on_held_session_is_rejected() {
 #[tokio::test]
 async fn an_account_limit_terminal_names_the_frozen_account_on_every_surface() {
     let exhausted = broca_protocol::error::ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Transient,
@@ -3314,6 +3316,7 @@ async fn an_account_limit_terminal_names_the_frozen_account_on_every_surface() {
 #[tokio::test]
 async fn a_billing_exhausted_terminal_names_the_frozen_account_on_every_surface() {
     let billing = broca_protocol::error::ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Permanent,
@@ -3461,6 +3464,7 @@ async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account()
         account_decision: None,
     };
     let auth_failure = broca_protocol::error::ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Auth,
@@ -3476,6 +3480,7 @@ async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account()
         affordable_max_tokens: None,
     };
     let exhausted = broca_protocol::error::ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Transient,

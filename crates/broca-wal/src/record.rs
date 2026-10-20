@@ -1286,10 +1286,31 @@ impl WalRecord {
         } else {
             base
         };
-        if self.carries_runner_tags() {
+        let base = if self.carries_runner_tags() {
             with_feature(base, crate::framing::RUNNER_TAGS_FEATURE)
         } else {
             base
+        };
+        if self.carries_google_rpc_error_details() {
+            with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
+        } else {
+            base
+        }
+    }
+
+    fn carries_google_rpc_error_details(&self) -> bool {
+        match self {
+            WalRecord::RunFinished {
+                error: Some(error), ..
+            }
+            | WalRecord::RunPaused {
+                error: Some(error), ..
+            } => error.provider_details.is_some(),
+            WalRecord::Retracted {
+                failure: Some(failure),
+                ..
+            } => failure.error.provider_details.is_some(),
+            _ => false,
         }
     }
 
@@ -3381,6 +3402,7 @@ mod schema_tests {
     #[test]
     fn every_v2_record_round_trips() {
         let provider_err = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -3528,6 +3550,7 @@ mod schema_tests {
                 failure: Some(QueuedAdmissionFailure {
                     run_id: RunId("r3".into()),
                     error: ProviderError {
+                        provider_details: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -3564,6 +3587,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
@@ -3585,6 +3609,7 @@ mod schema_tests {
             ts_ms: Some(1_790_000_000_001),
             reason: PauseReason::AuthRequired,
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -3618,21 +3643,19 @@ mod schema_tests {
             ts_ms: Some(1_790_387_965_000),
             reason: RunFinishReason::Error,
             usage: Usage::default(),
-            error: Some(ProviderError {
-                provider_subcode: None,
-                refusal: None,
-                class: ErrorClass::Transient,
-                message: r#"429: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CfRDPYNrfveajQccKCJ7o"}"#.into(),
-                status: Some(429),
-                retry_after_secs: Some(352_835.0),
-                provider_code: Some(broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.into()),
-                resets_at_ms: Some(1_790_740_800_000),
-                resets_at_source: None,
-                limit_window: Some("seven_day".into()),
-                account_ref: Some("d4bc9dbc".into()),
-                credential_id: None,
-                affordable_max_tokens: None,
-            }),
+            error: Some(ProviderError { provider_details: None, provider_subcode: None,
+            refusal: None,
+            class: ErrorClass::Transient,
+            message: r#"429: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CfRDPYNrfveajQccKCJ7o"}"#.into(),
+            status: Some(429),
+            retry_after_secs: Some(352_835.0),
+            provider_code: Some(broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.into()),
+            resets_at_ms: Some(1_790_740_800_000),
+            resets_at_source: None,
+            limit_window: Some("seven_day".into()),
+            account_ref: Some("d4bc9dbc".into()),
+            credential_id: None,
+            affordable_max_tokens: None, }),
             retries_used: 0,
         };
         assert_eq!(serde_json::to_string(&record).unwrap(), FINISHED);
@@ -3655,6 +3678,7 @@ mod schema_tests {
                      retry_after_secs,
                      code: Option<&str>,
                      account: Option<&str>| ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -3754,6 +3778,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::ProviderUnavailable,

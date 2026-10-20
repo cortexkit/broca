@@ -110,6 +110,9 @@ fn options(prompt: Vec<Message>) -> CallOptions {
     let mut options = CallOptions::new(prompt);
     // Families that embed a per-request id derive it from the run and step.
     options.step_context = Some(broca_protocol::StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-tags".into(),
         step_index: 2,
     });

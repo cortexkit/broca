@@ -2093,6 +2093,7 @@ mod tests {
             failure: Some(broca_wal::QueuedAdmissionFailure {
                 run_id: RunId("next-run".into()),
                 error: broca_protocol::error::ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     class: ErrorClass::Permanent,
                     message: "unknown model".into(),
@@ -2552,6 +2553,7 @@ mod tests {
             reasoning_tokens: Some(1),
         };
         let terminal_error = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -2818,6 +2820,7 @@ mod tests {
     fn session_read_lineage_state_carries_typed_terminal_error() {
         let mut wal = sample_wal();
         let error = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,

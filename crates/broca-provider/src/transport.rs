@@ -41,7 +41,9 @@ use broca_core::{clock::Clock, provider::Provider};
 use broca_protocol::{
     display::DisplayEvent,
     error::{
-        ErrorClass, ProviderError, ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, CREDIT_INSUFFICIENT,
+        ErrorClass, GoogleRpcErrorDetails, GoogleRpcErrorInfo, GoogleRpcQuotaFailure,
+        GoogleRpcQuotaViolation, GoogleRpcRetryInfo, ProviderError, ACCOUNT_LIMIT_EXHAUSTED,
+        BILLING_EXHAUSTED, CREDIT_INSUFFICIENT,
     },
     AttemptOutcome, CallOptions, CredentialRefresh, GenerationConfig, ModelAttempt,
     NormalizedEvent, ProviderControl, StepId, ToolChoice,
@@ -203,6 +205,11 @@ struct PreparedHttpRequest {
         crate::spec::WireFamilyId,
         crate::service_tier::ServiceTierRequest,
     )>,
+    session_address: Option<String>,
+    run_id: Option<String>,
+    credential_id: Option<String>,
+    account_ref: Option<String>,
+    wire_model_id: Option<String>,
 }
 
 impl From<HttpRequest> for PreparedHttpRequest {
@@ -214,6 +221,11 @@ impl From<HttpRequest> for PreparedHttpRequest {
             body: Bytes::from(request.body),
             family: None,
             service_tier: None,
+            session_address: None,
+            run_id: None,
+            credential_id: None,
+            account_ref: None,
+            wire_model_id: None,
         }
     }
 }
@@ -414,6 +426,13 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             .service_tier_request
             .clone()
             .map(|tier| (self.frozen.family_id, tier));
+        if let Some(context) = &self.opts.step_context {
+            request.session_address = context.session_address.clone();
+            request.run_id = Some(context.run_id.clone());
+            request.credential_id = context.credential_id.clone();
+            request.account_ref = context.account_ref.clone();
+        }
+        request.wire_model_id = Some(self.frozen.wire_model_id.clone());
         maybe_dump_rendered_request(&request.body, &self.opts, self.step_id);
         let request_digest = RequestDigest::of(&request.body);
         RenderedRequest {
@@ -909,6 +928,7 @@ async fn send_warm(
     let identity = Bytes::from(request.body);
     let failed = |message: String| {
         broca_core::WarmFailure::Provider(ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -1796,6 +1816,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 // the blocking handle. Keep that failure on the typed provider-error path instead
                 // of closing the receiver as an unexplained missing assistant message.
                 let error = ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
@@ -1854,6 +1875,11 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 body: sent.body.clone(),
                 family: sent.family,
                 service_tier: sent.service_tier.clone(),
+                session_address: sent.session_address.clone(),
+                run_id: sent.run_id.clone(),
+                credential_id: sent.credential_id.clone(),
+                account_ref: sent.account_ref.clone(),
+                wire_model_id: sent.wire_model_id.clone(),
             }
         };
         let step_recovery = recovery.map(|recovery| StepAuthRecovery {
@@ -2370,21 +2396,19 @@ fn account_changed_error(frozen: Option<&str>, served: Option<&str>) -> Option<P
     if frozen == served {
         return None;
     }
-    Some(ProviderError {
-        provider_subcode: None,
-        refusal: None,
-        class: ErrorClass::Auth,
-        message: format!("credential account changed: frozen account {frozen}, served account {served}; re-admission required"),
-        provider_code: Some("account_changed".into()),
-        status: None,
-        retry_after_secs: None,
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-    })
+    Some(ProviderError { provider_details: None, provider_subcode: None,
+    refusal: None,
+    class: ErrorClass::Auth,
+    message: format!("credential account changed: frozen account {frozen}, served account {served}; re-admission required"),
+    provider_code: Some("account_changed".into()),
+    status: None,
+    retry_after_secs: None,
+    resets_at_ms: None,
+    resets_at_source: None,
+    limit_window: None,
+    account_ref: None,
+    credential_id: None,
+    affordable_max_tokens: None, })
 }
 
 /// ChatGPT carries an account in its headers as well as in vault metadata. Neither may
@@ -2801,6 +2825,27 @@ async fn drive_attempt(
             }
             None => error,
         };
+        if code == 429
+            && matches!(
+                request.family,
+                Some(
+                    crate::spec::WireFamilyId::Gemini | crate::spec::WireFamilyId::GoogleCodeAssist
+                )
+            )
+            && error.is_account_limit_exhausted()
+        {
+            tracing::warn!(
+                target: "provider",
+                session_address = request.session_address.as_deref().unwrap_or("unknown"),
+                run_id = request.run_id.as_deref().unwrap_or("unknown"),
+                credential_id = request.credential_id.as_deref().unwrap_or("unknown"),
+                account_ref = request.account_ref.as_deref().unwrap_or("unknown"),
+                wire_model_id = request.wire_model_id.as_deref().unwrap_or("unknown"),
+                request_body_len = request.body.len(),
+                provider_details = ?error.provider_details,
+                "Google provider quota refusal"
+            );
+        }
         // An exhausted account refills in hours or days. Re-sending within the step cannot
         // succeed, and honoring the wait would park the run far past any step budget.
         let retry_forbidden = retry_forbidden
@@ -3318,6 +3363,7 @@ fn tool_args_cut(events: &[NormalizedEvent]) -> bool {
 
 fn stream_timeout_error(activity: &str) -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -3336,6 +3382,7 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
 
 fn content_timeout_error() -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -3375,6 +3422,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
         _ => format!("normalize response: {e}"),
     };
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class,
@@ -3399,12 +3447,13 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
 /// the shared boundary anyway and says less.
 fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
         message: format!(
             "provider stream below the configured floor: {measured_bytes_per_sec:.1} content \
-             bytes/sec over {}s, floor {:.1}",
+         bytes/sec over {}s, floor {:.1}",
             floor.window.as_secs(),
             floor.bytes_per_sec
         ),
@@ -3422,6 +3471,7 @@ fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> Pro
 
 fn transport_error(message: &str) -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::ProviderUnavailable,
@@ -3440,6 +3490,7 @@ fn transport_error(message: &str) -> ProviderError {
 
 fn stream_limit_error(message: &str) -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -3616,24 +3667,22 @@ fn classify_chatgpt_upstream_key_rejection(
     {
         return error;
     }
-    ProviderError {
-        provider_subcode: None,
-        refusal: None,
-        class: ErrorClass::Transient,
-        message: format!(
-            "{status}: {CHATGPT_UPSTREAM_KEY_REJECTED}: the ChatGPT backend rejected an OpenAI API key on its own side (broca sent \
-             the account's OAuth token, not a key); not a credential failure."
-        ),
-        status: Some(status),
-        retry_after_secs: error.retry_after_secs,
-        provider_code: Some(CHATGPT_UPSTREAM_KEY_REJECTED.to_string()),
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-    }
+    ProviderError { provider_details: None, provider_subcode: None,
+    refusal: None,
+    class: ErrorClass::Transient,
+    message: format!(
+        "{status}: {CHATGPT_UPSTREAM_KEY_REJECTED}: the ChatGPT backend rejected an OpenAI API key on its own side (broca sent \
+         the account's OAuth token, not a key); not a credential failure."
+    ),
+    status: Some(status),
+    retry_after_secs: error.retry_after_secs,
+    provider_code: Some(CHATGPT_UPSTREAM_KEY_REJECTED.to_string()),
+    resets_at_ms: None,
+    resets_at_source: None,
+    limit_window: None,
+    account_ref: None,
+    credential_id: None,
+    affordable_max_tokens: None, }
 }
 
 /// A 429 that says one ACCOUNT has used up a usage window, rather than that the route is
@@ -3912,8 +3961,12 @@ fn kimi_weekly_usage_limit_reached(body: &str, error: ProviderError) -> Provider
 /// even when its reset time cannot be read. `limit_window` is left empty because Google does not
 /// name the window that ran out.
 fn google_quota_exhausted(body: &str, now: SystemTime, error: ProviderError) -> ProviderError {
+    let provider_details = google_rpc_error_details(body).map(Box::new);
     let Ok(body) = serde_json::from_str::<Value>(body) else {
-        return error;
+        return ProviderError {
+            provider_details,
+            ..error
+        };
     };
     let Some(info) = body
         .get("error")
@@ -3927,7 +3980,10 @@ fn google_quota_exhausted(body: &str, now: SystemTime, error: ProviderError) -> 
             })
         })
     else {
-        return error;
+        return ProviderError {
+            provider_details,
+            ..error
+        };
     };
     let metadata = info.get("metadata");
     let field = |name: &str| {
@@ -3954,8 +4010,128 @@ fn google_quota_exhausted(body: &str, now: SystemTime, error: ProviderError) -> 
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        provider_details,
         ..error
     }
+}
+
+const GOOGLE_RPC_METADATA_MAX_KEYS: usize = 16;
+const GOOGLE_RPC_DIMENSIONS_MAX_KEYS: usize = 8;
+const GOOGLE_RPC_VIOLATIONS_MAX: usize = 8;
+
+/// Copy only bounded typed quota fields; provider messages can contain request content.
+fn google_rpc_error_details(text: &str) -> Option<GoogleRpcErrorDetails> {
+    let body = serde_json::from_str::<Value>(text).ok()?;
+    let details = body
+        .get("error")
+        .and_then(|error| error.get("details"))
+        .and_then(Value::as_array)?;
+    let mut error_info = None;
+    let mut violations = Vec::new();
+    let mut retry_info = None;
+
+    for detail in details {
+        match detail.get("@type").and_then(Value::as_str) {
+            Some(GOOGLE_RPC_ERROR_INFO_TYPE) if error_info.is_none() => {
+                error_info = Some(GoogleRpcErrorInfo {
+                    reason: bounded_google_string(detail.get("reason"), 128),
+                    domain: bounded_google_string(detail.get("domain"), 128),
+                    metadata: bounded_google_string_map(
+                        detail.get("metadata"),
+                        GOOGLE_RPC_METADATA_MAX_KEYS,
+                    ),
+                });
+            }
+            Some(GOOGLE_RPC_QUOTA_FAILURE_TYPE) if violations.len() < GOOGLE_RPC_VIOLATIONS_MAX => {
+                let Some(items) = detail.get("violations").and_then(Value::as_array) else {
+                    continue;
+                };
+                for item in items
+                    .iter()
+                    .take(GOOGLE_RPC_VIOLATIONS_MAX - violations.len())
+                {
+                    if let Some(violation) = google_rpc_quota_violation(item) {
+                        violations.push(violation);
+                    }
+                }
+            }
+            Some(GOOGLE_RPC_RETRY_INFO_TYPE) if retry_info.is_none() => {
+                if let Some(retry_delay) = bounded_google_string(detail.get("retryDelay"), 128) {
+                    retry_info = Some(GoogleRpcRetryInfo {
+                        retry_delay: Some(retry_delay),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let quota_failure = (!violations.is_empty()).then_some(GoogleRpcQuotaFailure { violations });
+    if error_info.is_none() && quota_failure.is_none() && retry_info.is_none() {
+        return None;
+    }
+    Some(GoogleRpcErrorDetails {
+        error_info,
+        quota_failure,
+        retry_info,
+    })
+}
+
+fn google_rpc_quota_violation(value: &Value) -> Option<GoogleRpcQuotaViolation> {
+    let violation = GoogleRpcQuotaViolation {
+        subject: bounded_google_string(value.get("subject"), 256),
+        description: bounded_google_string(value.get("description"), 256),
+        quota_metric: bounded_google_string(value.get("quotaMetric"), 128),
+        quota_id: bounded_google_string(value.get("quotaId"), 128),
+        quota_dimensions: bounded_google_string_map(
+            value.get("quotaDimensions"),
+            GOOGLE_RPC_DIMENSIONS_MAX_KEYS,
+        ),
+        quota_value: bounded_google_number_or_string(value.get("quotaValue"), 128),
+        future_quota_value: bounded_google_number_or_string(value.get("futureQuotaValue"), 128),
+    };
+    (violation.subject.is_some()
+        || violation.description.is_some()
+        || violation.quota_metric.is_some()
+        || violation.quota_id.is_some()
+        || !violation.quota_dimensions.is_empty()
+        || violation.quota_value.is_some()
+        || violation.future_quota_value.is_some())
+    .then_some(violation)
+}
+
+fn bounded_google_string(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(|value| value.chars().take(max_chars).collect())
+}
+
+fn bounded_google_number_or_string(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    let value = value?;
+    let value = value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .as_i64()
+            .map(|number| number.to_string())
+            .or_else(|| value.as_u64().map(|number| number.to_string()))
+    })?;
+    Some(value.chars().take(max_chars).collect())
+}
+
+fn bounded_google_string_map(
+    value: Option<&Value>,
+    max_keys: usize,
+) -> std::collections::BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(key, value)| {
+            let value = bounded_google_string(Some(value), 128)?;
+            let key = key.chars().take(128).collect();
+            Some((key, value))
+        })
+        .take(max_keys)
+        .collect()
 }
 
 /// Parse a non-negative Go `time.Duration` string (`21m0.959250039s`, `1h30m`, `500ms`, `0`)
@@ -4018,6 +4194,8 @@ fn parse_go_duration_millis(text: &str) -> Option<u64> {
 }
 
 const GOOGLE_RPC_ERROR_INFO_TYPE: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+const GOOGLE_RPC_QUOTA_FAILURE_TYPE: &str = "type.googleapis.com/google.rpc.QuotaFailure";
+const GOOGLE_RPC_RETRY_INFO_TYPE: &str = "type.googleapis.com/google.rpc.RetryInfo";
 const GOOGLE_QUOTA_EXHAUSTED_REASON: &str = "QUOTA_EXHAUSTED";
 
 use cortexkit_anthropic_policy::{
@@ -4101,6 +4279,7 @@ fn http_error_in_family(
     };
     let provider_code = overflow_code.map(str::to_owned).or(provider_code);
     let error = ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class,
@@ -4193,8 +4372,10 @@ mod tests {
         drive_stream_with_header_timeout, dump_files_to_delete, extract_provider_code, http_error,
         parse_retry_after_header, parse_retry_after_value, publish_completion,
         request_dump_filename, retry_delay, write_dump_file, DumpFileMeta, DumpRetentionCaps,
-        LiveProvider, PreparedHttpRequest, MAX_ERROR_BODY_BYTES, MAX_HTTP_ERROR_BODY_READ_BYTES,
-        STREAM_CONTENT_TIMEOUT, STREAM_IDLE_TIMEOUT,
+        LiveProvider, PreparedHttpRequest, GOOGLE_RPC_DIMENSIONS_MAX_KEYS,
+        GOOGLE_RPC_ERROR_INFO_TYPE, GOOGLE_RPC_METADATA_MAX_KEYS, GOOGLE_RPC_QUOTA_FAILURE_TYPE,
+        GOOGLE_RPC_RETRY_INFO_TYPE, GOOGLE_RPC_VIOLATIONS_MAX, MAX_ERROR_BODY_BYTES,
+        MAX_HTTP_ERROR_BODY_READ_BYTES, STREAM_CONTENT_TIMEOUT, STREAM_IDLE_TIMEOUT,
     };
     // Directory mode is only asserted on Unix, so keep that helper import under the same cfg.
     #[cfg(unix)]
@@ -4298,6 +4479,9 @@ mod tests {
         opts.tool_choice = Arc::new(ToolChoice::Auto);
         opts.provider_options = Arc::new(Value::Object(provider_options));
         opts.step_context = Some(StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: "render-job-run".into(),
             step_index: 7,
         });
@@ -4366,6 +4550,9 @@ mod tests {
         );
         let mut opts = comprehensive_render_options();
         opts.step_context = Some(StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: "panic-translation".into(),
             step_index: 1,
         });
@@ -4613,6 +4800,7 @@ mod tests {
         fn push(&mut self, _chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
             Ok(vec![NormalizedEvent::Control(ProviderControl::Error {
                 error: ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Transient,
@@ -5991,6 +6179,7 @@ mod tests {
     #[test]
     fn in_band_retry_after_without_http_status_sets_the_delay_floor() {
         let error = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -6011,6 +6200,7 @@ mod tests {
     #[test]
     fn retry_after_delay_is_capped_at_one_hundred_twenty_seconds() {
         let error = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -6031,6 +6221,7 @@ mod tests {
     #[test]
     fn computed_backoff_doubles_from_two_seconds_to_a_thirty_second_cap() {
         let error = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
@@ -6350,21 +6541,19 @@ mod tests {
     fn a_refused_service_tier_is_not_relabelled_an_exhausted_account() {
         let now = UNIX_EPOCH + Duration::from_secs(1_790_387_965);
         let headers = crate::wire::ResponseHeaders::new(CAPTURED_EXHAUSTED_HEADERS.iter().copied());
-        let tier_refusal = ProviderError {
-            provider_subcode: None,
-            refusal: None,
-            class: ErrorClass::Permanent,
-            message: "429: provider 'anthropic' refused service_tier \"priority\" for this account: Usage credits are required for fast mode.".into(),
-            status: Some(429),
-            retry_after_secs: None,
-            provider_code: Some(crate::service_tier::SERVICE_TIER_UNAVAILABLE.into()),
-            resets_at_ms: None,
-            resets_at_source: None,
-            limit_window: None,
-            account_ref: None,
-            credential_id: None,
-            affordable_max_tokens: None,
-        };
+        let tier_refusal = ProviderError { provider_details: None, provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::Permanent,
+        message: "429: provider 'anthropic' refused service_tier \"priority\" for this account: Usage credits are required for fast mode.".into(),
+        status: Some(429),
+        retry_after_secs: None,
+        provider_code: Some(crate::service_tier::SERVICE_TIER_UNAVAILABLE.into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None, };
         let error = classify_account_limit_exhausted(
             WireFamilyId::AnthropicMessages,
             429,
@@ -6632,6 +6821,7 @@ mod tests {
                         retry_after_secs: Option<f64>,
                         provider_code: Option<&str>,
                         resets: Option<(u64, &str)>| ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -7095,6 +7285,7 @@ mod tests {
             assert_eq!(error.status, Some(status));
 
             let raw_error = ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 class: ErrorClass::Permanent,
                 message: "403: forbidden".into(),
@@ -7450,6 +7641,154 @@ mod tests {
         let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
         let error = classify_http_error(429, body, None, None);
         classify_account_limit_exhausted(family, 429, &headers, body, now, error)
+    }
+
+    #[test]
+    fn google_rpc_quota_details_survive_error_message_truncation() {
+        let body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": format!("Individual quota reached. {}", "x".repeat(700)),
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": GOOGLE_RPC_ERROR_INFO_TYPE,
+                        "reason": "QUOTA_EXHAUSTED",
+                        "domain": "cloudcode-pa.googleapis.com",
+                        "metadata": {
+                            "model": "gemini-3.8-flash-high",
+                            "quotaResetDelay": "21m0.959250039s",
+                            "quotaResetTimeStamp": "2026-10-03T03:40:39Z"
+                        }
+                    },
+                    {
+                        "@type": GOOGLE_RPC_QUOTA_FAILURE_TYPE,
+                        "violations": [{
+                            "subject": "project:123",
+                            "description": "The model-tier request allowance is exhausted.",
+                            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                            "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                            "quotaDimensions": {"model": "gemini-3.8-flash-high", "region": "global"},
+                            "quotaValue": "1000",
+                            "futureQuotaValue": "2000"
+                        }]
+                    },
+                    {
+                        "@type": GOOGLE_RPC_RETRY_INFO_TYPE,
+                        "retryDelay": "21m0.959250039s"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        assert!(body.len() > MAX_ERROR_BODY_BYTES);
+
+        for family in [WireFamilyId::GoogleCodeAssist, WireFamilyId::Gemini] {
+            let error = classify_google_429(family, &body, UNIX_EPOCH);
+            assert!(error.is_account_limit_exhausted(), "{family:?}");
+            assert!(error.message.len() <= 5 + MAX_ERROR_BODY_BYTES);
+            let details = serde_json::to_value(error.provider_details.unwrap()).unwrap();
+            assert_eq!(details["errorInfo"]["reason"], "QUOTA_EXHAUSTED");
+            assert_eq!(
+                details["errorInfo"]["domain"],
+                "cloudcode-pa.googleapis.com"
+            );
+            assert_eq!(
+                details["errorInfo"]["metadata"],
+                serde_json::json!({
+                    "model": "gemini-3.8-flash-high",
+                    "quotaResetDelay": "21m0.959250039s",
+                    "quotaResetTimeStamp": "2026-10-03T03:40:39Z"
+                })
+            );
+            assert_eq!(
+                details["quotaFailure"]["violations"][0],
+                serde_json::json!({
+                    "subject": "project:123",
+                    "description": "The model-tier request allowance is exhausted.",
+                    "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                    "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                    "quotaDimensions": {"model": "gemini-3.8-flash-high", "region": "global"},
+                    "quotaValue": "1000",
+                    "futureQuotaValue": "2000"
+                })
+            );
+            assert_eq!(details["retryInfo"]["retryDelay"], "21m0.959250039s");
+        }
+    }
+
+    #[test]
+    fn google_rpc_quota_details_are_bounded_and_malformed_details_do_not_break_classification() {
+        let metadata = (0..64)
+            .map(|index| (format!("key-{index}"), serde_json::json!("m".repeat(200))))
+            .collect::<serde_json::Map<_, _>>();
+        let dimensions = (0..32)
+            .map(|index| {
+                (
+                    format!("dimension-{index}"),
+                    serde_json::json!("d".repeat(200)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let violation = serde_json::json!({
+            "subject": "subject-oversized",
+            "description": "d".repeat(400),
+            "quotaMetric": "q".repeat(200),
+            "quotaId": "i".repeat(200),
+            "quotaDimensions": dimensions,
+            "quotaValue": "1",
+            "futureQuotaValue": "2"
+        });
+        let mut details = vec![serde_json::json!({
+            "@type": GOOGLE_RPC_ERROR_INFO_TYPE,
+            "reason": "QUOTA_EXHAUSTED",
+            "metadata": metadata
+        })];
+        details.extend((0..64).map(|_| {
+            serde_json::json!({
+                "@type": GOOGLE_RPC_QUOTA_FAILURE_TYPE,
+                "violations": [violation.clone()]
+            })
+        }));
+        let body = serde_json::json!({
+            "error": {
+                "status": "RESOURCE_EXHAUSTED",
+                "details": details
+            }
+        })
+        .to_string();
+        let error = classify_google_429(WireFamilyId::GoogleCodeAssist, &body, UNIX_EPOCH);
+        assert!(error.is_account_limit_exhausted());
+        let details = error.provider_details.unwrap();
+        let info = details.error_info.unwrap();
+        assert_eq!(info.metadata.len(), GOOGLE_RPC_METADATA_MAX_KEYS);
+        assert!(info
+            .metadata
+            .values()
+            .all(|value| value.chars().count() <= 128));
+        let violations = details.quota_failure.unwrap().violations;
+        assert_eq!(violations.len(), GOOGLE_RPC_VIOLATIONS_MAX);
+        assert!(violations.iter().all(|violation| {
+            violation.description.as_ref().unwrap().chars().count() <= 256
+                && violation.quota_metric.as_ref().unwrap().chars().count() <= 128
+                && violation.quota_id.as_ref().unwrap().chars().count() <= 128
+                && violation.quota_dimensions.len() <= GOOGLE_RPC_DIMENSIONS_MAX_KEYS
+                && violation
+                    .quota_dimensions
+                    .values()
+                    .all(|value| value.chars().count() <= 128)
+        }));
+
+        for malformed in [
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED","details":{"not":"an array"}}}"#,
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED","details":[null,7,{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":"bad"}]}}"#,
+        ] {
+            let error = classify_google_429(WireFamilyId::GoogleCodeAssist, malformed, UNIX_EPOCH);
+            assert_eq!(error.class, ErrorClass::Transient);
+            assert_eq!(error.provider_code.as_deref(), Some("RESOURCE_EXHAUSTED"));
+            assert!(!error.is_account_limit_exhausted());
+            assert!(error.provider_details.is_none());
+        }
     }
 
     #[test]
@@ -8768,6 +9107,9 @@ mod tests {
     fn request_dump_filename_uses_step_context_identity() {
         let filename = request_dump_filename(
             Some(&StepContext {
+                session_address: None,
+                credential_id: None,
+                account_ref: None,
                 run_id: "run-abc".into(),
                 step_index: 7,
             }),

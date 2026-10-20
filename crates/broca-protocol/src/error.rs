@@ -87,6 +87,61 @@ pub struct ProviderRefusal {
     pub provider_detail_code: Option<String>,
 }
 
+/// Bounded, content-free fields from Google's `google.rpc.Status.details` quota response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleRpcErrorDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_info: Option<GoogleRpcErrorInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_failure: Option<GoogleRpcQuotaFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_info: Option<GoogleRpcRetryInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleRpcErrorInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleRpcQuotaFailure {
+    pub violations: Vec<GoogleRpcQuotaViolation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleRpcQuotaViolation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_metric: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub quota_dimensions: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub future_quota_value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleRpcRetryInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay: Option<String>,
+}
+
 // No `Eq`: `retry_after_secs` is an `f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderError {
@@ -158,6 +213,10 @@ pub struct ProviderError {
     /// hold a `ProviderError` inline past clippy's size limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affordable_max_tokens: Option<u32>,
+    /// Google quota detail fields, copied from typed RPC details before the provider message is
+    /// truncated. WAL records carrying this field require `google-rpc-error-details/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_details: Option<Box<GoogleRpcErrorDetails>>,
 }
 
 /// The `provider_code` of a rate-limit refusal that means ONE provider account has used up a

@@ -171,6 +171,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     DELIVERY_ORDER_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
+    GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
@@ -186,6 +187,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STRUCTURED_OUTPUT_FEATURE,
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
 ];
+
+/// Google RPC quota details on a stored provider error must not be silently discarded on read.
+pub const GOOGLE_RPC_ERROR_DETAILS_FEATURE: &str = "google-rpc-error-details/v1";
 
 /// Text-part state and the frozen codec policy are required for faithful provider replay.
 pub const PROVIDER_TEXT_STATE_FEATURE: &str = "provider-text-state/v1";
@@ -917,6 +921,7 @@ mod tests {
                 DELIVERY_ORDER_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
+                GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
@@ -945,6 +950,10 @@ mod tests {
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
         assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");
+        assert_eq!(
+            GOOGLE_RPC_ERROR_DETAILS_FEATURE,
+            "google-rpc-error-details/v1"
+        );
         assert_eq!(INPUT_TOKEN_CAP_FEATURE, "input-token-cap/v1");
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
@@ -1014,6 +1023,79 @@ mod tests {
         refrozen["frozen_render_config"]["provider_text_state"] = serde_json::json!(false);
         let legacy: WalRecord = serde_json::from_value(refrozen).unwrap();
         assert!(legacy.required_features().is_empty());
+    }
+
+    #[test]
+    fn stored_google_rpc_error_details_require_their_wal_feature() {
+        let details = serde_json::json!({
+            "errorInfo": {"reason": "QUOTA_EXHAUSTED", "metadata": {}},
+            "quotaFailure": {"violations": [{"quotaMetric": "model-tier"}]},
+            "retryInfo": {"retryDelay": "21m0s"}
+        });
+        let values = [
+            serde_json::json!({
+                "type": "run_finished",
+                "reason": "error",
+                "usage": {},
+                "error": {
+                    "class": "transient",
+                    "message": "429: quota exhausted",
+                    "provider_details": details
+                }
+            }),
+            serde_json::json!({
+                "type": "run_paused",
+                "run_id": "run-1",
+                "reason": "auth_required",
+                "error": {
+                    "class": "transient",
+                    "message": "provider error",
+                    "provider_details": details
+                }
+            }),
+            serde_json::json!({
+                "type": "retracted",
+                "submission_id": "submission-1",
+                "failure": {
+                    "run_id": "run-1",
+                    "error": {
+                        "class": "transient",
+                        "message": "provider error",
+                        "provider_details": details
+                    }
+                }
+            }),
+        ];
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != GOOGLE_RPC_ERROR_DETAILS_FEATURE)
+            .collect();
+        for value in values {
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                record.required_features(),
+                &[GOOGLE_RPC_ERROR_DETAILS_FEATURE]
+            );
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+            assert!(matches!(
+                decode_next_with(&bytes, &older),
+                DecodeStep::NewerWriter { missing, .. }
+                    if missing == [GOOGLE_RPC_ERROR_DETAILS_FEATURE]
+            ));
+        }
+
+        let legacy: WalRecord = serde_json::from_value(serde_json::json!({
+            "type": "run_finished",
+            "reason": "error",
+            "usage": {},
+            "error": {"class": "transient", "message": "429: quota exhausted"}
+        }))
+        .unwrap();
+        assert!(legacy.required_features().is_empty());
+        assert_eq!(encode(1, 1, &legacy).unwrap()[4], FRAMING_VERSION);
     }
 
     /// Every record kind that carries runner tags, and a run start frozen to render them, is a
