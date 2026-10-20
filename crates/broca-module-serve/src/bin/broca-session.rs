@@ -277,6 +277,10 @@ enum Cmd {
         /// Stop after this many RunFinished events (one per episode). 0 = until stream end.
         #[arg(long, default_value_t = 1)]
         until_runs: u32,
+        /// Also print the lossy display lane: one line per event with its arrival time, the
+        /// event type and its text length (never the text itself).
+        #[arg(long)]
+        display: bool,
     },
     /// Import a canonical JSON message array into an empty session.
     Import {
@@ -661,6 +665,7 @@ async fn run(args: Args) -> Result<i32, String> {
             from,
             from_cursor,
             until_runs,
+            display,
         } => {
             let from = match from_cursor {
                 Some(c) => {
@@ -678,7 +683,7 @@ async fn run(args: Args) -> Result<i32, String> {
                     other => return Err(format!("--from must be start|live, got '{other}'")),
                 },
             };
-            observe(&client, json, from, until_runs).await
+            observe(&client, json, from, until_runs, display).await
         }
         Cmd::Import { file, source_ref } => {
             // Keep full-file scratch buffers out of the future while the import request is in
@@ -1351,6 +1356,23 @@ async fn run_turn(
     Ok(tracker.exit_code())
 }
 
+/// One display-lane event for an operator: its arrival time, type and text length. The text
+/// itself is left out, since a reasoning or answer delta is conversation content.
+fn display_line(event: &broca_protocol::DisplayEvent) -> serde_json::Value {
+    use broca_protocol::DisplayEvent as D;
+    let (kind, chars) = match event {
+        D::TextDelta { delta, .. } => ("text_delta", Some(delta.chars().count())),
+        D::ReasoningDelta { delta, .. } => ("reasoning_delta", Some(delta.chars().count())),
+        D::ToolInputDelta { delta, .. } => ("tool_input_delta", Some(delta.chars().count())),
+        D::DisplayGap { .. } => ("display_gap", None),
+        D::DisplayReset => ("display_reset", None),
+    };
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    serde_json::json!({"event": "display", "type": kind, "chars": chars, "at_ms": at_ms})
+}
+
 /// A pure observer: subscribe and drain the control stream, printing each event, until
 /// `until_runs` RunFinished events are seen (or the stream ends). Exit 0 if the target run
 /// count was reached. Proves fan-out (run this alongside a `run`/`send` client) and
@@ -1360,6 +1382,7 @@ async fn observe(
     json: bool,
     from: SubscribeFrom,
     until_runs: u32,
+    display: bool,
 ) -> Result<i32, String> {
     let mut stream = client
         .subscribe(from)
@@ -1390,7 +1413,12 @@ async fn observe(
                     }
                 }
             }
-            Ok(SubscribeEvent::Display(_)) => {}
+            Ok(SubscribeEvent::Display(event)) => {
+                if display {
+                    let line = display_line(&event);
+                    emit(json, &line, || line.to_string());
+                }
+            }
             Err(e) => return Err(format!("decode subscribe event: {e}")),
         }
     }
