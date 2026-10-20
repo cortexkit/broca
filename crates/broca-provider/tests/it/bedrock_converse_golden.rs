@@ -10,7 +10,8 @@ use broca_protocol::{
     ToolCallId,
 };
 use broca_provider::families::{
-    bedrock_frozen_config_with_region, BedrockConverse, BEDROCK_RENDERER_VERSION,
+    bedrock_frozen_config_with_region, earlier_renderer_versions, reproduces_renderer_version,
+    BedrockConverse, EarlierRendererVersion, BEDROCK_RENDERER_VERSION,
 };
 use broca_provider::wire::{
     AuthHandle, CacheClass, CachePolicy, CacheTtl, MarkerSyntax, WireFamily,
@@ -98,6 +99,19 @@ fn fixed_request() -> CallOptions {
     opts
 }
 
+fn finalize_request() -> CallOptions {
+    let mut opts = fixed_request();
+    // Core marks its final answer turn with None, while the earlier tool exchange stays in history.
+    opts.prompt.push(Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Finalize the response.".into(),
+        }],
+    ));
+    opts.tool_choice = ToolChoice::None.into();
+    opts
+}
+
 const GOLDEN: &str = include_str!("../fixtures/bedrock_converse_render_golden.json");
 const GOLDEN_VERSION: &str =
     include_str!("../fixtures/bedrock_converse_render_golden.json.version");
@@ -138,6 +152,115 @@ fn bedrock_converse_render_matches_golden_unsigned_body() {
     assert!(!rendered.contains("x-amz-date"));
     assert!(!rendered.contains("AWS4-HMAC-SHA256"));
     assert!(!rendered.contains("modelId"));
+}
+
+const FINALIZE_GOLDEN: &str =
+    include_str!("../fixtures/bedrock_converse_finalize_tool_history_render_golden.json");
+const FINALIZE_GOLDEN_VERSION: &str =
+    include_str!("../fixtures/bedrock_converse_finalize_tool_history_render_golden.json.version");
+
+#[test]
+fn bedrock_finalize_turn_keeps_tool_config_for_tool_history() {
+    let frozen =
+        bedrock_frozen_config_with_region("anthropic.claude-3-5-sonnet-20240620-v1:0", "us-west-2");
+    let bytes = BedrockConverse.render(&frozen, &finalize_request());
+    let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
+
+    if render_golden_support::update_if_requested(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/bedrock_converse_finalize_tool_history_render_golden.json"
+        ),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/bedrock_converse_finalize_tool_history_render_golden.json.version"
+        ),
+        rendered.as_bytes(),
+        FINALIZE_GOLDEN.as_bytes(),
+        FINALIZE_GOLDEN_VERSION,
+        BEDROCK_RENDERER_VERSION,
+        "Bedrock Converse finalize-with-tool-history",
+    ) {
+        return;
+    }
+
+    let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(body["toolConfig"]["toolChoice"], json!({"auto": {}}));
+    assert_eq!(body["toolConfig"]["tools"].as_array().unwrap().len(), 2);
+    let messages = body["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block.get("toolUse").is_some())
+    }));
+    assert!(messages.iter().any(|message| {
+        message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block.get("toolResult").is_some())
+    }));
+    assert_eq!(
+        messages.last().unwrap()["content"][0]["text"],
+        "Finalize the response."
+    );
+
+    render_golden_support::assert_matches_or_requires_bump(
+        rendered.as_bytes(),
+        FINALIZE_GOLDEN.as_bytes(),
+        FINALIZE_GOLDEN_VERSION,
+        BEDROCK_RENDERER_VERSION,
+        "Bedrock Converse finalize-with-tool-history",
+    );
+}
+
+#[test]
+fn bedrock_omits_tool_config_when_no_tools_are_available() {
+    let frozen =
+        bedrock_frozen_config_with_region("anthropic.claude-3-5-sonnet-20240620-v1:0", "us-west-2");
+    let mut opts = CallOptions::new(vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Hello.".into(),
+        }],
+    )]);
+    opts.tool_choice = ToolChoice::None.into();
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&BedrockConverse.render(&frozen, &opts)).unwrap();
+    assert!(body.get("toolConfig").is_none());
+}
+
+#[test]
+fn bedrock_finalize_renderer_versions_refuse_only_old_finalize_reproduction() {
+    let family = broca_provider::spec::WireFamilyId::BedrockConverse;
+    for version in [2, 3] {
+        assert!(!reproduces_renderer_version(family, version));
+        let reason = earlier_renderer_versions(family)
+            .iter()
+            .find_map(|(declared, disposition)| (*declared == version).then_some(disposition))
+            .expect("every old Bedrock renderer version is declared");
+        assert!(matches!(
+            reason,
+            EarlierRendererVersion::NotReproducible(text)
+                if *text == "earlier versions sent no toolConfig on a finalize request whose history carries tool blocks"
+        ));
+    }
+
+    // Auto turns with the same tool history keep their pre-bump bytes. The new bytes are specific
+    // to a finalize choice, for which the earlier renderer versions are refused on resume.
+    let frozen =
+        bedrock_frozen_config_with_region("anthropic.claude-3-5-sonnet-20240620-v1:0", "us-west-2");
+    for version in [2, 3] {
+        let mut old_config = frozen.clone();
+        old_config.renderer_version = version;
+        assert_eq!(
+            BedrockConverse.render(&old_config, &fixed_request()),
+            GOLDEN.trim_end_matches('\n').as_bytes(),
+        );
+    }
 }
 
 #[test]

@@ -145,6 +145,14 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         &opts.prompt,
         &crate::tool_id_alias::IdGrammar::bedrock(),
     );
+    let has_tool_history = opts.prompt.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+            )
+        })
+    });
     let system = convert_system(frozen, &opts.prompt, marker_policy.is_some());
     let messages = convert_messages(frozen, opts, &name_map, &id_map);
 
@@ -158,7 +166,9 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         convert_inference_config(frozen, opts),
     );
 
-    if let Some(tool_config) = convert_tool_config(&opts.tools, &opts.tool_choice, &name_map) {
+    if let Some(tool_config) =
+        convert_tool_config(&opts.tools, &opts.tool_choice, &name_map, has_tool_history)
+    {
         body.insert("toolConfig".to_string(), tool_config);
     }
 
@@ -571,10 +581,17 @@ fn convert_tool_config(
     tools: &[Tool],
     choice: &ToolChoice,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    has_tool_history: bool,
 ) -> Option<Value> {
-    if tools.is_empty() || matches!(choice, ToolChoice::None) {
+    if tools.is_empty() || (matches!(choice, ToolChoice::None) && !has_tool_history) {
         return None;
     }
+    // AWS documents client-side tool use as supplying definitions with requests, then resending
+    // the conversation after appending a tool result. Keep definitions while historical tool blocks
+    // remain. Converse has no `none` choice, so reuse the existing `auto` conversion; core still
+    // refuses to dispatch any tool the model might return on a finalize turn.
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html
+    // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolChoice.html
     Some(json!({
         "tools": tools.iter().map(|tool| convert_tool(tool, name_map)).collect::<Vec<_>>(),
         "toolChoice": convert_tool_choice(choice, name_map),
