@@ -56,7 +56,7 @@ pub fn render_step(
     };
     if let Some(state) = prior.compaction.state() {
         broca_protocol::content::stamp_ordinals(&mut opts.prompt);
-        opts = broca_core::compaction::model_options(&opts, state);
+        opts = broca_core::compaction::model_options(&opts, state).map_err(|e| e.to_string())?;
     }
     let body = family.render(&frozen, &opts);
     Ok((frozen, opts, body))

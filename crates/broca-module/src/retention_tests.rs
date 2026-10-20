@@ -719,6 +719,43 @@ fn deletion_records_the_next_tag_and_a_later_lineage_starts_past_it() {
     );
 }
 
+/// Deleting a lineage that recorded compaction notices records the sequence number its next
+/// notice would have had, and keeps the higher number of an earlier tombstone, so the address's
+/// next lineage numbers its notices past every notice the session published.
+#[test]
+fn deletion_records_the_next_notice_seq_and_keeps_the_highest() {
+    let rig = Rig::new();
+    let notice = |seq: u64| WalRecord::CompactionNotice {
+        seq,
+        headers: std::collections::BTreeMap::from([("seq".to_owned(), seq.to_string())]),
+    };
+    {
+        let _lease = rig.service.lease(&rig.key).unwrap();
+        let mut wal = rig
+            .service
+            .wal
+            .open_with_retention(&rig.key, Some(1))
+            .unwrap();
+        wal.append(1, &started(&rig.key, "r1", Some(1), 100), true)
+            .unwrap();
+        for seq in 1..=3 {
+            wal.append(1, &notice(seq), true).unwrap();
+        }
+        wal.append(1, &finished(200), true).unwrap();
+        rig.service.remember_session(&rig.key).unwrap();
+    }
+    assert_eq!(rig.service.wal.retired_notice_floor(&rig.key).unwrap(), 1);
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert!(rig
+        .service
+        .delete_expired(&rig.key, 1200)
+        .unwrap()
+        .is_some());
+    let stone = rig.service.tombstones(&rig.key).unwrap().pop().unwrap();
+    assert_eq!(stone.next_notice_seq, Some(4));
+    assert_eq!(rig.service.wal.retired_notice_floor(&rig.key).unwrap(), 4);
+}
+
 #[test]
 fn sweep_deletes_and_keeps_terminal_content_free_rows() {
     let rig = Rig::new();
@@ -1140,6 +1177,7 @@ fn sidecar_removal_failure_leaves_completion_retryable() {
     let temp = side.with_extension("session.tmp");
     let stone = Tombstone {
         next_tag: None,
+        next_notice_seq: None,
         lineage_id: id.clone(),
         expired_at_ms: 1200,
         seq: 1,
@@ -1176,6 +1214,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
     let id = rig.seed(30, 100, Some(200));
     let stone = Tombstone {
         next_tag: None,
+        next_notice_seq: None,
         lineage_id: id.clone(),
         expired_at_ms: u64::MAX - 10,
         seq: 2,
@@ -1194,6 +1233,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
             &rig.key,
             &Tombstone {
                 next_tag: None,
+                next_notice_seq: None,
                 lineage_id: "a".repeat(32),
                 expired_at_ms: 1,
                 seq: 3,
@@ -1249,6 +1289,7 @@ fn unfinished_deletion_resumes_each_disk_boundary_and_never_moves_a_new_lineage(
         let id = rig.seed(1, 100, Some(200));
         let stone = Tombstone {
             next_tag: None,
+            next_notice_seq: None,
             lineage_id: id.clone(),
             expired_at_ms: 1200,
             seq: 1,
@@ -2141,6 +2182,7 @@ async fn expiry_frees_cached_sender_and_ownership_for_the_next_lineage() {
             &rig.key,
             &Tombstone {
                 next_tag: None,
+                next_notice_seq: None,
                 lineage_id: id,
                 expired_at_ms: now + RETAINED_SECONDS * 1000,
                 seq: 1,
@@ -2449,6 +2491,7 @@ fn interrupted_retention_deletion_exports_owed_identity_without_restoring_wal() 
     rig.service.rederive(&rig.key).unwrap();
     let stone = Tombstone {
         next_tag: None,
+        next_notice_seq: None,
         lineage_id: lineage.clone(),
         expired_at_ms: 1020,
         seq: 1,
@@ -3476,6 +3519,7 @@ fn readable_record_first_legacy_deletion_accepts_live_and_moved_layouts() {
         if moved {
             let stone = Tombstone {
                 next_tag: None,
+                next_notice_seq: None,
                 lineage_id: id.clone(),
                 expired_at_ms: 1200,
                 seq: 1,
@@ -4403,6 +4447,7 @@ fn deletion_recovery_isolates_persistent_bad_tombstone_and_evicts_good_keys() {
                 &rig.key,
                 &Tombstone {
                     next_tag: None,
+                    next_notice_seq: None,
                     lineage_id: id.clone(),
                     expired_at_ms: 1200,
                     seq: 1,

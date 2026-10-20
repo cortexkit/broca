@@ -82,6 +82,33 @@ pub enum CompactionWaitExit {
     Interrupted,
 }
 
+/// A half-open range of transcript ordinals, `[from_ordinal, to_ordinal)`, in which every
+/// signed reasoning block of a message the request sends as written is left out of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionStrip {
+    pub from_ordinal: u64,
+    pub to_ordinal: u64,
+}
+
+/// How an asynchronous compaction view went into effect (compaction-provider/v1 §7).
+///
+/// Closed: a reader must understand a choice before it can render the request the writer
+/// rendered, and the record that carries it is must-understand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactionViewChoice {
+    /// Applied as published: no signed reasoning the request keeps sat after the view's first
+    /// changed byte.
+    Applied,
+    /// Applied with the companion edit `edit` (today only `strip_signed_reasoning`): signed
+    /// reasoning produced against the prefix the view changed is left out of every request
+    /// from now on, because the model provider rejects a signature whose prefix changed.
+    Companion {
+        edit: String,
+        strip: CompactionStrip,
+    },
+}
+
 /// SHA-256 of the compact JSON encoding of the native replacement message array, as
 /// `serde_json::to_vec` writes it (no newline). Metadata and the outer frame are excluded.
 /// Readers and the later writer use this domain regardless of the provider's JSON layout.

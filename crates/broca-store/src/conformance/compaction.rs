@@ -69,6 +69,7 @@ fn compaction_message(seq: u64, kind: CompactionMessageKind) -> FramedRecord {
                     .unwrap()
             }),
             stability: setup.then(|| vec![CompactionStabilityRank { index: 0, rank: 7 }]),
+            ceiling: None,
         },
     )
 }
@@ -253,8 +254,9 @@ pub fn absent_compaction_checkpoint_refolds_complete_wal<S: PageUsageConformance
         state.stability,
         vec![CompactionStabilityRank { index: 0, rank: 7 }]
     );
-    assert_eq!(state.cursor.as_ref().unwrap().after_ordinal, Some(1));
-    assert_eq!(state.newest_request_id.as_deref(), Some("request-2"));
+    // The synchronous client's request ids and cursor are no longer kept: nothing calls the
+    // provider per step, so only the applied replacement and Setup's declarations matter.
+    assert_eq!(state.provider, "provider");
 
     let mut captured_none = seed.admission_checkpoint;
     captured_none.compaction = Some(CompactionCheckpoint::None);

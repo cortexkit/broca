@@ -2078,39 +2078,6 @@ where
         }
     }
     match req.method.as_str() {
-        "compaction.ready" => {
-            let request: broca_wire::CompactionReady =
-                match serde_json::from_value(req.params.clone()) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let field = broca_wire::failing_field::<broca_wire::CompactionReady>(
-                            &req.params,
-                            &error,
-                        );
-                        return send_invalid_params(
-                            writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            field,
-                            &error.to_string(),
-                        )
-                        .await;
-                    }
-                };
-            let caller = match bind.principal.as_ref() {
-                Some(broca_protocol::BindPrincipal::Reserved { module_id }) => module_id.as_str(),
-                _ => "",
-            };
-            match handler.compaction_ready(&session, caller, request).await {
-                Ok(Ok(reply)) => {
-                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
-                }
-                Ok(Err(code)) => send_error(writer, ver, channel, epoch, corr, code, code).await,
-                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
-            }
-        }
         OP_CAP_INSTALL => {
             let params: CapInstallParams = match serde_json::from_value(req.params) {
                 Ok(params) => params,

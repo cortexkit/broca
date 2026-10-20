@@ -1,7 +1,5 @@
 use broca_core::compaction_provider::{
-    setup::SetupRequest,
-    status::{Estimate, MessageRef, StepStatus},
-    OpRequest as CompactionOpRequest,
+    lineage::MessageRef, setup::SetupRequest, OpRequest as CompactionOpRequest,
 };
 use cortexkit_role_step_transform_provider::{
     hook::{HookCall, Subject},
@@ -38,26 +36,6 @@ fn compaction_setup_request_bytes_are_pinned() {
     assert_eq!(
         bytes,
         br#"{"method":"compaction.setup","params":{"session":"session-1","harness":"broca","request_id":"lineage-1:setup:9","lineage_id":"lineage-1","preset":"default","params":{"budget":3},"composition":{"provider":"compactor"},"model":"provider/model","variant":"fast","context_window":128000,"output_limit":8192,"newest":{"ordinal":4,"mid":"m4"},"now":1700000000000}}"#
-    );
-}
-
-#[test]
-fn compaction_step_request_bytes_are_pinned() {
-    let request = StepStatus::new(
-        "session-1",
-        "broca",
-        "lineage-1:step:5",
-        "lineage-1",
-        "5",
-        "user_turn",
-        "provider/model",
-        Estimate::new(23),
-        1_700_000_000_001,
-    );
-    let bytes = serde_json::to_vec(&CompactionOpRequest::new("compaction.step", &request)).unwrap();
-    assert_eq!(
-        bytes,
-        br#"{"method":"compaction.step","params":{"session":"session-1","harness":"broca","request_id":"lineage-1:step:5","lineage_id":"lineage-1","step_id":"5","step_kind":"user_turn","model":"provider/model","estimate":{"request_tokens":23},"messages":[],"now":1700000000001}}"#
     );
 }
 

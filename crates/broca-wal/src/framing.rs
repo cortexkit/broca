@@ -163,6 +163,7 @@ pub const GATED_FRAMING_VERSION: u8 = 3;
 pub const KNOWN_FEATURES: &[&str] = &[
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
+    COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
     COMPACTION_FEATURE,
     DEFERRED_CALL_FEATURE,
@@ -198,6 +199,14 @@ pub const COMPACTION_FEATURE: &str = "compaction/v1";
 
 /// Durable compaction wait exits, including terminal intents that recovery must seal.
 pub const COMPACTION_WAIT_FEATURE: &str = "compaction-wait/v1";
+
+/// Asynchronous compaction (compaction-provider/v1 0.3): a provider view applied at a step
+/// boundary together with how it was applied (as published, or with the companion strip of
+/// signed reasoning), the advance notices recorded before they are published, and the ceiling
+/// policy frozen from Setup. A build that skipped any of them would render a resumed request
+/// without the applied view, reuse a notice sequence number, or forget the ceiling, so all
+/// three are must-understand.
+pub const COMPACTION_VIEW_FEATURE: &str = "compaction-view/v1";
 
 /// Not a WAL frame feature: no frame ever requires it, so its entry here is inert for the
 /// decoder. It is listed because this table is also what `--wal-known-features` reports to
@@ -895,6 +904,7 @@ mod tests {
             &[
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
+                COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
                 COMPACTION_FEATURE,
                 DEFERRED_CALL_FEATURE,

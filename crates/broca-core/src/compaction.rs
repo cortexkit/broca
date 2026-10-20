@@ -1,17 +1,26 @@
-//! Runner-owned compaction state and validation. Scheduling, fencing and cursor rules come
-//! from the pinned role; native-message validation and durability belong to broca.
+//! Runner-owned compaction state and validation.
+//!
+//! Compaction is asynchronous (compaction-provider/v1 0.3): Setup once per session, then the
+//! provider's views, applied at step boundaries ([`view`]). Records the removed synchronous
+//! client wrote (`CompactionRequest`, step `CompactionMessage`s, `CompactionAnswer`,
+//! `CompactionWait`) are still folded here, so an old session replays and renders the bytes it
+//! rendered before.
+//!
+//! Runner state lost (compaction-provider/v1 §5.3) cannot happen to broca on its own: tags,
+//! the Setup answer, applied views and notices all live in the same write-ahead log as the
+//! transcript, so none of them can be lost or restored separately from it. The next tag is the
+//! WAL's own high-water plus one, and retention deletion carries a tag floor to the next
+//! lineage. A new lineage starts with no compaction state at all: it runs Setup again,
+//! renders Setup's initial message, and its notices carry no `descends_from` and no
+//! `applied_view_version` until a view of that lineage applies. Its notice numbers continue
+//! from the deleted lineage's, which retention deletion records on its tombstone beside the tag
+//! floor. Restoring an older copy of a session's WAL by hand is not detected.
 
-use crate::compaction_provider::{
-    answer::{CompactionMessage, Range, StepAnswer},
-    fence::{self, Disposition, FenceState},
-    setup::{self, CallWhen},
-    status::{AppliedRef, NotAppliedRef, StepStatus},
-};
+use crate::compaction_provider::message::{CompactionMessage, Range};
 use broca_protocol::{ContentBlock, Message, Role, Usage};
 use broca_wal::{
-    CompactionCursor, CompactionDisposition, CompactionMessageKind, CompactionRange,
-    CompactionStabilityRank, CompactionWait, CompactionWaitExit, OpaqueJson, RejectedCompaction,
-    WalRecord,
+    CompactionMessageKind, CompactionRange, CompactionStabilityRank, CompactionStrip,
+    CompactionWait, CompactionWaitExit, OpaqueJson, WalRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -21,19 +30,16 @@ use std::{
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
-pub use runtime::{CompactionConfig, CompactionInbox, CompactionPlane, CompactionUnavailable};
+pub use runtime::{CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews};
 pub(crate) mod runtime;
 #[cfg(feature = "test-clock")]
 pub mod test_control;
+pub mod view;
 
-/// End-to-end route budget, including route open and retries, for Setup and step calls.
+/// End-to-end route budget, including route open and retries, for a Setup call.
 pub const COMPACTION_CALL_BUDGET_MS: u64 = 2_000;
-/// A step cannot wait forever even when the provider repeatedly extends its bound.
-pub const COMPACTION_STEP_WAIT_CAP_MS: u64 = 30_000;
 /// Two bytes per token deliberately overcounts typical text/JSON's unmeasured input.
 pub const ESTIMATE_BYTES_PER_TOKEN: u64 = 2;
-/// Uncertain estimates near the window must not authorize sending an overflowing request.
-pub const ESTIMATE_SAFETY_MARGIN_PERCENT: u64 = 10;
 
 /// Absent checkpoint field means not captured; `None` means captured before Setup; `State`
 /// carries everything needed to continue without consulting the provider or the old WAL.
@@ -106,11 +112,8 @@ impl AppliedCompaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NotAppliedCompaction {
-    pub disposition: CompactionDisposition,
-    pub rejected: RejectedCompaction,
-}
+/// A wait the removed synchronous client opened. Recovery still seals one left open by a crash,
+/// without calling any provider (see `runtime::seal_recorded_wait`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenCompactionWait {
     pub request_id: String,
@@ -122,20 +125,37 @@ pub struct OpenCompactionWait {
 pub struct CompactionState {
     pub history: CompactionHistory,
     pub provider: String,
+    /// The `call_when` schedule a `compaction.setup` answer of the removed synchronous client
+    /// froze (folded from its Setup record); no new record carries one.
     pub call_when: Option<OpaqueJson>,
+    /// The stability ranks a `compaction.setup` answer of the removed synchronous client froze;
+    /// the renderer still declares them on that session's applied replacement.
     pub stability: Vec<CompactionStabilityRank>,
+    /// Setup's initial CompactionMessage, or the last replacement the synchronous client
+    /// applied. Rendered until an asynchronous view applies.
     pub applied: Option<AppliedCompaction>,
-    pub last_not_applied: Option<NotAppliedCompaction>,
-    pub cursor: Option<CompactionCursor>,
-    pub newest_request_id: Option<String>,
     pub open_wait: Option<OpenCompactionWait>,
-    /// An answer for an opened step, not yet consumed by a durable model completion.
-    /// Recovery renders it without repeating a completed provider call.
-    pub pending_answer: bool,
-    pub recall_required: bool,
-    /// An issued request with no durable outcome must be superseded on recovery, even
-    /// when the original scheduling cause (such as a model switch) has already folded.
-    pub pending_request: bool,
+    /// Setup's ceiling policy, verbatim (`CeilingPolicy`); absent when Setup gave none.
+    #[serde(default)]
+    pub ceiling: Option<OpaqueJson>,
+    /// The newest view applied at a step boundary; rendered instead of `applied`.
+    #[serde(default)]
+    pub view: Option<view::AppliedView>,
+    /// Every companion strip applied in this lineage. Once signed reasoning is left out of a
+    /// request it stays out, so the bytes later signatures were produced against stay put.
+    #[serde(default)]
+    pub strips: Vec<CompactionStrip>,
+    /// The notice sequence of the newest recorded notice; 0 before the first.
+    #[serde(default)]
+    pub notice_seq: u64,
+    /// What the newest recorded notice announced, to tell whether a boundary has news.
+    #[serde(default)]
+    pub announced: Option<view::Announced>,
+    /// Event tokens owed to the next notice: companion edits of views applied since the
+    /// newest notice. Folded from the WAL, so a crash between a view record and its notice
+    /// still reports the companion edit.
+    #[serde(default)]
+    pub unannounced: Vec<String>,
 }
 impl CompactionState {
     pub fn capture_thinking_boundary(&mut self, record: &WalRecord, prefix_len: u64) {
@@ -152,18 +172,19 @@ impl CompactionState {
             .is_none_or(|applied| applied.thinking_prefix_len != u64::MAX)
     }
 
+    /// The version of the view the session renders now, for notices.
+    pub fn applied_view_version(&self, lineage_id: &str) -> Option<u64> {
+        self.view
+            .as_ref()
+            .filter(|applied| applied.view.lineage_id == lineage_id)
+            .map(|applied| applied.view.view_version)
+    }
+
     pub fn fold(&mut self, record: &WalRecord) {
         self.history.fold(record);
         match record {
-            WalRecord::CompactionRequest {
-                provider,
-                request_id,
-            } => {
+            WalRecord::CompactionRequest { provider, .. } => {
                 self.provider.clone_from(provider);
-                self.newest_request_id = Some(request_id.clone());
-                self.recall_required = false;
-                self.pending_request = true;
-                self.pending_answer = false;
             }
             WalRecord::CompactionMessage {
                 provider,
@@ -173,19 +194,16 @@ impl CompactionState {
                 range,
                 replacement,
                 sha256,
-                cursor,
                 call_when,
                 stability,
+                ceiling,
                 ..
             } => {
                 self.provider.clone_from(provider);
                 if *kind == CompactionMessageKind::Setup {
                     self.call_when.clone_from(call_when);
                     self.stability = stability.clone().unwrap_or_default();
-                } else {
-                    self.cursor.clone_from(cursor);
-                    self.pending_answer = true;
-                    self.pending_request = false;
+                    self.ceiling.clone_from(ceiling);
                 }
                 self.applied = Some(AppliedCompaction {
                     compaction_id: compaction_id.clone(),
@@ -195,38 +213,16 @@ impl CompactionState {
                     sha256: sha256.clone().into_boxed_str(),
                     thinking_prefix_len: unknown_thinking_boundary(),
                 });
-                if self
-                    .last_not_applied
-                    .as_ref()
-                    .is_some_and(|last| last.rejected.version <= *version)
-                {
-                    self.last_not_applied = None;
-                }
             }
             WalRecord::CompactionAnswer {
                 provider,
                 request_id,
-                cursor,
                 disposition,
-                rejected,
                 wait,
+                ..
             } => {
                 self.provider.clone_from(provider);
-                if !matches!(
-                    disposition,
-                    CompactionDisposition::Late | CompactionDisposition::SupersededRequest
-                ) {
-                    self.cursor = Some(cursor.clone());
-                    self.pending_answer = true;
-                    self.pending_request = false;
-                }
-                if let Some(rejected) = rejected {
-                    self.last_not_applied = Some(NotAppliedCompaction {
-                        disposition: *disposition,
-                        rejected: rejected.clone(),
-                    });
-                }
-                if *disposition == CompactionDisposition::Wait {
+                if *disposition == broca_wal::CompactionDisposition::Wait {
                     self.open_wait = wait.clone().map(|wait| OpenCompactionWait {
                         request_id: request_id.clone(),
                         wait,
@@ -240,110 +236,50 @@ impl CompactionState {
                     CompactionWaitExit::Ready | CompactionWaitExit::Bound | CompactionWaitExit::Cap
                 ) {
                     self.open_wait = None;
-                    self.pending_answer = *exited == CompactionWaitExit::Cap;
-                    self.recall_required = *exited != CompactionWaitExit::Cap;
                 } else if let Some(wait) = &mut self.open_wait {
                     wait.terminal_exit = Some(*exited);
                 }
             }
+            WalRecord::CompactionViewApplied {
+                provider,
+                view,
+                choice,
+                ..
+            } => {
+                self.provider.clone_from(provider);
+                // The writer only records a view it decoded, so a view that does not decode
+                // here is a corrupt WAL. Keep rendering what was rendered before rather than
+                // guess at the record's meaning.
+                if let Some(applied) = view::AppliedView::decode(view, choice) {
+                    if let broca_wal::CompactionViewChoice::Companion { edit, strip } = choice {
+                        self.strips.push(*strip);
+                        self.unannounced.push(
+                            crate::compaction_provider::notice::Event::ViewCompanion {
+                                view_version: applied.view.view_version,
+                                edit: edit.clone(),
+                            }
+                            .token(),
+                        );
+                    }
+                    self.view = Some(applied);
+                }
+            }
+            WalRecord::CompactionNotice { seq, headers } => {
+                self.notice_seq = *seq;
+                self.announced = Some(view::Announced::from_headers(headers));
+                self.unannounced.clear();
+            }
             WalRecord::RunFinished { .. } => {
                 self.open_wait = None;
-                self.pending_answer = false;
-                self.pending_request = false;
-            }
-            WalRecord::StepStarted { .. } | WalRecord::ModelStepFinished { .. } => {
-                self.pending_answer = false
             }
             _ => {}
         }
-    }
-    pub fn should_call(
-        &self,
-        model: &str,
-        usage: Option<Usage>,
-        window: Option<u64>,
-        prefix_rebuilding: bool,
-        execution_error: bool,
-    ) -> bool {
-        let condition = self
-            .call_when
-            .as_ref()
-            .and_then(|json| serde_json::from_str::<CallWhen>(json.as_json_text()).ok());
-        self.pending_request
-            || self.recall_required
-            || prefix_rebuilding
-            || execution_error
-            || setup::calls_every_step(condition.as_ref())
-            || window.zip(usage).is_some_and(|(window, usage)| {
-                window > 0
-                    && usage.fill_tokens().unwrap_or(0) as f64 / window as f64
-                        >= condition
-                            .as_ref()
-                            .expect("known condition")
-                            .share_for(model)
-            })
-    }
-    pub fn fill_status(&self, status: &mut StepStatus, raw: &[Message]) {
-        status.after_ordinal = self
-            .cursor
-            .as_ref()
-            .filter(|cursor| cursor.lineage_id == status.lineage_id)
-            .and_then(|cursor| cursor.after_ordinal);
-        let pending = raw
-            .iter()
-            .filter_map(|message| {
-                let ordinal = message
-                    .ordinal
-                    .expect("full lineage is stamped before status assembly");
-                status
-                    .after_ordinal
-                    .is_none_or(|after| ordinal > after)
-                    .then(|| crate::compaction_provider::status::StatusMessage {
-                        ordinal,
-                        mid: format!("m{ordinal}"),
-                        message: serde_json::to_value(message).expect("native message JSON"),
-                        raw_message: None,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let (count, more) = crate::compaction_provider::status::take_capped(
-            &pending,
-            crate::compaction_provider::status::DEFAULT_MESSAGE_CAP_BYTES,
-        );
-        status.messages = pending.into_iter().take(count).collect();
-        status.more = more;
-        status.newest = raw.last().and_then(|m| m.ordinal).map(|ordinal| {
-            crate::compaction_provider::status::MessageRef {
-                ordinal,
-                mid: format!("m{ordinal}"),
-            }
-        });
-        status.last_applied = self.applied.as_ref().map(|applied| AppliedRef {
-            compaction_id: applied.compaction_id.clone(),
-            version: applied.version,
-        });
-        status.last_not_applied = self
-            .last_not_applied
-            .as_ref()
-            .filter(|last| {
-                self.applied
-                    .as_ref()
-                    .is_none_or(|applied| last.rejected.version > applied.version)
-            })
-            .map(|last| {
-                NotAppliedRef::new(
-                    &last.rejected.compaction_id,
-                    last.rejected.version,
-                    disposition_name(last.disposition),
-                )
-            });
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactionHistory {
-    pub previous_usage: Option<crate::compaction_provider::status::Usage>,
-    /// Preserve unreported counters across checkpoints; the wire Usage cannot encode them.
+    /// The last completed model step's measured usage.
     pub previous_native_usage: Option<Usage>,
     pub previous_provider_code: Option<String>,
     pub previous_model: Option<broca_protocol::ModelHandle>,
@@ -365,18 +301,9 @@ impl CompactionHistory {
                 self.completed_at = *ts_ms;
                 self.current_request_bytes = usize::try_from(*request_body_len).ok();
             }
-            WalRecord::ModelStepFinished {
-                usage,
-                finish_reason,
-                ..
-            } => {
+            WalRecord::ModelStepFinished { usage, .. } => {
                 self.previous_native_usage = Some(*usage);
                 self.previous_model.clone_from(&self.current_model);
-                let finish_reason = finish_reason
-                    .and_then(|reason| serde_json::to_value(reason).ok())
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "unknown".into());
-                self.previous_usage = wire_usage(*usage, self.completed_at, finish_reason);
                 self.previous_provider_code = None;
                 self.previous_error = false;
                 self.previous_request_bytes = self.current_request_bytes;
@@ -401,21 +328,6 @@ impl CompactionHistory {
     }
 }
 
-pub(crate) fn wire_usage(
-    usage: Usage,
-    completed_at: u64,
-    finish_reason: String,
-) -> Option<crate::compaction_provider::status::Usage> {
-    Some(crate::compaction_provider::status::Usage {
-        input: usage.input_tokens?,
-        cache_read: usage.cached_input_tokens?,
-        cache_write: usage.cache_write_tokens?,
-        output: usage.output_tokens?,
-        completed_at,
-        finish_reason,
-    })
-}
-
 /// Use the measured full occupancy, not just billed fresh tokens. The shared helper treats
 /// absent cache splits as included in fresh input; only absent fresh input makes fill unknown.
 /// A display estimate may fall back to byte conversion, but unknown measured input never
@@ -425,27 +337,10 @@ pub(crate) fn request_estimate(bytes: usize, history: &CompactionHistory) -> (u6
     // Without the old body length, the whole current body bounds bytes added since it.
     let previous = measured.map(|input| (input, history.previous_request_bytes.unwrap_or(0)));
     let estimate = estimate_tokens(bytes, previous);
-    let first_request = history.previous_native_usage.is_none()
-        && history.previous_usage.is_none()
-        && history.current_request_bytes.is_none();
+    let first_request =
+        history.previous_native_usage.is_none() && history.current_request_bytes.is_none();
     let reliable = (first_request || measured.is_some()).then_some(estimate);
     (estimate, reliable)
-}
-
-pub fn disposition_name(disposition: CompactionDisposition) -> &'static str {
-    match disposition {
-        CompactionDisposition::Noop => "noop",
-        CompactionDisposition::Wait => "wait",
-        CompactionDisposition::Refuse => "refuse",
-        CompactionDisposition::SupersededRequest => "superseded_request",
-        CompactionDisposition::Late => "late",
-        CompactionDisposition::RangeInverted => "range_inverted",
-        CompactionDisposition::StaleVersion => "stale_version",
-        CompactionDisposition::RangeBeyondNewest => "range_beyond_newest",
-        CompactionDisposition::Structural => "structural",
-        CompactionDisposition::FailedCall => "failed_call",
-        CompactionDisposition::Timeout => "timeout",
-    }
 }
 
 pub fn has_compaction(manifest: &broca_wal::PlanManifest) -> bool {
@@ -457,63 +352,35 @@ pub fn has_compaction(manifest: &broca_wal::PlanManifest) -> bool {
         })
 }
 
-/// Size belongs to the message-on-its-own check, ahead of range inversion but behind fence
-/// and deadline. Commons cannot validate broca's schema or byte ceiling, so we interpose
-/// there using a noop probe, then delegate the remaining ordered checks to its fence.
-pub fn validate_answer(
-    fence: &FenceState,
-    answer: &StepAnswer,
-    arrived: u64,
-    raw: &[Message],
-) -> Result<Option<Vec<Message>>, CompactionDisposition> {
-    let probe = StepAnswer::Noop {
-        request_id: answer.request_id().into(),
-        channel2_directive: None,
-        bootstrap_complete: None,
-    };
-    let first = fence::dispose(fence, &probe, arrived);
-    if let Disposition::NotApplied(reason) = first {
-        return Err(disposition_from_name(reason.name()));
-    }
-    let StepAnswer::CompactionMessage { compaction, .. } = answer else {
-        return Ok(None);
-    };
-    if serde_json::to_vec(&compaction.replacement)
+/// Check Setup's initial CompactionMessage against broca's message schema and the transcript
+/// it is rendered over, and return its messages. `None` when it cannot be rendered, which
+/// Setup treats as a failed call (compaction-provider/v1 §4).
+pub fn validate_initial(initial: &CompactionMessage, raw: &[Message]) -> Option<Vec<Message>> {
+    if serde_json::to_vec(&initial.replacement)
         .map_or(true, |bytes| bytes.len() > MAX_REPLACEMENT_BYTES)
     {
-        return Err(CompactionDisposition::Structural);
+        return None;
     }
-    // Range inversion is the role's message-on-its-own rule. Native checks must not mask it.
-    if compaction.check().is_err() {
-        return Err(CompactionDisposition::RangeInverted);
+    // Range inversion is the role's message-on-its-own rule.
+    initial.check().ok()?;
+    if initial.range.to > raw.len() as u64 {
+        return None;
     }
-    let messages = native_replacement(compaction, raw)?;
-    if serde_json::to_vec(&messages).map_or(true, |bytes| bytes.len() > MAX_REPLACEMENT_BYTES) {
-        return Err(CompactionDisposition::Structural);
-    }
-    if let Disposition::NotApplied(reason) = fence::dispose(fence, answer, arrived) {
-        return Err(disposition_from_name(reason.name()));
-    }
-    structural_conversation(compaction, &messages, raw)?;
-    Ok(Some(messages))
+    let messages = native_replacement(initial, raw).ok()?;
+    structural_conversation(initial, &messages, raw).ok()?;
+    Some(messages)
 }
-fn disposition_from_name(name: &str) -> CompactionDisposition {
-    match name {
-        "superseded_request" => CompactionDisposition::SupersededRequest,
-        "late" => CompactionDisposition::Late,
-        "range_inverted" => CompactionDisposition::RangeInverted,
-        "stale_version" => CompactionDisposition::StaleVersion,
-        "range_beyond_newest" => CompactionDisposition::RangeBeyondNewest,
-        _ => unreachable!("closed role fence reason"),
-    }
-}
+
+/// Why broca's schema or conversation rules refuse a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Structural;
 
 fn keys(value: &Value, allowed: &[&str]) -> bool {
     value
         .as_object()
         .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
 }
-fn native_fields(value: &Value) -> bool {
+pub(crate) fn native_fields(value: &Value) -> bool {
     if !keys(value, &["role", "content", "origin", "cache_prefix_blocks"]) {
         return false;
     }
@@ -578,8 +445,8 @@ fn tool_ids(message: &Message) -> impl Iterator<Item = &str> {
 fn native_replacement(
     compaction: &CompactionMessage,
     raw: &[Message],
-) -> Result<Vec<Message>, CompactionDisposition> {
-    let bad = CompactionDisposition::Structural;
+) -> Result<Vec<Message>, Structural> {
+    let bad = Structural;
     let end = usize::try_from(compaction.range.to)
         .ok()
         .filter(|end| *end <= raw.len());
@@ -591,50 +458,67 @@ fn native_replacement(
         .unwrap_or_default();
     let mut messages = Vec::with_capacity(compaction.replacement.len());
     for value in &compaction.replacement {
-        if !native_fields(value) {
-            return Err(bad);
-        }
-        let message: Message = serde_json::from_value(value.clone()).map_err(|_| bad)?;
-        if message.cache_prefix_blocks.is_some() || message.role == Role::System {
-            return Err(bad);
-        }
-        let unchanged = carried
-            .iter()
-            .any(|original| encoded(original) == encoded(&message));
-        if !unchanged {
-            if message.origin.is_some()
-                || message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::Reasoning {
-                            signature: Some(_),
-                            ..
-                        } | ContentBlock::RedactedReasoning { .. }
-                            | ContentBlock::TextWithState { .. }
-                    )
-                })
-            {
-                return Err(bad);
-            }
-            // Removing an origin from otherwise unchanged content does not make it authored.
-            if carried.iter().any(|original| {
-                original.origin.is_some()
-                    && original.role == message.role
-                    && original.content == message.content
-            }) {
-                return Err(bad);
-            }
-        }
-        messages.push(message);
+        messages.push(native_message(value, carried).ok_or(bad)?);
     }
     Ok(messages)
+}
+
+/// One provider-written message in broca's schema. A message that is not a byte-identical
+/// copy of one in `carried` (the transcript messages it stands in for) is authored by the
+/// provider, and may then carry no model origin, signed or encrypted reasoning, or
+/// provider-signed text: those would claim the model wrote what the provider wrote.
+pub(crate) fn native_message(value: &Value, carried: &[Message]) -> Option<Message> {
+    let message = native_schema_message(value)?;
+    let unchanged = carried
+        .iter()
+        .any(|original| encoded(original) == encoded(&message));
+    if !unchanged {
+        if message.origin.is_some() || message.content.iter().any(is_signed) {
+            return None;
+        }
+        // Removing an origin from otherwise unchanged content does not make it authored.
+        if carried.iter().any(|original| {
+            original.origin.is_some()
+                && original.role == message.role
+                && original.content == message.content
+        }) {
+            return None;
+        }
+    }
+    Some(message)
+}
+
+/// One provider-written message in broca's schema, without judging who wrote its content: no
+/// unknown members, no cache marker, and not a system message.
+pub(crate) fn native_schema_message(value: &Value) -> Option<Message> {
+    if !native_fields(value) {
+        return None;
+    }
+    let message: Message = serde_json::from_value(value.clone()).ok()?;
+    if message.cache_prefix_blocks.is_some() || message.role == Role::System {
+        return None;
+    }
+    Some(message)
+}
+
+/// Signed or encrypted model output a model provider checks against the request's prefix, or
+/// that only the model may author.
+pub(crate) fn is_signed(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Reasoning {
+            signature: Some(_),
+            ..
+        } | ContentBlock::RedactedReasoning { .. }
+            | ContentBlock::TextWithState { .. }
+    )
 }
 fn structural_conversation(
     compaction: &CompactionMessage,
     messages: &[Message],
     raw: &[Message],
-) -> Result<(), CompactionDisposition> {
-    let bad = CompactionDisposition::Structural;
+) -> Result<(), Structural> {
+    let bad = Structural;
     let end = usize::try_from(compaction.range.to)
         .ok()
         .filter(|end| *end <= raw.len());
@@ -671,20 +555,30 @@ fn structural_conversation(
         {
             return Err(bad);
         }
-        conversation(messages.iter().chain(&raw[end..]))?;
+        conversation(messages.iter().chain(&raw[end..])).map_err(|_| bad)?;
     } else {
         // Range is not usable yet; still validate the replacement on its own.
-        conversation(messages.iter())?;
+        conversation(messages.iter()).map_err(|_| bad)?;
     }
     Ok(())
 }
-fn conversation<'a>(
+
+/// Why a history breaks broca's conversation rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Conversation {
+    /// A tool call without its result, or a result without its call.
+    ToolPairSplit,
+    /// A message in a role the place it stands does not allow.
+    RoleOrder,
+}
+
+pub(crate) fn conversation<'a>(
     messages: impl Iterator<Item = &'a Message>,
-) -> Result<(), CompactionDisposition> {
+) -> Result<(), Conversation> {
     let mut pending = HashMap::<&str, usize>::new();
     for message in messages {
         if !pending.is_empty() && message.role != Role::Tool {
-            return Err(CompactionDisposition::Structural);
+            return Err(Conversation::ToolPairSplit);
         }
         if message.role == Role::System {
             continue;
@@ -693,18 +587,19 @@ fn conversation<'a>(
             match block {
                 ContentBlock::ToolCall(call) => {
                     if message.role != Role::Assistant {
-                        return Err(CompactionDisposition::Structural);
+                        return Err(Conversation::RoleOrder);
                     }
                     *pending.entry(call.tool_call_id.0.as_str()).or_default() += 1;
                 }
                 ContentBlock::ToolResult(result) => {
-                    if message.role != Role::Tool
-                        || !consume_result(&mut pending, result.tool_call_id.0.as_str())
-                    {
-                        return Err(CompactionDisposition::Structural);
+                    if message.role != Role::Tool {
+                        return Err(Conversation::RoleOrder);
+                    }
+                    if !consume_result(&mut pending, result.tool_call_id.0.as_str()) {
+                        return Err(Conversation::ToolPairSplit);
                     }
                 }
-                _ if message.role == Role::Tool => return Err(CompactionDisposition::Structural),
+                _ if message.role == Role::Tool => return Err(Conversation::RoleOrder),
                 _ => {}
             }
         }
@@ -712,7 +607,7 @@ fn conversation<'a>(
     if pending.is_empty() {
         Ok(())
     } else {
-        Err(CompactionDisposition::Structural)
+        Err(Conversation::ToolPairSplit)
     }
 }
 
@@ -729,12 +624,19 @@ fn consume_result<'a>(pending: &mut HashMap<&'a str, usize>, id: &'a str) -> boo
 
 /// Slice only the fully stamped, guidance-folded prompt. Replacement messages retain their
 /// applied bytes and have no positional ordinal; raw tail ordinals are never restamped.
+///
+/// A session with an applied asynchronous view renders that view ([`view::render`]);
+/// otherwise Setup's initial message, or the replacement the synchronous client last applied,
+/// stands in for its range, exactly as before views existed.
 pub fn model_options(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
-) -> broca_protocol::CallOptions {
+) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
+    if let Some(view) = view::render(opts, state) {
+        return view;
+    }
     let Some(applied) = &state.applied else {
-        return opts.clone();
+        return Ok(opts.clone());
     };
     let mut prompt: Vec<_> = opts
         .prompt
@@ -797,7 +699,7 @@ pub fn model_options(
             })
             .collect(),
     });
-    view
+    Ok(view)
 }
 
 pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) -> u64 {
@@ -806,12 +708,6 @@ pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) ->
         || convert(rendered_bytes),
         |(input, bytes)| input.saturating_add(convert(rendered_bytes.saturating_sub(bytes))),
     )
-}
-pub fn estimate_fits(estimate: Option<u64>, window: Option<u64>) -> bool {
-    estimate.zip(window).is_some_and(|(estimate, window)| {
-        u128::from(estimate) * 100
-            < u128::from(window) * u128::from(100 - ESTIMATE_SAFETY_MARGIN_PERCENT)
-    })
 }
 
 pub(crate) type CompactionItem = (

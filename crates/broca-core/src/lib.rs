@@ -73,7 +73,7 @@ pub use caps::{
 };
 pub use clock::Clock;
 pub use compaction::{
-    CompactionCheckpoint, CompactionInbox, CompactionPlane, CompactionState, CompactionUnavailable,
+    CompactionCheckpoint, CompactionPlane, CompactionState, CompactionUnavailable, CompactionViews,
     MAX_REPLACEMENT_BYTES,
 };
 pub use context::{

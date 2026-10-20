@@ -91,6 +91,15 @@ pub trait WalStore: Send + Sync {
         Ok(1)
     }
 
+    /// The lowest compaction notice sequence number a new lineage at `session` may use. A
+    /// notice's bus id and the provider's duplicate check both key on the session, not the
+    /// lineage, so a lineage created after retention deleted an earlier one must number its
+    /// notices on from where that one stopped, as its tombstone recorded. With no such
+    /// tombstone the answer is 1. The default, for a store without tombstones, is 1.
+    fn retired_notice_floor(&self, _session: &BindIdentity) -> Result<u64, WalError> {
+        Ok(1)
+    }
+
     /// Read the first run's frozen policy, independently of any materialized watermark.
     fn is_retention_lineage(&self, session: &BindIdentity) -> Result<bool, WalError> {
         self.read_records(session)
@@ -1257,6 +1266,18 @@ impl FileWalStore {
 /// no `next_tag` and counts as 1. An unreadable tombstone is an error: guessing low could make a
 /// new lineage reuse a deleted lineage's tags.
 pub fn retired_tag_floor_in(dir: &Path) -> Result<u64, WalError> {
+    retired_floor_in(dir, "next_tag")
+}
+
+/// The highest `next_notice_seq` the retention tombstones in `dir` recorded, or 1: the first
+/// compaction notice sequence number a new lineage at that address may use. A tombstone written
+/// before notices existed has none and counts as 1.
+pub fn retired_notice_floor_in(dir: &Path) -> Result<u64, WalError> {
+    retired_floor_in(dir, "next_notice_seq")
+}
+
+/// The highest value of the number `key` that the tombstones in `dir` recorded, or 1.
+fn retired_floor_in(dir: &Path, key: &str) -> Result<u64, WalError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(1),
@@ -1275,7 +1296,7 @@ pub fn retired_tag_floor_in(dir: &Path) -> Result<u64, WalError> {
         };
         let stone: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| WalError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-        if let Some(next) = stone.get("next_tag").and_then(serde_json::Value::as_u64) {
+        if let Some(next) = stone.get(key).and_then(serde_json::Value::as_u64) {
             floor = floor.max(next);
         }
     }
@@ -1314,6 +1335,9 @@ impl WalStore for FileWalStore {
     }
     fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
         retired_tag_floor_in(&self.tombstone_path(session, ""))
+    }
+    fn retired_notice_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
+        retired_notice_floor_in(&self.tombstone_path(session, ""))
     }
     fn open_with_class(
         &self,

@@ -99,6 +99,38 @@ addition does not change a renderer version. Older binaries ignore an unknown `r
 field in typed config decoding, but actual resumes refuse on recorded/current config drift
 rather than silently sending a request without the echo.
 
+Asynchronous compaction (compaction-provider/v1 0.3) requires **`compaction-view/v1`** for three
+things. `compaction_view_applied` records a provider view at the step boundary before the step
+that first renders it, with how it was applied: as published, or with the companion strip of
+signed reasoning a model provider binds to its prefix. A resumed run renders it from that record
+alone, byte for byte, without asking the provider again. The decision to apply a view is made
+over the prompt the request is rendered from (runner tags and loop guidance included). The view's
+own bytes are judged against the stored transcript a provider copies from and sent exactly as
+given (compaction-provider §6), so a verbatim copy of a stored message is accepted, and the
+change its untagged bytes make is stripped or deferred like any other. A recorded view that no
+longer assembles fails the step rather than render anything else.
+`compaction_notice` records an advance notice, with its sequence number and headers, before the
+bus publisher can project and publish it, so a republish after a crash reuses its number. A
+notice is recorded after the writes of each step boundary (input, steers, tool results, an
+applied view) and after a run's last step, before its terminal: its final answer, or the step a
+max-steps or budget stop or a structured-output submit ends on, in that stop's own barrier.
+Only a session whose plan names a compaction provider reads the tombstones for the notice floor. A Setup `compaction_message` that carries
+the provider's ceiling policy is gated too. A Setup record without one keeps the
+`compaction/v1` frame the removed synchronous client wrote. That client's records
+(`compaction_request`, step `compaction_message`s, `compaction_answer`, `compaction_wait`) are
+still read and folded, so its sessions replay the bytes they rendered.
+
+Runner state is never lost apart from the transcript (compaction-provider/v1 §5.3). Tags, the
+Setup answer, applied views and notices all live in the session's one WAL. The next tag is the
+WAL's highest tag plus one, and retention deletion carries a tag floor to the next lineage. So
+they cannot be lost or restored separately from the messages they describe. A new lineage starts
+with no compaction state: it runs Setup again and renders Setup's initial message, and its
+notices name no parent lineage and no applied view until one of its own applies. Notice sequence
+numbers are per session, not per lineage (the bus id and the provider's duplicate check key on
+the session), so retention deletion records the next notice number on its tombstone
+(`next_notice_seq`, beside `next_tag`) and a new lineage numbers its notices from there. Nothing detects
+a session's WAL restored by hand to an older copy.
+
 Runner tags (**`runner-tags/v1`**): every message part broca stores has a per-session tag
 number (`§N§` in the llm-runner contract), assigned by the session's writer as it appends the
 record carrying the part and stored in that record's `tags` member: `run_started` and

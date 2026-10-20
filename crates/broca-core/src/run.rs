@@ -564,15 +564,11 @@ pub struct RunControl {
     pub elicitation_plane: Option<Arc<dyn crate::tool_plane::ElicitationPlane>>,
     /// Adapter on the module-level role route stack, alongside the write-time hook plane.
     pub compaction_plane: Option<Arc<dyn crate::compaction::CompactionPlane>>,
-    /// Limits for compaction Setup/step calls and the cumulative wait within one model step.
-    /// Default uses COMPACTION_CALL_BUDGET_MS and COMPACTION_STEP_WAIT_CAP_MS.
+    /// The budget for the compaction Setup call. Default uses COMPACTION_CALL_BUDGET_MS.
     pub compaction_config: crate::compaction::CompactionConfig,
-    /// Session-owned ready mailbox, shared with the inbound management operation.
-    pub compaction_inbox: Option<Arc<crate::compaction::CompactionInbox>>,
-    /// Session cache clock caps compaction waits by the prompt cache's remaining lifetime.
-    pub compaction_cache_clock: Option<crate::CacheClock>,
-    /// Explicit rebuild (flush or manifest change) reported by the session owner.
-    pub compaction_prefix_rebuilding: Option<String>,
+    /// Views fetched from the session's compaction provider, offered at each step boundary.
+    /// Absent, the session renders Setup's message and the views it already applied.
+    pub compaction_views: Option<Arc<dyn crate::compaction::CompactionViews>>,
     #[cfg(feature = "test-clock")]
     pub test_compaction: Option<crate::compaction::test_control::Config>,
 }
@@ -634,10 +630,8 @@ impl Default for RunControl {
             clock: None,
             cancel: None,
             compaction_plane: None,
+            compaction_views: None,
             compaction_config: Default::default(),
-            compaction_inbox: None,
-            compaction_cache_clock: None,
-            compaction_prefix_rebuilding: None,
             #[cfg(feature = "test-clock")]
             test_compaction: None,
             provider_call_timeout: None,
@@ -1382,8 +1376,6 @@ where
                 clock.refresh().map_err(|e| RunError::Wal(e.to_string()))?;
             }
             control.compaction_config.call_budget_ms = config.call_timeout_ms;
-            control.compaction_config.step_wait_cap_ms =
-                config.wait_cap_ms.min(config.prompt_cache_lifetime_ms);
             control.admitted_context_limit = Some(config.context_window);
             req.generation.max_output_tokens = Some(
                 config
@@ -1417,7 +1409,8 @@ where
         prior_snapshot,
     )
     .await;
-    let (prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct {
+    let (mut prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct
+    {
         Ok(v) => v,
         Err(e) => {
             if let Some(ack) = on_admitted {
@@ -1426,6 +1419,33 @@ where
             return Err(e);
         }
     };
+    // Compaction notices are numbered per session, not per lineage: the provider and the bus
+    // both key them on the session. A compaction session's lineage that has recorded no notice
+    // yet numbers its first one past every notice of this session's earlier lineages that
+    // retention deleted, as their tombstones recorded. Only a session whose plan names a
+    // compaction provider reads the tombstones, so every other admission does no extra I/O.
+    let frozen_plan = if is_resume {
+        prior.manifest.as_ref()
+    } else {
+        control.manifest.as_ref()
+    };
+    if frozen_plan.is_some_and(|manifest| crate::compaction::has_compaction(manifest))
+        && prior
+            .compaction
+            .state()
+            .is_none_or(|state| state.notice_seq == 0)
+    {
+        match wal_store.retired_notice_floor(&req.session) {
+            Ok(floor) => prior.compaction_notice_floor = floor,
+            Err(error) => {
+                let error = RunError::Wal(error.to_string());
+                if let Some(ack) = on_admitted {
+                    let _ = ack.send(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        }
+    }
 
     // Promote a client's NEXT-TURN send to an append. A FreshOrResume send (append_episode
     // false) over an IDLE lineage is one of two things, and run_id IDENTITY is the only
@@ -2723,18 +2743,8 @@ where
             .filter(|state| state.open_wait.is_some())
             .cloned()
         {
-            let provider_name = state.provider.clone();
-            let runtime = crate::compaction::runtime::Runtime {
-                provider: &provider_name,
-                bind: &req.session,
-                plane: control.compaction_plane.as_ref(),
-                inbox: control.compaction_inbox.as_ref(),
-                writer,
-                control,
-                replies: &crate::compaction::runtime::CompactionReplies::new(),
-            };
-            if let Some(crate::compaction::runtime::StepResult::Terminal(reason, error)) =
-                runtime.recover_wait(&mut state).await?
+            if let Some(crate::compaction::runtime::Terminal(reason, error)) =
+                crate::compaction::runtime::seal_recorded_wait(writer, &mut state).await?
             {
                 let run_id = prior.run_id.clone().unwrap_or_else(|| req.run_id.clone());
                 admit(&mut on_admitted, Ok(run_id.clone()));
@@ -2978,30 +2988,20 @@ where
     });
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
-    let mut replayed_compaction_answer = is_resume
-        && !append_episode
-        && compaction_state
-            .as_ref()
-            .is_some_and(|state| state.pending_answer);
+    let compaction_notice_floor = prior.compaction_notice_floor;
+    // The newest fetched view this run will not apply (refused, rejected or stale), and the
+    // newest one a notice already reported, so neither is offered or reported twice.
+    let mut declined_view: Option<u64> = None;
+    let mut reported_view: Option<u64> = None;
+    // The rendered size of the last request under compaction, from which a notice recorded
+    // between boundaries estimates the next one.
+    let mut notice_request_bytes = 0usize;
     let mut compaction_history = prior.compaction_history.clone();
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
         .transpose()
         .map_err(RunError::Wal)?
         .flatten();
-    // The bounded reply channel owns queue storage for the whole run. Allocate it only
-    // for a frozen compaction plan, so ordinary tool steps do not retain unused capacity.
-    let compaction_replies =
-        crate::compaction::runtime::CompactionReplies::for_plan(compaction_item.is_some());
-    #[cfg(feature = "test-clock")]
-    let compaction_replies = compaction_replies.map(|replies| {
-        replies.with_test_root(
-            control
-                .test_compaction
-                .as_ref()
-                .map(|config| config.root.clone()),
-        )
-    });
     let compaction_runtime =
         compaction_item
             .as_ref()
@@ -3009,12 +3009,8 @@ where
                 provider,
                 bind: &hook_bind,
                 plane: control.compaction_plane.as_ref(),
-                inbox: control.compaction_inbox.as_ref(),
                 writer,
                 control,
-                replies: compaction_replies
-                    .as_ref()
-                    .expect("compaction item owns replies"),
             });
     let recovered_cancel = is_resume && !append_episode && prior.cancel_at.is_some();
     if recovered_cancel {
@@ -3315,6 +3311,7 @@ where
                         &[],
                         control.emit_control_payloads,
                         None,
+                        None,
                     )
                     .await;
                 }
@@ -3387,6 +3384,7 @@ where
                         &[],
                         control.emit_control_payloads,
                         Some(&submit.tool_call_id),
+                        None,
                     )
                     .await;
                 }
@@ -4119,10 +4117,6 @@ where
     // The typed terminal error, set only when the loop breaks with `Error`. Persisted on
     // the durable RunFinished so the control-stream projection can surface the cause.
     let mut terminal_error: Option<ProviderError> = None;
-    // Raw status values must never include model-only repetition guidance. The full prompt
-    // remains the render-time fold; retain native final values separately for provider status.
-    let mut explicit_rebuild = control.compaction_prefix_rebuilding.clone();
-
     // Reuse one immutable request snapshot for the whole turn loop. The renderer owns a
     // cloned Arc while its blocking job runs, so every append below first proves that no
     // in-flight render can force a copy of the durable prompt.
@@ -4350,7 +4344,7 @@ where
                 setup.newest = raw
                     .last()
                     .and_then(|message| message.ordinal)
-                    .map(|ordinal| crate::compaction_provider::status::MessageRef {
+                    .map(|ordinal| crate::compaction_provider::lineage::MessageRef {
                         ordinal,
                         mid: format!("m{ordinal}"),
                     });
@@ -4368,90 +4362,79 @@ where
                 }
             }
             let state = compaction_state.as_mut().expect("Setup is durable");
-            let view = crate::compaction::model_options(&opts, state);
-            let bytes = provider.render_request(&view).len();
-            let (estimate, cap_estimate) =
-                crate::compaction::request_estimate(bytes, &compaction_history);
-            #[cfg(feature = "test-clock")]
-            let (estimate, cap_estimate) = control
-                .test_compaction
-                .as_ref()
-                .map_or((estimate, cap_estimate), |config| {
-                    (config.request_tokens, Some(config.request_tokens))
-                });
-            let cache = control
-                .compaction_cache_clock
-                .as_ref()
-                .and_then(crate::CacheClock::read);
-            let rebuilding = explicit_rebuild.take().or_else(|| {
-                if compaction_history
-                    .previous_model
-                    .as_ref()
-                    .is_some_and(|model| model != &cfg.model)
+            let session_ref = crate::wal_writer::agent_session_ref(&req.session);
+            let mut view_events = Vec::new();
+            if let Some(views) = &control.compaction_views {
+                let current = state.view.as_ref().map(|applied| applied.view.view_version);
+                if let Some((fetched, ready)) = views
+                    .newest(&session_ref, &lineage_id, current)
+                    .filter(|(fetched, _)| declined_view != Some(fetched.view_version))
                 {
-                    Some("model_switch".into())
-                } else if cache
-                    .and_then(|clock| clock.expires_at_ms())
-                    .is_some_and(|expires| expires <= crate::compaction::now())
-                {
-                    Some("expired_cache".into())
-                } else {
-                    None
-                }
-            });
-            if !replayed_compaction_answer
-                && state.should_call(
-                    &cfg.model.model_id,
-                    compaction_history.usage(),
-                    context_limit,
-                    rebuilding.is_some(),
-                    compaction_history.previous_error,
-                )
-            {
-                let mut status = crate::compaction_provider::status::StepStatus::new(
-                    &req.session.session,
-                    &req.session.harness,
-                    "",
-                    lineage_id,
-                    step_id.0.to_string(),
-                    if completed_steps == 0 {
-                        "user_turn"
-                    } else {
-                        "tool_step"
-                    },
-                    &cfg.model.model_id,
-                    crate::compaction_provider::status::Estimate::new(estimate),
-                    crate::compaction::now(),
-                )
-                .with_model_details(
-                    variant.clone(),
-                    context_limit,
-                    opts.generation.max_output_tokens.map(u64::from),
-                )
-                .with_previous(
-                    compaction_history.previous_usage.clone(),
-                    compaction_history.previous_provider_code.clone(),
-                );
-                status.estimate.previous_input = compaction_history
-                    .usage()
-                    .and_then(|usage| usage.fill_tokens());
-                status.prefix_rebuilding = rebuilding
-                    .map(|reason| crate::compaction_provider::status::PrefixRebuild { reason });
-                if let crate::compaction::runtime::StepResult::Terminal(reason, error) =
-                    Box::pin(runtime.step(state, status, raw, cap_estimate, cache)).await?
-                {
-                    terminal_error = error.map(|error| *error);
-                    break reason;
+                    let (decision, event) = Box::pin(runtime.offer_view(
+                        state,
+                        &fetched,
+                        &ready,
+                        &lineage_id,
+                        // The prompt the request renders from, so the decision sees the bytes
+                        // the model is sent (tags and loop guidance included); and the stored
+                        // copy, against which the view's own bytes are judged.
+                        &opts.prompt,
+                        raw,
+                        provider.reasoning_is_prefix_bound(),
+                    ))
+                    .await?;
+                    // A refused, rejected or stale view is never offered to this run again. A
+                    // deferred view is offered at every later boundary, and so is one that is
+                    // not (yet) a prefix of this transcript: it may cover messages this run
+                    // has still to write again after a restart.
+                    if matches!(
+                        decision,
+                        crate::compaction::view::Decision::Refuse(_)
+                            | crate::compaction::view::Decision::Rejected(_)
+                            | crate::compaction::view::Decision::Stale
+                    ) {
+                        declined_view = Some(fetched.view_version);
+                    }
+                    if reported_view != Some(fetched.view_version) {
+                        if let Some(event) = event {
+                            view_events.push(event);
+                            reported_view = Some(fetched.view_version);
+                        }
+                    }
                 }
             }
-            model_opts = Some(Arc::new(crate::compaction::model_options(&opts, state)));
+            let view = crate::compaction::model_options(&opts, state)
+                .map_err(|error| RunError::Wal(error.to_string()))?;
+            notice_request_bytes = provider.render_request(&view).len();
+            let (estimate, _) =
+                crate::compaction::request_estimate(notice_request_bytes, &compaction_history);
+            // Tell the provider what the session wrote since its last notice. The notice is
+            // durable in the WAL before the model call, and the bus publisher projects it from
+            // there, so it is never published before it is durable.
+            if let Some(notice) = crate::compaction::view::next_notice(
+                state,
+                raw,
+                crate::compaction::view::NoticeFacts {
+                    session_ref,
+                    lineage_id: &lineage_id,
+                    est_tokens: estimate,
+                    model: &cfg.model.model_id,
+                    window: context_limit,
+                    usage: compaction_history.usage(),
+                    events: view_events,
+                    seq_floor: compaction_notice_floor,
+                },
+            ) {
+                runtime.record_notice(state, notice).await?;
+            }
+            model_opts = Some(Arc::new(view));
             #[cfg(feature = "test-clock")]
             {
-                // The model prompt is the replacement followed by the retained raw tail.
-                // CompactionMessage/CompactionAnswer preserve the replacement and cursor;
-                // RunStarted, ModelStepFinished and ToolResult preserve the raw transcript.
-                // Sync those ingredients before model I/O so a crash can rebuild the
-                // identical prompt rather than request another compaction answer.
+                // The model prompt is Setup's message or the applied view, with the raw
+                // transcript. CompactionMessage and CompactionViewApplied preserve the first;
+                // RunStarted, ModelStepFinished and ToolResult preserve the second. Sync them
+                // before model I/O so a crash rebuilds the identical prompt rather than ask
+                // the provider again.
                 writer.sync().await?;
                 crate::compaction::test_control::barrier(
                     control.clock.as_ref(),
@@ -4460,7 +4443,6 @@ where
                 )
                 .await?;
             }
-            replayed_compaction_answer = false;
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
@@ -4480,11 +4462,8 @@ where
         // Complete attempts still share the step's existing barrier.
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
-        let completed_at = std::sync::atomic::AtomicU64::new(0);
-        let compaction_completed_at = &completed_at;
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             Box::pin(async move {
-                compaction_completed_at.store(attempt.ts_ms, std::sync::atomic::Ordering::Relaxed);
                 if let Some(warm) = &control.keep_warm {
                     warm.note_attempt(&attempt);
                 }
@@ -4525,10 +4504,7 @@ where
             ));
             // Keep the same pinned model future while filing delayed receipts; no receipt may
             // cancel, restart, or change the request already being streamed by the provider.
-            let model_result = match (&compaction_runtime, &mut compaction_state) {
-                (Some(runtime), Some(state)) => runtime.with_replies(state, model_step).await??,
-                _ => model_step.await?,
-            };
+            let model_result = model_step.await?;
             let mut step = match model_result {
                 Ok(step) => step,
                 Err(reason) => break Err(reason),
@@ -4602,14 +4578,6 @@ where
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
-                    compaction_history.previous_usage = crate::compaction::wire_usage(
-                        usage,
-                        compaction_completed_at.load(std::sync::atomic::Ordering::Relaxed),
-                        finish_reason
-                            .and_then(|reason| serde_json::to_value(reason).ok())
-                            .and_then(|v| v.as_str().map(str::to_owned))
-                            .unwrap_or_else(|| "unknown".into()),
-                    );
                     compaction_history.previous_provider_code = None;
                     compaction_history.previous_error = false;
                     compaction_history.previous_request_bytes = Some(bytes);
@@ -4769,6 +4737,13 @@ where
                     };
                     if no_tool_reason == RunFinishReason::Completed && wants_final_text {
                         natural_final_text = Some(joined_text(&message));
+                    }
+                    if let Some(raw) = &mut compaction_raw {
+                        // The run's last message, announced before the run ends.
+                        raw.push(Message::assistant_from(
+                            message.content.clone(),
+                            cfg.model.clone(),
+                        ));
                     }
                     let message = Arc::new(message);
                     record_model_hook(
@@ -4953,6 +4928,18 @@ where
                     &[],
                     control.emit_control_payloads,
                     None,
+                    ClosingNotice::new(
+                        compaction_state.as_mut(),
+                        compaction_raw.as_mut(),
+                        writer,
+                        &req.session,
+                        &cfg.model,
+                        context_limit,
+                        &compaction_history,
+                        notice_request_bytes,
+                        compaction_notice_floor,
+                    )
+                    .map(|closing| (closing, assembled.content.as_slice())),
                 )
                 .await;
             }
@@ -4992,6 +4979,18 @@ where
                 &[],
                 control.emit_control_payloads,
                 Some(&submit.tool_call_id),
+                ClosingNotice::new(
+                    compaction_state.as_mut(),
+                    compaction_raw.as_mut(),
+                    writer,
+                    &req.session,
+                    &cfg.model,
+                    context_limit,
+                    &compaction_history,
+                    notice_request_bytes,
+                    compaction_notice_floor,
+                )
+                .map(|closing| (closing, assembled.content.as_slice())),
             )
             .await;
         }
@@ -5017,6 +5016,18 @@ where
                     &[],
                     control.emit_control_payloads,
                     None,
+                    ClosingNotice::new(
+                        compaction_state.as_mut(),
+                        compaction_raw.as_mut(),
+                        writer,
+                        &req.session,
+                        &cfg.model,
+                        context_limit,
+                        &compaction_history,
+                        notice_request_bytes,
+                        compaction_notice_floor,
+                    )
+                    .map(|closing| (closing, assembled.content.as_slice())),
                 )
                 .await;
             }
@@ -5093,6 +5104,18 @@ where
                     &budget_firings,
                     control.emit_control_payloads,
                     None,
+                    ClosingNotice::new(
+                        compaction_state.as_mut(),
+                        compaction_raw.as_mut(),
+                        writer,
+                        &req.session,
+                        &cfg.model,
+                        context_limit,
+                        &compaction_history,
+                        notice_request_bytes,
+                        compaction_notice_floor,
+                    )
+                    .map(|closing| (closing, assembled.content.as_slice())),
                 )
                 .await;
             }
@@ -5121,6 +5144,13 @@ where
             }
             if wants_final_text {
                 natural_final_text = Some(joined_text(&assembled));
+            }
+            if let Some(raw) = &mut compaction_raw {
+                // The run's last message, announced before the run ends.
+                raw.push(Message::assistant_from(
+                    assembled.content.clone(),
+                    cfg.model.clone(),
+                ));
             }
             break RunFinishReason::Completed;
         }
@@ -5155,10 +5185,7 @@ where
             approval_history.as_mut(),
             req.on_restart == Some(broca_protocol::request::OnRestart::Resume),
         ));
-        let mut batch = match (&compaction_runtime, &mut compaction_state) {
-            (Some(runtime), Some(state)) => runtime.with_replies(state, batch_future).await??,
-            _ => batch_future.await?,
-        };
+        let mut batch = batch_future.await?;
 
         if batch.interruption == Some(BatchInterruption::RestartPause) {
             return pause_approval(
@@ -5273,6 +5300,28 @@ where
         }
     };
 
+    // Announce what the run wrote after its last step boundary (its final answer) now, not at
+    // the next send's first boundary: the contract owes a notice after each durable write. The
+    // notice follows those records in the WAL and its own barrier makes both durable before the
+    // publisher can project it.
+    if let (Some(runtime), Some(closing)) = (
+        &compaction_runtime,
+        ClosingNotice::new(
+            compaction_state.as_mut(),
+            compaction_raw.as_mut(),
+            writer,
+            &req.session,
+            &cfg.model,
+            context_limit,
+            &compaction_history,
+            notice_request_bytes,
+            compaction_notice_floor,
+        ),
+    ) {
+        if let Some((state, notice)) = closing.notice(&[], &[]) {
+            runtime.record_notice(state, notice).await?;
+        }
+    }
     // A completed run admitted with structured output records what it produced in the same
     // barrier as its terminal. A run that submitted returned above; reaching here, a
     // `submit_tool` run completed without calling `submit_result`.
@@ -7593,6 +7642,129 @@ fn interrupted_result(id: &ToolCallId) -> ToolResult {
     }
 }
 
+/// The advance notice a compaction session records when its run ends, announcing the writes
+/// after its last step boundary (the final answer, and the results of a hard stop) before the
+/// terminal (compaction-provider CONTRACT.md §5: a notice after each durable write). `None`
+/// for a session without compaction, or a WAL that has no lineage id yet.
+struct ClosingNotice<'a> {
+    state: &'a mut crate::compaction::CompactionState,
+    raw: &'a mut Vec<Message>,
+    lineage_id: String,
+    session: &'a broca_protocol::BindIdentity,
+    model: &'a broca_protocol::ModelHandle,
+    window: Option<u64>,
+    history: &'a crate::compaction::CompactionHistory,
+    request_bytes: usize,
+    floor: u64,
+}
+
+impl<'a> ClosingNotice<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        state: Option<&'a mut crate::compaction::CompactionState>,
+        raw: Option<&'a mut Vec<Message>>,
+        writer: &WalHandle,
+        session: &'a broca_protocol::BindIdentity,
+        model: &'a broca_protocol::ModelHandle,
+        window: Option<u64>,
+        history: &'a crate::compaction::CompactionHistory,
+        request_bytes: usize,
+        floor: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            state: state?,
+            raw: raw?,
+            lineage_id: writer.lineage_id()?.to_string(),
+            session,
+            model,
+            window,
+            history,
+            request_bytes,
+            floor,
+        })
+    }
+
+    /// The notice for the transcript after `assistant` (the run's last model message, when it
+    /// is not in the transcript copy yet) and the tool `results` written after it, or `None`
+    /// when there is nothing new or the notice would be malformed.
+    fn notice(
+        self,
+        assistant: &[ContentBlock],
+        results: &[ToolResult],
+    ) -> Option<(
+        &'a mut crate::compaction::CompactionState,
+        crate::compaction_provider::notice::AdvanceNotice,
+    )> {
+        if !assistant.is_empty() {
+            self.raw.push(Message::assistant_from(
+                assistant.to_vec(),
+                self.model.clone(),
+            ));
+        }
+        if !results.is_empty() {
+            self.raw.push(Message::new(
+                Role::Tool,
+                results
+                    .iter()
+                    .cloned()
+                    .map(ContentBlock::ToolResult)
+                    .collect(),
+            ));
+        }
+        broca_protocol::content::stamp_ordinals(self.raw);
+        let announced = self
+            .state
+            .announced
+            .as_ref()
+            .and_then(|announced| announced.through_ordinal);
+        let appended: usize = self
+            .raw
+            .iter()
+            .filter(|m| m.ordinal.is_some_and(|o| announced.is_none_or(|a| o > a)))
+            .map(|m| serde_json::to_vec(m).map_or(0, |bytes| bytes.len()))
+            .sum();
+        let (estimate, _) = crate::compaction::request_estimate(
+            self.request_bytes.saturating_add(appended),
+            self.history,
+        );
+        let notice = crate::compaction::view::next_notice(
+            self.state,
+            self.raw,
+            crate::compaction::view::NoticeFacts {
+                session_ref: crate::wal_writer::agent_session_ref(self.session),
+                lineage_id: &self.lineage_id,
+                est_tokens: estimate,
+                model: &self.model.model_id,
+                window: self.window,
+                usage: self.history.usage(),
+                events: Vec::new(),
+                seq_floor: self.floor,
+            },
+        )?;
+        notice.check().ok()?;
+        Some((self.state, notice))
+    }
+
+    /// Record the notice for a hard stop's step in the hard stop's own barrier: queued here
+    /// after its synthetic results, made durable with them and the terminal by the one sync
+    /// the hard stop owes, and only then visible to the publisher.
+    fn record_with_terminal(
+        self,
+        writer: &WalHandle,
+        assistant: &[ContentBlock],
+        results: &[ToolResult],
+    ) {
+        if let Some((state, notice)) = self.notice(assistant, results) {
+            let record = WalRecord::CompactionNotice {
+                seq: notice.seq,
+                headers: notice.to_headers(),
+            };
+            writer.record(record.clone());
+            state.fold(&record);
+        }
+    }
+}
+
 /// Finalize a hard stop (a stop/max-steps condition fired while the model's last step
 /// still had PENDING, never-dispatched tool calls). Persists a provider-valid terminal
 /// for each pending call (so the durable turn isn't a dangling tool_use the model would
@@ -7628,6 +7800,7 @@ async fn finalize_hard_stop(
     budget_firings: &[BudgetFiring],
     emit_control_payloads: bool,
     submitted: Option<&ToolCallId>,
+    closing: Option<(ClosingNotice<'_>, &[ContentBlock])>,
 ) -> Result<RunSummary, RunError> {
     let batch_id = BatchId(format!("{}-b{}", resolved_run_id.0, step_id.0));
     let call_ids: Vec<ToolCallId> = pending.iter().map(|c| c.tool_call_id.clone()).collect();
@@ -7713,6 +7886,9 @@ async fn finalize_hard_stop(
     writer.record(WalRecord::ToolBatchFinished { batch_id });
     writer.record(WalRecord::TurnFinished { step_id });
     record_budget_firings(writer, resolved_run_id, budget_firings);
+    if let Some((closing, assistant)) = closing {
+        closing.record_with_terminal(writer, assistant, &results);
+    }
     // The terminal goes in the SAME barrier as the repair batch (no intermediate sync).
     control.close_steers();
     writer.record(WalRecord::RunFinished {

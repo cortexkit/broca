@@ -836,8 +836,10 @@ A paused run is already at a boundary and is cancelled without another model ste
 submission is not an active run: cancellation answers `"not_active"`; use `session.retract`
 to remove it. An active tool batch awaiting human approval still owns that wait, so boundary
 cancellation waits for the decision/expiry and the batch's results; an immediate cancellation
-can end the wait. A compaction wait before model I/O is already a safe boundary: cancellation
-records the wait's `cancel` exit and seals `Cancelled` without recalling compaction or the model.
+can end the wait. A run never waits on its compaction provider between steps: views are applied
+at step boundaries from what was already fetched. A compaction wait the removed synchronous client
+recorded and a crash left open is sealed on recovery with its recorded exit, without calling the
+provider or the model.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
 ends `Interrupted`, not `Cancelled`, and releases the lease.

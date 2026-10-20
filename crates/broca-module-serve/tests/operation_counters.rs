@@ -26,7 +26,6 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "run.status",
     "run.event.get",
     "session.read",
-    "compaction.ready",
     "role.describe",
     "session.resolve",
     "session.head",

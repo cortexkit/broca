@@ -1,17 +1,17 @@
+//! Setup, the replay of what the removed synchronous client recorded, and the in-memory WAL the
+//! asynchronous view tests share.
+
 use super::*;
-use crate::compaction_provider::{
-    setup::{SetupAnswer, SetupRequest},
-    status::{Estimate, MessageRef},
-};
+use crate::compaction_provider::setup::{SetupAnswer, SetupRequest};
 use broca_protocol::{BindIdentity, CallOptions, FinishReason, ModelHandle, RunFinishReason};
-use broca_wal::{FramedRecord, Wal, WalError};
+use broca_wal::{CompactionCursor, CompactionDisposition, FramedRecord, Wal, WalError};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
 };
 
-fn text(role: Role, text: &str) -> Message {
+pub(super) fn text(role: Role, text: &str) -> Message {
     Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }
 fn raw() -> Vec<Message> {
@@ -24,88 +24,13 @@ fn raw() -> Vec<Message> {
     broca_protocol::content::stamp_ordinals(&mut raw);
     raw
 }
-fn compaction(replacement: Vec<Value>) -> CompactionMessage {
-    CompactionMessage::new("c", 2, Range::new(0, 3), replacement)
+fn initial(range: Range, replacement: Vec<Value>) -> CompactionMessage {
+    CompactionMessage::new("c", 1, range, replacement)
 }
-fn fence() -> FenceState {
-    FenceState {
-        newest_request_id: "r".into(),
-        last_applied_version: Some(1),
-        newest_ordinal: Some(3),
-        newest_deadline_ms: Some(100),
-    }
+fn refused(message: CompactionMessage, raw: &[Message]) {
+    assert_eq!(validate_initial(&message, raw), None, "{message:?}");
 }
-fn answer(message: CompactionMessage) -> StepAnswer {
-    StepAnswer::CompactionMessage {
-        request_id: "r".into(),
-        compaction: message,
-        coverage: None,
-        channel2_directive: None,
-        bootstrap_complete: None,
-    }
-}
-fn rejected(message: CompactionMessage) {
-    assert_eq!(
-        validate_answer(&fence(), &answer(message), 99, &raw()),
-        Err(CompactionDisposition::Structural)
-    );
-}
-#[test]
-fn structural_rule_cache_prefix_is_refused() {
-    rejected(compaction(vec![
-        json!({"role":"user","cache_prefix_blocks":1,"content":[{"type":"text","text":"head"}]} ),
-    ]));
-}
-#[test]
-fn structural_rule_origin_fidelity_is_refused() {
-    let mut original = text(Role::Assistant, "signed model answer");
-    original.origin = Some(ModelHandle::new("p", "m"));
-    let mut raw = vec![original.clone(), text(Role::User, "tail")];
-    broca_protocol::content::stamp_ordinals(&mut raw);
-    let mut carried = original.clone();
-    carried.origin = None;
-    let message = CompactionMessage::new("c", 2, Range::new(0, 1), vec![encoded(&carried)]);
-    assert_eq!(
-        validate_answer(&fence(), &answer(message), 99, &raw),
-        Err(CompactionDisposition::Structural)
-    );
-    let message = CompactionMessage::new("c", 2, Range::new(0, 1), vec![encoded(&original)]);
-    assert!(validate_answer(&fence(), &answer(message), 99, &raw).is_ok());
-}
-#[test]
-fn structural_rule_authored_signed_reasoning_is_refused() {
-    for block in [
-        json!({"type":"reasoning","text":"thinking","signature":"signed"}),
-        json!({"type":"redacted_reasoning","data":"opaque"}),
-    ] {
-        rejected(compaction(vec![
-            json!({"role":"assistant","content":[block]}),
-        ]));
-    }
-}
-
-#[test]
-fn text_provider_state_can_only_be_carried_as_an_unchanged_original() {
-    let original: Message = serde_json::from_value(json!({"role":"assistant","origin":{"provider_module_id":"p","model_id":"m"},"content":[{"type":"text_with_state","text":"answer","provider_state":{"format":"gemini","data":"opaque"}}]})).unwrap();
-    let raw = vec![original.clone(), text(Role::User, "tail")];
-    let carried = CompactionMessage::new("c", 2, Range::new(0, 1), vec![encoded(&original)]);
-    assert!(validate_answer(&fence(), &answer(carried), 99, &raw).is_ok());
-    let mut forged = original.clone();
-    forged.origin = None;
-    if let ContentBlock::TextWithState { text, .. } = &mut forged.content[0] {
-        text.push_str(" rewritten");
-    }
-    let changed = CompactionMessage::new("c", 2, Range::new(0, 1), vec![encoded(&forged)]);
-    assert_eq!(
-        validate_answer(&fence(), &answer(changed), 99, &raw),
-        Err(CompactionDisposition::Structural)
-    );
-}
-#[test]
-fn structural_rule_system_is_refused() {
-    rejected(compaction(vec![encoded(&text(Role::System, "head"))]));
-}
-fn call(id: &str) -> ContentBlock {
+pub(super) fn call(id: &str) -> ContentBlock {
     ContentBlock::ToolCall(broca_protocol::ToolCall {
         tool_call_id: broca_protocol::ToolCallId(id.into()),
         tool_name: "t".into(),
@@ -113,7 +38,7 @@ fn call(id: &str) -> ContentBlock {
         thought_signature: None,
     })
 }
-fn result(id: &str) -> ContentBlock {
+pub(super) fn result(id: &str) -> ContentBlock {
     ContentBlock::ToolResult(broca_protocol::ToolResult {
         tool_call_id: broca_protocol::ToolCallId(id.into()),
         output: broca_protocol::ToolOutput::Text {
@@ -122,167 +47,196 @@ fn result(id: &str) -> ContentBlock {
         is_error: false,
     })
 }
+
+/// Setup's initial message is rendered as written, so it may not use what only the model or
+/// the runner may write: a cache marker, a model origin or signed reasoning it did not copy
+/// unchanged, a system message, or a split tool call.
 #[test]
-fn structural_rule_tool_pair_and_range_integrity_is_refused() {
-    let mut raw = vec![
+fn setup_initial_is_refused_when_broca_cannot_render_it_faithfully() {
+    let head = |value: Value| initial(Range::new(0, 0), vec![value]);
+    refused(
+        head(
+            json!({"role":"user","cache_prefix_blocks":1,"content":[{"type":"text","text":"head"}]}),
+        ),
+        &raw(),
+    );
+    for block in [
+        json!({"type":"reasoning","text":"thinking","signature":"signed"}),
+        json!({"type":"redacted_reasoning","data":"opaque"}),
+    ] {
+        refused(head(json!({"role":"assistant","content":[block]})), &raw());
+    }
+    refused(head(encoded(&text(Role::System, "head"))), &raw());
+    for value in [
+        json!({"role":"user","content":[],"mystery":1}),
+        json!({"role":"user","content":[{"type":"image","data":"x"}]}),
+        json!({"role":"user","content":[{"type":"text","text":"x","mystery":1}]}),
+    ] {
+        refused(head(value), &raw());
+    }
+    // A model origin survives only on an unchanged copy of the message it stands for.
+    let mut original = text(Role::Assistant, "signed model answer");
+    original.origin = Some(ModelHandle::new("p", "m"));
+    let mut transcript = vec![original.clone(), text(Role::User, "tail")];
+    broca_protocol::content::stamp_ordinals(&mut transcript);
+    let mut carried = original.clone();
+    carried.origin = None;
+    refused(
+        initial(Range::new(0, 1), vec![encoded(&carried)]),
+        &transcript,
+    );
+    assert!(validate_initial(
+        &initial(Range::new(0, 1), vec![encoded(&original)]),
+        &transcript
+    )
+    .is_some());
+    // Tool calls and results stay paired across the range.
+    let mut transcript = vec![
         Message::new(Role::Assistant, vec![call("id")]),
         Message::new(Role::Tool, vec![result("id")]),
         text(Role::User, "tail"),
     ];
-    broca_protocol::content::stamp_ordinals(&mut raw);
+    broca_protocol::content::stamp_ordinals(&mut transcript);
     for message in [
-        CompactionMessage::new("c", 2, Range::new(0, 1), vec![]),
-        CompactionMessage::new(
-            "c",
-            2,
+        initial(Range::new(0, 1), vec![]),
+        initial(
             Range::new(0, 2),
             vec![encoded(&Message::new(Role::Tool, vec![result("id")]))],
         ),
-        CompactionMessage::new(
-            "c",
-            2,
-            Range::new(0, 2),
-            vec![encoded(&Message::new(Role::Assistant, vec![call("id")]))],
-        ),
-        CompactionMessage::new(
-            "c",
-            2,
+        initial(
             Range::new(0, 0),
             vec![
                 encoded(&Message::new(Role::Assistant, vec![call("id")])),
                 encoded(&Message::new(Role::Tool, vec![result("id")])),
             ],
         ),
+        // Inverted, and past the transcript.
+        initial(Range::new(2, 1), vec![]),
+        initial(Range::new(0, 9), vec![]),
     ] {
-        assert_eq!(
-            validate_answer(&fence(), &answer(message), 99, &raw),
-            Err(CompactionDisposition::Structural)
-        );
+        refused(message, &transcript);
     }
-    let valid = CompactionMessage::new(
-        "c",
-        2,
-        Range::new(0, 2),
-        vec![encoded(&raw[0]), encoded(&raw[1])],
-    );
-    assert!(validate_answer(&fence(), &answer(valid), 99, &raw).is_ok());
-}
-#[test]
-fn structural_rule_unknown_native_fields_are_refused() {
-    for value in [
-        json!({"role":"user","content":[],"mystery":1}),
-        json!({"role":"user","content":[{"type":"image","data":"x"}]}),
-        json!({"role":"user","content":[{"type":"text","text":"x","mystery":1}]}),
-    ] {
-        rejected(compaction(vec![value]));
-    }
-}
-#[test]
-fn fence_order_size_deadline_version_and_range_are_pinned() {
-    let mut oversized = compaction(vec![encoded(&text(
-        Role::User,
-        &"x".repeat(MAX_REPLACEMENT_BYTES),
-    ))]);
-    oversized.range = Range::new(10, 0);
-    let mut stale = answer(oversized.clone());
-    if let StepAnswer::CompactionMessage { request_id, .. } = &mut stale {
-        *request_id = "old".into();
-    }
-    assert_eq!(
-        validate_answer(&fence(), &stale, 100, &raw()),
-        Err(CompactionDisposition::SupersededRequest)
-    );
-    assert_eq!(
-        validate_answer(&fence(), &answer(oversized.clone()), 100, &raw()),
-        Err(CompactionDisposition::Late)
-    );
-    assert_eq!(
-        validate_answer(&fence(), &answer(oversized), 99, &raw()),
-        Err(CompactionDisposition::Structural)
-    );
-    let mut message = compaction(vec![]);
-    message.range = Range::new(9, 8);
-    message.version = 1;
-    assert_eq!(
-        validate_answer(&fence(), &answer(message.clone()), 99, &raw()),
-        Err(CompactionDisposition::RangeInverted)
-    );
-    message.range = Range::new(0, 8);
-    assert_eq!(
-        validate_answer(&fence(), &answer(message.clone()), 99, &raw()),
-        Err(CompactionDisposition::StaleVersion)
-    );
-    message.version = 2;
-    assert_eq!(
-        validate_answer(&fence(), &answer(message), 99, &raw()),
-        Err(CompactionDisposition::RangeBeyondNewest)
-    );
-}
-
-#[test]
-fn replacement_ceiling_is_eight_mib_independent_of_configuration() {
-    // The fixture must not derive its boundary from the implementation's constant:
-    // increasing that constant must make the real validator accept this oversized input.
-    let message = compaction(vec![encoded(&text(
-        Role::User,
-        &"x".repeat(8 * 1024 * 1024),
-    ))]);
-    assert_eq!(
-        validate_answer(&fence(), &answer(message), 99, &raw()),
-        Err(CompactionDisposition::Structural)
-    );
-}
-
-#[test]
-fn inverted_range_precedes_invalid_native_content() {
-    let mut message = compaction(vec![
-        json!({"role":"user","content":[{"type":"text","text":"summary"}],"future":true}),
-    ]);
-    message.range = Range::new(3, 2);
-    assert_eq!(
-        validate_answer(&fence(), &answer(message), 99, &raw()),
-        Err(CompactionDisposition::RangeInverted)
-    );
-}
-#[test]
-fn compaction_margin_is_strict_and_unknown_window_fails_closed() {
-    assert!(estimate_fits(Some(899), Some(1000)));
-    assert!(!estimate_fits(Some(900), Some(1000)));
-    assert!(!estimate_fits(Some(950), Some(1000)));
-    assert!(!estimate_fits(Some(100), None));
-    assert!(!estimate_fits(None, Some(1000)));
-    assert_eq!(estimate_tokens(101, None), 51);
-    assert_eq!(estimate_tokens(120, Some((100, 100))), 110);
-}
-#[test]
-fn scheduling_uses_fill_and_shared_model_overrides() {
-    let mut state = CompactionState {
-        call_when: Some(
-            OpaqueJson::from_json_text(r#"{"default":0.8,"models":{"m*":0.7,"model":0.6}}"#)
-                .unwrap(),
+    assert!(validate_initial(
+        &initial(
+            Range::new(0, 2),
+            vec![encoded(&transcript[0]), encoded(&transcript[1])]
         ),
-        ..Default::default()
-    };
-    let usage = Usage {
-        input_tokens: Some(100),
-        cached_input_tokens: Some(400),
-        cache_write_tokens: Some(100),
-        ..Usage::default()
-    };
-    assert!(state.should_call("model", Some(usage), Some(1000), false, false));
-    assert!(!state.should_call("model", Some(usage), Some(1001), false, false));
-    assert!(!state.should_call("other", Some(usage), Some(1000), false, false));
-    assert!(state.should_call("other", None, None, true, false));
-    assert!(state.should_call("other", None, None, false, true));
-    state.call_when = Some(OpaqueJson::from_json_text(r#"{"default":0.8,"future":1}"#).unwrap());
-    assert!(state.should_call("other", None, None, false, false));
+        &transcript
+    )
+    .is_some());
 }
-#[derive(Clone, Default)]
-struct Shared {
-    records: Arc<Mutex<Vec<WalRecord>>>,
-    durable: Arc<AtomicUsize>,
-    lineage: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
-    omit_lineage: bool,
+
+pub(super) fn setup_record(ceiling: Option<&str>) -> WalRecord {
+    let replacement = vec![text(Role::User, "head")];
+    WalRecord::CompactionMessage {
+        provider: "provider".into(),
+        kind: CompactionMessageKind::Setup,
+        compaction_id: "c".into(),
+        version: 1,
+        range: CompactionRange { from: 0, to: 0 },
+        sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+        replacement: Arc::new(replacement),
+        request_id: None,
+        cursor: None,
+        call_when: None,
+        stability: None,
+        ceiling: ceiling.map(|json| OpaqueJson::from_json_text(json).unwrap()),
+    }
+}
+
+/// Records the removed synchronous client wrote: Setup with frozen ranks, a step replacement
+/// with its request id and cursor, and the answer and wait records around it.
+fn synchronous_records() -> Vec<WalRecord> {
+    let head = vec![text(Role::User, "head")];
+    let summary = vec![text(Role::User, "summary")];
+    vec![
+        WalRecord::CompactionMessage {
+            provider: "provider".into(),
+            kind: CompactionMessageKind::Setup,
+            compaction_id: "c".into(),
+            version: 1,
+            range: CompactionRange { from: 0, to: 0 },
+            sha256: broca_wal::compaction_replacement_sha256(&head).unwrap(),
+            replacement: Arc::new(head),
+            request_id: None,
+            cursor: None,
+            call_when: Some(OpaqueJson::from_json_text(r#"{"default":0.8}"#).unwrap()),
+            // A rank past the replacement's end is never declared.
+            stability: Some(vec![
+                CompactionStabilityRank { index: 0, rank: 7 },
+                CompactionStabilityRank {
+                    index: 99,
+                    rank: 10,
+                },
+            ]),
+            ceiling: None,
+        },
+        WalRecord::CompactionRequest {
+            provider: "provider".into(),
+            request_id: "r".into(),
+        },
+        WalRecord::CompactionMessage {
+            provider: "provider".into(),
+            kind: CompactionMessageKind::Step,
+            compaction_id: "c".into(),
+            version: 2,
+            range: CompactionRange { from: 0, to: 3 },
+            sha256: broca_wal::compaction_replacement_sha256(&summary).unwrap(),
+            replacement: Arc::new(summary),
+            request_id: Some("r".into()),
+            cursor: Some(CompactionCursor {
+                lineage_id: "lineage".into(),
+                after_ordinal: Some(3),
+            }),
+            call_when: None,
+            stability: None,
+            ceiling: None,
+        },
+        WalRecord::CompactionAnswer {
+            provider: "provider".into(),
+            request_id: "late".into(),
+            cursor: CompactionCursor {
+                lineage_id: "lineage".into(),
+                after_ordinal: Some(3),
+            },
+            disposition: CompactionDisposition::Late,
+            rejected: None,
+            wait: None,
+        },
+    ]
+}
+
+/// A session the synchronous client compacted still renders what it rendered: the newest
+/// applied replacement in place of its range, the frozen ranks declared on it, and the raw tail
+/// after it. Folding its records through an admission checkpoint keeps every one of them.
+#[test]
+fn recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint() {
+    let mut captured = crate::AdmissionCheckpointV1::empty();
+    for (seq, record) in synchronous_records().iter().enumerate() {
+        captured.fold_record(seq as u64 + 1, record).unwrap();
+    }
+    let decoded =
+        crate::decode_admission_checkpoint(&crate::encode_admission_checkpoint(&captured).unwrap())
+            .unwrap();
+    assert_eq!(decoded, captured);
+    let state = decoded.compaction.as_ref().unwrap().state().unwrap();
+    assert_eq!(state.applied.as_ref().unwrap().version, 2);
+    assert!(state.call_when.is_some());
+    assert!(state.view.is_none());
+    let options = CallOptions::new(raw());
+    let view = model_options(&options, state).unwrap();
+    assert_eq!(view.prompt.len(), 3);
+    assert_eq!(view.prompt[0], options.prompt[0]);
+    assert_eq!(view.prompt[1].ordinal, None);
+    assert_eq!(view.prompt[1].content, text(Role::User, "summary").content);
+    assert_eq!(view.prompt[2].ordinal, Some(3));
+    assert_eq!(
+        view.declared_markers,
+        vec![broca_protocol::request::DeclaredMessageMarker {
+            message_index: 1,
+            rank: 7
+        }]
+    );
 }
 
 fn fixture_lineage_id() -> broca_wal::WalLineageId {
@@ -299,13 +253,31 @@ fn fixture_lineage_id() -> broca_wal::WalLineageId {
     })
 }
 
+#[derive(Clone, Default)]
+pub(super) struct Shared {
+    records: Arc<Mutex<Vec<WalRecord>>>,
+    durable: Arc<AtomicUsize>,
+    lineage: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
+}
+
 impl Shared {
+    /// A WAL already holding `records`, with the identity the first append minted.
+    pub(super) fn with_records(records: Vec<WalRecord>) -> Self {
+        let shared = Self::default();
+        *shared.records.lock().unwrap() = records;
+        *shared.lineage.lock().unwrap() = Some(fixture_lineage_id());
+        shared
+    }
+    pub(super) fn records(&self) -> Vec<WalRecord> {
+        self.records.lock().unwrap().clone()
+    }
+    /// How many records were durable at the last sync.
+    pub(super) fn durable(&self) -> usize {
+        self.durable.load(Ordering::SeqCst)
+    }
     fn frames(&self) -> Vec<FramedRecord> {
-        self.records
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
+        self.records()
+            .into_iter()
             .enumerate()
             .map(|(i, record)| FramedRecord {
                 seq: i as u64 + 1,
@@ -314,7 +286,7 @@ impl Shared {
             })
             .collect()
     }
-    fn writer(&self) -> crate::WalHandle {
+    pub(super) fn writer(&self) -> crate::WalHandle {
         crate::WalHandle::spawn(Box::new(self.clone()), 1).unwrap()
     }
 }
@@ -322,13 +294,11 @@ impl Wal for Shared {
     fn append(&mut self, _: u64, record: &WalRecord, _: bool) -> Result<u64, WalError> {
         let mut records = self.records.lock().unwrap();
         records.push(record.clone());
-        if !self.omit_lineage {
-            // Mirror FileWal's legacy upgrade: identity appears only after an append.
-            self.lineage
-                .lock()
-                .unwrap()
-                .get_or_insert_with(fixture_lineage_id);
-        }
+        // Like FileWal's legacy upgrade, the identity appears only after an append.
+        self.lineage
+            .lock()
+            .unwrap()
+            .get_or_insert_with(fixture_lineage_id);
         Ok(records.len() as u64)
     }
     fn sync(&self) -> Result<(), WalError> {
@@ -361,25 +331,10 @@ impl crate::WalStore for Shared {
         Ok(self.frames())
     }
 }
+
 struct Scripted {
-    setup: Value,
-    steps: Mutex<std::collections::VecDeque<Value>>,
+    answer: Value,
     setups: AtomicUsize,
-    setup_requests: Mutex<Vec<SetupRequest>>,
-    statuses: Mutex<Vec<StepStatus>>,
-    shared: Shared,
-}
-impl Scripted {
-    fn new(shared: &Shared, setup: Value, steps: Vec<Value>) -> Arc<Self> {
-        Arc::new(Self {
-            setup,
-            steps: Mutex::new(steps.into()),
-            setups: AtomicUsize::new(0),
-            setup_requests: Mutex::new(Vec::new()),
-            statuses: Mutex::new(Vec::new()),
-            shared: shared.clone(),
-        })
-    }
 }
 #[async_trait::async_trait]
 impl CompactionPlane for Scripted {
@@ -390,42 +345,8 @@ impl CompactionPlane for Scripted {
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         self.setups.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(request.harness, "caller");
-        self.setup_requests.lock().unwrap().push(request.clone());
-        let mut value = self.setup.clone();
+        let mut value = self.answer.clone();
         value["request_id"] = request.request_id.into();
-        if value["answer"] == "never" {
-            return std::future::pending().await;
-        }
-        serde_json::from_value(value).map_err(|_| CompactionUnavailable)
-    }
-    async fn step(
-        &self,
-        _: &str,
-        _: &BindIdentity,
-        status: StepStatus,
-    ) -> Result<StepAnswer, CompactionUnavailable> {
-        {
-            let records = self.shared.records.lock().unwrap();
-            assert_eq!(
-                self.shared.durable.load(Ordering::SeqCst),
-                records.len(),
-                "issued request is durable before route call"
-            );
-            assert!(
-                matches!(records.last(), Some(WalRecord::CompactionRequest { request_id, .. }) if request_id == &status.request_id)
-            );
-        }
-        self.statuses.lock().unwrap().push(status.clone());
-        let mut value = self
-            .steps
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| json!({"answer":"noop"}));
-        if value.get("request_id").is_none() {
-            value["request_id"] = status.request_id.into();
-        }
         if value["answer"] == "never" {
             return std::future::pending().await;
         }
@@ -433,184 +354,52 @@ impl CompactionPlane for Scripted {
     }
 }
 fn ready() -> Value {
-    json!({"answer":"ready","initial":{"compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[{"role":"user","content":[{"type":"text","text":"head"}]}]},"stability":[{"index":0,"rank":7}]})
+    json!({"answer":"ready","initial":{"compaction_id":"c","version":1,"range":{"from":0,"to":0},
+        "replacement":[{"role":"user","content":[{"type":"text","text":"head"}]}]}})
 }
-fn bind() -> BindIdentity {
+pub(super) fn bind() -> BindIdentity {
     BindIdentity::new(std::path::PathBuf::from("/project"), "caller", "session")
 }
-fn status() -> StepStatus {
-    StepStatus::new(
-        "session",
-        "caller",
-        "",
-        "lineage",
-        "1",
-        "user_turn",
-        "model",
-        Estimate::new(1),
-        1,
-    )
-    .with_model_details(None, Some(1000), None)
-}
-
-#[test]
-fn broca_step_status_keeps_its_pre_lane_wire_bytes() {
-    let mut status = status();
-    status.request_id = "lineage:compaction:4".into();
-    let mut messages = vec![text(Role::User, "hello")];
-    broca_protocol::content::stamp_ordinals(&mut messages);
-    CompactionState::default().fill_status(&mut status, &messages);
-
-    // Broca does not meet both Claude Code admission conditions: attested `reserved:thalamus`
-    // identity and a plan-declared capability. Its status must serialize to the exact bytes
-    // asserted below, without the new optional members.
-    // Keep `geometry`, `output_reserve`, `mid_turn`, `fill`, `channel2_delivered_id`,
-    // `channel2_receipt`, and `raw_message` absent.
-    assert_eq!(
-        serde_json::to_vec(&status).unwrap(),
-        br#"{"session":"session","harness":"caller","request_id":"lineage:compaction:4","lineage_id":"lineage","step_id":"1","step_kind":"user_turn","model":"model","context_window":1000,"estimate":{"request_tokens":1},"newest":{"ordinal":0,"mid":"m0"},"messages":[{"ordinal":0,"mid":"m0","message":{"content":[{"text":"hello","type":"text"}],"role":"user"}}],"now":1}"#
-    );
-}
-
-#[tokio::test]
-async fn claude_code_answer_fields_decode_but_do_not_change_broca_apply_or_wal() {
-    let replacement = json!([{"role":"user","content":[{"type":"text","text":"summary"}]}]);
-    let plain = json!({"answer":"compaction_message","compaction":{
-        "compaction_id":"c","version":2,"range":{"from":0,"to":0},
-        "replacement":replacement
-    }});
-    let digest = "a".repeat(64);
-    let view = json!({
-        "view_id":"view-2","version":2,"byte_length":17,"sha256":digest,
-    });
-    let mut with_lane_fields = plain.clone();
-    with_lane_fields["coverage"] = json!({
-        "end_mid":"m0","ordinal":0,
-        "endpoint":{"message_id":"m0","part_index":0}
-    });
-    with_lane_fields["compaction"]["raw_view"] = json!({
-        "view_id":"view-2","version":2,"byte_length":17,"sha256":digest,
-        "profile":"profile","profile_generation":"profile-generation",
-        "provider_generation":"provider-generation","lineage_id":"lineage",
-        "endpoint":{"message_id":"m0","part_index":0},
-        "payload":{"kind":"reference","view":view}
-    });
-    with_lane_fields["channel2_directive"] = json!({
-        "directive_id":"notice-1","text":"notice","armed_at_ms":10
-    });
-    with_lane_fields["request_id"] = json!("r");
-
-    match serde_json::from_value::<StepAnswer>(with_lane_fields.clone()).unwrap() {
-        StepAnswer::CompactionMessage {
-            compaction,
-            coverage: Some(coverage),
-            channel2_directive: Some(directive),
-            ..
-        } => {
-            assert_eq!(coverage.end_mid, "m0");
-            let endpoint = coverage.endpoint.as_ref().expect("typed coverage endpoint");
-            assert_eq!(
-                (endpoint.message_id.as_str(), endpoint.part_index),
-                ("m0", 0)
-            );
-            assert_eq!(
-                compaction
-                    .raw_view
-                    .as_ref()
-                    .expect("frozen view reference")
-                    .view
-                    .sha256,
-                digest
-            );
-            assert_eq!(directive.directive_id, "notice-1");
-        }
-        answer => panic!("unexpected answer: {answer:?}"),
-    }
-
-    async fn apply(mut answer: Value) -> Vec<WalRecord> {
-        answer.as_object_mut().unwrap().remove("request_id");
-        let shared = Shared::default();
-        let writer = shared.writer();
-        let control = crate::RunControl::default();
-        let bind = bind();
-        let scripted = Scripted::new(&shared, ready(), vec![answer]);
-        let plane: Arc<dyn CompactionPlane> = scripted;
-        let replies = runtime::CompactionReplies::new();
-        let runtime = runtime::Runtime {
-            provider: "provider",
-            bind: &bind,
-            plane: Some(&plane),
-            inbox: None,
-            writer: &writer,
-            control: &control,
-            replies: &replies,
-        };
-        let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-        assert!(matches!(
-            runtime
-                .step(&mut state, status(), &raw(), Some(10), None)
-                .await
-                .unwrap(),
-            runtime::StepResult::Continue
-        ));
-        let records = shared.records.lock().unwrap().clone();
-        let _ = writer.shutdown().await;
-        records
-    }
-
-    let plain_records = apply(plain).await;
-    let lane_records = apply(with_lane_fields).await;
-    let applied_replacement = |records: &[WalRecord]| {
-        records
-            .iter()
-            .find_map(|record| match record {
-                WalRecord::CompactionMessage {
-                    kind: CompactionMessageKind::Step,
-                    replacement,
-                    ..
-                } => Some((**replacement).clone()),
-                _ => None,
-            })
-            .expect("the step answer was applied")
-    };
-    assert_eq!(
-        applied_replacement(&plain_records),
-        applied_replacement(&lane_records)
-    );
-    assert_eq!(plain_records, lane_records);
-}
-
-fn setup() -> SetupRequest {
+fn setup_request() -> SetupRequest {
     SetupRequest::new("session", "caller", "setup", Map::new(), "model", 1)
 }
-fn applied_record(kind: CompactionMessageKind, request: Option<&str>) -> WalRecord {
-    let replacement = vec![text(Role::User, "head")];
-    WalRecord::CompactionMessage {
-        provider: "provider".into(),
-        kind,
-        compaction_id: "c".into(),
-        version: if kind == CompactionMessageKind::Setup {
-            1
-        } else {
-            2
-        },
-        range: CompactionRange { from: 0, to: 0 },
-        sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
-        replacement: Arc::new(replacement),
-        request_id: request.map(str::to_owned),
-        cursor: request.map(|_| CompactionCursor {
-            lineage_id: "lineage".into(),
-            after_ordinal: Some(3),
-        }),
-        call_when: None,
-        stability: Some(vec![CompactionStabilityRank { index: 0, rank: 7 }]),
-    }
+
+async fn run_setup(
+    answer: Value,
+) -> (
+    Result<CompactionState, Box<broca_protocol::ProviderError>>,
+    Vec<WalRecord>,
+) {
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let control = crate::RunControl::default();
+    let bind = bind();
+    let plane: Arc<dyn CompactionPlane> = Arc::new(Scripted {
+        answer,
+        setups: AtomicUsize::new(0),
+    });
+    let runtime = runtime::Runtime {
+        provider: "provider",
+        bind: &bind,
+        plane: Some(&plane),
+        writer: &writer,
+        control: &control,
+    };
+    let outcome = runtime.setup(setup_request(), &raw()).await;
+    let _ = writer.shutdown().await;
+    (outcome, shared.records())
 }
+
+/// A failed, timed-out or unrenderable Setup is `compaction_unavailable`; a refusal carries the
+/// provider's role code and, beside it, its finer code. Neither records anything, so the next
+/// send calls Setup again.
 #[tokio::test]
-async fn setup_failures_timeout_refuse_and_oversize_write_no_setup() {
+async fn setup_failures_and_refusals_record_nothing() {
     let mut oversized = ready();
     oversized["initial"]["replacement"][0]["content"][0]["text"] =
         "x".repeat(MAX_REPLACEMENT_BYTES).into();
+    let mut bad_ceiling = ready();
+    bad_ceiling["ceiling"] = json!({"at_share": 1.5, "wait_ms": 1000});
     for (reply, code, provider_code) in [
         (
             json!({"answer":"unknown"}),
@@ -623,6 +412,7 @@ async fn setup_failures_timeout_refuse_and_oversize_write_no_setup() {
             Some("compaction_unavailable"),
         ),
         (oversized, None, Some("compaction_unavailable")),
+        (bad_ceiling, None, Some("compaction_unavailable")),
         (
             json!({"answer":"refuse","code":"window_too_small","reason":"small","provider_code":"finer"}),
             Some("window_too_small"),
@@ -634,22 +424,8 @@ async fn setup_failures_timeout_refuse_and_oversize_write_no_setup() {
             None,
         ),
     ] {
-        let shared = Shared::default();
-        let writer = shared.writer();
-        let control = crate::RunControl::default();
-        let bind = bind();
-        let scripted = Scripted::new(&shared, reply, vec![]);
-        let plane: Arc<dyn CompactionPlane> = scripted;
-        let runtime = runtime::Runtime {
-            provider: "provider",
-            bind: &bind,
-            plane: Some(&plane),
-            inbox: None,
-            writer: &writer,
-            control: &control,
-            replies: &runtime::CompactionReplies::new(),
-        };
-        let error = runtime.setup(setup(), &raw()).await.unwrap_err();
+        let (outcome, records) = run_setup(reply).await;
+        let error = outcome.unwrap_err();
         assert_eq!(error.provider_code.as_deref(), code.or(provider_code));
         assert_eq!(
             error
@@ -658,298 +434,55 @@ async fn setup_failures_timeout_refuse_and_oversize_write_no_setup() {
                 .and_then(|refusal| refusal.provider_detail_code.as_deref()),
             code.and(provider_code)
         );
-        assert!(shared.frames().is_empty());
-        let _ = writer.shutdown().await;
+        assert!(records.is_empty());
     }
-}
-#[tokio::test]
-async fn every_step_outcome_records_atomic_cursor_and_rejection() {
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let control = crate::RunControl::default();
-    let bind = bind();
-    let invalid = compaction(vec![encoded(&text(Role::System, "bad"))]);
-    let scripted = Scripted::new(
-        &shared,
-        ready(),
-        vec![
-            json!({"answer":"noop"}),
-            json!({"answer":"unknown"}),
-            json!({"answer":"never"}),
-            json!({"answer":"compaction_message","compaction":invalid}),
-            json!({"answer":"noop","request_id":"superseded"}),
-        ],
-    );
-    let plane: Arc<dyn CompactionPlane> = scripted.clone();
-    let runtime = runtime::Runtime {
-        provider: "provider",
-        bind: &bind,
-        plane: Some(&plane),
-        inbox: None,
-        writer: &writer,
-        control: &control,
-        replies: &runtime::CompactionReplies::new(),
-    };
-    let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-    for expected in [
-        CompactionDisposition::Noop,
-        CompactionDisposition::FailedCall,
-        CompactionDisposition::Timeout,
-        CompactionDisposition::Structural,
-        CompactionDisposition::SupersededRequest,
-    ] {
-        runtime
-            .step(&mut state, status(), &raw(), Some(10), None)
-            .await
-            .unwrap();
-        let records = shared.records.lock().unwrap();
-        assert!(
-            matches!(records.last(), Some(WalRecord::CompactionAnswer { disposition, cursor, .. }) if *disposition == expected && cursor.after_ordinal == Some(3))
-        );
-        assert_eq!(shared.durable.load(Ordering::SeqCst), records.len());
-    }
-    let mut next = status();
-    state.fill_status(&mut next, &raw());
-    assert_eq!(next.last_not_applied.unwrap().reason, "structural");
-    assert_eq!(next.after_ordinal, Some(3));
-    assert!(next.messages.is_empty());
-    let _ = writer.shutdown().await;
-}
-#[test]
-fn checkpoint_has_three_states_and_absent_never_folds_from_tail() {
-    let mut checkpoint = crate::AdmissionCheckpointV1::empty();
-    assert_eq!(checkpoint.compaction, Some(CompactionCheckpoint::None));
-    checkpoint.compaction = None;
-    checkpoint
-        .fold_record(1, &applied_record(CompactionMessageKind::Setup, None))
-        .unwrap();
-    assert!(checkpoint.compaction.is_none());
-    let bytes = crate::encode_admission_checkpoint(&checkpoint).unwrap();
-    assert!(!bytes.contains("\"compaction\":"));
-    let mut captured = crate::AdmissionCheckpointV1::empty();
-    captured
-        .fold_record(1, &applied_record(CompactionMessageKind::Setup, None))
-        .unwrap();
-    captured
-        .fold_record(2, &applied_record(CompactionMessageKind::Step, Some("r")))
-        .unwrap();
-    let decoded =
-        crate::decode_admission_checkpoint(&crate::encode_admission_checkpoint(&captured).unwrap())
-            .unwrap();
-    assert_eq!(decoded, captured);
-    let state = decoded.compaction.as_ref().unwrap().state().unwrap();
-    assert_eq!(state.applied.as_ref().unwrap().version, 2);
-    assert_eq!(state.cursor.as_ref().unwrap().after_ordinal, Some(3));
-}
-#[test]
-fn render_slices_stamped_tail_and_declares_frozen_ranks_without_decorating_replacement() {
-    let mut state = CompactionState::default();
-    state.fold(&applied_record(CompactionMessageKind::Setup, None));
-    state.applied.as_mut().unwrap().range = CompactionRange { from: 0, to: 3 };
-    state.stability.push(CompactionStabilityRank {
-        index: 99,
-        rank: 10,
-    });
-    let options = CallOptions::new(raw());
-    let view = model_options(&options, &state);
-    assert_eq!(view.prompt.len(), 3);
-    assert_eq!(view.prompt[0], options.prompt[0]);
-    assert_eq!(view.prompt[1].ordinal, None);
-    assert_eq!(view.prompt[2].ordinal, Some(3));
-    assert_eq!(
-        view.prompt[1].content,
-        vec![ContentBlock::Text {
-            text: "head".into()
-        }]
-    );
-    assert_eq!(
-        view.declared_markers,
-        vec![broca_protocol::request::DeclaredMessageMarker {
-            message_index: 1,
-            rank: 7
-        }]
-    );
-    let before = crate::canonical_request_bytes(&view);
-    let mut without = view.clone();
-    without.declared_markers.clear();
-    assert_eq!(before, crate::canonical_request_bytes(&without));
 }
 
+/// A ready Setup records its initial message and its ceiling verbatim, durable before Setup
+/// returns, behind the asynchronous compaction feature when a ceiling is present.
 #[tokio::test]
-async fn wait_bound_and_ready_recall_with_fresh_status_and_close_wait() {
-    for ready_hint in [false, true] {
-        let shared = Shared::default();
-        let writer = shared.writer();
-        let bind = bind();
-        let inbox = Arc::new(CompactionInbox::default());
-        let control = crate::RunControl::default();
-        let scripted = Scripted::new(
-            &shared,
-            ready(),
-            vec![
-                json!({"answer":"wait","reason":"work","bound_ms":10}),
-                json!({"answer":"noop"}),
-            ],
-        );
-        let plane: Arc<dyn CompactionPlane> = scripted.clone();
-        let runtime = runtime::Runtime {
-            provider: "provider",
-            bind: &bind,
-            plane: Some(&plane),
-            inbox: Some(&inbox),
-            writer: &writer,
-            control: &control,
-            replies: &runtime::CompactionReplies::new(),
-        };
-        let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-        let wake = async {
-            if ready_hint {
-                // Observe the durable wait, not a proxy "waiting" flag.
-                loop {
-                    if let Some(WalRecord::CompactionAnswer {
-                        request_id,
-                        disposition: CompactionDisposition::Wait,
-                        ..
-                    }) = shared.records.lock().unwrap().last().cloned()
-                    {
-                        let request = crate::compaction_provider::ready::CompactionReady::new(
-                            "session", request_id,
-                        );
-                        assert_eq!(
-                            inbox.ready("stranger", Some("provider"), &request),
-                            Err("not_session_compaction_provider")
-                        );
-                        inbox.ready("provider", Some("provider"), &request).unwrap();
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-        };
-        let raw = raw();
-        let (result, _) = tokio::join!(
-            runtime.step(&mut state, status(), &raw, Some(10), None),
-            wake
-        );
-        assert!(matches!(result.unwrap(), runtime::StepResult::Continue));
-        let statuses = scripted.statuses.lock().unwrap().clone();
-        assert_eq!(statuses.len(), 2);
-        assert_ne!(statuses[0].request_id, statuses[1].request_id);
-        assert_eq!(statuses[1].after_ordinal, Some(3));
-        let exit = if ready_hint {
-            CompactionWaitExit::Ready
-        } else {
-            CompactionWaitExit::Bound
-        };
-        assert!(shared.frames().iter().any(|frame| matches!(frame.record, WalRecord::CompactionWait { exited, .. } if exited == exit)));
-        assert!(state.open_wait.is_none());
-        let _ = writer.shutdown().await;
-    }
-}
-#[tokio::test]
-async fn wait_cap_sends_only_below_margin_and_fails_closed_otherwise() {
-    for (estimate, window, expected) in [
-        (Some(899), Some(1000), CompactionWaitExit::Cap),
-        (Some(900), Some(1000), CompactionWaitExit::Exceeded),
-        (Some(950), Some(1000), CompactionWaitExit::Exceeded),
-        (None, Some(1000), CompactionWaitExit::Exceeded),
-        (Some(10), None, CompactionWaitExit::Exceeded),
-    ] {
-        let shared = Shared::default();
-        let writer = shared.writer();
-        let control = crate::RunControl::default();
-        let bind = bind();
-        let scripted = Scripted::new(
-            &shared,
-            ready(),
-            vec![json!({"answer":"wait","reason":"work","bound_ms":60000})],
-        );
-        let plane: Arc<dyn CompactionPlane> = scripted;
-        let runtime = runtime::Runtime {
-            provider: "provider",
-            bind: &bind,
-            plane: Some(&plane),
-            inbox: None,
-            writer: &writer,
-            control: &control,
-            replies: &runtime::CompactionReplies::new(),
-        };
-        let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-        let mut status = status();
-        status.context_window = window;
-        let result = runtime
-            .step(
-                &mut state,
-                status,
-                &raw(),
-                estimate,
-                Some(crate::CacheClockReading {
-                    last_sent_at_ms: now(),
-                    ttl_ms: Some(1),
-                    prefix_tokens: None,
-                }),
-            )
-            .await
-            .unwrap();
-        match result {
-            runtime::StepResult::Continue => assert_eq!(expected, CompactionWaitExit::Cap),
-            runtime::StepResult::Terminal(reason, error) => {
-                assert_eq!(expected, CompactionWaitExit::Exceeded);
-                assert_eq!(reason, RunFinishReason::Error);
-                assert_eq!(
-                    error.unwrap().provider_code.as_deref(),
-                    Some("compaction_wait_exceeded")
-                );
-            }
-        }
-        assert!(
-            matches!(shared.records.lock().unwrap().last(), Some(WalRecord::CompactionWait { exited, .. }) if *exited == expected)
-        );
-        let _ = writer.shutdown().await;
-    }
-}
-#[test]
-fn inbox_accepts_only_frozen_provider_and_current_request() {
-    let inbox = CompactionInbox::default();
-    inbox.issue("new");
-    let old = crate::compaction_provider::ready::CompactionReady::new("s", "old");
+async fn setup_records_its_initial_message_and_ceiling() {
+    let mut answer = ready();
+    answer["ceiling"] = json!({"at_share": 0.8, "on_overflow": true, "wait_ms": 1000});
+    let (outcome, records) = run_setup(answer).await;
+    let state = outcome.unwrap();
+    assert_eq!(records.len(), 1);
     assert_eq!(
-        inbox.ready("foreign", Some("provider"), &old),
-        Err("not_session_compaction_provider")
+        records[0].required_features(),
+        &[
+            broca_wal::framing::COMPACTION_VIEW_FEATURE,
+            broca_wal::framing::COMPACTION_FEATURE
+        ]
     );
-    inbox.ready("provider", Some("provider"), &old).unwrap();
-    let current = crate::compaction_provider::ready::CompactionReady::new("s", "new");
+    let policy = view::ceiling_policy(&state).unwrap();
+    assert_eq!(policy.wait_ms, 1000);
+    assert!(policy.on_overflow);
+    let mut refolded = CompactionCheckpoint::None;
+    refolded.fold(&records[0]);
+    assert_eq!(refolded.state().unwrap().ceiling, state.ceiling);
+    // Without a ceiling the record is the one the synchronous client wrote.
+    let (_, records) = run_setup(ready()).await;
     assert_eq!(
-        inbox.ready("provider", None, &current),
-        Err("not_session_compaction_provider")
+        records[0].required_features(),
+        &[broca_wal::framing::COMPACTION_FEATURE]
     );
 }
+
+/// A wait the synchronous client left open when the process stopped is sealed without calling
+/// any provider: a recorded terminal intent ends the run with it, and an open wait with none
+/// ends `interrupted`, recorded once.
 #[tokio::test]
-async fn terminal_wait_intents_recover_without_provider_call_and_survive_second_cut() {
+async fn recorded_waits_are_sealed_without_a_provider() {
     for exited in [
         None,
         Some(CompactionWaitExit::Cancel),
         Some(CompactionWaitExit::Stopped),
-        Some(CompactionWaitExit::Interrupted),
         Some(CompactionWaitExit::Exceeded),
     ] {
         let shared = Shared::default();
         let writer = shared.writer();
-        let bind = bind();
-        let control = crate::RunControl::default();
-        let scripted = Scripted::new(&shared, ready(), vec![]);
-        let plane: Arc<dyn CompactionPlane> = scripted.clone();
-        let runtime = runtime::Runtime {
-            provider: "provider",
-            bind: &bind,
-            plane: Some(&plane),
-            inbox: None,
-            writer: &writer,
-            control: &control,
-            replies: &runtime::CompactionReplies::new(),
-        };
         let mut state = CompactionState::default();
-        state.fold(&applied_record(CompactionMessageKind::Setup, None));
+        state.fold(&setup_record(None));
         state.fold(&WalRecord::CompactionAnswer {
             provider: "provider".into(),
             request_id: "r".into(),
@@ -976,13 +509,12 @@ async fn terminal_wait_intents_recover_without_provider_call_and_survive_second_
             _ => RunFinishReason::Interrupted,
         };
         for _ in 0..2 {
-            assert!(
-                matches!(runtime.recover_wait(&mut state).await.unwrap(), Some(runtime::StepResult::Terminal(reason, _)) if reason == expected)
-            );
+            let sealed = runtime::seal_recorded_wait(&writer, &mut state)
+                .await
+                .unwrap();
+            assert!(matches!(sealed, Some(runtime::Terminal(reason, _)) if reason == expected));
         }
-        assert_eq!(scripted.setups.load(Ordering::SeqCst), 0);
-        assert!(scripted.statuses.lock().unwrap().is_empty());
-        assert_eq!(shared.frames().len(), usize::from(exited.is_none()));
+        assert_eq!(shared.records().len(), usize::from(exited.is_none()));
         state.fold(&WalRecord::RunFinished {
             ts_ms: None,
             reason: expected,
@@ -994,10 +526,27 @@ async fn terminal_wait_intents_recover_without_provider_call_and_survive_second_
         let _ = writer.shutdown().await;
     }
 }
+
+/// The replacement ceiling is broca's own, independent of configuration: an initial message
+/// of 8 MiB is refused.
+#[test]
+fn replacement_ceiling_is_eight_mib_independent_of_configuration() {
+    // The fixture must not derive its boundary from the implementation's constant:
+    // increasing that constant must make the real validator accept this oversized input.
+    let message = initial(
+        Range::new(0, 0),
+        vec![encoded(&text(Role::User, &"x".repeat(8 * 1024 * 1024)))],
+    );
+    refused(message, &raw());
+}
+
+/// A model page folds the captured compaction state with the WAL tail after it, renders the
+/// newest replacement (here one the synchronous client recorded) in place of its range, and
+/// refuses an `after_mid` cursor before reading anything.
 #[test]
 fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
     let mut captured = CompactionCheckpoint::None;
-    captured.fold(&applied_record(CompactionMessageKind::Setup, None));
+    captured.fold(&setup_record(None));
     let raw = raw();
     let snapshot = crate::StorePageSnapshot {
         prefix_len: raw.len() as u64,
@@ -1015,15 +564,13 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
         lineage_id: Some("lineage".into()),
         ..crate::StorePageSnapshot::empty()
     };
-    let mut update = applied_record(CompactionMessageKind::Step, Some("r"));
+    let mut update = synchronous_records().remove(2);
     if let WalRecord::CompactionMessage {
-        range,
         replacement,
         sha256,
         ..
     } = &mut update
     {
-        *range = CompactionRange { from: 0, to: 3 };
         *replacement = Arc::new(vec![text(Role::User, "new view")]);
         *sha256 = broca_wal::compaction_replacement_sha256(replacement).unwrap();
     }
@@ -1044,9 +591,7 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
     assert_eq!(page.messages.len(), 2);
     assert_eq!(
         page.messages[0].message.content,
-        vec![ContentBlock::Text {
-            text: "new view".into()
-        }]
+        text(Role::User, "new view").content
     );
     assert_eq!(page.messages[0].source["kind"], "replacement");
     assert_eq!(page.messages[1].source["ordinal"], 3);
@@ -1061,12 +606,31 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
         Err(crate::ModelPageError::InvalidParams { field: "view" })
     );
 }
+
 fn manifest() -> Arc<broca_wal::PlanManifest> {
-    Arc::new(broca_wal::PlanManifest { plan: OpaqueJson::from_json_text(json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{}}).to_string()).unwrap(),
-        plan_identity: "id".into(), composition_digest: "digest".into(), tools: Arc::new(vec![]), system_text: String::new(), system_digest: String::new(), join_version: 1, role_versions: Default::default(), fetches: vec![], declarations: vec![] })
+    Arc::new(broca_wal::PlanManifest {
+        plan: OpaqueJson::from_json_text(
+            json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{}})
+                .to_string(),
+        )
+        .unwrap(),
+        plan_identity: "id".into(),
+        composition_digest: "digest".into(),
+        tools: Arc::new(vec![]),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![],
+    })
 }
 fn request() -> crate::RunRequest {
-    let submission: broca_protocol::request::SubmissionRequest = serde_json::from_value(json!({"model":{"provider_module_id":"stub","model_id":"model"},"input":[{"role":"user","content":[{"type":"text","text":"user"}]}]})).unwrap();
+    let submission: broca_protocol::request::SubmissionRequest = serde_json::from_value(json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[{"role":"user","content":[{"type":"text","text":"user"}]}]
+    }))
+    .unwrap();
     crate::RunRequest::from_submission(
         submission,
         broca_protocol::RunId("run".into()),
@@ -1092,399 +656,23 @@ fn model_events() -> Vec<broca_protocol::NormalizedEvent> {
         }),
     ]
 }
-#[tokio::test]
-async fn engine_setup_once_and_durable_apply_cut_resume_make_no_compaction_calls() {
-    let shared = Shared::default();
-    let writer = shared.writer();
-    assert_eq!(
-        writer.lineage_id(),
-        None,
-        "legacy identity has not been minted yet"
-    );
-    let applied = json!({"answer":"compaction_message","compaction":{"compaction_id":"c","version":2,"range":{"from":0,"to":0},"replacement":[{"role":"user","content":[{"type":"text","text":"applied head"}]}]}});
-    let scripted = Scripted::new(&shared, ready(), vec![applied]);
-    let model = crate::StubProvider::new(vec![model_events()]);
-    let (out, _events) = tokio::sync::mpsc::channel(128);
-    let control = crate::RunControl {
-        manifest: Some(manifest()),
-        compaction_plane: Some(scripted.clone()),
-        ..Default::default()
-    };
-    let summary = crate::run_loop_on_writer(
-        request(),
-        &writer,
-        crate::StartMode::FreshOrResume,
-        &model,
-        &crate::StubToolPlane::new(),
-        &crate::AllowAll,
-        &shared,
-        None,
-        control,
-        &out,
-    )
-    .await
-    .unwrap();
-    assert_eq!(summary.reason, RunFinishReason::Completed);
-    assert_eq!(scripted.setups.load(Ordering::SeqCst), 1);
-    let lineage_id = writer.lineage_id().unwrap().to_string();
-    let setup_request = scripted.setup_requests.lock().unwrap()[0].clone();
-    assert_eq!(
-        setup_request.lineage_id.as_deref(),
-        Some(lineage_id.as_str())
-    );
-    assert!(setup_request
-        .request_id
-        .starts_with(&format!("{lineage_id}:setup:")));
-    assert_eq!(scripted.statuses.lock().unwrap()[0].lineage_id, lineage_id);
-    assert_eq!(
-        model.calls()[0].render_episodes.compaction_prefix_len,
-        Some(1)
-    );
-    assert_eq!(
-        model.calls()[0].prompt[0].content,
-        vec![ContentBlock::Text {
-            text: "applied head".into()
-        }]
-    );
-    let records = shared.records.lock().unwrap().clone();
-    let _ = writer.shutdown().await;
-    let cut = records
-        .iter()
-        .position(|record| {
-            matches!(
-                record,
-                WalRecord::CompactionMessage {
-                    kind: CompactionMessageKind::Step,
-                    ..
-                }
-            )
-        })
-        .unwrap()
-        + 1;
-    assert!(
-        matches!(&records[cut - 1], WalRecord::CompactionMessage { cursor: Some(cursor), version: 2, .. } if cursor.after_ordinal == Some(0))
-    );
-    let resumed = Shared {
-        records: Arc::new(Mutex::new(records[..cut].to_vec())),
-        ..Default::default()
-    };
-    let writer = resumed.writer();
-    let scripted = Scripted::new(&resumed, ready(), vec![]);
-    let model2 = crate::StubProvider::new(vec![model_events()]);
-    let control = crate::RunControl {
-        compaction_plane: Some(scripted.clone()),
-        ..Default::default()
-    };
-    crate::run_loop_on_writer(
-        request(),
-        &writer,
-        crate::StartMode::FreshOrResume,
-        &model2,
-        &crate::StubToolPlane::new(),
-        &crate::AllowAll,
-        &resumed,
-        None,
-        control,
-        &out,
-    )
-    .await
-    .unwrap();
-    assert_eq!(scripted.setups.load(Ordering::SeqCst), 0);
-    assert!(scripted.statuses.lock().unwrap().is_empty());
-    assert_eq!(
-        model2.calls()[0].render_episodes.compaction_prefix_len,
-        Some(1)
-    );
-    assert_eq!(
-        crate::canonical_request_bytes(&model.calls()[0]),
-        crate::canonical_request_bytes(&model2.calls()[0])
-    );
-    let _ = writer.shutdown().await;
-}
 
-#[tokio::test]
-async fn engine_missing_lineage_refuses_before_compaction_or_model_calls() {
-    let shared = Shared {
-        omit_lineage: true,
-        ..Default::default()
-    };
-    let writer = shared.writer();
-    let scripted = Scripted::new(&shared, ready(), vec![]);
-    let model = crate::StubProvider::new(vec![model_events()]);
-    let (out, _events) = tokio::sync::mpsc::channel(128);
-    let control = crate::RunControl {
-        manifest: Some(manifest()),
-        compaction_plane: Some(scripted.clone()),
-        ..Default::default()
-    };
-    let error = crate::run_loop_on_writer(
-        request(),
-        &writer,
-        crate::StartMode::FreshOrResume,
-        &model,
-        &crate::StubToolPlane::new(),
-        &crate::AllowAll,
-        &shared,
-        None,
-        control,
-        &out,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::RunError::Wal(ref reason)
-            if reason == "compaction requires a WAL lineage id after the durable StepStarted barrier"
-    ));
-    assert_eq!(writer.lineage_id(), None);
-    assert_eq!(scripted.setups.load(Ordering::SeqCst), 0);
-    assert!(scripted.statuses.lock().unwrap().is_empty());
-    assert!(model.calls().is_empty());
-    assert!(
-        !shared.records.lock().unwrap().iter().any(|record| matches!(
-            record,
-            WalRecord::CompactionRequest { .. }
-                | WalRecord::CompactionMessage { .. }
-                | WalRecord::CompactionAnswer { .. }
-        ))
-    );
-    let _ = writer.shutdown().await;
-}
-
-#[tokio::test]
-async fn engine_legacy_auth_resume_mints_lineage_before_setup_and_step() {
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let model = crate::StubProvider::new(vec![model_events()]);
-    let (out, _events) = tokio::sync::mpsc::channel(128);
-    let mut pause = super::runtime::error(None, "needs reauthentication", None, false);
-    pause.class = broca_protocol::ErrorClass::Auth;
-    let summary = crate::run_loop_on_writer(
-        request(),
-        &writer,
-        crate::StartMode::FreshOrResume,
-        &model,
-        &crate::StubToolPlane::new(),
-        &crate::AllowAll,
-        &shared,
-        None,
-        crate::RunControl {
-            manifest: Some(manifest()),
-            pause_for_auth_at_start: Some(pause),
-            ..Default::default()
-        },
-        &out,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        summary.paused,
-        Some(broca_protocol::PauseReason::AuthRequired)
-    );
-    assert!(model.calls().is_empty());
-    let _ = writer.shutdown().await;
-
-    // A legacy file retains the paused records but has no lineage header. Resolving auth
-    // without refreezing config writes no resume record, so StepStarted must mint the id.
-    let legacy = Shared {
-        records: Arc::new(Mutex::new(shared.records.lock().unwrap().clone())),
-        ..Default::default()
-    };
-    let writer = legacy.writer();
-    assert_eq!(writer.lineage_id(), None);
-    let scripted = Scripted::new(&legacy, ready(), vec![]);
-    let summary = crate::run_loop_on_writer(
-        request(),
-        &writer,
-        crate::StartMode::ResumeAfterAuth,
-        &model,
-        &crate::StubToolPlane::new(),
-        &crate::AllowAll,
-        &legacy,
-        None,
-        crate::RunControl {
-            compaction_plane: Some(scripted.clone()),
-            ..Default::default()
-        },
-        &out,
-    )
-    .await
-    .unwrap();
-    assert_eq!(summary.reason, RunFinishReason::Completed);
-    let lineage_id = writer.lineage_id().unwrap().to_string();
-    let setup_request = scripted.setup_requests.lock().unwrap()[0].clone();
-    assert_eq!(
-        setup_request.lineage_id.as_deref(),
-        Some(lineage_id.as_str())
-    );
-    assert!(setup_request
-        .request_id
-        .starts_with(&format!("{lineage_id}:setup:")));
-    assert_eq!(scripted.statuses.lock().unwrap()[0].lineage_id, lineage_id);
-    assert_eq!(model.calls().len(), 1);
-    let _ = writer.shutdown().await;
-}
-
-#[test]
-fn status_uses_native_values_and_caps_before_newest_without_skipping_cursor() {
-    let mut raw = vec![
-        text(Role::User, &"x".repeat(3 * 1024 * 1024)),
-        text(Role::Assistant, &"y".repeat(3 * 1024 * 1024)),
-    ];
-    broca_protocol::content::stamp_ordinals(&mut raw);
-    let state = CompactionState::default();
-    let mut status = status();
-    state.fill_status(&mut status, &raw);
-    assert_eq!(status.messages.len(), 1);
-    assert!(status.more);
-    assert_eq!(status.next_cursor(), Some(0));
-    assert_eq!(
-        status.newest,
-        Some(MessageRef {
-            ordinal: 1,
-            mid: "m1".into()
-        })
-    );
-    assert_eq!(status.messages[0].message, encoded(&raw[0]));
-    let mut state = state;
-    state.cursor = Some(CompactionCursor {
-        lineage_id: "lineage".into(),
-        after_ordinal: status.next_cursor(),
-    });
-    state.fill_status(&mut status, &raw);
-    assert_eq!(status.messages.len(), 1);
-    assert_eq!(status.next_cursor(), Some(1));
-    assert!(!status.more);
-    status.lineage_id = "new lineage".into();
-    state.fill_status(&mut status, &raw);
-    assert_eq!(status.after_ordinal, None);
-}
-#[test]
-fn guidance_fold_precedes_slice_and_carried_replacements_remain_undecorated() {
-    let mut raw = vec![text(Role::System, "system"), text(Role::User, "user")];
-    for i in 0..12 {
-        raw.push(Message::new(Role::Assistant, vec![call(&format!("id{i}"))]));
-        raw.push(Message::new(
-            Role::Tool,
-            vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
-                tool_call_id: broca_protocol::ToolCallId(format!("id{i}")),
-                output: broca_protocol::ToolOutput::Error {
-                    message: "failed".into(),
-                },
-                is_error: true,
-            })],
-        ));
-    }
-    broca_protocol::content::stamp_ordinals(&mut raw);
-    let mut folded = raw.clone();
-    crate::run::restore_repetition_guidance(&mut folded[2..]);
-    assert_ne!(
-        folded[13], raw[13],
-        "the carried-over result actually has guidance in the full fold"
-    );
-    let mut state = CompactionState::default();
-    state.fold(&applied_record(CompactionMessageKind::Setup, None));
-    let applied = state.applied.as_mut().unwrap();
-    applied.range = CompactionRange { from: 0, to: 14 };
-    applied.replacement = Arc::new(vec![
-        text(Role::User, "head"),
-        raw[12].clone(),
-        raw[13].clone(),
-    ]);
-    let options = CallOptions::new(folded.clone());
-    let view = model_options(&options, &state);
-    assert_eq!(
-        view.prompt[3].content, raw[13].content,
-        "carried replacement is not decorated"
-    );
-    assert_eq!(
-        &view.prompt[4..],
-        &folded[14..],
-        "tail keeps counters from the replaced messages"
-    );
-    assert_eq!(
-        options.prompt.len(),
-        raw.len(),
-        "the transcript is not rewritten"
-    );
-}
-#[tokio::test]
-async fn engine_setup_refusals_make_no_model_call_and_preserve_role_code() {
-    for reply in [
-        json!({"answer":"unknown"}),
-        json!({"answer":"refuse","code":"window_too_small","reason":"small","provider_code":"own"}),
-    ] {
-        let shared = Shared::default();
-        let writer = shared.writer();
-        let scripted = Scripted::new(&shared, reply.clone(), vec![]);
-        let model = crate::StubProvider::new(vec![model_events()]);
-        let (out, _events) = tokio::sync::mpsc::channel(128);
-        let control = crate::RunControl {
-            manifest: Some(manifest()),
-            compaction_plane: Some(scripted),
-            ..Default::default()
-        };
-        let summary = crate::run_loop_on_writer(
-            request(),
-            &writer,
-            crate::StartMode::FreshOrResume,
-            &model,
-            &crate::StubToolPlane::new(),
-            &crate::AllowAll,
-            &shared,
-            None,
-            control,
-            &out,
-        )
-        .await
-        .unwrap();
-        assert_eq!(summary.reason, RunFinishReason::Error);
-        assert!(model.calls().is_empty());
-        let records = shared.records.lock().unwrap().clone();
-        assert!(!records.iter().any(|record| matches!(
-            record,
-            WalRecord::CompactionMessage {
-                kind: CompactionMessageKind::Setup,
-                ..
-            }
-        )));
-        let Some(WalRecord::RunFinished {
-            error: Some(error), ..
-        }) = records.last()
-        else {
-            panic!("typed terminal error");
-        };
-        if reply["answer"] == "refuse" {
-            assert_eq!(error.provider_code.as_deref(), Some("window_too_small"));
-            assert_eq!(
-                error
-                    .refusal
-                    .as_ref()
-                    .unwrap()
-                    .provider_detail_code
-                    .as_deref(),
-                Some("own")
-            );
-        } else {
-            assert_eq!(
-                error.provider_code.as_deref(),
-                Some("compaction_unavailable")
-            );
-        }
-        drop(records);
-        let _ = writer.shutdown().await;
-    }
-}
+/// A real run with a compaction plan calls Setup once, records it and then a notice before the
+/// model call. An admission or model page whose materialized summary lacks the compaction state
+/// reads the complete WAL instead of rendering without Setup's message.
 #[tokio::test]
 async fn admission_and_model_page_absent_compaction_summary_force_complete_reads() {
     let shared = Shared::default();
     let writer = shared.writer();
-    let scripted = Scripted::new(&shared, ready(), vec![]);
+    let scripted = Arc::new(Scripted {
+        answer: ready(),
+        setups: AtomicUsize::new(0),
+    });
     let model = crate::StubProvider::new(vec![model_events()]);
     let (out, _events) = tokio::sync::mpsc::channel(128);
     let control = crate::RunControl {
         manifest: Some(manifest()),
-        compaction_plane: Some(scripted),
+        compaction_plane: Some(scripted.clone()),
         ..Default::default()
     };
     crate::run_loop_on_writer(
@@ -1501,7 +689,18 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
     )
     .await
     .unwrap();
+    assert_eq!(scripted.setups.load(Ordering::SeqCst), 1);
     let frames = shared.frames();
+    let position = |matches: fn(&WalRecord) -> bool| {
+        frames
+            .iter()
+            .position(|frame| matches(&frame.record))
+            .unwrap()
+    };
+    let setup = position(|r| matches!(r, WalRecord::CompactionMessage { .. }));
+    let notice = position(|r| matches!(r, WalRecord::CompactionNotice { .. }));
+    let model_call = position(|r| matches!(r, WalRecord::ModelStepFinished { .. }));
+    assert!(setup < notice && notice < model_call);
     let head = frames.last().unwrap().seq;
     let mut checkpoint = crate::AdmissionCheckpointV1::from_frames(&frames).unwrap();
     checkpoint.compaction = None;
@@ -1549,20 +748,17 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
     let snapshot = crate::load_prior_wal_snapshot(&reads, &bind(), head, Some(&store)).unwrap();
     assert_eq!(reads.1.load(Ordering::SeqCst), 1);
     assert_eq!(snapshot.base_watermark, 0);
-    assert_eq!(
-        snapshot
-            .checkpoint_at_head
-            .compaction
-            .as_ref()
-            .unwrap()
-            .state()
-            .unwrap()
-            .applied
-            .as_ref()
-            .unwrap()
-            .version,
-        1
-    );
+    let state = snapshot
+        .checkpoint_at_head
+        .compaction
+        .as_ref()
+        .unwrap()
+        .state()
+        .unwrap()
+        .clone();
+    assert_eq!(state.applied.as_ref().unwrap().version, 1);
+    // One notice at the step boundary, and one announcing the final answer before the end.
+    assert_eq!(state.notice_seq, 2);
     let snapshot = crate::StorePageSnapshot {
         watermark_seq: head,
         lineage_id: Some("lineage".into()),
@@ -1580,842 +776,570 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
     let _ = writer.shutdown().await;
 }
 
-#[test]
-fn structural_tool_pairing_tracks_reused_ids_by_occurrence() {
-    let mut raw = vec![text(Role::User, "user")];
-    for _ in 0..2 {
-        raw.push(Message::new(Role::Assistant, vec![call("reused")]));
-        raw.push(Message::new(Role::Tool, vec![result("reused")]));
-    }
-    broca_protocol::content::stamp_ordinals(&mut raw);
-    let initial = CompactionMessage::new(
-        "c",
-        2,
-        Range::new(0, 0),
-        vec![encoded(&text(Role::User, "head"))],
-    );
-    assert!(validate_answer(
-        &FenceState {
-            newest_ordinal: Some(4),
-            ..fence()
-        },
-        &answer(initial),
-        99,
-        &raw
-    )
-    .is_ok());
-    let invalid = CompactionMessage::new(
-        "c",
-        2,
-        Range::new(0, 5),
-        vec![
-            encoded(&Message::new(
-                Role::Assistant,
-                vec![call("new"), call("new")],
-            )),
-            encoded(&Message::new(Role::Tool, vec![result("new")])),
-        ],
-    );
-    assert_eq!(
-        validate_answer(
-            &FenceState {
-                newest_ordinal: Some(4),
-                ..fence()
-            },
-            &answer(invalid),
-            99,
-            &raw
-        ),
-        Err(CompactionDisposition::Structural)
-    );
-}
-
-#[tokio::test]
-async fn q28_cached_fill_is_inside_margin_and_unreported_input_fails_closed() {
-    let anthropic = Usage {
-        input_tokens: Some(1),
-        cached_input_tokens: Some(945),
-        cache_write_tokens: Some(4),
-        output_tokens: Some(3),
-        ..Usage::default()
-    };
-    let codex = Usage {
-        input_tokens: Some(1),
-        cached_input_tokens: Some(850),
-        cache_write_tokens: None,
-        output_tokens: Some(3),
-        ..Usage::default()
-    };
-    for (usage, expected_fill, has_wire_usage) in [
-        (anthropic, Some(950), true),
-        (codex, Some(851), false),
-        (
-            Usage {
-                input_tokens: None,
-                ..anthropic
-            },
-            None,
-            false,
-        ),
-    ] {
-        let mut history = CompactionHistory {
-            previous_native_usage: Some(usage),
-            previous_request_bytes: Some(20),
-            ..Default::default()
-        };
-        history.previous_usage = wire_usage(usage, 1, "stop".into());
-        assert_eq!(
-            history.usage().and_then(|usage| usage.fill_tokens()),
-            expected_fill
-        );
-        assert_eq!(history.previous_usage.is_some(), has_wire_usage);
-        let (display, reliable) = request_estimate(20, &history);
-        assert_eq!(reliable, expected_fill);
-        if let Some(fill) = expected_fill {
-            assert_eq!(display, fill);
-        }
-        let encoded = serde_json::to_string(&history).unwrap();
-        let decoded: CompactionHistory = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.previous_native_usage, Some(usage));
-        assert_eq!(request_estimate(20, &decoded), (display, reliable));
-        if has_wire_usage {
-            let status = history.previous_usage.as_ref().unwrap();
-            assert_eq!(
-                (status.input, status.cache_read, status.cache_write),
-                (1, 945, 4)
-            );
-        }
-        let shared = Shared::default();
-        let writer = shared.writer();
-        let control = crate::RunControl::default();
-        let bind = bind();
-        let scripted = Scripted::new(
-            &shared,
-            ready(),
-            vec![json!({"answer":"wait","reason":"work","bound_ms":60000})],
-        );
-        let plane: Arc<dyn CompactionPlane> = scripted;
-        let runtime = runtime::Runtime {
-            provider: "provider",
-            bind: &bind,
-            plane: Some(&plane),
-            inbox: None,
-            writer: &writer,
-            control: &control,
-            replies: &runtime::CompactionReplies::new(),
-        };
-        let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-        let outcome = runtime
-            .step(
-                &mut state,
-                status(),
-                &raw(),
-                reliable,
-                Some(crate::CacheClockReading {
-                    last_sent_at_ms: now(),
-                    ttl_ms: Some(1),
-                    prefix_tokens: None,
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                outcome,
-                runtime::StepResult::Terminal(RunFinishReason::Error, _)
-            ) != (usage == codex)
-        );
-        let _ = writer.shutdown().await;
-    }
-    assert_eq!(
-        request_estimate(101, &CompactionHistory::default()),
-        (51, Some(51))
-    );
-}
-
-#[tokio::test]
-async fn issued_request_cut_is_filed_without_advancing_cursor_and_forces_fresh_call() {
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let bind = bind();
-    let control = crate::RunControl::default();
-    let mut setup_answer = ready();
-    setup_answer["call_when"] = json!({"default":1.0});
-    let scripted = Scripted::new(&shared, setup_answer, vec![]);
-    let plane: Arc<dyn CompactionPlane> = scripted.clone();
-    let runtime = runtime::Runtime {
-        provider: "provider",
-        bind: &bind,
-        plane: Some(&plane),
-        inbox: None,
-        writer: &writer,
-        control: &control,
-        replies: &runtime::CompactionReplies::new(),
-    };
-    let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-    assert!(!state.should_call("model", None, Some(1000), false, false));
-    let lost = WalRecord::CompactionRequest {
-        provider: "provider".into(),
-        request_id: "lost".into(),
-    };
-    writer.record(lost.clone());
-    writer.sync().await.unwrap();
-    state.fold(&lost);
-    assert!(state.should_call("model", None, Some(1000), false, false));
-    runtime
-        .step(&mut state, status(), &raw(), Some(10), None)
-        .await
-        .unwrap();
-    let statuses = scripted.statuses.lock().unwrap().clone();
-    assert_eq!(statuses.len(), 1);
-    assert_ne!(statuses[0].request_id, "lost");
-    assert_eq!(statuses[0].after_ordinal, None);
-    assert_eq!(statuses[0].messages.len(), 4);
-    let records = shared.records.lock().unwrap().clone();
-    assert!(
-        matches!(&records[2], WalRecord::CompactionAnswer { request_id, cursor, disposition: CompactionDisposition::FailedCall, .. } if request_id == "lost" && cursor.after_ordinal.is_none())
-    );
-    assert!(!state.pending_request);
-    let _ = writer.shutdown().await;
-}
-
-#[cfg(feature = "test-clock")]
-#[tokio::test]
-async fn frozen_clock_drives_configured_compaction_timeout_without_wall_time() {
-    let root = broca_test_support::scratch_root().join("compaction-frozen-clock");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("test-clock");
-    std::fs::write(&path, r#"{"now_ms":1000}"#).unwrap();
-    let clock = crate::Clock::for_state_root(&root).unwrap();
-    assert_eq!(clock.now_ms(), 1000);
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let control = crate::RunControl {
-        clock: Some(clock.clone()),
-        compaction_config: runtime::CompactionConfig {
-            call_budget_ms: 17,
-            step_wait_cap_ms: 31,
-        },
-        ..Default::default()
-    };
-    let bind = bind();
-    let scripted = Scripted::new(&shared, ready(), vec![json!({"answer":"never"})]);
-    let plane: Arc<dyn CompactionPlane> = scripted.clone();
-    let runtime = runtime::Runtime {
-        provider: "provider",
-        bind: &bind,
-        plane: Some(&plane),
-        inbox: None,
-        writer: &writer,
-        control: &control,
-        replies: &runtime::CompactionReplies::new(),
-    };
-    let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-    assert_eq!(scripted.setup_requests.lock().unwrap()[0].now, 1000);
-    let step = async {
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            runtime.step(&mut state, status(), &raw(), Some(10), None),
-        )
-        .await
-        .expect("configured clock deadline did not release the step")
-        .unwrap();
-    };
-    let advance = async {
-        while scripted.statuses.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(scripted.statuses.lock().unwrap()[0].now, 1000);
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        assert_eq!(
-            clock.now_ms(),
-            1000,
-            "wall time must not advance a frozen domain"
-        );
-        assert!(matches!(
-            shared.records.lock().unwrap().last(),
-            Some(WalRecord::CompactionRequest { .. })
-        ));
-        std::fs::write(&path, r#"{"now_ms":1016}"#).unwrap();
-        clock.refresh().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        assert!(matches!(
-            shared.records.lock().unwrap().last(),
-            Some(WalRecord::CompactionRequest { .. })
-        ));
-        std::fs::write(&path, r#"{"now_ms":1017}"#).unwrap();
-        clock.refresh().unwrap();
-    };
-    tokio::join!(step, advance);
-    assert!(matches!(
-        shared.records.lock().unwrap().last(),
-        Some(WalRecord::CompactionAnswer {
-            disposition: CompactionDisposition::Timeout,
-            ..
-        })
-    ));
-    let _ = writer.shutdown().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn discarded_receipts_preserve_pending_requests_and_genuine_pending_answers() {
-    for disposition in [
-        CompactionDisposition::Late,
-        CompactionDisposition::SupersededRequest,
-    ] {
-        for pending in [false, true] {
-            let mut state = CompactionState::default();
-            state.fold(&applied_record(CompactionMessageKind::Setup, None));
-            state.fold(&WalRecord::CompactionRequest {
-                provider: "provider".into(),
-                request_id: "new".into(),
-            });
-            if pending {
-                state.fold(&applied_record(CompactionMessageKind::Step, Some("new")));
-            }
-            let before = (
-                state.pending_answer,
-                state.pending_request,
-                state.cursor.clone(),
-            );
-            state.fold(&WalRecord::CompactionAnswer {
-                provider: "provider".into(),
-                request_id: "old".into(),
-                cursor: CompactionCursor {
-                    lineage_id: "old-lineage".into(),
-                    after_ordinal: None,
-                },
-                disposition,
-                rejected: None,
-                wait: None,
-            });
-            assert_eq!(
-                (
-                    state.pending_answer,
-                    state.pending_request,
-                    state.cursor.clone()
-                ),
-                before
-            );
-            assert_eq!(
-                state.applied.as_ref().unwrap().version,
-                if pending { 2 } else { 1 }
-            );
-        }
-        let mut idle = CompactionState::default();
-        idle.fold(&WalRecord::CompactionAnswer {
-            provider: "provider".into(),
-            request_id: "old".into(),
-            cursor: CompactionCursor {
-                lineage_id: "old-lineage".into(),
-                after_ordinal: None,
-            },
-            disposition,
-            rejected: None,
-            wait: None,
-        });
-        assert!(!idle.pending_answer);
-        assert!(!idle.pending_request);
-    }
-}
-
-#[cfg(feature = "test-clock")]
-#[tokio::test]
-async fn concurrent_clock_refresh_cannot_move_wait_cap_into_real_time() {
-    let root = broca_test_support::scratch_root().join("compaction-refresh-order");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("test-clock");
-    let clock = crate::Clock::for_state_root(&root).unwrap();
-    let (read_tx, read_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let poll_clock = clock.clone();
-    let poll = std::thread::spawn(move || {
-        poll_clock.refresh_with_read_probe(|serialized| {
-            // Suspend a real NotFound read, as when the poller runs before installation.
-            read_tx.send(serialized).unwrap();
-            release_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("release the held clock read");
-        })
-    });
-    let serialized = read_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("poller read the absent clock file");
-    std::fs::write(&path, r#"{"now_ms":0}"#).unwrap();
-    if serialized {
-        // The admission refresh cannot overtake a read that owns the clock lock.
-        release_tx.send(()).unwrap();
-        poll.join().unwrap().unwrap();
-        clock.refresh().unwrap();
-    } else {
-        // Force the unsafe ordering: admission installs zero, then the old poll
-        // applies its missing-file snapshot and puts the clock back in real time.
-        clock.refresh().unwrap();
-        release_tx.send(()).unwrap();
-        poll.join().unwrap().unwrap();
-    }
-
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let control = crate::RunControl {
-        clock: Some(clock.clone()),
-        compaction_config: runtime::CompactionConfig {
-            call_budget_ms: 100,
-            step_wait_cap_ms: 100,
-        },
-        ..Default::default()
-    };
-    let bind = bind();
-    let scripted = Scripted::new(
-        &shared,
-        ready(),
-        vec![json!({"answer":"wait","reason":"work","bound_ms":200})],
-    );
-    let plane: Arc<dyn CompactionPlane> = scripted.clone();
-    let runtime = runtime::Runtime {
-        provider: "provider",
-        bind: &bind,
-        plane: Some(&plane),
-        inbox: None,
-        writer: &writer,
-        control: &control,
-        replies: &runtime::CompactionReplies::new(),
-    };
-    let raw = raw();
-    let mut state = runtime.setup(setup(), &raw).await.unwrap();
-    let mut status = status();
-    status.context_window = Some(1000);
-    let mut step = Box::pin(runtime.step(&mut state, status, &raw, Some(950), None));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            assert!(futures::poll!(&mut step).is_pending());
-            if matches!(
-                shared.records.lock().unwrap().last(),
-                Some(WalRecord::CompactionAnswer {
-                    disposition: CompactionDisposition::Wait,
-                    ..
-                })
-            ) && shared.durable.load(Ordering::SeqCst) == shared.frames().len()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("WAIT must become durable before advancing the fixed clock");
-    if !serialized {
-        eprintln!(
-            "stale refresh: step issued at {} ms; fixed clock will advance only to 100 ms",
-            scripted.statuses.lock().unwrap()[0].now
-        );
-    }
-
-    // Only the injected clock advances; the wall-clock timeout is a failure fence,
-    // not the mechanism that expires the compaction wait.
-    std::fs::write(&path, r#"{"now_ms":99}"#).unwrap();
-    clock.refresh().unwrap();
-    assert!(
-        futures::poll!(&mut step).is_pending(),
-        "WAIT ended before its cap"
-    );
-    std::fs::write(&path, r#"{"now_ms":100}"#).unwrap();
-    clock.refresh().unwrap();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), step).await;
-    let _ = writer.shutdown().await;
-    let result = result
-        .expect("fixed-clock compaction cap did not fire at 100 ms after the held refresh")
-        .unwrap();
-    let runtime::StepResult::Terminal(reason, error) = result else {
-        panic!("over-margin WAIT must fail closed at its cap");
-    };
-    assert_eq!(reason, RunFinishReason::Error);
-    assert_eq!(
-        error.unwrap().provider_code.as_deref(),
-        Some("compaction_wait_exceeded")
-    );
-    assert_eq!(scripted.statuses.lock().unwrap()[0].now, 0);
-    assert!(matches!(
-        shared.records.lock().unwrap().last(),
-        Some(WalRecord::CompactionWait {
-            exited: CompactionWaitExit::Exceeded,
-            ..
-        })
-    ));
-}
-
-/// The provider's bound (200 ms) is longer than the step's cap (100 ms), so the wait must
-/// end with the cap's decision at 100 ms. The clock reaches 100 between two clock reads
-/// made in one poll of the wait, as when the test-clock poller refreshes on another thread
-/// while the run task is being polled. The decision must not depend on which read saw it.
-#[cfg(feature = "test-clock")]
-#[tokio::test]
-async fn clock_reaching_the_cap_mid_poll_takes_the_cap_exit_not_the_bound() {
-    let root = broca_test_support::scratch_root().join("compaction-cap-mid-poll");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("test-clock");
-    std::fs::write(&path, r#"{"now_ms":0}"#).unwrap();
-    let clock = crate::Clock::for_state_root(&root).unwrap();
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let control = crate::RunControl {
-        clock: Some(clock.clone()),
-        compaction_config: runtime::CompactionConfig {
-            call_budget_ms: 25,
-            step_wait_cap_ms: 100,
-        },
-        ..Default::default()
-    };
-    let bind = bind();
-    // After the WAIT the script answers noop, as the conformance provider does once its
-    // script runs out, so asking again would let the step go on to the model.
-    let scripted = Scripted::new(
-        &shared,
-        ready(),
-        vec![json!({"answer":"wait","reason":"work","bound_ms":200})],
-    );
-    let plane: Arc<dyn CompactionPlane> = scripted.clone();
-    let runtime = runtime::Runtime {
-        provider: "provider",
-        bind: &bind,
-        plane: Some(&plane),
-        inbox: None,
-        writer: &writer,
-        control: &control,
-        replies: &runtime::CompactionReplies::new(),
-    };
-    let raw = raw();
-    let mut state = runtime.setup(setup(), &raw).await.unwrap();
-    let mut status = status();
-    status.context_window = Some(1000);
-    let mut step = Box::pin(runtime.step(&mut state, status, &raw, Some(950), None));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            assert!(futures::poll!(&mut step).is_pending());
-            if matches!(
-                shared.records.lock().unwrap().last(),
-                Some(WalRecord::CompactionAnswer {
-                    disposition: CompactionDisposition::Wait,
-                    ..
-                })
-            ) && shared.durable.load(Ordering::SeqCst) == shared.frames().len()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("WAIT must become durable before advancing the fixed clock");
-
-    std::fs::write(&path, r#"{"now_ms":99}"#).unwrap();
-    clock.refresh().unwrap();
-    assert!(
-        futures::poll!(&mut step).is_pending(),
-        "WAIT ended before its cap"
-    );
-    // Wake every clock timer with the time still at 99: an offset change notifies
-    // subscribers but does not move a fixed clock. The file already says 100, and the
-    // probe applies it just after the first timer has read 99 and subscribed.
-    std::fs::write(&path, r#"{"now_ms":99,"offset_ms":1}"#).unwrap();
-    clock.refresh().unwrap();
-    std::fs::write(&path, r#"{"now_ms":100,"offset_ms":1}"#).unwrap();
-    clock.refresh_on_read_after(99);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), step).await;
-    let _ = writer.shutdown().await;
-    let result = result
-        .expect("fixed-clock compaction cap did not fire at 100 ms")
-        .unwrap();
-    assert_eq!(clock.now_ms(), 100, "the probe moved the clock to the cap");
-    let exits: Vec<_> = shared
-        .records
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::CompactionWait { exited, .. } => Some(*exited),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        exits,
-        [CompactionWaitExit::Exceeded],
-        "the wait reached its cap and must take the cap's decision"
-    );
-    assert_eq!(
-        scripted.statuses.lock().unwrap().len(),
-        1,
-        "the provider is not asked again once the cap is reached"
-    );
-    let runtime::StepResult::Terminal(reason, error) = result else {
-        panic!("over-margin WAIT must fail closed at its cap, not continue to the model");
-    };
-    assert_eq!(reason, RunFinishReason::Error);
-    assert_eq!(
-        error.unwrap().provider_code.as_deref(),
-        Some("compaction_wait_exceeded")
-    );
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(feature = "test-clock")]
-struct HeldCompaction {
-    script: Arc<Scripted>,
-    reply: Mutex<Option<tokio::sync::oneshot::Sender<StepAnswer>>>,
-}
+/// A model provider that binds signed reasoning to its prefix, as Anthropic's thinking does,
+/// around the stub provider that records every request it is sent.
+struct PrefixBound(crate::StubProvider);
 #[async_trait::async_trait]
-#[cfg(feature = "test-clock")]
-impl CompactionPlane for HeldCompaction {
-    async fn setup(
-        &self,
-        provider: &str,
-        bind: &BindIdentity,
-        request: SetupRequest,
-    ) -> Result<SetupAnswer, CompactionUnavailable> {
-        self.script.setup(provider, bind, request).await
-    }
+impl crate::Provider for PrefixBound {
     async fn step(
         &self,
-        _: &str,
-        _: &BindIdentity,
-        status: StepStatus,
-    ) -> Result<StepAnswer, CompactionUnavailable> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.script.statuses.lock().unwrap().push(status);
-        *self.reply.lock().unwrap() = Some(tx);
-        rx.await.map_err(|_| CompactionUnavailable)
-    }
-}
-#[cfg(feature = "test-clock")]
-struct HeldModel {
-    calls: Mutex<Vec<CallOptions>>,
-    release: tokio::sync::Notify,
-}
-#[async_trait::async_trait]
-#[cfg(feature = "test-clock")]
-impl crate::Provider for HeldModel {
-    async fn step(
-        &self,
-        _: broca_protocol::StepId,
+        step_id: broca_protocol::StepId,
         opts: &CallOptions,
     ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
-        self.calls.lock().unwrap().push(opts.clone());
-        self.release.notified().await;
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        for event in model_events() {
-            tx.send(event).await.unwrap();
-        }
-        rx
+        self.0.step(step_id, opts).await
+    }
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        true
     }
 }
 
-#[cfg(feature = "test-clock")]
-#[tokio::test]
-async fn late_receipt_during_model_wait_is_durable_without_resending_and_crash_resume_uses_last_view(
-) {
-    let root = broca_test_support::scratch_root().join("late-model-clock");
-    std::fs::create_dir_all(&root).unwrap();
-    let clock_path = root.join("test-clock");
-    std::fs::write(&clock_path, r#"{"now_ms":1000}"#).unwrap();
-    let clock = crate::Clock::for_state_root(&root).unwrap();
-    let shared = Shared::default();
-    let writer = shared.writer();
-    let script = Scripted::new(&shared, ready(), vec![]);
-    let plane = Arc::new(HeldCompaction {
-        script: script.clone(),
-        reply: Mutex::new(None),
-    });
-    let model = HeldModel {
-        calls: Mutex::new(vec![]),
-        release: tokio::sync::Notify::new(),
-    };
+/// The provider's one view of the session: its first message folded into a summary.
+#[derive(Default)]
+struct OneView {
+    offered: AtomicUsize,
+    /// Replace the first question with a copy of it from the raw transcript, which lacks the
+    /// runner tag the request shows on its text, instead of a summary.
+    copy_raw_question: bool,
+}
+impl CompactionViews for OneView {
+    fn newest(
+        &self,
+        session_ref: &str,
+        lineage_id: &str,
+        after: Option<u64>,
+    ) -> Option<(
+        crate::compaction_provider::view::CompactionView,
+        crate::compaction_provider::notice::ViewReady,
+    )> {
+        use crate::compaction_provider::{lineage::MessageRef, view::*};
+        if after.is_some_and(|applied| applied >= 2) {
+            return None;
+        }
+        self.offered.fetch_add(1, Ordering::SeqCst);
+        let fold = if self.copy_raw_question {
+            vec![text(Role::User, "first question")]
+        } else {
+            vec![text(Role::User, "summary")]
+        };
+        let covers = 0;
+        let bytes = serde_json::to_string(&fold).unwrap();
+        let view = CompactionView::new(
+            session_ref,
+            2,
+            lineage_id,
+            MessageRef {
+                ordinal: covers,
+                mid: format!("m{covers}"),
+            },
+            vec![ViewRange::replace(0, covers + 1, bytes)],
+        );
+        let ready = crate::compaction_provider::notice::ViewReady::for_view(&view);
+        Some((view, ready))
+    }
+}
+
+/// A send carrying history with signed reasoning, on a plan that renders runner tags.
+fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
+    let submission: broca_protocol::request::SubmissionRequest = serde_json::from_value(json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[
+            {"role":"user","content":[{"type":"text","text":"first question"}]},
+            {"role":"assistant","origin":{"provider_module_id":"stub","model_id":"model"},
+             "content":[{"type":"reasoning","text":"old thinking","signature":"old-signature"},
+                        {"type":"text","text":"first answer"}]},
+            {"role":"user","content":[{"type":"text","text":"second question"}]}
+        ]
+    }))
+    .unwrap();
+    let request = crate::RunRequest::from_submission(
+        submission,
+        broca_protocol::RunId("run".into()),
+        bind(),
+        broca_protocol::SubmissionId("sub".into()),
+    );
+    let mut plan = manifest().as_ref().clone();
+    plan.plan = OpaqueJson::from_json_text(
+        json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},
+            "composition":{},"render_tags":true})
+        .to_string(),
+    )
+    .unwrap();
+    let views = Arc::new(OneView::default());
     let control = crate::RunControl {
-        manifest: Some(manifest()),
-        compaction_plane: Some(plane.clone()),
-        clock: Some(clock.clone()),
-        compaction_config: runtime::CompactionConfig {
-            call_budget_ms: 17,
-            step_wait_cap_ms: 100,
-        },
+        manifest: Some(Arc::new(plan)),
+        compaction_plane: Some(Arc::new(Scripted {
+            answer: ready(),
+            setups: AtomicUsize::new(0),
+        })),
+        compaction_views: Some(views.clone()),
         ..Default::default()
     };
-    let (out, _events) = tokio::sync::mpsc::channel(128);
-    let tools = crate::StubToolPlane::new();
-    let run = crate::run_loop_on_writer(
-        request(),
+    (request, control, views)
+}
+
+async fn run_history(shared: &Shared) -> (PrefixBound, Arc<OneView>) {
+    run_history_with(shared, OneView::default()).await
+}
+
+async fn run_history_with(shared: &Shared, views: OneView) -> (PrefixBound, Arc<OneView>) {
+    let writer = shared.writer();
+    let (request, mut control, _) = history_request();
+    if views.copy_raw_question {
+        // Setup inserts nothing, so the view's copy is the request's only change.
+        let mut empty = ready();
+        empty["initial"]["replacement"] = json!([]);
+        control.compaction_plane = Some(Arc::new(Scripted {
+            answer: empty,
+            setups: AtomicUsize::new(0),
+        }));
+    }
+    let views = Arc::new(views);
+    control.compaction_views = Some(views.clone());
+    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
         &writer,
         crate::StartMode::FreshOrResume,
         &model,
-        &tools,
+        &crate::StubToolPlane::new(),
         &crate::AllowAll,
-        &shared,
+        shared,
         None,
         control,
         &out,
-    );
-    let observe = async {
-        while plane.reply.lock().unwrap().is_none() {
-            tokio::task::yield_now().await;
-        }
-        std::fs::write(&clock_path, r#"{"now_ms":1017}"#).unwrap();
-        clock.refresh().unwrap();
-        while model.calls.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-        let request_id = script.statuses.lock().unwrap()[0].request_id.clone();
-        plane
-            .reply
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .send(StepAnswer::CompactionMessage {
-                request_id,
-                compaction: CompactionMessage::new(
-                    "c",
-                    99,
-                    Range::new(0, 0),
-                    vec![
-                        json!({"role":"user","content":[{"type":"text","text":"must not apply"}]}),
-                    ],
-                ),
-                coverage: None,
-                channel2_directive: None,
-                bootstrap_complete: None,
-            })
-            .unwrap();
-        loop {
-            let frames = shared.frames();
-            if matches!(frames.last().map(|f| &f.record), Some(WalRecord::CompactionAnswer {
-                disposition: CompactionDisposition::Late, rejected: Some(rejected), .. }) if rejected.version == 99)
-                && shared.durable.load(Ordering::SeqCst) == frames.len()
-            {
-                assert_eq!(
-                    model.calls.lock().unwrap().len(),
-                    1,
-                    "late reply must not resend model request"
-                );
-                model.release.notify_one();
-                return frames.into_iter().map(|f| f.record).collect::<Vec<_>>();
-            }
-            tokio::task::yield_now().await;
-        }
-    };
-    let (summary, cut) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
-        tokio::join!(run, observe)
-    })
+    )
     .await
-    .expect("late receipt must be filed while the model is held");
-    assert_eq!(summary.unwrap().reason, RunFinishReason::Completed);
+    .unwrap();
     let _ = writer.shutdown().await;
-    // The persisted prefix used for resume ends after the timeout and discarded receipt;
-    // it contains neither a model answer nor a run terminal.
-    let resumed = Shared {
-        records: Arc::new(Mutex::new(cut)),
-        ..Default::default()
-    };
-    let writer = resumed.writer();
-    let scripted = Scripted::new(&resumed, ready(), vec![]);
-    let model2 = crate::StubProvider::new(vec![model_events()]);
+    (model, views)
+}
+
+fn notice_seqs(records: &[WalRecord]) -> Vec<u64> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionNotice { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The run loop applies a provider's view at a step boundary with the companion strip of the
+/// signed reasoning it invalidates, over the tagged prompt the model is sent. A crash after
+/// the view is recorded, before or after its notice, resumes through replay and the run loop
+/// and sends the same request bytes without offering the view again; the notices stay one
+/// gapless sequence, and the run's final answer is announced before the run ends.
+#[tokio::test]
+async fn an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically() {
+    let shared = Shared::default();
+    let (model, views) = run_history(&shared).await;
+    assert_eq!(views.offered.load(Ordering::SeqCst), 1);
+    let calls = model.0.calls();
+    assert_eq!(calls.len(), 1);
+    let live = crate::canonical_request_bytes(&calls[0]);
+    let sent = String::from_utf8_lossy(&live).into_owned();
+    assert!(sent.contains("summary"), "{sent}");
+    assert!(!sent.contains("first question"), "the view replaced it");
+    assert!(sent.contains('§'), "runner tags are rendered: {sent}");
+    assert!(
+        calls[0]
+            .prompt
+            .iter()
+            .all(|message| !message.content.iter().any(view::is_prefix_bound)),
+        "the invalidated signed reasoning is stripped"
+    );
+    let records = shared.records();
+    let applied = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record,
+                WalRecord::CompactionViewApplied {
+                    choice: broca_wal::CompactionViewChoice::Companion { .. },
+                    ..
+                }
+            )
+        })
+        .expect("view applied with the companion strip");
+    let finished = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    let seqs = notice_seqs(&records);
+    assert_eq!(seqs, vec![1, 2], "a boundary notice and the final answer's");
+    let last_notice = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::CompactionNotice { .. }))
+        .unwrap();
+    assert!(
+        last_notice > finished,
+        "the final answer is announced before the run ends"
+    );
+    for cut in applied + 1..finished {
+        let resumed = Shared::with_records(records[..cut].to_vec());
+        let (model, views) = run_history(&resumed).await;
+        assert_eq!(
+            views.offered.load(Ordering::SeqCst),
+            0,
+            "cut {cut}: a durable view was offered again"
+        );
+        let calls = model.0.calls();
+        assert_eq!(calls.len(), 1, "cut {cut}");
+        assert_eq!(
+            crate::canonical_request_bytes(&calls[0]),
+            live,
+            "cut {cut}: resumed request bytes differ"
+        );
+        let after = resumed.records();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|record| matches!(record, WalRecord::CompactionViewApplied { .. }))
+                .count(),
+            1,
+            "cut {cut}"
+        );
+        let seqs = notice_seqs(&after);
+        assert_eq!(
+            seqs,
+            (1..=seqs.len() as u64).collect::<Vec<_>>(),
+            "cut {cut}"
+        );
+    }
+}
+
+/// A new lineage of a session whose earlier lineage retention deleted starts its notice numbers
+/// at the number that lineage's tombstone recorded. The bus and the provider key notices on the
+/// session, so they never take the new lineage's notices for repeats of the deleted lineage's.
+#[tokio::test]
+async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
+    let root = broca_test_support::scratch_root().join(format!(
+        "broca-compaction-notice-floor-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = crate::FileWalStore::new(&root);
+    let stone = store.tombstone_path(&bind(), "deleted-lineage");
+    std::fs::create_dir_all(stone.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stone,
+        json!({"lineage_id":"deleted-lineage","expired_at_ms":1,"seq":1,"next_notice_seq":7})
+            .to_string(),
+    )
+    .unwrap();
+    let writer =
+        crate::WalHandle::spawn(crate::WalStore::open(&store, &bind()).unwrap(), 1).unwrap();
+    let model = crate::StubProvider::new(vec![model_events()]);
+    let (out, _events) = tokio::sync::mpsc::channel(128);
     crate::run_loop_on_writer(
         request(),
         &writer,
         crate::StartMode::FreshOrResume,
-        &model2,
-        &tools,
+        &model,
+        &crate::StubToolPlane::new(),
         &crate::AllowAll,
-        &resumed,
+        &store,
         None,
         crate::RunControl {
-            compaction_plane: Some(scripted.clone()),
+            manifest: Some(manifest()),
+            compaction_plane: Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            })),
             ..Default::default()
         },
         &out,
     )
     .await
     .unwrap();
-    assert_eq!(scripted.setups.load(Ordering::SeqCst), 0);
-    assert!(scripted.statuses.lock().unwrap().is_empty());
-    assert_eq!(
-        crate::canonical_request_bytes(&model.calls.lock().unwrap()[0]),
-        crate::canonical_request_bytes(&model2.calls()[0])
-    );
-    let _ = writer.shutdown().await;
+    writer.shutdown().await.unwrap();
+    let records: Vec<WalRecord> = crate::WalStore::read_records(&store, &bind())
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
+    assert_eq!(notice_seqs(&records), vec![7, 8]);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The run loop decides a view over the prompt the model is sent, tags included. A view that
+/// puts back the raw text of the first question changes the request there (the request showed
+/// it with its runner tag), so the signed answer after it is invalidated: the view applies
+/// with the companion strip and the old signature never goes out over the changed prefix.
 #[tokio::test]
-async fn boundary_cancel_during_compaction_wait_exits_cancelled_without_recall() {
+async fn the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends() {
     let shared = Shared::default();
-    let writer = shared.writer();
-    let bind = bind();
-    let inbox = Arc::new(CompactionInbox::default());
-    let boundary = crate::SteerInbox::new();
-    let control = crate::RunControl {
-        steer: Some(boundary.clone()),
-        ..Default::default()
-    };
-    let scripted = Scripted::new(
+    let (model, views) = run_history_with(
         &shared,
-        ready(),
-        vec![json!({"answer":"wait","reason":"work","bound_ms":60000})],
-    );
-    let plane: Arc<dyn CompactionPlane> = scripted.clone();
-    let replies = runtime::CompactionReplies::new();
-    let runtime = runtime::Runtime {
-        provider: "provider",
-        bind: &bind,
-        plane: Some(&plane),
-        inbox: Some(&inbox),
-        writer: &writer,
-        control: &control,
-        replies: &replies,
-    };
-    let mut state = runtime.setup(setup(), &raw()).await.unwrap();
-    let driver = async {
-        loop {
-            if shared.frames().iter().any(|frame| {
-                matches!(
-                    frame.record,
-                    WalRecord::CompactionAnswer {
-                        disposition: CompactionDisposition::Wait,
-                        ..
-                    }
-                )
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        boundary
-            .request_boundary_cancel(&writer, &broca_protocol::RunId("r".into()))
-            .await
-            .unwrap();
-    };
-    let raw = raw();
-    let (result, _) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
-        tokio::join!(
-            runtime.step(&mut state, status(), &raw, Some(10), None),
-            driver
-        )
-    })
-    .await
-    .expect("boundary cancellation must not wait out compaction's bound");
-    assert!(matches!(
-        result.unwrap(),
-        runtime::StepResult::Terminal(RunFinishReason::Cancelled, None)
-    ));
-    assert_eq!(
-        scripted.statuses.lock().unwrap().len(),
-        1,
-        "no compaction recall after cancellation"
-    );
-    assert!(shared.frames().iter().any(|frame| matches!(
-        frame.record,
-        WalRecord::CompactionWait {
-            exited: CompactionWaitExit::Cancel,
+        OneView {
+            copy_raw_question: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(views.offered.load(Ordering::SeqCst), 1);
+    assert!(shared.records().iter().any(|record| matches!(
+        record,
+        WalRecord::CompactionViewApplied {
+            choice: broca_wal::CompactionViewChoice::Companion { .. },
             ..
         }
     )));
-    writer.shutdown().await.unwrap();
+    let call = &model.0.calls()[0];
+    assert_eq!(
+        call.prompt[0].content,
+        text(Role::User, "first question").content
+    );
+    assert!(
+        call.prompt
+            .iter()
+            .all(|message| !message.content.iter().any(view::is_prefix_bound)),
+        "the old signature is not sent over the changed first message"
+    );
+}
+
+/// A WAL store that counts how often admission asks it for the notice floor.
+struct CountingFloor {
+    inner: Shared,
+    floor_reads: AtomicUsize,
+}
+impl crate::WalStore for CountingFloor {
+    fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+        crate::WalStore::open(&self.inner, session)
+    }
+    fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+        crate::WalStore::read_records(&self.inner, session)
+    }
+    fn retired_notice_floor(&self, _: &BindIdentity) -> Result<u64, WalError> {
+        self.floor_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    }
+}
+
+async fn floor_reads(control: crate::RunControl) -> usize {
+    let store = CountingFloor {
+        inner: Shared::default(),
+        floor_reads: AtomicUsize::new(0),
+    };
+    let writer = store.inner.writer();
+    let model = crate::StubProvider::new(vec![model_events()]);
+    let (out, _events) = tokio::sync::mpsc::channel(128);
+    crate::run_loop_on_writer(
+        request(),
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &store,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    let _ = writer.shutdown().await;
+    store.floor_reads.load(Ordering::SeqCst)
+}
+
+/// Admission reads the retention tombstones for the notice floor only for a session whose plan
+/// names a compaction provider: a session without a plan, or with a plan that names none, does
+/// exactly the I/O it did before compaction notices existed.
+#[tokio::test]
+async fn only_a_compaction_session_reads_the_notice_floor() {
+    assert_eq!(floor_reads(crate::RunControl::default()).await, 0);
+    // A session with a plan that names no compaction provider.
+    let mut plain = manifest().as_ref().clone();
+    plain.plan = OpaqueJson::from_json_text(json!({"composition":{}}).to_string()).unwrap();
+    assert_eq!(
+        floor_reads(crate::RunControl {
+            manifest: Some(Arc::new(plain)),
+            ..Default::default()
+        })
+        .await,
+        0
+    );
+    assert_eq!(
+        floor_reads(crate::RunControl {
+            manifest: Some(manifest()),
+            compaction_plane: Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            })),
+            ..Default::default()
+        })
+        .await,
+        1
+    );
+}
+
+/// The stub provider, answering with a structured-output run frozen in its render config
+/// when `submit` is set, as a provider admitted with `submit_tool` does.
+struct EndingModel {
+    stub: crate::StubProvider,
+    submit: bool,
+}
+#[async_trait::async_trait]
+impl crate::Provider for EndingModel {
+    async fn step(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: &CallOptions,
+    ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        self.stub.step(step_id, opts).await
+    }
+    fn render_config_blob(&self) -> Value {
+        if self.submit {
+            json!({"render_config":"stateless","structured_output":{
+                "mode":"submit_tool","name":"result","schema_jcs":"{}",
+                "enforcement":"best_effort","delivery":"unconstrained"}})
+        } else {
+            json!({"render_config":"stateless"})
+        }
+    }
+}
+
+/// One model step that calls `tool` with `input_tokens` of reported usage.
+fn tool_call_events(tool: &str, input_tokens: u64) -> Vec<broca_protocol::NormalizedEvent> {
+    use broca_protocol::{NormalizedEvent, ProviderControl};
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: broca_protocol::AssistantMessage {
+                message_id: broca_protocol::MessageId("a".into()),
+                content: vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+                    tool_name: tool.into(),
+                    input: json!({"answer": 42}),
+                    thought_signature: None,
+                })],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(1),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ]
+}
+
+/// Run a compaction session whose one model step calls `tool`, with the request changed by
+/// `adjust`, and return its WAL and how the run ended.
+async fn ending_run(
+    tool: &str,
+    input_tokens: u64,
+    submit: bool,
+    adjust: impl FnOnce(&mut Value),
+) -> (Vec<WalRecord>, RunFinishReason) {
+    let mut submission = json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[{"role":"user","content":[{"type":"text","text":"user"}]}],
+        "tools":[{"name":"edit","description":"edit","input_schema":{"type":"object"}}]
+    });
+    adjust(&mut submission);
+    let mut request = crate::RunRequest::from_submission(
+        serde_json::from_value(submission).unwrap(),
+        broca_protocol::RunId("run".into()),
+        bind(),
+        broca_protocol::SubmissionId("sub".into()),
+    );
+    request.policy_allowed.insert("edit".into());
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let model = EndingModel {
+        stub: crate::StubProvider::new(vec![tool_call_events(tool, input_tokens)]),
+        submit,
+    };
+    let (out, _events) = tokio::sync::mpsc::channel(128);
+    let summary = crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &shared,
+        None,
+        crate::RunControl {
+            manifest: Some(manifest()),
+            compaction_plane: Some(Arc::new(Scripted {
+                answer: ready(),
+                setups: AtomicUsize::new(0),
+            })),
+            ..Default::default()
+        },
+        &out,
+    )
+    .await
+    .unwrap();
+    let _ = writer.shutdown().await;
+    (shared.records(), summary.reason)
+}
+
+/// A run that ends at a hard stop announces the step it ended on (the model's tool call and the
+/// synthetic results the stop writes) before its terminal, in the stop's own barrier.
+fn assert_closing_notice(records: &[WalRecord], kind: &str) {
+    let finished = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunFinished { .. }))
+        .unwrap_or_else(|| panic!("{kind}: no terminal"));
+    let last_result = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::ToolResult { .. }))
+        .unwrap_or_else(|| panic!("{kind}: no synthetic result"));
+    let notice = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::CompactionNotice { .. }))
+        .unwrap_or_else(|| panic!("{kind}: no notice"));
+    assert!(
+        last_result < notice && notice < finished,
+        "{kind}: the closing notice follows the step's results and precedes the terminal"
+    );
+    let WalRecord::CompactionNotice { headers, .. } = &records[notice] else {
+        unreachable!()
+    };
+    // The user message, the tool call and its result: ordinals 0, 1, 2.
+    assert_eq!(headers["through_ordinal"], "2", "{kind}");
+    let seqs = notice_seqs(records);
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>(), "{kind}");
+}
+
+#[tokio::test]
+async fn a_max_steps_stop_with_pending_calls_announces_its_step() {
+    let (records, reason) = ending_run("edit", 1, false, |request| {
+        request["stop_when"] = json!([{"type":"step_count","n":1}]);
+    })
+    .await;
+    assert_eq!(reason, RunFinishReason::MaxSteps);
+    assert_closing_notice(&records, "max steps");
+}
+
+#[tokio::test]
+async fn a_budget_stop_with_pending_calls_announces_its_step() {
+    let (records, reason) = ending_run("edit", 1_000, false, |request| {
+        request["budget"] = json!({"max_input_tokens": 10});
+    })
+    .await;
+    assert_eq!(reason, RunFinishReason::BudgetExhausted);
+    assert_closing_notice(&records, "budget");
+}
+
+#[tokio::test]
+async fn a_structured_output_submit_announces_its_step() {
+    let (records, reason) = ending_run(
+        broca_protocol::structured_output::SUBMIT_RESULT_TOOL,
+        1,
+        true,
+        |_| {},
+    )
+    .await;
+    assert_eq!(reason, RunFinishReason::Completed);
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::StructuredOutputResult { .. })));
+    assert_closing_notice(&records, "structured output submit");
 }

@@ -29,8 +29,8 @@ pub use plan_manifest::{
 mod compaction;
 pub use compaction::{
     compaction_replacement_sha256, CompactionCursor, CompactionDisposition, CompactionMessageKind,
-    CompactionRange, CompactionStabilityRank, CompactionWait, CompactionWaitExit,
-    RejectedCompaction, MAX_REPLACEMENT_BYTES,
+    CompactionRange, CompactionStabilityRank, CompactionStrip, CompactionViewChoice,
+    CompactionWait, CompactionWaitExit, RejectedCompaction, MAX_REPLACEMENT_BYTES,
 };
 
 fn is_false(value: &bool) -> bool {
@@ -863,6 +863,12 @@ pub enum WalRecord {
         call_when: Option<OpaqueJson>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stability: Option<Vec<CompactionStabilityRank>>,
+        /// Setup's ceiling policy (compaction-provider 0.3 `CeilingPolicy`), verbatim JSON,
+        /// frozen with the session. Present only on a Setup record of an asynchronous
+        /// session, and then must-understand (feature `compaction-view/v1`): a reader that
+        /// dropped it would let the session run past its ceiling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ceiling: Option<OpaqueJson>,
     },
     /// Every other step outcome and the cursor it moves, in one durable frame. A wait
     /// answer is itself the wait entry, with the reason and bound in the same record.
@@ -880,6 +886,32 @@ pub enum WalRecord {
     CompactionWait {
         exited: CompactionWaitExit,
         reason: String,
+    },
+    /// A compaction provider's view (compaction-provider/v1 §6), applied at the step boundary
+    /// before the step that first renders it. Every later request of the lineage renders it,
+    /// until a newer view applies, including after a restart, without asking the provider
+    /// again. Must-understand (feature `compaction-view/v1`).
+    CompactionViewApplied {
+        /// The session's compaction provider module.
+        provider: String,
+        /// The view's `view_version`, repeated here so readers need not decode `view`.
+        view_version: u64,
+        /// The view exactly as `view.get` returned it, verbatim JSON, digest included.
+        view: OpaqueJson,
+        /// How it was applied: as published, or with the companion edit the model provider
+        /// requires. Recorded so a resumed request strips exactly what the live one did.
+        choice: CompactionViewChoice,
+    },
+    /// One advance notice (compaction-provider/v1 §5), recorded before it is published. The
+    /// publisher projects it from the durable WAL, so it never publishes a notice that is not
+    /// durable, and a republish after a crash carries the same `seq` and headers.
+    /// Must-understand (feature `compaction-view/v1`): a reader that skipped one would reuse
+    /// its `seq`, and the bus would drop the later notice as a duplicate.
+    CompactionNotice {
+        /// The session's notice sequence, from 1.
+        seq: u64,
+        /// The notice's headers, as the contract names and encodes them.
+        headers: std::collections::BTreeMap<String, String>,
     },
 
     // ── calls held for a human's approval (feature `deferred-call/v1`) ──
@@ -1226,6 +1258,17 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(
+            self,
+            WalRecord::CompactionMessage {
+                ceiling: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::COMPACTION_VIEW_FEATURE)
+        } else {
+            base
+        };
         if self.carries_runner_tags() {
             with_feature(base, crate::framing::RUNNER_TAGS_FEATURE)
         } else {
@@ -1396,6 +1439,9 @@ impl WalRecord {
             | WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionAnswer { .. } => &[crate::framing::COMPACTION_FEATURE],
             WalRecord::CompactionWait { .. } => &[crate::framing::COMPACTION_WAIT_FEATURE],
+            WalRecord::CompactionViewApplied { .. } | WalRecord::CompactionNotice { .. } => {
+                &[crate::framing::COMPACTION_VIEW_FEATURE]
+            }
             WalRecord::RunPaused {
                 reason: PauseReason::Restart,
                 ..

@@ -3061,35 +3061,6 @@ impl LineageRegistry {
         })))
     }
 
-    /// Route a ready hint with the daemon's caller stamp, never a caller id from params.
-    pub async fn route_compaction_ready(
-        &self,
-        key: &LineageKey,
-        caller: &str,
-        request: broca_wire::CompactionReady,
-    ) -> Result<crate::actor::CompactionReadyOutcome, OpenError> {
-        use crate::actor::{CompactionReadyOutcome, LineageCmd};
-        loop {
-            let handle = self.actor_for(key).await?;
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            if handle
-                .send(LineageCmd::CompactionReady {
-                    caller: caller.to_owned(),
-                    request: request.clone(),
-                    reply,
-                })
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            match rx.await {
-                Ok(CompactionReadyOutcome::Reopen) | Err(_) => continue,
-                Ok(outcome) => return Ok(outcome),
-            }
-        }
-    }
-
     /// Expiring logs blocked from deletion because they are unreadable and the indexed
     /// deadline cannot be proved to include every WAL record.
     pub fn retention_unreadable_sessions(&self) -> usize {

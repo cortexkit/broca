@@ -3,15 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// The harness's settings for one session. Members the harness writes that this build does
+/// not use are ignored.
 #[derive(Clone, serde::Deserialize)]
 pub struct Config {
     pub call_timeout_ms: u64,
-    pub wait_cap_ms: u64,
-    pub prompt_cache_lifetime_ms: u64,
     pub context_window: u64,
     pub output_limit: u64,
-    pub safety_margin: u64,
-    pub request_tokens: u64,
     #[serde(skip)]
     pub root: PathBuf,
 }
@@ -36,10 +34,6 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(crate::RunError::Wal(e.to_string())),
         }
-    }
-    pub(crate) fn fits(&self) -> bool {
-        self.request_tokens.saturating_add(self.output_limit)
-            < self.context_window.saturating_sub(self.safety_margin)
     }
 }
 
@@ -67,16 +61,6 @@ pub(crate) async fn barrier(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     Ok(())
-}
-
-#[derive(serde::Deserialize)]
-pub(crate) struct Receipt {
-    pub original_request_id: String,
-    pub answer: crate::compaction_provider::answer::StepAnswer,
-}
-
-pub(crate) fn acknowledge(root: &Path) -> Result<(), crate::RunError> {
-    publish(&root.join("ack"), b"durable discarded receipt")
 }
 
 /// Write a file the harness polls for. A plain write creates the file empty before filling

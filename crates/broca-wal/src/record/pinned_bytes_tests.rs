@@ -105,6 +105,8 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::CompactionMessage { .. } => "compaction_message",
         WalRecord::CompactionAnswer { .. } => "compaction_answer",
         WalRecord::CompactionWait { .. } => "compaction_wait",
+        WalRecord::CompactionViewApplied { .. } => "compaction_view_applied",
+        WalRecord::CompactionNotice { .. } => "compaction_notice",
         WalRecord::ToolCallDeferred { .. } => "tool_call_deferred",
         WalRecord::ApprovalRecorded { .. } => "approval_recorded",
         WalRecord::AwaitingApproval { .. } => "awaiting_approval",
@@ -408,6 +410,33 @@ fn a_resume_record_from_a_later_build_still_decodes() {
     assert_eq!(redone, vec![ResumeRedo::Unknown]);
 }
 
+/// Asynchronous compaction's records and the Setup record carrying a ceiling: their bytes, and
+/// that each is written in a gated frame naming `compaction-view/v1`, so a build that does not
+/// know the feature refuses the WAL instead of rendering a resumed request without its view.
+const COMPACTION_VIEW_PINNED: &[&str] = &[
+    r#"{"type":"compaction_view_applied","provider":"mc","view_version":2,"view":"{\"session_ref\":\"0123456789abcdef0123456789abcdef\",\"view_version\":2,\"lineage_id\":\"l\",\"covers_through\":{\"ordinal\":1,\"mid\":\"m1\"},\"ranges\":[{\"kind\":\"replace\",\"from\":0,\"to\":1,\"bytes\":\"[]\"},{\"kind\":\"keep\",\"from\":1,\"to\":2}],\"digest\":\"00\"}","choice":{"kind":"applied"}}"#,
+    r#"{"type":"compaction_view_applied","provider":"mc","view_version":3,"view":"{\"session_ref\":\"0123456789abcdef0123456789abcdef\",\"view_version\":3,\"lineage_id\":\"l\",\"covers_through\":{\"ordinal\":0,\"mid\":\"m0\"},\"ranges\":[{\"kind\":\"replace\",\"from\":0,\"to\":0,\"bytes\":\"[]\"},{\"kind\":\"keep\",\"from\":0,\"to\":1}],\"digest\":\"00\"}","choice":{"kind":"companion","edit":"strip_signed_reasoning","strip":{"from_ordinal":0,"to_ordinal":4}}}"#,
+    r#"{"type":"compaction_notice","seq":1,"headers":{"est_tokens":"10","lineage_id":"l","model":"m","seq":"1","session_ref":"0123456789abcdef0123456789abcdef","through_digest":"00","through_ordinal":"0"}}"#,
+    r#"{"type":"compaction_message","provider":"mc","kind":"setup","compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[],"sha256":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","ceiling":"{\"at_share\":0.8,\"wait_ms\":1000}"}"#,
+];
+
+#[test]
+fn asynchronous_compaction_records_keep_their_bytes_and_require_the_view_feature() {
+    use crate::framing::{encode, GATED_FRAMING_VERSION};
+    for pinned in COMPACTION_VIEW_PINNED {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+        let required = record.required_features();
+        assert!(
+            required.contains(&crate::framing::COMPACTION_VIEW_FEATURE),
+            "{pinned}: {required:?}"
+        );
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION, "{pinned}");
+    }
+}
+
 /// The pinned list covers every kind this build can write, so no kind's bytes can drift
 /// without a test failing. `Unknown`, the placeholder for a kind this build does not know, is
 /// never written.
@@ -422,6 +451,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(DELIVERY_ORDER_PINNED.iter().copied())
         .chain(INPUT_CAP_PINNED.iter().copied())
         .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
+        .chain(COMPACTION_VIEW_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -459,6 +489,8 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "compaction_message",
         "compaction_answer",
         "compaction_wait",
+        "compaction_view_applied",
+        "compaction_notice",
         "tool_call_deferred",
         "approval_recorded",
         "awaiting_approval",

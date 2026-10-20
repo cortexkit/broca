@@ -27,19 +27,6 @@ struct Inner {
     control: Option<std::path::PathBuf>,
     #[cfg(feature = "test-clock")]
     fixed: std::sync::Mutex<Option<u64>>,
-    #[cfg(all(test, feature = "test-clock"))]
-    refresh_probe: std::sync::Mutex<Option<RefreshProbe>>,
-}
-
-/// A one-shot test hook that stands in for the filesystem poller landing between two
-/// clock reads. Once a read returns `after_read_of`, the next read first refreshes from
-/// the control file. Timers read the clock and then subscribe to its changes, so a
-/// refresh between those steps of one timer and the next is otherwise a timing accident.
-#[cfg(all(test, feature = "test-clock"))]
-#[derive(Debug)]
-struct RefreshProbe {
-    after_read_of: u64,
-    seen: bool,
 }
 
 impl Default for Clock {
@@ -51,8 +38,6 @@ impl Default for Clock {
                 control: None,
                 #[cfg(feature = "test-clock")]
                 fixed: std::sync::Mutex::new(None),
-                #[cfg(all(test, feature = "test-clock"))]
-                refresh_probe: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -77,8 +62,6 @@ impl Clock {
                     changes: watch::channel(0).0,
                     control: Some(root.as_ref().join("test-clock")),
                     fixed: std::sync::Mutex::new(None),
-                    #[cfg(test)]
-                    refresh_probe: std::sync::Mutex::new(None),
                 }),
             };
             clock.refresh()?;
@@ -96,20 +79,7 @@ impl Clock {
     }
 
     pub fn now_ms(&self) -> u64 {
-        #[cfg(all(test, feature = "test-clock"))]
-        self.run_refresh_probe();
-        let now = self.read_now_ms();
-        #[cfg(all(test, feature = "test-clock"))]
-        if let Some(probe) = self
-            .inner
-            .refresh_probe
-            .lock()
-            .expect("clock probe lock")
-            .as_mut()
-        {
-            probe.seen |= now == probe.after_read_of;
-        }
-        now
+        self.read_now_ms()
     }
 
     fn read_now_ms(&self) -> u64 {
@@ -123,27 +93,6 @@ impl Clock {
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
             });
         real.saturating_add_signed(*self.inner.changes.borrow())
-    }
-
-    /// Arm a one-shot refresh from the control file. It runs at the start of the first
-    /// `now_ms` call after a call that returned `after_read_of`.
-    #[cfg(all(test, feature = "test-clock"))]
-    pub(crate) fn refresh_on_read_after(&self, after_read_of: u64) {
-        *self.inner.refresh_probe.lock().expect("clock probe lock") = Some(RefreshProbe {
-            after_read_of,
-            seen: false,
-        });
-    }
-
-    #[cfg(all(test, feature = "test-clock"))]
-    fn run_refresh_probe(&self) {
-        let mut probe = self.inner.refresh_probe.lock().expect("clock probe lock");
-        if probe.as_ref().is_some_and(|probe| probe.seen) {
-            *probe = None;
-            drop(probe);
-            self.refresh()
-                .expect("probe refresh reads the control file");
-        }
     }
 
     /// Timers and the sweep must recompute their deadlines when this watch changes.
@@ -206,11 +155,10 @@ impl Clock {
         }))
     }
 
+    /// `refresh`, calling `probe` after the control file is read and before the read is applied.
+    /// `probe` is passed whether the refresh holds the clock's lock at that moment.
     #[cfg(all(test, feature = "test-clock"))]
-    pub(crate) fn refresh_with_read_probe(
-        &self,
-        probe: impl FnOnce(bool),
-    ) -> std::io::Result<bool> {
+    fn refresh_with_read_probe(&self, probe: impl FnOnce(bool)) -> std::io::Result<bool> {
         self.refresh_with_reader(|path| {
             let bytes = std::fs::read(path);
             let serialized = self.inner.fixed.try_lock().is_err();
@@ -237,6 +185,51 @@ impl Clock {
 
 #[cfg(test)]
 mod tests {
+    /// The poller's refresh and admission's refresh run concurrently. A poller read taken
+    /// before the harness installs its fixed clock must not be applied after admission has
+    /// installed it, or the clock would go back to real time. The refresh holds the clock's
+    /// lock from its read to its application, so admission's refresh waits for the older one
+    /// and then applies the newer file.
+    #[cfg(feature = "test-clock")]
+    #[test]
+    fn a_held_refresh_read_cannot_put_the_clock_back_in_real_time() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("clock-refresh-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("test-clock");
+        let clock = super::Clock::for_state_root(&root).unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let poll_clock = clock.clone();
+        let poll = std::thread::spawn(move || {
+            poll_clock.refresh_with_read_probe(|serialized| {
+                // Hold the poller's read of the absent file, as when it runs before the
+                // harness writes its clock.
+                read_tx.send(serialized).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release the held clock read");
+            })
+        });
+        let serialized = read_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the poller read the absent clock file");
+        assert!(
+            serialized,
+            "a refresh must hold the clock lock from its read until it applies it"
+        );
+        std::fs::write(&path, r#"{"now_ms":0}"#).unwrap();
+        let admission_clock = clock.clone();
+        let admission = std::thread::spawn(move || admission_clock.refresh());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        poll.join().unwrap().unwrap();
+        admission.join().unwrap().unwrap();
+        assert_eq!(clock.now_ms(), 0, "the fixed clock stays installed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]
