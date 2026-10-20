@@ -30,7 +30,7 @@ fn run_config(max_tokens: u32) -> RunConfig {
         tools: vec![].into(),
         tool_choice: ToolChoice::Auto,
         generation: GenerationConfig {
-            max_output_tokens: Some(max_tokens),
+            max_output_tokens: Some(u64::from(max_tokens)),
             ..Default::default()
         },
         response_format: Default::default(),

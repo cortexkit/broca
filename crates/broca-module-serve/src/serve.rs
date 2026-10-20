@@ -59,8 +59,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_CAP_INSTALL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT,
-    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SPEND_DELTA,
-    OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
+    OP_SPEND_DELTA, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, CapInstallParams, CapMutationResult, FromWireExt, ImportParams, ImportResult,
@@ -2154,6 +2154,35 @@ where
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
+        OP_SEND_STATUS => {
+            let params: broca_wire::SendStatusRequest =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            broca_wire::failing_field::<broca_wire::SendStatusRequest>(
+                                &req.params,
+                                &error,
+                            ),
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            let run_id = run_id_for_send(&session, Some(&params.send_id));
+            match handler
+                .send_status(&session, run_id, &params.send_id, bind.principal.as_ref())
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         OP_SEND => {
             if req
                 .params
@@ -2178,6 +2207,18 @@ where
                 &req.params,
                 &session.harness,
             );
+            if let Err(field) = broca_wire::check_run_parameters(&req.params) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.clone()),
+                    &format!("invalid {field}"),
+                )
+                .await;
+            }
             let mut params: SendParams = match serde_json::from_value(req.params.clone()) {
                 Ok(p) => p,
                 Err(e) => {
@@ -3306,6 +3347,7 @@ async fn send_serve_error(
         ServeError::InvalidParams { .. } => broca_wire::INVALID_PARAMS,
         ServeError::LineageChanged { .. } => broca_wire::LINEAGE_CHANGED,
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
+        ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND,
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN,
         ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. } => {
             // Callers branch on these bodies, so they are sent exactly as the broca-wire types
@@ -4867,10 +4909,18 @@ mod tests {
     /// A transcript served two messages per page, so `session.resolve` has to page.
     struct PagedTranscript {
         messages: Vec<broca_protocol::Message>,
+        tag_location: Option<broca_core::TagLocation>,
     }
 
     #[async_trait::async_trait]
     impl ServeHandler for PagedTranscript {
+        async fn tag_location(
+            &self,
+            _session: &BrocaBindIdentity,
+            _tag: u64,
+        ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+            Ok(self.tag_location)
+        }
         async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
             unimplemented!()
         }
@@ -4970,6 +5020,7 @@ mod tests {
     async fn resolve_answers_a_parts_stored_text_whole_or_by_character_range() {
         use broca_protocol::Role;
         let handler = PagedTranscript {
+            tag_location: None,
             messages: vec![
                 tagged_text(Role::User, &["first"], &[1]),
                 tagged_text(Role::Assistant, &["answer"], &[2]),
@@ -5019,6 +5070,37 @@ mod tests {
         }
         let unknown = resolve(4, None).await.unwrap().unwrap_err();
         assert_eq!(unknown.0, broca_wire::UNKNOWN_TAG);
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_current_lineage_locations_and_refuses_left_tags() {
+        let handler = PagedTranscript {
+            messages: vec![tagged_text(
+                broca_protocol::Role::User,
+                &["carried", "new"],
+                &[2, 5],
+            )],
+            // A lookup made before the read repaired an old lineage's projection.
+            tag_location: Some(broca_core::TagLocation {
+                found: Some((3, 0)),
+                indexed_through: 4,
+            }),
+        };
+        let session = BrocaBindIdentity::new("/tmp/project", "runner", "current-lineage");
+        let carried = handler
+            .resolve(&session, &broca_wire::ResolveParams::new("§2§"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(carried.content, "carried");
+        assert_eq!(carried.ordinal, 0);
+        assert_eq!(carried.mid, "m0");
+        let absent = handler
+            .resolve(&session, &broca_wire::ResolveParams::new("§3§"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(absent.0, broca_wire::UNKNOWN_TAG);
     }
 
     #[test]

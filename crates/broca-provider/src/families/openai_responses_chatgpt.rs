@@ -131,6 +131,7 @@ impl WireFamily for OpenAiResponsesChatgpt {
         body["store"] = serde_json::Value::Bool(false);
         // The codex backend rejects platform-only output and sampling controls as unsupported.
         // They must be absent rather than defaulted, even when the caller supplied them.
+        // Because ChatGPT cannot enforce that cap, broca does not declare max_output_tokens.
         if let Some(obj) = body.as_object_mut() {
             for field in ["max_output_tokens", "temperature", "top_p"] {
                 obj.remove(field);

@@ -196,11 +196,22 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
     );
     assert_eq!(result(&restarted), expected);
 
+    let status_frame = rig
+        .request(
+            7,
+            serde_json::json!({"method": "send.status", "params": {"send_id": "note"}}),
+        )
+        .await;
+    pin_resend(&status_frame, "send_status.step.json", &joined);
     // The re-send after the restart answers the run the send joined, with the
     // `step` receipt, never `pending`.
     let resent_frame = rig
         .send_with("note", "also this", None, steer_or_idle_start())
         .await;
+    assert_eq!(
+        resent_frame.body, status_frame.body,
+        "send.status is the same bytes as a re-send"
+    );
     pin_resend(
         &resent_frame,
         "send_reply.ordered_resend_step.json",
@@ -279,9 +290,20 @@ async fn an_ordered_send_that_starts_its_own_run_answers_that_run() {
         status.body,
         "the same answer after a restart"
     );
+    let status_frame = rig
+        .request(
+            7,
+            serde_json::json!({"method": "send.status", "params": {"send_id": "later"}}),
+        )
+        .await;
+    pin_resend(&status_frame, "send_status.turn.json", &provisional);
     let resent_frame = rig
         .send_with("later", "and then", None, steer_or_idle_start())
         .await;
+    assert_eq!(
+        resent_frame.body, status_frame.body,
+        "send.status is the same bytes as a re-send"
+    );
     pin_resend(
         &resent_frame,
         "send_reply.ordered_resend_turn.json",
@@ -298,8 +320,12 @@ async fn an_ordered_send_that_starts_its_own_run_answers_that_run() {
 fn pin_resend(frame: &Frame, file: &str, run_id: &str) {
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         let body = String::from_utf8(frame.body.to_vec()).expect("UTF-8 reply");
-        std::fs::write(golden_path(file), body.replace(run_id, "@RUN_ID@"))
-            .expect("write the re-send golden");
+        let body = if run_id.is_empty() {
+            body
+        } else {
+            body.replace(run_id, "@RUN_ID@")
+        };
+        std::fs::write(golden_path(file), body).expect("write the re-send golden");
     }
     assert_golden(frame, file, run_id);
 }
@@ -365,5 +391,92 @@ async fn an_undelivered_send_answers_its_terminal_state_across_a_restart() {
             "after the restart"
         );
     }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn send_status_writes_nothing_and_never_opens_a_closed_actor() {
+    let mut rig = Rig::start_with_idle_ttl("send-status-read-only", IDLE_TTL).await;
+    let before = rig.wal_bytes();
+    let reply = rig
+        .request(
+            7,
+            serde_json::json!({"method": "send.status", "params": {"send_id": "absent"}}),
+        )
+        .await;
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(
+        rig.wal_bytes(),
+        before,
+        "even an unknown send must not create a WAL"
+    );
+    rig.script.push(&[Step::Text("done")]);
+    rig.send("first", "hi", None).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_closed().await;
+    rig = rig.restart().await;
+    let before = rig.wal_bytes();
+    let reply = rig
+        .request(
+            7,
+            serde_json::json!({"method": "send.status", "params": {"send_id": "first"}}),
+        )
+        .await;
+    assert_eq!(result(&reply)["state"], "finished");
+    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(
+        rig.registry().slot_counts().open,
+        0,
+        "polling a closed session must not reopen it"
+    );
+    assert_eq!(started_runs(&rig.records()).len(), 1);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn send_status_unknown_send_is_terminal_and_strict() {
+    let mut rig = Rig::start_with_idle_ttl("send-status-unknown", IDLE_TTL).await;
+    rig.send("known", "hi", None).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_closed().await;
+    rig = rig.restart().await;
+    let reply = rig
+        .request(
+            7,
+            serde_json::json!({"method": "send.status", "params": {"send_id": "absent"}}),
+        )
+        .await;
+    pin_resend(&reply, "send_status.unknown_send.json", "");
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(error["code"], "unknown_send");
+    let reply = rig.request(7, serde_json::json!({"method": "send.status", "params": {"send_id": "known", "typo": true}})).await;
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["code"], "invalid_params");
+    assert_eq!(error["detail"]["field"], "typo");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn send_status_pending_answers_resend_bytes_after_restart() {
+    let mut rig = Rig::start_with_idle_ttl("send-status-pending", IDLE_TTL).await;
+    rig.send("first", "hi", None).await;
+    rig.wait_for_finished(1).await;
+    let extra = serde_json::json!({"delivery": ["steer"]});
+    let pending = rig.send_with("waiting", "wait", None, extra.clone()).await;
+    let provisional = provisional_run_id(&pending);
+    rig.wait_closed().await;
+    rig = rig.restart().await;
+    let reply = rig
+        .request(
+            7,
+            serde_json::json!({"method": "send.status", "params": {"send_id": "waiting"}}),
+        )
+        .await;
+    pin_resend(&reply, "send_status.pending.json", &provisional);
+    assert_eq!(reply.body, pending.body);
+    assert_eq!(rig.registry().slot_counts().open, 0);
+    let resend = rig.send_with("waiting", "wait", None, extra).await;
+    assert_eq!(reply.body, resend.body);
     rig.finish().await;
 }

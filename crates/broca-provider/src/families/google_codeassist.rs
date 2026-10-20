@@ -223,15 +223,21 @@ fn normalize_antigravity_arch(arch: &str) -> &str {
     }
 }
 
-/// Apply Antigravity's model-resolver defaults after the shared Gemini request is built. An
-/// explicit caller cap wins unless it exceeds the tier ceiling; omission selects the tier default.
-/// Both the resolved tier and caller intent are frozen, so resume makes the same decision without
-/// consulting a mutable route table.
+/// Apply Antigravity's model-resolver defaults after the shared Gemini request is built.
+/// An explicit cap is bounded by both admission's model maximum and the tier ceiling;
+/// omission retains the tier default. All three inputs are frozen for resume.
 fn apply_antigravity_generation_defaults(body: &mut Value, frozen: &FrozenRenderConfig) {
     if let Some(tier_ceiling) = antigravity_max_output_tokens(&frozen.wire_model_id) {
         let max_output_tokens = frozen
             .caller_max_output_tokens
-            .map_or(tier_ceiling, |explicit| explicit.min(tier_ceiling));
+            .map_or(tier_ceiling, |explicit| {
+                let capped = explicit.min(tier_ceiling);
+                if frozen.renderer_version >= 7 {
+                    capped.min(frozen.max_output_tokens)
+                } else {
+                    capped
+                }
+            });
         body["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
     }
     if let Some(tier) = antigravity_tier(&frozen.wire_model_id) {

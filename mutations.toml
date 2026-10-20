@@ -17777,13 +17777,14 @@ new = '''            | WalRecord::Retracted { .. }
 id = "delivery-order-retry-reports-run-state"
 guards = "a keyed retry of a delivered ordered send reports the delivered run's current state, finished once it ended"
 runner = "cargo"
+select = "expected"
 package = "broca-module"
 target = "--test it"
 test_file = "crates/broca-module/tests/it/delivery_order.rs"
 expect_red = ["delivery_order::a_keyed_retry_reports_the_delivered_runs_state_and_keeps_its_order"]
-file = "crates/broca-module/src/actor.rs"
-old = "Ok(Some(state)) => match indexed_finish_reason(&state.state) {"
-new = "Ok(Some(state)) => match None::<broca_protocol::RunFinishReason>.filter(|_| indexed_finish_reason(&state.state).is_some()) { // NON-VACUITY BREAK: report a finished run as active"
+file = "crates/broca-module/src/send_fate.rs"
+old = "    if let Some(reason) = indexed_finish_reason(&state.state) {"
+new = "    if let Some(reason) = indexed_finish_reason(&state.state).filter(|_| false) { // NON-VACUITY BREAK: report a finished run as active"
 
 [[control]]
 id = "runner-tags-steer-delivery-carries-its-record-tags"
@@ -18651,3 +18652,101 @@ expect_red = ["compaction::tests::ceiling_tests::a_smaller_view_can_lower_a_usag
 file = "crates/broca-core/src/compaction.rs"
 old = "if rendered_bytes < bytes {"
 new = "if false && rendered_bytes < bytes { // NON-VACUITY BREAK"
+
+[[control]]
+id = "send-status-read-only"
+guards = "send.status writes no WAL and never opens an actor, even for an unrecorded send"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/it/provisional_run_status.rs"
+expect_red = ["provisional_run_status::send_status_writes_nothing_and_never_opens_a_closed_actor"]
+expect_message = "even an unknown send must not create a WAL"
+file = "crates/broca-module/src/serve.rs"
+old = "        self.check_expired(session, Some(&own_run.0)).await?;"
+new = "        self.actor_for(session).await?; // NON-VACUITY BREAK: open an actor during a read."
+
+[[control]]
+id = "send-status-resend-bytes"
+guards = "send.status has the identical durable receipt bytes as a re-send after restart"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/it/provisional_run_status.rs"
+expect_red = ["provisional_run_status::a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart"]
+expect_message = "the reply bytes pinned in send_status.step.json"
+file = "crates/broca-module/src/serve.rs"
+old = '''        Ok(broca_wire::SendReplyWire {
+            result,
+            baseline,
+            delivered,
+        })'''
+new = '''        Ok(broca_wire::SendReplyWire {
+            result,
+            baseline,
+            delivered: delivered.filter(|_| false), // NON-VACUITY BREAK: discard the poll's receipt.
+        })'''
+
+[[control]]
+id = "send-status-unknown-refused"
+guards = "An unrecorded send_id is refused unknown_send, never invented as pending"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/it/provisional_run_status.rs"
+expect_red = ["provisional_run_status::send_status_unknown_send_is_terminal_and_strict"]
+expect_message = "the reply bytes pinned in send_status.unknown_send.json"
+file = "crates/broca-module/src/serve.rs"
+old = "            .ok_or(ServeError::UnknownSend)?;"
+new = '''            .unwrap_or_else(|| crate::actor::SendOutcome::Pending {
+                submission_id: broca_protocol::SubmissionId(format!("sub-{}", own_run.0)),
+            }); // NON-VACUITY BREAK: invent a send the caller never submitted.'''
+
+[[control]]
+id = "plan-later-tools-refused"
+guards = "Any explicit later plan-session tools are refused by field before queue, steer or interrupt writes"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::later_plan_tools_are_refused_in_every_delivery_without_writes"]
+file = "crates/broca-module/src/actor.rs"
+old = "        if request.tools.is_some() {"
+new = "        if false && request.tools.is_some() { // NON-VACUITY BREAK: bypass frozen plan tools refusal."
+
+[[control]]
+id = "send-zero-output-limit-refused"
+guards = "A zero output limit is refused invalid_params with its exact field before writing"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
+expect_red = ["send_delivery::invalid_run_limits_are_refused_by_field_without_writes"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    request.max_output_tokens()?;"
+new = "    let _ = request.max_output_tokens(); // NON-VACUITY BREAK: accept zero output tokens."
+
+[[control]]
+id = "catalog-explicit-cap-resume-keeps-admission"
+guards = "A resumed episode retains its admission-frozen output cap despite an explicit caller cap and a changed catalog maximum"
+runner = "cargo"
+select = "expected"
+package = "broca-catalog"
+target = "--test explicit_cap_resume"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/explicit_cap_resume.rs"
+expect_red = ["gated::an_explicit_cap_resumes_unchanged_after_the_catalog_maximum_moves"]
+expect_message = "a resume must retain the cap frozen at admission"
+file = "crates/broca-catalog/src/live.rs"
+old = "        restored_max_tokens.unwrap_or_else(|| {"
+new = "        restored_max_tokens.filter(|_| caller_max_tokens.is_none()).unwrap_or_else(|| { // NON-VACUITY BREAK: re-clamp an explicit cap on resume."

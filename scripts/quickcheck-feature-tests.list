@@ -3,6 +3,7 @@
 broca-catalog|code_assist_variant_resume|broca-catalog/live|crates/broca-catalog/tests/code_assist_variant_resume.rs|a_resume_keeps_the_frozen_tier_after_the_alias_row_is_withdrawn|Checks catalog resume rendering without network or daemon access.
 # Runs the output-ceiling suite with the same live feature as the full gate.
 broca-catalog|default_max_output|broca-catalog/live|crates/broca-catalog/tests/default_max_output.rs|an_omitted_cap_freezes_the_models_catalog_output_limit|Pins catalog output-cap behavior against local fixture data.
+broca-catalog|explicit_cap_resume|broca-catalog/live|crates/broca-catalog/tests/explicit_cap_resume.rs|an_explicit_cap_resumes_unchanged_after_the_catalog_maximum_moves|Checks explicit-cap resume stability after a live catalog maximum changes.
 # Runs the feature-gated reasoning variants suite when its package changes.
 broca-catalog|reasoning_variants|broca-catalog/live|crates/broca-catalog/tests/reasoning_variants.rs|served_options_keep_null_empty_and_populated_as_three_states|Checks local reasoning option fixtures without provider calls.
 broca-catalog|reasoning_routes|broca-catalog/live|crates/broca-catalog/tests/reasoning_routes.rs|xai_reasoning_route_is_stateless_responses|Checks stateless reasoning routes and frozen legacy Chat resumes without network or credentials.

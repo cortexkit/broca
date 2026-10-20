@@ -2481,3 +2481,59 @@ async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
+    let (mut rig, admitter) = plan_rig("later-plan-tools").await;
+    let plan = vector("plans/broca-head-no-compaction.json");
+    rig.script.hold_model(true);
+    send_plan(&mut rig, 7, "first", "freeze plan", Some(&plan), json!({})).await;
+    rig.wait_entered().await;
+    let calls = admitter.calls();
+    let identical = rig
+        .records()
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted { config, .. } => {
+                Some(serde_json::to_value(config.tools.as_ref()).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    for (index, tools) in [json!([]), identical].into_iter().enumerate() {
+        for delivery in ["queue", "steer", "interrupt"] {
+            for repeat_plan in [false, true] {
+                let before = rig.wal_bytes();
+                let reply = send_plan(
+                    &mut rig,
+                    7,
+                    &format!("{index}-{delivery}-{repeat_plan}"),
+                    "change tools",
+                    repeat_plan.then_some(&plan),
+                    json!({"tools": tools, "delivery": delivery}),
+                )
+                .await;
+                assert_eq!(error_body(&reply)["code"], "invalid_params");
+                assert_eq!(error_body(&reply)["detail"]["field"], "tools");
+                assert_eq!(rig.wal_bytes(), before, "refused tools must write nothing");
+                assert_eq!(admitter.calls(), calls, "no provider fetch on refusal");
+            }
+        }
+    }
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    let before = rig.wal_bytes();
+    let reply = send_plan(
+        &mut rig,
+        7,
+        "idle",
+        "change tools",
+        None,
+        json!({"tools": []}),
+    )
+    .await;
+    assert_eq!(error_body(&reply)["code"], "invalid_params");
+    assert_eq!(error_body(&reply)["detail"]["field"], "tools");
+    assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}

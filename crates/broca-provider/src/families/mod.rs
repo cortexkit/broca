@@ -321,10 +321,14 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
                 NotReproducible("v4 normalizes model-visible tool names at the render edge"),
             ),
         ],
-        WireFamilyId::BedrockConverse => &[(
-            1,
-            NotReproducible("v2 normalizes model-visible tool names at the render edge"),
-        )],
+        WireFamilyId::BedrockConverse => &[
+            (
+                1,
+                NotReproducible("v2 normalizes model-visible tool names at the render edge"),
+            ),
+            // Older versions retain their per-call cap behavior when replayed.
+            (2, Reproducible),
+        ],
         WireFamilyId::OpenAiResponses => &[
             (
                 1,
@@ -382,6 +386,8 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             ),
             // v6 retains signed text parts only under `provider_text_state`, which v5 configs lack.
             (5, Reproducible),
+            // v7 applies the model bound only to newly frozen requests.
+            (6, Reproducible),
         ],
         WireFamilyId::OpenAiResponsesChatgpt => &[
             (
@@ -733,7 +739,8 @@ pub fn openai_chat_frozen_config(wire_model_id: impl Into<String>) -> FrozenRend
 /// rendered request shape — a change means a resume can't reproduce the original
 /// bytes.
 /// v2: normalize model-visible tool names at the render edge.
-pub const BEDROCK_RENDERER_VERSION: u32 = 2;
+/// v3: bound new per-call output limits by the frozen model maximum; retain v2 replay bytes.
+pub const BEDROCK_RENDERER_VERSION: u32 = 3;
 
 /// Default AWS region used by the convenience Bedrock frozen config. Real provider
 /// specs resolve the region from `AuthKind::SigV4`.
@@ -822,7 +829,8 @@ pub fn frozen_config_for_family(
 /// v5: preserve an explicit caller output-token cap, clamped only to the Antigravity tier ceiling.
 /// v6: retain signed text parts through the shared Gemini codec. Session identity is an opt-in
 /// frozen field within v6: its absence keeps all earlier bytes.
-pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 6;
+/// v7: explicit output limits also retain admission's catalog bound; older versions replay unchanged.
+pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 7;
 
 /// Build the frozen render config for Google Antigravity / Code-Assist. The inner request
 /// body follows Gemini's rendering rules; the cloud project id is not known when reading the

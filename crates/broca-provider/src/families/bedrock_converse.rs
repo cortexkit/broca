@@ -542,13 +542,16 @@ fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
 
 fn convert_inference_config(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
     let mut config = Map::new();
-    config.insert(
-        "maxTokens".to_string(),
-        json!(opts
-            .generation
-            .max_output_tokens
-            .unwrap_or(frozen.max_output_tokens)),
-    );
+    let requested = opts
+        .generation
+        .max_output_tokens
+        .unwrap_or(u64::from(frozen.max_output_tokens));
+    let effective = if frozen.renderer_version >= 3 {
+        requested.min(u64::from(frozen.max_output_tokens))
+    } else {
+        requested
+    };
+    config.insert("maxTokens".to_string(), json!(effective));
     if let Some(temperature) = opts.generation.temperature {
         config.insert("temperature".to_string(), json!(temperature));
     }
@@ -1518,6 +1521,24 @@ fn test_string_header(out: &mut Vec<u8>, name: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_cap_keeps_model_bound_and_legacy_replay_bytes() {
+        let mut frozen = crate::families::bedrock_frozen_config("model");
+        frozen.max_output_tokens = 100;
+        let mut opts = broca_protocol::CallOptions::new(vec![]);
+        std::sync::Arc::make_mut(&mut opts.generation).max_output_tokens = Some(u64::MAX);
+        assert_eq!(
+            super::convert_inference_config(&frozen, &opts)["maxTokens"],
+            serde_json::json!(100)
+        );
+        frozen.renderer_version = 2;
+        std::sync::Arc::make_mut(&mut opts.generation).max_output_tokens = Some(200);
+        assert_eq!(
+            super::convert_inference_config(&frozen, &opts)["maxTokens"],
+            serde_json::json!(200)
+        );
+    }
+
     use super::*;
     use crate::families::bedrock_frozen_config_with_region;
 

@@ -319,6 +319,27 @@ fn gemini_3_5_flash_tier_clamps_an_explicit_output_limit_to_its_ceiling() {
 }
 
 #[test]
+fn antigravity_explicit_output_limit_keeps_the_catalog_bound() {
+    let mut frozen = google_codeassist_frozen_config("gemini-3.5-flash-low");
+    frozen.project_id = Some("encouraging-env-qwp21".into());
+    frozen.max_output_tokens = 32_000;
+    frozen.caller_max_output_tokens = Some(100_000);
+    let rendered: serde_json::Value =
+        serde_json::from_slice(&GoogleCodeAssist.render(&frozen, &fixed_request())).unwrap();
+    assert_eq!(
+        rendered["request"]["generationConfig"]["maxOutputTokens"],
+        json!(32_000)
+    );
+    frozen.renderer_version = 6;
+    let legacy: serde_json::Value =
+        serde_json::from_slice(&GoogleCodeAssist.render(&frozen, &fixed_request())).unwrap();
+    assert_eq!(
+        legacy["request"]["generationConfig"]["maxOutputTokens"],
+        json!(65_536)
+    );
+}
+
+#[test]
 fn gemini_3_flash_tier_uses_thinking_level_without_a_budget() {
     let mut frozen = google_codeassist_frozen_config("gemini-3-flash-medium");
     frozen.project_id = Some("encouraging-env-qwp21".into());

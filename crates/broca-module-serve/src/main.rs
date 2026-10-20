@@ -3779,7 +3779,12 @@ mod executor {
             let resolved = match resolve_provider_for_episode(
                 &model_id,
                 self.provider_base_url.as_deref(),
-                job.req.generation.max_output_tokens,
+                // Renderers use u32 caps; saturation preserves the caller's u64 in the
+                // admitted identity while never raising the effective request bound.
+                job.req
+                    .generation
+                    .max_output_tokens
+                    .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
                 &resolution,
                 &resolve_options,
                 self.provider_client.clone(),

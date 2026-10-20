@@ -594,13 +594,10 @@ pub struct EpisodeRenderConfig<'a> {
     pub base_url: Option<&'a str>,
     /// The output cap recorded when this episode started, fed back on resume.
     ///
-    /// When a send sets no cap, the default comes from the catalog's `limit.output`, and that
-    /// fact moves with ordinary upstream churn (1,692 changes across 685 models in 44 days when
-    /// it was measured). Re-deriving it on resume would make the frozen-config drift guard
-    /// refuse resumes that nobody changed anything about, so the default is an episode input
-    /// frozen once, restored here the same way the recorded host is. It applies only when the
-    /// resuming send has no cap of its own; an explicit cap still wins, and a different
-    /// explicit cap still shows up as drift.
+    /// Both a default cap and an explicit request/catalog minimum are frozen admission
+    /// inputs. Restore this value unconditionally, even if the resuming send repeats an
+    /// explicit cap: re-clamping against a changed catalog would alter the episode's
+    /// render config and make the drift guard refuse an otherwise unchanged resume.
     pub max_output_tokens: Option<u32>,
     /// The variant this episode froze at start, fed back on resume and applied as recorded.
     /// It is never re-derived from the catalog, so a catalog change since admission cannot move
@@ -807,24 +804,20 @@ fn resolve_provider_inner(
         catalog_base_url,
         episode_render,
     } = context;
-    // The requested output cap, in precedence order:
-    //
-    // 1. The caller's explicit number, sent as given. There is no clamp to the model's
-    //    published limit in either direction: catalogs publish placeholder limits (output equal
-    //    to or above the context window on over a thousand rows), so a request larger than the
-    //    real limit goes to the provider and is refused there. That is worse for actionability
-    //    and better for correctness than silently rewriting what the caller asked for on the
-    //    strength of a number the upstream may not mean.
-    // 2. On a resume, the cap this episode froze at start (`episode_render.max_output_tokens`),
-    //    so a catalog value that moved since admission cannot trip the drift guard.
-    // 3. The model's own maximum from the catalog when it is a usable cap, else
-    //    the fallback bounded below a known context (see `default_max_output_tokens`). The mode
-    //    below decides which catalog limits are known; this closure applies the rule.
+    // Resume restores admission's cap, regardless of a repeated explicit request or a
+    // changed catalog maximum. Only a new episode computes the request/catalog minimum.
     let restored_max_tokens = episode_render.max_output_tokens;
     let max_tokens_for = |output_limit: Option<u64>, context_limit: Option<u64>| {
-        caller_max_tokens
-            .or(restored_max_tokens)
-            .unwrap_or_else(|| default_max_output_tokens(output_limit, context_limit))
+        restored_max_tokens.unwrap_or_else(|| {
+            caller_max_tokens.map_or_else(
+                || default_max_output_tokens(output_limit, context_limit),
+                |requested| {
+                    output_limit
+                        .filter(|limit| *limit > 0)
+                        .map_or(requested, |limit| u64::from(requested).min(limit) as u32)
+                },
+            )
+        })
     };
 
     if let Some(base_url) = base_url.filter(|s| !s.is_empty()) {

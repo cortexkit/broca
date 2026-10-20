@@ -493,6 +493,9 @@ impl Fixture {
     async fn send_new(&mut self, delivery: broca_protocol::Delivery) -> SendOutcome {
         let mut request = self.request.clone();
         request.input = text_req(&self.actor.key, "new").input;
+        // The session runs under a fetch plan, which owns its tools; a later send that names
+        // tools is refused before the ceiling check this fixture exists to reach.
+        request.tools = None;
         self.actor
             .on_send(
                 RunId("new".into()),

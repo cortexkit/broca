@@ -17,6 +17,9 @@ use crate::CursorWire;
 /// The role this module serves, as its manifest and `role.describe` spell it.
 pub const LLM_RUNNER_V1: &str = "llm-runner/v1";
 
+pub use cortexkit_role_llm_runner::ops::SEND_STATUS as OP_SEND_STATUS;
+pub use cortexkit_role_llm_runner::send_status::SendStatusRequest;
+
 pub const OP_ROLE_DESCRIBE: &str = "role.describe";
 pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
@@ -284,9 +287,12 @@ pub fn broca_role_describe_with_writers(
         "session.subscribe",
         "session.send",
         OP_SESSION_RESOLVE,
+        OP_SEND_STATUS,
     ]
     .map(String::from)
     .to_vec();
+    // ChatGPT rejects an output-cap field, so this runner cannot promise the
+    // max_output_tokens group across all of its model routes.
     let mut capabilities = [
         "transcript_reads",
         "run_ops",
@@ -304,6 +310,9 @@ pub fn broca_role_describe_with_writers(
         "session_class",
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
+        cortexkit_role_llm_runner::capabilities::SEND_STATUS,
+        cortexkit_role_llm_runner::capabilities::MAX_STEPS,
+        cortexkit_role_llm_runner::capabilities::NO_TOOLS,
         TAGS_CAPABILITY,
         RUN_TOOL_CALLS_GROUP,
         // `session.send` takes an ordered `delivery` list with `dedupe_key` and `expires_at_ms`.
@@ -767,6 +776,24 @@ mod pinned_reply_bytes {
     /// `role.describe` as this build answers it. The build identity is fixed here so a version
     /// bump does not move the pinned bytes.
     #[test]
+    fn send_status_and_enforceable_run_parameters_are_declared() {
+        use cortexkit_role_llm_runner::{capabilities, describe::check_describe};
+        let encoded = serde_json::to_value(broca_role_describe("test")).unwrap();
+        let role = check_describe(&encoded).unwrap();
+        for group in [
+            capabilities::SEND_STATUS,
+            capabilities::MAX_STEPS,
+            capabilities::NO_TOOLS,
+        ] {
+            assert!(role.declares(group), "{group}");
+        }
+        assert!(
+            !role.declares(capabilities::MAX_OUTPUT_TOKENS),
+            "ChatGPT cannot enforce an output cap"
+        );
+    }
+
+    #[test]
     fn role_describe_bytes_are_pinned() {
         assert_golden(
             broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true),
@@ -817,7 +844,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "147d2ede7aca640c5311480d00554faf1562c29945213348ff484512bcd04927",
+            "8ec810a98e63c6d3723550f37e3f215f7d85e754307cdda4f4603df326996e20",
         );
     }
 
@@ -971,7 +998,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "0340f57ca9016155e28eeef6712db615d95fd308bbdc93fc68f94a1a49bec4bd";
+        "220273da43c0af526fbf928ae41abae8539d8790b64a94a2e9229f7054c44a15";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
