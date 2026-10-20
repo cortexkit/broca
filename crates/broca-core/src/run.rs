@@ -6468,9 +6468,8 @@ async fn run_step<P: Provider>(
     })
 }
 
-/// Per-call plan after the capability + approval gates. Model tool-call ids may repeat within
-/// a turn; each call keeps its own source-order slot and durable intent key. A `NoDispatch` call's
-/// durable terminal is a `tool_no_dispatch` record; a `Synthetic` call
+/// Per-call plan after duplicate-id validation and the capability + approval gates. A
+/// `NoDispatch` call's durable terminal is a `tool_no_dispatch` record; a `Synthetic` call
 /// gets a `tool_result` without reaching the plane; and a `Dispatch` call gets an intent
 /// followed by a `tool_result`.
 enum CallPlan {
@@ -6706,6 +6705,13 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         // route is only ever opened under the scope this run was admitted under.
         scope: scope.cloned(),
     };
+    // Validate ids before making the batch durable. The first instance remains eligible for
+    // dispatch; later instances are represented by synthetic error results in source order.
+    let mut seen_call_ids = HashSet::new();
+    let duplicate_calls: Vec<bool> = calls
+        .iter()
+        .map(|call| !seen_call_ids.insert(call.tool_call_id.clone()))
+        .collect();
     // On resume, the batch may already be durable — re-writing tool_batch_started
     // would reset the batch if we crash and replay again, so skip it.
     if !resume
@@ -6764,7 +6770,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     // already has a durable terminal (resume) is Already — never re-gated/dispatched.
     let mut plan: Vec<CallPlan> = Vec::with_capacity(calls.len());
     let mut gating_stop = None;
-    for mut call in calls {
+    for (mut call, is_duplicate) in calls.into_iter().zip(duplicate_calls) {
         if emit_control_payloads {
             // Direct loop consumers observe proposed calls here. Module subscribers reconstruct
             // ToolCall from the durable ModelStepFinished record, so skipping this clone is safe
@@ -6785,6 +6791,13 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         }
         if gating_stop.is_some() {
             plan.push(CallPlan::Stopped(call.tool_call_id.clone()));
+            continue;
+        }
+        if is_duplicate {
+            plan.push(CallPlan::Synthetic {
+                result: Arc::new(error_result(&call, "duplicate tool_call_id from provider")),
+                reason: None,
+            });
             continue;
         }
         match &batch_refusal {
@@ -10876,6 +10889,7 @@ mod approval_gate {
                 .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
         });
         let mut slots = Vec::with_capacity(calls.len());
+        let mut seen = HashSet::new();
         for call in calls {
             if emit {
                 let _ = send(
@@ -10892,6 +10906,11 @@ mod approval_gate {
                 Slot::Ready(Some(CallPlan::Already(result)))
             } else if let Some(prepared) = held.remove(&call.tool_call_id) {
                 Slot::Held(prepared)
+            } else if !seen.insert(call.tool_call_id.clone()) {
+                Slot::Ready(Some(CallPlan::Synthetic {
+                    result: Arc::new(error_result(&call, "duplicate tool_call_id from provider")),
+                    reason: None,
+                }))
             } else if is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) {
                 Slot::Ready(Some(CallPlan::Stopped(call.tool_call_id)))
             } else if let Err(error) = &start {

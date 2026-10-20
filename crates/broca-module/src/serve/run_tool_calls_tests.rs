@@ -155,6 +155,89 @@ impl ClosedSession {
         }
     }
 
+    fn write_duplicate_id_tool_turn(&mut self) {
+        let call_id = ToolCallId("duplicate-id".into());
+        let calls = [
+            ToolCall {
+                tool_call_id: call_id.clone(),
+                tool_name: "write_file".into(),
+                input: json!({"path":"first"}),
+                thought_signature: None,
+            },
+            ToolCall {
+                tool_call_id: call_id.clone(),
+                tool_name: "write_file".into(),
+                input: json!({"path":"duplicate"}),
+                thought_signature: None,
+            },
+        ];
+        let step_id = StepId(1);
+        let batch_id = BatchId("batch-duplicate-id".into());
+        self.append(WalRecord::ModelStepFinished {
+            step_id,
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("assistant-duplicate-id".into()),
+                content: calls.iter().cloned().map(ContentBlock::ToolCall).collect(),
+            }),
+            usage: Usage::default(),
+            finish_reason: Some(broca_protocol::content::FinishReason::ToolCalls),
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+            hooks: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id,
+            planned_calls: vec![call_id.clone(), call_id.clone()],
+        });
+        self.append(WalRecord::ToolDispatchIntent {
+            batch_id: batch_id.clone(),
+            tool_call_id: call_id.clone(),
+            tool_name: Some("write_file".into()),
+            args: Arc::new(calls[0].input.clone()),
+            module_id: Some("test-tools".into()),
+            schema_pin: None,
+            hooks: None,
+            approval_digest: None,
+            call_key: None,
+        });
+        self.append(WalRecord::ToolResult {
+            batch_id: batch_id.clone(),
+            result: Arc::new(ToolResult {
+                tool_call_id: call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "first call ran".into(),
+                },
+                is_error: false,
+            }),
+            outcome: DispatchOutcome::Completed,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolResult {
+            batch_id: batch_id.clone(),
+            result: Arc::new(ToolResult {
+                tool_call_id: call_id,
+                output: ToolOutput::Error {
+                    message: "duplicate tool_call_id from provider".into(),
+                },
+                is_error: true,
+            }),
+            outcome: DispatchOutcome::Completed,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+            tags: None,
+        });
+        self.append(WalRecord::ToolBatchFinished { batch_id });
+    }
+
     fn finish(&mut self) {
         self.append(WalRecord::RunFinished {
             reason: RunFinishReason::Completed,
@@ -218,6 +301,30 @@ async fn run_tool_calls_pages_by_count_and_reads_a_closed_session_from_wal_only(
     assert!(third.next.is_none());
     assert_eq!(first.calls[0].outcome, outcomes::SUCCEEDED);
     assert!(first.calls[0].result_bytes.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn run_tool_calls_lists_duplicate_id_with_its_synthetic_error_result() {
+    let mut session = ClosedSession::new("duplicate-id");
+    session.write_duplicate_id_tool_turn();
+    session.finish();
+    session.close_writer();
+
+    let page = session.page(ToolCallsRequest::new("run-1")).await;
+    assert_eq!(page.calls.len(), 2);
+    assert_eq!(page.calls[0].tool_call_id, "duplicate-id");
+    assert_eq!(page.calls[0].args, json!({"path":"first"}));
+    assert_eq!(page.calls[0].outcome, outcomes::SUCCEEDED);
+    assert!(page.calls[0].call_key.is_some());
+    assert_eq!(page.calls[0].dispatched_to.as_deref(), Some("test-tools"));
+
+    let duplicate = &page.calls[1];
+    assert_eq!(duplicate.tool_call_id, "duplicate-id");
+    assert_eq!(duplicate.args, json!({"path":"duplicate"}));
+    assert_eq!(duplicate.outcome, outcomes::REFUSED);
+    assert!(duplicate.call_key.is_none());
+    assert!(duplicate.dispatched_to.is_none());
+    assert!(duplicate.result_bytes.is_some_and(|bytes| bytes > 0));
 }
 
 #[tokio::test]
