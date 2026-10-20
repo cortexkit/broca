@@ -18222,3 +18222,18 @@ expect_red = ["send_delivery::invalid_run_limits_are_refused_by_field_without_wr
 file = "crates/broca-wire/src/lib.rs"
 old = "    request.max_output_tokens()?;"
 new = "    let _ = request.max_output_tokens(); // NON-VACUITY BREAK: accept zero output tokens."
+
+[[control]]
+id = "catalog-explicit-cap-resume-keeps-admission"
+guards = "A resumed episode retains its admission-frozen output cap despite an explicit caller cap and a changed catalog maximum"
+runner = "cargo"
+select = "expected"
+package = "broca-catalog"
+target = "--test explicit_cap_resume"
+features = ["live"]
+test_file = "crates/broca-catalog/tests/explicit_cap_resume.rs"
+expect_red = ["gated::an_explicit_cap_resumes_unchanged_after_the_catalog_maximum_moves"]
+expect_message = "a resume must retain the cap frozen at admission"
+file = "crates/broca-catalog/src/live.rs"
+old = "        restored_max_tokens.unwrap_or_else(|| {"
+new = "        restored_max_tokens.filter(|_| caller_max_tokens.is_none()).unwrap_or_else(|| { // NON-VACUITY BREAK: re-clamp an explicit cap on resume."

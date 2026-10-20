@@ -270,7 +270,7 @@ mod gated {
     }
 
     #[test]
-    fn a_restored_episode_cap_wins_over_the_catalog_but_not_over_the_caller() {
+    fn a_restored_episode_cap_wins_over_the_catalog_and_the_caller() {
         install();
         let resolve = |caller, restored| {
             broca_catalog::live::resolve_catalog_episode_with_client(
@@ -305,7 +305,8 @@ mod gated {
                 .clone()
         };
         assert_eq!(resolve(None, Some(8_192)), 8_192);
-        assert_eq!(resolve(Some(2_048), Some(8_192)), 2_048);
+        assert_eq!(resolve(Some(2_048), Some(8_192)), 8_192);
+        assert_eq!(resolve(Some(100_000), Some(8_192)), 8_192);
         assert_eq!(resolve(None, None), KNOWN_OUTPUT);
     }
 }
