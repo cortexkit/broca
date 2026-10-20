@@ -929,6 +929,68 @@ async fn status_of_expired_session_refuses_without_opening_or_deleting() {
     assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
 }
 
+/// A closed log above the status read limit is answered through a status-mode actor open
+/// rather than a direct WAL read, so the opener itself must refuse an expired session before
+/// its ordinary open path deletes the lineage and reports Idle.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn status_of_expired_large_session_refuses_in_the_status_opener() {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    {
+        let _lease = rig.service.lease(&rig.key).unwrap();
+        let mut wal = rig
+            .service
+            .wal
+            .open_with_retention(&rig.key, Some(1))
+            .unwrap();
+        wal.append(1, &started(&rig.key, "r1", Some(1), now), true)
+            .unwrap();
+        for step in 1..=160 {
+            wal.append(
+                1,
+                &WalRecord::ModelStepFinished {
+                    tags: None,
+                    hooks: None,
+                    step_id: broca_protocol::StepId(step),
+                    assistant_message: broca_protocol::AssistantMessage {
+                        message_id: broca_protocol::MessageId(format!("answer-{step}")),
+                        content: vec![broca_protocol::ContentBlock::Text {
+                            text: "x".repeat(8192),
+                        }],
+                    }
+                    .into(),
+                    usage: Default::default(),
+                    finish_reason: Some(broca_protocol::FinishReason::Stop),
+                    retries_used: 0,
+                    service_tier_used: None,
+                    speed_used: None,
+                },
+                false,
+            )
+            .unwrap();
+        }
+        wal.append(1, &finished(now), true).unwrap();
+        rig.service.remember_session(&rig.key).unwrap();
+    }
+    assert!(
+        rig.service.wal.live_wal_bytes(&rig.key).unwrap().unwrap()
+            > crate::registry::STATUS_WAL_READ_MAX_BYTES,
+        "the fixture must exceed the direct status read limit to reach the status opener"
+    );
+    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":2000}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    let registry = rig.registry(None);
+    let result = registry.route_status(&rig.key).await;
+    assert!(
+        matches!(result, Err(crate::registry::OpenError::Expired { expired_at_ms }) if expired_at_ms == now + 1000),
+        "{result:?}"
+    );
+    assert!(rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+    assert_eq!(registry.slot_counts().open, 0);
+}
+
 #[test]
 fn sidecar_removal_failure_leaves_completion_retryable() {
     let rig = Rig::new();

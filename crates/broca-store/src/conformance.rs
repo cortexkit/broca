@@ -141,9 +141,17 @@ impl PageUsageConformance for crate::SqliteStore {
         let key = crate::SqliteStore::key(session);
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // `upgraded` means a current writer already stamped the current version, so only the
+        // NULL attribution rows below can mark the projection incomplete. Any older version is
+        // incomplete by itself, which would hide whether those rows are detected.
+        let version = if upgraded {
+            crate::RUN_ATTRIBUTION_VERSION
+        } else {
+            0
+        };
         tx.execute(
             "UPDATE meta SET run_attribution_version=?2 WHERE session=?1",
-            rusqlite::params![key, i64::from(upgraded)],
+            rusqlite::params![key, version],
         )
         .map_err(|e| e.to_string())?;
         // An old-format INSERT OR REPLACE names no attribution column and restores SQL NULL.
