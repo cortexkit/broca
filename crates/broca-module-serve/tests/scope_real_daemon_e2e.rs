@@ -2006,6 +2006,7 @@ async fn real_legacy_and_direct_histories_remain_unprotected() {
             wal.append(
                 1,
                 &broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: broca_protocol::RunFinishReason::Cancelled,
                     ts_ms: None,
                     usage: broca_protocol::Usage::default(),

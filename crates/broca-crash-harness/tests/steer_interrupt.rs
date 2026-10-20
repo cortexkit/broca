@@ -291,6 +291,7 @@ impl Session {
 
     async fn send(&self, send_id: &str, text: &str, delivery: Delivery) -> SendResponse {
         let request = RunRequest {
+            directives: None,
             session_class: None,
             retention: None,
             title: None,

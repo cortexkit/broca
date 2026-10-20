@@ -52,6 +52,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
                 run_id: RunId("maintenance-run".into()),
                 session: session.clone(),
                 config: Box::new(RunConfig {
+                    turn_directives_v1: None,
                     render_tags: false,
                     model: ModelHandle::new("import", "import"),
                     tools: Vec::new().into(),
@@ -93,6 +94,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
             seq: 2,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: broca_protocol::RunFinishReason::Completed,
                 usage: Default::default(),

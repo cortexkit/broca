@@ -591,6 +591,48 @@ fn final_message_of(
     })
 }
 
+fn recorded_interrupt_reason(
+    records: &[broca_wal::FramedRecord],
+    run_id: &broca_protocol::RunId,
+) -> Option<String> {
+    let mut current = None;
+    let mut reason = None;
+    for frame in records {
+        match &frame.record {
+            broca_wal::WalRecord::RunStarted { run_id, .. } => current = Some(run_id),
+            broca_wal::WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Interrupted,
+                interrupt_reason,
+                ..
+            } if current == Some(run_id) => reason = interrupt_reason.clone(),
+            _ => {}
+        }
+    }
+    reason
+}
+
+fn completed_directives(
+    records: &[broca_wal::FramedRecord],
+    run_id: &broca_protocol::RunId,
+    text: &str,
+) -> Option<Vec<cortexkit_role_llm_runner::directives::Directive>> {
+    let names = records
+        .iter()
+        .rev()
+        .find_map(|frame| match &frame.record {
+            broca_wal::WalRecord::RunStarted {
+                run_id: id, config, ..
+            } if id == run_id => Some(config.turn_directives_v1.as_ref()),
+            _ => None,
+        })??;
+    // Parse the stored final message, never a provider request decorated with runner tags.
+    if !names.contains(&cortexkit_role_llm_runner::directives::DirectiveName::Wake) {
+        return None;
+    }
+    cortexkit_role_llm_runner::directives::parse_trailing(text)
+        .map(|directive| vec![directive.into()])
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct RunToolCallsAnchor {
     file_id: u64,
@@ -818,16 +860,19 @@ fn indexed_run_tool_calls(
                     .unwrap_or(prompt_len);
                 let calls: Vec<_> = assistant_message.tool_calls().collect();
                 if current_run.as_deref() == Some(target_run_id) {
-                    active_calls.extend(calls.iter().map(|call| RunToolCallBuilder {
-                        call: cortexkit_role_llm_runner::tool_calls::RunToolCall::new(
-                            call.tool_call_id.0.clone(),
-                            call.tool_name.clone(),
-                            call.input.clone(),
-                            "",
-                            active_step_ordinal,
-                        ),
-                        has_intent: false,
-                        terminal: false,
+                    active_calls.extend(calls.iter().enumerate().map(|(position, call)| {
+                        RunToolCallBuilder {
+                            call: cortexkit_role_llm_runner::tool_calls::RunToolCall::new(
+                                call.tool_call_id.0.clone(),
+                                call.tool_name.clone(),
+                                call.input.clone(),
+                                "",
+                                active_step_ordinal,
+                            )
+                            .with_position(position as u32),
+                            has_intent: false,
+                            terminal: false,
+                        }
                     }));
                 }
                 if calls.is_empty() {
@@ -919,6 +964,9 @@ fn indexed_run_tool_calls(
                 if active_batch_id.as_deref() == Some(batch_id.0.as_str()) =>
             {
                 if current_run.as_deref() == Some(target_run_id) {
+                    for builder in &mut active_calls {
+                        builder.call.result_ordinal = Some(active_step_ordinal + 1);
+                    }
                     finish_calls(
                         &mut active_calls,
                         active_step_seq,
@@ -1189,6 +1237,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             title,
         },
         State::Interrupted => RunStatusResponse::Interrupted {
+            reason: None,
             error,
             final_step_finish_reason,
             undelivered_steers,
@@ -1199,6 +1248,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Completed => RunStatusResponse::Completed {
+            directives: None,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -2714,6 +2764,15 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
+        let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
+            if let Some(run_id) = &page.lineage_state.last_run_id {
+                recorded_interrupt_reason(&self.read_durable_wal(session).await?.0, run_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(broca_wire::HeadResponse {
             lineage_id: Some(lineage_id.to_string()),
             last_ordinal: page.prompt_len.checked_sub(1),
@@ -2727,10 +2786,12 @@ impl ServeHandler for crate::LineageRegistry {
                 .map(|run_id| broca_wire::LastRunState {
                     run_id: run_id.0,
                     state: page.lineage_state.state.as_str().to_owned(),
-                    reason: page
-                        .lineage_state
-                        .reason
-                        .map(|reason| reason.as_str().to_owned()),
+                    reason: interrupted_reason.or_else(|| {
+                        page.lineage_state
+                            .reason
+                            .filter(|reason| reason.as_str() != "interrupted")
+                            .map(|reason| reason.as_str().to_owned())
+                    }),
                 }),
             updated_at: Some(updated_at),
             cache: self
@@ -2784,7 +2845,7 @@ impl ServeHandler for crate::LineageRegistry {
             .map(|state| state.run_usage.clone())
             .unwrap_or_default();
         let status = run_status_response(state);
-        let (mut state, reason, mut error) = match status {
+        let (mut state, mut reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
             RunStatusResponse::Active { .. } => ("active".to_owned(), None, None),
             RunStatusResponse::Paused { reason, error, .. } => ("paused".to_owned(), reason, error),
@@ -2836,16 +2897,28 @@ impl ServeHandler for crate::LineageRegistry {
             }
             records = Some(read);
         }
+        if state == "interrupted" {
+            let read = match records.take() {
+                Some(records) => records,
+                None => self.read_durable_wal(session).await?.0,
+            };
+            reason = recorded_interrupt_reason(&read, &run_id);
+            records = Some(read);
+        }
+        let mut directives = None;
         let final_message = if state == "completed" {
             let records = match records {
                 Some(records) => records,
                 None => self.read_durable_wal(session).await?.0,
             };
-            Some(final_message_of(&records, &run_id)?)
+            let message = final_message_of(&records, &run_id)?;
+            directives = completed_directives(&records, &run_id, &message.text);
+            Some(message)
         } else {
             None
         };
         let response = broca_wire::RunResultResponse {
+            directives,
             usage,
             detail,
             context_ceiling,
@@ -3177,6 +3250,18 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<RunStatusResponse, ServeError> {
         let state = self.route_run_state(session, run_id.clone()).await?;
         let mut response = run_status_response(state);
+        match &mut response {
+            RunStatusResponse::Interrupted { reason, .. } => {
+                *reason =
+                    recorded_interrupt_reason(&self.read_durable_wal(session).await?.0, &run_id);
+            }
+            RunStatusResponse::Completed { directives, .. } => {
+                let records = self.read_durable_wal(session).await?.0;
+                let message = final_message_of(&records, &run_id)?;
+                *directives = completed_directives(&records, &run_id, &message.text);
+            }
+            _ => {}
+        }
         if let RunStatusResponse::Active {
             awaiting_approval, ..
         } = &mut response

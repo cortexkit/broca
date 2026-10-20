@@ -664,6 +664,7 @@ mod tests {
 
     fn config(usage_policy: &str) -> RunConfig {
         RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("xai", "grok-4"),
             tools: Vec::new().into(),
@@ -789,6 +790,7 @@ mod tests {
             seq: records.len() as u64 + 1,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(200),
                 usage: Usage::default(),

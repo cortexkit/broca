@@ -219,6 +219,7 @@ fn census_with_ref_projection_and_export_writers_has_no_failures_or_markers() {
                 seq: 3,
                 fence: 1,
                 record: broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(2),
                     usage: Usage::default(),

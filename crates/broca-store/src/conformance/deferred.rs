@@ -106,6 +106,7 @@ pub(crate) fn records(session: &BindIdentity) -> Vec<FramedRecord> {
     records.push(framed(
         12,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Cancelled,
             ts_ms: None,
             usage: Usage::default(),
@@ -252,6 +253,7 @@ pub fn deferred_projection_matches_replay_golden<
     records.push(framed(
         18,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: None,
             usage: Usage::default(),

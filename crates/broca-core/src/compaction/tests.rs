@@ -516,6 +516,7 @@ async fn recorded_waits_are_sealed_without_a_provider() {
         }
         assert_eq!(shared.records().len(), usize::from(exited.is_none()));
         state.fold(&WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: expected,
             usage: Usage::default(),

@@ -23,6 +23,7 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        directives: existing_directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
@@ -47,6 +48,7 @@ pub fn submission_difference(
         structured_output: existing_structured_output,
     } = existing;
     let SubmissionRequest {
+        directives: requested_directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
@@ -72,6 +74,7 @@ pub fn submission_difference(
     } = requested;
 
     [
+        (existing_directives != requested_directives, "directives"),
         (
             existing_on_restart.unwrap_or_default() != requested_on_restart.unwrap_or_default(),
             "on_restart",
@@ -132,6 +135,8 @@ fn inherited_difference(
 
 #[derive(Serialize, Deserialize)]
 struct SubmissionIdentityDigestV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directives: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     on_restart: Option<String>,
     version: u8,
@@ -215,6 +220,7 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
@@ -241,6 +247,9 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        directives: directives
+            .as_ref()
+            .map(|names| digest_json(serde_json::json!(names))),
         version: 1,
         on_restart: (*on_restart == Some(broca_protocol::request::OnRestart::Resume))
             .then(|| digest_json(serde_json::json!("resume"))),
@@ -310,6 +319,7 @@ pub fn send_identity_difference_with_conversation_key(
     }
     let requested = identity_digest_v1(requested, delivery, conversation_key);
     [
+        (stored.directives != requested.directives, "directives"),
         (stored.keep_warm != requested.keep_warm, "keep_warm"),
         (stored.delivery != requested.delivery, "delivery"),
         (
@@ -1150,6 +1160,7 @@ mod tests {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("stub", model),
             tools: Arc::new(vec![
@@ -1299,6 +1310,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),
@@ -1607,6 +1619,7 @@ mod tests {
             frame(
                 8,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),
@@ -1750,6 +1763,7 @@ mod tests {
             frame(
                 20,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Interrupted,
                     usage: terminal_usage(),
@@ -2222,6 +2236,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: terminal_usage(),

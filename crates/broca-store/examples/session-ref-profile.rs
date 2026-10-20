@@ -38,6 +38,7 @@ fn record(session: &BindIdentity) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("stub", "synthetic"),
             tools: vec![].into(),

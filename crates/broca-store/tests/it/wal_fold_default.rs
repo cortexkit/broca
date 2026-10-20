@@ -28,6 +28,7 @@ fn operator_cli_default_remains_fourteen_days_with_store_identities() {
         wal.append(
             1,
             &broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(now - days * 86_400_000),
                 usage: Default::default(),

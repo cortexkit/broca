@@ -40,6 +40,10 @@ struct ClosedSession {
 
 impl ClosedSession {
     fn new(name: &str) -> Self {
+        Self::with_directives(name, None)
+    }
+
+    fn with_directives(name: &str, directives: Option<Value>) -> Self {
         let root = broca_test_support::scratch_root()
             .join(format!("run-tool-calls-{name}-{}", std::process::id()));
         let project = root.join("project");
@@ -48,7 +52,7 @@ impl ClosedSession {
         let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap());
         let mut wal = wal_store.open(&key).unwrap();
-        let started: WalRecord = serde_json::from_value(json!({
+        let mut started = json!({
             "type": "run_started",
             "run_id": "run-1",
             "session": key.clone(),
@@ -63,8 +67,11 @@ impl ClosedSession {
             },
             "input": [],
             "origin": {"kind": "fresh"}
-        }))
-        .unwrap();
+        });
+        if let Some(directives) = directives {
+            started["config"]["turn_directives_v1"] = directives;
+        }
+        let started: WalRecord = serde_json::from_value(started).unwrap();
         wal.append(1, &started, true).unwrap();
         let registry = crate::LineageRegistry::new_with_reader(
             Arc::new(NeverOpen),
@@ -299,6 +306,7 @@ impl ClosedSession {
 
     fn finish(&mut self) {
         self.append(WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: None,
             usage: Usage::default(),
@@ -559,6 +567,34 @@ async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix
             )
     }));
     assert_eq!(reported_calls, transcript_calls);
+    for call in &reported.calls {
+        let message = transcript
+            .messages
+            .iter()
+            .find(|message| message.ordinal == call.ordinal)
+            .unwrap();
+        let calls: Vec<_> = message
+            .message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let position = calls
+            .iter()
+            .position(|stored| stored.tool_call_id.0 == call.tool_call_id)
+            .unwrap();
+        assert_eq!(call.position, Some(position as u32));
+        let result_message = transcript.messages.iter().find(|message| {
+            message.message.content.iter().any(|block| matches!(block, ContentBlock::ToolResult(result) if result.tool_call_id.0 == call.tool_call_id))
+        });
+        assert_eq!(
+            call.result_ordinal,
+            result_message.map(|message| message.ordinal)
+        );
+    }
 
     // Pin the bytes a caller sees for this layout: the page as served and the
     // `session.read` ordinal of each tool-call block, with the random lineage id
@@ -650,4 +686,172 @@ async fn run_tool_calls_unknown_run_is_not_an_empty_answer() {
     .await
     .unwrap_err();
     assert!(matches!(error, ServeError::UnknownRun(run) if run == "absent-run"));
+}
+
+fn terminal(reason: RunFinishReason, interrupt_reason: Option<&str>) -> WalRecord {
+    WalRecord::RunFinished {
+        reason,
+        interrupt_reason: interrupt_reason.map(str::to_owned),
+        ts_ms: Some(42),
+        usage: Usage::default(),
+        error: None,
+        retries_used: 0,
+    }
+}
+
+#[tokio::test]
+async fn interrupt_reason_surfaces_recorded_values_and_leaves_old_seals_absent() {
+    for reason in [None, Some("runner_shutdown"), Some("runner_crash")] {
+        let mut session = ClosedSession::new(&format!("interrupt-reason-{reason:?}"));
+        session.append(terminal(RunFinishReason::Interrupted, reason));
+        session.close_writer();
+        let run = broca_protocol::RunId("run-1".into());
+        let result = ServeHandler::run_result(&session.registry, &session.key, run.clone())
+            .await
+            .unwrap();
+        let status = ServeHandler::run_status(&session.registry, &session.key, run)
+            .await
+            .unwrap();
+        assert_eq!(result.reason.as_deref(), reason);
+        let status = serde_json::to_value(status).unwrap();
+        assert_eq!(status.get("reason").and_then(Value::as_str), reason);
+        assert_eq!(status["state"], "interrupted");
+        assert!(status.get("directives").is_none());
+        assert!(result.directives.is_none());
+    }
+}
+
+#[tokio::test]
+async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
+    use cortexkit_role_llm_runner::vectors;
+    for (name, raw) in vectors::FILES
+        .iter()
+        .filter(|(name, _)| name.starts_with("directives/") && !name.ends_with("wire.json"))
+    {
+        let case: Value = serde_json::from_str(raw).unwrap();
+        let mut session =
+            ClosedSession::with_directives(&name.replace('/', "-"), Some(json!(["wake"])));
+        let content: Vec<ContentBlock> = if let Some(parts) = case["parts"].as_array() {
+            parts
+                .iter()
+                .map(|part| match part["type"].as_str().unwrap() {
+                    "text" => ContentBlock::Text {
+                        text: part["text"].as_str().unwrap().into(),
+                    },
+                    _ => ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("ignored".into()),
+                        tool_name: "ignored".into(),
+                        input: json!({}),
+                        thought_signature: None,
+                    }),
+                })
+                .collect()
+        } else {
+            vec![ContentBlock::Text {
+                text: case["text"].as_str().unwrap().into(),
+            }]
+        };
+        let has_tool = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+        session.append(WalRecord::ModelStepFinished {
+            step_id: StepId(1),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("final".into()),
+                content,
+            }),
+            usage: Usage::default(),
+            finish_reason: Some(broca_protocol::content::FinishReason::Stop),
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+            hooks: None,
+            tags: None,
+        });
+        if has_tool {
+            let batch_id = BatchId("directive-batch".into());
+            session.append(WalRecord::ToolBatchStarted {
+                batch_id: batch_id.clone(),
+                step_id: StepId(1),
+                planned_calls: vec![ToolCallId("ignored".into())],
+            });
+            session.append(WalRecord::ToolResult {
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId("ignored".into()),
+                    output: ToolOutput::Text {
+                        text: "<wake off/>".into(),
+                    },
+                    is_error: false,
+                }),
+                outcome: DispatchOutcome::Completed,
+                hooks: None,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+                tags: None,
+            });
+            session.append(WalRecord::ToolBatchFinished { batch_id });
+        }
+        session.append(WalRecord::TurnFinished { step_id: StepId(1) });
+        session.append(terminal(RunFinishReason::Completed, None));
+        session.close_writer();
+        let run = broca_protocol::RunId("run-1".into());
+        let result = ServeHandler::run_result(&session.registry, &session.key, run.clone())
+            .await
+            .unwrap();
+        let expected = if case["expected"].is_null() {
+            Value::Null
+        } else {
+            json!([case["expected"].clone()])
+        };
+        assert_eq!(
+            serde_json::to_value(&result.directives).unwrap(),
+            expected,
+            "{name}"
+        );
+        assert_eq!(
+            result.final_message.as_ref().unwrap().text,
+            case["text"].as_str().unwrap(),
+            "{name}"
+        );
+        let status = ServeHandler::run_status(&session.registry, &session.key, run.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["directives"],
+            expected,
+            "{name}"
+        );
+        let bytes = serde_json::to_vec(&result).unwrap();
+        let reopened = crate::LineageRegistry::new_with_reader(
+            Arc::new(NeverOpen),
+            session.wal_store.clone(),
+            None,
+        );
+        let reread = ServeHandler::run_result(&reopened, &session.key, run)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&reread).unwrap(),
+            bytes,
+            "{name}: old frozen grammar and response bytes"
+        );
+    }
+}
+
+#[test]
+fn wake_v1_frozen_run_answer_is_pinned_independently_of_current_vectors() {
+    let mut session = ClosedSession::with_directives("wake-v1-pin", Some(json!(["wake"])));
+    session.close_writer();
+    let frames = session.wal_store.read_records(&session.key).unwrap();
+    let answer = super::completed_directives(
+        &frames,
+        &broca_protocol::RunId("run-1".into()),
+        "answer<wake in=\"000000001m\"> café </wake>",
+    );
+    assert_eq!(
+        serde_json::to_string(&answer).unwrap(),
+        r#"[{"name":"wake","in_ms":60000,"note":"café"}]"#
+    );
 }

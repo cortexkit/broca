@@ -367,6 +367,7 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
         .to_string();
     let policy_allowed = spec.tools.iter().map(|t| t.name.clone()).collect();
     let req = RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

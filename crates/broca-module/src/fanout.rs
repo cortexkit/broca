@@ -1203,6 +1203,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                 tools: vec![].into(),
@@ -1255,6 +1256,7 @@ mod tests {
 
     fn run_finished() -> WalRecord {
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -2642,6 +2644,7 @@ mod tests {
                     run_id: RunId("r1".into()),
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
+                        turn_directives_v1: None,
                         render_tags: false,
                         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                         tools: vec![].into(),
@@ -2705,6 +2708,7 @@ mod tests {
                 seq: 3,
                 fence: 1,
                 record: WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),

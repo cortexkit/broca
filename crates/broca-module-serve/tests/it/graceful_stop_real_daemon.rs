@@ -11,8 +11,6 @@
 //! GOODBYE starts the final grace. Unix only: the signal cases and process census use Unix tools.
 #![cfg(unix)]
 
-use crate::delivery_rig as usage_compat;
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1060,6 +1058,9 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
     let status = client.run_status(&run_id).await.unwrap();
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["state"], "interrupted");
+    assert_eq!(value["reason"], "runner_crash");
+    assert_eq!(value["usage"]["steps"], 1);
+    assert_eq!(value["usage"]["unreported_steps"], 1);
     assert_eq!(value["error"]["class"], "transient");
     assert_eq!(
         value["error"]["provider_code"],
@@ -1076,16 +1077,7 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
     }
     let golden =
         std::fs::read(&path).expect("generate the crash-orphan golden through the real serve path");
-    let bytes = usage_compat::legacy_bytes(&bytes, &golden);
-    use sha2::{Digest, Sha256};
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&bytes)),
-        "212d487e8c557357753484a912903a496fe6e5713a8ec9d842509f718460fc6f"
-    );
-    assert_eq!(
-        bytes,
-        std::fs::read(&path).expect("generate the crash-orphan golden through the real serve path")
-    );
+    assert_eq!(bytes, golden);
 
     let mut stream = client
         .subscribe(broca_module::SubscribeFrom::Start)
@@ -1153,4 +1145,104 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
         facts[0].get("error").is_none(),
         "export facts carry reasons, not interruption diagnostics"
     );
+}
+
+async fn interrupt_reference_reply(rig: &Rig, run_id: &str, method: &str) -> Value {
+    let connection = broca_subc::SubcConnection::connect(&rig.connection_file)
+        .await
+        .unwrap();
+    let key = broca_protocol::BindIdentity::new(rig.dir.join("project"), "runner", "restart-run");
+    let route = connection
+        .route_open_management("broca", &key)
+        .await
+        .unwrap();
+    let reply = connection
+        .route_request(
+            &route,
+            serde_json::to_vec(&serde_json::json!({"method":method,"params":{"run_id":run_id}}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(reply.get("error").is_none(), "{reply}");
+    let mut result = reply["result"].clone();
+    if result.get("run_id").is_some() {
+        result["run_id"] = serde_json::json!("@RUN_ID@");
+    }
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
+    for planned in [true, false] {
+        let url = serve_model(Arc::new(AtomicUsize::new(0))).await;
+        let Some(rig) = Rig::start(&url).await else {
+            return;
+        };
+        let run_id = start_keyed_run(&rig, None).await;
+        rig.wait_for_tool().await;
+        let launch = rig.health().await["launch_id"].clone();
+        if planned {
+            rig.restart().await;
+        } else {
+            signal_during_tool(&rig, "-KILL").await;
+        }
+        rig.wait_for_replacement(&launch, Duration::from_secs(30))
+            .await;
+        let expected = if planned {
+            "runner_shutdown"
+        } else {
+            "runner_crash"
+        };
+        let records = wait_records(&rig, |records| {
+            records
+                .iter()
+                .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+        })
+        .await;
+        assert!(
+            matches!(records.last(), Some(WalRecord::RunFinished { interrupt_reason: Some(reason), .. }) if reason == expected),
+            "planned={planned}, expected {expected}, last record: {:?}",
+            records.last()
+        );
+        let before = serde_json::to_vec(records.last().unwrap()).unwrap();
+        // Cut after the terminal's sync, then boot again: recovery must not overwrite its cause.
+        let launch = rig.health().await["launch_id"].clone();
+        let children = broca_children(rig.daemon.id().unwrap());
+        assert_eq!(children.len(), 1);
+        assert!(std::process::Command::new("kill")
+            .args(["-KILL", &children[0].to_string()])
+            .status()
+            .unwrap()
+            .success());
+        rig.wait_for_replacement(&launch, Duration::from_secs(30))
+            .await;
+        let after = wait_records(&rig, |records| {
+            records
+                .iter()
+                .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+        })
+        .await;
+        assert_eq!(serde_json::to_vec(after.last().unwrap()).unwrap(), before);
+        for method in ["run.status", "run.result"] {
+            let value = interrupt_reference_reply(&rig, &run_id, method).await;
+            assert_eq!(value["state"], "interrupted");
+            assert_eq!(value["reason"], expected);
+            assert!(value.get("directives").is_none());
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../broca-wire/tests/golden/{}.{}.json",
+                method.replace('.', "_"),
+                expected
+            ));
+            if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+                std::fs::write(&path, &bytes).unwrap();
+            }
+            assert_eq!(
+                bytes,
+                std::fs::read(&path)
+                    .expect("capture interrupt reference replies through the real serve path")
+            );
+        }
+    }
 }

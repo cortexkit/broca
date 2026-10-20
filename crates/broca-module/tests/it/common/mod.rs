@@ -170,6 +170,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),
@@ -196,6 +197,7 @@ impl FakeExecutor {
                     let _ = rx.recv().await;
                 }
                 job.writer.record(broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),
@@ -283,6 +285,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Cancelled,
                     usage: Usage::default(),
@@ -312,6 +315,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),
@@ -334,6 +338,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::MaxSteps,
                     usage: Usage::default(),
@@ -356,6 +361,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Interrupted,
                     usage: Usage::default(),
@@ -412,6 +418,7 @@ impl FakeExecutor {
             run_id: job.req.run_id.clone(),
             session: job.req.session.clone(),
             config: Box::new(broca_wal::RunConfig {
+                turn_directives_v1: job.req.directives.clone(),
                 tools: job.req.tools.clone().into(),
                 tools_were_omitted: job.control.tools_were_omitted,
                 ..min_config()
@@ -485,6 +492,7 @@ impl RunExecutor for FakeExecutor {
             }
         }
         job.writer.record(broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -506,6 +514,7 @@ impl RunExecutor for FakeExecutor {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),
@@ -595,6 +604,7 @@ fn unique() -> u64 {
 pub fn req(key: &BindIdentity, run: &str) -> RunRequest {
     use broca_protocol::content::{ContentBlock, Message, Role};
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

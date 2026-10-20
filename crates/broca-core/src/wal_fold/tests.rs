@@ -152,6 +152,7 @@ impl Fixture {
                 session: session.clone(),
                 ts_ms: ts,
                 config: Box::new(RunConfig {
+                    turn_directives_v1: None,
                     render_tags: false,
                     model: broca_protocol::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
@@ -1259,6 +1260,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         wal.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(1),
                 reason: broca_protocol::caller::RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -1287,6 +1289,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         }),
     ]]);
     let req = RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -1695,6 +1698,7 @@ fn a_newer_writer_wal_is_skipped_as_newer_writer_not_undecodable() {
         1,
         &["from-the-future/v1"],
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(1),
             reason: broca_protocol::RunFinishReason::Completed,
             usage: Default::default(),
@@ -2101,6 +2105,7 @@ fn append_fold_test_finish(f: &Fixture, session: &BindIdentity, ts_ms: u64, torn
         3,
         1,
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(ts_ms),
             reason: broca_protocol::RunFinishReason::Completed,
             usage: Default::default(),

@@ -4152,6 +4152,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: req.model.clone(),
                 tools: req.tools.clone().into(),
@@ -5486,6 +5487,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: if error.is_some() {
                         broca_protocol::caller::RunFinishReason::Error
@@ -5521,6 +5523,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        turn_directives_v1: None,
                         render_tags: false,
                         model: broca_protocol::request::ModelHandle::new("openai", "gpt-test"),
                         tools: Vec::new().into(),

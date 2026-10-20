@@ -85,6 +85,7 @@ fn start(input: Vec<Message>) -> WalRecord {
         run_id: RunId("compacted-run".into()),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("anthropic", "claude-opus-5-5"),
             tools: vec![].into(),

@@ -438,6 +438,7 @@ mod tests {
                     session,
                     ts_ms: Some(now - age * DAY_MS),
                     config: Box::new(RunConfig {
+                        turn_directives_v1: None,
                         render_tags: false,
                         model: broca_protocol::ModelHandle::new("stub", "m"),
                         tools: vec![].into(),
@@ -776,6 +777,7 @@ mod identity_tests {
                 session: broca_protocol::BindIdentity::new("/old-location", "runner", "legacy"),
                 ts_ms: Some(1),
                 config: Box::new(broca_wal::RunConfig {
+                    turn_directives_v1: None,
                     render_tags: false,
                     model: broca_protocol::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
@@ -818,6 +820,7 @@ mod identity_tests {
         wal.append(
             1,
             &broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: broca_protocol::RunFinishReason::Completed,
                 ts_ms: Some(1),
                 usage: Default::default(),

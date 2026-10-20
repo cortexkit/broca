@@ -37,6 +37,7 @@ impl Rig {
     }
     fn request(&self, id: &str, limit: Option<u64>) -> RunRequest {
         RunRequest {
+            directives: None,
             session_class: None,
             retention: None,
             title: None,

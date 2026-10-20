@@ -79,6 +79,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
             wal.append(
                 1,
                 &WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: broca_protocol::caller::RunFinishReason::Completed,
                     ts_ms: None,
                     usage: Default::default(),

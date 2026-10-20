@@ -143,6 +143,7 @@ fn text(text: &str) -> Vec<Message> {
 
 fn request(dir: &std::path::Path, run: &str, input: &str) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

@@ -21,6 +21,14 @@ pub fn legacy_bytes(actual: &[u8], golden: &[u8]) -> Vec<u8> {
         .result
         .map(|value| serde_json::from_str(value.get()).unwrap())
         .unwrap_or(golden_body);
+    if golden_body.usage.is_some_and(|usage| {
+        let object: serde_json::Value = serde_json::from_str(usage.get()).unwrap();
+        ["steps", "unreported_steps", "by_model"]
+            .iter()
+            .any(|key| object.get(key).is_some())
+    }) {
+        return actual.to_vec();
+    }
     let Some(usage) = actual_body.usage else {
         return actual.to_vec();
     };
@@ -57,6 +65,17 @@ pub fn legacy_bytes(actual: &[u8], golden: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_usage_golden_is_not_normalized() {
+        let golden =
+            br#"{"state":"interrupted","usage":{"steps":1,"unreported_steps":1,"by_model":[]}}"#;
+        assert_eq!(legacy_bytes(golden, golden), golden);
+        let changed =
+            br#"{"state":"interrupted","usage":{"steps":0,"unreported_steps":0,"by_model":[]}}"#;
+        assert_eq!(legacy_bytes(changed, golden), changed);
+        assert_ne!(legacy_bytes(changed, golden), golden);
+    }
 
     #[test]
     fn normalization_keeps_legacy_usage_and_unrelated_bytes() {

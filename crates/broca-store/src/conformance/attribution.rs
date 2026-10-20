@@ -4,6 +4,7 @@ fn terminal(seq: u64, reason: RunFinishReason) -> FramedRecord {
     framed(
         seq,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason,
             ts_ms: None,
             usage: Usage::default(),

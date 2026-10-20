@@ -3402,6 +3402,7 @@ mod tests {
             seq,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason,
                 ts_ms: Some(1),
                 usage: Usage {
@@ -3846,6 +3847,7 @@ mod tests {
             seq: 4,
             fence: 1,
             record: broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),

@@ -342,6 +342,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
             run_id: RunId("run-import".into()),
             session: BindIdentity::new("/project", "runner", "imported"),
             config: Box::new(RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: ModelHandle::new("import", "import"),
                 tools: Vec::new().into(),
@@ -373,6 +374,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
             submission_id: None,
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),

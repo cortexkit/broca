@@ -95,6 +95,7 @@ fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 
 fn request(run: &str, dir: &std::path::Path, text: &str) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

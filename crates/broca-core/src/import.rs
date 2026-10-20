@@ -332,6 +332,7 @@ pub async fn run_import_with_store<W: WalStore>(
             repairable_import_prefix(&frames)?.ok_or(ImportError::LineageNotEmpty)?;
         if dangling_seed {
             writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: epoch_millis(),
                 reason: RunFinishReason::Interrupted,
                 usage: Usage::default(),
@@ -368,6 +369,7 @@ pub async fn run_import_with_store<W: WalStore>(
         submission_id: None,
     });
     writer.record(WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: epoch_millis(),
         reason: RunFinishReason::Completed,
         usage: Usage::default(),
@@ -397,6 +399,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
 fn import_marker_config(request_digest: &str) -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: ModelHandle::new("import", "import"),
         tools: Vec::new().into(),

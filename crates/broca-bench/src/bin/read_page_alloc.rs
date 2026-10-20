@@ -57,6 +57,7 @@ impl TerminalTailFixture {
         wal.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),

@@ -37,7 +37,7 @@ fn seed_admission_episode(wal: &FlakyReadWalStore, key: &BindIdentity, now: u64,
         WalRecord::RunPaused { run_id: RunId("prior".into()), ts_ms: Some(now),
             reason: broca_protocol::PauseReason::Restart, error: None }
     } else {
-        WalRecord::RunFinished { ts_ms: Some(now), reason: RunFinishReason::Completed,
+        WalRecord::RunFinished { interrupt_reason: None, ts_ms: Some(now), reason: RunFinishReason::Completed,
             usage: Usage::default(), error: None, retries_used: 0 }
     };
     writer.append(1, &end, true).unwrap();

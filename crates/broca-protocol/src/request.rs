@@ -2,6 +2,7 @@
 //! plus `stop_when` loop control. Mirrors the Vercel `LanguageModelV4`
 //! CallOptions, adapted to subc-routed tools.
 
+pub use cortexkit_role_llm_runner::directives::DirectiveName;
 use std::sync::Arc;
 
 /// Session classes are opaque labels, not paths or provider identities.
@@ -412,6 +413,8 @@ pub enum KeepWarm {
 /// as the identical request sent when idle).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     /// The restart policy applies only to this send. If omitted, a graceful daemon stop interrupts the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_restart: Option<OnRestart>,
@@ -722,6 +725,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),
@@ -809,6 +813,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),

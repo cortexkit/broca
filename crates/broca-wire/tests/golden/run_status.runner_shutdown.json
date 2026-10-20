@@ -1,0 +1,1 @@
+{"final_step_finish_reason":"tool_calls","indeterminate_tool_calls":[],"reason":"runner_shutdown","retries_used":0,"state":"interrupted","undelivered_steers":[],"usage":{"by_model":[{"model":"mock-model","provider":"mock","steps":1,"unreported_steps":1}],"steps":1,"unreported_steps":1}}

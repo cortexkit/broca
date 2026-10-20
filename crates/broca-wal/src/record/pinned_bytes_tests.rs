@@ -842,3 +842,40 @@ fn structured_output_records_are_must_understand_and_round_trip() {
         std::fs::write(plain_path, encode(1, 3, &plain).unwrap()).unwrap();
     }
 }
+
+#[test]
+fn interrupt_reason_and_directives_require_named_reader_features_only_when_present() {
+    use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION};
+    for (field, value) in [
+        ("interrupt_reason", serde_json::json!("runner_shutdown")),
+        ("interrupt_reason", serde_json::json!("runner_crash")),
+    ] {
+        let mut raw = serde_json::json!({"type":"run_finished","reason":"interrupted","usage":{},"retries_used":0});
+        raw[field] = value;
+        let record: WalRecord = serde_json::from_value(raw).unwrap();
+        assert_eq!(record.required_features(), &["interrupt-reason/v1"]);
+        let frame = encode(1, 1, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION);
+        assert!(matches!(decode_next(&frame), DecodeStep::Record { .. }));
+    }
+    let old = include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end();
+    let mut raw: serde_json::Value = serde_json::from_str(old).unwrap();
+    let record: WalRecord = serde_json::from_value(raw.clone()).unwrap();
+    let prior = record.required_features();
+    raw["config"]["turn_directives_v1"] = serde_json::json!(["wake"]);
+    let record: WalRecord = serde_json::from_value(raw).unwrap();
+    assert!(record.required_features().contains(&"turn-directives/v1"));
+    assert!(!prior.contains(&"turn-directives/v1"));
+    let queued: WalRecord = serde_json::from_value(serde_json::json!({
+        "type":"queued", "submission_id":"sub", "request": {
+            "model":{"provider_module_id":"p","model_id":"m"}, "input":[], "directives":["wake"]
+        }
+    }))
+    .unwrap();
+    assert!(queued.required_features().contains(&"turn-directives/v1"));
+    let old: WalRecord = serde_json::from_str(old).unwrap();
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end()
+    );
+}

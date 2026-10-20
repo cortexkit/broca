@@ -90,6 +90,7 @@ pub enum OutputEvent {
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
+    pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
     /// Retention accepted for this send, recorded in a new episode's `RunStarted` but never
     /// included in a provider request. Resuming an existing episode cannot change its policy.
@@ -187,6 +188,7 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            directives: self.directives.clone(),
             on_restart: self.on_restart,
             keep_warm: self.keep_warm,
             scope: Default::default(),
@@ -229,6 +231,7 @@ impl RunRequest {
         submission_id: broca_protocol::SubmissionId,
     ) -> Self {
         RunRequest {
+            directives: req.directives,
             session_class: None,
             retention: None,
             on_restart: req.on_restart,
@@ -3034,6 +3037,7 @@ where
                 .as_ref()
                 .ok_or_else(|| RunError::Wal("inferred terminal has no prior run id".into()))?;
             writer.record_terminal(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: control.now_ms(),
                 reason: *last_reason,
                 usage: prior.usage,
@@ -3836,6 +3840,7 @@ where
             session: req.session.clone(),
             config: remember_warm_config(
                 RunConfig {
+                    turn_directives_v1: req.directives.clone(),
                     render_tags,
                     model: cfg.model.clone(),
                     tools: Arc::clone(&tools),
@@ -4143,6 +4148,7 @@ where
         .as_ref()
         .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText);
     let mut natural_final_text: Option<String> = None;
+    let mut interrupt_reason = None;
     let reason = loop {
         input_budget.limit = writer.input_token_limit().or(input_budget.limit);
         // A session budget is independent of episode counters and reminder inheritance.
@@ -4210,6 +4216,7 @@ where
                 )
                 .await;
             }
+            interrupt_reason = Some("runner_shutdown".to_owned());
             break RunFinishReason::Interrupted;
         }
         let finalize_turn = budget_state.finalize_pending;
@@ -4462,6 +4469,7 @@ where
                 break RunFinishReason::Cancelled;
             }
             if stop_is_requested(control.stop_requested.as_ref()) {
+                interrupt_reason = Some("runner_shutdown".to_owned());
                 break RunFinishReason::Interrupted;
             }
             model_opts = Some(Arc::new(view));
@@ -5333,6 +5341,9 @@ where
         // unknown result) is persisted so the conversation stays valid, but the
         // loop does not continue.
         if let Some(reason) = BatchOutcome::finish_reason(batch.interruption) {
+            if batch.interruption == Some(BatchInterruption::StopRequested) {
+                interrupt_reason = Some("runner_shutdown".to_owned());
+            }
             break reason;
         }
     };
@@ -5380,7 +5391,10 @@ where
         control,
         out,
         &resolved_run_id,
-        reason,
+        RunTerminal {
+            reason,
+            interrupt_reason,
+        },
         completed_steps,
         total_usage,
         total_retries_used,
@@ -5630,6 +5644,41 @@ fn last_record_seq(writer: &WalHandle) -> u64 {
     writer.next_record_seq().saturating_sub(1)
 }
 
+// Pairs the terminal state with any explicitly recorded interrupt reason.
+struct RunTerminal {
+    reason: RunFinishReason,
+    interrupt_reason: Option<String>,
+}
+
+impl From<RunFinishReason> for RunTerminal {
+    fn from(reason: RunFinishReason) -> Self {
+        Self {
+            reason,
+            interrupt_reason: None,
+        }
+    }
+}
+
+fn sealed_interrupt_reason(
+    control: &RunControl,
+    reason: RunFinishReason,
+    recorded: Option<String>,
+) -> Option<String> {
+    // These coordinator-issued signals establish a planned stop on the new terminal, even
+    // when an in-flight tool's outcome is unknown. Never infer provenance from tool outcomes,
+    // timestamps, or missing metadata on an older terminal.
+    let planned_stop = stop_is_requested(control.stop_requested.as_ref())
+        || control
+            .shutdown_seal
+            .as_ref()
+            .is_some_and(crate::ShutdownSeal::is_tripped);
+    if reason == RunFinishReason::Interrupted && planned_stop {
+        Some("runner_shutdown".into())
+    } else {
+        recorded
+    }
+}
+
 /// Finalize the run: record + fsync `run_finished` BEFORE emitting the terminal
 /// RunFinished and returning (so a durable run_finished means the run is truly
 /// done, and resume treats it as a no-op).
@@ -5642,18 +5691,23 @@ async fn finish_run(
     // other way to attribute it: a resumed run writes no new `RunStarted`, so a client
     // that identifies its run by waiting for one waits through its own completion.
     run_id: &RunId,
-    reason: RunFinishReason,
+    terminal: impl Into<RunTerminal>,
     steps: u64,
     usage: Usage,
     retries_used: u32,
     error: Option<ProviderError>,
     final_step_finish_reason: Option<FinishReason>,
 ) -> Result<(RunSummary, u64), RunError> {
+    let RunTerminal {
+        reason,
+        interrupt_reason,
+    } = terminal.into();
     // `error` is the typed terminal error, persisted on the durable RunFinished so the
     // control-stream projection (a module subscriber's only source) can emit a
     // ControlUnit::Error with the cause. Provider failures and resume render-drift interrupts
     // pass `Some`; terminals without a typed cause pass `None`.
     writer.record(WalRecord::RunFinished {
+        interrupt_reason: sealed_interrupt_reason(control, reason, interrupt_reason),
         ts_ms: control.now_ms(),
         reason,
         usage,
@@ -7929,6 +7983,7 @@ async fn finalize_hard_stop(
     // The terminal goes in the SAME barrier as the repair batch (no intermediate sync).
     control.close_steers();
     writer.record(WalRecord::RunFinished {
+        interrupt_reason: sealed_interrupt_reason(control, reason, None),
         ts_ms: control.now_ms(),
         reason,
         usage,
@@ -8417,6 +8472,7 @@ mod tests {
         let mut prior = crate::replay::replay(&[]).unwrap();
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
             tools: vec![].into(),
@@ -8543,6 +8599,7 @@ mod tests {
             },
         };
         let mut req = RunRequest {
+            directives: None,
             session_class: None,
             retention: None,
             title: None,
@@ -9515,6 +9572,7 @@ mod tests {
         }
 
         let config = RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("stub", "m"),
             tools: Vec::new().into(),

@@ -212,6 +212,8 @@ fn deserialize_run_usage_value(
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directives: Option<Vec<cortexkit_role_llm_runner::directives::Directive>>,
     #[serde(default, deserialize_with = "deserialize_run_usage")]
     pub usage: broca_protocol::usage::RunUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +307,8 @@ pub fn broca_role_describe_with_writers(
         "steer",
         "queue",
         "interrupt",
+        cortexkit_role_llm_runner::capabilities::INTERRUPT_REASON,
+        cortexkit_role_llm_runner::capabilities::TURN_DIRECTIVES,
         "plans",
         "fetch-plan-optional-tools/v1",
         "session_class",
@@ -844,7 +848,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "8ec810a98e63c6d3723550f37e3f215f7d85e754307cdda4f4603df326996e20",
+            "b672175e3fe5cd8027c766c9262593c0c0de8c55b8c23fe7e0b34ccd80361e1c",
         );
     }
 
@@ -998,7 +1002,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "220273da43c0af526fbf928ae41abae8539d8790b64a94a2e9229f7054c44a15";
+        "334449647a4f58817b9244255706baaa2be43f584975355714b61aac2d58345d";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

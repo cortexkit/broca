@@ -90,6 +90,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
             provider_held: None,
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -186,6 +187,7 @@ fn assistant_one_call() -> AssistantMessage {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),
@@ -300,6 +302,7 @@ impl LineageOpener for FreeOpener {
 
 fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

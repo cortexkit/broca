@@ -809,6 +809,11 @@ fn steer_settings_conflict(
     {
         return Some("stop_when.max_steps");
     }
+    if request.directives.as_ref().is_some_and(|names| {
+        names.as_slice() != frozen.turn_directives_v1.as_deref().unwrap_or_default()
+    }) {
+        return Some("directives");
+    }
     // Checked last, so a send that also conflicts on an earlier setting still reports that
     // setting rather than `auth`.
     if let Some(pin) = &request.auth {
@@ -1135,6 +1140,7 @@ fn submission_from_config(
 ) -> SubmissionRequest {
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
     SubmissionRequest {
+        directives: config.turn_directives_v1,
         on_restart: None,
         keep_warm: None,
         scope: Default::default(),
@@ -6752,6 +6758,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         let terminal_seq = writer
             .record_terminal(WalRecord::RunFinished {
+                interrupt_reason: Some(
+                    match cause {
+                        SealCause::CrashOrphan => "runner_crash",
+                        _ => "runner_shutdown",
+                    }
+                    .into(),
+                ),
                 reason: broca_protocol::RunFinishReason::Interrupted,
                 // Timestamp this terminal so exported spend belongs to its billing period.
                 // A missing ts_ms becomes NULL occurred_at_ms and is omitted from period totals.
@@ -7522,8 +7535,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn joining_steer_directives_are_frozen_and_omission_inherits() {
+        let mut frozen = min_config();
+        frozen.turn_directives_v1 = Some(vec![
+            cortexkit_role_llm_runner::directives::DirectiveName::Wake,
+        ]);
+        let key = BindIdentity::new("/tmp/directives", "runner", "steer");
+        let mut request = text_req(&key, "directives").to_submission();
+        request.model = frozen.model.clone();
+        request.stop_when = frozen.stop_when.clone();
+        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        request.directives = frozen.turn_directives_v1.clone();
+        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        request.directives = Some(vec![]);
+        assert_eq!(
+            steer_settings_conflict(&request, &frozen, false),
+            Some("directives")
+        );
+        frozen.turn_directives_v1 = None;
+        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+    }
+
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             tools: vec![].into(),
@@ -7611,6 +7647,7 @@ mod tests {
     pub(super) fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         use broca_protocol::content::{ContentBlock, Message, Role};
         RunRequest {
+            directives: None,
             session_class: None,
             retention: None,
             title: None,
@@ -7781,6 +7818,7 @@ mod tests {
                 let _ = ack.send(Ok(job.req.run_id.clone()));
             }
             job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -7915,6 +7953,7 @@ mod tests {
             self.finish.notified().await;
 
             job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -8297,6 +8336,7 @@ mod tests {
                 self.release_first.notified().await;
             }
             job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -8397,6 +8437,7 @@ mod tests {
                 self.release_first.notified().await;
             }
             job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -8609,6 +8650,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -9291,6 +9333,7 @@ mod tests {
                 assert!(!taken.is_empty(), "the steer reaches the step");
             }
             job.writer.record(broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: self.reason,
                 usage: Usage::default(),
@@ -9865,6 +9908,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -9952,6 +9996,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -10681,6 +10726,7 @@ mod import_idempotency_tests {
             call_key: None,
         });
         writer.record(broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),

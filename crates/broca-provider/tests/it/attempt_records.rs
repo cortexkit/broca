@@ -279,6 +279,7 @@ mod gated {
 
     fn request(dir: &Path) -> RunRequest {
         RunRequest {
+            directives: None,
             session_class: None,
             retention: None,
             title: None,

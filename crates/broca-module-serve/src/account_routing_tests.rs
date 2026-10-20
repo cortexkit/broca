@@ -1176,6 +1176,7 @@ async fn a_scoped_not_found_is_reported_and_a_still_listed_credential_alarms() {
 /// Any record, to give a scratch log its lineage id.
 fn any_record() -> broca_wal::WalRecord {
     broca_wal::WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: Default::default(),

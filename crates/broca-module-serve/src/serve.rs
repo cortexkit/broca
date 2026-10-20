@@ -4675,6 +4675,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            directives: None,
             context_ceiling: None,
             usage: Default::default(),
             detail: None,
@@ -5669,6 +5670,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                 tools: vec![].into(),

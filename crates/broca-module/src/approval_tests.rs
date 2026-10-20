@@ -270,6 +270,7 @@ impl Rig {
             });
             self.append(WalRecord::TurnFinished { step_id: StepId(1) });
             self.append(WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: broca_protocol::RunFinishReason::Interrupted,
                 ts_ms: None,
                 usage: Default::default(),
@@ -696,6 +697,7 @@ fn unread_debt_is_not_empty_debt() {
             seq: 1,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: broca_protocol::RunFinishReason::Interrupted,
                 ts_ms: None,
                 usage: Default::default(),
@@ -787,6 +789,7 @@ async fn projected_approval_metadata_matches_wal_session_read() {
             });
             rig.append(WalRecord::TurnFinished { step_id: StepId(1) });
             rig.append(WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: broca_protocol::RunFinishReason::Interrupted,
                 ts_ms: None,
                 usage: Default::default(),
@@ -999,6 +1002,7 @@ async fn dispatched_refused_declined_and_approved_closed_calls_send_no_withdrawa
         });
         rig.append(WalRecord::TurnFinished { step_id: StepId(1) });
         rig.append(WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: broca_protocol::RunFinishReason::Interrupted,
             ts_ms: None,
             usage: Default::default(),
@@ -1538,6 +1542,7 @@ impl RunExecutor for HoldingNoApproval {
         }
         job.control.cancel.as_ref().unwrap().cancelled().await;
         job.writer.record(WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: broca_protocol::RunFinishReason::Cancelled,
             ts_ms: None,
             usage: Default::default(),
@@ -1768,6 +1773,7 @@ fn seed_late_entries(rig: &Rig) -> Vec<String> {
         file.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: broca_protocol::RunFinishReason::Interrupted,
                 ts_ms: None,
                 usage: Default::default(),
@@ -2277,6 +2283,7 @@ fn approval_cache_tool_update_work_is_independent_of_prior_runs() {
             1,
             None,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: broca_protocol::RunFinishReason::Completed,
                 usage: Default::default(),

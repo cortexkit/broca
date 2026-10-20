@@ -547,6 +547,7 @@ impl SqliteStore {
                     error,
                     usage,
                     retries_used,
+                    ..
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
                     state.open = false;
@@ -895,6 +896,7 @@ mod tests {
             seq,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason,
                 ts_ms: Some(2000),
                 usage: Usage::default(),

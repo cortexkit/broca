@@ -784,6 +784,28 @@ fn sigkill(pid: i32) -> bool {
 
 impl Drop for Live {
     fn drop(&mut self) {
+        // Dropping Live requests an orderly shutdown; kill_at remains the SIGKILL path.
+        // Wait for the daemon's shutdown notification to let the coordinator record a planned
+        // stop before fallback cleanup can leave the run for crash recovery.
+        if let Some(daemon) = self.daemon.as_mut() {
+            if let Some(pid) = daemon.id() {
+                let sent = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if sent {
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            broca_test_support::event_timeout(
+                                "orderly conformance daemon exit",
+                                daemon.wait(),
+                                || format!("daemon pid={pid}"),
+                            ),
+                        )
+                    });
+                }
+            }
+        }
         self.kill_all();
     }
 }
@@ -1575,6 +1597,8 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Steer,
             Capability::Queue,
             Capability::Interrupt,
+            Capability::InterruptReason,
+            Capability::TurnDirectives,
             Capability::HoldToolCalls,
             Capability::Tags,
             Capability::DeliveryOrder,
@@ -2883,6 +2907,7 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
         wal.append(
             1,
             &broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: broca_protocol::RunFinishReason::Completed,
                 usage: Default::default(),
@@ -2989,6 +3014,7 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
         wal.append(
             1,
             &broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: broca_protocol::RunFinishReason::Completed,
                 usage: Default::default(),
@@ -3532,4 +3558,98 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
     serving.abort();
     reader_live.kill_all();
     std::fs::remove_dir_all(scratch).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orderly_handle_drop_seals_a_held_tool_with_shutdown_reason() {
+    use broca_core::WalStore;
+    use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
+    for (name, key) in [
+        ("ck-subc", "SUBC_CORE_BIN"),
+        ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+    ] {
+        if !sibling_bin(name, key).exists() {
+            assert!(!require_subc(), "{name} is required");
+            println!("SKIP: {name} is missing");
+            return;
+        }
+    }
+    std::env::remove_var("SUBC_MODULE_ID");
+    std::env::remove_var("SUBC_LAUNCH_NONCE");
+    let scratch = broca_test_support::scratch_root()
+        .join(format!("broca-orderly-drop-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let subject = BrocaSubject::new(&scratch).await;
+    let root = scratch.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = "orderly-drop";
+    let held = ScriptedToolCall {
+        tool_call_id: "held".into(),
+        tool: SCRIPTED_TOOL.into(),
+        arguments: json!({"marker":"orderly-drop"}),
+        result: json!({"done":true}),
+        hold: true,
+    };
+    subject
+        .install_script(
+            session,
+            Script {
+                turns: vec![ScriptedTurn::new(vec![ScriptedPart::ToolCall(
+                    held.clone(),
+                )])],
+            },
+        )
+        .await
+        .unwrap();
+    let live = subject.spawn(&root).await.unwrap();
+    let state_root = live.state_root.clone();
+    let route = subject
+        .session_route(&live, session, &subject.owner_stamp())
+        .await
+        .unwrap();
+    let mut fields = subject.send_fields(session, true);
+    fields.insert("prompt".into(), json!("start"));
+    fields.insert("send_id".into(), json!("orderly-drop"));
+    let Reply::Response(admitted) = route
+        .request("session.send", Value::Object(fields))
+        .await
+        .unwrap()
+    else {
+        panic!("send refused");
+    };
+    subject.await_tool_call(&held.arguments).await.unwrap();
+    drop(route);
+    // Dropping Live requests an orderly shutdown; verify its recorded cause before restarting.
+    drop(live);
+    let records = broca_core::FileWalStore::new(state_root.join("wal"))
+        .read_records(&subject.bind_identity(session))
+        .unwrap();
+    let terminal = records.iter().rev().find_map(|frame| match &frame.record {
+        broca_wal::WalRecord::RunFinished {
+            interrupt_reason, ..
+        } => Some(interrupt_reason),
+        _ => None,
+    });
+    assert_eq!(
+        terminal.and_then(|reason| reason.as_deref()),
+        Some("runner_shutdown"),
+        "WAL after orderly stop: {records:?}"
+    );
+    let live = subject.restart(&root).await.unwrap();
+    let route = subject
+        .session_route(&live, session, &subject.owner_stamp())
+        .await
+        .unwrap();
+    for method in ["run.status", "run.result"] {
+        let Reply::Response(reply) = route
+            .request(method, json!({"run_id":admitted["run_id"]}))
+            .await
+            .unwrap()
+        else {
+            panic!("{method} refused");
+        };
+        assert_eq!(reply["state"], "interrupted", "{method}: {reply}");
+        assert_eq!(reply["reason"], "runner_shutdown", "{method}: {reply}");
+    }
 }
