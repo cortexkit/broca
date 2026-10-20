@@ -3,6 +3,7 @@ use crate::bus_events::{now_ms, BusConnector};
 use broca_core::compaction_provider::notice::{event_subject, ViewReady, VIEW_READY_EVENT};
 use broca_diagnostics::{spawn_blocking, JobKind};
 use broca_module::LineageRegistry;
+use broca_store::compaction_facts::CompactionFacts;
 use broca_store::{compaction_receipts::ViewReceipt, SqliteStore};
 use cortexkit_bus_trait::{Message, StreamCursor};
 use std::{
@@ -43,6 +44,7 @@ pub fn health() -> serde_json::Value {
 pub struct Service {
     store: Arc<SqliteStore>,
     registry: LineageRegistry,
+    wal: Arc<dyn broca_core::WalStore>,
     inbox: Arc<broca_core::ViewReadyInbox>,
     connector: Arc<dyn BusConnector>,
     stop: CancellationToken,
@@ -52,6 +54,7 @@ impl Service {
     pub fn new(
         store: Arc<SqliteStore>,
         registry: LineageRegistry,
+        wal: Arc<dyn broca_core::WalStore>,
         inbox: Arc<broca_core::ViewReadyInbox>,
         connector: Arc<dyn BusConnector>,
         stop: CancellationToken,
@@ -61,6 +64,7 @@ impl Service {
         Self {
             store,
             registry,
+            wal,
             inbox,
             connector,
             stop,
@@ -103,18 +107,18 @@ impl Service {
         if message.id != ready.message_id() || message.digest.to_string() != ready.digest {
             return Err("compaction view_ready identity mismatch".into());
         }
-        let Some((session, lineage, records)) = self.session(&ready.session_ref).await? else {
+        let Some((_, facts)) = self.session(&ready.session_ref).await? else {
             self.metrics
                 .dropped_unknown_session
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
-        if resolved(&ready, &records) {
+        if facts.resolved(ready.view_version) {
             return Ok(());
         }
         let receipt = ViewReceipt {
             ready: ready.clone(),
-            lineage_id: lineage,
+            lineage_id: facts.lineage_id,
             received_at_ms: now_ms(),
         };
         let store = self.store.clone();
@@ -129,7 +133,6 @@ impl Service {
         #[cfg(feature = "test-clock")]
         receipt_barrier("ViewReceiptRecorded").await?;
         self.inbox.announce(ready);
-        let _ = session;
         Ok(())
     }
 
@@ -151,14 +154,7 @@ impl Service {
     async fn session(
         &self,
         reference: &str,
-    ) -> Result<
-        Option<(
-            broca_protocol::BindIdentity,
-            String,
-            Vec<broca_wal::FramedRecord>,
-        )>,
-        String,
-    > {
+    ) -> Result<Option<(broca_protocol::BindIdentity, CompactionFacts)>, String> {
         let store = self.store.clone();
         let reference = reference.to_owned();
         let refs = spawn_blocking(JobKind::StoreRead, move || {
@@ -173,35 +169,25 @@ impl Service {
             }
             return Err("compaction session-ref projection is incomplete".into());
         };
-        let (records, lineage) = self
-            .registry
-            .read_durable_wal(session)
-            .await
-            .map_err(|e| e.to_string())?;
-        let Some(lineage) = lineage else {
-            return Ok(None);
-        };
-        if !records.iter().any(|r| {
-            matches!(
-                &r.record,
-                broca_wal::WalRecord::CompactionMessage {
-                    kind: broca_wal::CompactionMessageKind::Setup,
-                    ..
-                }
-            )
-        }) {
-            return Ok(None);
-        }
-        Ok(Some((session.clone(), lineage.to_string(), records)))
+        let session = session.clone();
+        let lookup_session = session.clone();
+        let store = self.store.clone();
+        let wal = self.wal.clone();
+        let facts = spawn_blocking(JobKind::StoreRead, move || {
+            current_facts(&store, wal.as_ref(), &lookup_session)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(facts.setup.then_some((session, facts)))
     }
 
     async fn reconcile_one(&self, receipt: ViewReceipt) -> Result<(), String> {
         let current = self.session(&receipt.ready.session_ref).await?;
         let clear = match current {
             None => true,
-            Some((_, lineage, _)) if lineage != receipt.lineage_id => true,
-            Some((session, _, records)) => {
-                if resolved(&receipt.ready, &records) {
+            Some((_, facts)) if facts.lineage_id != receipt.lineage_id => true,
+            Some((session, facts)) => {
+                if facts.resolved(receipt.ready.view_version) {
                     self.registry
                         .route_compaction_changed(&session)
                         .await
@@ -363,21 +349,36 @@ async fn receipt_barrier(point: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn resolved(ready: &ViewReady, records: &[broca_wal::FramedRecord]) -> bool {
-    records.iter().any(|frame| match &frame.record {
-        broca_wal::WalRecord::CompactionNotice { headers, .. } => {
-            headers
-                .get("applied_view_version")
-                .and_then(|v| v.parse::<u64>().ok())
-                .is_some_and(|v| v >= ready.view_version)
-                || headers.get("events").is_some_and(|events| {
-                    events.split(',').any(|event| {
-                        event.starts_with(&format!("view_refused:{}:", ready.view_version))
-                    })
-                })
-        }
-        _ => false,
-    })
+const FACTS_TAIL_BYTES: u64 = 256 * 1024;
+
+fn current_facts(
+    store: &SqliteStore,
+    wal: &dyn broca_core::WalStore,
+    session: &broca_protocol::BindIdentity,
+) -> Result<CompactionFacts, String> {
+    let facts = store.compaction_facts(session).map_err(|e| e.to_string())?;
+    let identity = wal.file_identity(session).map_err(|e| e.to_string())?;
+    let bytes = wal.live_wal_bytes(session).map_err(|e| e.to_string())?;
+    if let Some(facts) = facts.filter(|f| f.current_file(identity, bytes)) {
+        return Ok(facts);
+    }
+    // Projection lag must stay cheap even when a message frame is larger than the
+    // suffix budget. Unknown suffixes retry later; they never widen to a full read.
+    let range = wal
+        .read_records_tail_bounded(session, FACTS_TAIL_BYTES)
+        .map_err(|e| e.to_string())?
+        .ok_or("compaction facts projection is behind the bounded WAL suffix")?;
+    let flushed = wal.flush_for_read(session).map_err(|e| e.to_string())?;
+    if range
+        .next_anchor
+        .is_some_and(|a| Some(a.file_id) != flushed)
+    {
+        return Err("compaction WAL changed during its durability proof".into());
+    }
+    store
+        .project_compaction_facts(session, &range)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "compaction facts projection cannot cover the bounded WAL suffix".into())
 }
 
 pub async fn apply_idle(
@@ -428,3 +429,7 @@ pub async fn apply_idle(
     .await
     .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+#[path = "compaction_bus/tests.rs"]
+mod tests;

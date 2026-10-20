@@ -4,6 +4,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use broca_module_serve::wire::SendParamsExt;
 use cortexkit_bus_naming::AccountNames;
 use cortexkit_bus_nats::{ConnectConfig, NatsConnection};
 use cortexkit_bus_testkit::{
@@ -150,6 +151,41 @@ impl BusRig {
     }
 }
 struct Credentials(Arc<BusRig>);
+
+fn with_prompt(mut fields: Map<String, Value>, send_id: &str, prompt: &str) -> Map<String, Value> {
+    fields.insert("send_id".into(), json!(send_id));
+    fields.insert("prompt".into(), json!(prompt));
+    fields
+}
+
+#[test]
+fn bus_fixture_sends_decode_the_public_prompt_field() {
+    let fields = with_prompt(
+        json!({"model":{"provider":"mock","model":"m"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+        "send",
+        "original",
+    );
+    let params: broca_module_serve::wire::SendParams =
+        serde_json::from_value(Value::Object(fields)).unwrap();
+    let request = params
+        .into_send_request(
+            broca_protocol::BindIdentity::new("/test", "h", "s"),
+            broca_protocol::RunId("run".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        request.request.input,
+        vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "original".into()
+            }]
+        )]
+    );
+}
 #[async_trait]
 impl subc_client_rs::ModuleHandler for Credentials {
     async fn handle(
@@ -182,8 +218,11 @@ impl subc_client_rs::ModuleHandler for Credentials {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
+async fn at_receipt_cut(
+    runtime: &Path,
+    project: &Path,
+    cut: &str,
+) -> (BrocaSubject, Live, BrocaRoute, PathBuf) {
     use broca_core::{
         compaction_provider::{
             lineage::MessageRef,
@@ -199,6 +238,102 @@ async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
         sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN").exists(),
         "native real-kill needs fake-aft-stub"
     );
+    std::fs::create_dir_all(runtime).unwrap();
+    let mut subject = BrocaSubject::new(runtime).await;
+    subject.project_root = project.canonicalize().unwrap();
+    subject.bus = Some(Arc::new(BusRig::new(runtime).await));
+    let session = "bus-crash";
+    subject
+        .install_script(
+            session,
+            Script {
+                turns: vec![cortexkit_role_llm_runner_conformance::ScriptedTurn::new(
+                    vec![ScriptedPart::Text("answer".into())],
+                )],
+            },
+        )
+        .await
+        .unwrap();
+    subject.install_setup(
+        session,
+        cortexkit_role_llm_runner_conformance::CompactionSetup::Ready(
+            cortexkit_role_llm_runner_conformance::CompactionMessage {
+                compaction_id: "head".into(),
+                version: 1,
+                from: 0,
+                to: 0,
+                replacement: vec![],
+            },
+        ),
+    );
+    let live = subject.start(runtime).await.unwrap();
+    let route = subject
+        .session_route(&live, session, &subject.owner_stamp())
+        .await
+        .unwrap();
+    let fields = with_prompt(subject.send_fields(session, true), "first", "original");
+    let reply = route
+        .request("session.send", Value::Object(fields))
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Response(_)), "{reply:?}");
+    let wal = broca_core::FileWalStore::new(live.state_root.join("wal"));
+    let lineage = wal
+        .read_records_range(&subject.bind_identity(session), 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap()
+        .to_string();
+    let replacement = json!({"role":"user","content":[{"type":"text","text":"bus summary"}]});
+    let view = CompactionView::new(
+        broca_core::agent_session_ref(&subject.bind_identity(session)),
+        2,
+        lineage,
+        MessageRef {
+            ordinal: 0,
+            mid: "m0".into(),
+        },
+        vec![ViewRange::replace(0, 1, json!([replacement]).to_string())],
+    );
+    subject.offer_bus_view(session, view.clone(), replacement);
+    let gate = live.state_root.join("test-compaction-bus-gate");
+    std::fs::write(&gate, cut).unwrap();
+    subject.bus.as_ref().unwrap().publish(&view).await;
+    broca_test_support::wait_until("bus receipt crash checkpoint", || async {
+        std::fs::read_to_string(live.state_root.join("test-compaction-bus-reached"))
+            .map_err(|e| e.to_string())
+            .and_then(|value| if value == cut { Ok(()) } else { Err(value) })
+    })
+    .await;
+    assert!(
+        !subject
+            .records(&live, session)
+            .iter()
+            .any(|r| matches!(r, broca_wal::WalRecord::CompactionViewApplied { .. })),
+        "view applied mid-step"
+    );
+    let receipts = broca_store::SqliteStore::open(live.state_root.join("run-index.db"))
+        .unwrap()
+        .compaction_receipts("", 256)
+        .unwrap();
+    assert_eq!(receipts.len(), 1, "receipt was not durable before {cut}");
+    println!("accepted send reached {cut}: one durable receipt, no mid-step view application");
+    (subject, live, route, gate)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_bus_mid_run_receipt_reaches_both_crash_cuts_without_killing() {
+    let root = broca_test_support::scratch_root().join("bus-receipt-cut-probe");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    for cut in ["ViewReceiptRecorded", "ViewReadyAcked"] {
+        let (_subject, _live, _route, gate) = at_receipt_cut(&root.join(cut), &project, cut).await;
+        std::fs::remove_file(gate).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
     let root = broca_test_support::scratch_root().join("bus-mid-run-real-kill");
     std::fs::create_dir_all(&root).unwrap();
     let project = root.join("project");
@@ -206,90 +341,8 @@ async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
     let mut captured = Vec::new();
     for cut in ["ViewReceiptRecorded", "ViewReadyAcked"] {
         let runtime = root.join(cut);
-        std::fs::create_dir_all(&runtime).unwrap();
-        let mut subject = BrocaSubject::new(&runtime).await;
-        subject.project_root = project.canonicalize().unwrap();
-        subject.bus = Some(Arc::new(BusRig::new(&runtime).await));
+        let (subject, mut live, route, gate) = at_receipt_cut(&runtime, &project, cut).await;
         let session = "bus-crash";
-        subject
-            .install_script(
-                session,
-                Script {
-                    turns: vec![cortexkit_role_llm_runner_conformance::ScriptedTurn::new(
-                        vec![ScriptedPart::Text("answer".into())],
-                    )],
-                },
-            )
-            .await
-            .unwrap();
-        subject.install_setup(
-            session,
-            cortexkit_role_llm_runner_conformance::CompactionSetup::Ready(
-                cortexkit_role_llm_runner_conformance::CompactionMessage {
-                    compaction_id: "head".into(),
-                    version: 1,
-                    from: 0,
-                    to: 0,
-                    replacement: vec![],
-                },
-            ),
-        );
-        let mut live = subject.start(&runtime).await.unwrap();
-        let route = subject
-            .session_route(&live, session, &subject.owner_stamp())
-            .await
-            .unwrap();
-        let mut fields = subject.send_fields(session, true);
-        fields.insert("send_id".into(), json!("first"));
-        fields.insert(
-            "input".into(),
-            json!([{"role":"user","content":[{"type":"text","text":"original"}]}]),
-        );
-        let reply = route
-            .request("session.send", Value::Object(fields))
-            .await
-            .unwrap();
-        assert!(matches!(reply, Reply::Response(_)), "{reply:?}");
-        let wal = broca_core::FileWalStore::new(live.state_root.join("wal"));
-        let lineage = wal
-            .read_records_range(&subject.bind_identity(session), 0, None, None)
-            .unwrap()
-            .lineage_id
-            .unwrap()
-            .to_string();
-        let replacement = json!({"role":"user","content":[{"type":"text","text":"bus summary"}]});
-        let view = CompactionView::new(
-            broca_core::agent_session_ref(&subject.bind_identity(session)),
-            2,
-            lineage,
-            MessageRef {
-                ordinal: 0,
-                mid: "m0".into(),
-            },
-            vec![ViewRange::replace(0, 1, json!([replacement]).to_string())],
-        );
-        subject.offer_bus_view(session, view.clone(), replacement);
-        let gate = live.state_root.join("test-compaction-bus-gate");
-        std::fs::write(&gate, cut).unwrap();
-        subject.bus.as_ref().unwrap().publish(&view).await;
-        broca_test_support::wait_until("bus receipt crash checkpoint", || async {
-            std::fs::read_to_string(live.state_root.join("test-compaction-bus-reached"))
-                .map_err(|e| e.to_string())
-                .and_then(|value| if value == cut { Ok(()) } else { Err(value) })
-        })
-        .await;
-        assert!(
-            !subject
-                .records(&live, session)
-                .iter()
-                .any(|r| matches!(r, broca_wal::WalRecord::CompactionViewApplied { .. })),
-            "view applied mid-step"
-        );
-        let receipts = broca_store::SqliteStore::open(live.state_root.join("run-index.db"))
-            .unwrap()
-            .compaction_receipts("", 256)
-            .unwrap();
-        assert_eq!(receipts.len(), 1, "receipt was not durable before {cut}");
         assert!(live.kill_all(), "no runner process was SIGKILLed at {cut}");
         drop(route);
         subject
@@ -308,12 +361,7 @@ async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
             .session_route(&live, session, &subject.owner_stamp())
             .await
             .unwrap();
-        let mut fields = subject.send_fields(session, false);
-        fields.insert("send_id".into(), json!("resume"));
-        fields.insert(
-            "input".into(),
-            json!([{"role":"user","content":[{"type":"text","text":"next"}]}]),
-        );
+        let fields = with_prompt(subject.send_fields(session, false), "resume", "next");
         let reply = route
             .request("session.send", Value::Object(fields))
             .await
@@ -387,27 +435,18 @@ async fn real_bus_fitting_idle_view_records_estimate_then_releases_held_queue_he
         .session_route(&live, session, &subject.owner_stamp())
         .await
         .unwrap();
-    let mut fields = subject.send_fields(session, true);
-    fields.insert("send_id".into(), json!("first"));
+    let mut fields = with_prompt(subject.send_fields(session, true), "first", "original");
     fields.insert("context_limit".into(), json!(10_000));
-    fields.insert(
-        "input".into(),
-        json!([{"role":"user","content":[{"type":"text","text":"original"}]}]),
+    let reply = route
+        .request("session.send", Value::Object(fields))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, Reply::Response(_)),
+        "initial send refused: {reply:?}"
     );
-    assert!(matches!(
-        route
-            .request("session.send", Value::Object(fields))
-            .await
-            .unwrap(),
-        Reply::Response(_)
-    ));
-    let mut fields = subject.send_fields(session, false);
-    fields.insert("send_id".into(), json!("queued"));
+    let mut fields = with_prompt(subject.send_fields(session, false), "queued", "next");
     fields.insert("delivery".into(), json!("queue"));
-    fields.insert(
-        "input".into(),
-        json!([{"role":"user","content":[{"type":"text","text":"next"}]}]),
-    );
     // A queued send does not reach a model yet, so use the raw route instead of the
     // compaction adapter's send helper, which waits for a model receipt.
     let reply = route

@@ -201,9 +201,9 @@ fn remember_replacement(state: &mut Session, value: &Value) {
         state.replacements.push((source.clone(), message.clone()));
     }
 }
-// OpenAI removes native position/origin fields and splits grouped tool results. Match the
-// received wire bytes against messages actually observed in statuses or delivered answers;
-// those observations supply only the metadata absent from the wire, never expected content.
+// OpenAI removes native position/origin fields and splits grouped tool results. Match received
+// bytes against provider replacements and recorded raw messages before attaching the native
+// metadata; unexpected wire content is never replaced with an expected message.
 fn render_native(message: &Value) -> Result<Vec<Value>, String> {
     let role = message["role"].as_str().ok_or("native role absent")?;
     let content = message["content"]
@@ -296,8 +296,35 @@ fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String>
     Ok(entries)
 }
 pub(super) fn capture(shared: &Shared, session: &str, messages: &[Value]) -> Option<Arc<HoldGate>> {
+    let root = shared.session_roots.lock().unwrap().get(session)?.clone();
+    let identity = shared
+        .session_bindings
+        .lock()
+        .unwrap()
+        .get(session)?
+        .clone();
+    let records = broca_core::FileWalStore::new(root.join("wal"))
+        .read_records(&identity)
+        .unwrap_or_else(|error| {
+            panic!("cannot read native sources for received model input: {error}")
+        });
+    let records: Vec<_> = records.into_iter().map(|frame| frame.record).collect();
+    let prior = broca_core::replay::replay(&records).expect("recorded model input sources replay");
     let mut states = shared.compaction.lock().unwrap();
     let state = states.get_mut(session)?;
+    // The wire is the observation. WAL messages identify origins and ordinals omitted by
+    // OpenAI, but each received message must still render-match the recorded content.
+    state.raw = prior
+        .prompt
+        .iter()
+        .enumerate()
+        .map(|(ordinal, message)| {
+            (
+                ordinal as u64,
+                serde_json::to_value(message).expect("native message"),
+            )
+        })
+        .collect();
     let translated =
         translate(state, messages).unwrap_or_else(|e| panic!("wire capture translation: {e}"));
     state.inputs.push(translated);

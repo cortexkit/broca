@@ -425,6 +425,12 @@ impl SqliteStore {
         now_ms: u64,
         baseline: Baseline,
     ) -> Result<(), StoreError> {
+        if records
+            .iter()
+            .any(|r| crate::compaction_facts::is_compaction_record(&r.record))
+        {
+            self.project_compaction_facts_records(session, epoch, records, None, None)?;
+        }
         let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
             return Ok(());
         };

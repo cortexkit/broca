@@ -35,6 +35,7 @@ use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
 pub mod caps;
+pub mod compaction_facts;
 pub mod compaction_receipts;
 pub mod export_index;
 mod fold_identities;
@@ -1048,6 +1049,7 @@ impl SqliteStore {
         session_refs::init_schema(conn)?;
         bus_events::init_schema(conn)?;
         compaction_receipts::init_schema(conn)?;
+        compaction_facts::init_schema(conn)?;
         export_index::init_schema(conn).map_err(StoreError::from)
     }
 
@@ -1221,6 +1223,14 @@ impl SqliteStore {
         records: &[FramedRecord],
         range: Option<&WalRangeRead>,
     ) -> Result<u64, StoreError> {
+        if records
+            .iter()
+            .any(|r| compaction_facts::is_compaction_record(&r.record))
+        {
+            if let Some(range) = range {
+                self.project_compaction_facts(session, range)?;
+            }
+        }
         let key = Self::key(session);
         for _ in 0..OPTIMISTIC_PROJECTION_ATTEMPTS {
             let snapshot = self.projection_snapshot(&key)?;

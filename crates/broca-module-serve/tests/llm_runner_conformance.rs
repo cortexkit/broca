@@ -159,6 +159,7 @@ struct Shared {
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
+    session_bindings: Mutex<HashMap<String, broca_protocol::BindIdentity>>,
     compaction_clocks: Mutex<HashMap<PathBuf, u64>>,
     /// Each session's scripted model.
     scripts: Mutex<HashMap<String, Script>>,
@@ -784,6 +785,7 @@ struct BrocaSubject {
     binary: Option<PathBuf>,
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
+    compaction_only: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
 }
@@ -803,6 +805,7 @@ impl BrocaSubject {
             binary: None,
             backup_classes: None,
             bus_events_enabled: true,
+            compaction_only: false,
             #[cfg(feature = "test-clock")]
             bus: None,
         }
@@ -1190,7 +1193,7 @@ impl Harness for BrocaSubject {
     type Route = BrocaRoute;
 
     fn declared_points(&self) -> Vec<PointDeclaration> {
-        if skip_crash_kills() {
+        if skip_crash_kills() || self.compaction_only {
             return Vec::new();
         }
         let points: Vec<_> = [
@@ -1554,6 +1557,18 @@ impl LlmRunnerSubject for BrocaSubject {
             .map_or(0, Vec::len))
     }
     fn capabilities(&self) -> BTreeSet<Capability> {
+        if self.compaction_only {
+            return [
+                Capability::Compaction,
+                Capability::ModelView,
+                Capability::Queue,
+                Capability::TranscriptReads,
+                Capability::RunOps,
+                Capability::Tags,
+            ]
+            .into_iter()
+            .collect();
+        }
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
             Capability::RunOps,
@@ -1615,6 +1630,11 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .insert(session.to_owned(), handle.state_root.clone());
         let identity = self.bind_identity(session);
+        self.shared
+            .session_bindings
+            .lock()
+            .unwrap()
+            .insert(session.into(), identity.clone());
         let started = Instant::now();
         let route = self.open(&connection, &identity).await?;
         if self.shared.compaction.lock().unwrap().contains_key(session)
@@ -2409,10 +2429,7 @@ async fn compaction_bus_disabled_refuses_plan_without_writes() {
         .unwrap()
         .contains(&json!("compaction")));
     let mut fields = subject.send_fields(session, true);
-    fields.insert(
-        "input".into(),
-        json!([{"role":"user","content":[{"type":"text","text":"do not write"}]}]),
-    );
+    fields.insert("prompt".into(), json!("do not write"));
     fields.insert("send_id".into(), json!("bus-off"));
     let reply = route
         .request("session.send", Value::Object(fields))
@@ -2430,6 +2447,37 @@ async fn compaction_bus_disabled_refuses_plan_without_writes() {
     assert!(subject.shared.compaction.lock().unwrap()[session]
         .describe()
         .contains("captured model inputs=0"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kit_compaction_cases_without_process_kills() {
+    require_compaction_test_clock();
+    let root = broca_test_support::scratch_root().join("kit-compaction-without-kills");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut subject = BrocaSubject::new(&root).await;
+    subject.compaction_only = true;
+    let report = run_suite(&subject, &root.join("suite")).await.unwrap();
+    println!("{}", report.render());
+    assert!(report.kills.is_empty());
+    for name in [
+        "model_view_half_open_ranges_and_travel",
+        "compaction_unavailable_distinct_from_refuse",
+    ] {
+        let case = report.cases.iter().find(|c| c.case == name).unwrap();
+        assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
+    }
+    assert!(
+        matches!(
+            report
+                .cases
+                .iter()
+                .find(|c| c.case == "compaction_setup_durable_once")
+                .unwrap()
+                .outcome,
+            CaseOutcome::Skipped { .. }
+        ),
+        "the Setup crash case remains reserved to a real-kill runner"
+    );
 }
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume

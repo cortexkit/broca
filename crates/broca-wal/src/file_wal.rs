@@ -91,6 +91,9 @@ pub struct WalRangeRead {
     records: Vec<FramedRecord>,
     pub next_anchor: Option<WalByteAnchor>,
     pub lineage_id: Option<WalLineageId>,
+    /// End of the verified source prefix, including trailing lineage frames, only
+    /// when this range includes the source's last record. A torn suffix ends before EOF.
+    pub complete_byte_end: Option<u64>,
     /// Whether this read observed a live file or a verified archive member.
     ///
     /// `Some(false)` means the source was absent, `Some(true)` means a source was observed,
@@ -170,6 +173,7 @@ impl WalRangeRead {
             records,
             next_anchor: anchors.last().copied(),
             lineage_id,
+            complete_byte_end: None,
             file_present: None,
             archive_lookup_missed: false,
             anchors,
@@ -183,6 +187,7 @@ impl WalRangeRead {
             records,
             next_anchor: None,
             lineage_id: None,
+            complete_byte_end: None,
             file_present: None,
             archive_lookup_missed: false,
             anchors: Vec::new(),
@@ -1240,6 +1245,7 @@ pub fn read_records_range(
                 next_anchor: None,
                 lineage_id: None,
                 file_present: Some(false),
+                complete_byte_end: None,
                 archive_lookup_missed: false,
                 anchors: Vec::new(),
                 used_features: Vec::new(),
@@ -1363,6 +1369,56 @@ pub fn read_records_tail(
         lineage_id: decoded.lineage_id,
         file_present: true,
     })
+}
+
+/// Decode at most the final `tail_bytes` of a live WAL. A frame larger than the
+/// window or an undecodable suffix returns `None`, never a full-history fallback.
+pub fn read_records_tail_bounded(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+    tail_bytes: u64,
+) -> Result<Option<WalRangeRead>, WalError> {
+    let path = path.as_ref();
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    let metadata = file.metadata().map_err(WalError::Io)?;
+    let file_size = metadata.len();
+    if file_size > max_bytes {
+        return Err(WalError::TooLarge {
+            max_bytes,
+            file_size,
+        });
+    }
+    let start = file_size.saturating_sub(tail_bytes);
+    let suffix = read_open_file_capped(&mut file, start, file_size, file_size)?;
+    let lineage = read_first_frame_lineage(&mut file, max_bytes)?;
+    let file_id = metadata_file_id(&metadata);
+    if start == 0 {
+        let decoded = decode_bytes(&suffix, 0, 1)?;
+        return select_decoded_range(decoded, &suffix, 0, file_id, 0, None).map(Some);
+    }
+    for offset in 0..suffix.len() {
+        let DecodeStep::Record { framed, .. } = decode_next(&suffix[offset..]) else {
+            continue;
+        };
+        let after = framed.seq.saturating_sub(1);
+        if let Ok(decoded) = decode_bytes(&suffix[offset..], start + offset as u64, framed.seq) {
+            let mut range = select_decoded_range(
+                decoded,
+                &suffix[offset..],
+                start + offset as u64,
+                file_id,
+                after,
+                None,
+            )?;
+            range.lineage_id = range.lineage_id.or(lineage);
+            return Ok(Some(range));
+        }
+    }
+    Ok(None)
 }
 
 /// The lineage identity a WAL records in its first frame. A WAL that predates lineage
@@ -1658,6 +1714,8 @@ fn select_decoded_range(
         offset: absolute_start as usize,
         source,
     })?;
+    let source_head = decoded.records.last().map(|(r, _)| r.seq);
+    let complete_end = decoded.valid_end;
     let mut range = select_range(
         decoded.records,
         file_id,
@@ -1666,6 +1724,9 @@ fn select_decoded_range(
         decoded.lineage_id,
     );
     range.used_features = used_features;
+    if source_head.is_some() && range.next_anchor.map(|a| a.seq) == source_head {
+        range.complete_byte_end = Some(complete_end);
+    }
     Ok(range)
 }
 

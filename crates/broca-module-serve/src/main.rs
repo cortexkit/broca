@@ -627,6 +627,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let service = broca_module_serve::compaction_bus::Service::new(
             run_index.clone(),
             registry.as_ref().clone(),
+            crash_orphan_wal.clone(),
             compaction_inbox,
             bus_connector.clone(),
             bus_stop.clone(),

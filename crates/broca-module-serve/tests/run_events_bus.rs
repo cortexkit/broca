@@ -311,11 +311,13 @@ async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
     drop(writer);
     broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(temp.path()))
         .unwrap();
-    let registry = broca_module::LineageRegistry::new_with_reader(Arc::new(NoActor), wal, None);
+    let registry =
+        broca_module::LineageRegistry::new_with_reader(Arc::new(NoActor), wal.clone(), None);
     let inbox = Arc::new(ViewReadyInbox::default());
     let service = broca_module_serve::compaction_bus::Service::new(
         store.clone(),
         registry.clone(),
+        wal.clone(),
         inbox.clone(),
         Arc::new(NoConnector),
         Default::default(),
@@ -392,6 +394,7 @@ async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
     let service = broca_module_serve::compaction_bus::Service::new(
         store.clone(),
         registry,
+        wal,
         restored.clone(),
         Arc::new(NoConnector),
         Default::default(),

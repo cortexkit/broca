@@ -18893,3 +18893,207 @@ expect_red = ["real_bus_compaction_attach_never_creates_or_modifies_consumers"]
 file = "crates/broca-module-serve/src/bus_events_nats.rs"
 old = "config.ack_wait != spec.ack_wait"
 new = "false /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-intake-no-full-history-reads"
+guards = "twenty announcements and repeated receipt reconciliation use projected facts rather than decode a large WAL"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::twenty_announcements_and_reconcile_passes_do_zero_full_reads_of_a_large_log"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "let facts = store.compaction_facts(session).map_err(|e| e.to_string())?;"
+new = "let _ = wal.read_records(session).map_err(|e| e.to_string())?; // NON-VACUITY BREAK\n    let facts = store.compaction_facts(session).map_err(|e| e.to_string())?;"
+
+[[control]]
+id = "compaction-intake-current-projection-skips-tail"
+guards = "a current facts projection avoids repeated WAL suffix decoding"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::twenty_announcements_and_reconcile_passes_do_zero_full_reads_of_a_large_log"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "facts.filter(|f| f.current_file(identity, bytes))"
+new = "facts.filter(|_| { let _ = (identity, bytes); false }) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-intake-replacement-invalidates-file-proof"
+guards = "a replaced WAL cannot reuse the prior inode's cached compaction facts proof"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::replaced_file_identity_invalidates_cached_facts_without_a_full_read"]
+file = "crates/broca-store/src/compaction_facts.rs"
+old = "identity == self.file_id"
+new = "(identity.is_some() || self.file_id.is_some()) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-intake-oversized-tail-never-widens"
+guards = "an oversized suffix stays unknown instead of falling back to full WAL decoding"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::oversized_tail_returns_unknown_without_any_full_read_fallback"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "    Ok(None)\n}\n\n/// The lineage identity a WAL records in its first frame."
+new = "    read_records_range(path, max_bytes, 0, None, None).map(Some) // NON-VACUITY BREAK\n}\n\n/// The lineage identity a WAL records in its first frame."
+
+[[control]]
+id = "compaction-turn-projection-captures-facts"
+guards = "normal durable turn projection populates the small facts projection used by intake"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::twenty_announcements_and_reconcile_passes_do_zero_full_reads_of_a_large_log"]
+file = "crates/broca-store/src/lib.rs"
+old = "self.project_compaction_facts(session, range)?;"
+new = "let _ = range; // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-projection-captures-facts"
+guards = "the existing durable bus projection folds applied and refused versions into compaction facts"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_facts.rs"
+expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_outcomes_and_rejects_gaps"]
+file = "crates/broca-store/src/bus_events.rs"
+old = "self.project_compaction_facts_records(session, epoch, records, None, None)?;"
+new = "// NON-VACUITY BREAK: omit the durable facts fold"
+
+[[control]]
+id = "compaction-facts-notice-before-cleanup"
+guards = "a view applied without its updated notice cannot resolve an announcement receipt"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_facts.rs"
+expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_outcomes_and_rejects_gaps"]
+file = "crates/broca-store/src/compaction_facts.rs"
+old = "self.noticed.max(self.refused) >= version"
+new = "self.applied.max(self.refused) >= version /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-facts-projection-requires-contiguous-suffix"
+guards = "a missing WAL frame cannot advance the facts watermark over unknown outcomes"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_facts.rs"
+expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_outcomes_and_rejects_gaps"]
+file = "crates/broca-store/src/compaction_facts.rs"
+old = "r.seq != facts.watermark.saturating_add(1)"
+new = "{ let _ = r; false } /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-facts-lineage-cleanup"
+guards = "lineage deletion clears only that lineage's compaction facts"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_facts.rs"
+expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_outcomes_and_rejects_gaps"]
+file = "crates/broca-store/src/compaction_facts.rs"
+old = "DELETE FROM compaction_facts WHERE lineage_id=OLD.lineage_id;"
+new = "DELETE FROM compaction_facts WHERE 0 AND lineage_id=OLD.lineage_id; -- NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-facts-verified-end-includes-lineage-frames"
+guards = "the cached file proof includes verified trailing lineage frames so current intake needs no suffix read"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::twenty_announcements_and_reconcile_passes_do_zero_full_reads_of_a_large_log"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "range.complete_byte_end = Some(complete_end);"
+new = "range.complete_byte_end = None; let _ = complete_end; // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-health-pins-disabled-reading"
+guards = "a healthy bus-off adapter reports a detached consumer with zero counters and no bus error"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::health_check_reports_slot_counts_and_stale_lkg_without_degrading"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "\"compaction_bus\": crate::compaction_bus::health(),"
+new = "\"compaction_bus\": serde_json::Value::Null, // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-fixture-uses-public-prompt-field"
+guards = "the bus crash and idle fixtures send the public prompt field rather than an ignored native input array"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/bus.rs"
+expect_red = ["bus::bus_fixture_sends_decode_the_public_prompt_field"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance/bus.rs"
+old = "fields.insert(\"prompt\".into(), json!(prompt));"
+new = "fields.insert(\"input\".into(), json!(prompt)); // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-kit-capture-loads-recorded-native-sources"
+guards = "canonical model-input capture matches received bytes against the recorded native transcript"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["kit_compaction_cases_without_process_kills"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance/compaction.rs"
+old = "state.raw = prior\n        .prompt\n        .iter()"
+new = "state.raw = prior\n        .prompt\n        .iter().take(0) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-facts-bounded-setup-initializes-projection"
+guards = "Setup in a bounded suffix can initialize facts without decoding the older conversation"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_facts.rs"
+expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_outcomes_and_rejects_gaps"]
+file = "crates/broca-store/src/compaction_facts.rs"
+old = "if !facts.setup {\n            if let Some(setup)"
+new = "if false && !facts.setup { // NON-VACUITY BREAK\n            if let Some(setup)"
+
+[[control]]
+id = "compaction-facts-mismatched-notice-stays-unknown"
+guards = "a notice from another lineage cannot advance facts or break ordinary outbox projection"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_facts.rs"
+expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_outcomes_and_rejects_gaps"]
+file = "crates/broca-store/src/compaction_facts.rs"
+old = "if headers.get(\"lineage_id\").map(String::as_str) != Some(lineage) {"
+new = "if false && headers.get(\"lineage_id\").map(String::as_str) != Some(lineage) { // NON-VACUITY BREAK"
