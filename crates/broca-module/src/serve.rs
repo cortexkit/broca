@@ -770,7 +770,6 @@ fn indexed_run_tool_calls(
     let mut active_step_seq = 0u64;
     let mut active_step_ordinal = 0u64;
     let mut active_batch_id: Option<String> = None;
-    let mut planned_call_count = 0usize;
 
     let finish_calls = |calls: &mut Vec<RunToolCallBuilder>,
                         step_seq: u64,
@@ -802,7 +801,6 @@ fn indexed_run_tool_calls(
                 pending_steers = 0;
                 active_calls.clear();
                 active_batch_id = None;
-                planned_call_count = 0;
             }
             WalRecord::StepStarted { .. } => {
                 prompt_len = prompt_len.saturating_add(pending_steers);
@@ -813,7 +811,6 @@ fn indexed_run_tool_calls(
             } => {
                 active_calls.clear();
                 active_batch_id = None;
-                planned_call_count = 0;
                 active_step_seq = framed.seq;
                 active_step_ordinal = step_ordinals
                     .get(&framed.seq)
@@ -837,13 +834,8 @@ fn indexed_run_tool_calls(
                     prompt_len = prompt_len.saturating_add(1);
                 }
             }
-            WalRecord::ToolBatchStarted {
-                batch_id,
-                planned_calls,
-                ..
-            } => {
+            WalRecord::ToolBatchStarted { batch_id, .. } => {
                 active_batch_id = Some(batch_id.0.clone());
-                planned_call_count = planned_calls.len();
             }
             WalRecord::ToolCallDeferred {
                 batch_id, call_id, ..
@@ -935,12 +927,11 @@ fn indexed_run_tool_calls(
                         &mut entries,
                     );
                 }
-                prompt_len = prompt_len
-                    .saturating_add(1)
-                    .saturating_add(planned_call_count as u64);
+                // Each batch adds two prompt messages—one assistant and one tool-role message,
+                // regardless of how many calls the batch contains.
+                prompt_len = prompt_len.saturating_add(2);
                 active_calls.clear();
                 active_batch_id = None;
-                planned_call_count = 0;
             }
             WalRecord::Steered { input, .. } => {
                 pending_steers = pending_steers.saturating_add(input.len() as u64);

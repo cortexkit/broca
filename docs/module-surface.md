@@ -226,8 +226,15 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   exceeds the transport limit, broca refuses `reply_too_large` and names the final message by
   session and ordinal without including its content. A run result without a final message uses
   the generic `response_too_large` refusal if its metadata alone cannot fit.
-- `run.tool_calls` pages the run's durable calls in dispatch order. `tool_call_id` is a model
-  display id and may repeat; the per-call `call_key` identifies each prepared or dispatched call.
+- `run.tool_calls` pages the run's durable calls in dispatch order. Every call in a
+  batch has the `ordinal` of the assistant message that requested it, which is also
+  the `session.read` ordinal. The assistant message is followed by one tool-role
+  message at `ordinal + 1` containing all results in the order the calls were planned
+  when the batch started (the same positions as the assistant message's tool-call
+  blocks), even if calls completed in another order. Match calls to results by
+  position in those messages: `tool_call_id` is a model display id and may repeat,
+  while the per-call `call_key` identifies each prepared or dispatched call. A steer
+  user message, when present, comes after the tool-result message.
   `limit` is capped to the
   transcript-read maximum (absent means its default; zero is `invalid_params` naming `limit`);
   `after` is an opaque continuation returned as `next`, and an unknown cursor is refused naming
