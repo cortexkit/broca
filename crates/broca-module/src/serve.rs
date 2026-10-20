@@ -1805,10 +1805,13 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// Whether the session was ever written (it has a WAL, live or archived). A send may leave
-    /// runner parameters to the session's frozen values only then. A store that cannot tell
-    /// answers `true`, and admission refuses the send if the session has no episode after all.
-    fn session_written(&self, _session: &LineageKey) -> bool {
-        true
+    /// runner parameters to the session's frozen values only then. An unavailable classifier
+    /// refuses retryably rather than inventing history or discarding frozen settings.
+    fn session_written(&self, _session: &LineageKey) -> Result<bool, ServeError> {
+        Err(ServeError::Open(
+            "cannot determine whether the session has a WAL; retry the send".into(),
+            Some(broca_protocol::ErrorClass::Transient),
+        ))
     }
 
     /// Where `session` stands with respect to fetch plans. The default cannot tell.
@@ -2971,8 +2974,13 @@ impl ServeHandler for crate::LineageRegistry {
             })
     }
 
-    fn session_written(&self, session: &LineageKey) -> bool {
-        self.wal_written(session)
+    fn session_written(&self, session: &LineageKey) -> Result<bool, ServeError> {
+        self.wal_written(session).ok_or_else(|| {
+            ServeError::Open(
+                "cannot determine whether the session has a WAL; retry the send".into(),
+                Some(broca_protocol::ErrorClass::Transient),
+            )
+        })
     }
 
     async fn cancel(

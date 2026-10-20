@@ -2269,21 +2269,30 @@ where
                 )
                 .await;
             }
-            // A steer or interrupt into a session that already has an episode takes every
-            // runner parameter it omits from the session's latest frozen config, so its turn
-            // renders the session's own request prefix. Admission fills them in, from the
-            // admission view it reads anyway, so nothing is read here beyond whether the session
-            // was ever written. Any other send takes the defaults for what it omits, and must
-            // name a model.
+            // Deliveries that can join an episode take omitted runner parameters from its
+            // frozen config, so they render the session's own request prefix. Admission resolves
+            // them against its history snapshot; this preflight only classifies WAL presence.
+            // Deliveries that can only start a new run take defaults and must name a model.
             let inherit_frozen: std::collections::BTreeSet<
                 broca_protocol::request::InheritedParam,
-            > = match params.delivery.as_ref().map(|delivery| delivery.mode()) {
-                // An ordered list joins the session as it is, like a steer: what it omits comes
-                // from the session's frozen values.
-                Some(
-                    Some(broca_protocol::Delivery::Steer | broca_protocol::Delivery::Interrupt)
-                    | None,
-                ) => broca_protocol::request::InheritedParam::ALL
+            > = if match params.delivery.as_ref() {
+                Some(broca_wire::SendDelivery::Mode(_)) => matches!(
+                    params.legacy_delivery(),
+                    broca_protocol::Delivery::Steer | broca_protocol::Delivery::Interrupt
+                ),
+                // Only modes that can join an episode need its frozen settings. Starting or
+                // queueing a new run takes defaults even when expressed as an ordered list.
+                Some(broca_wire::SendDelivery::Order(modes)) => modes.iter().any(|mode| {
+                    matches!(
+                        mode,
+                        broca_protocol::DeliveryMode::Steer
+                            | broca_protocol::DeliveryMode::ToolResult
+                            | broca_protocol::DeliveryMode::TurnSystem
+                    )
+                }),
+                None => false,
+            } {
+                broca_protocol::request::InheritedParam::ALL
                     .iter()
                     .filter(|(_, member)| {
                         req.params
@@ -2291,13 +2300,24 @@ where
                             .is_none_or(serde_json::Value::is_null)
                     })
                     .map(|(param, _)| *param)
-                    .collect(),
-                _ => Default::default(),
+                    .collect()
+            } else {
+                Default::default()
+            };
+            let session_written = if inherit_frozen.is_empty() {
+                false
+            } else {
+                match handler.session_written(&session) {
+                    Ok(written) => written,
+                    Err(error) => {
+                        return send_serve_error(writer, ver, channel, epoch, corr, &error).await
+                    }
+                }
             };
             if params.model.is_none() {
                 let may_inherit = inherit_frozen
                     .contains(&broca_protocol::request::InheritedParam::Model)
-                    && handler.session_written(&session);
+                    && session_written;
                 if !may_inherit {
                     return send_invalid_params(
                         writer,
@@ -2306,7 +2326,7 @@ where
                         epoch,
                         corr,
                         Some("model".into()),
-                        "model is required, except on a steer or interrupt into a session that has one",
+                        "model is required unless a joining delivery can inherit it from an existing episode",
                     )
                     .await;
                 }
@@ -2321,8 +2341,7 @@ where
             }
             // A session never written has no frozen values, so its first send keeps the
             // defaults for everything it omits.
-            let inherit_frozen = if inherit_frozen.is_empty() || !handler.session_written(&session)
-            {
+            let inherit_frozen = if !session_written {
                 Default::default()
             } else {
                 inherit_frozen

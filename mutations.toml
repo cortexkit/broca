@@ -17915,3 +17915,81 @@ expect_red = ["compaction_routes::view_get_and_ride_use_the_role_route_and_only_
 file = "crates/broca-subc/src/compaction_plane.rs"
 old = '&OpRequest::new(ops::COMPACTION_RIDE, &request),'
 new = '&OpRequest::new(ops::VIEW_GET, &request), // NON-VACUITY BREAK'
+
+[[control]]
+id = "fresh-idle-start-defaults"
+guards = "a revive-shaped idle_start send with a named model starts an episode without frozen parameters, even when only a WAL header exists"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::a_fresh_idle_start_with_a_model_uses_defaults"]
+[[control.edits]]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "Some(broca_wire::SendDelivery::Order(modes)) => modes.iter().any(|mode| {"
+new = "Some(broca_wire::SendDelivery::Order(modes)) => !modes.is_empty() || modes.iter().any(|mode| { // NON-VACUITY BREAK: all lists inherit"
+[[control.edits]]
+file = "crates/broca-module/src/actor.rs"
+old = "resolved_request.inherit_frozen.clear();"
+new = "return Err(StartRunFailure::Admission(broca_core::RunError::Config(\"NON-VACUITY BREAK: no frozen settings\".into())));"
+
+[[control]]
+id = "fresh-steer-defaults"
+guards = "a first steer with a named model takes defaults rather than refusing because other frozen parameters were omitted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::a_fresh_steer_with_a_model_uses_defaults"]
+file = "crates/broca-module/src/actor.rs"
+old = "resolved_request.inherit_frozen.clear();"
+new = "return Err(StartRunFailure::Admission(broca_core::RunError::Config(\"NON-VACUITY BREAK: no frozen settings\".into())));"
+
+[[control]]
+id = "fresh-send-requires-model"
+guards = "a session with no episode refuses an omitted model precisely and writes nothing, even when a WAL header exists"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::a_fresh_send_without_a_model_refuses_precisely"]
+file = "crates/broca-module/src/actor.rs"
+old = """
+                if resolved_request
+                    .inherit_frozen
+                    .contains(&broca_protocol::request::InheritedParam::Model)
+                {"""
+new = """
+                if false && resolved_request // NON-VACUITY BREAK: admit a missing first model
+                    .inherit_frozen
+                    .contains(&broca_protocol::request::InheritedParam::Model)
+                {"""
+
+[[control]]
+id = "unknown-wal-presence-is-not-written"
+guards = "an unavailable WAL classifier preserves unknown and yields a typed retryable refusal rather than claiming history"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry.rs"
+expect_red = ["registry::tests::an_unclassifiable_wal_is_not_reported_as_written"]
+file = "crates/broca-module/src/registry.rs"
+old = ".and_then(|reader| reader.wal_store.wal_present(key))"
+new = ".and_then(|reader| reader.wal_store.wal_present(key)).or(Some(true)) // NON-VACUITY BREAK: unknown is written"
+
+[[control]]
+id = "idle-start-only-list-defaults"
+guards = "an idle_start-only list cannot omit model or inherit the preceding episode's runner settings"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::an_idle_start_only_list_does_not_inherit_an_existing_episode"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "Some(broca_wire::SendDelivery::Order(modes)) => modes.iter().any(|mode| {"
+new = "Some(broca_wire::SendDelivery::Order(modes)) => !modes.is_empty() || modes.iter().any(|mode| { // NON-VACUITY BREAK: all lists inherit"
