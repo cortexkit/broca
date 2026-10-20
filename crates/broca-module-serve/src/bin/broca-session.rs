@@ -18,6 +18,7 @@
 //! check that answered "nothing wrong".
 #![forbid(unsafe_code)]
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use broca_module::serve::SubscribeFrom;
@@ -29,6 +30,7 @@ use broca_protocol::caller::{ControlUnit, RunFinishReason};
 use broca_protocol::request::{CacheRole, Tool};
 use broca_subc::SubcConnection;
 use clap::{Parser, Subcommand, ValueEnum};
+use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -289,12 +291,24 @@ enum Cmd {
         #[arg(long)]
         source_ref: Option<String>,
     },
-    /// `run.status`: the SESSION state (Idle|Active), or a SPECIFIC run's three-tier status
-    /// with `--run-id` (the durable run index's wire surface).
+    /// `run.status`: report the session state, or use `--run-id` to report one run's lifecycle
+    /// status. `--raw` with `--run-id` writes the daemon's exact reply bytes to stdout and their
+    /// count and SHA-256 to stderr.
     Status {
         /// Resolve this specific run's lifecycle state (via the run index), not the session.
         #[arg(long)]
         run_id: Option<String>,
+        /// Write the exact run-status reply bytes to stdout; requires `--run-id`.
+        #[arg(long, requires = "run_id")]
+        raw: bool,
+    },
+    /// `run.result`: the decoded state and final-message summary for one specific run.
+    Result {
+        #[arg(long)]
+        run_id: String,
+        /// Write the exact daemon reply bytes to stdout and its byte count and SHA-256 to stderr.
+        #[arg(long)]
+        raw: bool,
     },
     /// `run.cancel <run_id>`.
     Cancel {
@@ -553,23 +567,29 @@ async fn run(args: Args) -> Result<i32, String> {
             args.project_root.display()
         )
     };
-    emit(
-        json,
-        &serde_json::json!({
-            "event": "bound",
-            "module": args.module_id,
-            "harness": args.harness,
-            "project_root": keyed_root.display().to_string(),
-            "project_root_as_typed": args.project_root.display().to_string(),
-            "session": args.session,
-        }),
-        || {
-            format!(
-                "BOUND module={} harness={} project_root={} session={}",
-                args.module_id, args.harness, root_display, args.session
-            )
-        },
+    let raw_output = matches!(
+        &args.cmd,
+        Cmd::Status { raw: true, .. } | Cmd::Result { raw: true, .. }
     );
+    if !raw_output {
+        emit(
+            json,
+            &serde_json::json!({
+                "event": "bound",
+                "module": args.module_id,
+                "harness": args.harness,
+                "project_root": keyed_root.display().to_string(),
+                "project_root_as_typed": args.project_root.display().to_string(),
+                "session": args.session,
+            }),
+            || {
+                format!(
+                    "BOUND module={} harness={} project_root={} session={}",
+                    args.module_id, args.harness, root_display, args.session
+                )
+            },
+        );
+    }
 
     match args.cmd {
         Cmd::CacheDump(_) => Err("cache-dump must be invoked without daemon arguments".into()),
@@ -710,7 +730,7 @@ async fn run(args: Args) -> Result<i32, String> {
             );
             Ok(0)
         }
-        Cmd::Status { run_id } => {
+        Cmd::Status { run_id, raw } => {
             match run_id {
                 None => {
                     let status = client.status().await.map_err(|e| format!("status: {e}"))?;
@@ -719,6 +739,13 @@ async fn run(args: Args) -> Result<i32, String> {
                         &serde_json::json!({"event": "status", "status": format!("{status:?}")}),
                         || format!("STATUS {status:?}"),
                     );
+                }
+                Some(rid) if raw => {
+                    let body = client
+                        .run_status_raw(&rid)
+                        .await
+                        .map_err(|e| format!("run_status: {e}"))?;
+                    write_raw_reply(&body)?;
                 }
                 Some(rid) => {
                     let status = client
@@ -731,6 +758,26 @@ async fn run(args: Args) -> Result<i32, String> {
                         || format!("RUN_STATUS run_id={rid} status={status:?}"),
                     );
                 }
+            }
+            Ok(0)
+        }
+        Cmd::Result { run_id, raw } => {
+            if raw {
+                let body = client
+                    .run_result_raw(&run_id)
+                    .await
+                    .map_err(|e| format!("run_result: {e}"))?;
+                write_raw_reply(&body)?;
+            } else {
+                let result = client
+                    .run_result(&run_id)
+                    .await
+                    .map_err(|e| format!("run_result: {e}"))?;
+                emit(
+                    json,
+                    &serde_json::json!({"event": "run_result", "run_id": run_id, "result": format!("{result:?}")}),
+                    || format!("RUN_RESULT run_id={run_id} result={result:?}"),
+                );
             }
             Ok(0)
         }
@@ -1741,6 +1788,16 @@ fn emit_run_final_text_to(json: bool, text: &str, output: &mut impl FnMut(String
             output,
         );
     }
+}
+
+fn write_raw_reply(body: &[u8]) -> Result<(), String> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(body)
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("write raw daemon reply to stdout: {error}"))?;
+    eprintln!("RAW bytes={} sha256={:x}", body.len(), Sha256::digest(body));
+    Ok(())
 }
 
 /// Emit one event: a JSON line (`--json-events`) or a greppable human marker.

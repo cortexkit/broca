@@ -33,7 +33,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use broca_protocol::BindIdentity;
+use broca_subc::SubcConnection;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -1477,6 +1480,28 @@ async fn run_client(
 
 /// Observe admission/finish markers as they arrive, rather than inferring concurrency
 /// from how quickly client processes exit. All clients share the same deadline evidence.
+async fn run_client_output(
+    daemon: &Daemon,
+    project_root: &Path,
+    session: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new(broca_session_bin());
+    command
+        .arg("--subc")
+        .arg(&daemon.connection_file)
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--session")
+        .arg(session)
+        .args(args)
+        .kill_on_drop(true);
+    timeout(CLIENT_DEADLINE, command.output())
+        .await
+        .expect("raw broca-session request deadline")
+        .expect("run broca-session")
+}
+
 async fn run_client_with_probe(
     daemon: &Daemon,
     project_root: &Path,
@@ -1630,6 +1655,101 @@ async fn single_client_single_turn_through_the_real_module() {
         "the run reached a clean terminal"
     );
     assert_eq!(run.exit_code, 0, "a clean single-turn run exits 0");
+
+    let run_id = run
+        .lines
+        .iter()
+        .find(|line| line.starts_with("RUN_STARTED "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("run_id="))
+        })
+        .expect("the completed turn printed its run id")
+        .to_owned();
+
+    // Capture the module's response body through the transport's raw API, independently of the
+    // CLI process. Comparing bytes rather than parsed JSON catches any output decoding or rewrite.
+    let raw_conn = SubcConnection::connect(&daemon.connection_file)
+        .await
+        .expect("connect a raw response observer");
+    let identity = BindIdentity::new(&project_root, "broca", session);
+    let route = raw_conn
+        .route_open_management("broca", &identity)
+        .await
+        .expect("open a raw response route");
+    let result_request = serde_json::to_vec(&json!({
+        "method": "run.result",
+        "params": {"run_id": run_id},
+    }))
+    .unwrap();
+    let expected_result = raw_conn
+        .route_request_raw(&route, result_request)
+        .await
+        .expect("read raw run.result reply");
+    let status_request = serde_json::to_vec(&json!({
+        "method": "run.status",
+        "params": {"run_id": run_id},
+    }))
+    .unwrap();
+    let expected_status = raw_conn
+        .route_request_raw(&route, status_request)
+        .await
+        .expect("read raw run.status reply");
+
+    let raw_result = run_client_output(
+        &daemon,
+        &project_root,
+        session,
+        &["result", "--run-id", &run_id, "--raw"],
+    )
+    .await;
+    assert_eq!(raw_result.status.code(), Some(0));
+    assert_eq!(raw_result.stdout, expected_result);
+    assert_eq!(
+        raw_result.stderr,
+        format!(
+            "RAW bytes={} sha256={:x}\n",
+            expected_result.len(),
+            Sha256::digest(&expected_result)
+        )
+        .as_bytes()
+    );
+
+    let raw_status = run_client_output(
+        &daemon,
+        &project_root,
+        session,
+        &["status", "--run-id", &run_id, "--raw"],
+    )
+    .await;
+    assert_eq!(raw_status.status.code(), Some(0));
+    assert_eq!(raw_status.stdout, expected_status);
+    assert_eq!(
+        raw_status.stderr,
+        format!(
+            "RAW bytes={} sha256={:x}\n",
+            expected_status.len(),
+            Sha256::digest(&expected_status)
+        )
+        .as_bytes()
+    );
+
+    let result_summary = run_client(
+        &daemon,
+        &project_root,
+        session,
+        &["result", "--run-id", &run_id],
+    )
+    .await;
+    assert_eq!(result_summary.exit_code, 0);
+    assert!(
+        result_summary
+            .lines
+            .iter()
+            .any(|line| line.starts_with(&format!("RUN_RESULT run_id={run_id} result="))),
+        "result prints a decoded summary like status: {:?}",
+        result_summary.lines
+    );
 
     // ANTI-FALSE-GREEN 2: the run actually PERSISTED — the module wrote a durable WAL for the
     // session. A run that merely produced wire events but didn't persist (or never ran) would

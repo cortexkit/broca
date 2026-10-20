@@ -28,6 +28,8 @@ use crate::wire::{
     SendResult, StatusParams, SubscribeParams,
 };
 
+use broca_wire::RunResultParams;
+
 pub use broca_wire::{decode_subscribe_event, SubscribeEvent};
 
 /// A client for one session on a module. Short requests like send/status/cancel/retract use
@@ -304,6 +306,34 @@ impl SessionClient {
             .await
     }
 
+    /// `run.status{run_id}` as the daemon returned it, before JSON decoding.
+    pub async fn run_status_raw(&self, run_id: &str) -> Result<Vec<u8>, ConnError> {
+        let params = StatusParams {
+            run_id: Some(run_id.to_string()),
+        };
+        self.request_raw("run.status", &params).await
+    }
+
+    /// `run.result{run_id}`: a run's state and, once completed, its final message.
+    pub async fn run_result(
+        &self,
+        run_id: &str,
+    ) -> Result<broca_wire::RunResultResponse, ConnError> {
+        let params = RunResultParams {
+            run_id: run_id.to_string(),
+        };
+        self.request("run.result", &params, "decode run_result")
+            .await
+    }
+
+    /// `run.result{run_id}` as the daemon returned it, before JSON decoding.
+    pub async fn run_result_raw(&self, run_id: &str) -> Result<Vec<u8>, ConnError> {
+        let params = RunResultParams {
+            run_id: run_id.to_string(),
+        };
+        self.request_raw("run.result", &params).await
+    }
+
     /// `session.read`: read a durable transcript page. An omitted `from_ordinal` returns the
     /// newest page; an explicit ordinal starts a forward range.
     pub async fn read(
@@ -386,9 +416,19 @@ impl SessionClient {
         P: serde::Serialize,
         T: serde::de::DeserializeOwned,
     {
-        let body = self.request_body(method, params)?;
-        let response = self.conn.route_request_raw(&self.cmd_route, body).await?;
+        let response = self.request_raw(method, params).await?;
         decode_result_envelope(&response, error_context)
+    }
+
+    /// Return the response body unchanged so callers that need byte fidelity can read it before
+    /// any JSON decoding takes place.
+    async fn request_raw<P: serde::Serialize>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<Vec<u8>, ConnError> {
+        let body = self.request_body(method, params)?;
+        self.conn.route_request_raw(&self.cmd_route, body).await
     }
 
     fn request_body<P: serde::Serialize>(
@@ -652,5 +692,21 @@ mod tests {
             context_management: None,
         };
         assert_request_preserves_legacy_shape("session.send", &send);
+
+        let result = RunResultParams {
+            run_id: "run-1".into(),
+        };
+        let request: serde_json::Value = serde_json::from_slice(
+            &serde_json::to_vec(&RequestRef {
+                method: "run.result",
+                params: &result,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({"method": "run.result", "params": {"run_id": "run-1"}})
+        );
     }
 }
