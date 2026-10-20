@@ -7816,6 +7816,7 @@ package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/crash_orphan_tests.rs"
 features = ["test-clock"]
+only = false
 expect_red = ["actor::crash_orphan_tests::crash_orphan_seal_keeps_a_never_sent_call_with_a_never_executed_result"]
 expect_message = "the seal must keep the call with a never-executed result"
 file = "crates/broca-module/src/actor.rs"

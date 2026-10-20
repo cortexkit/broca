@@ -171,6 +171,43 @@ impl RunExecutor for Recording {
     }
 }
 
+/// Runs each send through broca's real run loop with a scripted provider, the way the daemon's
+/// executor does, so the provider sees the exact request the loop renders from the WAL.
+struct CoreLoop {
+    wal_store: Arc<FileWalStore>,
+    provider: broca_core::StubProvider,
+}
+
+#[async_trait::async_trait]
+impl RunExecutor for CoreLoop {
+    async fn execute(
+        &self,
+        job: RunJob,
+        out: mpsc::Sender<OutputEvent>,
+    ) -> Result<RunSummary, broca_core::RunError> {
+        let mode = match job.kind {
+            RunKind::FreshOrResume => broca_core::StartMode::FreshOrResume,
+            RunKind::AppendEpisode => broca_core::StartMode::AppendEpisode,
+            RunKind::ResumeAfterAuth => broca_core::StartMode::ResumeAfterAuth,
+        };
+        broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
+            job.req,
+            job.writer.as_ref(),
+            mode,
+            &self.provider,
+            &broca_core::StubToolPlane::new(),
+            &broca_core::AllowAll,
+            self.wal_store.as_ref(),
+            None,
+            job.control,
+            &out,
+            job.on_admitted,
+            Some(&job.prior_snapshot),
+        )
+        .await
+    }
+}
+
 struct Fixture {
     root: std::path::PathBuf,
     key: BindIdentity,
@@ -228,6 +265,20 @@ impl Fixture {
         wrap: impl FnOnce(Arc<broca_store::SqliteStore>) -> Arc<dyn RunIndex>,
         observer: Option<Arc<broca_core::wal_writer::DurableWalObserver>>,
     ) -> Self {
+        Self::build(wrap, observer, None)
+    }
+
+    /// A fixture whose sends run broca's real run loop against `provider`, so a test can see
+    /// the model request a send after the seal renders.
+    fn with_core_loop(provider: broca_core::StubProvider) -> Self {
+        Self::build(|index| index, None, Some(provider))
+    }
+
+    fn build(
+        wrap: impl FnOnce(Arc<broca_store::SqliteStore>) -> Arc<dyn RunIndex>,
+        observer: Option<Arc<broca_core::wal_writer::DurableWalObserver>>,
+        provider: Option<broca_core::StubProvider>,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "broca-crash-orphan-{}-{}",
@@ -243,10 +294,17 @@ impl Fixture {
             wal = wal.with_durable_observer(observer);
         }
         let wal = Arc::new(wal);
+        let runs: Arc<dyn RunExecutor> = match provider {
+            Some(provider) => Arc::new(CoreLoop {
+                wal_store: wal.clone(),
+                provider,
+            }),
+            None => executor.clone(),
+        };
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(root.join("leases"))),
             wal.clone(),
-            executor.clone(),
+            runs,
         )
         .with_run_index(wrap(index.clone()));
         let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
@@ -722,6 +780,93 @@ async fn crash_orphan_seal_keeps_a_never_sent_call_with_a_never_executed_result(
                 && matches!(message.content.as_slice(),
                     [ContentBlock::ToolResult(r)] if *r == broca_core::not_dispatched_result(&call))
         ),
+        "{prompt:#?}"
+    );
+    f.stop().await;
+}
+
+/// The send after such a seal reaches the model, and its request carries the kept step as
+/// written: the call, its never-executed result right after it, then the new user turn. The
+/// model's answer is written as the next assistant turn.
+#[tokio::test]
+async fn next_send_after_a_kept_never_sent_call_renders_call_result_and_new_turn() {
+    use broca_protocol::content::Role;
+    use broca_protocol::provider::{NormalizedEvent, ProviderControl};
+    let provider = broca_core::StubProvider::new(vec![vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId("after-the-seal".into()),
+                content: vec![ContentBlock::Text {
+                    text: "after the seal".into(),
+                }],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: broca_protocol::Usage::default(),
+            finish_reason: broca_protocol::FinishReason::Stop,
+            retries_used: 0,
+        }),
+    ]]);
+    let f = Fixture::with_core_loop(provider.clone());
+    f.seed(vec![run_started(&f.key), model_step_with_tool_call()]);
+    assert_eq!(f.sweep(Fixture::boot_after_seed()).await.sealed, 1);
+
+    let outcome = f
+        .registry
+        .route_send(
+            &f.key,
+            super::tests::text_req(&f.key, "next-run"),
+            RunKind::FreshOrResume,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    let terminals = broca_test_support::wait_until("the next send's run to end", || async {
+        let terminals = f.terminals();
+        if terminals.len() == 2 {
+            Ok(terminals)
+        } else {
+            Err(format!("terminals so far: {terminals:?}"))
+        }
+    })
+    .await;
+    assert_eq!(
+        terminals,
+        vec![RunFinishReason::Interrupted, RunFinishReason::Completed],
+        "the next send completes instead of stalling or failing"
+    );
+
+    let calls = provider.calls();
+    let [request] = calls.as_slice() else {
+        panic!("the next send makes exactly one model request: {calls:#?}");
+    };
+    let call = ToolCallId(CALL.into());
+    let tail: Vec<(Role, &[ContentBlock])> = request
+        .prompt
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(|message| (message.role, message.content.as_slice()))
+        .collect();
+    assert!(
+        matches!(
+            tail.as_slice(),
+            [
+                (Role::Assistant, [ContentBlock::ToolCall(c)]),
+                (Role::Tool, [ContentBlock::ToolResult(r)]),
+                (Role::User, [ContentBlock::Text { text }]),
+            ] if c.tool_call_id == call
+                && *r == broca_core::not_dispatched_result(&call)
+                && text == "hi"
+        ),
+        "{:#?}",
+        request.prompt
+    );
+    let prompt = broca_core::replay(&f.records()).unwrap().prompt;
+    assert!(
+        matches!(prompt.last(), Some(message) if message.role == Role::Assistant
+            && matches!(message.content.as_slice(), [ContentBlock::Text { text }] if text == "after the seal")),
         "{prompt:#?}"
     );
     f.stop().await;

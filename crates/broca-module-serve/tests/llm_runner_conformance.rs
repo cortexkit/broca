@@ -170,11 +170,6 @@ struct Shared {
     requests: Mutex<HashMap<String, Vec<Vec<Value>>>>,
     /// Every request's whole body the model received, by session, in order.
     bodies: Mutex<HashMap<String, Vec<Value>>>,
-    /// Per session, how many durable model steps the rig cut out of the transcript. broca
-    /// leaves a step whose calls were never dispatched out of the transcript when it seals the
-    /// run, so a later request holds one assistant message fewer than the script has served;
-    /// the next turn the script serves is past them.
-    dropped_steps: Mutex<HashMap<String, usize>>,
     /// Woken when a kill is done, so every request the rig was holding gives up.
     released: Notify,
     /// The scripted calls the suite asked to hold, by their arguments' JSON text, and each one's
@@ -421,15 +416,9 @@ async fn serve_model_request(
         stream.write_all(reply.as_bytes()).await?;
         return Ok(());
     }
-    let dropped = session.as_ref().map_or(0, |session| {
-        shared
-            .dropped_steps
-            .lock()
-            .unwrap()
-            .get(session)
-            .copied()
-            .unwrap_or(0)
-    });
+    // Legacy sessions are matched to their scripted turn by the number of assistant messages
+    // already in the request. A step cut at StepRecorded stays in the transcript (the seal keeps
+    // it with a never-executed result), so this count is the number of turns already served.
     let turn_index = session
         .as_ref()
         .and_then(|session| {
@@ -445,7 +434,6 @@ async fn serve_model_request(
                 .iter()
                 .filter(|message| message["role"] == "assistant")
                 .count()
-                + dropped
         });
     let turn = session.as_ref().and_then(|session| {
         shared
@@ -1299,13 +1287,6 @@ impl Harness for BrocaSubject {
                 }
                 self.shared.released.notify_waiters();
                 self.cut_back_to_last_step(&handle, &session)?;
-                *self
-                    .shared
-                    .dropped_steps
-                    .lock()
-                    .unwrap()
-                    .entry(session.clone())
-                    .or_default() += 1;
                 self.holds_point(&handle, &session, name)
                     .map_err(HarnessError::new)?;
                 drop(handle);
