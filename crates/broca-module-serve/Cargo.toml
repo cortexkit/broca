@@ -105,7 +105,7 @@ async-trait.workspace = true
 subc-control = { workspace = true }
 # The role's own wire types and checks, so the role-surface tests decode broca's answers the way
 # a consumer of the role does rather than against broca's own types.
-cortexkit-role-llm-runner = { workspace = true }
+cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
 # The catalog and declaration wire types the fetch-plan tests answer with.
 cortexkit-role-tool-provider = { workspace = true }
 # The role's conformance suite and the crash harness it drives, run against the real ck-broca

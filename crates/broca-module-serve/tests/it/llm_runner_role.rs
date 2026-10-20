@@ -261,12 +261,13 @@ async fn import_reply_too_large_session(rig: &mut Rig, channel: u16, final_text:
         .unwrap();
 }
 
-/// Pinned from the published commons vectors at commit 649d5f12.
+/// Read the published crate's copy of the refusal vectors.
 fn reply_too_large_vectors() -> serde_json::Value {
-    serde_json::from_str(include_str!(
-        "../fixtures/llm-runner-v1/reply-too-large.json"
-    ))
-    .unwrap()
+    let contents = cortexkit_role_llm_runner::vectors::FILES
+        .iter()
+        .find_map(|(name, contents)| (*name == "reply-too-large.json").then_some(*contents))
+        .expect("the role crate publishes reply-too-large.json");
+    serde_json::from_str(contents).unwrap()
 }
 
 // ---- role.describe ------------------------------------------------------------------------
@@ -284,6 +285,7 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         "transcript_reads",
         "run_ops",
         "run_status",
+        "run_usage",
         "run_cancel",
         "retract",
         "input_token_cap",

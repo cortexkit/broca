@@ -162,13 +162,53 @@ pub struct FinalMessage {
     pub text: String,
 }
 
+/// Accept older status fixtures that predate the usage counters while keeping the published
+/// role type as the only representation of run usage.
+pub(crate) fn deserialize_optional_run_usage<'de, D>(
+    deserializer: D,
+) -> Result<Option<broca_protocol::usage::RunUsage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    value
+        .map(deserialize_run_usage_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_run_usage<'de, D>(
+    deserializer: D,
+) -> Result<broca_protocol::usage::RunUsage, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_run_usage_value(serde_json::Value::deserialize(deserializer)?)
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_run_usage_value(
+    mut value: serde_json::Value,
+) -> Result<broca_protocol::usage::RunUsage, serde_json::Error> {
+    if let Some(object) = value.as_object_mut() {
+        object.entry("steps").or_insert(serde_json::json!(0));
+        object
+            .entry("unreported_steps")
+            .or_insert(serde_json::json!(0));
+        object
+            .entry("by_model")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    }
+    serde_json::from_value(value)
+}
+
 /// `run.result`: a run's state and, once it completed, its final message. `state` is one of the
 /// role's states (`active`, `paused`, `completed`, `max_steps`, `cancelled`, `error`,
 /// `interrupted`) or a state of broca's own (`transform_unavailable`), which a consumer decodes
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_run_usage")]
     pub usage: broca_protocol::usage::RunUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<broca_protocol::BudgetExhaustedDetail>,
@@ -245,6 +285,7 @@ pub fn broca_role_describe_with_writers(
         "transcript_reads",
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RETRACT,
         "dispatch_attribution",
@@ -620,29 +661,13 @@ mod pinned_reply_bytes {
         );
     }
 
-    /// The cortexkit-role-llm-runner vectors from commons revision
-    /// `067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7`, vendored byte for byte from
-    /// `test-vectors/llm-runner-v1`. Refresh these copies and their SHA-256 pins
-    /// when the workspace's role dependency revision is bumped.
+    /// Read the vectors shipped by the role crate, rather than requiring a commons checkout.
     fn role_vectors(file: &str) -> serde_json::Value {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/commons-067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7/llm-runner-v1")
-            .join(file);
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|error| panic!("read vectors {}: {error}", path.display()));
-        let sha256 = match file {
-            "send.json" => "e9a50df9e8806625d8e6db2681e02515b1726ce6bc3164d38e12ae8e58f0c318",
-            "role-describe.json" => {
-                "36fbcbb22cc55792edd1785b4adbf747f30f99fd189ee9bd46dbacd6d528fb28"
-            }
-            _ => panic!("no reviewed SHA-256 for role vector {file}"),
-        };
-        assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
-            sha256,
-            "refresh the commons role vectors and their reviewed SHA-256 pins together"
-        );
-        serde_json::from_slice(&bytes).unwrap()
+        let contents = cortexkit_role_llm_runner::vectors::FILES
+            .iter()
+            .find_map(|(name, contents)| (*name == file).then_some(*contents))
+            .unwrap_or_else(|| panic!("no published role vector {file}"));
+        serde_json::from_str(contents).unwrap()
     }
 
     /// Every `session.send` reply vector broca can answer (no baseline, and no receipt state a
@@ -719,6 +744,19 @@ mod pinned_reply_bytes {
         );
     }
 
+    #[test]
+    fn role_describe_advertises_run_usage() {
+        let encoded = serde_json::to_value(broca_role_describe("0.0.0-golden")).unwrap();
+        cortexkit_role_llm_runner::describe::check_describe(&encoded)
+            .unwrap_or_else(|error| panic!("{encoded}: {error:?}"));
+        assert!(encoded["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(
+                cortexkit_role_llm_runner::capabilities::RUN_USAGE
+            )));
+    }
+
     /// `role.describe` as this build answers it. The build identity is fixed here so a version
     /// bump does not move the pinned bytes.
     #[test]
@@ -735,7 +773,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "fb3ab9721fea0ef5264517d9b29b7062328b48882815d6d6a63c12f75d6fee9d",
+            "04b83a4bb38af4251de49629f22638e7220f0a64d1bbd3871ff9da42cdccae75",
         );
     }
 
@@ -889,7 +927,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "bb2412dc18e3bb8a66617aa5aefd017929bb69e8126b973cb002c5b7d6ea7951";
+        "c6730ddb97c7ed2d68d7a6f14f0cb10258095886ae029c50d847638f45d7f53d";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =

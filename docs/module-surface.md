@@ -127,7 +127,7 @@ session.warm { lineage_id? }
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
 run.result { run_id } → { run_id, state, usage, reason?, error?, final_message?: { ordinal, mid, text } }
 session.baseline {} → { state: "not_yet" | "ready", baseline? } (owner only)
-role.describe {} → the llm-runner/v1 major, its ops and capability groups, max_bytes
+role.describe {} → the llm-runner/v1 major, its ops and capability groups (including `run_usage`), max_bytes
 
 session.subscribe { from?: "start" | "live" | cursor } (dedicated route; §9)
     → stream of events (control reliable+replayable, display live+lossy); see §7,§8,§16
@@ -173,14 +173,15 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`,
 - Every known run's `run.status` and `run.result` carry `usage` from completed
   `ModelStepFinished` WAL records, including while the run is active. It always has
   `steps` and `unreported_steps`; a run with no completed step reports exactly
-  `{"steps":0,"unreported_steps":0}`. A step is unreported only if **all five** token
+  `{"steps":0,"unreported_steps":0,"by_model":[]}`. A step is unreported only if **all five** token
   measurements are absent; a partial report or an explicit zero is reported.
   The optional totals `input_tokens`, `cached_input_tokens`, `cache_write_tokens`,
   `output_tokens` and `reasoning_tokens` sum only reported contributions, staying absent
   until a step reports that measurement. Partial totals are lower bounds, not estimates.
   Input is fresh input only; reasoning is already included in output, never added to it.
-  `by_model`, omitted until a step completes, lists contributions in first-seen order
-  for each `{provider, model, variant?}` frozen in the step's episode's `RunConfig`.
+  `by_model` is always present and empty until a step completes; then it lists contributions
+  in first-seen order for each `{provider, model, variant?}` frozen in the step's episode's
+  `RunConfig`.
   Each entry carries the same counters and optional token totals. An unnamed variant is
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber

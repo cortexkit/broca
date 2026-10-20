@@ -271,7 +271,7 @@ async fn active_status_and_result_count_only_completed_steps() {
             .await;
         assert_eq!(
             result(&reply)["usage"],
-            json!({"steps":0,"unreported_steps":0})
+            json!({"steps":0,"unreported_steps":0,"by_model":[]})
         );
     }
     rig.script.hold_model(false);
