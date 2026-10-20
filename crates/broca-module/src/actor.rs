@@ -592,7 +592,9 @@ fn run_index_terminal_state(summary: &RunSummary) -> RunIndexState {
 }
 
 /// Recover the finish reason from a terminal run-index state; active and paused are unfinished.
-fn indexed_finish_reason(state: &RunIndexState) -> Option<broca_protocol::RunFinishReason> {
+pub(crate) fn indexed_finish_reason(
+    state: &RunIndexState,
+) -> Option<broca_protocol::RunFinishReason> {
     use broca_protocol::RunFinishReason;
     match state {
         RunIndexState::Active | RunIndexState::Paused => None,
@@ -784,6 +786,11 @@ fn steer_settings_conflict(
     {
         return Some("generation.stop_sequences");
     }
+    if !request.inherit_frozen.contains(&InheritedParam::StopWhen)
+        && request.stop_when != frozen.stop_when
+    {
+        return Some("stop_when.max_steps");
+    }
     // Checked last, so a send that also conflicts on an earlier setting still reports that
     // setting rather than `auth`.
     if let Some(pin) = &request.auth {
@@ -969,17 +976,17 @@ fn recorded_send_keys(records: &[WalRecord]) -> HashMap<RunId, RecordedSendKey> 
 /// What the WAL holds for one steer, keyed by its `send_id`: enough to answer a retry with the
 /// same key without anything but the WAL.
 #[derive(Debug, Clone, PartialEq)]
-struct RecordedSteer {
+pub(crate) struct RecordedSteer {
     /// The run the steer joined: the episode whose `RunStarted` precedes its `Steered` record.
     /// `None` only for a malformed WAL whose steer precedes every episode.
-    run_id: Option<RunId>,
+    pub(crate) run_id: Option<RunId>,
     /// The request identity digest the `Steered` record carries.
     request_identity_digest: Option<String>,
 }
 
 /// Rebuild every recorded steer from the complete WAL. A steer is keyed by its `send_id`, not
 /// by a run id: it opens no episode of its own. The first record for a key wins.
-fn recorded_steers(records: &[WalRecord]) -> HashMap<String, RecordedSteer> {
+pub(crate) fn recorded_steers(records: &[WalRecord]) -> HashMap<String, RecordedSteer> {
     let mut current_run = None;
     let mut steers = HashMap::new();
     for record in records {
@@ -1023,7 +1030,7 @@ fn recorded_steers(records: &[WalRecord]) -> HashMap<String, RecordedSteer> {
 /// steer, later records cannot change which one came first, so a receipt once given never
 /// changes. That holds only for records that cannot be lost, which is why callers pass the WAL
 /// read up to its durable head.
-fn steer_delivery(records: &[WalRecord], send_id: &str) -> Option<Delivered> {
+pub(crate) fn steer_delivery(records: &[WalRecord], send_id: &str) -> Option<Delivered> {
     let mut current_run: Option<&RunId> = None;
     // `Some(joined)` once the steer's record has been seen; `joined` is the run it joined.
     let mut steered: Option<Option<&RunId>> = None;
@@ -2700,6 +2707,40 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        // A plan owns the tool surface for the entire lineage. Reject an explicit later
+        // surface before any retry, queue, steer or interrupt path can ignore or freeze it.
+        if request.tools.is_some() {
+            let planned = match self
+                .prior_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.checkpoint_at_head.ownership.as_ref())
+            {
+                Some(ownership) => ownership
+                    .first_episode
+                    .as_ref()
+                    .is_some_and(|first| first.manifest.is_some()),
+                None => match self.load_ownership().await {
+                    Ok(ownership) => ownership
+                        .first_episode
+                        .as_ref()
+                        .is_some_and(|first| first.manifest.is_some()),
+                    Err(error) => return SendOutcome::Transient(error),
+                },
+            };
+            if self
+                .first_episode
+                .get()
+                .is_some_and(|first| first.manifest.is_some())
+                || planned
+            {
+                return SendOutcome::DeliveryRefused {
+                    code: "invalid_params",
+                    field: "tools",
+                    message: "tools are frozen by the session's fetch plan".into(),
+                };
+            }
+        }
+
         // A send carrying a plan meets the session's frozen plan before its key is looked up, so
         // a retry under the same key with another plan is refused by name like any later send.
         // The identical plan changes nothing: the send goes on as an ordinary later send.
@@ -2837,6 +2878,29 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         })
                         .unwrap_or("request identity");
                     return SendOutcome::SendIdReuse { differing };
+                }
+                if started {
+                    let records = match self.read_wal_records().await {
+                        Ok(records) => records,
+                        Err(error) => return SendOutcome::Error(error),
+                    };
+                    if let Some(outcome) = crate::send_fate::recorded_send_outcome(
+                        &records,
+                        &run_id,
+                        key.send_id().unwrap_or(""),
+                    ) {
+                        // An auth-paused re-send is still the explicit re-drive operation;
+                        // polling never takes that branch or starts its executor.
+                        if !matches!(
+                            outcome,
+                            SendOutcome::Paused {
+                                reason: broca_protocol::PauseReason::AuthRequired,
+                                ..
+                            }
+                        ) {
+                            return outcome;
+                        }
+                    }
                 }
                 // An ordered send's own run is its `idle_start` delivery, so a retry of it carries
                 // the `turn` receipt naming that run, as a retry of one delivered into a running
@@ -3581,55 +3645,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(records) => records,
             Err(error) => return SendOutcome::Error(error),
         };
-        let delivered = steer_delivery(&records, send_id);
-        if matches!(&self.state, RunState::Active { run_id, .. } if *run_id == target) {
-            // As for any other retry: once the run's terminal is durable it has ended, even if
-            // this actor has not processed its end yet, and `run.result` already reports it. The
-            // run task's signal says so after its own fsync; the records just read can say so
-            // earlier, because they were read after a sync of everything appended so far.
-            let finished = self.durable_finish_of_active(&target).or_else(|| {
-                broca_core::reconcile_run_state(&records, &target.0)
-                    .and_then(|state| indexed_finish_reason(&state.state))
-            });
-            return match finished {
-                Some(reason) => SendOutcome::Finished {
-                    run_id: target,
-                    reason,
-                    delivered,
-                },
-                None => SendOutcome::Active {
-                    run_id: target,
-                    delivered,
-                },
-            };
-        }
-        match self.lookup_indexed_run(&target).await {
-            Ok(Some(indexed)) => {
-                if let Some(reason) = indexed_finish_reason(&indexed.state) {
-                    return SendOutcome::Finished {
-                        run_id: target,
-                        reason,
-                        delivered,
-                    };
-                }
-            }
-            Ok(None) => {}
-            Err(error) => return SendOutcome::Error(error),
-        }
-        match broca_core::reconcile_run_state(&records, &target.0) {
-            Some(state) => match indexed_finish_reason(&state.state) {
-                Some(reason) => SendOutcome::Finished {
-                    run_id: target,
-                    reason,
-                    delivered,
-                },
-                None => SendOutcome::Active {
-                    run_id: target,
-                    delivered,
-                },
-            },
-            None => SendOutcome::Error("the run a steer joined is missing from the WAL".into()),
-        }
+        crate::send_fate::recorded_send_outcome(&records, &target, send_id).unwrap_or_else(|| {
+            SendOutcome::Error("the recorded steer disappeared from the WAL".into())
+        })
     }
 
     fn check_budget_admission(&self) -> Result<(), RunError> {
@@ -4452,48 +4470,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         SendOutcome::Pending { submission_id }
     }
 
-    /// The answer to a keyed retry of an ordered send delivered into run `run_id`: that run's state
-    /// now, as for a retry of the send that started it. Finished once its terminal is durable,
-    /// paused while it is paused, and active otherwise. Every answer carries the `step` receipt
-    /// naming that run: the send was delivered into a run already going, at one of its steps.
-    /// The delivery is read from the WAL's `SendDelivered` record, so the receipt is the same
-    /// after a restart and never goes back to `pending`.
-    async fn delivered_run_outcome(&mut self, run_id: RunId) -> SendOutcome {
-        let delivered = Some(Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone()));
-        if matches!(&self.state, RunState::Active { run_id: active, .. } if *active == run_id) {
-            if let Some(reason) = self.durable_finish_of_active(&run_id) {
-                return SendOutcome::Finished {
-                    run_id,
-                    reason,
-                    delivered,
-                };
-            }
-            return SendOutcome::Active { run_id, delivered };
-        }
-        match self.reconcile_from_wal(&run_id).await {
-            Ok(Some(state)) => match indexed_finish_reason(&state.state) {
-                Some(reason) => SendOutcome::Finished {
-                    run_id,
-                    reason,
-                    delivered,
-                },
-                None => match state.pause_reason {
-                    Some(reason) => SendOutcome::Paused {
-                        run_id,
-                        reason,
-                        delivered,
-                    },
-                    None => SendOutcome::Active { run_id, delivered },
-                },
-            },
-            Ok(None) => SendOutcome::Error(format!(
-                "the WAL records a delivery into run {} but not the run",
-                run_id.0
-            )),
-            Err(error) => SendOutcome::Error(error),
-        }
-    }
-
     /// Whether a keyed send reuses the run id of an earlier send that asked for a different
     /// delivery order: a legacy send (no order) and an ordered send, or two different orders.
     /// The same `send_id` is the same send, so the order is part of its identity.
@@ -4670,17 +4646,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             if let Err(error) = self.ensure_wal_scan_loaded().await {
                 return SendOutcome::Error(error);
             }
-            if let Some(reason) = self.ended_submissions.get(&submission_id) {
-                return SendOutcome::SendEnded {
-                    submission_id,
-                    reason: reason.clone(),
-                };
-            }
-            if let Some(delivered_into) = self.delivered_submissions.get(&submission_id).cloned() {
-                return self.delivered_run_outcome(delivered_into).await;
-            }
-            if self.retracted_submissions.contains(&submission_id) {
-                return SendOutcome::Retracted { submission_id };
+            let records = match self.read_wal_records().await {
+                Ok(records) => records,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            if let Some(outcome) = crate::send_fate::recorded_send_outcome(
+                &records,
+                &run_id,
+                identity.send_id.as_deref().unwrap_or(""),
+            ) {
+                return outcome;
             }
         }
         let expired = order.expired_at(self.ordered_now_ms());

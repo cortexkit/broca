@@ -206,7 +206,7 @@ pub struct SendParams {
     pub tool_choice: ToolChoice,
     #[serde(default)]
     pub generation: GenerationConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stop_when")]
     pub stop_when: Vec<StopCondition>,
     /// Admission-only prompt-cache preferences.
     #[serde(default)]
@@ -328,6 +328,44 @@ pub struct SendParams {
     /// run identity.
     #[serde(default)]
     pub append_episode: bool,
+}
+
+/// Check the shared run parameters before broca's legacy parameter decoder can lose a
+/// nested field name. Legacy stop-condition lists remain accepted beside the role object.
+pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
+    let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
+    for field in ["stop_when", "generation", "tools"] {
+        if let Some(value) = params.get(field) {
+            if field == "stop_when" && value.is_array() || field == "tools" && value.is_null() {
+                continue;
+            }
+            request.runner_params.insert(field.into(), value.clone());
+        }
+    }
+    request.max_steps()?;
+    request.max_output_tokens()?;
+    request.no_tools()?;
+    Ok(())
+}
+
+fn deserialize_stop_when<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<StopCondition>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_array() {
+        return serde_json::from_value(value).map_err(serde::de::Error::custom);
+    }
+    let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
+    request.runner_params.insert("stop_when".into(), value);
+    request
+        .max_steps()
+        .map(|limit| {
+            limit
+                .into_iter()
+                .map(|n| StopCondition::StepCount { n })
+                .collect()
+        })
+        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_budget<'de, D: serde::Deserializer<'de>>(

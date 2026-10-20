@@ -1377,12 +1377,7 @@ where
             }
             control.compaction_config.call_budget_ms = config.call_timeout_ms;
             control.admitted_context_limit = Some(config.context_window);
-            req.generation.max_output_tokens = Some(
-                config
-                    .output_limit
-                    .try_into()
-                    .map_err(|_| RunError::Wal("test output limit overflows u32".into()))?,
-            );
+            req.generation.max_output_tokens = Some(config.output_limit);
         }
         control
     };
@@ -4338,7 +4333,7 @@ where
                 .with_model_details(
                     variant.clone(),
                     context_limit,
-                    opts.generation.max_output_tokens.map(u64::from),
+                    opts.generation.max_output_tokens,
                 );
                 setup.lineage_id = Some(lineage_id.clone());
                 setup.newest = raw

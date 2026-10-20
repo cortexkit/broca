@@ -756,7 +756,7 @@ fn render_with_max_tokens(rec: &Reconstructed, max_tokens: u32) -> Result<Vec<u8
     let mut opts = rec.opts.clone();
     let mut generation = (*opts.generation).clone();
     if generation.max_output_tokens.is_some() {
-        generation.max_output_tokens = Some(max_tokens);
+        generation.max_output_tokens = Some(u64::from(max_tokens));
     }
     opts.generation = Arc::new(generation);
     let family = broca_provider::registry::wire_family(frozen.family_id)

@@ -1641,13 +1641,9 @@ fn resolve_declared_route(
     resolved
 }
 
-/// For every family that declares its previous renderer version reproducible, a run recorded at
-/// that version by the release before `provider_text_state` resumes through the executor's
-/// restore path and core, and completes. The recorded config is what the current code records
-/// for the same admission without the fields that release did not have: `provider_text_state`
-/// and, for Code Assist, the session identity frozen since. The blob the resumed provider states
-/// for the recorded version equals the recorded blob, so none of the frozen fields added since
-/// (Code Assist identity, the Chat reasoning-echo policy, the Claude Code persona) appears in it.
+/// Every declared reproducible renderer version resumes through the executor and core.
+/// Reconstruct the fields that version could have recorded, then require exact frozen
+/// blob equality as well as a completed run, so ABI bumps cannot silently lose an older lane.
 #[tokio::test]
 async fn every_declared_previous_version_resumes_through_the_executor_restore_path() {
     use broca_provider::families::{
@@ -1689,15 +1685,11 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
             .filter(|(_, disposition)| *disposition == EarlierRendererVersion::Reproducible)
             .map(|(version, _)| *version)
             .collect();
-        assert_eq!(
-            declared,
-            vec![renderer_version_for(route.family) - 1],
-            "{:?}",
-            route.family
-        );
-        let previous = declared[0];
+        let expected = if route.family == WireFamilyId::GoogleCodeAssist { vec![5, 6] } else { vec![renderer_version_for(route.family) - 1] };
+        assert_eq!(declared, expected, "{:?}", route.family);
+        for previous in declared {
         let root = broca_test_support::scratch_root().join(format!(
-            "broca-declared-resume-{:?}-{}",
+            "broca-declared-resume-{:?}-{previous}-{}",
             route.family,
             std::process::id()
         ));
@@ -1716,13 +1708,11 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         );
         let mut recorded = drift_run_config(&request, &started);
         let blob = recorded.frozen_render_config.as_object_mut().unwrap();
-        assert_eq!(blob.remove("provider_text_state"), Some(true.into()));
-        assert_eq!(
-            blob.remove("codeassist_identity").is_some(),
-            route.family == WireFamilyId::GoogleCodeAssist,
-            "{:?}",
-            route.family
-        );
+        let predates_text_state = route.family != WireFamilyId::GoogleCodeAssist || previous < 6;
+        if predates_text_state {
+            assert_eq!(blob.remove("provider_text_state"), Some(true.into()));
+            assert_eq!(blob.remove("codeassist_identity").is_some(), route.family == WireFamilyId::GoogleCodeAssist, "{:?}", route.family);
+        }
         blob.insert("renderer_version".into(), previous.into());
         recorded.renderer_version = previous;
 
@@ -1733,7 +1723,7 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
             0,
         )
         .unwrap();
-        assert_eq!(identity, None);
+        assert_eq!(identity.is_none(), predates_text_state);
         let resumed = resolve_declared_route(
             route,
             restored_episode_render(&recorded, identity.as_ref()),
@@ -1747,6 +1737,7 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
             "reasoning_echo",
             "claude_code_persona",
         ] {
+            if !predates_text_state && matches!(key, "provider_text_state" | "codeassist_identity") { continue; }
             assert!(stated.get(key).is_none(), "{:?} states {key}", route.family);
         }
 
@@ -1760,5 +1751,6 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
             route.family
         );
         assert_eq!(calls, 1, "{:?}", route.family);
+        }
     }
 }

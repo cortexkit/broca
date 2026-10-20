@@ -234,6 +234,10 @@ async fn joining_steer_settings_conflict_refuses_before_any_wal_write() {
             serde_json::json!({"generation": {"max_output_tokens": 101, "temperature": 0.1}}),
         ),
         (
+            "stop_when.max_steps",
+            serde_json::json!({"stop_when": {"max_steps": 2}}),
+        ),
+        (
             "generation.temperature",
             serde_json::json!({"generation": {"temperature": 0.1, "top_p": 0.1}}),
         ),
@@ -1728,5 +1732,36 @@ async fn status_and_head_fall_back_to_the_wal_when_the_store_has_no_title() {
     }
     rig = rig.restart().await;
     assert_eq!(head_title(&mut rig).await.as_deref(), Some("From the WAL"));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_run_limits_are_refused_by_field_without_writes() {
+    let mut rig = Rig::start("invalid-run-limits").await;
+    for field in ["stop_when.max_steps", "generation.max_output_tokens"] {
+        let (group, member) = field.split_once('.').unwrap();
+        for (index, value) in [
+            serde_json::json!(0),
+            serde_json::json!(1.5),
+            serde_json::json!(-1),
+            serde_json::Value::Null,
+            serde_json::json!("2"),
+            serde_json::json!(1e30),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = rig.wal_bytes();
+            let mut extra = serde_json::json!({});
+            extra[group] = serde_json::json!({member: value});
+            let frame = rig
+                .send_with(&format!("{group}-{index}"), "invalid", None, extra)
+                .await;
+            let error: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(error["code"], "invalid_params", "{field}: {error}");
+            assert_eq!(error["detail"]["field"], field, "{error}");
+            assert_eq!(rig.wal_bytes(), before);
+        }
+    }
     rig.finish().await;
 }

@@ -16,6 +16,7 @@ pub mod opener;
 pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;
+mod send_fate;
 pub mod serve;
 pub mod session_class;
 

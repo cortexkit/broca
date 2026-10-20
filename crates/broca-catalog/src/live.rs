@@ -807,24 +807,21 @@ fn resolve_provider_inner(
         catalog_base_url,
         episode_render,
     } = context;
-    // The requested output cap, in precedence order:
-    //
-    // 1. The caller's explicit number, sent as given. There is no clamp to the model's
-    //    published limit in either direction: catalogs publish placeholder limits (output equal
-    //    to or above the context window on over a thousand rows), so a request larger than the
-    //    real limit goes to the provider and is refused there. That is worse for actionability
-    //    and better for correctness than silently rewriting what the caller asked for on the
-    //    strength of a number the upstream may not mean.
-    // 2. On a resume, the cap this episode froze at start (`episode_render.max_output_tokens`),
-    //    so a catalog value that moved since admission cannot trip the drift guard.
-    // 3. The model's own maximum from the catalog when it is a usable cap, else
-    //    the fallback bounded below a known context (see `default_max_output_tokens`). The mode
-    //    below decides which catalog limits are known; this closure applies the rule.
+    // Explicit requests remain authoritative up to the catalog's model maximum. When
+    // no cap is named on resume, retain the frozen cap even if the catalog has moved.
     let restored_max_tokens = episode_render.max_output_tokens;
     let max_tokens_for = |output_limit: Option<u64>, context_limit: Option<u64>| {
-        caller_max_tokens
-            .or(restored_max_tokens)
-            .unwrap_or_else(|| default_max_output_tokens(output_limit, context_limit))
+        caller_max_tokens.map_or_else(
+            || {
+                restored_max_tokens
+                    .unwrap_or_else(|| default_max_output_tokens(output_limit, context_limit))
+            },
+            |requested| {
+                output_limit
+                    .filter(|limit| *limit > 0)
+                    .map_or(requested, |limit| u64::from(requested).min(limit) as u32)
+            },
+        )
     };
 
     if let Some(base_url) = base_url.filter(|s| !s.is_empty()) {

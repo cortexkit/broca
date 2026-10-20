@@ -330,6 +330,13 @@ fn observe_model_request(
         .collect();
     let mut observation =
         cortexkit_role_llm_runner_conformance::ModelRequestObservation::new(names);
+    if let Some(cap) = request
+        .get("max_tokens")
+        .or_else(|| request.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+    {
+        observation = observation.with_max_output_tokens(cap);
+    }
     if request["response_format"]["type"] == "json_schema" {
         observation = observation
             .with_final_text_schema(request["response_format"]["json_schema"]["schema"].clone());
@@ -519,11 +526,28 @@ async fn serve_model_request(
         json!({"id": id, "object": "chat.completion.chunk", "model": "mock-model",
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
     };
+    // The scripted model honours the cap it actually received. Its word-sized tokens
+    // make bounded-output cases deterministic without borrowing the runner's cap logic.
+    let output_cap = request
+        .get("max_tokens")
+        .or_else(|| request.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let mut remaining = output_cap;
     let mut events = vec![chunk(json!({"role": "assistant"}), None)];
     let mut calls = 0;
     for part in &turn.parts {
         events.push(match part {
-            ScriptedPart::Text(text) => chunk(json!({"content": text}), None),
+            ScriptedPart::Text(text) => {
+                let words: Vec<_> = text.split_whitespace().collect();
+                let content = if words.len() as u64 > remaining {
+                    words[..remaining as usize].join(" ")
+                } else {
+                    text.clone()
+                };
+                remaining = remaining.saturating_sub(words.len() as u64);
+                chunk(json!({"content": content}), None)
+            }
             ScriptedPart::Reasoning(text) => chunk(json!({"reasoning_content": text}), None),
             ScriptedPart::ToolCall(call) => {
                 calls += 1;
@@ -545,9 +569,10 @@ async fn serve_model_request(
             .input_tokens
             .saturating_add(usage.cache_read_tokens)
             .saturating_add(usage.cache_write_tokens);
+        let output = usage.output_tokens.min(output_cap);
         events.push(json!({"id": id, "object": "chat.completion.chunk", "choices": [],
-            "usage": {"prompt_tokens": prompt, "completion_tokens": usage.output_tokens,
-                "total_tokens": prompt.saturating_add(usage.output_tokens),
+            "usage": {"prompt_tokens": prompt, "completion_tokens": output,
+                "total_tokens": prompt.saturating_add(output),
                 "prompt_tokens_details": {"cached_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens}}}));
     }
     let mut body = String::new();
@@ -1538,6 +1563,9 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::RunToolCalls,
             Capability::InputTokenCap,
             Capability::StructuredOutput,
+            Capability::SendStatus,
+            Capability::MaxSteps,
+            Capability::NoTools,
             Capability::RunStatus,
             Capability::RunUsage,
             Capability::RunCancel,
@@ -1648,6 +1676,10 @@ impl LlmRunnerSubject for BrocaSubject {
             .insert(session.into());
         let mut fields = self.send_fields(session, first);
         if first {
+            // The kit can promote params already carrying legacy tools into a plan send.
+            // Null explicitly clears those legacy defaults; the plan owns this surface.
+            fields.insert("tools".into(), Value::Null);
+            fields.insert("system".into(), Value::Null);
             let composition = json!({"providers":[{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],"step_transform_items":[]});
             let mut plan = json!({
                 "tool_items":[{"provider":TOOL_MODULE,"preset":"conformance","params":{}}],
@@ -1818,6 +1850,17 @@ impl LlmRunnerSubject for BrocaSubject {
                         cortexkit_role_llm_runner_conformance::ToolResultObservation::new(
                             false,
                             broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT,
+                        ),
+                    )
+                }
+                broca_protocol::ToolOutput::Error { message }
+                    if result.is_error
+                        && message == "tool not run: max steps reached before dispatch" =>
+                {
+                    Some(
+                        cortexkit_role_llm_runner_conformance::ToolResultObservation::new(
+                            false,
+                            "max_steps",
                         ),
                     )
                 }
@@ -2198,6 +2241,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "run_cancel_unlisted_at_refused",
         "run_cancel_step_boundary_escalates_to_now",
         "run_usage_counts_reported_steps",
+        "send_status_answers_as_a_resend_after_restart",
+        "send_status_unknown_send_refused",
+        "max_steps_seals_pending_calls",
+        "no_tools_offered_to_model",
+        "no_tools_later_plan_send_refused",
         "send_id_retry_same_answer",
         "run_attribution_per_message",
         "send_id_reuse_refused_naming_field",

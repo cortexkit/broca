@@ -62,6 +62,7 @@ fn every_open_failed_site_chooses_a_class() {
         ),
         ("send: erased cause", "None"),
         ("send: typed admission", "Some(class)"),
+        ("send_status: durable send has no carrying run", "None"),
         ("retract: erased cause", "None"),
         ("subscribe: erased cause", "None"),
         (

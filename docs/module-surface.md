@@ -144,6 +144,7 @@ session.retract { session, submission_id }
 
 run.cancel { run_id, at?: "now" | "step_boundary" } → "ack" | "not_active" (§13)
 run.status { run_id | session }
+send.status { send_id }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
 
@@ -348,6 +349,26 @@ when the lineage has no control unit.
 `session.send.system` is an OPTIONAL leading `Role::System` message for the turn: one
 byte-exact text block, delivered role-scoped before the user prompt; absent, empty, or
 whitespace-only means no system message.
+
+`send.status {send_id}` reads that send's durable fate and answers the same reply bytes as
+an identical re-send, including its baseline and final delivery receipt. An auth-paused send
+instead reports its current durable pause and reason; an explicit re-send still re-drives
+that run's authentication. It never admits,
+delivers or re-queues work, does not update retention activity, and does not reopen a closed
+session actor. An unrecorded key for the caller is refused `unknown_send` (terminal).
+`run.status` also continues to accept a queued send's submission-derived run id, reporting
+its pending, delivered or ended fate as described in §14; callers can migrate to `send.status`
+without losing that compatibility path.
+
+Broca declares `send_status`, `max_steps` and `no_tools`. The role's positive-u64
+`stop_when.max_steps` object is accepted beside the legacy stop-condition list. Zero or
+malformed limits are refused `invalid_params` naming `stop_when.max_steps` or
+`generation.max_output_tokens`. Explicit output caps on supporting routes are bounded by
+the catalog's model maximum. Broca does **not** declare `max_output_tokens`: ChatGPT routes
+cannot enforce an output cap because their backend rejects the field, so they continue to
+accept explicit caps without rendering them. `tools: []` offers no tools; on a plan session
+any non-null `tools` on a later send is refused `invalid_params {field: "tools"}` before
+queueing, steering or interrupting, even if it repeats the frozen surface.
 
 `session.send.send_id` is an OPTIONAL client-chosen idempotency key, unique per LOGICAL
 send. A retry of the same logical send reuses it VERBATIM; the module derives the same

@@ -1262,6 +1262,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
+    UnknownSend,
     SessionMoving {
         cut_id: String,
     },
@@ -1408,6 +1409,7 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
             ServeError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
@@ -1535,6 +1537,18 @@ pub trait ServeHandler: Send + Sync {
     /// `session.send` — start or durably queue a run.
     async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError>;
 
+    /// Read a send's recorded fate without opening the session's actor. An auth-paused
+    /// send stays paused here; only an explicit re-send re-drives authentication.
+    async fn send_status(
+        &self,
+        _session: &LineageKey,
+        _run_id: broca_protocol::RunId,
+        _send_id: &str,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<broca_wire::SendReplyWire, ServeError> {
+        Err(ServeError::UnknownSend)
+    }
+
     /// Install or remove one daemon-scoped durable cap.
     async fn cap_install(&self, _req: CapInstallRequest) -> Result<CapMutation, ServeError> {
         Err(ServeError::CapUnavailable(
@@ -1626,7 +1640,7 @@ pub trait ServeHandler: Send + Sync {
                 )))
             }
         };
-        let location = self.tag_location(session, number).await?;
+        let mut location = self.tag_location(session, number).await?;
         let mut lineage_id = None;
         if let Some((ordinal, _)) = location.and_then(|location| location.found) {
             let page = self
@@ -1640,6 +1654,9 @@ pub trait ServeHandler: Send + Sync {
             if let Some(answer) = resolve_in_page(&page, params) {
                 return Ok(answer);
             }
+            // The indexed location may predate a lineage change repaired by this read.
+            // Its old prefix bound cannot exclude parts carried into the new lineage.
+            location = None;
         }
         // Not in the index: past the materialized prefix, or a store without an index.
         let mut from = location.map_or(0, |location| location.indexed_through);
@@ -2251,6 +2268,121 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::PreUserUnavailable { provider })
             }
         }
+    }
+
+    async fn send_status(
+        &self,
+        session: &LineageKey,
+        own_run: broca_protocol::RunId,
+        send_id: &str,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<broca_wire::SendReplyWire, ServeError> {
+        self.check_expired(session, Some(&own_run.0)).await?;
+        let records: Vec<_> = self
+            .read_durable_wal(session)
+            .await?
+            .0
+            .into_iter()
+            .map(|frame| frame.record)
+            .collect();
+        // Ordered senders share a session, not each other's send keys. Legacy owner records
+        // omit sent_by, so their principal is the one on Queued or RunStarted.
+        let submission = format!("sub-{}", own_run.0);
+        let sender = records.iter().find_map(|record| match record {
+            broca_wal::WalRecord::DeliveryOrdered {
+                submission_id,
+                sent_by: Some(sender),
+                ..
+            } if submission_id.0 == submission => Some(Some(sender)),
+            broca_wal::WalRecord::Queued {
+                submission_id,
+                principal,
+                ..
+            } if submission_id.0 == submission => Some(principal.as_ref()),
+            broca_wal::WalRecord::RunStarted {
+                run_id, principal, ..
+            } if run_id == &own_run => Some(principal.as_ref()),
+            _ => None,
+        });
+        let sender = sender.or_else(|| {
+            records.iter().find_map(|record| match record {
+                broca_wal::WalRecord::RunStarted { principal, .. } => Some(principal.as_ref()),
+                _ => None,
+            })
+        });
+        if sender
+            .flatten()
+            .is_some_and(|sender| Some(sender) != principal)
+        {
+            return Err(ServeError::UnknownSend);
+        }
+        let outcome = crate::send_fate::recorded_send_outcome(&records, &own_run, send_id)
+            .ok_or(ServeError::UnknownSend)?;
+        let (result, delivered) = match outcome {
+            crate::actor::SendOutcome::Finished {
+                run_id,
+                reason,
+                delivered,
+            } => (
+                broca_wire::SendResult::Finished {
+                    run_id: run_id.0,
+                    reason,
+                },
+                delivered,
+            ),
+            crate::actor::SendOutcome::Active { run_id, delivered } => (
+                broca_wire::SendResult::Active { run_id: run_id.0 },
+                delivered,
+            ),
+            crate::actor::SendOutcome::Paused {
+                run_id,
+                reason,
+                delivered,
+            } => (
+                broca_wire::SendResult::Paused {
+                    run_id: run_id.0,
+                    pause_reason: reason,
+                },
+                delivered,
+            ),
+            crate::actor::SendOutcome::Pending { submission_id } => (
+                broca_wire::SendResult::Pending {
+                    submission_id: submission_id.0,
+                },
+                None,
+            ),
+            crate::actor::SendOutcome::Retracted { submission_id } => {
+                return Err(ServeError::SendRetracted {
+                    submission_id: submission_id.0,
+                })
+            }
+            crate::actor::SendOutcome::SendEnded {
+                submission_id,
+                reason,
+            } => {
+                return Err(ServeError::SendEnded {
+                    submission_id: submission_id.0,
+                    outcome: reason.as_str(),
+                })
+            }
+            crate::actor::SendOutcome::Error(message) => {
+                return Err(ServeError::Open(message, None))
+            }
+            _ => unreachable!("recorded send fate cannot admit work"),
+        };
+        let baseline = match &result {
+            broca_wire::SendResult::Active { run_id } | broca_wire::SendResult::Finished { run_id, .. } if run_id == &own_run.0 => {
+                records.iter().find(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
+                    .filter(|record| matches!(record, broca_wal::WalRecord::RunStarted { run_id, .. } if run_id == &own_run))
+                    .map(baseline_of)
+            }
+            _ => None,
+        };
+        Ok(broca_wire::SendReplyWire {
+            result,
+            baseline,
+            delivered,
+        })
     }
 
     async fn plan_state(&self, session: &LineageKey) -> PlanState {

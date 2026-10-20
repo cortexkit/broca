@@ -3917,11 +3917,15 @@ async fn chatgpt_needs_reauth_pauses_and_resumes_original_send() {
         first_attempt_pauses: true,
     });
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let reg = Arc::new(LineageRegistry::new(Arc::new(
-        DefaultOpener::new(lease, wal.clone(), exec)
-            .with_idle_ttl(Duration::from_secs(5))
-            .with_run_index(store),
-    )));
+    let reg = Arc::new(LineageRegistry::new_with_reader(
+        Arc::new(
+            DefaultOpener::new(lease, wal.clone(), exec)
+                .with_idle_ttl(Duration::from_secs(5))
+                .with_run_index(store.clone()),
+        ),
+        wal.clone(),
+        Some(store),
+    ));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -4056,6 +4060,44 @@ async fn chatgpt_needs_reauth_pauses_and_resumes_original_send() {
     );
 
     credential_ready.store(true, Ordering::SeqCst);
+    // Polling observes the durable pause even after credential repair. Only the
+    // explicit re-send below may resume this episode or write another record.
+    let before = serde_json::to_vec(
+        &wal.read_records(&session)
+            .unwrap()
+            .iter()
+            .map(|frame| &frame.record)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    write_req(
+        &mut cwriter,
+        7,
+        15,
+        serde_json::json!({"method": "send.status", "params": {"send_id": "reauth-original"}}),
+    )
+    .await;
+    let observed = read_one(&mut creader).await;
+    assert_eq!(observed.header.ty, FrameType::Response);
+    let observed: serde_json::Value = serde_json::from_slice(&observed.body).unwrap();
+    assert_eq!(observed["result"]["state"], "paused");
+    assert_eq!(observed["result"]["pause_reason"], "auth_required");
+    assert_eq!(observed["result"]["run_id"], original_run_id);
+    assert_eq!(
+        serde_json::to_vec(
+            &wal.read_records(&session)
+                .unwrap()
+                .iter()
+                .map(|frame| &frame.record)
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        before
+    );
+    assert!(
+        provider_calls.lock().unwrap().is_empty(),
+        "send.status must not re-drive a repaired credential"
+    );
     write_req(&mut cwriter, 7, 14, original_send).await;
     let resumed = read_one(&mut creader).await;
     assert_eq!(resumed.header.ty, FrameType::Response);

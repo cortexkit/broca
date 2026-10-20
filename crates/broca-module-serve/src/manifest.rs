@@ -20,6 +20,7 @@ use subc_protocol::manifest::{
 use subc_protocol::PROTOCOL_VERSION;
 
 /// The request/response ops, classified Query vs Mutate.
+pub const OP_SEND_STATUS: &str = broca_wire::OP_SEND_STATUS;
 pub const OP_SEND: &str = "session.send";
 pub const OP_IMPORT: &str = "session.import";
 pub const OP_RETRACT: &str = "session.retract";
@@ -135,6 +136,11 @@ pub fn manifest_with_archive(
 /// The management request list is also the source of `health.check` request-counter names.
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     vec![
+        ManagementOperation {
+            name: OP_SEND_STATUS.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),
+        },
         ManagementOperation {
             name: OP_SEND.to_string(),
             kind: ManagementOperationKind::Mutate,

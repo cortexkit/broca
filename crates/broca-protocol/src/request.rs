@@ -94,7 +94,7 @@ pub enum ResponseFormat {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GenerationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
+    pub max_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -163,15 +163,16 @@ mod gated {
 
     #[test]
     fn default_output_cap_is_below_a_small_known_context() {
-        for model in [
-            "anthropic/small-context-null-output",
-            "anthropic/small-context-zero-output",
-            "anthropic/small-context-placeholder-output",
+        for (model, explicit) in [
+            ("anthropic/small-context-null-output", 100_000),
+            ("anthropic/small-context-zero-output", 100_000),
+            ("anthropic/small-context-placeholder-output", 32_000),
         ] {
             let cap = frozen_cap(model, None).as_u64().unwrap();
             assert_eq!(cap, 16_383, "{model}");
             assert!(cap < 16_384, "output must leave room in the context window");
-            assert_eq!(frozen_cap(model, Some(100_000)), 100_000);
+            // Explicit caps use a positive published output maximum, not the fallback.
+            assert_eq!(frozen_cap(model, Some(100_000)), explicit);
         }
         use broca_catalog::live::default_max_output_tokens;
         assert_eq!(default_max_output_tokens(None, Some(1)), 0);
@@ -194,9 +195,12 @@ mod gated {
     }
 
     #[test]
-    fn an_explicit_caller_cap_wins_over_catalog_and_fallback_unclamped() {
-        // Over a known catalog limit: sent as given, no downward clamp.
-        assert_eq!(frozen_cap("anthropic/known-output", Some(100_000)), 100_000);
+    fn an_explicit_caller_cap_is_bounded_by_the_catalog_maximum() {
+        // Both caps apply: a larger request is reduced, a smaller one is not raised.
+        assert_eq!(
+            frozen_cap("anthropic/known-output", Some(100_000)),
+            KNOWN_OUTPUT
+        );
         // Under it: not raised to the model maximum either.
         assert_eq!(frozen_cap("anthropic/known-output", Some(1_024)), 1_024);
         // Where the fallback would apply.
