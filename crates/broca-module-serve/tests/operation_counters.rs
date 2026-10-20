@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +16,86 @@ use subc_protocol::{
 };
 use subc_transport::{read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing_subscriber::prelude::*;
+
+const MANAGEMENT_OPERATIONS: &[&str] = &[
+    "session.send",
+    "session.import",
+    "session.retract",
+    "run.cancel",
+    "run.status",
+    "run.event.get",
+    "session.read",
+    "compaction.ready",
+    "role.describe",
+    "session.resolve",
+    "session.head",
+    "run.result",
+    "session.baseline",
+    "session.warm",
+    "cap.install",
+    "spend.delta",
+    "vault.audit",
+    "session.subscribe",
+];
+
+#[derive(Clone, Debug)]
+struct CapturedRequestLog {
+    target: &'static str,
+    level: tracing::Level,
+    operation: String,
+    session: String,
+    actor_opened: bool,
+}
+
+#[derive(Clone)]
+struct RequestLogCapture(Arc<Mutex<Vec<CapturedRequestLog>>>);
+
+#[derive(Default)]
+struct RequestLogFields {
+    operation: Option<String>,
+    session: Option<String>,
+    actor_opened: Option<bool>,
+}
+
+impl tracing::field::Visit for RequestLogFields {
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "operation" => self.operation = Some(value.to_owned()),
+            "session" => self.session = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == "actor_opened" {
+            self.actor_opened = Some(value);
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLogCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "requests" {
+            return;
+        }
+        let mut fields = RequestLogFields::default();
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(CapturedRequestLog {
+            target: event.metadata().target(),
+            level: *event.metadata().level(),
+            operation: fields.operation.expect("request log operation"),
+            session: fields.session.expect("request log session"),
+            actor_opened: fields.actor_opened.expect("request log actor flag"),
+        });
+    }
+}
 
 struct RejectingOpener;
 
@@ -119,6 +199,15 @@ async fn bind_route<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 
 #[tokio::test]
 async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_then_increment() {
+    let (request_filter, filter_reload) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+    let request_logs = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(request_filter)
+        .with(RequestLogCapture(request_logs.clone()));
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("the isolated counter test owns its tracing subscriber");
+
     let dir = tmpdir("health");
     let registry = Arc::new(LineageRegistry::new_with_reader(
         Arc::new(RejectingOpener),
@@ -176,6 +265,16 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         serde_json::json!(0),
         "actor_opens must start at zero"
     );
+    let mut expected_operation_counts: std::collections::BTreeMap<String, u64> =
+        MANAGEMENT_OPERATIONS
+            .iter()
+            .map(|operation| ((*operation).to_string(), 0))
+            .collect();
+    assert_eq!(
+        before["management_ops"],
+        serde_json::json!(expected_operation_counts),
+        "every manifest management operation has a zero-valued counter"
+    );
 
     bind_route(&mut client_writer, &mut client_reader, &dir.join("proj")).await;
 
@@ -196,6 +295,13 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         read_one(&mut client_reader).await.header.ty,
         FrameType::Response
     );
+    assert!(
+        request_logs.lock().unwrap().is_empty(),
+        "the request logger stays quiet at INFO"
+    );
+    filter_reload
+        .reload(tracing_subscriber::EnvFilter::new("info,requests=debug"))
+        .expect("enable the request component at DEBUG");
 
     // A cancel always goes through the registry's actor opening, which this rig refuses on
     // purpose. `run.status` no longer does: a never-written session answers `idle` from its
@@ -212,6 +318,17 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         read_one(&mut client_reader).await.header.ty,
         FrameType::Error
     );
+    let request_log = request_logs
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the authorized operation emits a request log");
+    assert_eq!(request_log.target, "requests");
+    assert_eq!(request_log.level, tracing::Level::DEBUG);
+    assert_eq!(request_log.operation, "run.cancel");
+    assert_eq!(request_log.session, "operation-counters");
+    assert!(!request_log.actor_opened);
 
     let after = health_metrics(&mut client_reader, &mut client_writer, 5).await;
     assert_eq!(
@@ -229,6 +346,46 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         serde_json::json!(1),
         "actor_opens must increment after one registry opening"
     );
+    expected_operation_counts.insert("session.read".to_string(), 1);
+    expected_operation_counts.insert("run.cancel".to_string(), 1);
+    assert_eq!(
+        after["management_ops"],
+        serde_json::json!(expected_operation_counts),
+        "one session.read and one run.cancel were served"
+    );
+
+    for (index, operation) in MANAGEMENT_OPERATIONS
+        .iter()
+        .filter(|operation| !matches!(**operation, "session.read" | "run.cancel"))
+        .enumerate()
+    {
+        write_request(
+            &mut client_writer,
+            7,
+            1,
+            10 + index as u64,
+            serde_json::json!({"method": operation, "params": {}}),
+        )
+        .await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), read_one(&mut client_reader))
+            .await
+            .expect("each management request receives a reply");
+        assert!(
+            matches!(reply.header.ty, FrameType::Response | FrameType::Error),
+            "{operation} returned unexpected frame type {:?}",
+            reply.header.ty
+        );
+        *expected_operation_counts
+            .get_mut(*operation)
+            .expect("the operation has a zero counter") += 1;
+        let counts =
+            health_metrics(&mut client_reader, &mut client_writer, 100 + index as u64).await;
+        assert_eq!(
+            counts["management_ops"],
+            serde_json::json!(expected_operation_counts),
+            "{operation} increments its counter exactly once"
+        );
+    }
 
     drop(client_writer);
     drop(client_reader);

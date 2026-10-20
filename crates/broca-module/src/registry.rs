@@ -13,6 +13,7 @@
 use broca_diagnostics::{spawn_blocking, JobKind};
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -77,6 +78,22 @@ impl<V> BoundedSessionCache<V> {
 
 static SESSION_READS: AtomicU64 = AtomicU64::new(0);
 static ACTOR_OPENS: AtomicU64 = AtomicU64::new(0);
+
+tokio::task_local! {
+    static SERVED_REQUEST_ACTOR_OPENED: Arc<AtomicBool>;
+}
+
+/// Run one served operation with a task-local marker for a successful actor open it starts.
+///
+/// The marker belongs to the opening request, not to a process-wide counter delta: other
+/// sessions may open actors concurrently while this request is running.
+pub async fn with_request_actor_opened<F: Future>(future: F) -> (F::Output, bool) {
+    let opened = Arc::new(AtomicBool::new(false));
+    let output = SERVED_REQUEST_ACTOR_OPENED
+        .scope(opened.clone(), future)
+        .await;
+    (output, opened.load(Ordering::Relaxed))
+}
 
 /// `session.read` requests served by this process since boot.
 ///
@@ -1487,6 +1504,11 @@ impl LineageRegistry {
                                 slots.remove(key);
                             }
                         }
+                    }
+                    if result.is_ok() {
+                        let _ = SERVED_REQUEST_ACTOR_OPENED.try_with(|opened| {
+                            opened.store(true, Ordering::Relaxed);
+                        });
                     }
                     let _ = ready.send(result.clone());
                     open_guard.commit();
@@ -3962,6 +3984,22 @@ mod tests {
             reached.load(Ordering::Acquire),
             "status never reached the facts lock"
         );
+    }
+
+    #[tokio::test]
+    async fn request_actor_open_flag_marks_only_the_request_that_opens_it() {
+        let registry = LineageRegistry::new(Arc::new(GaugeOpener {
+            durable_head: Mutex::new(Some(Arc::new(AtomicU64::new(0)))),
+        }));
+        let key = BindIdentity::new("/tmp/request-open", "agent", "session");
+
+        let (opened, actor_opened) = with_request_actor_opened(registry.actor_for(&key)).await;
+        assert!(opened.is_ok());
+        assert!(actor_opened, "the request that opens the actor is marked");
+
+        let (existing, actor_opened) = with_request_actor_opened(registry.actor_for(&key)).await;
+        assert!(existing.is_ok());
+        assert!(!actor_opened, "a request reusing the actor is not marked");
     }
 
     #[test]

@@ -33,6 +33,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::stall::{self, Phase};
 use broca_diagnostics::{Receiver as EgressReceiver, Sender as EgressSender};
@@ -78,6 +79,66 @@ const DROP_LOG_KEY_LIMIT: usize = 256;
 // client-side outbound routes.
 static SERVE_FRAMES_DROPPED_UNBOUND_CHANNEL: AtomicU64 = AtomicU64::new(0);
 static SERVE_FRAMES_DROPPED_STALE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static MANAGEMENT_OPERATION_COUNTS: OnceLock<Vec<(String, AtomicU64)>> = OnceLock::new();
+
+fn management_operation_counters() -> &'static [(String, AtomicU64)] {
+    MANAGEMENT_OPERATION_COUNTS.get_or_init(|| {
+        let operations = crate::manifest::management_operations()
+            .into_iter()
+            .map(|operation| operation.name)
+            .chain(
+                crate::manifest::observability_surfaces()
+                    .into_iter()
+                    .map(|surface| surface.name),
+            );
+        operations
+            .map(|operation| (operation, AtomicU64::new(0)))
+            .collect()
+    })
+}
+
+fn count_management_operation(operation: &str) {
+    if let Some((_, count)) = management_operation_counters()
+        .iter()
+        .find(|(name, _)| name == operation)
+    {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn management_operation_counts() -> serde_json::Value {
+    serde_json::Value::Object(
+        management_operation_counters()
+            .iter()
+            .map(|(operation, count)| {
+                (
+                    operation.clone(),
+                    serde_json::json!(count.load(Ordering::Relaxed)),
+                )
+            })
+            .collect(),
+    )
+}
+
+async fn log_served_request<F: std::future::Future>(
+    operation: String,
+    session: String,
+    future: F,
+) -> F::Output {
+    let started = Instant::now();
+    let (output, actor_opened) = broca_module::registry::with_request_actor_opened(future).await;
+    emit_request_log(
+        &operation,
+        &session,
+        actor_opened,
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+    );
+    output
+}
+
+fn emit_request_log(operation: &str, session: &str, actor_opened: bool, elapsed_us: u64) {
+    tracing::debug!(target: "requests", operation, session, actor_opened, elapsed_us, "served management request");
+}
 
 // Keep the first keys seen rather than evicting them: this bounds log volume even if a peer
 // cycles through many channel/epoch pairs, while the counters continue to capture every drop.
@@ -1590,6 +1651,7 @@ async fn handle_control_request(
                     "input_transformations_unmeasured_attempts": broca_core::input_transformations_unmeasured_attempts(),
                     "session_reads": broca_module::registry::session_reads(),
                     "actor_opens": broca_module::registry::actor_opens(),
+                    "management_ops": management_operation_counts(),
             "wal_archive_polls": crate::wal_archive::wal_archive_polls(),
             "bus_events": crate::bus_events::health(),
             // The subscriber fan-out's own counters. NOT related to frames_dropped_*
@@ -1796,41 +1858,51 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             .acquire_owned()
             .await
             .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
-        let work = async move {
-            if let Err(error) =
-                authorize_route_request(handler.as_ref(), &session, &bind, &req.method).await
-            {
-                return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
-            }
-            if !req.params.is_null() {
-                if let Err(error) =
-                    serde_json::from_value::<crate::wire::VaultAuditParams>(req.params)
-                {
-                    return send_error(
-                        &writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_params",
-                        &error.to_string(),
-                    )
-                    .await;
-                }
-            }
-            // A daemon without the vault auth source still answers, and says it could not
-            // check: the caller must be able to tell that apart from a clean audit.
-            let answer = match vault_auditor {
-                Some(auditor) => auditor.audit().await,
-                None => crate::wire::VaultAuditResponse::Unanswered {
-                    reason: "this broca is not configured with the credential vault".into(),
-                },
-            };
-            send_json_response(&writer, ver, channel, epoch, corr, &answer).await
+        let authorization = tokio::select! {
+            _ = conn_cancel.cancelled() => return Ok(()),
+            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method) => result,
         };
-        tokio::select! {
-            _ = conn_cancel.cancelled() => Ok(()),
-            result = work => result,
+        if let Err(error) = authorization {
+            return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
+        }
+        count_management_operation(OP_VAULT_AUDIT);
+        let log_context = tracing::enabled!(target: "requests", tracing::Level::DEBUG)
+            .then(|| (req.method.clone(), session.session.clone()));
+        let request = async move {
+            tokio::select! {
+                _ = conn_cancel.cancelled() => Ok(()),
+                result = async move {
+                    if !req.params.is_null() {
+                        if let Err(error) =
+                            serde_json::from_value::<crate::wire::VaultAuditParams>(req.params)
+                        {
+                            return send_error(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "invalid_params",
+                                &error.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                    // A daemon without the vault auth source still answers, and says it could not
+                    // check: the caller must be able to tell that apart from a clean audit.
+                    let answer = match vault_auditor {
+                        Some(auditor) => auditor.audit().await,
+                        None => crate::wire::VaultAuditResponse::Unanswered {
+                            reason: "this broca is not configured with the credential vault".into(),
+                        },
+                    };
+                    send_json_response(&writer, ver, channel, epoch, corr, &answer).await
+                } => result,
+            }
+        };
+        match log_context {
+            Some((operation, session)) => log_served_request(operation, session, request).await,
+            None => request.await,
         }
     });
     Ok(())
@@ -1885,47 +1957,72 @@ where
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
             }
         }
+        count_management_operation(method);
+        let log_context = (method != OP_SUBSCRIBE
+            && tracing::enabled!(target: "requests", tracing::Level::DEBUG))
+            .then(|| (method.to_owned(), session.session.clone()));
         if describe {
             trace_describe("task_started", channel, epoch, corr);
         }
         // The connection keeps reading while requests run, but actor-bound work for one session
         // takes its turn in wire-arrival order. Separate sessions use separate lanes and remain
         // concurrent; replies may still arrive out of order because correlation ids disambiguate them.
-        match prepared {
-            PreparedRouteRequest::Request(req) => {
-                if describe {
-                    trace_describe("turn_acquired", channel, epoch, corr);
-                }
-                tokio::select! {
-                    _ = conn_cancel.cancelled() => Ok(()),
-                    result = execute_route_request(req, &writer, ver, channel, epoch, corr, session, bind, &handler) => result,
-                }
-            }
-            PreparedRouteRequest::Subscribe { params, slot } => {
-                let from = match subscribe_from(&params) {
-                    Ok(from) => from,
-                    Err((field, message)) => {
-                        return send_invalid_params(&writer, ver, channel, epoch, corr, field, &message).await;
+        let request = async move {
+            match prepared {
+                PreparedRouteRequest::Request(req) => {
+                    if describe {
+                        trace_describe("turn_acquired", channel, epoch, corr);
                     }
-                };
-                // Only an authorized, well-formed replacement may stop the previous stream.
-                let cancel = slot.replace();
-                tokio::select! {
-                    _ = conn_cancel.cancelled() => Ok(()),
-                    _ = cancel.cancelled() => Ok(()),
-                    result = start_subscribe_stream(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        session,
-                        from,
-                        handler,
-                        cancel.clone(),
-                    ) => result,
+                    tokio::select! {
+                        _ = conn_cancel.cancelled() => Ok(()),
+                        result = execute_route_request(req, &writer, ver, channel, epoch, corr, session, bind, &handler) => result,
+                    }
+                }
+                PreparedRouteRequest::Subscribe { params, slot } => {
+                    let from = match subscribe_from(&params) {
+                        Ok(from) => from,
+                        Err((field, message)) => {
+                            let refusal = send_invalid_params(
+                                &writer, ver, channel, epoch, corr, field, &message,
+                            );
+                            return if tracing::enabled!(
+                                target: "requests",
+                                tracing::Level::DEBUG
+                            ) {
+                                log_served_request(
+                                    OP_SUBSCRIBE.to_string(),
+                                    session.session.clone(),
+                                    refusal,
+                                )
+                                .await
+                            } else {
+                                refusal.await
+                            };
+                        }
+                    };
+                    // Only an authorized, well-formed replacement may stop the previous stream.
+                    let cancel = slot.replace();
+                    tokio::select! {
+                        _ = conn_cancel.cancelled() => Ok(()),
+                        _ = cancel.cancelled() => Ok(()),
+                        result = start_subscribe_stream(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            session,
+                            from,
+                            handler,
+                            cancel.clone(),
+                        ) => result,
+                    }
                 }
             }
+        };
+        match log_context {
+            Some((operation, session)) => log_served_request(operation, session, request).await,
+            None => request.await,
         }
     });
     Ok(())
@@ -2856,7 +2953,13 @@ where
     // egress backpressures the FORWARD task here (not the coordinator's fanout, which has
     // its own per-subscriber backpressure + detach-on-lag).
     let (sink, mut deliveries) = mpsc::channel::<Delivery>(EGRESS_BUFFER);
-    if let Err(e) = handler.subscribe(&session, from, sink).await {
+    let subscribe = handler.subscribe(&session, from, sink);
+    let subscribe_result = if tracing::enabled!(target: "requests", tracing::Level::DEBUG) {
+        log_served_request(OP_SUBSCRIBE.to_string(), session.session.clone(), subscribe).await
+    } else {
+        subscribe.await
+    };
+    if let Err(e) = subscribe_result {
         return send_serve_error(&writer, ver, channel, epoch, corr, &e).await;
     }
     if cancel.is_cancelled() {
@@ -3817,6 +3920,88 @@ mod tests {
         CancelResponse, RetractResponse, RunStatusResponse, SendRequest, SendResponse,
         SessionReadResponse, StatusResponse,
     };
+
+    #[derive(Clone)]
+    struct RequestLogCapture(Arc<Mutex<Vec<CapturedRequestLog>>>);
+
+    #[derive(Clone, Debug)]
+    struct CapturedRequestLog {
+        target: &'static str,
+        level: tracing::Level,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Fields(std::collections::BTreeMap<String, String>);
+
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+            }
+
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(CapturedRequestLog {
+                target: event.metadata().target(),
+                level: *event.metadata().level(),
+                fields: fields.0,
+            });
+        }
+    }
+
+    fn request_logs_for_filter(filter: &str) -> Vec<CapturedRequestLog> {
+        use tracing_subscriber::prelude::*;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(filter))
+            .with(RequestLogCapture(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            emit_request_log("session.read", "bind-session-id", true, 17);
+        });
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    #[test]
+    fn request_log_is_debug_only_and_carries_the_bound_session() {
+        assert!(request_logs_for_filter("info").is_empty());
+
+        let logs = request_logs_for_filter("info,requests=debug");
+        assert_eq!(logs.len(), 1);
+        let log = &logs[0];
+        assert_eq!(log.target, "requests");
+        assert_eq!(log.level, tracing::Level::DEBUG);
+        assert_eq!(log.fields["operation"], "session.read");
+        assert_eq!(log.fields["session"], "bind-session-id");
+        assert_eq!(log.fields["actor_opened"], "true");
+        assert_eq!(log.fields["elapsed_us"], "17");
+        assert_eq!(log.fields["message"], "served management request");
+    }
 
     #[test]
     fn projection_health_degrades_only_for_sessions_still_behind() {
