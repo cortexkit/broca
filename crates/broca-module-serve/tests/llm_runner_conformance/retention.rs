@@ -226,13 +226,30 @@ fn expired_at(method: &str, reply: Reply) -> u64 {
 async fn wait_run_end(route: &BrocaRoute, run_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let status = response(
-            "run.status",
-            route
-                .request("run.status", json!({ "run_id": run_id }))
-                .await
-                .unwrap(),
-        );
+        let reply = route
+            .request("run.status", json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        // Right after a restart the boot pass may still be sealing the cut run; status then
+        // answers a refusal classed transient ("could not tell"), which means poll again.
+        let status = match reply {
+            Reply::Error(error)
+                if error
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail["class"] == "transient") =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "run {run_id} status stayed refused: {} {}",
+                    error.code,
+                    error.message
+                );
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            reply => response("run.status", reply),
+        };
         if status["state"] != "active" {
             return status;
         }
