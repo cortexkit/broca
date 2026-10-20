@@ -361,6 +361,34 @@ async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
             .session_route(&live, session, &subject.owner_stamp())
             .await
             .unwrap();
+        let recovery = subject.records(&live, session);
+        let resumed = recovery
+            .iter()
+            .position(|record| matches!(record, broca_wal::WalRecord::ResumeStarted { .. }))
+            .expect("restart did not record recovery");
+        let terminal = recovery
+            .iter()
+            .enumerate()
+            .skip(resumed + 1)
+            .find_map(|(at, record)| {
+                matches!(
+                    record,
+                    broca_wal::WalRecord::RunFinished {
+                        reason: broca_protocol::RunFinishReason::Interrupted,
+                        ..
+                    }
+                )
+                .then_some(at)
+            })
+            .expect("the crashed run was not sealed interrupted");
+        assert!(
+            !recovery[resumed..=terminal].iter().any(|record| matches!(
+                record,
+                broca_wal::WalRecord::StepStarted { .. }
+                    | broca_wal::WalRecord::ModelStepFinished { .. }
+            )),
+            "sealing a pre-response crash started a model step"
+        );
         let fields = with_prompt(subject.send_fields(session, false), "resume", "next");
         let reply = route
             .request("session.send", Value::Object(fields))

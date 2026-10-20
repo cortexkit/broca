@@ -19097,3 +19097,78 @@ expect_red = ["compaction_facts::tests::durable_bus_projection_keeps_compaction_
 file = "crates/broca-store/src/compaction_facts.rs"
 old = "if headers.get(\"lineage_id\").map(String::as_str) != Some(lineage) {"
 new = "if false && headers.get(\"lineage_id\").map(String::as_str) != Some(lineage) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-settle-poller-accepts-idle-metadata"
+guards = "the settlement poller accepts the current episode terminal even when idle compaction appends a view and notice"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/compaction.rs"
+expect_red = ["compaction::compaction_settle_poller_observes_terminal_before_idle_view_and_notice"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance/compaction.rs"
+old = "if let Some(reason) = settled_episode(&frames) {"
+new = "if let Some(reason) = settled_episode(&frames).filter(|_| frames.last().is_some_and(|frame| matches!(frame.record, broca_wal::WalRecord::RunFinished { .. }))) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-settle-requires-current-episode-terminal"
+guards = "an older finished episode cannot settle a newer unfinished run"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/compaction.rs"
+expect_red = ["compaction::settled_episode_accepts_idle_view_metadata_but_not_a_newer_unfinished_run"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance/compaction.rs"
+old = "let terminal = frames[start..]"
+new = "let terminal = frames[..] /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-kit-declares-fold-recorded"
+guards = "the full conformance adapter declares the durable pre-model Setup checkpoint required by compaction_setup_durable_once"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["setup_fold_recorded_is_declared_as_a_real_process_kill"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "point: KillPoint::new(points::FOLD_RECORDED),"
+new = "point: KillPoint::new(\"MissingSetupPoint\"), // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-kit-fold-recorded-is-real-signal"
+guards = "the Setup durability checkpoint promises a real process kill rather than a simulated truncation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["setup_fold_recorded_is_declared_as_a_real_process_kill"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "point: KillPoint::new(points::FOLD_RECORDED),\n                mechanisms: vec![KillMechanism::ProcessSignal],"
+new = "point: KillPoint::new(points::FOLD_RECORDED),\n                mechanisms: vec![KillMechanism::LogTruncation], // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-no-kill-adapter-keeps-real-capabilities"
+guards = "disabling process-kill cases never under-declares the daemon's capabilities to manufacture negative-subject failures"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["setup_fold_recorded_is_declared_as_a_real_process_kill"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "fn capabilities(&self) -> BTreeSet<Capability> {\n        let mut capabilities"
+new = "fn capabilities(&self) -> BTreeSet<Capability> {\n        if self.process_kills_disabled { return BTreeSet::new(); } // NON-VACUITY BREAK\n        let mut capabilities"

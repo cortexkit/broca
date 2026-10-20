@@ -339,6 +339,204 @@ fn atomic_write(path: &Path, value: &[u8]) -> Result<(), HarnessError> {
     std::fs::write(&temporary, value).map_err(|e| HarnessError::new(e.to_string()))?;
     std::fs::rename(temporary, path).map_err(|e| HarnessError::new(e.to_string()))
 }
+
+fn settled_episode(frames: &[broca_wal::FramedRecord]) -> Option<String> {
+    use broca_wal::WalRecord as R;
+    let start = frames
+        .iter()
+        .rposition(|frame| matches!(frame.record, R::RunStarted { .. }))?;
+    let terminal = frames[start..]
+        .iter()
+        .rev()
+        .find(|frame| matches!(frame.record, R::RunFinished { .. }))?;
+    let R::RunStarted { run_id, .. } = &frames[start].record else {
+        unreachable!()
+    };
+    let R::RunFinished { reason, .. } = &terminal.record else {
+        unreachable!()
+    };
+    let following = frames.iter().filter(|frame| frame.seq > terminal.seq);
+    Some(format!(
+        "run {} finished {reason:?} at WAL seq {}; {}",
+        run_id.0,
+        terminal.seq,
+        broca_test_support::record_kinds(following.map(|frame| &frame.record))
+    ))
+}
+
+fn settlement_records() -> Vec<broca_wal::FramedRecord> {
+    use broca_protocol::{BindIdentity, ModelHandle, RunFinishReason, RunId};
+    use broca_wal::{FramedRecord, WalRecord as R};
+    let started = |id: &str| R::RunStarted {
+        run_id: RunId(id.into()),
+        session: BindIdentity::new("/test", "runner", "settle"),
+        config: Box::new(broca_wal::RunConfig {
+            model: ModelHandle::new("mock", "m"),
+            tools: Arc::new(vec![]),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: Value::Null,
+            cache_tiers: Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: vec![],
+            context_management: None,
+            render_tags: false,
+        }),
+        input: Arc::new(vec![]),
+        origin: Default::default(),
+        tags: None,
+        on_restart: None,
+        keep_warm: None,
+        project_id: None,
+        principal: None,
+        retention: None,
+        session_class: None,
+        submission_id: None,
+        send_id: None,
+        request_identity_digest: None,
+        title: None,
+        scope: None,
+        marker_order_version: None,
+        manifest: None,
+        hooks: None,
+        ts_ms: None,
+    };
+    let frame = |seq, record| FramedRecord {
+        seq,
+        fence: 1,
+        record,
+    };
+    vec![
+        frame(1, started("sealed")),
+        frame(
+            2,
+            R::RunFinished {
+                reason: RunFinishReason::Interrupted,
+                ts_ms: None,
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            },
+        ),
+        frame(
+            3,
+            R::CompactionViewApplied {
+                provider: MODULE.into(),
+                view_version: 2,
+                view: broca_wal::OpaqueJson::from_json_text("{}").unwrap(),
+                choice: broca_wal::CompactionViewChoice::Applied,
+            },
+        ),
+        frame(
+            4,
+            R::CompactionNotice {
+                seq: 2,
+                headers: BTreeMap::new(),
+            },
+        ),
+    ]
+}
+
+#[test]
+fn settled_episode_accepts_idle_view_metadata_but_not_a_newer_unfinished_run() {
+    use broca_wal::{FramedRecord, WalRecord as R};
+    let mut records = settlement_records();
+    let frame = |seq, record| FramedRecord {
+        seq,
+        fence: 1,
+        record,
+    };
+    let reason = settled_episode(&records).expect("idle metadata must not hide the terminal");
+    assert!(
+        reason.contains("sealed finished Interrupted at WAL seq 2"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("CompactionViewApplied") && reason.contains("CompactionNotice"),
+        "{reason}"
+    );
+    let mut active = records[0].record.clone();
+    if let R::RunStarted { run_id, .. } = &mut active {
+        *run_id = broca_protocol::RunId("active".into());
+    }
+    records.push(frame(5, active));
+    assert_eq!(
+        settled_episode(&records),
+        None,
+        "an earlier run's terminal settled new work"
+    );
+    records.push(frame(
+        6,
+        R::CompactionNotice {
+            seq: 3,
+            headers: BTreeMap::new(),
+        },
+    ));
+    assert_eq!(
+        settled_episode(&records),
+        None,
+        "metadata alone settled the active run"
+    );
+}
+
+#[tokio::test]
+async fn compaction_settle_poller_observes_terminal_before_idle_view_and_notice() {
+    let root = broca_test_support::scratch_root().join("compaction-settle-metadata");
+    std::fs::create_dir_all(&root).unwrap();
+    let subject = BrocaSubject::new(&root).await;
+    let session = "settle";
+    let state = root.join("state");
+    subject
+        .shared
+        .session_roots
+        .lock()
+        .unwrap()
+        .insert(session.into(), state.clone());
+    subject.install_setup(
+        session,
+        CompactionSetup::Ready(CompactionMessage {
+            compaction_id: "head".into(),
+            version: 1,
+            from: 0,
+            to: 0,
+            replacement: vec![],
+        }),
+    );
+    let identity = subject.bind_identity(session);
+    let wal = broca_core::FileWalStore::new(state.join("wal"));
+    let mut writer = wal.open(&identity).unwrap();
+    for mut frame in settlement_records() {
+        if let broca_wal::WalRecord::RunStarted { session, .. } = &mut frame.record {
+            *session = identity.clone();
+        }
+        writer.append(frame.fence, &frame.record, false).unwrap();
+    }
+    writer.sync().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), subject.settle_compaction(session))
+        .await
+        .expect("poller ignored the current run's terminal after idle compaction metadata")
+        .unwrap();
+    let evidence = subject.shared.evidence.lock().unwrap();
+    let observed = evidence.last().unwrap();
+    assert!(
+        observed.contains("sealed finished Interrupted at WAL seq 2"),
+        "{observed}"
+    );
+    assert!(
+        observed.contains("CompactionViewApplied") && observed.contains("CompactionNotice"),
+        "{observed}"
+    );
+}
 impl BrocaSubject {
     #[cfg(feature = "test-clock")]
     pub(super) fn offer_bus_view(
@@ -463,14 +661,10 @@ impl BrocaSubject {
                     let frames = broca_core::FileWalStore::new(root.join("wal"))
                         .read_records(&self.bind_identity(session))
                         .unwrap_or_default();
-                    if let Some(last) = frames.last() {
-                        use broca_wal::WalRecord as R;
-                        if matches!(last.record, R::RunFinished { .. }) {
-                            return format!(
-                                "RunFinished is the last WAL record (seq {})",
-                                last.seq
-                            );
-                        }
+                    // Idle compaction may append a view and notice after a terminal.
+                    // Only a newer RunStarted makes that terminal irrelevant to settling.
+                    if let Some(reason) = settled_episode(&frames) {
+                        return reason;
                     }
                     if root.join("test-compaction-reached").exists() {
                         return "test-compaction-reached marker exists".to_owned();
@@ -491,6 +685,7 @@ impl BrocaSubject {
         .await;
         match settled {
             Ok(reason) => {
+                eprintln!("compaction settled session={session}: {reason}");
                 self.shared.note(session, format_args!("settled: {reason}"));
                 Ok(())
             }

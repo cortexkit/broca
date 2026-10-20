@@ -785,7 +785,7 @@ struct BrocaSubject {
     binary: Option<PathBuf>,
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
-    compaction_only: bool,
+    process_kills_disabled: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
 }
@@ -805,7 +805,7 @@ impl BrocaSubject {
             binary: None,
             backup_classes: None,
             bus_events_enabled: true,
-            compaction_only: false,
+            process_kills_disabled: false,
             #[cfg(feature = "test-clock")]
             bus: None,
         }
@@ -1148,16 +1148,21 @@ impl BrocaSubject {
             points::TOOL_RESULT_RECORDED => results == 1 && steps == 1,
             points::TERMINAL => finished == 1,
             points::FOLD_RECORDED => {
-                count(|r| {
-                    matches!(
-                        r,
-                        R::CompactionMessage {
-                            kind: broca_wal::CompactionMessageKind::Setup,
-                            ..
-                        }
-                    )
-                }) == 1
+                started == 1
+                    && finished == 0
                     && steps == 0
+                    && intents == 0
+                    && count(|r| matches!(r, R::StepStarted { .. })) == 1
+                    && count(|r| matches!(r, R::CompactionNotice { .. })) >= 1
+                    && count(|r| {
+                        matches!(
+                            r,
+                            R::CompactionMessage {
+                                kind: broca_wal::CompactionMessageKind::Setup,
+                                ..
+                            }
+                        )
+                    }) == 1
             }
             points::COMPACTION_APPLIED => {
                 count(|r| {
@@ -1193,7 +1198,7 @@ impl Harness for BrocaSubject {
     type Route = BrocaRoute;
 
     fn declared_points(&self) -> Vec<PointDeclaration> {
-        if skip_crash_kills() || self.compaction_only {
+        if skip_crash_kills() || self.process_kills_disabled {
             return Vec::new();
         }
         let points: Vec<_> = [
@@ -1232,6 +1237,13 @@ impl Harness for BrocaSubject {
         #[cfg(feature = "test-clock")]
         let points = {
             let mut points = points;
+            points.push(PointDeclaration {
+                point: KillPoint::new(points::FOLD_RECORDED),
+                mechanisms: vec![KillMechanism::ProcessSignal],
+                note: "Setup's initial compaction message and its notice are durable at the \
+                    pre-model FoldRecorded barrier. The rig verifies one Setup and no model \
+                    step or captured model request before SIGKILL; restart must not call Setup again.".into(),
+            });
             points.push(PointDeclaration {
                 point: KillPoint::new(points::RETENTION_TOMBSTONED),
                 mechanisms: vec![KillMechanism::ProcessSignal],
@@ -1341,6 +1353,35 @@ impl Harness for BrocaSubject {
     async fn restart(&self, state_root: &Path) -> Result<Live, HarnessError> {
         self.start(state_root).await
     }
+}
+
+#[tokio::test]
+#[cfg(feature = "test-clock")]
+async fn setup_fold_recorded_is_declared_as_a_real_process_kill() {
+    let root = broca_test_support::scratch_root().join("fold-recorded-declaration");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut subject = BrocaSubject::new(&root).await;
+    let points = subject.declared_points();
+    let fold = points
+        .iter()
+        .find(|p| p.point.as_str() == points::FOLD_RECORDED);
+    if skip_crash_kills() {
+        assert!(fold.is_none());
+    } else {
+        let fold = fold.expect("compaction Setup needs its durable pre-model kill point");
+        assert_eq!(fold.mechanisms, vec![KillMechanism::ProcessSignal]);
+    }
+    let capabilities = subject.capabilities();
+    subject.process_kills_disabled = true;
+    assert_eq!(
+        subject.capabilities(),
+        capabilities,
+        "no-kill mode changed declared groups"
+    );
+    assert!(
+        subject.declared_points().is_empty(),
+        "the no-kill kit subset declared a kill"
+    );
 }
 
 /// A session-bound management route to the real `ck-broca`, through the real daemon.
@@ -1557,18 +1598,6 @@ impl LlmRunnerSubject for BrocaSubject {
             .map_or(0, Vec::len))
     }
     fn capabilities(&self) -> BTreeSet<Capability> {
-        if self.compaction_only {
-            return [
-                Capability::Compaction,
-                Capability::ModelView,
-                Capability::Queue,
-                Capability::TranscriptReads,
-                Capability::RunOps,
-                Capability::Tags,
-            ]
-            .into_iter()
-            .collect();
-        }
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
             Capability::RunOps,
@@ -2455,10 +2484,24 @@ async fn kit_compaction_cases_without_process_kills() {
     let root = broca_test_support::scratch_root().join("kit-compaction-without-kills");
     std::fs::create_dir_all(&root).unwrap();
     let mut subject = BrocaSubject::new(&root).await;
-    subject.compaction_only = true;
+    let advertised = subject.capabilities();
+    subject.process_kills_disabled = true;
+    assert_eq!(
+        subject.capabilities(),
+        advertised,
+        "disabling kills changed daemon capability declarations"
+    );
     let report = run_suite(&subject, &root.join("suite")).await.unwrap();
     println!("{}", report.render());
     assert!(report.kills.is_empty());
+    assert!(
+        report
+            .cases
+            .iter()
+            .all(|case| !matches!(case.outcome, CaseOutcome::Failed { .. })),
+        "{}",
+        report.render()
+    );
     for name in [
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
