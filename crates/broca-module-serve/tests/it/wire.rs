@@ -6631,7 +6631,9 @@ async fn a_queued_keyed_send_drained_after_a_crash_is_deduplicated_from_the_wal(
 async fn admission_open_failed_preserves_legacy_message() {
     let mut route = PreparedWalRoute::start("admission-open-failed", |_| {}).await;
     let body = route.expect_error(2, serde_json::json!({"method":"session.send", "params":{"prompt":"hi","delivery":"interrupt"}})).await;
-    let legacy = r#"{"code":"open_failed","message":"open failed: run resolution failed: the send left runner parameters to the session's frozen values, but the session has no episode to take them from; name `model`"}"#;
+    // An interrupt names no model on a session with no episode, so the one thing missing is
+    // the model; the message says exactly that.
+    let legacy = r#"{"code":"open_failed","message":"open failed: run resolution failed: model is required: the session has no episode to inherit it from"}"#;
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["detail"]["class"], "permanent");
     let mut without_detail = value;
