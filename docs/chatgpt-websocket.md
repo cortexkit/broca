@@ -104,8 +104,12 @@ No message, payload, header, token, or raw identifier is included.
 
 Raw Text observations before normalization count sequence numbers, their range,
 and numbers at or below the previous high-water mark (repeats or backwards
-movement). They also count distinct response/item IDs, maximum output index, and
-argument delta count, UTF-8 bytes, whitespace-only deltas and distinct deltas.
+movement). They also count distinct response/item IDs and record the maximum
+output index, argument-delta count, total decoded UTF-8 delta bytes, counts of
+nonempty whitespace-only and empty deltas (`empty_deltas`), and distinct-delta
+count. A minimal borrowed envelope skips unrelated
+fields without building a JSON value tree; unescaped strings borrow the frame,
+while JSON-escaped strings are decoded before measuring bytes or hashing.
 Distinct counts use per-attempt randomized hashes capped at 4,096 entries each;
 an overflow flag means the count is a lower bound. Hashes themselves are not
 logged, and sets are freed at attempt end, including cancellation. Frame counts

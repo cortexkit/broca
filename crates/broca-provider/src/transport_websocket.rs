@@ -7,6 +7,7 @@
 
 use super::*;
 use futures::SinkExt;
+use std::borrow::Cow;
 use std::collections::{hash_map::RandomState, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{atomic::AtomicU16, Mutex, RwLock};
@@ -79,6 +80,44 @@ impl FrameCounts {
     }
 }
 
+// A newtype lets Serde's borrowing support reach strings inside Option. Plain
+// Option<Cow<str>> would allocate even for strings without JSON escapes.
+#[derive(serde::Deserialize)]
+struct ObservationString<'a>(#[serde(borrow)] Cow<'a, str>);
+
+#[derive(serde::Deserialize)]
+struct ObservationId<'a> {
+    #[serde(borrow)]
+    id: Option<ObservationString<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ObservationError<'a> {
+    #[serde(borrow)]
+    code: Option<ObservationString<'a>>,
+}
+
+// Unknown fields are skipped instead of constructing another copy of model output.
+#[derive(serde::Deserialize)]
+struct ObservationEvent<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<ObservationString<'a>>,
+    sequence_number: Option<u64>,
+    #[serde(borrow)]
+    response_id: Option<ObservationString<'a>>,
+    #[serde(borrow)]
+    item_id: Option<ObservationString<'a>>,
+    output_index: Option<u64>,
+    #[serde(borrow)]
+    delta: Option<ObservationString<'a>>,
+    #[serde(borrow)]
+    response: Option<ObservationId<'a>>,
+    #[serde(borrow)]
+    item: Option<ObservationId<'a>>,
+    #[serde(borrow)]
+    error: Option<ObservationError<'a>>,
+}
+
 #[derive(Default)]
 pub(super) struct AttemptObservation {
     frames: Option<(Arc<FrameCounts>, [u64; 7])>,
@@ -97,16 +136,17 @@ pub(super) struct AttemptObservation {
     argument_deltas: u64,
     argument_delta_bytes: u64,
     whitespace_deltas: u64,
+    empty_deltas: u64,
     delta_hashes: DistinctHashes,
     wrapped_error_code: Option<&'static str>,
 }
 
 impl AttemptObservation {
     pub(super) fn observe_text(&mut self, raw: &[u8]) {
-        let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+        let Ok(event) = serde_json::from_slice::<ObservationEvent<'_>>(raw) else {
             return;
         };
-        if let Some(sequence) = value.get("sequence_number").and_then(Value::as_u64) {
+        if let Some(sequence) = event.sequence_number {
             self.sequence_count += 1;
             // Compare with the high-water mark, so replaying an older range is counted
             // throughout the replay, not just at its first backwards jump.
@@ -116,40 +156,57 @@ impl AttemptObservation {
             self.sequence_min = Some(self.sequence_min.map_or(sequence, |min| min.min(sequence)));
             self.sequence_max = Some(self.sequence_max.map_or(sequence, |max| max.max(sequence)));
         }
-        for id in [value.get("response_id"), value.pointer("/response/id")]
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+        for id in [
+            event.response_id.as_ref(),
+            event
+                .response
+                .as_ref()
+                .and_then(|response| response.id.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
         {
-            self.response_ids.observe(id);
+            self.response_ids.observe(&id.0);
         }
-        for id in [value.get("item_id"), value.pointer("/item/id")]
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+        for id in [
+            event.item_id.as_ref(),
+            event.item.as_ref().and_then(|item| item.id.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
         {
-            self.item_ids.observe(id);
+            self.item_ids.observe(&id.0);
         }
-        if let Some(index) = value.get("output_index").and_then(Value::as_u64) {
+        if let Some(index) = event.output_index {
             self.output_index_max = Some(self.output_index_max.map_or(index, |max| max.max(index)));
         }
-        match value.get("type").and_then(Value::as_str) {
+        match event.kind.as_ref().map(|kind| kind.0.as_ref()) {
             Some("response.function_call_arguments.delta") => {
-                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                if let Some(ObservationString(delta)) = event.delta {
                     self.argument_deltas += 1;
                     self.argument_delta_bytes += delta.len() as u64;
-                    self.whitespace_deltas += u64::from(delta.chars().all(char::is_whitespace));
-                    self.delta_hashes.observe(delta);
+                    if delta.is_empty() {
+                        self.empty_deltas += 1;
+                    } else {
+                        self.whitespace_deltas += u64::from(delta.chars().all(char::is_whitespace));
+                    }
+                    self.delta_hashes.observe(&delta);
                 }
             }
             Some("error") => {
-                self.wrapped_error_code =
-                    Some(match value.pointer("/error/code").and_then(Value::as_str) {
+                self.wrapped_error_code = Some(
+                    match event
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.code.as_ref())
+                        .map(|code| code.0.as_ref())
+                    {
                         Some("websocket_connection_limit_reached") => {
                             "websocket_connection_limit_reached"
                         }
                         _ => "other",
-                    });
+                    },
+                );
             }
             _ => {}
         }
@@ -197,7 +254,7 @@ impl Drop for ObservationGuard {
                     distinct_response_ids = stats.response_ids.hashes.len(), response_ids_overflow = stats.response_ids.overflow,
                     distinct_item_ids = stats.item_ids.hashes.len(), item_ids_overflow = stats.item_ids.overflow,
                     output_index_max = stats.output_index_max, argument_deltas = stats.argument_deltas,
-                    argument_delta_bytes = stats.argument_delta_bytes, whitespace_deltas = stats.whitespace_deltas,
+                    argument_delta_bytes = stats.argument_delta_bytes, whitespace_deltas = stats.whitespace_deltas, empty_deltas = stats.empty_deltas,
                     distinct_deltas = stats.delta_hashes.hashes.len(), distinct_deltas_overflow = stats.delta_hashes.overflow,
                     "Responses websocket attempt summary"
                 );
@@ -556,10 +613,10 @@ where
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         frames.pings_received.fetch_add(1, Ordering::Relaxed);
-                        if stream.send(Message::Pong(payload)).await.is_err() {
-                            break;
+                        match stream.send(Message::Pong(payload)).await {
+                            Ok(()) => { frames.pongs_sent.fetch_add(1, Ordering::Relaxed); }
+                            Err(_) => break,
                         }
-                        frames.pongs_sent.fetch_add(1, Ordering::Relaxed);
                         Ok(Vec::new())
                     }
                     Some(Ok(Message::Pong(_))) => {
@@ -1019,6 +1076,97 @@ mod pump_tests {
     use crate::wire::HttpMethod;
 
     #[test]
+    fn observation_borrows_unescaped_strings_and_skips_unneeded_output() {
+        let raw = br#"{"type":"response.function_call_arguments.delta","sequence_number":7,"response_id":"r1","item_id":"i1","output_index":2,"delta":"plain fragment","response":{"id":"r1","output":[{"content":[{"text":"ignored"}]}]},"item":{"id":"i1","arguments":"ignored"},"error":{"code":"ignored","message":"ignored"},"unknown":{"nested":[1,true,null]}}"#;
+        let event: ObservationEvent<'_> = serde_json::from_slice(raw).unwrap();
+        for text in [
+            event.kind,
+            event.response_id,
+            event.item_id,
+            event.delta,
+            event.response.unwrap().id,
+            event.item.unwrap().id,
+            event.error.unwrap().code,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                matches!(text.0, Cow::Borrowed(_)),
+                "unescaped fields must borrow the input"
+            );
+        }
+        let mut observation = AttemptObservation::default();
+        observation.observe_text(raw);
+        assert_eq!(observation.argument_deltas, 1);
+        assert_eq!(observation.argument_delta_bytes, 14);
+        assert_eq!(observation.sequence_min, Some(7));
+        assert_eq!(observation.output_index_max, Some(2));
+        assert_eq!(observation.response_ids.hashes.len(), 1);
+        assert_eq!(observation.item_ids.hashes.len(), 1);
+    }
+
+    #[test]
+    fn observation_decodes_escaped_strings_before_counting_and_hashing() {
+        let raw = br#"{"type":"response.function_call_arguments.delta","delta":"\"caf\u00e9\"\n","response_id":"r\u0031","item_id":"i\u0031"}"#;
+        let event: ObservationEvent<'_> = serde_json::from_slice(raw).unwrap();
+        assert!(matches!(event.delta.unwrap().0, Cow::Owned(_)));
+        let mut observation = AttemptObservation::default();
+        observation.observe_text(raw);
+        observation.observe_text("{\"type\":\"response.function_call_arguments.delta\",\"delta\":\"\\\"café\\\"\\n\",\"response\":{\"id\":\"r1\"},\"item\":{\"id\":\"i1\"}}".as_bytes());
+        assert_eq!(observation.argument_deltas, 2);
+        assert_eq!(observation.argument_delta_bytes, 16);
+        assert_eq!(observation.delta_hashes.hashes.len(), 1);
+        assert_eq!(observation.response_ids.hashes.len(), 1);
+        assert_eq!(observation.item_ids.hashes.len(), 1);
+        observation.observe_text(br#"{"type":"error","error":{"code":"\u0077ebsocket_connection_limit_reached","message":"ignored"}}"#);
+        assert_eq!(
+            observation.wrapped_error_code,
+            Some("websocket_connection_limit_reached")
+        );
+    }
+
+    #[test]
+    #[ignore = "manual optimized-build CPU timing benchmark"]
+    fn observation_timing_production_shaped_stream() {
+        const EVENTS: usize = 20_000;
+        const ROUNDS: usize = 100;
+        let records: Vec<_> = (0..EVENTS)
+            .map(|index| {
+                serde_json::to_vec(&serde_json::json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":index, "response_id":"resp_0123456789",
+                    "item_id":"fc_0123456789", "output_index":0,
+                    "delta":format!("const value_{index} = await lookup(\"key_{index}\");\n"),
+                }))
+                .unwrap()
+            })
+            .collect();
+        let bytes: usize = records.iter().map(Vec::len).sum();
+        for _ in 0..5 {
+            let mut observation = AttemptObservation::default();
+            for record in &records {
+                observation.observe_text(std::hint::black_box(record));
+            }
+            std::hint::black_box(observation);
+        }
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            let mut observation = AttemptObservation::default();
+            for record in &records {
+                observation.observe_text(std::hint::black_box(record));
+            }
+            assert_eq!(observation.argument_deltas, EVENTS as u64);
+            assert_eq!(observation.sequence_repeated_or_backwards, 0);
+            std::hint::black_box(observation);
+        }
+        let elapsed = started.elapsed();
+        println!("observation timing: events={EVENTS} warmup_rounds=5 measured_rounds={ROUNDS} mean_event_bytes={} total_events={} elapsed_ns={} ns_per_event={:.1}",
+            bytes / EVENTS, EVENTS * ROUNDS, elapsed.as_nanos(),
+            elapsed.as_nanos() as f64 / (EVENTS * ROUNDS) as f64);
+    }
+
+    #[test]
     fn fingerprint_memory_is_capped_and_ordered_sequences_are_not_replays() {
         let mut stats = AttemptObservation::default();
         for sequence in 0..(DISTINCT_LIMIT + 10) {
@@ -1113,6 +1261,62 @@ mod pump_tests {
             "cancel must interrupt the write, not wait for the peer to read"
         );
         assert!(closed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_interrupts_a_blocked_pong_without_counting_it_as_sent() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (io, peer) = tokio::io::duplex(8);
+            let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                io,
+                tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            let mut server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                peer,
+                tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            let (_send, commands) = mpsc::channel(1);
+            let (messages, _records) = mpsc::channel(8);
+            let shutdown = CancellationToken::new();
+            let frames = Arc::new(FrameCounts::default());
+            let (_active, activity) = tokio::sync::watch::channel(true);
+            let task = spawn_pump(
+                stream,
+                commands,
+                messages,
+                shutdown.clone(),
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicU16::new(0)),
+                    Arc::clone(&frames),
+                ),
+                activity,
+            );
+            server
+                .send(Message::Ping(vec![1; 125].into()))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(frames.pings_received.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                frames.pongs_sent.load(Ordering::Relaxed),
+                0,
+                "the unread eight-byte peer keeps the Pong send pending"
+            );
+            shutdown.cancel();
+            task.await.unwrap();
+            assert_eq!(
+                frames.pongs_sent.load(Ordering::Relaxed),
+                0,
+                "cancelling a pending Pong is not a successful send"
+            );
+        })
+        .await
+        .expect("the blocked-Pong fixture must terminate");
     }
 
     #[tokio::test]

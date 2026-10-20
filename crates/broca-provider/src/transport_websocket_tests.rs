@@ -368,6 +368,7 @@ async fn delta_fingerprint(distinct: bool) -> broca_test_support::LogEvent {
         ("text_received", "17"),
         ("argument_deltas", "15"),
         ("whitespace_deltas", "1"),
+        ("empty_deltas", "0"),
         ("distinct_response_ids", "1"),
         ("distinct_item_ids", "1"),
         ("output_index_max", "3"),
@@ -403,6 +404,21 @@ async fn websocket_summary_repeated_deltas_have_few_hashes() {
 async fn websocket_summary_distinct_deltas_have_many_hashes() {
     let summary = delta_fingerprint(true).await;
     assert_eq!(summary.fields["distinct_deltas"], "15");
+}
+
+#[tokio::test]
+async fn websocket_summary_separates_empty_and_whitespace_deltas() {
+    let mut events = tool_events();
+    for delta in ["", " \n"] {
+        events.insert(2, serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":delta}));
+    }
+    let mock = Mock::start(vec![events], false, false).await;
+    let summary = observed_socket_attempt(&mock).await;
+    assert_eq!(summary.fields["argument_deltas"], "3");
+    assert_eq!(summary.fields["argument_delta_bytes"], "9");
+    assert_eq!(summary.fields["whitespace_deltas"], "1");
+    assert_eq!(summary.fields["empty_deltas"], "1");
+    assert_eq!(summary.fields["distinct_deltas"], "3");
 }
 
 #[tokio::test]
