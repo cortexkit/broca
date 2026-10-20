@@ -2677,6 +2677,232 @@ async fn content_free_withdrawal_retries_routes_but_settles_ended_scopes_and_unk
     }
 }
 
+fn retained_rig_with_replies(
+    replies: impl IntoIterator<Item = broca_core::tool_plane::ApprovalWithdrawal>,
+) -> (Rig, Arc<RetainedQuestions>) {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    // The question never expires, so only the worker's own retry window can end retries.
+    seed_owed_question_at(&rig, now, u64::MAX, Some("question"));
+    {
+        let _lease = rig.service.lease(&rig.key).unwrap();
+        rig.service.delete_expired(&rig.key, now + 2000).unwrap();
+    }
+    assert_eq!(rig.store.pending_retention_withdrawals().unwrap().len(), 1);
+    let questions = Arc::new(RetainedQuestions::default());
+    questions.replies.lock().unwrap().extend(replies);
+    rig.service.set_withdrawal_adapter(Arc::new(
+        crate::retention_withdrawals::ScopedRetentionWithdrawalAdapter(questions.clone()),
+    ));
+    (rig, questions)
+}
+
+#[tokio::test]
+async fn content_free_structured_route_refusal_settles_on_the_first_attempt() {
+    use broca_core::tool_plane::{ApprovalRouteError, ApprovalWithdrawal};
+    for reply in [
+        ApprovalWithdrawal::Retry(ApprovalRouteError {
+            code: "module_rejected".into(),
+            retryable: false,
+        }),
+        ApprovalWithdrawal::NotSent {
+            reason: "unknown_module".into(),
+        },
+    ] {
+        let (rig, questions) = retained_rig_with_replies([reply]);
+        let (result, logs) =
+            broca_test_support::capture_logs(rig.service.withdraw_retained_questions()).await;
+        assert!(result.unwrap());
+        assert_eq!(questions.withdrawals.lock().unwrap().len(), 1);
+        assert!(rig
+            .store
+            .pending_retention_withdrawals()
+            .unwrap()
+            .is_empty());
+        let events: Vec<_> = logs
+            .iter()
+            .filter(|event| event.target == "retention" && event.fields.contains_key("call_key"))
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert!(events[0].fields.contains_key("code"));
+        assert!(events[1].message().contains("settled after refusals"));
+    }
+}
+
+/// The plane's retryable flag decides, as in the per-session worker: a code that would
+/// settle when final is retried while the plane marks it retryable.
+#[tokio::test]
+async fn content_free_retryable_reply_is_retried_whatever_its_code() {
+    use broca_core::tool_plane::{ApprovalRouteError, ApprovalWithdrawal};
+    let (rig, questions) =
+        retained_rig_with_replies([ApprovalWithdrawal::Retry(ApprovalRouteError {
+            code: "elicitation_not_found".into(),
+            retryable: true,
+        })]);
+    assert!(!rig.service.withdraw_retained_questions().await.unwrap());
+    assert_eq!(rig.store.pending_retention_withdrawals().unwrap().len(), 1);
+    assert!(rig.service.withdraw_retained_questions().await.unwrap());
+    assert_eq!(questions.withdrawals.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn content_free_retryable_refusal_without_expiry_gives_up_at_the_retry_window() {
+    use broca_core::tool_plane::{ApprovalRouteError, ApprovalWithdrawal};
+    let warming = || {
+        ApprovalWithdrawal::Retry(ApprovalRouteError {
+            code: "module_warming".into(),
+            retryable: true,
+        })
+    };
+    let (rig, questions) = retained_rig_with_replies([warming(), warming(), warming()]);
+    let question = rig
+        .store
+        .pending_retention_withdrawals()
+        .unwrap()
+        .pop()
+        .unwrap();
+    tokio::time::pause();
+    let window = crate::approval::WITHDRAWAL_RETRY_WINDOW;
+    let mut refusals = crate::approval::RefusalWindows::default();
+    let ((), logs) = broca_test_support::capture_logs(async {
+        let service = &rig.service;
+        assert!(!service
+            .withdraw_retained_questions_with(&mut refusals)
+            .await
+            .unwrap());
+        tokio::time::advance(window - std::time::Duration::from_secs(1)).await;
+        assert!(!service
+            .withdraw_retained_questions_with(&mut refusals)
+            .await
+            .unwrap());
+        assert_eq!(rig.store.pending_retention_withdrawals().unwrap().len(), 1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(service
+            .withdraw_retained_questions_with(&mut refusals)
+            .await
+            .unwrap());
+    })
+    .await;
+    assert!(rig
+        .store
+        .pending_retention_withdrawals()
+        .unwrap()
+        .is_empty());
+    let reopened = SqliteStore::open(rig.root.join("run-index.db")).unwrap();
+    assert_eq!(
+        reopened
+            .retention_withdrawal_stop_reason(&question.lineage_id, &question.call_key)
+            .unwrap()
+            .as_deref(),
+        Some(crate::approval::WITHDRAWAL_RETRY_EXHAUSTED),
+        "giving up must leave a durable reason after the pending row is removed"
+    );
+    assert_eq!(
+        questions.withdrawals.lock().unwrap().len(),
+        2,
+        "the pass after the window gives up without another attempt"
+    );
+    let events: Vec<_> = logs
+        .iter()
+        .filter(|event| event.target == "retention" && event.fields.contains_key("call_key"))
+        .collect();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(events[0].message().contains("refused"), "{events:?}");
+    assert_eq!(events[0].fields["code"], "module_warming");
+    assert!(events[1].message().contains("given up"), "{events:?}");
+    assert_eq!(
+        events[1].fields["reason"],
+        crate::approval::WITHDRAWAL_RETRY_EXHAUSTED
+    );
+}
+
+/// A retention index whose content-free withdrawal table can never be read.
+struct WithdrawalStoreDown {
+    store: Arc<SqliteStore>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+impl RetentionIndex for WithdrawalStoreDown {
+    fn live(&self, session: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+        RetentionIndex::live(self.store.as_ref(), session)
+    }
+    fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+        RetentionIndex::lineage(self.store.as_ref(), id)
+    }
+    fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String> {
+        RetentionIndex::candidates(self.store.as_ref(), now_ms)
+    }
+    fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+        RetentionIndex::run(self.store.as_ref(), id)
+    }
+    fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String> {
+        RetentionIndex::upsert(self.store.as_ref(), row, runs)
+    }
+    fn pending_withdrawals(
+        &self,
+    ) -> Result<Vec<broca_store::retention_withdrawals::RetentionWithdrawal>, String> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Err("injected withdrawal table failure".into())
+    }
+}
+
+/// A store failure that outlasts the retry window stops the content-free worker with one
+/// ERROR, after one WARN at the first failure. The worker parks rather than returning,
+/// because the retention task ends when the worker does.
+#[tokio::test(start_paused = true)]
+async fn content_free_store_failure_stops_the_worker_with_one_warning_and_one_error() {
+    let (rig, _) = retained_rig_with_replies([]);
+    let index = Arc::new(WithdrawalStoreDown {
+        store: rig.store.clone(),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
+    let service = Arc::new(
+        RetentionService::new(
+            Arc::new(FileWalStore::new(rig.root.join("store-down-wal"))),
+            index.clone(),
+            rig.leases.clone(),
+            rig.store.clone(),
+            resolver,
+        )
+        .unwrap(),
+    );
+    let capture = broca_test_support::LogCapture::new();
+    let worker = tokio::spawn(capture.scope_future({
+        let service = service.clone();
+        async move { service.run_withdrawal_worker().await }
+    }));
+    let window = crate::approval::WITHDRAWAL_RETRY_WINDOW;
+    tokio::time::sleep(window + std::time::Duration::from_secs(10)).await;
+    let reads = index.reads.load(Ordering::SeqCst);
+    assert!(reads > 1, "the worker never retried");
+    tokio::time::sleep(window).await;
+    assert_eq!(
+        index.reads.load(Ordering::SeqCst),
+        reads,
+        "the worker kept reading after it gave up"
+    );
+    assert!(
+        !worker.is_finished(),
+        "the worker returned and would end retention"
+    );
+    worker.abort();
+    let _ = worker.await;
+    let levels: Vec<_> = capture
+        .events()
+        .iter()
+        .filter(|event| event.target == "retention")
+        .map(|event| event.level)
+        .collect();
+    assert_eq!(levels, [tracing::Level::WARN, tracing::Level::ERROR]);
+    let reopened = SqliteStore::open(rig.root.join("run-index.db")).unwrap();
+    assert_eq!(
+        reopened.pending_retention_withdrawals().unwrap().len(),
+        1,
+        "storage failure must not settle durable debt"
+    );
+}
+
 #[cfg(feature = "test-clock")]
 #[tokio::test(start_paused = true)]
 async fn actor_expiry_hands_owed_withdrawals_to_content_free_worker_before_releasing_lease() {

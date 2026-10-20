@@ -2778,7 +2778,7 @@ fn reverse_request_refusal(request: &Frame) -> Result<Frame, subc_protocol::Fram
     )
 }
 
-fn decode_error_body(body: &[u8]) -> RejectedMessage {
+pub(crate) fn decode_error_body(body: &[u8]) -> RejectedMessage {
     match serde_json::from_slice::<subc_protocol::ErrorBody>(body) {
         Ok(error) => RejectedMessage::structured(error.code, error.message),
         Err(_) => String::from_utf8_lossy(body).into_owned().into(),

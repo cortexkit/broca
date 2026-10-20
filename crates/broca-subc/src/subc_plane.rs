@@ -2657,6 +2657,8 @@ mod tests {
     #[derive(Clone)]
     enum ScriptedRouteOpenError {
         Rejected(String),
+        /// A daemon Error frame body, decoded the way a live route open decodes it.
+        RejectedBody(Vec<u8>),
         Transport(String),
     }
 
@@ -2664,6 +2666,15 @@ mod tests {
         fn rejected(message: impl Into<String>) -> Self {
             Self {
                 error: Some(ScriptedRouteOpenError::Rejected(message.into())),
+                ..Self::default()
+            }
+        }
+
+        fn rejected_body(body: &subc_protocol::ErrorBody) -> Self {
+            Self {
+                error: Some(ScriptedRouteOpenError::RejectedBody(
+                    serde_json::to_vec(body).unwrap(),
+                )),
                 ..Self::default()
             }
         }
@@ -2845,6 +2856,9 @@ mod tests {
                 return Err(match error {
                     ScriptedRouteOpenError::Rejected(message) => {
                         ConnError::Rejected(message.into())
+                    }
+                    ScriptedRouteOpenError::RejectedBody(body) => {
+                        ConnError::Rejected(crate::connection::decode_error_body(&body))
                     }
                     ScriptedRouteOpenError::Transport(message) => ConnError::Transport(message),
                 });
@@ -3501,6 +3515,68 @@ mod tests {
         assert!(matches!(result, Err(ToolPlaneError::Unavailable(_))));
         assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// The daemon passes a module's refusal through as a structured error body. The warmer
+    /// must stop on its code at once, as it does for the legacy text form above, rather than
+    /// retrying until its own timeout.
+    #[tokio::test]
+    async fn warm_structured_module_refusal_stops_after_one_attempt() {
+        let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
+        let body = subc_protocol::ErrorBody::new("module_rejected", "module refused the route")
+            .with_detail(serde_json::json!({
+                "module_code": "project_origin_unclassifiable",
+                "module_id": "aft",
+            }));
+        conn.script_route_open_sequence("aft", vec![RouteOpenScript::rejected_body(&body)]);
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        plane.windows.lock().unwrap().insert("aft".into(), 1);
+        let bind = BindIdentity::new("/tmp/warm-structured-terminal", "test", "session");
+        let started = Instant::now();
+
+        let result = plane
+            .warm_bind_for_lifecycle(
+                &bind,
+                None,
+                Duration::from_millis(500),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(ToolPlaneError::Unavailable(_))));
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// Companion to the structured stop: a retryable code in the same body form is retried.
+    /// If the body were not decoded, the whole JSON text would be read as the code, and that
+    /// unknown code would stop the warmer after one attempt.
+    #[tokio::test]
+    async fn warm_structured_retryable_refusal_is_retried() {
+        let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
+        let body = subc_protocol::ErrorBody::new("module_warming", "module is starting");
+        conn.script_route_open_sequence(
+            "aft",
+            vec![
+                RouteOpenScript::rejected_body(&body),
+                RouteOpenScript::default(),
+            ],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        plane.windows.lock().unwrap().insert("aft".into(), 1);
+        let bind = BindIdentity::new("/tmp/warm-structured-retry", "test", "session");
+
+        let result = plane
+            .warm_bind_for_lifecycle(
+                &bind,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

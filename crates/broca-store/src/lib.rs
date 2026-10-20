@@ -909,6 +909,12 @@ impl SqliteStore {
                   state TEXT NOT NULL CHECK(state IN ('ready','id_unknown','scope_unknown')),
                   PRIMARY KEY(lineage_id, call_key)
               );
+              CREATE TABLE IF NOT EXISTS retention_withdrawal_stop (
+                  lineage_id TEXT NOT NULL,
+                  call_key TEXT NOT NULL,
+                  reason TEXT NOT NULL CHECK(reason = 'withdrawal_retry_exhausted'),
+                  PRIMARY KEY(lineage_id, call_key)
+              );
                CREATE TABLE IF NOT EXISTS retention_deletion (
                    lineage_id TEXT PRIMARY KEY,
                    session TEXT NOT NULL

@@ -1023,7 +1023,10 @@ pub enum WalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         elicitation_id: Option<String>,
         answer: WithdrawalAnswer,
-        /// Why nothing was withdrawn, with `not_sent`: the reply code, or `expired`.
+        /// With `not_sent`, why nothing was withdrawn: the reply code, `expired`, or
+        /// `withdrawal_retry_exhausted` when broca stopped retrying. With `acknowledged`,
+        /// absent when the withdrawal was confirmed, or the code saying the card was already
+        /// settled or not ours (`elicitation_not_found`, `elicitation_not_owner`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },

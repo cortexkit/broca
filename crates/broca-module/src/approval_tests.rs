@@ -20,6 +20,7 @@ struct Questions {
     await_refusal: tokio::sync::Notify,
     await_refused: std::sync::atomic::AtomicBool,
     requests: Mutex<Vec<String>>,
+    request_errors: Mutex<std::collections::VecDeque<ApprovalRouteError>>,
     withdrawals: Mutex<Vec<String>>,
     replies: Mutex<std::collections::VecDeque<ApprovalWithdrawal>>,
 }
@@ -41,6 +42,9 @@ impl ElicitationPlane for Questions {
         assert_eq!(ctx.scope.as_ref(), Some(scope));
         assert_eq!(ctx.run_id.0, "r");
         self.requests.lock().unwrap().push(key.into());
+        if let Some(error) = self.request_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         Ok(ApprovalFiling {
             elicitation_id: "recovered-id".into(),
             args_hash: args_hash.clone(),
@@ -1283,8 +1287,10 @@ async fn reader_unmarked_running_prepared_calls_close_regardless_of_restart_poli
     }
 }
 
+/// Cingulate's permanent refusals are final: there is no list of final codes in broca, so a
+/// refusal the plane did not mark retryable settles the debt at once with its code.
 #[tokio::test]
-async fn invalid_request_and_requester_refusal_retain_question_debt() {
+async fn invalid_request_and_requester_refusal_settle_question_debt() {
     for reason in [
         "elicitation_invalid_request",
         "elicitation_requester_refused",
@@ -1312,10 +1318,14 @@ async fn invalid_request_and_requester_refusal_retain_question_debt() {
         .await
         .unwrap();
         let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
-        assert!(!empty, "{reason} is not a withdrawal stop class");
-        assert!(!rig.frames().iter().any(|frame| matches!(
-            frame.record,
-            WalRecord::QuestionWithdrawalAcknowledged { .. }
+        assert!(empty, "{reason} is a permanent refusal and must settle");
+        assert!(rig.frames().iter().any(|frame| matches!(
+            &frame.record,
+            WalRecord::QuestionWithdrawalAcknowledged {
+                answer: broca_wal::WithdrawalAnswer::NotSent,
+                reason: Some(recorded),
+                ..
+            } if recorded == reason
         )));
     }
 }
@@ -2318,5 +2328,499 @@ fn approval_cache_tool_update_work_is_independent_of_prior_runs() {
         cache.retained_runs(),
         0,
         "finished run remained in active status cache"
+    );
+}
+
+fn withdrawal_acknowledgements(rig: &Rig) -> Vec<(broca_wal::WithdrawalAnswer, Option<String>)> {
+    rig.frames()
+        .into_iter()
+        .filter_map(|frame| match frame.record {
+            WalRecord::QuestionWithdrawalAcknowledged { answer, reason, .. } => {
+                Some((answer, reason))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn refusal_pass(
+    rig: &Rig,
+    writer: &Arc<WalHandle>,
+    refusals: &mut crate::approval::RefusalWindows<String>,
+) -> bool {
+    crate::approval::service_pass_with(
+        rig.wal.clone(),
+        rig.key.clone(),
+        writer.clone(),
+        None,
+        Arc::new(Mutex::new(())),
+        rig.executor.questions.as_ref().unwrap().as_ref(),
+        &broca_core::Clock::default(),
+        refusals,
+    )
+    .await
+    .unwrap()
+}
+
+fn approval_events(logs: &[broca_test_support::LogEvent]) -> Vec<broca_test_support::LogEvent> {
+    logs.iter()
+        .filter(|event| event.target == "approval")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn unfiled_question_final_refusal_stops_without_withdrawal() {
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    let questions = rig.executor.questions.as_ref().unwrap();
+    questions
+        .request_errors
+        .lock()
+        .unwrap()
+        .push_back(ApprovalRouteError {
+            code: "module_rejected".into(),
+            retryable: false,
+        });
+    assert!(
+        refusal_pass(
+            &rig,
+            &writer,
+            &mut crate::approval::RefusalWindows::default()
+        )
+        .await
+    );
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    assert_eq!(questions.requests.lock().unwrap().len(), 1);
+    assert!(questions.withdrawals.lock().unwrap().is_empty());
+    assert_eq!(
+        withdrawal_acknowledgements(&rig),
+        [(
+            broca_wal::WithdrawalAnswer::NotSent,
+            Some("module_rejected".into())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn unfiled_question_retryable_refusal_gives_up_at_window() {
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    let questions = rig.executor.questions.as_ref().unwrap();
+    for _ in 0..3 {
+        questions
+            .request_errors
+            .lock()
+            .unwrap()
+            .push_back(ApprovalRouteError {
+                code: "module_warming".into(),
+                retryable: true,
+            });
+    }
+    tokio::time::pause();
+    let mut refusals = crate::approval::RefusalWindows::default();
+    assert!(!refusal_pass(&rig, &writer, &mut refusals).await);
+    tokio::time::advance(crate::approval::WITHDRAWAL_RETRY_WINDOW).await;
+    assert!(refusal_pass(&rig, &writer, &mut refusals).await);
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    assert_eq!(questions.requests.lock().unwrap().len(), 1);
+    assert!(questions.withdrawals.lock().unwrap().is_empty());
+    assert_eq!(
+        withdrawal_acknowledgements(&rig),
+        [(
+            broca_wal::WithdrawalAnswer::NotSent,
+            Some(crate::approval::WITHDRAWAL_RETRY_EXHAUSTED.into())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn structured_route_refusal_settles_on_the_first_attempt() {
+    for reply in [
+        ApprovalWithdrawal::Retry(ApprovalRouteError {
+            code: "module_rejected".into(),
+            retryable: false,
+        }),
+        ApprovalWithdrawal::NotSent {
+            reason: "unknown_module".into(),
+        },
+    ] {
+        let code = match &reply {
+            ApprovalWithdrawal::Retry(error) => error.code.clone(),
+            ApprovalWithdrawal::NotSent { reason } => reason.clone(),
+            ApprovalWithdrawal::Acknowledged => unreachable!(),
+        };
+        let rig = Rig::new(true);
+        rig.seed(true, false, false, true);
+        let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+        let questions = rig.executor.questions.as_ref().unwrap();
+        questions.replies.lock().unwrap().push_back(reply);
+        let (empty, logs) = broca_test_support::capture_logs(refusal_pass(
+            &rig,
+            &writer,
+            &mut crate::approval::RefusalWindows::default(),
+        ))
+        .await;
+        let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+        assert!(empty, "{code} is permanent and must not be retried");
+        assert_eq!(questions.withdrawals.lock().unwrap().len(), 1, "{code}");
+        assert_eq!(
+            withdrawal_acknowledgements(&rig),
+            [(broca_wal::WithdrawalAnswer::NotSent, Some(code.clone()))]
+        );
+        let events = approval_events(&logs);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(events[0].fields["code"], code);
+        assert_eq!(events[0].fields["session"], "session");
+        assert!(events[0].fields.contains_key("call_key"));
+        assert!(events[1].message().contains("settled after refusals"));
+    }
+}
+
+/// Cingulate answers `elicitation_not_found` or `elicitation_not_owner` when the card was
+/// already settled, pruned or never ours. Nothing is left to withdraw, so the debt settles
+/// as withdrawn rather than as a failed withdrawal.
+#[tokio::test]
+async fn a_card_that_is_already_gone_settles_as_withdrawn() {
+    for code in ["elicitation_not_found", "elicitation_not_owner"] {
+        for structured in [false, true] {
+            let rig = Rig::new(true);
+            rig.seed(true, false, false, true);
+            let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+            let questions = rig.executor.questions.as_ref().unwrap();
+            questions.replies.lock().unwrap().push_back(if structured {
+                ApprovalWithdrawal::Retry(ApprovalRouteError {
+                    code: code.into(),
+                    retryable: false,
+                })
+            } else {
+                ApprovalWithdrawal::NotSent {
+                    reason: code.into(),
+                }
+            });
+            let empty = refusal_pass(
+                &rig,
+                &writer,
+                &mut crate::approval::RefusalWindows::default(),
+            )
+            .await;
+            let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+            assert!(empty, "{code}");
+            assert_eq!(
+                withdrawal_acknowledgements(&rig),
+                [(
+                    broca_wal::WithdrawalAnswer::Acknowledged,
+                    Some(code.to_owned())
+                )],
+                "{code} structured={structured}"
+            );
+        }
+    }
+}
+
+/// The question never expires (`u64::MAX`), so only broca's own retry window can end the
+/// retries. The window is measured on Tokio's clock, which this test pauses and advances.
+#[tokio::test]
+async fn retryable_refusal_without_expiry_gives_up_at_the_retry_window_and_logs_twice() {
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    let questions = rig.executor.questions.as_ref().unwrap();
+    questions.retrying.store(true, Ordering::Release);
+    tokio::time::pause();
+    let mut refusals = crate::approval::RefusalWindows::default();
+    let window = crate::approval::WITHDRAWAL_RETRY_WINDOW;
+    let ((), logs) = broca_test_support::capture_logs(async {
+        assert!(!refusal_pass(&rig, &writer, &mut refusals).await);
+        tokio::time::advance(window - Duration::from_secs(1)).await;
+        assert!(!refusal_pass(&rig, &writer, &mut refusals).await);
+        assert!(
+            withdrawal_acknowledgements(&rig).is_empty(),
+            "gave up inside the retry window"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(refusal_pass(&rig, &writer, &mut refusals).await);
+    })
+    .await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    assert_eq!(
+        questions.withdrawals.lock().unwrap().len(),
+        2,
+        "the pass after the window gives up without another attempt"
+    );
+    assert_eq!(
+        withdrawal_acknowledgements(&rig),
+        [(
+            broca_wal::WithdrawalAnswer::NotSent,
+            Some(crate::approval::WITHDRAWAL_RETRY_EXHAUSTED.to_owned())
+        )]
+    );
+    let events = approval_events(&logs);
+    assert_eq!(
+        events.len(),
+        2,
+        "one line per refusal episode end: {events:?}"
+    );
+    assert_eq!(events[0].level, tracing::Level::WARN);
+    assert!(events[0].message().contains("refused"), "{events:?}");
+    assert_eq!(events[0].fields["code"], "elicitation_unavailable");
+    assert_eq!(events[0].fields["session"], "session");
+    assert_eq!(events[1].level, tracing::Level::WARN);
+    assert!(events[1].message().contains("given up"), "{events:?}");
+    assert_eq!(events[1].fields["refusals"], "2");
+}
+
+#[tokio::test]
+async fn refused_then_acknowledged_withdrawal_logs_one_settled_line() {
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    let questions = rig.executor.questions.as_ref().unwrap();
+    let warming = || {
+        ApprovalWithdrawal::Retry(ApprovalRouteError {
+            code: "module_warming".into(),
+            retryable: true,
+        })
+    };
+    questions.replies.lock().unwrap().extend([
+        warming(),
+        warming(),
+        ApprovalWithdrawal::Acknowledged,
+    ]);
+    let mut refusals = crate::approval::RefusalWindows::default();
+    let ((), logs) = broca_test_support::capture_logs(async {
+        assert!(!refusal_pass(&rig, &writer, &mut refusals).await);
+        assert!(!refusal_pass(&rig, &writer, &mut refusals).await);
+        assert!(refusal_pass(&rig, &writer, &mut refusals).await);
+    })
+    .await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    assert_eq!(
+        withdrawal_acknowledgements(&rig),
+        [(broca_wal::WithdrawalAnswer::Acknowledged, None)]
+    );
+    let events = approval_events(&logs);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].level, tracing::Level::WARN);
+    assert_eq!(events[0].fields["code"], "module_warming");
+    assert_eq!(events[1].level, tracing::Level::INFO);
+    assert!(events[1].message().contains("settled after refusals"));
+    assert_eq!(events[1].fields["refusals"], "2");
+}
+
+/// The actor closes an idle session only once `WithdrawalTask::pending` is false. A debt
+/// that is refused for the whole retry window must not hold that gate forever.
+#[tokio::test(start_paused = true)]
+async fn a_capped_out_withdrawal_lets_the_session_close() {
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    let questions = rig.executor.questions.as_ref().unwrap();
+    questions.retrying.store(true, Ordering::Release);
+    let task = crate::approval::WithdrawalTask::spawn(
+        rig.wal.clone(),
+        rig.key.clone(),
+        writer.clone(),
+        None,
+        Arc::new(Mutex::new(())),
+        questions.clone(),
+        broca_core::Clock::default(),
+    );
+    let started = tokio::time::Instant::now();
+    let window = crate::approval::WITHDRAWAL_RETRY_WINDOW;
+    // Paused time jumps ahead whenever the runtime waits on the WAL writer thread, so it
+    // cannot bound the wait from above. Real time guards against a worker that never stops.
+    let guard = std::time::Instant::now();
+    while task.pending(writer.durable_head().load(Ordering::Acquire)) {
+        assert!(
+            guard.elapsed() < broca_test_support::EVENT_HANG_GUARD,
+            "a refused withdrawal kept the session open"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let elapsed = started.elapsed();
+    task.stop().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    assert!(elapsed >= window, "gave up after only {elapsed:?}");
+    assert_eq!(
+        withdrawal_acknowledgements(&rig),
+        [(
+            broca_wal::WithdrawalAnswer::NotSent,
+            Some(crate::approval::WITHDRAWAL_RETRY_EXHAUSTED.to_owned())
+        )]
+    );
+}
+
+/// Every read of this WAL is incomplete, so a pass can never prove what is owed.
+struct IncompleteReads {
+    wal: Arc<FileWalStore>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_index_cleanup_failure_stops_without_clearing_durable_discovery() {
+    let mut rig = Rig::new(true);
+    rig.key.session = "persistent-cleanup-failure".into();
+    rig.seed_at(true, false, false, true, 1);
+    rig.store
+        .index_run_terminal("r", RunIndexState::Interrupted, None, None, 0)
+        .unwrap();
+    rig.store.index_run_withdrawals_owed("r", true).unwrap();
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wal = Arc::new(CountedWal {
+        count_when: None,
+        wal: rig.wal.clone(),
+        full_reads: reads.clone(),
+    });
+    let capture = broca_test_support::LogCapture::observe(|event| {
+        event.target == "approval"
+            && event
+                .fields
+                .get("session")
+                .is_some_and(|s| s == "persistent-cleanup-failure")
+    });
+    let task = crate::approval::WithdrawalTask::spawn(
+        wal,
+        rig.key.clone(),
+        writer.clone(),
+        Some(Arc::new(FailingLookup(rig.store.clone()))),
+        Arc::new(Mutex::new(())),
+        rig.executor.questions.as_ref().unwrap().clone(),
+        broca_core::Clock::default(),
+    );
+    let guard = std::time::Instant::now();
+    while task.pending(writer.durable_head().load(Ordering::Acquire)) {
+        assert!(
+            guard.elapsed() < broca_test_support::EVENT_HANG_GUARD,
+            "persistent cleanup kept the session open"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let stopped_reads = reads.load(Ordering::SeqCst);
+    assert!(stopped_reads > 2);
+    task.wake();
+    tokio::time::sleep(crate::approval::WITHDRAWAL_RETRY_WINDOW).await;
+    assert_eq!(reads.load(Ordering::SeqCst), stopped_reads);
+    assert!(
+        rig.row().withdrawals_owed,
+        "restart must still discover failed cleanup"
+    );
+    task.stop().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .map(|event| event.level)
+            .collect::<Vec<_>>(),
+        [tracing::Level::WARN, tracing::Level::ERROR]
+    );
+}
+impl WalStore for IncompleteReads {
+    fn open(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+        self.wal.open(key)
+    }
+    fn read_records(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.wal.read_records(key)
+    }
+    fn read_records_range(
+        &self,
+        _: &LineageKey,
+        _: u64,
+        _: Option<u64>,
+        _: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()))
+    }
+}
+
+/// A WAL that can never be read completely stops the worker after the retry window with
+/// one ERROR. The debt stays durable for the next process, and this session may close.
+#[tokio::test(start_paused = true)]
+async fn a_persistent_wal_failure_stops_the_worker_with_one_warning_and_one_error() {
+    const SESSION: &str = "persistent-wal-failure-session";
+    let rig = Rig::new(true);
+    let key = LineageKey::new(rig.root.join("project"), "runner", SESSION);
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&key).unwrap(), 1).unwrap());
+    writer.record(WalRecord::StepStarted { step_id: StepId(1) });
+    writer.sync().await.unwrap();
+    let wal = Arc::new(IncompleteReads {
+        wal: rig.wal.clone(),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let capture = broca_test_support::LogCapture::observe(|event| {
+        event.target == "approval" && event.fields.get("session").is_some_and(|s| s == SESSION)
+    });
+    let task = crate::approval::WithdrawalTask::spawn(
+        wal.clone(),
+        key.clone(),
+        writer.clone(),
+        None,
+        Arc::new(Mutex::new(())),
+        rig.executor.questions.as_ref().unwrap().clone(),
+        broca_core::Clock::default(),
+    );
+    let started = tokio::time::Instant::now();
+    let window = crate::approval::WITHDRAWAL_RETRY_WINDOW;
+    let head = || writer.durable_head().load(Ordering::Acquire);
+    // Real time bounds the wait; paused time can jump while the worker reads the WAL.
+    let guard = std::time::Instant::now();
+    while task.pending(head()) {
+        assert!(
+            guard.elapsed() < broca_test_support::EVENT_HANG_GUARD,
+            "a persistent WAL failure kept the worker retrying"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(started.elapsed() >= window);
+    let reads = wal.reads.load(Ordering::SeqCst);
+    assert!(reads > 1, "the worker never retried");
+    task.wake();
+    assert!(
+        !task.pending(head()),
+        "new debt reopened a worker that stopped for the process lifetime"
+    );
+    tokio::time::sleep(window).await;
+    assert_eq!(
+        wal.reads.load(Ordering::SeqCst),
+        reads,
+        "stopped worker kept reading"
+    );
+    task.stop().await;
+    let reopened = crate::approval::WithdrawalTask::spawn(
+        wal.clone(),
+        key,
+        writer.clone(),
+        None,
+        Arc::new(Mutex::new(())),
+        rig.executor.questions.as_ref().unwrap().clone(),
+        broca_core::Clock::default(),
+    );
+    reopened.wake();
+    assert!(
+        !reopened.pending(head()),
+        "reopening the actor reset the process-lifetime stop"
+    );
+    tokio::time::sleep(window).await;
+    assert_eq!(wal.reads.load(Ordering::SeqCst), reads);
+    reopened.stop().await;
+    let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+    let events = capture.events();
+    let levels: Vec<_> = events.iter().map(|event| event.level).collect();
+    assert_eq!(
+        levels,
+        [tracing::Level::WARN, tracing::Level::ERROR],
+        "{events:?}"
     );
 }
