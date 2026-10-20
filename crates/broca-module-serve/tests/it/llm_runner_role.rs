@@ -920,6 +920,7 @@ async fn run_status_falls_back_to_the_terminal_index_when_the_wal_is_absent() {
     );
     assert_eq!(status["state"], "completed");
     assert!(status.get("undelivered_steers").is_none());
+    assert!(status.get("directives").is_none());
     rig.finish().await;
 }
 

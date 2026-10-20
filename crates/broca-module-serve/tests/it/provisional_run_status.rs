@@ -143,6 +143,21 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
     .expect("the durable delivery is answered");
     assert_eq!(live["state"], "active", "{live}");
     assert_eq!(live["delivered"], step_receipt(&joined), "{live}");
+    let active_status = rig
+        .request(
+            7,
+            serde_json::json!({"method":"send.status", "params":{"send_id":"note"}}),
+        )
+        .await;
+    let active_resent = rig
+        .send_with("note", "also this", None, steer_or_idle_start())
+        .await;
+    assert_eq!(active_status.body, active_resent.body);
+    let active_reply = result(&active_status);
+    assert_eq!(active_reply["state"], "active");
+    assert_eq!(active_reply["run_id"], joined);
+    assert_eq!(active_reply["delivered"], step_receipt(&joined));
+    pin_resend(&active_status, "send_status.active_step.json", &joined);
 
     // Cancelling the send's run id cancels nothing: the send is part of another run now.
     assert_eq!(rig.cancel(&provisional).await, "not_active");
@@ -315,7 +330,7 @@ async fn an_ordered_send_that_starts_its_own_run_answers_that_run() {
     rig.finish().await;
 }
 
-/// Pins a re-send's reply bytes, taken after a restart from the real serve path, with
+/// Pins a re-send or send-status reply from the real serve path, with
 /// `@RUN_ID@` standing for the run the receipt names. `BROCA_UPDATE_GOLDEN` writes them.
 fn pin_resend(frame: &Frame, file: &str, run_id: &str) {
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {

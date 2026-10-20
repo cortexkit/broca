@@ -38,9 +38,8 @@ pub const READ_DEFAULT_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 /// The largest `session.read` byte cap broca honours; a larger request is capped to it.
 pub const READ_MAXIMUM_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 
-/// A send whose delivery mode the runner does not declare, with `detail.delivery` naming it.
-/// broca declares every mode the role defines (`queue`, `steer` and `interrupt`), so it never
-/// answers this code; it is listed so the code set matches the role's.
+/// A send whose delivery mode, or every mode in its ordered list, is undeclared.
+/// `detail.delivery` preserves the delivery value the caller sent.
 pub use cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED;
 /// A request member is malformed, unknown, or combined with one it excludes. `detail.field`
 /// names it.
@@ -713,6 +712,13 @@ mod pinned_reply_bytes {
                 // always names the run a delivered steer reached.
                 Some(_) => continue,
             };
+            if delivered.is_some() && role.run_id.is_none() {
+                assert!(
+                    serde_json::from_value::<crate::SendResult>(vector.clone()).is_err(),
+                    "broca declares run_ops and must name the delivered run: {name}"
+                );
+                continue;
+            }
             let result: crate::SendResult = serde_json::from_value(vector.clone())
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             let reply = SendReplyWire {

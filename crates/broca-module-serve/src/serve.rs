@@ -2263,6 +2263,17 @@ where
                 )
                 .await;
             }
+            let declared = broca_wire::broca_role_describe_with_writers(
+                env!("CARGO_PKG_VERSION"),
+                handler.compaction_supported(),
+                crate::RETENTION_WRITER_ENABLED,
+                handler.hook_plane_available(),
+            )
+            .role
+            .capabilities;
+            if let Some(refusal) = delivery_list_refusal(params.delivery.as_ref(), &declared) {
+                return send_error_body(writer, ver, channel, epoch, corr, refusal).await;
+            }
             if params
                 .cache
                 .as_ref()
@@ -3610,6 +3621,25 @@ async fn send_invalid_params(
         );
     }
     send_error_body(writer, ver, channel, epoch, corr, body).await
+}
+
+fn delivery_list_refusal<S: AsRef<str>>(
+    delivery: Option<&broca_wire::SendDelivery>,
+    declared: &[S],
+) -> Option<ErrorBody> {
+    let broca_wire::SendDelivery::Order(modes) = delivery? else {
+        return None;
+    };
+    if modes.iter().any(|mode| mode.is_declared(declared)) {
+        return None;
+    }
+    Some(
+        ErrorBody::new(
+            broca_wire::DELIVERY_UNSUPPORTED,
+            "none of the requested delivery modes are declared",
+        )
+        .with_detail(serde_json::json!({"delivery":modes})),
+    )
 }
 
 async fn send_error(
@@ -7058,5 +7088,50 @@ mod agent_data_refusal_vectors {
                 assert_eq!(decoded.code.is_known(), case["named"], "{}", case["name"]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_list_tests {
+    use super::*;
+
+    #[test]
+    fn undeclared_delivery_lists_match_published_refusal_vectors() {
+        let raw = cortexkit_role_llm_runner::vectors::FILES
+            .iter()
+            .find_map(|(name, raw)| (*name == "delivery-order.json").then_some(*raw))
+            .unwrap();
+        let vectors: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let cases = vectors["undeclared_mode_lists"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let params: SendParams = serde_json::from_value(case["request"].clone()).unwrap();
+            let declared: Vec<String> = serde_json::from_value(case["declares"].clone()).unwrap();
+            let refusal = serde_json::to_value(
+                delivery_list_refusal(params.delivery.as_ref(), &declared)
+                    .expect("a wholly undeclared list must be refused"),
+            )
+            .unwrap();
+            assert_eq!(refusal["code"], case["refusal"]["code"]);
+            assert_eq!(refusal["detail"], case["refusal"]["detail"]);
+        }
+    }
+
+    #[test]
+    fn one_declared_mode_keeps_the_original_delivery_list_accepted() {
+        let params: SendParams = serde_json::from_value(
+            serde_json::json!({"prompt":"reminder", "delivery":["steer","idle_start"]}),
+        )
+        .unwrap();
+        let before = serde_json::to_value(&params.delivery).unwrap();
+        assert!(
+            delivery_list_refusal(params.delivery.as_ref(), &["delivery_order", "queue"]).is_none()
+        );
+        assert_eq!(serde_json::to_value(&params.delivery).unwrap(), before);
+        let refusal = serde_json::to_value(
+            delivery_list_refusal(params.delivery.as_ref(), &["delivery_order"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refusal["detail"]["delivery"], before);
     }
 }

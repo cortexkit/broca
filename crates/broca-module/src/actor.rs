@@ -2826,6 +2826,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        // The running loop can deliver an ordered send while this actor stays active. Drop
+        // those stale queue entries before a retry can incorrectly answer pending again.
+        if let RunState::Active { steer, .. } = &self.state {
+            let consumed = steer.take_consumed();
+            if !consumed.is_empty() {
+                self.pending_fifo
+                    .retain(|pending| !consumed.contains(&pending.submission_id));
+                self.wal_scan_complete = false;
+            }
+        }
         // Nonce-minted sends can never repeat and deliberately pay no digest or lookup. A keyed
         // send first asks whether an episode already started under its run id. The WAL answers
         // that: `RunStarted` records the send's identity digest, and the actor keeps what the WAL
@@ -4989,30 +4999,46 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => RetractOutcome::Error(error.to_string()),
             };
         }
-        let records = match self.read_wal_records().await {
-            Ok(records) => records,
-            Err(e) => return RetractOutcome::Error(e),
-        };
-        self.replace_wal_scan_sets(&records);
-        match broca_core::retract_decision(&records, &submission_id) {
-            broca_core::RetractDecision::Retract => {
-                let writer = self.writer.as_ref().expect("writer live while open");
-                writer.record(WalRecord::Retracted {
-                    submission_id: submission_id.clone(),
-                    failure: None,
-                });
-                if let Err(e) = writer.sync().await {
-                    return RetractOutcome::Error(e.to_string());
+        loop {
+            let records = match self.read_wal_records().await {
+                Ok(records) => records,
+                Err(e) => return RetractOutcome::Error(e),
+            };
+            self.replace_wal_scan_sets(&records);
+            return match broca_core::retract_decision(&records, &submission_id) {
+                broca_core::RetractDecision::Retract => {
+                    let writer = self.writer.as_ref().expect("writer live while open");
+                    let record = || {
+                        writer.record(WalRecord::Retracted {
+                            submission_id: submission_id.clone(),
+                            failure: None,
+                        });
+                    };
+                    let recorded = match &self.state {
+                        RunState::Active { steer, .. } => {
+                            steer.retract_ordered(&submission_id, record)
+                        }
+                        _ => {
+                            record();
+                            true
+                        }
+                    };
+                    if !recorded {
+                        continue;
+                    }
+                    if let Err(e) = writer.sync().await {
+                        return RetractOutcome::Error(e.to_string());
+                    }
+                    self.pending_fifo
+                        .retain(|pending| pending.submission_id != submission_id);
+                    self.skip_materialization_submissions.remove(&submission_id);
+                    self.retracted_submissions.insert(submission_id);
+                    self.prior_snapshot = None;
+                    RetractOutcome::Retracted
                 }
-                self.pending_fifo
-                    .retain(|pending| pending.submission_id != submission_id);
-                self.skip_materialization_submissions.remove(&submission_id);
-                self.retracted_submissions.insert(submission_id);
-                self.prior_snapshot = None;
-                RetractOutcome::Retracted
-            }
-            broca_core::RetractDecision::AlreadyStarted => RetractOutcome::AlreadyStarted,
-            broca_core::RetractDecision::NotPending => RetractOutcome::NotPending,
+                broca_core::RetractDecision::AlreadyStarted => RetractOutcome::AlreadyStarted,
+                broca_core::RetractDecision::NotPending => RetractOutcome::NotPending,
+            };
         }
     }
 

@@ -18960,3 +18960,118 @@ expect_red = ["usage_compat::tests::full_usage_golden_is_not_normalized"]
 file = "crates/broca-wire/tests/support/run_usage.rs"
 old = 'if golden_body.usage.is_some_and(|usage| {'
 new = 'if false && golden_body.usage.is_some_and(|usage| { // NON-VACUITY BREAK: strip current counters too'
+
+[[control]]
+id = "status-optional-reader-keeps-terminal-answer"
+guards = "Optional WAL metadata cannot make an indexed terminal status or identical-send replay fail when the external reader is unavailable"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::same_send_id_same_prompt_reuses_one_episode"]
+file = "crates/broca-module/src/serve.rs"
+old = 'self.read_durable_wal(session).await.ok().map(|read| read.0)'
+new = 'Some(self.read_durable_wal(session).await?.0) // NON-VACUITY BREAK: require the optional transcript reader'
+
+[[control]]
+id = "status-unreadable-final-text-omits-directives"
+guards = "A completed status remains answerable without readable final text even when wake directives were requested"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::completed_status_without_final_text_omits_directives"]
+file = "crates/broca-module/src/serve.rs"
+old = '''final_message_of(records, &run_id)
+                    .ok()'''
+new = '''Some(final_message_of(records, &run_id)?) // NON-VACUITY BREAK: require optional completed text'''
+
+[[control]]
+id = "ordered-retract-removes-live-copy"
+guards = "A retracted ordered send is removed from the live inbox before either tool-result or step delivery"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/steer.rs"
+expect_red = ["steer::retract_tests::retract_removes_ordered_send_before_tool_or_step_delivery"]
+file = "crates/broca-core/src/steer.rs"
+old = '.retain(|send| &send.submission_id != submission_id);'
+new = '.retain(|send| &send.submission_id == submission_id); // NON-VACUITY BREAK: retain the withdrawn send'
+
+[[control]]
+id = "ordered-retract-respects-delivery-winner"
+guards = "A stale pending snapshot cannot record a retraction after boundary delivery consumed the send"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/steer.rs"
+expect_red = ["steer::retract_tests::a_delivered_ordered_send_cannot_be_retracted_from_a_stale_snapshot"]
+file = "crates/broca-core/src/steer.rs"
+old = 'if state.consumed.contains(submission_id) {'
+new = 'if false && state.consumed.contains(submission_id) { // NON-VACUITY BREAK: retract after delivery won'
+
+[[control]]
+id = "actor-ordered-retract-updates-live-inbox"
+platforms = ["linux", "macos"]
+guards = "A pending tool-result send retracted through the real daemon cannot later enter the transcript"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["pending_delivery_order_send_is_retracted_before_tool_result"]
+file = "crates/broca-module/src/actor.rs"
+old = 'steer.retract_ordered(&submission_id, record)'
+new = '{ let _ = steer; record(); true } // NON-VACUITY BREAK: leave the inbox copy deliverable'
+
+[[control]]
+id = "delivered-steer-resend-never-regresses-to-pending"
+guards = "A delivered steer's resend and send.status name the joined run as active then finished with the same step receipt"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/it/provisional_run_status.rs"
+expect_red = ["provisional_run_status::a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart"]
+file = "crates/broca-module/src/actor.rs"
+old = '''        // The running loop can deliver an ordered send while this actor stays active. Drop
+        // those stale queue entries before a retry can incorrectly answer pending again.
+        if let RunState::Active { steer, .. } = &self.state {
+            let consumed = steer.take_consumed();'''
+new = '''        // The running loop can deliver an ordered send while this actor stays active. Drop
+        // those stale queue entries before a retry can incorrectly answer pending again.
+        if let RunState::Active { steer, .. } = &self.state {
+            let consumed = { let _ = steer; Vec::new() }; // NON-VACUITY BREAK: keep the stale pending cache'''
+
+[[control]]
+id = "delivery-list-requires-a-declared-mode"
+guards = "An entirely undeclared delivery list is refused with delivery_unsupported and the original detail.delivery array"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::delivery_list_tests::undeclared_delivery_lists_match_published_refusal_vectors"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = 'if modes.iter().any(|mode| mode.is_declared(declared)) {'
+new = 'if true || modes.iter().any(|mode| mode.is_declared(declared)) { // NON-VACUITY BREAK: accept undeclared lists'
+
+[[control]]
+id = "delivery-list-one-declared-mode-is-enough"
+guards = "A delivery list with a declared fallback is accepted unchanged even when earlier modes are undeclared"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::delivery_list_tests::one_declared_mode_keeps_the_original_delivery_list_accepted"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = 'if modes.iter().any(|mode| mode.is_declared(declared)) {'
+new = 'if modes.iter().all(|mode| mode.is_declared(declared)) { // NON-VACUITY BREAK: require every mode to be declared'

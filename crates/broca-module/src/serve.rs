@@ -611,22 +611,31 @@ fn recorded_interrupt_reason(
     reason
 }
 
-fn completed_directives(
+fn wake_directive_requested(
     records: &[broca_wal::FramedRecord],
     run_id: &broca_protocol::RunId,
-    text: &str,
-) -> Option<Vec<cortexkit_role_llm_runner::directives::Directive>> {
-    let names = records
+) -> bool {
+    records
         .iter()
         .rev()
         .find_map(|frame| match &frame.record {
             broca_wal::WalRecord::RunStarted {
                 run_id: id, config, ..
-            } if id == run_id => Some(config.turn_directives_v1.as_ref()),
+            } if id == run_id => Some(config.turn_directives_v1.as_ref().is_some_and(|names| {
+                names.contains(&cortexkit_role_llm_runner::directives::DirectiveName::Wake)
+            })),
             _ => None,
-        })??;
+        })
+        .unwrap_or(false)
+}
+
+fn completed_directives(
+    records: &[broca_wal::FramedRecord],
+    run_id: &broca_protocol::RunId,
+    text: &str,
+) -> Option<Vec<cortexkit_role_llm_runner::directives::Directive>> {
     // Parse the stored final message, never a provider request decorated with runner tags.
-    if !names.contains(&cortexkit_role_llm_runner::directives::DirectiveName::Wake) {
+    if !wake_directive_requested(records, run_id) {
         return None;
     }
     cortexkit_role_llm_runner::directives::parse_trailing(text)
@@ -3250,15 +3259,26 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<RunStatusResponse, ServeError> {
         let state = self.route_run_state(session, run_id.clone()).await?;
         let mut response = run_status_response(state);
-        match &mut response {
-            RunStatusResponse::Interrupted { reason, .. } => {
-                *reason =
-                    recorded_interrupt_reason(&self.read_durable_wal(session).await?.0, &run_id);
+        // Lifecycle resolution above remains authoritative when its transcript reader or
+        // final text is unavailable. Enrich the answer only with readable durable metadata.
+        let metadata = if matches!(
+            response,
+            RunStatusResponse::Interrupted { .. } | RunStatusResponse::Completed { .. }
+        ) {
+            self.read_durable_wal(session).await.ok().map(|read| read.0)
+        } else {
+            None
+        };
+        match (&mut response, metadata.as_deref()) {
+            (RunStatusResponse::Interrupted { reason, .. }, Some(records)) => {
+                *reason = recorded_interrupt_reason(records, &run_id);
             }
-            RunStatusResponse::Completed { directives, .. } => {
-                let records = self.read_durable_wal(session).await?.0;
-                let message = final_message_of(&records, &run_id)?;
-                *directives = completed_directives(&records, &run_id, &message.text);
+            (RunStatusResponse::Completed { directives, .. }, Some(records))
+                if wake_directive_requested(records, &run_id) =>
+            {
+                *directives = final_message_of(records, &run_id)
+                    .ok()
+                    .and_then(|message| completed_directives(records, &run_id, &message.text));
             }
             _ => {}
         }

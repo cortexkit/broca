@@ -2074,7 +2074,12 @@ async fn wait_for_run_state<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .await;
         offset += 1;
         let resp = read_one(reader).await;
-        assert_eq!(resp.header.ty, FrameType::Response);
+        assert_eq!(
+            resp.header.ty,
+            FrameType::Response,
+            "run.status reply: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         if v["result"]["state"] == expected {
             return v["result"].clone();

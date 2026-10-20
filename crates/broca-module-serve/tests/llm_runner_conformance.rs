@@ -3653,3 +3653,117 @@ async fn orderly_handle_drop_seals_a_held_tool_with_shutdown_reason() {
         assert_eq!(reply["reason"], "runner_shutdown", "{method}: {reply}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_delivery_order_send_is_retracted_before_tool_result() {
+    use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
+    for (name, key) in [
+        ("ck-subc", "SUBC_CORE_BIN"),
+        ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+    ] {
+        if !sibling_bin(name, key).exists() {
+            assert!(!require_subc(), "{name} is required");
+            println!("SKIP: {name} is missing");
+            return;
+        }
+    }
+    std::env::remove_var("SUBC_MODULE_ID");
+    std::env::remove_var("SUBC_LAUNCH_NONCE");
+    let scratch = broca_test_support::scratch_root()
+        .join(format!("broca-ordered-retract-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let subject = BrocaSubject::new(&scratch).await;
+    let root = scratch.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = "ordered-retract";
+    let held = ScriptedToolCall {
+        tool_call_id: "held".into(),
+        tool: SCRIPTED_TOOL.into(),
+        arguments: json!({"marker":"ordered-retract-held"}),
+        result: json!({"done":true}),
+        hold: true,
+    };
+    subject
+        .install_script(
+            session,
+            Script {
+                turns: vec![
+                    ScriptedTurn::new(vec![ScriptedPart::ToolCall(held.clone())]),
+                    ScriptedTurn::new(vec![ScriptedPart::Text("done".into())]),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    let live = subject.spawn(&root).await.unwrap();
+    let route = subject
+        .session_route(&live, session, &subject.owner_stamp())
+        .await
+        .unwrap();
+    let response = |reply| match reply {
+        Reply::Response(value) => value,
+        other => panic!("expected response, got {other:?}"),
+    };
+    let mut fields = subject.send_fields(session, true);
+    fields.insert("prompt".into(), json!("start"));
+    fields.insert("send_id".into(), json!("ordered-run"));
+    let admitted = response(
+        route
+            .request("session.send", Value::Object(fields))
+            .await
+            .unwrap(),
+    );
+    subject.await_tool_call(&held.arguments).await.unwrap();
+    let marker = "ordered-send-retracted-before-delivery";
+    let mut fields = subject.send_fields(session, false);
+    fields.insert("prompt".into(), json!(marker));
+    fields.insert("send_id".into(), json!("ordered-withdrawn"));
+    fields.insert("delivery".into(), json!(["tool_result"]));
+    let pending = response(
+        route
+            .request("session.send", Value::Object(fields))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(pending["state"], "pending");
+    let retract = json!({"submission_id":pending["submission_id"]});
+    assert_eq!(
+        response(
+            route
+                .request("session.retract", retract.clone())
+                .await
+                .unwrap()
+        ),
+        "retracted"
+    );
+    assert_eq!(
+        response(route.request("session.retract", retract).await.unwrap()),
+        "not_pending"
+    );
+    subject.release_tool_call(&held.arguments).await.unwrap();
+    broca_test_support::wait_until("ordered retract run completes", || async {
+        let result = response(
+            route
+                .request("run.result", json!({"run_id":admitted["run_id"]}))
+                .await
+                .unwrap(),
+        );
+        if result["state"] == "completed" {
+            Ok(())
+        } else {
+            Err(format!("{result}"))
+        }
+    })
+    .await;
+    let page = response(
+        route
+            .request("session.read", json!({"from_ordinal":0}))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !serde_json::to_string(&page).unwrap().contains(marker),
+        "retracted send reached the transcript: {page}"
+    );
+}

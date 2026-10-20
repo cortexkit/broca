@@ -192,6 +192,25 @@ impl SteerInbox {
     }
 
     /// The ordered sends this turn delivered or ended since the last call.
+    /// Record a validated queued send's retraction and remove its live copy under the same
+    /// lock as boundary delivery. False means the run consumed it after the actor's WAL read;
+    /// the actor must re-read that fate instead of writing a contradictory tombstone.
+    pub fn retract_ordered(
+        &self,
+        submission_id: &broca_protocol::SubmissionId,
+        record: impl FnOnce(),
+    ) -> bool {
+        let mut state = self.lock();
+        if state.consumed.contains(submission_id) {
+            return false;
+        }
+        record();
+        state
+            .ordered
+            .retain(|send| &send.submission_id != submission_id);
+        true
+    }
+
     pub fn take_consumed(&self) -> Vec<broca_protocol::SubmissionId> {
         std::mem::take(&mut self.lock().consumed)
     }
@@ -458,6 +477,80 @@ mod tests {
         assert_eq!(
             inbox.accept_ordered(ordered("y", &[ToolResult], None), |_| panic!("closed")),
             OrderedAcceptance::Closed
+        );
+    }
+}
+
+#[cfg(test)]
+mod retract_tests {
+    use super::*;
+    use broca_protocol::content::{Role, ToolOutput, ToolResult};
+    use broca_protocol::{DeliveryMode, RunId, SubmissionId};
+
+    fn queued(mode: DeliveryMode) -> crate::delivery_order::OrderedSend {
+        crate::delivery_order::OrderedSend {
+            submission_id: SubmissionId("queued".into()),
+            order: broca_protocol::DeliveryOrder {
+                modes: vec![mode],
+                dedupe_key: None,
+                expires_at_ms: None,
+                template: None,
+            },
+            principal: None,
+            input: vec![Message::new(
+                Role::User,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "withdrawn".into(),
+                }],
+            )],
+        }
+    }
+
+    #[test]
+    fn retract_removes_ordered_send_before_tool_or_step_delivery() {
+        for mode in [DeliveryMode::ToolResult, DeliveryMode::Steer] {
+            let inbox = SteerInbox::new();
+            inbox.seed_ordered(vec![queued(mode)]);
+            let mut recorded = false;
+            assert!(inbox.retract_ordered(&SubmissionId("queued".into()), || recorded = true));
+            assert!(recorded);
+            let result = ToolResult {
+                tool_call_id: broca_protocol::ToolCallId("call".into()),
+                output: ToolOutput::Text {
+                    text: "result".into(),
+                },
+                is_error: false,
+            };
+            assert!(inbox
+                .deliver_with_tool_results(&RunId("run".into()), 0, [&result], |records| assert!(
+                    records.is_empty()
+                ))
+                .is_empty());
+            assert!(inbox
+                .try_take_at_step_ordered(&RunId("run".into()), 0, |records| {
+                    assert!(records.is_empty());
+                    Vec::new()
+                })
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn a_delivered_ordered_send_cannot_be_retracted_from_a_stale_snapshot() {
+        let inbox = SteerInbox::new();
+        inbox.seed_ordered(vec![queued(DeliveryMode::Steer)]);
+        assert_eq!(
+            inbox
+                .try_take_at_step_ordered(&RunId("run".into()), 0, |_| Vec::new())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !inbox.retract_ordered(&SubmissionId("queued".into()), || panic!(
+                "delivery already won; no retraction may be recorded"
+            ))
         );
     }
 }

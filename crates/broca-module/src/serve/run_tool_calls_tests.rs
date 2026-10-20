@@ -855,3 +855,25 @@ fn wake_v1_frozen_run_answer_is_pinned_independently_of_current_vectors() {
         r#"[{"name":"wake","in_ms":60000,"note":"café"}]"#
     );
 }
+
+#[tokio::test]
+async fn completed_status_without_final_text_omits_directives() {
+    for directives in [None, Some(json!(["wake"]))] {
+        let mut session = ClosedSession::with_directives(
+            &format!("status-without-text-{directives:?}"),
+            directives,
+        );
+        session.append(terminal(RunFinishReason::Completed, None));
+        session.close_writer();
+        let status = ServeHandler::run_status(
+            &session.registry,
+            &session.key,
+            broca_protocol::RunId("run-1".into()),
+        )
+        .await
+        .unwrap();
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["state"], "completed");
+        assert!(value.get("directives").is_none(), "{value}");
+    }
+}
