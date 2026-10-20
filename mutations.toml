@@ -11640,6 +11640,39 @@ old = "pub const READ_REPLY_MAX_BYTES: u64 = 3 * 1024 * 1024;"
 new = "pub const READ_REPLY_MAX_BYTES: u64 = 4 * 1024 * 1024; // NON-VACUITY BREAK"
 
 [[control]]
+id = "run-tool-calls-open-batch-ordinal"
+guards = "an open batch ordinal follows the assistant message after a completed multi-call batch"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix_and_open_batch"]
+[[control.edits]]
+file = "crates/broca-module/src/serve.rs"
+old = "    let mut active_batch_id: Option<String> = None;\n"
+new = "    let mut active_batch_id: Option<String> = None;\n    let mut planned_call_count = 0usize;\n"
+[[control.edits]]
+file = "crates/broca-module/src/serve.rs"
+old = '''            WalRecord::ToolBatchStarted { batch_id, .. } => {
+                active_batch_id = Some(batch_id.0.clone());
+            }'''
+new = '''            WalRecord::ToolBatchStarted {
+                batch_id,
+                planned_calls,
+                ..
+            } => {
+                active_batch_id = Some(batch_id.0.clone());
+                planned_call_count = planned_calls.len();
+            }'''
+[[control.edits]]
+file = "crates/broca-module/src/serve.rs"
+old = "                prompt_len = prompt_len.saturating_add(2);\n"
+new = '''                prompt_len = prompt_len
+                    .saturating_add(1)
+                    .saturating_add(planned_call_count as u64); // NON-VACUITY BREAK'''
+
+[[control]]
 id = "session-read-model-page-reply-body-budget"
 guards = "model-view pages use the shared 3 MiB full-reply budget rather than the former 4/16 MiB limits"
 runner = "cargo"

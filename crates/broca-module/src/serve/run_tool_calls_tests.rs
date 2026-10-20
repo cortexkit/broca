@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{FileWalStore, WalStore};
-use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall, ToolOutput, ToolResult};
+use broca_core::{FileWalStore, MaterializedStore, WalStore};
+use broca_protocol::content::{
+    AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+};
 use broca_protocol::{
     BatchId, BindIdentity, MessageId, RunFinishReason, StepId, ToolCallId, Usage,
 };
@@ -11,7 +13,7 @@ use broca_wal::{Wal, WalRecord};
 use cortexkit_role_llm_runner::tool_calls::{outcomes, ToolCallsPage, ToolCallsRequest};
 use serde_json::{json, Value};
 
-use super::{LineageKey, ServeError, ServeHandler};
+use super::{LineageKey, ServeError, ServeHandler, SessionReadRequest};
 
 struct NeverOpen;
 
@@ -31,6 +33,8 @@ struct ClosedSession {
     _root: std::path::PathBuf,
     registry: crate::LineageRegistry,
     key: LineageKey,
+    wal_store: Arc<FileWalStore>,
+    store: Arc<broca_store::SqliteStore>,
     wal: Option<Box<dyn Wal + Send>>,
 }
 
@@ -42,6 +46,7 @@ impl ClosedSession {
         std::fs::create_dir_all(&project).unwrap();
         let key = BindIdentity::new(project, "runner", name);
         let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        let store = Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap());
         let mut wal = wal_store.open(&key).unwrap();
         let started: WalRecord = serde_json::from_value(json!({
             "type": "run_started",
@@ -61,12 +66,17 @@ impl ClosedSession {
         }))
         .unwrap();
         wal.append(1, &started, true).unwrap();
-        let registry =
-            crate::LineageRegistry::new_with_reader(Arc::new(NeverOpen), wal_store, None);
+        let registry = crate::LineageRegistry::new_with_reader(
+            Arc::new(NeverOpen),
+            wal_store.clone(),
+            Some(store.clone()),
+        );
         Self {
             _root: root,
             registry,
             key,
+            wal_store,
+            store,
             wal: Some(wal),
         }
     }
@@ -84,8 +94,18 @@ impl ClosedSession {
     }
 
     fn write_tool_turn(&mut self, calls: &[(String, Value)], results: Option<&[String]>) {
-        let step_id = StepId(1);
-        let batch_id = BatchId("batch-1".into());
+        self.write_tool_turn_with("batch-1", 1, calls, results);
+    }
+
+    fn write_tool_turn_with(
+        &mut self,
+        batch_id: &str,
+        step: u64,
+        calls: &[(String, Value)],
+        results: Option<&[String]>,
+    ) {
+        let step_id = StepId(step);
+        let batch_id = BatchId(batch_id.into());
         let tool_calls: Vec<_> = calls
             .iter()
             .map(|(id, args)| ToolCall {
@@ -95,6 +115,7 @@ impl ClosedSession {
                 thought_signature: None,
             })
             .collect();
+        self.append(WalRecord::StepStarted { step_id });
         self.append(WalRecord::ModelStepFinished {
             step_id,
             assistant_message: Arc::new(AssistantMessage {
@@ -152,7 +173,45 @@ impl ClosedSession {
         }
         if results.is_some() {
             self.append(WalRecord::ToolBatchFinished { batch_id });
+            self.append(WalRecord::TurnFinished { step_id });
         }
+    }
+
+    fn steer(&mut self, text: &str) {
+        self.append(WalRecord::Steered {
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some(format!("steer-{text}")),
+            request_identity_digest: None,
+            delivery: Some(broca_protocol::Delivery::Steer),
+            input: Arc::new(vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: text.into() }],
+            )]),
+            hooks: None,
+        });
+    }
+
+    fn materialize_through_batch(&self, batch_id: &str) -> u64 {
+        let records = self.wal_store.read_records(&self.key).unwrap();
+        let batch_end = records
+            .iter()
+            .position(|framed| {
+                matches!(
+                    &framed.record,
+                    WalRecord::ToolBatchFinished { batch_id: finished }
+                        if finished.0 == batch_id
+                )
+            })
+            .expect("the requested tool batch is finished");
+        let end = records[batch_end + 1..]
+            .iter()
+            .position(|framed| matches!(&framed.record, WalRecord::TurnFinished { .. }))
+            .map(|offset| batch_end + 1 + offset)
+            .expect("the completed tool turn has a durable boundary");
+        self.store.project(&self.key, &records[..=end]).unwrap()
     }
 
     fn write_duplicate_id_tool_turn(&mut self) {
@@ -414,6 +473,92 @@ async fn run_tool_calls_reports_intent_without_result_as_indeterminate() {
     assert_eq!(page.calls.len(), 1);
     assert_eq!(page.calls[0].outcome, outcomes::INDETERMINATE);
     assert!(page.calls[0].result_bytes.is_none());
+}
+
+#[tokio::test]
+async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix_and_open_batch() {
+    let mut session = ClosedSession::new("open-batch-ordinal");
+    session.write_tool_turn(
+        &[
+            call("first-call", json!({"path":"a"})),
+            call("second-call", json!({"path":"b"})),
+            call("third-call", json!({"path":"c"})),
+        ],
+        Some(&["one".into(), "two".into(), "three".into()]),
+    );
+    let watermark = session.materialize_through_batch("batch-1");
+    let prefix = session
+        .store
+        .read_prefix_with_watermark(&session.key)
+        .unwrap();
+    assert_eq!(prefix.watermark_seq, watermark);
+    assert_eq!(
+        prefix.prefix.len(),
+        2,
+        "the store holds the committed assistant/tool pair"
+    );
+
+    session.steer("between turns");
+    session.write_tool_turn_with(
+        "batch-2",
+        2,
+        &[call("open-call", json!({"path":"d"}))],
+        None,
+    );
+    session.close_writer();
+    assert!(session
+        .wal_store
+        .read_records(&session.key)
+        .unwrap()
+        .iter()
+        .any(|framed| framed.seq > watermark));
+
+    let transcript = ServeHandler::read(
+        &session.registry,
+        SessionReadRequest::new(session.key.clone(), Some(0), Some(100)),
+    )
+    .await
+    .unwrap();
+    let transcript_calls: Vec<_> = transcript
+        .messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .message
+                .content
+                .iter()
+                .filter_map(move |block| match block {
+                    ContentBlock::ToolCall(call) => {
+                        Some((message.ordinal, call.tool_call_id.0.clone()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    let reported = session.page(ToolCallsRequest::new("run-1")).await;
+    let reported_calls: Vec<_> = reported
+        .calls
+        .iter()
+        .map(|call| (call.ordinal, call.tool_call_id.clone()))
+        .collect();
+
+    assert_eq!(
+        transcript_calls,
+        vec![
+            (0, "first-call".into()),
+            (0, "second-call".into()),
+            (0, "third-call".into()),
+            (3, "open-call".into()),
+        ]
+    );
+    assert!(transcript.messages.iter().any(|message| {
+        message.ordinal == 2
+            && message.message.role == Role::User
+            && message.message.content.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if text == "between turns"),
+            )
+    }));
+    assert_eq!(reported_calls, transcript_calls);
 }
 
 #[tokio::test]
