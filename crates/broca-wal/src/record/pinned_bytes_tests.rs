@@ -12,6 +12,24 @@
 
 use super::*;
 
+/// Pre-interrupt `run_finished` records keep their exact bytes and require no reader feature.
+#[test]
+fn pre_interrupt_reason_terminal_bytes_and_features_are_pinned() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+
+    for pinned in [
+        r#"{"type":"run_finished","reason":"interrupted","usage":{},"retries_used":0}"#,
+        r#"{"type":"run_finished","reason":"interrupted","ts_ms":42,"usage":{},"retries_used":0}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty());
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
 /// Existing reasoning tags and scalar frozen flags predate the OpenRouter continuation format.
 /// Their payload bytes and ungated frame version must survive adding a reader feature.
 #[test]
