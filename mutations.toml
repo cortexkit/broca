@@ -7082,13 +7082,13 @@ new = '''        // NON-VACUITY BREAK: acknowledge completion before removing id
 
 [[control]]
 id = "retention-status-expiry-before-open"
-guards = "status refuses expired sessions before actor opening can erase the lineage and return Idle"
+guards = "status refuses expired sessions before actor opening can erase the lineage and return Idle; small closed logs are refused by the direct WAL read instead, so the test uses a log above the status read limit"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 features = ["test-clock"]
 test_file = "crates/broca-module/src/retention_tests.rs"
-expect_red = ["retention::tests::status_of_expired_session_refuses_without_opening_or_deleting"]
+expect_red = ["retention::tests::status_of_expired_large_session_refuses_in_the_status_opener"]
 select = "expected"
 file = "crates/broca-module/src/opener.rs"
 old = "self.open_mode(key, gen, registry, None, None, true).await"
@@ -7468,8 +7468,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::status_never_expires_a_new_active_run_from_a_captured_old_head"]
 file = "crates/broca-module/src/registry.rs"
-old = "                Action::Have(handle) => return Ok(handle),"
-new = "                Action::Have(handle) => { if status { self.check_expired(key, None).await?; } return Ok(handle); }, // NON-VACUITY BREAK"
+old = "            if handle.send(LineageCmd::Status { reply }).await.is_err() {"
+new = "            self.check_expired(key, None).await?; if handle.send(LineageCmd::Status { reply }).await.is_err() { // NON-VACUITY BREAK: expire a live status from its captured head"
 
 [[control]]
 id = "retention-audit-fresh-bind-known-empty"

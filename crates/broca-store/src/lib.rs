@@ -1499,8 +1499,8 @@ impl SqliteStore {
             ],
         )?;
         tx.execute(
-            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=2 WHERE session=?1",
-            rusqlite::params![key, prepared.deferred_calls_json],
+            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=?3 WHERE session=?1",
+            rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION],
         )?;
         for run_id in prepared.withdrawals_owed_runs {
             tx.execute(
@@ -2324,6 +2324,10 @@ fn current_projection_position(
     }
 }
 
+/// The `meta.run_attribution_version` a current writer stamps on every projection. Rows with
+/// any other version were written by an older format and are backfilled from the WAL.
+pub(crate) const RUN_ATTRIBUTION_VERSION: i64 = 2;
+
 fn attribution_complete(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<bool, StoreError> {
     let version: Option<i64> = tx
         .query_row(
@@ -2334,7 +2338,7 @@ fn attribution_complete(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<boo
         .optional()?;
     // Version 2 includes ordered-delivery receipts. Older rows are backfilled from the WAL
     // on their session's first read, just like rows missing run attribution.
-    if version.is_some_and(|version| version != 2) {
+    if version.is_some_and(|version| version != RUN_ATTRIBUTION_VERSION) {
         return Ok(false);
     }
     // Session-scoped only: no global index build or startup scan of historical bodies.
