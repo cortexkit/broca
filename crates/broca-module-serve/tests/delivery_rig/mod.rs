@@ -164,6 +164,8 @@ pub struct Script {
     pub narrow_input: Mutex<Option<serde_json::Value>>,
     pub batch_finishes: Mutex<usize>,
     pub failures: Mutex<Vec<String>>,
+    pub provider_output: Mutex<Vec<String>>,
+    module_log: Mutex<Option<broca_test_support::LogCapture>>,
     /// Seal tests hold work past the ordinary boundary-stop grace so the actor, rather than
     /// the loop's graceful stop, must collect and persist the hook fallback slots.
     pub ignore_graceful_stop: Mutex<bool>,
@@ -228,8 +230,13 @@ impl Provider for ScriptedProvider {
         }
     }
 
-    async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         use broca_provider::wire::WireFamily;
+        self.0.provider_output.lock().unwrap().push(format!(
+            "step {} entered; hold_model={}",
+            step_id.0,
+            *self.0.hold_model.lock().unwrap()
+        ));
         self.0
             .rendered
             .lock()
@@ -258,6 +265,11 @@ impl Provider for ScriptedProvider {
             .unwrap_or(Step::Text("done"));
         let (tx, rx) = mpsc::channel(8);
         for event in step.events() {
+            self.0
+                .provider_output
+                .lock()
+                .unwrap()
+                .push(format!("step {} output: {event:?}", step_id.0));
             tx.send(event).await.unwrap();
         }
         rx
@@ -437,22 +449,30 @@ impl RunExecutor for CoreExec {
                     .unwrap()
                 })
             });
-        run_loop_on_writer_admitted_with_prior_snapshot(
+        let module_log = self.script.module_log.lock().unwrap().clone();
+        let provider = ScriptedProvider(self.script.clone(), structured_output);
+        let tools = ScriptedTools(self.script.clone());
+        let approval = ScriptedApproval(self.script.clone());
+        let run = run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
             mode,
-            &ScriptedProvider(self.script.clone(), structured_output),
-            &ScriptedTools(self.script.clone()),
-            &ScriptedApproval(self.script.clone()),
+            &provider,
+            &tools,
+            &approval,
             self.wal_store.as_ref(),
             materialized_store,
             control,
             &out,
             job.on_admitted,
             Some(&job.prior_snapshot),
-        )
-        .await
-        .inspect_err(|error| {
+        );
+        let result = if let Some(log) = module_log {
+            log.scope_future(run).await
+        } else {
+            run.await
+        };
+        result.inspect_err(|error| {
             self.script.failures.lock().unwrap().push(error.to_string());
         })
     }
@@ -472,7 +492,42 @@ pub struct Rig {
     corr: u64,
 }
 
+pub struct FailureDiagnostics {
+    script: Arc<Script>,
+    wal_path: PathBuf,
+}
+
+impl FailureDiagnostics {
+    pub fn snapshot(&self) -> String {
+        format!(
+            "--- broca in-process module log ---\n{:?}\nexecutor failures: {:?}\n--- scripted model provider output ---\n{:?}\nhold_model={}\n--- broca WAL ---\n{:?}",
+            self.script.module_log.lock().unwrap().as_ref().map(|log| log.events()),
+            self.script.failures.lock().unwrap(),
+            self.script.provider_output.lock().unwrap(),
+            self.script.hold_model.lock().unwrap(),
+            broca_wal::replay_file(&self.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES),
+        )
+    }
+}
+
+impl Drop for FailureDiagnostics {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", self.snapshot());
+        }
+    }
+}
+
 impl Rig {
+    /// The module and model provider run in-process, so daemon stdio cannot report their errors.
+    pub fn failure_diagnostics(&self) -> FailureDiagnostics {
+        *self.script.module_log.lock().unwrap() = Some(broca_test_support::LogCapture::new());
+        FailureDiagnostics {
+            script: self.script.clone(),
+            wal_path: self.wal_path.clone(),
+        }
+    }
+
     pub async fn start(tag: &str) -> Self {
         Self::start_with_idle_ttl(tag, broca_module::actor::IDLE_TTL).await
     }
@@ -634,7 +689,7 @@ impl Rig {
         params: serde_json::Value,
         quiet: Duration,
     ) -> Vec<Frame> {
-        self.subscribe_collect_after_attach(channel, params, quiet, || {})
+        self.subscribe_collect_inner(channel, params, quiet, None::<fn()>)
             .await
     }
 
@@ -645,6 +700,7 @@ impl Rig {
     /// first frame proves nothing and `on_attach` would wait for an event it gates. A test that
     /// releases a held model from `on_attach` cannot stream display deltas before anyone
     /// listens; the display lane is lossy and never replayed.
+    /// Attachment uses the shared hang guard; `quiet` applies only after replay arrives.
     pub async fn subscribe_collect_after_attach(
         &mut self,
         channel: u16,
@@ -652,7 +708,17 @@ impl Rig {
         quiet: Duration,
         on_attach: impl FnOnce(),
     ) -> Vec<Frame> {
-        let mut on_attach = Some(on_attach);
+        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach))
+            .await
+    }
+
+    async fn subscribe_collect_inner(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        on_attach: Option<impl FnOnce()>,
+    ) -> Vec<Frame> {
         self.bind(channel).await;
         self.corr += 1;
         let corr = self.corr;
@@ -669,22 +735,7 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
-        let mut frames = Vec::new();
-        while let Ok(next) = tokio::time::timeout(quiet, read_frame(&mut self.reader)).await {
-            let next = next.unwrap().unwrap();
-            if next.header.corr != corr {
-                continue;
-            }
-            let ends = matches!(next.header.ty, FrameType::Error | FrameType::StreamEnd);
-            frames.push(next);
-            if let Some(attached) = on_attach.take() {
-                attached();
-            }
-            if ends {
-                break;
-            }
-        }
-        frames
+        collect_subscription_frames(&mut self.reader, corr, quiet, on_attach).await
     }
 
     pub async fn bind(&mut self, channel: u16) {
@@ -1089,4 +1140,193 @@ pub fn result(frame: &Frame) -> serde_json::Value {
         String::from_utf8_lossy(&frame.body)
     );
     serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+}
+
+async fn collect_subscription_frames(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    corr: u64,
+    quiet: Duration,
+    on_attach: Option<impl FnOnce()>,
+) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    if let Some(attached) = on_attach {
+        // A slow first replay is not a quiet subscription: the caller may still hold the model.
+        let first = broca_test_support::wait_for(
+            "subscription attachment replay",
+            async {
+                loop {
+                    let next = read_frame(reader)
+                        .await
+                        .unwrap()
+                        .expect("subscription stays open");
+                    if next.header.corr == corr {
+                        return next;
+                    }
+                }
+            },
+            || format!("waiting for first replay on correlation {corr}"),
+        )
+        .await;
+        assert_eq!(
+            first.header.ty,
+            FrameType::StreamData,
+            "subscription did not attach: {first:?}"
+        );
+        frames.push(first);
+        attached();
+    }
+    while let Ok(next) = tokio::time::timeout(quiet, read_frame(reader)).await {
+        let next = next.unwrap().unwrap();
+        if next.header.corr != corr {
+            continue;
+        }
+        let ends = matches!(next.header.ty, FrameType::Error | FrameType::StreamEnd);
+        frames.push(next);
+        if ends {
+            break;
+        }
+    }
+    frames
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn failure_dump_includes_module_log_and_scripted_provider_output() {
+        const CHILD: &str = "BROCA_DELIVERY_DIAGNOSTICS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut rig = Rig::start("failure-dump-evidence").await;
+            println!("RIG_DIR={}", rig.dir.display());
+            let _diagnostics = rig.failure_diagnostics();
+            rig.script
+                .module_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .in_scope(|| {
+                    tracing::error!("BROCA_MODULE_LOG_MARKER");
+                });
+            rig.script
+                .push(&[Step::Text("SCRIPTED_PROVIDER_OUTPUT_MARKER")]);
+            result(&rig.send("dump-evidence", "hello", None).await);
+            rig.wait_for_finished(1).await;
+            panic!("intentional failure to verify in-process diagnostics");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "delivery_rig::subscription_tests::failure_dump_includes_module_log_and_scripted_provider_output",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "child must fail deliberately");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for marker in [
+            "BROCA_MODULE_LOG_MARKER",
+            "SCRIPTED_PROVIDER_OUTPUT_MARKER",
+            "RunFinished",
+        ] {
+            assert!(stderr.contains(marker), "missing {marker}: {stderr}");
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let dir = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("RIG_DIR="))
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_waits_for_first_replay_before_starting_quiet_window() {
+        let script = Arc::new(Script::default());
+        script.hold_model(true);
+        let held = script.clone();
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let quiet = Duration::from_millis(500);
+        let collect = collect_subscription_frames(
+            &mut reader,
+            9,
+            quiet,
+            Some(move || held.hold_model(false)),
+        );
+        tokio::pin!(collect);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await
+        );
+
+        // No replay can arrive until this test writes it; only the virtual clock advances.
+        tokio::time::advance(quiet * 2).await;
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await,
+            "quiet collection ended before attachment; hold_model={}",
+            script.hold_model.lock().unwrap()
+        );
+        assert!(*script.hold_model.lock().unwrap());
+        let replay = Frame::build(
+            FrameType::StreamData,
+            Flags::new(false, Priority::Interactive, false),
+            8,
+            8,
+            9,
+            b"replayed StepStarted".to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut writer, &replay).await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(
+            !*script.hold_model.lock().unwrap(),
+            "replay must release the held model"
+        );
+        tokio::time::advance(quiet).await;
+        assert_eq!(
+            collect.await.len(),
+            1,
+            "quiet collection still ends after attachment"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collection_without_attach_can_end_without_frames() {
+        let (mut reader, _writer) = tokio::io::duplex(4096);
+        assert!(collect_subscription_frames(
+            &mut reader,
+            9,
+            Duration::from_millis(500),
+            None::<fn()>,
+        )
+        .await
+        .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_attachment_replay_hits_shared_hang_guard() {
+        let (mut reader, _writer) = tokio::io::duplex(4096);
+        let collection = tokio::spawn(async move {
+            collect_subscription_frames(
+                &mut reader,
+                9,
+                Duration::from_millis(500),
+                Some(|| panic!("model must not be released without replay")),
+            )
+            .await
+        });
+        let error = collection
+            .await
+            .expect_err("missing replay must trip the hang guard");
+        let panic = error.into_panic();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains("timed out waiting for subscription attachment replay"),
+            "{message}"
+        );
+    }
 }
