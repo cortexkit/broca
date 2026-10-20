@@ -267,6 +267,7 @@ impl RunExecutor for FakeExec {
             hold.notified().await;
         }
         job.writer.record(WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -439,6 +440,7 @@ impl RunExecutor for ReauthCoreExec {
             }
             self.first_pause_release.notified().await;
             job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -498,6 +500,7 @@ impl RunExecutor for ReauthCoreExec {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),
@@ -708,6 +711,7 @@ async fn over_cap_admission_is_typed_and_leaves_no_wal_or_run_index_row() {
         .expect("cap install is acknowledged after commit");
 
     let request = SubmissionRequest {
+        directives: None,
         on_restart: None,
         keep_warm: None,
         scope: Default::default(),
@@ -814,6 +818,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         run_id: RunId(run_id.into()),
         send_id: Some(format!("send-{run_id}")),
         request: Box::new(SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),
@@ -861,6 +866,7 @@ fn budget_send(session: BindIdentity, run_id: &str) -> SendRequest {
         run_id: broca_protocol::RunId(run_id.into()),
         send_id: None,
         request: Box::new(SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),
@@ -1007,6 +1013,7 @@ async fn unresolved_decrement_to_zero_allows_admission_at_the_export_head() {
             seq: 2,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(200),
                 usage: Usage::default(),
@@ -2067,7 +2074,12 @@ async fn wait_for_run_state<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .await;
         offset += 1;
         let resp = read_one(reader).await;
-        assert_eq!(resp.header.ty, FrameType::Response);
+        assert_eq!(
+            resp.header.ty,
+            FrameType::Response,
+            "run.status reply: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         if v["result"]["state"] == expected {
             return v["result"].clone();
@@ -5942,6 +5954,7 @@ impl PreparedWalRoute {
                 file.append(
                     1,
                     &WalRecord::RunFinished {
+                        interrupt_reason: None,
                         reason: RunFinishReason::Completed,
                         ts_ms: None,
                         usage: Usage::default(),
@@ -6798,6 +6811,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: None,
                 usage: Usage::default(),

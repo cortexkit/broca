@@ -246,6 +246,7 @@ impl Rig {
             },
             WalRecord::TurnFinished { step_id: StepId(0) },
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(2),
                 usage: Usage::default(),
@@ -365,6 +366,7 @@ impl Rig {
             wal.append(
                 1,
                 &WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(2),
                     usage: Usage::default(),
@@ -397,6 +399,7 @@ fn started(session: &BindIdentity, run: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: vec![].into(),
@@ -933,6 +936,7 @@ async fn retention_marker_never_reaches_the_door() {
     wal.append(
         1,
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: Some(2),
             usage: Usage::default(),
@@ -999,6 +1003,7 @@ async fn import_verifies_the_doors_sealed_digest() {
 async fn import_checks_all_frame_features_before_staging() {
     let (rig, params, mut bytes) = incoming_rig("format");
     let record = WalRecord::RunFinished {
+        interrupt_reason: None,
         reason: RunFinishReason::Completed,
         ts_ms: Some(3),
         usage: Usage::default(),
@@ -1747,6 +1752,7 @@ fn retained_copy(rig: &Rig, session: &BindIdentity) {
     wal.append(
         1,
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: Some(2),
             usage: Usage::default(),
@@ -1855,6 +1861,7 @@ async fn activation_corruption_is_a_staging_digest_fork_and_abort_discards_it() 
                     4,
                     1,
                     &WalRecord::RunFinished {
+                        interrupt_reason: None,
                         reason: RunFinishReason::Completed,
                         ts_ms: Some(3),
                         usage: Usage::default(),
@@ -2109,6 +2116,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
         request_identity_digest: None,
         principal: None,
         request: Box::new(broca_protocol::request::SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),

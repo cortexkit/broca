@@ -281,6 +281,7 @@ async fn materialized_import_prefix_merges_with_a_following_episode_tail() {
         submission_id: None,
     });
     writer.record(WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: Usage::default(),
@@ -351,6 +352,7 @@ async fn repair_retry_survives_a_crash_after_every_repair_record() {
     let torn_start = complete_records[0].clone();
     let repair_records = [
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -454,6 +456,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
             submission_id: None,
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -489,6 +492,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
             submission_id: None,
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -532,6 +536,7 @@ fn complete_import_records_for_test(
     prompt: &str,
 ) -> Vec<WalRecord> {
     let config = broca_wal::RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: broca_protocol::request::ModelHandle::new("import", "import"),
         tools: Vec::new().into(),
@@ -583,6 +588,7 @@ fn complete_import_records_for_test(
             submission_id: None,
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),

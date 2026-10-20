@@ -967,6 +967,7 @@ mod tests {
             session: session.clone(),
             ts_ms: Some(ts_ms),
             config: Box::new(broca_wal::RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: broca_protocol::request::ModelHandle::new("fixture", "model"),
                 tools: vec![].into(),
@@ -1009,6 +1010,7 @@ mod tests {
 
     fn run_finished(ts_ms: u64) -> broca_wal::WalRecord {
         broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: broca_protocol::RunFinishReason::Completed,
             ts_ms: Some(ts_ms),
             usage: Default::default(),

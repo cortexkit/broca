@@ -147,6 +147,7 @@ impl RunExecutor for Recording {
             submission_id: None,
         });
         job.writer.record(WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: None,
             usage: broca_protocol::Usage::default(),
@@ -514,9 +515,16 @@ async fn crash_orphan_seal_carries_previous_process_cause_without_becoming_error
     f.seed(vec![run_started(&f.key), model_step_with_tool_call()]);
     assert_eq!(f.sweep(Fixture::boot_after_seed()).await.sealed, 1);
     let records = f.records();
-    let Some(WalRecord::RunFinished { reason, error, .. }) = records.last() else {
+    let Some(WalRecord::RunFinished {
+        reason,
+        interrupt_reason,
+        error,
+        ..
+    }) = records.last()
+    else {
         panic!("the crash orphan has no durable terminal");
     };
+    assert_eq!(interrupt_reason.as_deref(), Some("runner_crash"));
     assert_eq!(*reason, RunFinishReason::Interrupted);
     let error = error.as_ref().expect("crash orphan must report its cause");
     assert_eq!(error.class, broca_protocol::ErrorClass::Transient);
@@ -959,6 +967,7 @@ async fn crash_orphan_pass_leaves_an_already_sealed_run_alone() {
         run_started(&f.key),
         model_step_with_tool_call(),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: None,
             usage: broca_protocol::Usage::default(),
@@ -1059,6 +1068,7 @@ async fn a_wal_terminal_whose_index_write_was_lost_is_repaired_not_resealed() {
         run_started(&f.key),
         model_step_with_tool_call(),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Interrupted,
             ts_ms: Some(1),
             usage,
@@ -1212,6 +1222,7 @@ async fn keyed_resend_reconciles_stale_index_to_finished() {
     f.seed(vec![
         run_started(&f.key),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: None,
             usage: broca_protocol::Usage::default(),

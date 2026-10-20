@@ -39,6 +39,7 @@ fn queued(id: &str) -> WalRecord {
         delivery: None,
         submission_id: SubmissionId(id.into()),
         request: Box::new(SubmissionRequest {
+            directives: None,
             on_restart: None,
             keep_warm: None,
             scope: Default::default(),
@@ -94,6 +95,7 @@ fn consume(run: &str, sub: &str) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("stub", "m"),
             tools: vec![].into(),

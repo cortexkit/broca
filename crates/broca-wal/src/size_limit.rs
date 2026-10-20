@@ -51,6 +51,7 @@ pub fn scoped_terminal(
 
 pub fn terminal(max_bytes: u64, ts_ms: Option<u64>, usage: Usage, retries_used: u32) -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms,
         reason: RunFinishReason::Error,
         usage,

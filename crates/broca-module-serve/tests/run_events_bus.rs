@@ -68,6 +68,7 @@ fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("fixture", "model"),
             tools: vec![].into(),
@@ -273,6 +274,7 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
         .append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(now_ms()),
                 usage: Usage::default(),
@@ -1101,6 +1103,7 @@ fn seed_history(state_root: &std::path::Path, project: &std::path::Path, count: 
             .append(
                 1,
                 &WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(hour_ago),
                     usage: Usage::default(),

@@ -139,6 +139,12 @@ fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
 /// `session.send` params. The session comes from the bound route identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendParams {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_directives"
+    )]
+    pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     /// Opaque session label, frozen on the first send; omission on later sends inherits it.
     #[serde(
         default,
@@ -334,7 +340,7 @@ pub struct SendParams {
 /// nested field name. Legacy stop-condition lists remain accepted beside the role object.
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
-    for field in ["stop_when", "generation", "tools"] {
+    for field in ["stop_when", "generation", "tools", "directives"] {
         if let Some(value) = params.get(field) {
             if field == "stop_when" && value.is_array() || field == "tools" && value.is_null() {
                 continue;
@@ -345,7 +351,17 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     request.max_steps()?;
     request.max_output_tokens()?;
     request.no_tools()?;
+    request.directives()?;
     Ok(())
+}
+
+fn deserialize_directives<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
+    request.runner_params.insert("directives".into(), value);
+    request.directives().map_err(serde::de::Error::custom)
 }
 
 fn deserialize_stop_when<'de, D: serde::Deserializer<'de>>(
@@ -1506,6 +1522,8 @@ pub enum RunStatusResponse {
         title: Option<String>,
     },
     Interrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
         /// Diagnostic cause of the interruption, when the terminal records one. Its presence
         /// does not change the run's interrupted state into an error state.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1537,6 +1555,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Completed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directives: Option<Vec<cortexkit_role_llm_runner::directives::Directive>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
@@ -2937,6 +2957,7 @@ mod tests {
         assert_eq!(
             send_params_keys(),
             &[
+                "directives",
                 "session_class",
                 "on_restart",
                 "keep_warm",
@@ -4128,6 +4149,7 @@ mod title_wire_tests {
         assert_eq!(
             status,
             RunStatusResponse::Completed {
+                directives: None,
                 final_step_finish_reason: Some(FinishReason::Stop),
                 undelivered_steers: Some(Vec::new()),
                 usage: Some(Default::default()),

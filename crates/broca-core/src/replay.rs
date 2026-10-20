@@ -2913,6 +2913,7 @@ pub(crate) mod projection_boundary_tests {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
                 config: Box::new(RunConfig {
+                    turn_directives_v1: None,
                     render_tags: false,
                     model: ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
@@ -2945,6 +2946,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -3290,6 +3292,7 @@ pub(crate) mod projection_boundary_tests {
             framed(
                 3,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),
@@ -3494,6 +3497,7 @@ pub(crate) mod deferred_tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(1),
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),

@@ -258,7 +258,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         broca_core::ChargeBasis::MeteredApi
     );
     install_test_catalog();
-    let mut req = broca_core::RunRequest { session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    let mut req = broca_core::RunRequest { directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -462,7 +462,7 @@ fn resolve_drift_revision(
 }
 
 fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
-    broca_core::RunRequest { session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    broca_core::RunRequest { directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -494,7 +494,7 @@ fn drift_run_config(
     req: &broca_core::RunRequest,
     started: &broca_catalog::live::ProviderResolution,
 ) -> broca_wal::RunConfig {
-    broca_wal::RunConfig { render_tags: false,
+    broca_wal::RunConfig { turn_directives_v1: None, render_tags: false,
         model: req.model.clone(),
         tools: req.tools.clone().into(),
         tool_choice: req.tool_choice.clone(),
@@ -513,8 +513,7 @@ fn drift_run_config(
         variant: None,
         service_tier: None,
         stop_when: vec![],
-        context_management: None,
-    }
+        context_management: None, }
 }
 
 // Keep production rendering/config identity; replace only network IO. A masked drift

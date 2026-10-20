@@ -399,6 +399,7 @@ fn cancellation_replay_and_checkpoint_are_monotonic_and_episode_scoped() {
     }
     let mut records = records;
     records.push(WalRecord::RunFinished {
+        interrupt_reason: None,
         reason: RunFinishReason::Cancelled,
         ts_ms: None,
         usage: Usage::default(),

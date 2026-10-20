@@ -140,6 +140,7 @@ fn tool(name: &str) -> Tool {
 
 fn request(dir: &std::path::Path, run: &str, model: &str, user: Message) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

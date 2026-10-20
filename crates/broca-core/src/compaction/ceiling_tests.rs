@@ -345,6 +345,7 @@ fn ceiling_records_and_terminal_require_a_named_reader_gate() {
             )),
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::ContextCeiling,
             ts_ms: None,
             error: None,

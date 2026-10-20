@@ -57,6 +57,7 @@ fn started(
 
 fn finished() -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         reason: RunFinishReason::Cancelled,
         ts_ms: None,
         usage: Usage::default(),

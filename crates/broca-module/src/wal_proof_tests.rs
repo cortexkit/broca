@@ -153,6 +153,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: broca_protocol::RunFinishReason::Completed,
                     ts_ms: None,
                     usage: Default::default(),
@@ -454,6 +455,7 @@ impl Fixture {
             "ceiling":r#"{"at_share":0.8,"wait_ms":50}"#
         })).unwrap());
         writer.record(WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: broca_protocol::RunFinishReason::Completed,
             ts_ms: None,
             error: None,

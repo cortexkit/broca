@@ -873,6 +873,7 @@ impl Fixture {
                 speed_used: None,
             },
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(200),
                 reason: broca_protocol::RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -1576,6 +1577,7 @@ async fn after_a_restart_an_attempt_without_a_status_does_not_move_the_clock() {
                 WalRecord::StepStarted { step_id: StepId(1) },
                 failed,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: Some(now_ms - 58_000),
                     reason: broca_protocol::RunFinishReason::Error,
                     usage: Usage::default(),

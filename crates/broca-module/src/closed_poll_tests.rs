@@ -77,6 +77,7 @@ impl RunExecutor for TerminalExecutor {
             });
         }
         job.writer.record(WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: self.0,
             usage: Usage::default(),
@@ -642,6 +643,7 @@ async fn large_closed_session_status_poll_cost_is_independent_of_history() {
             .append(
                 1,
                 &WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),

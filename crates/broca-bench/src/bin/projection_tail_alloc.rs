@@ -127,6 +127,7 @@ impl Fixture {
                 run_id: RunId(format!("run-{}", shape.label)),
                 session,
                 config: Box::new(RunConfig {
+                    turn_directives_v1: None,
                     render_tags: false,
                     model: ModelHandle::new("stub", "projection-bench"),
                     tools: Vec::new().into(),

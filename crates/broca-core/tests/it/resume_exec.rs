@@ -183,6 +183,7 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

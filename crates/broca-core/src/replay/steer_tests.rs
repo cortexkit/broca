@@ -37,6 +37,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
         run_id: RunId("r1".into()),
         session: BindIdentity::new("/tmp/project", "runner", "session"),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("stub", "m"),
             tools: vec![].into(),
@@ -174,6 +175,7 @@ fn tool_turn(step: u64, call: &str) -> (Vec<WalRecord>, Vec<WalRecord>) {
 
 fn run_finished(reason: RunFinishReason) -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason,
         usage: Usage::default(),

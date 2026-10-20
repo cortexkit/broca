@@ -3791,6 +3791,7 @@ async fn stale_active_reconciles_to_terminal_from_wal() {
             speed_used: None,
         });
         writer.record(broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: terminal_usage,
@@ -3916,27 +3917,25 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
         origin: broca_wal::RunOrigin::Fresh,
         submission_id: None,
     });
-    writer.record(broca_wal::WalRecord::RunFinished {
-        ts_ms: Some(101),
-        reason: RunFinishReason::Interrupted,
-        usage: Usage::default(),
-        error: Some(ProviderError {
-            provider_subcode: None,
-            refusal: None,
-            class: ErrorClass::Permanent,
-            message: "resume refused: the provider renderer version differs from the version recorded at run start".into(),
-            status: None,
-            retry_after_secs: None,
-            provider_code: Some("renderer_version_drift".into()),
-            resets_at_ms: None,
-            resets_at_source: None,
-            limit_window: None,
-            account_ref: None,
-            credential_id: None,
-            affordable_max_tokens: None,
-        }),
-        retries_used: 0,
-    });
+    writer.record(broca_wal::WalRecord::RunFinished { interrupt_reason: None, ts_ms: Some(101),
+    reason: RunFinishReason::Interrupted,
+    usage: Usage::default(),
+    error: Some(ProviderError {
+        provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::Permanent,
+        message: "resume refused: the provider renderer version differs from the version recorded at run start".into(),
+        status: None,
+        retry_after_secs: None,
+        provider_code: Some("renderer_version_drift".into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }),
+    retries_used: 0, });
     writer.sync().await.expect("fsync the core-sealed terminal");
     let _ = writer.shutdown().await;
     drop(lease);
@@ -4211,6 +4210,7 @@ fn seed_completed_run_with_queue(
     wal.append(
         seq,
         &broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: broca_protocol::caller::RunFinishReason::Completed,
             usage: broca_protocol::Usage::default(),
@@ -4246,6 +4246,7 @@ fn seed_completed_run_with_queue(
 
 fn min_run_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         tools: vec![].into(),

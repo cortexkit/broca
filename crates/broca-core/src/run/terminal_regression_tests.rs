@@ -332,6 +332,7 @@ async fn size_refusal_already_durable_owned_return_closes_steer_inbox() {
             seq: 2,
             fence: 1,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),

@@ -197,6 +197,7 @@ fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(broca_wal::RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: broca_protocol::request::ModelHandle::new("profile", "model"),
             tools: vec![].into(),
@@ -239,6 +240,7 @@ fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
 
 fn run_finished(ts_ms: u64) -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         reason: RunFinishReason::Completed,
         ts_ms: Some(ts_ms),
         usage: Default::default(),

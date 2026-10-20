@@ -31,6 +31,7 @@ pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/retention-test", "runner", "session"),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: Default::default(),
@@ -87,6 +88,7 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
         },
         WalRecord::TurnFinished { step_id: StepId(1) },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(2000),
             reason: RunFinishReason::Completed,
             usage: Usage::default(),

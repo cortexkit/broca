@@ -83,6 +83,7 @@ fn retained_wal(root: &Path, key: &BindIdentity, activity_ms: u64, retention_s: 
     wal.append(
         1,
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(activity_ms),
             reason: broca_protocol::RunFinishReason::Completed,
             usage: Default::default(),
@@ -306,6 +307,7 @@ async fn fixture<F: WireFamily + 'static>(
         vec![]
     };
     let request = RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

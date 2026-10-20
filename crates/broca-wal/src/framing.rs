@@ -148,6 +148,8 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 /// Framing version of a gated record: its payload is `{"requires": [...], "record": ...}`,
 /// and a reader must know every feature name in `requires` before it interprets `record`.
 pub const GATED_FRAMING_VERSION: u8 = 3;
+pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
+pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
@@ -161,6 +163,8 @@ pub const GATED_FRAMING_VERSION: u8 = 3;
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    INTERRUPT_REASON_FEATURE,
+    TURN_DIRECTIVES_FEATURE,
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
     COMPACTION_VIEW_FEATURE,
@@ -907,6 +911,8 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                INTERRUPT_REASON_FEATURE,
+                TURN_DIRECTIVES_FEATURE,
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
                 COMPACTION_VIEW_FEATURE,

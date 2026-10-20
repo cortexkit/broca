@@ -46,6 +46,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         run_id: RunId(format!("run-{effort}")),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("chatgpt", model),
             tools: vec![].into(),
@@ -88,6 +89,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
 
 fn finish() -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: Usage::default(),

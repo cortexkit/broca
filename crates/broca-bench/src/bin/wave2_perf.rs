@@ -471,6 +471,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
         speed_used: None,
     });
     writer.record(WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: Usage {
@@ -486,6 +487,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
 
 fn request(session: &BindIdentity, episode: usize) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

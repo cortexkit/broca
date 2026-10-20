@@ -7450,6 +7450,7 @@ test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::append_repairs_inferred_prior_terminal_before_refusing_new_admission_at_cap"]
 file = "crates/broca-core/src/run.rs"
 old = '''            writer.record_terminal(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: control.now_ms(),
                 reason: *last_reason,
                 usage: prior.usage,
@@ -7457,6 +7458,7 @@ old = '''            writer.record_terminal(WalRecord::RunFinished {
                 error: None,
             })?;'''
 new = '''            writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: control.now_ms(), reason: *last_reason, usage: prior.usage,
                 retries_used: prior.retries_used, error: None,
             }).into_result()?; // NON-VACUITY BREAK: sticky refusal blocks prior repair'''
@@ -18764,3 +18766,326 @@ expect_message = "a resume must retain the cap frozen at admission"
 file = "crates/broca-catalog/src/live.rs"
 old = "        restored_max_tokens.unwrap_or_else(|| {"
 new = "        restored_max_tokens.filter(|_| caller_max_tokens.is_none()).unwrap_or_else(|| { // NON-VACUITY BREAK: re-clamp an explicit cap on resume."
+
+[[control]]
+id = "wal-interrupt-reason-reader-feature"
+guards = "Only terminals carrying interrupt provenance require interrupt-reason/v1"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/record/pinned_bytes_tests.rs"
+expect_red = ["record::pinned_bytes_tests::interrupt_reason_and_directives_require_named_reader_features_only_when_present"]
+file = "crates/broca-wal/src/record.rs"
+old = "with_feature(base, crate::framing::INTERRUPT_REASON_FEATURE)"
+new = "base // NON-VACUITY BREAK: omit the interrupt provenance reader gate"
+
+[[control]]
+id = "wal-turn-directives-reader-feature"
+guards = "Only opted-in runs and queued sends require turn-directives/v1"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/record/pinned_bytes_tests.rs"
+expect_red = ["record::pinned_bytes_tests::interrupt_reason_and_directives_require_named_reader_features_only_when_present"]
+file = "crates/broca-wal/src/record.rs"
+old = "with_feature(base, crate::framing::TURN_DIRECTIVES_FEATURE)"
+new = "base // NON-VACUITY BREAK: omit the frozen directive grammar reader gate"
+
+[[control]]
+id = "seal-planned-stop-reason"
+guards = "The actor records runner_shutdown when a planned stop seals a live run"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/shutdown_tests.rs"
+expect_red = ["actor::shutdown_tests::shutdown_seal_does_not_claim_previous_process_ended_unsealed"]
+file = "crates/broca-module/src/actor.rs"
+old = '_ => "runner_shutdown",'
+new = '_ => "runner_crash", // NON-VACUITY BREAK: misclassify a planned stop'
+
+[[control]]
+id = "seal-crash-orphan-reason"
+guards = "Boot orphan sealing records runner_crash rather than claiming an orderly stop"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/crash_orphan_tests.rs"
+expect_red = ["actor::crash_orphan_tests::crash_orphan_seal_carries_previous_process_cause_without_becoming_error"]
+file = "crates/broca-module/src/actor.rs"
+old = 'SealCause::CrashOrphan => "runner_crash",'
+new = 'SealCause::CrashOrphan => "runner_shutdown", // NON-VACUITY BREAK: erase crash provenance'
+
+[[control]]
+id = "serve-interrupt-reason-preserves-absence"
+guards = "Status and result report only the recorded interruption provenance, including absent legacy seals"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::interrupt_reason_surfaces_recorded_values_and_leaves_old_seals_absent"]
+file = "crates/broca-module/src/serve.rs"
+old = 'reason = interrupt_reason.clone(),'
+new = 'reason = interrupt_reason.clone().or_else(|| Some("runner_shutdown".into())), // NON-VACUITY BREAK: guess a legacy seal cause'
+
+[[control]]
+id = "serve-turn-directives-stored-final-text"
+guards = "Completed runs parse stored joined text with the role parser, including tool-interleaved text vectors"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::completed_directives_match_all_published_vectors_and_old_run_bytes"]
+file = "crates/broca-module/src/serve.rs"
+old = 'cortexkit_role_llm_runner::directives::parse_trailing(text)'
+new = 'cortexkit_role_llm_runner::directives::parse_trailing(text).filter(|_| false) // NON-VACUITY BREAK: discard the parsed directive'
+
+[[control]]
+id = "serve-wake-v1-old-answer-pinned"
+guards = "The wake-v1 grammar on an admitted run keeps its independent byte-pinned answer across crate updates"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::wake_v1_frozen_run_answer_is_pinned_independently_of_current_vectors"]
+file = "crates/broca-module/src/serve.rs"
+old = 'cortexkit_role_llm_runner::directives::parse_trailing(text)'
+new = 'cortexkit_role_llm_runner::directives::parse_trailing(text).filter(|_| false) // NON-VACUITY BREAK: change an old run answer'
+
+[[control]]
+id = "run-tool-call-sibling-position"
+guards = "Tool-call positions match source block order in the actual session.read message"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix_and_open_batch"]
+file = "crates/broca-module/src/serve.rs"
+old = '.with_position(position as u32),'
+new = '.with_position(position as u32 + 1), // NON-VACUITY BREAK: shift sibling positions'
+
+[[control]]
+id = "run-tool-call-result-ordinal"
+guards = "Finished batches name the real session.read tool message while open batches omit result_ordinal"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix_and_open_batch"]
+file = "crates/broca-module/src/serve.rs"
+old = 'builder.call.result_ordinal = Some(active_step_ordinal + 1);'
+new = 'builder.call.result_ordinal = Some(active_step_ordinal); // NON-VACUITY BREAK: point at the assistant instead of the tool message'
+
+[[control]]
+id = "core-drain-interrupt-provenance"
+guards = "A run ending at the graceful drain boundary durably reports runner_shutdown"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/graceful_stop.rs"
+expect_red = ["graceful_stop::a_stop_during_a_tool_call_lets_it_finish_and_starts_no_next_step"]
+file = "crates/broca-core/src/run.rs"
+old = 'interrupt_reason: sealed_interrupt_reason(control, reason, interrupt_reason),'
+new = 'interrupt_reason: sealed_interrupt_reason(control, reason, interrupt_reason).filter(|_| false), // NON-VACUITY BREAK: drop drain provenance'
+
+[[control]]
+id = "core-directives-frozen-at-admission"
+guards = "A queued directive opt-in reaches RunStarted without changing the renderer version"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/run_loop.rs"
+expect_red = ["run_loop::directives_opt_in_is_frozen_at_admission_and_survives_queue_round_trip"]
+file = "crates/broca-core/src/run.rs"
+old = 'turn_directives_v1: req.directives.clone(),'
+new = 'turn_directives_v1: req.directives.clone().filter(|_| false), // NON-VACUITY BREAK: forget the admitted opt-in'
+
+[[control]]
+id = "steer-directives-cannot-change-frozen-run"
+guards = "A joining steer inherits omitted directives but cannot explicitly change the admitted names"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::joining_steer_directives_are_frozen_and_omission_inherits"]
+file = "crates/broca-module/src/actor.rs"
+old = 'return Some("directives");'
+new = 'return None; // NON-VACUITY BREAK: accept changed directives on a joining steer'
+
+[[control]]
+id = "core-shutdown-handover-interrupt-provenance"
+guards = "A tool outcome racing the actor's explicit shutdown handover cannot erase runner_shutdown"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/graceful_stop.rs"
+expect_red = ["graceful_stop::shutdown_handover_keeps_provenance_when_an_inflight_tool_returns_ambiguous"]
+file = "crates/broca-core/src/run.rs"
+old = 'Some("runner_shutdown".into())'
+new = 'None // NON-VACUITY BREAK: discard the explicit shutdown seal provenance'
+
+[[control]]
+id = "core-drain-before-actor-seal-provenance"
+guards = "A daemon drain followed by a lost tool transport keeps runner_shutdown before actor seal handover"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/graceful_stop.rs"
+expect_red = ["graceful_stop::planned_drain_keeps_provenance_when_a_tool_closes_before_actor_seal"]
+file = "crates/broca-core/src/run.rs"
+old = 'Some("runner_shutdown".into())'
+new = 'None // NON-VACUITY BREAK: discard the explicit drain provenance'
+
+[[control]]
+id = "core-no-planned-stop-means-no-interrupt-provenance"
+guards = "An ordinary ambiguous tool outcome must not invent planned-stop or crash provenance"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--test it"
+test_file = "crates/broca-core/tests/it/run_loop.rs"
+expect_red = ["run_loop::an_ambiguous_tool_without_a_planned_stop_has_no_interrupt_provenance"]
+file = "crates/broca-core/src/run.rs"
+old = 'if reason == RunFinishReason::Interrupted && planned_stop {'
+new = 'if reason == RunFinishReason::Interrupted && (planned_stop || true) { // NON-VACUITY BREAK: guess a shutdown without an explicit stop'
+
+[[control]]
+id = "wire-current-usage-goldens-keep-counters"
+guards = "A full current usage golden cannot lose measured counters through legacy fixture normalization"
+runner = "cargo"
+select = "expected"
+package = "broca-wire"
+target = "--lib"
+test_file = "crates/broca-wire/tests/support/run_usage.rs"
+expect_red = ["usage_compat::tests::full_usage_golden_is_not_normalized"]
+file = "crates/broca-wire/tests/support/run_usage.rs"
+old = 'if golden_body.usage.is_some_and(|usage| {'
+new = 'if false && golden_body.usage.is_some_and(|usage| { // NON-VACUITY BREAK: strip current counters too'
+
+[[control]]
+id = "status-optional-reader-keeps-terminal-answer"
+guards = "Optional WAL metadata cannot make an indexed terminal status or identical-send replay fail when the external reader is unavailable"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::same_send_id_same_prompt_reuses_one_episode"]
+file = "crates/broca-module/src/serve.rs"
+old = 'self.read_durable_wal(session).await.ok().map(|read| read.0)'
+new = 'Some(self.read_durable_wal(session).await?.0) // NON-VACUITY BREAK: require the optional transcript reader'
+
+[[control]]
+id = "status-unreadable-final-text-omits-directives"
+guards = "A completed status remains answerable without readable final text even when wake directives were requested"
+runner = "cargo"
+select = "expected"
+package = "broca-module"
+target = "--lib"
+test_file = "crates/broca-module/src/serve/run_tool_calls_tests.rs"
+expect_red = ["serve::run_tool_calls_tests::completed_status_without_final_text_omits_directives"]
+file = "crates/broca-module/src/serve.rs"
+old = '''final_message_of(records, &run_id)
+                    .ok()'''
+new = '''Some(final_message_of(records, &run_id)?) // NON-VACUITY BREAK: require optional completed text'''
+
+[[control]]
+id = "ordered-retract-removes-live-copy"
+guards = "A retracted ordered send is removed from the live inbox before either tool-result or step delivery"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/steer.rs"
+expect_red = ["steer::retract_tests::retract_removes_ordered_send_before_tool_or_step_delivery"]
+file = "crates/broca-core/src/steer.rs"
+old = '.retain(|send| &send.submission_id != submission_id);'
+new = '.retain(|send| &send.submission_id == submission_id); // NON-VACUITY BREAK: retain the withdrawn send'
+
+[[control]]
+id = "ordered-retract-respects-delivery-winner"
+guards = "A stale pending snapshot cannot record a retraction after boundary delivery consumed the send"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/steer.rs"
+expect_red = ["steer::retract_tests::a_delivered_ordered_send_cannot_be_retracted_from_a_stale_snapshot"]
+file = "crates/broca-core/src/steer.rs"
+old = 'if state.consumed.contains(submission_id) {'
+new = 'if false && state.consumed.contains(submission_id) { // NON-VACUITY BREAK: retract after delivery won'
+
+[[control]]
+id = "actor-ordered-retract-updates-live-inbox"
+platforms = ["linux", "macos"]
+guards = "A pending tool-result send retracted through the real daemon cannot later enter the transcript"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["pending_delivery_order_send_is_retracted_before_tool_result"]
+file = "crates/broca-module/src/actor.rs"
+old = 'steer.retract_ordered(&submission_id, record)'
+new = '{ let _ = steer; record(); true } // NON-VACUITY BREAK: leave the inbox copy deliverable'
+
+[[control]]
+id = "delivered-steer-resend-never-regresses-to-pending"
+guards = "A delivered steer's resend and send.status name the joined run as active then finished with the same step receipt"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--test it"
+features = ["test-clock"]
+test_file = "crates/broca-module-serve/tests/it/provisional_run_status.rs"
+expect_red = ["provisional_run_status::a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart"]
+file = "crates/broca-module/src/actor.rs"
+old = '''        // The running loop can deliver an ordered send while this actor stays active. Drop
+        // those stale queue entries before a retry can incorrectly answer pending again.
+        if let RunState::Active { steer, .. } = &self.state {
+            let consumed = steer.take_consumed();'''
+new = '''        // The running loop can deliver an ordered send while this actor stays active. Drop
+        // those stale queue entries before a retry can incorrectly answer pending again.
+        if let RunState::Active { steer, .. } = &self.state {
+            let consumed = { let _ = steer; Vec::new() }; // NON-VACUITY BREAK: keep the stale pending cache'''
+
+[[control]]
+id = "delivery-list-requires-a-declared-mode"
+guards = "An entirely undeclared delivery list is refused with delivery_unsupported and the original detail.delivery array"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::delivery_list_tests::undeclared_delivery_lists_match_published_refusal_vectors"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = 'if modes.iter().any(|mode| mode.is_declared(declared)) {'
+new = 'if true || modes.iter().any(|mode| mode.is_declared(declared)) { // NON-VACUITY BREAK: accept undeclared lists'
+
+[[control]]
+id = "delivery-list-one-declared-mode-is-enough"
+guards = "A delivery list with a declared fallback is accepted unchanged even when earlier modes are undeclared"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::delivery_list_tests::one_declared_mode_keeps_the_original_delivery_list_accepted"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = 'if modes.iter().any(|mode| mode.is_declared(declared)) {'
+new = 'if modes.iter().all(|mode| mode.is_declared(declared)) { // NON-VACUITY BREAK: require every mode to be declared'

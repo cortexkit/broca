@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 
 fn run_config() -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
@@ -266,6 +267,7 @@ fn replay_resets_last_step_usage_when_new_episode_starts() {
         step_text_with_usage(1, "done", prior_last_step),
         WalRecord::TurnFinished { step_id: StepId(1) },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: prior_last_step,
@@ -425,6 +427,7 @@ fn run_finished_after_indeterminate_intent_seals_without_committing_partial_turn
         batch_started("b1", 1, &["t1"]),
         intent("b1", "t1"),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -489,6 +492,7 @@ fn row_hard_stop_terminal_includes_result_never_redispatch() {
         result("b1", "t1", DispatchOutcome::MaxSteps),
         batch_finished("b1"),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::MaxSteps,
             usage: Usage::default(),
@@ -602,6 +606,7 @@ fn row_run_finished_is_terminal() {
         step_text(1, "done"),
         WalRecord::TurnFinished { step_id: StepId(1) },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -682,6 +687,7 @@ fn tool_then_text() -> Vec<Vec<NormalizedEvent>> {
 
 fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -893,6 +899,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
     });
     let lease = FileLeaseStore::new(dir.join("lease"));
     let req = RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -1435,6 +1442,7 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
 /// A text-only request that runs one model step and ends `Completed`.
 fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -1549,6 +1557,7 @@ async fn later_episode_copies_first_marker_order_including_absence() {
             .append(
                 1,
                 &WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     usage: Usage::default(),
                     retries_used: 0,
@@ -2348,6 +2357,7 @@ async fn cross_episode_resume_is_exactly_once() {
 
     // A tool request whose model calls `edit` once, then answers.
     let req1 = RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -2826,6 +2836,7 @@ async fn append_episode_cannot_introduce_a_system_prompt_mid_lineage() {
 /// resume, so this id is only the caller's handle).
 fn req2(session: &BindIdentity) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -3441,6 +3452,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Interrupted,
                 usage: Usage::default(),

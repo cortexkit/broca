@@ -332,6 +332,7 @@ pub async fn run_live<F: WireFamily + 'static>(
     });
     let req_input = input.clone();
     let req = RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

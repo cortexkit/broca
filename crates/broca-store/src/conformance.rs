@@ -353,6 +353,7 @@ where
     records.push(framed(
         1,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: Some(2),
             usage: Usage::default(),
@@ -531,6 +532,7 @@ fn export_records_with_account(
         framed(
             1,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(2),
                 usage: Usage::default(),
@@ -1133,6 +1135,7 @@ where
     repaired_records.push(framed(
         4,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1145,6 +1148,7 @@ where
     missing_records.push(framed(
         4,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1398,6 +1402,7 @@ where
     no_origin_records.push(framed(
         1,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1530,6 +1535,7 @@ where
     records.push(framed(
         4,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1558,6 +1564,7 @@ where
     records.push(framed(
         9,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1617,6 +1624,7 @@ where
     records.push(framed(
         5,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1822,6 +1830,7 @@ where
     recs.push(framed(
         4,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1847,6 +1856,7 @@ where
     recs.push(framed(
         5,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -1918,6 +1928,7 @@ where
         framed(
             2,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Interrupted,
                 usage: Usage::default(),
@@ -1959,6 +1970,7 @@ where
         framed(
             4,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -1995,6 +2007,7 @@ pub fn admission_checkpoint_empty_roundtrip_and_incremental_equivalence<S: Sessi
     records.push(framed(
         4,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -2366,6 +2379,7 @@ pub(crate) fn run_started(
             run_id: RunId(run_id.into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model,
                 tools: vec![].into(),

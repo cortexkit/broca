@@ -560,6 +560,7 @@ mod tests {
                     session: broca_protocol::BindIdentity::new("/tmp/project", "harness", "s"),
                     ts_ms: Some(100),
                     config: Box::new(broca_wal::RunConfig {
+                        turn_directives_v1: None,
                         render_tags: false,
                         model: broca_protocol::request::ModelHandle::new(provider, "model"),
                         tools: Vec::new().into(),
@@ -595,6 +596,7 @@ mod tests {
             framed(
                 2,
                 broca_wal::WalRecord::RunFinished {
+                    interrupt_reason: None,
                     ts_ms: Some(200),
                     reason: broca_protocol::caller::RunFinishReason::Completed,
                     usage: broca_protocol::Usage::default(),

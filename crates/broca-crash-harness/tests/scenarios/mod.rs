@@ -149,6 +149,7 @@ pub fn one_text_step_scripts() -> Vec<Vec<NormalizedEvent>> {
 
 pub fn edit_request() -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,

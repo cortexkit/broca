@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, Notify};
 
 fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -349,6 +350,7 @@ impl LineageOpener for RecOpener {
 
 fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -647,6 +649,7 @@ async fn drained_run_renders_identical_bytes_to_idle_send() {
 
 fn recovered_stop_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         tools: vec![Tool {

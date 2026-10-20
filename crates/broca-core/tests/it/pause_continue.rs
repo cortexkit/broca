@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -116,6 +117,7 @@ fn edit_tool() -> Tool {
 
 fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -183,6 +185,7 @@ fn seed_resume_without_terminal(
             session: session.clone(),
             ts_ms: None,
             config: Box::new(RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: ModelHandle::new("stub", "m"),
                 tools: vec![edit_tool()].into(),

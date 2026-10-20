@@ -131,6 +131,7 @@ fn seed_first_run(
     wal.append(
         1,
         &broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(finished_ms),
             reason: broca_protocol::RunFinishReason::Completed,
             usage: Default::default(),

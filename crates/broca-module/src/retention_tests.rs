@@ -326,6 +326,7 @@ fn started(key: &BindIdentity, run: &str, retention: Option<u64>, ts: u64) -> Wa
 }
 fn finished(ts: u64) -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: Some(ts),
         reason: RunFinishReason::Completed,
         usage: Default::default(),

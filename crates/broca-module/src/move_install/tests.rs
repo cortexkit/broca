@@ -28,6 +28,7 @@ pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: vec![].into(),
@@ -59,6 +60,7 @@ pub(crate) fn episode(wal: &mut dyn broca_wal::Wal, session: &BindIdentity, id: 
     wal.append(
         1,
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: Some(1),
             usage: Usage::default(),

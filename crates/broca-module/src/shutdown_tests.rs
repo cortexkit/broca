@@ -120,6 +120,7 @@ impl RunExecutor for DispatchHeld {
         if let Some(finish) = &self.finish {
             finish.notified().await;
             job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms: None,
                 usage: broca_protocol::Usage::default(),
@@ -380,6 +381,9 @@ async fn shutdown_seal_does_not_claim_previous_process_ended_unsealed() {
     f.start().await;
     f.stop().await;
     let records = f.records();
+    assert!(
+        matches!(records.last(), Some(WalRecord::RunFinished { interrupt_reason: Some(reason), .. }) if reason == "runner_shutdown")
+    );
     assert!(
         matches!(
             records.last(),

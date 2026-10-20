@@ -483,6 +483,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -612,6 +613,7 @@ async fn fresh_lineage_read_twice_returns_the_same_lineage_id() {
             started(&key, "run-stable", "hello"),
             assistant_text(0, "world"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -657,6 +659,7 @@ async fn range_projection_persists_lineage_with_its_page_checkpoint() {
             started(&key, "run-persisted", "hello"),
             assistant_text(0, "world"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -717,6 +720,7 @@ async fn legacy_store_snapshot_without_lineage_id_keeps_the_incremental_read() {
             started(&key, "run-legacy-store", "legacy prompt"),
             assistant_text(0, "legacy answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -785,6 +789,7 @@ async fn lineage_mismatch_replays_from_zero_and_repairs_the_store_once() {
             started(&key, "run-old", "old prompt"),
             assistant_text(0, "old answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -819,6 +824,7 @@ async fn lineage_mismatch_replays_from_zero_and_repairs_the_store_once() {
             started(&key, "run-new", "new prompt"),
             assistant_text(0, "new answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -905,6 +911,7 @@ async fn error_terminal_read_envelope_populates_the_lineage_error_block() {
             started(&key, "run-errored", "hello"),
             assistant_text(0, "partial answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Error,
                 usage: usage(),
@@ -988,6 +995,7 @@ fn errored_run(key: &BindIdentity, run: &str, error: Option<ProviderError>) -> V
         started(key, run, "hello"),
         assistant_text(0, "partial answer"),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Error,
             usage: usage(),
@@ -1179,6 +1187,7 @@ async fn run_status_without_a_cause_omits_the_cause_keys() {
             started(&completed, "run-done", "hello"),
             assistant_text(0, "answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -1477,6 +1486,7 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: ModelHandle::new("stub", "stub-model"),
         tools: vec![tool("lookup")].into(),
@@ -1639,6 +1649,7 @@ async fn terminal_lineage_usage_requires_a_completed_model_step() {
         &[
             started(&no_step_key, "run-no-step", "hello"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Error,
                 usage: Usage::default(),
@@ -1670,6 +1681,7 @@ async fn terminal_lineage_usage_requires_a_completed_model_step() {
             started(&zero_step_key, "run-zero-step", "hello"),
             assistant_text_with_usage(1, "done", Usage::default()),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -1705,6 +1717,7 @@ async fn foreign_session_cannot_read_terminal_index_metadata() {
             started(&owner, "run-owned", "hello"),
             assistant_text(0, "done"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -1759,6 +1772,7 @@ async fn legacy_terminal_index_row_reconciles_metadata_from_wal() {
             started(&key, "run-legacy", "hello"),
             assistant_text(0, "done"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -1819,6 +1833,7 @@ async fn foreign_session_cannot_read_legacy_terminal_index_state() {
             started(&owner, "run-legacy-owned", "hello"),
             assistant_text(0, "done"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -2379,6 +2394,7 @@ async fn check_scoped_session_reads(agent_run: bool) {
         record
     };
     let finished = || WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: usage(),
@@ -2509,6 +2525,7 @@ async fn session_read_and_projection_decode_a_manifest_session() {
         record
     };
     let finished = || WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: usage(),
@@ -2640,6 +2657,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
         WalRecord::TurnFinished { step_id: StepId(0) },
         assistant_text(1, &format!("{run} answer")),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: usage(),
@@ -2868,6 +2886,7 @@ async fn read_paging_defaults_and_no_actor_invariant() {
             started(&key, "run-complete", "hello"),
             assistant_text(0, "one"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -2933,6 +2952,7 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
             started(&key, "run-before-read", "before"),
             assistant_text(0, "before reply"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -2965,6 +2985,7 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
             started(&key, "run-after-read", "after"),
             assistant_text(0, "after reply"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -3120,6 +3141,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         started(&key, "first-run", "first question"),
         assistant_text(0, "first answer"),
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: usage(),
@@ -3351,6 +3373,7 @@ async fn archived_session_read_matches_live_page_without_extracting() {
             started(&key, "r", "archive prompt"),
             assistant_text(0, "archive answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -3407,6 +3430,7 @@ async fn missing_live_wal_rejects_indexed_store_prefix_even_without_archive() {
             started(&key, "r", "projected prompt"),
             assistant_text(0, "projected answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -3511,6 +3535,7 @@ async fn folded_session_send_preserves_lineage_identity_and_archived_prefix() {
             start,
             assistant_text(0, "original answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: Some(1),
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -3588,6 +3613,7 @@ async fn folded_session_send_preserves_lineage_identity_and_archived_prefix() {
 
 fn finished_ok() -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason: RunFinishReason::Completed,
         usage: usage(),
@@ -3917,6 +3943,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
             WalRecord::StepStarted { step_id: StepId(2) },
             assistant_text(2, "written up"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),
@@ -4217,6 +4244,7 @@ async fn an_imported_message_never_takes_a_real_steps_attribution() {
     let mut records = vec![
         import,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: usage(),

@@ -138,6 +138,7 @@ mod gated {
 
     fn request(dir: &std::path::Path) -> RunRequest {
         RunRequest {
+            directives: None,
             session_class: None,
             retention: None,
             title: None,
@@ -270,6 +271,7 @@ mod gated {
             .open(&request.session)
             .expect("open WAL for resumable seed");
         let config = RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: request.model.clone(),
             tools: request.tools.clone().into(),

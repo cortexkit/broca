@@ -773,6 +773,7 @@ fn stopped_run_projection_is_bounded_by_open_calls_and_prunes_terminals() {
             seq,
             fence: 0,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Cancelled,
                 ts_ms: None,
                 usage: Usage::default(),
@@ -845,6 +846,7 @@ fn released_0_3_199_projection_reader_accepts_stop_facts_cache_bytes() {
             seq: 6,
             fence: 0,
             record: WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Cancelled,
                 ts_ms: None,
                 usage: Usage::default(),
@@ -874,6 +876,7 @@ fn legacy_projection_suffix_remains_unknown_until_complete_origin_fold() {
         records.push(prepared("c", "b"));
         records.push(approval("c", &key, broca_wal::DeferredDecision::Expired));
         records.push(WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: if stopped {
                 RunFinishReason::Cancelled
             } else {

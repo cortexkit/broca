@@ -10,6 +10,7 @@ fn seed(rig: &Rig, key: &BindIdentity) {
             started(key, "old", "old input"),
             assistant_text(1, "old answer"),
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: usage(),

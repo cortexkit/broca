@@ -1798,6 +1798,7 @@ mod tests {
 
     fn interrupted() -> WalRecord {
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -1853,6 +1854,7 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    turn_directives_v1: None,
                     render_tags: false,
                     model: broca_protocol::request::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
@@ -1961,6 +1963,7 @@ mod tests {
                 speed_used: None,
             },
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -2468,6 +2471,7 @@ mod tests {
         interrupted_snapshot.completed_steps = 0;
         assert!(!interrupted_snapshot.rows.is_empty());
         let interrupted_tail = self::framed(&[WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -2567,6 +2571,7 @@ mod tests {
             affordable_max_tokens: None,
         };
         *wal.last_mut().expect("sample has RunFinished") = WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Error,
             usage: terminal_usage,
@@ -2728,6 +2733,7 @@ mod tests {
             assert_eq!(before.messages.len(), 1, "no intent means no open turn");
             assert_eq!(before.messages[0].message.role, Role::User);
             wal.push(WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Interrupted,
                 ts_ms: None,
                 usage: Usage::default(),
@@ -2834,6 +2840,7 @@ mod tests {
         };
         let last = wal.last_mut().expect("sample has terminal");
         *last = WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Error,
             usage: Usage::default(),
@@ -2864,6 +2871,7 @@ mod episode_merge_regression {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("stub", model),
             tools: Vec::new().into(),
@@ -2952,6 +2960,7 @@ mod episode_merge_regression {
                 speed_used: None,
             },
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: a_usage,

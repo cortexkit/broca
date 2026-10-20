@@ -583,6 +583,9 @@ pub enum WalRecord {
     /// episode terminal; it does NOT seal the lineage (a later `RunStarted` may open
     /// the next episode). `error` is populated only when `reason == Error`.
     RunFinished {
+        /// The interrupt reason recorded with this terminal; never inferred for older records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupt_reason: Option<String>,
         reason: RunFinishReason,
         /// Wall-clock terminal time, when available. Older WALs omit this metadata.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1211,6 +1214,27 @@ impl WalRecord {
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
         let base = self.base_required_features();
+        let base = if matches!(
+            self,
+            WalRecord::RunFinished {
+                interrupt_reason: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::INTERRUPT_REASON_FEATURE)
+        } else {
+            base
+        };
+        let has_directives = match self {
+            WalRecord::RunStarted { config, .. } => config.turn_directives_v1.is_some(),
+            WalRecord::Queued { request, .. } => request.directives.is_some(),
+            _ => false,
+        };
+        let base = if has_directives {
+            with_feature(base, crate::framing::TURN_DIRECTIVES_FEATURE)
+        } else {
+            base
+        };
         let scope = match self {
             WalRecord::RunStarted { scope, .. } => scope.as_ref(),
             WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
@@ -2070,6 +2094,10 @@ pub enum SeedOriginKind {
 /// across a run and its resume.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
+    /// Opts a run into the role crate's stable wake-directive grammar. Replay always uses
+    /// that grammar with `parse_trailing`; a grammar change needs a new versioned field/name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_directives_v1: Option<Vec<broca_protocol::request::DirectiveName>>,
     pub model: ModelHandle,
     /// Tools WITH ORDER preserved (a reorder would change the rendered bytes).
     pub tools: Arc<Vec<Tool>>,
@@ -2543,6 +2571,7 @@ mod schema_tests {
     #[test]
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
         let config = RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("p", "m"),
             tools: Arc::new(vec![Tool {
@@ -2651,6 +2680,7 @@ mod schema_tests {
 
     fn min_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new("p", "m"),
             tools: vec![].into(),
@@ -2897,6 +2927,7 @@ mod schema_tests {
             speed_used: None,
         };
         let terminal = WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -3447,6 +3478,7 @@ mod schema_tests {
                 call_key: None,
             },
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Error,
                 usage: Usage::default(),
@@ -3493,6 +3525,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    directives: None,
                     on_restart: None,
                     keep_warm: None,
                     scope: Default::default(),
@@ -3560,6 +3593,7 @@ mod schema_tests {
         const FINISHED: &str = r#"{"type":"run_finished","reason":"error","ts_ms":1790000000000,"usage":{},"error":{"class":"transient","message":"429: rate limited","status":429,"retry_after_secs":353271.0,"provider_code":"rate_limit_error"},"retries_used":1}"#;
         const PAUSED: &str = r#"{"type":"run_paused","run_id":"r1","ts_ms":1790000000001,"reason":"auth_required","error":{"class":"auth_required","message":"needs reauth","status":401,"provider_code":"authentication_error"}}"#;
         let finished = WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(1_790_000_000_000),
             reason: RunFinishReason::Error,
             usage: Usage::default(),
@@ -3614,27 +3648,25 @@ mod schema_tests {
     #[test]
     fn account_limit_terminal_error_has_pinned_bytes() {
         const FINISHED: &str = r#"{"type":"run_finished","reason":"error","ts_ms":1790387965000,"usage":{},"error":{"class":"transient","message":"429: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit. Please try again later.\"},\"request_id\":\"req_011CfRDPYNrfveajQccKCJ7o\"}","status":429,"retry_after_secs":352835.0,"provider_code":"account_limit_exhausted","resets_at_ms":1790740800000,"limit_window":"seven_day","account_ref":"d4bc9dbc"},"retries_used":0}"#;
-        let record = WalRecord::RunFinished {
-            ts_ms: Some(1_790_387_965_000),
-            reason: RunFinishReason::Error,
-            usage: Usage::default(),
-            error: Some(ProviderError {
-                provider_subcode: None,
-                refusal: None,
-                class: ErrorClass::Transient,
-                message: r#"429: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CfRDPYNrfveajQccKCJ7o"}"#.into(),
-                status: Some(429),
-                retry_after_secs: Some(352_835.0),
-                provider_code: Some(broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.into()),
-                resets_at_ms: Some(1_790_740_800_000),
-                resets_at_source: None,
-                limit_window: Some("seven_day".into()),
-                account_ref: Some("d4bc9dbc".into()),
-                credential_id: None,
-                affordable_max_tokens: None,
-            }),
-            retries_used: 0,
-        };
+        let record = WalRecord::RunFinished { interrupt_reason: None, ts_ms: Some(1_790_387_965_000),
+        reason: RunFinishReason::Error,
+        usage: Usage::default(),
+        error: Some(ProviderError {
+            provider_subcode: None,
+            refusal: None,
+            class: ErrorClass::Transient,
+            message: r#"429: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CfRDPYNrfveajQccKCJ7o"}"#.into(),
+            status: Some(429),
+            retry_after_secs: Some(352_835.0),
+            provider_code: Some(broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.into()),
+            resets_at_ms: Some(1_790_740_800_000),
+            resets_at_source: None,
+            limit_window: Some("seven_day".into()),
+            account_ref: Some("d4bc9dbc".into()),
+            credential_id: None,
+            affordable_max_tokens: None,
+        }),
+        retries_used: 0, };
         assert_eq!(serde_json::to_string(&record).unwrap(), FINISHED);
         assert_eq!(serde_json::from_str::<WalRecord>(FINISHED).unwrap(), record);
     }
@@ -3670,6 +3702,7 @@ mod schema_tests {
             affordable_max_tokens: None,
         };
         let finished = |ts_ms, error, retries_used| WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: Some(ts_ms),
             reason: RunFinishReason::Error,
             usage: Usage::default(),
@@ -3750,6 +3783,7 @@ mod schema_tests {
     #[test]
     fn run_finished_round_trip_preserves_provider_unavailable_error_class() {
         let record = WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Error,
             usage: Usage::default(),

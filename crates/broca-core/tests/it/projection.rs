@@ -40,6 +40,7 @@ fn framed(seq: u64, record: WalRecord) -> FramedRecord {
 
 fn run_config() -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
@@ -183,6 +184,7 @@ fn sample_records() -> Vec<FramedRecord> {
         framed(
             9,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -321,6 +323,7 @@ fn run_terminal_carries_last_recorded_step_finish_reason() {
         framed(
             3,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -415,6 +418,7 @@ fn interrupted_projection_matches_replay_and_excludes_abandoned_call() {
     records.push(framed(
         10,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Interrupted,
             usage: Usage::default(),
@@ -451,6 +455,7 @@ fn clean_interrupted_terminal_projects_present_empty_set() {
         framed(
             2,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Interrupted,
                 usage: Usage::default(),
@@ -503,6 +508,7 @@ fn completed_terminal_omits_indeterminate_set() {
         framed(
             4,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage: Usage::default(),
@@ -537,6 +543,7 @@ fn run_terminal_usage_requires_a_completed_model_step() {
         framed(
             3,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Completed,
                 usage,
@@ -667,6 +674,7 @@ fn error_terminal_surfaces_error_then_finished() {
         framed(
             2,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 ts_ms: None,
                 reason: RunFinishReason::Error,
                 usage: Usage::default(),
@@ -914,6 +922,7 @@ fn budget_firing_projects_to_control_stream() {
 /// Multi-unit records deliberately include two calls and a typed terminal error.
 fn all_projection_record_variants() -> Vec<FramedRecord> {
     let queued_request = SubmissionRequest {
+        directives: None,
         on_restart: None,
         keep_warm: None,
         scope: Default::default(),
@@ -989,6 +998,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             caller_text: None,
         },
         WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Error,
             usage: Usage::default(),

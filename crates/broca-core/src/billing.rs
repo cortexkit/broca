@@ -851,6 +851,7 @@ mod tests {
 
     fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
         RunConfig {
+            turn_directives_v1: None,
             render_tags: false,
             model: ModelHandle::new(provider, model),
             tools: vec![].into(),
@@ -960,6 +961,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::BudgetExhausted,
                     ts_ms: Some(200),
                     usage: usage(10, 2),
@@ -1014,6 +1016,7 @@ mod tests {
             frame(
                 5,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(200),
                     usage: usage(30, 5),
@@ -1068,6 +1071,7 @@ mod tests {
             frame(
                 14,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: None,
                     usage: Usage::default(),
@@ -1103,6 +1107,7 @@ mod tests {
             frame(
                 4,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(101),
                     usage: usage(3, 1),
@@ -1132,6 +1137,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(20),
                     usage: usage(3, 1),
@@ -1153,6 +1159,7 @@ mod tests {
             frame(
                 8,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(50),
                     usage: usage(12, 5),
@@ -1165,6 +1172,7 @@ mod tests {
             frame(
                 11,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(70),
                     usage: usage(11, 4),
@@ -1198,6 +1206,7 @@ mod tests {
                 frame(
                     3,
                     WalRecord::RunFinished {
+                        interrupt_reason: None,
                         reason: RunFinishReason::Error,
                         ts_ms: Some(200),
                         usage: Usage::default(),
@@ -1232,6 +1241,7 @@ mod tests {
                 frame(
                     5,
                     WalRecord::RunFinished {
+                        interrupt_reason: None,
                         reason: RunFinishReason::Error,
                         ts_ms: Some(200),
                         usage: usage(10, 2),
@@ -1258,6 +1268,7 @@ mod tests {
                 frame(
                     3,
                     WalRecord::RunFinished {
+                        interrupt_reason: None,
                         reason: RunFinishReason::Completed,
                         ts_ms: Some(200),
                         usage: usage(10, 2),
@@ -1332,6 +1343,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(200),
                     usage: Usage::default(),
@@ -1351,6 +1363,7 @@ mod tests {
                 frame(
                     2,
                     WalRecord::RunFinished {
+                        interrupt_reason: None,
                         reason: RunFinishReason::Completed,
                         ts_ms: Some(200),
                         usage: Usage::default(),
@@ -1376,6 +1389,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(200),
                     usage: Usage::default(),
@@ -1398,6 +1412,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(200),
                     usage: Usage::default(),
@@ -1425,6 +1440,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(200),
                     usage: Usage::default(),
@@ -1446,6 +1462,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: Some(200),
                     usage: Usage::default(),
@@ -1466,6 +1483,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::RunFinished {
+                    interrupt_reason: None,
                     reason: RunFinishReason::Completed,
                     ts_ms: None,
                     usage: Usage::default(),
@@ -1546,6 +1564,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunFinished {
+                interrupt_reason: None,
                 reason: RunFinishReason::Completed,
                 ts_ms,
                 usage,

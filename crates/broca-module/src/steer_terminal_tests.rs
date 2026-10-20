@@ -65,6 +65,7 @@ impl RunExecutor for ClosedInboxExecutor {
             self.release_next.notified().await;
         }
         job.writer.record(WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),

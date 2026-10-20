@@ -4882,6 +4882,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                turn_directives_v1: None,
                 render_tags: false,
                 model: ModelHandle::new("stub", "stub-model"),
                 tools: Vec::new().into(),

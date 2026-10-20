@@ -225,6 +225,7 @@ fn request(name: &str, mode: ExecutionMode) -> RunRequest {
     }];
     let policy_allowed: HashSet<String> = ["edit".to_string()].into_iter().collect();
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -354,6 +355,9 @@ fn terminals(records: &[WalRecord]) -> Vec<RunFinishReason> {
 /// What every stopped run must show: exactly one terminal, `Interrupted` and last; never
 /// `Cancelled`; no call left `outcome_unknown`; and the returned summary agrees.
 fn assert_stopped_cleanly(summary: &RunSummary, records: &[WalRecord]) {
+    assert!(
+        matches!(records.last(), Some(WalRecord::RunFinished { interrupt_reason: Some(reason), .. }) if reason == "runner_shutdown")
+    );
     assert_eq!(
         terminals(records),
         vec![RunFinishReason::Interrupted],
@@ -593,4 +597,98 @@ async fn without_a_stop_a_waiting_steer_extends_the_run() {
 
     assert_eq!(steps_started(&records), 2);
     assert_eq!(summary.reason, RunFinishReason::Completed);
+}
+
+struct SealHandoverPlane(broca_core::ShutdownSeal);
+
+#[async_trait]
+impl ToolPlane for SealHandoverPlane {
+    async fn batch_started(
+        &self,
+        _ctx: &BatchCtx,
+        _calls: &[ToolCall],
+        _manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+    async fn batch_finished(&self, _ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+    async fn dispatch(&self, _ctx: &BatchCtx, _call: &ToolCall) -> DispatchResult {
+        self.0
+            .seal_and_collect(std::time::Duration::from_secs(1))
+            .await;
+        DispatchResult::SentButOutcomeUnknown {
+            reason: "transport closed during explicit shutdown handover".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn shutdown_handover_keeps_provenance_when_an_inflight_tool_returns_ambiguous() {
+    let stop = CancellationToken::new();
+    let seal = broca_core::ShutdownSeal::new();
+    let provider = StoppingProvider::new(vec![edits_step(&["t1"])], &stop, StreamStop::Never);
+    let plane = SealHandoverPlane(seal.clone());
+    let (summary, records) = drive(
+        request("seal-handover", ExecutionMode::Parallel),
+        &provider,
+        &plane,
+        RunControl {
+            shutdown_seal: Some(seal),
+            ..control(&stop)
+        },
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Interrupted);
+    assert!(
+        matches!(records.last(), Some(WalRecord::RunFinished { interrupt_reason: Some(reason), .. }) if reason == "runner_shutdown"),
+        "{records:?}"
+    );
+    assert!(
+        !stop.is_cancelled(),
+        "provenance comes from the explicit seal, not an incidental stop token"
+    );
+}
+
+struct DrainBoundaryPlane(CancellationToken);
+
+#[async_trait]
+impl ToolPlane for DrainBoundaryPlane {
+    async fn batch_started(
+        &self,
+        _ctx: &BatchCtx,
+        _calls: &[ToolCall],
+        _manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+    async fn batch_finished(&self, _ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+    async fn dispatch(&self, _ctx: &BatchCtx, _call: &ToolCall) -> DispatchResult {
+        self.0.cancel();
+        DispatchResult::SentButOutcomeUnknown {
+            reason: "daemon transport closed after its drain notification".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn planned_drain_keeps_provenance_when_a_tool_closes_before_actor_seal() {
+    let stop = CancellationToken::new();
+    let provider = StoppingProvider::new(vec![edits_step(&["t1"])], &stop, StreamStop::Never);
+    let plane = DrainBoundaryPlane(stop.clone());
+    let (summary, records) = drive(
+        request("drain-boundary", ExecutionMode::Parallel),
+        &provider,
+        &plane,
+        control(&stop),
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Interrupted);
+    assert!(
+        matches!(records.last(), Some(WalRecord::RunFinished { interrupt_reason: Some(reason), .. }) if reason == "runner_shutdown"),
+        "{records:?}"
+    );
 }

@@ -244,6 +244,7 @@ impl WalStore for ReadCountingWalStore {
 fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     let mut wal = store.open(&request.session).expect("open WAL for seed");
     let config = RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: request.model.clone(),
         tools: request.tools.clone().into(),
@@ -296,6 +297,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     wal.append(
         1,
         &WalRecord::RunFinished {
+            interrupt_reason: None,
             ts_ms: None,
             reason: RunFinishReason::Completed,
             usage: Usage::default(),
@@ -309,6 +311,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
 
 fn resumable_frozen_config(request: &RunRequest, stop_when: Vec<StopCondition>) -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: request.model.clone(),
         tools: request.tools.clone().into(),
@@ -345,6 +348,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 fn req(name: &str, tools: Vec<Tool>, stop_when: Vec<StopCondition>) -> RunRequest {
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        directives: None,
         session_class: None,
         retention: None,
         title: None,
@@ -5456,4 +5460,76 @@ async fn trailing_garbage_finalize_turn_preserves_call_and_exact_error() {
         if result.tool_call_id.0 == "bad" && matches!(&result.output, ToolOutput::Error { message }
             if message.starts_with("tool_args_trailing_garbage:") && message.contains("json_bytes=15, whitespace_bytes=4097")))));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn directives_opt_in_is_frozen_at_admission_and_survives_queue_round_trip() {
+    let (store, dir) = tmp_lease_store("directives-freeze");
+    let mut request = req("directives-freeze", vec![], vec![]);
+    request.directives = Some(vec![broca_protocol::request::DirectiveName::Wake]);
+    let submission = request.to_submission();
+    let request = RunRequest::from_submission(
+        submission,
+        request.run_id.clone(),
+        request.session.clone(),
+        SubmissionId("directives-sub".into()),
+    );
+    assert_eq!(
+        request.directives,
+        Some(vec![broca_protocol::request::DirectiveName::Wake])
+    );
+    let (summary, records) = drive_wal(
+        request,
+        StubProvider::new(vec![text_step("<wake off/>")]),
+        &StubToolPlane::new(),
+        &store,
+        &AllowAll,
+    )
+    .await;
+    assert_eq!(summary.unwrap().reason, RunFinishReason::Completed);
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        started.turn_directives_v1,
+        Some(vec![broca_protocol::request::DirectiveName::Wake])
+    );
+    assert_eq!(started.renderer_version, 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn an_ambiguous_tool_without_a_planned_stop_has_no_interrupt_provenance() {
+    let (store, dir) = tmp_lease_store("ambiguous-no-provenance");
+    let provider = StubProvider::new(vec![tool_step(&[("call", "edit", json!({}))])]);
+    let plane =
+        StubToolPlane::new().with_tool("edit", |_| StubReply::OutcomeUnknown("reset".into()));
+    let (summary, records) = drive_wal(
+        req(
+            "ambiguous-no-provenance",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        provider,
+        &plane,
+        &store,
+        &AllowAll,
+    )
+    .await;
+    assert_eq!(summary.unwrap().reason, RunFinishReason::Interrupted);
+    assert!(
+        matches!(
+            records.last(),
+            Some(WalRecord::RunFinished {
+                interrupt_reason: None,
+                ..
+            })
+        ),
+        "{records:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

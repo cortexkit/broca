@@ -25,6 +25,7 @@ use broca_wal::{PauseReason, RunConfig, RunOrigin, WalRecord};
 
 fn run_config(max_tokens: u32) -> RunConfig {
     RunConfig {
+        turn_directives_v1: None,
         render_tags: false,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
@@ -118,6 +119,7 @@ fn turn_finished(step: u64) -> WalRecord {
 
 fn run_finished(reason: RunFinishReason) -> WalRecord {
     WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason,
         usage: Usage::default(),

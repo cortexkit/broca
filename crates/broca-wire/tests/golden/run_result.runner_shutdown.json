@@ -1,0 +1,1 @@
+{"reason":"runner_shutdown","run_id":"@RUN_ID@","state":"interrupted","usage":{"by_model":[{"model":"mock-model","provider":"mock","steps":1,"unreported_steps":1}],"steps":1,"unreported_steps":1}}

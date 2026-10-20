@@ -7,6 +7,7 @@ fn finish(seq: u64) -> FramedRecord {
     framed(
         seq,
         WalRecord::RunFinished {
+            interrupt_reason: None,
             reason: RunFinishReason::Completed,
             ts_ms: Some(seq),
             usage: Usage::default(),

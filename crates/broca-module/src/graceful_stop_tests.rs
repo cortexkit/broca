@@ -844,6 +844,7 @@ fn restart_pause_is_valid_even_if_teardown_outlasts_grace() {
 #[test]
 fn restart_stop_rejects_premature_interruption_and_other_outcomes() {
     let terminal = |reason| WalRecord::RunFinished {
+        interrupt_reason: None,
         ts_ms: None,
         reason,
         usage: Default::default(),
