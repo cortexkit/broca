@@ -559,6 +559,38 @@ async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix
             )
     }));
     assert_eq!(reported_calls, transcript_calls);
+
+    // Pin the bytes a caller sees for this layout: the page as served and the
+    // `session.read` ordinal of each tool-call block, with the random lineage id
+    // in every `call_key` replaced so the file is stable.
+    let lineage = reported
+        .calls
+        .iter()
+        .find_map(|call| call.call_key.as_deref())
+        .and_then(|key| key.rsplit_once(':'))
+        .map(|(lineage, _)| lineage.to_owned())
+        .expect("a dispatched call carries a call_key");
+    let fixture = json!({
+        "run_tool_calls_page": reported,
+        "session_read_tool_call_ordinals": transcript_calls
+            .iter()
+            .map(|(ordinal, id)| json!({"ordinal": ordinal, "tool_call_id": id}))
+            .collect::<Vec<_>>(),
+    });
+    let bytes = serde_json::to_string(&fixture)
+        .unwrap()
+        .replace(&lineage, "@LINEAGE@");
+    let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden/run_tool_calls.open_batch.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden, &bytes).unwrap();
+    }
+    assert_eq!(
+        bytes,
+        std::fs::read_to_string(&golden).unwrap(),
+        "the open-batch layout pinned in {}",
+        golden.display()
+    );
 }
 
 #[tokio::test]
