@@ -554,6 +554,179 @@ async fn crash_orphan_seal_pairs_an_indeterminate_call_with_outcome_unknown_befo
     f.stop().await;
 }
 
+/// A crash after the model step that asked for a tool, before that call's dispatch intent: the
+/// call never left the process. The seal keeps the written step and pairs the call with a
+/// never-executed result, committed in the same barrier as the Interrupted terminal, so the
+/// transcript only grows and the lineage stays the same.
+#[tokio::test]
+async fn crash_orphan_seal_keeps_a_never_sent_call_with_a_never_executed_result() {
+    let barriers = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let observed = barriers.clone();
+    let f = Fixture::configured(
+        |index| index,
+        Some(Arc::new(move |_, seq, _| {
+            observed.lock().unwrap().push(seq)
+        })),
+    );
+    let seeded = vec![run_started(&f.key), model_step_with_tool_call()];
+    let seeded_len = seeded.len();
+    f.seed(seeded);
+    let wal_path = f.wal_store().wal_path(&f.key);
+    let bytes_before = std::fs::read(&wal_path).unwrap();
+    // What a reader saw before the restart; the read goes around the actor, so it neither
+    // opens the session nor seals the run.
+    let read_before = f
+        .registry
+        .route_read_page(&f.key, None, None, false)
+        .await
+        .unwrap();
+    let messages_before: Vec<Vec<u8>> = read_before
+        .page
+        .messages
+        .iter()
+        .map(|message| serde_json::to_vec(&message.message).unwrap())
+        .collect();
+    assert!(
+        !read_before.page.messages.is_empty(),
+        "premise: the cut run's input is readable before the restart"
+    );
+
+    let sweep = f.sweep(Fixture::boot_after_seed()).await;
+    assert_eq!(sweep.sealed, 1, "{sweep:?}");
+    assert_eq!(f.terminals(), vec![RunFinishReason::Interrupted]);
+    assert!(
+        f.executor.executed.lock().unwrap().is_empty(),
+        "the orphan must be sealed, not resumed"
+    );
+
+    let call = ToolCallId(CALL.into());
+    let records = f.records();
+    let appended = &records[seeded_len..];
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record, WalRecord::ToolDispatchIntent { .. })),
+        "the never-sent call is never dispatched: {appended:#?}"
+    );
+    let [WalRecord::ResumeStarted { indeterminate, .. }, WalRecord::ToolBatchStarted {
+        batch_id: opened,
+        planned_calls,
+        ..
+    }, WalRecord::ToolResult {
+        batch_id,
+        result,
+        outcome: broca_wal::DispatchOutcome::Interrupted,
+        ..
+    }, WalRecord::ToolBatchFinished { batch_id: closed }, WalRecord::TurnFinished { .. }, WalRecord::RunFinished {
+        reason: RunFinishReason::Interrupted,
+        ..
+    }] = appended
+    else {
+        panic!("the seal must keep the call with a never-executed result: {appended:#?}");
+    };
+    assert!(
+        indeterminate.is_empty(),
+        "a call never sent is not indeterminate"
+    );
+    assert_eq!(planned_calls, &vec![call.clone()]);
+    assert_eq!(batch_id, opened);
+    assert_eq!(closed, opened);
+    assert_eq!(**result, broca_core::not_dispatched_result(&call));
+
+    // One commit: no durability barrier fell between the result and the terminal.
+    let frames = f.wal_store().read_records(&f.key).unwrap();
+    let first_kept = frames[seeded_len + 1].seq;
+    let terminal = frames.last().unwrap().seq;
+    let barriers = barriers.lock().unwrap().clone();
+    assert!(
+        barriers.contains(&terminal),
+        "premise: the terminal's barrier was observed: {barriers:?}"
+    );
+    assert!(
+        !barriers
+            .iter()
+            .any(|head| (first_kept..terminal).contains(head)),
+        "the kept turn and the terminal must be durable together, but a barrier fell at \
+         {barriers:?} between seq {first_kept} and the terminal at {terminal}"
+    );
+
+    // The transcript only grows, under the same lineage.
+    let bytes_after = std::fs::read(&wal_path).unwrap();
+    assert!(
+        bytes_after.starts_with(&bytes_before),
+        "the seal rewrote durable WAL bytes"
+    );
+    let read_after = f
+        .registry
+        .route_read_page(&f.key, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(read_after.page.lineage_id, read_before.page.lineage_id);
+    let kept = read_before.page.messages.len();
+    assert!(
+        read_after.page.messages.len() > kept,
+        "the kept turn is readable"
+    );
+    assert_eq!(
+        read_after.page.messages[..kept],
+        read_before.page.messages[..],
+        "messages read before the restart read back unchanged"
+    );
+    let messages_after: Vec<Vec<u8>> = read_after.page.messages[..kept]
+        .iter()
+        .map(|message| serde_json::to_vec(&message.message).unwrap())
+        .collect();
+    assert_eq!(
+        messages_after, messages_before,
+        "messages read before the restart serialize byte-identically"
+    );
+    let dispatches: Vec<_> = read_after.dispatches.values().flatten().collect();
+    assert!(
+        matches!(dispatches.as_slice(), [entry] if entry.tool_call_id == CALL
+            && !entry.indeterminate
+            && entry.intent_seq.is_none()
+            && entry.dispatched_to.is_none()),
+        "session.read reports the call as never dispatched and not indeterminate: {dispatches:?}"
+    );
+    let status = f
+        .registry
+        .route_run_state(&f.key, RunId(ORPHAN.into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, RunIndexState::Interrupted);
+    assert!(
+        status
+            .indeterminate_tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty()),
+        "{:?}",
+        status.indeterminate_tool_calls
+    );
+
+    // The next send renders the call followed directly by its result.
+    let prompt = broca_core::replay(&records).unwrap().prompt;
+    let call_at = prompt
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(c) if c.tool_call_id == call))
+        })
+        .expect("the kept step is in the history the next send renders");
+    assert!(
+        matches!(
+            prompt.get(call_at + 1),
+            Some(message) if message.role == broca_protocol::content::Role::Tool
+                && matches!(message.content.as_slice(),
+                    [ContentBlock::ToolResult(r)] if *r == broca_core::not_dispatched_result(&call))
+        ),
+        "{prompt:#?}"
+    );
+    f.stop().await;
+}
+
 #[tokio::test]
 async fn crash_orphan_pass_leaves_a_paused_run_alone() {
     let f = Fixture::new();

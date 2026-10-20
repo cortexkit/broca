@@ -6527,9 +6527,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// may have run), the seal first closes the open batch exactly as a run-loop resume does:
     /// an `outcome_unknown` result per such call, an interrupted result per planned call that
     /// never left the process, and batch commit markers.
-    /// The results normally sync before the terminal, and crash recovery normally writes
-    /// ResumeStarted first. An expiring log may have space only for its reserved terminal:
-    /// optional recovery/close-out appends can then be refused without blocking that terminal.
+    ///
+    /// When no call is indeterminate but the last model step asked for tools and some were
+    /// never dispatched (the run stopped between the step and a dispatch intent), the seal keeps
+    /// that step in history: it completes the batch with a never-executed result for each call
+    /// that has none, behind the same barrier as the terminal (see
+    /// [`broca_core::close_out_pending_turn`]). Nothing already written is dropped.
+    ///
+    /// The indeterminate close-out's results sync before the terminal, and crash recovery
+    /// normally writes ResumeStarted first. An expiring log may have space only for its
+    /// reserved terminal: optional recovery/close-out appends can then be refused without
+    /// blocking that terminal.
     /// The accepted prefix and any original dispatch intents remain intact; a full close-out
     /// sequence cannot be reserved because its tool-result payloads are not bounded here.
     async fn write_interrupted_seal(
@@ -6653,6 +6661,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // rejected later records, leave them unclaimed and still write RunFinished
             // through its reserved space. Recovery only deduplicates records present on disk.
             writer.sync_for_seal().await.map_err(|e| e.to_string())?;
+        } else {
+            // A durable tool turn whose calls were never dispatched is kept, not dropped: each
+            // such call gets a never-executed result. No barrier here, so these records commit
+            // with the terminal below; on their own they would read as a finished run.
+            for record in broca_core::close_out_pending_turn(&prior) {
+                writer.record(record);
+            }
         }
         let terminal_seq = writer
             .record_terminal(WalRecord::RunFinished {
