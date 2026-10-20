@@ -298,6 +298,195 @@ fn terminal_error(events: &[NormalizedEvent]) -> &ProviderError {
         .expect("the step ends in an error")
 }
 
+async fn observed_socket_attempt(mock: &Mock) -> broca_test_support::LogEvent {
+    let provider = provider(mock);
+    observed_provider_attempt(&provider).await
+}
+
+async fn observed_provider_attempt(
+    provider: &LiveProvider<OpenAiResponsesChatgpt>,
+) -> broca_test_support::LogEvent {
+    let request = provider
+        .family
+        .endpoint(
+            &provider.frozen,
+            &provider.current_auth().auth,
+            provider.render_request(&opts()),
+        )
+        .into();
+    let (tx, _rx) = mpsc::channel(256);
+    let (_, logs) = broca_test_support::capture_logs(async {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            responses_websocket::drive(
+                &provider.websocket,
+                &provider.client,
+                &request,
+                &provider.clock,
+                provider.family.normalizer(&provider.frozen, StepId(1)),
+                &tx,
+                &mut AttemptTrace::default(),
+            ),
+        )
+        .await
+        .expect("the scripted socket attempt must terminate");
+    })
+    .await;
+    let summaries: Vec<_> = logs
+        .into_iter()
+        .filter(|log| log.message() == "Responses websocket attempt summary")
+        .collect();
+    assert_eq!(summaries.len(), 1, "one summary per attempt");
+    summaries.into_iter().next().unwrap()
+}
+
+async fn delta_fingerprint(distinct: bool) -> broca_test_support::LogEvent {
+    let mut events = vec![
+        serde_json::json!({"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","id":"PRIVATE-ITEM-ID","call_id":"call1","name":"lookup","arguments":""}}),
+    ];
+    for delta in std::iter::once("[".to_owned())
+        .chain((0..12).map(|n| {
+            if distinct {
+                format!("\"PRIVATE-DELTA-{n}\",")
+            } else {
+                "\"PRIVATE-DELTA\",".into()
+            }
+        }))
+        .chain(["\"\"]".into(), " \n".into()])
+    {
+        events.push(serde_json::json!({"type":"response.function_call_arguments.delta","response_id":"PRIVATE-RESPONSE-ID","item_id":"PRIVATE-ITEM-ID","output_index":3,"delta":delta}));
+    }
+    events.push(serde_json::json!({"type":"response.completed","response":{"id":"PRIVATE-RESPONSE-ID","status":"completed"}}));
+    let mock = Mock::start(vec![events], false, false).await;
+    let summary = observed_socket_attempt(&mock).await;
+    assert_eq!(summary.target, "provider.websocket.attempt");
+    assert_eq!(summary.level, tracing::Level::DEBUG);
+    for (field, expected) in [
+        ("response_create_enqueued", "1"),
+        ("response_create_sent", "1"),
+        ("other_text_sent", "0"),
+        ("text_received", "17"),
+        ("argument_deltas", "15"),
+        ("whitespace_deltas", "1"),
+        ("empty_deltas", "0"),
+        ("distinct_response_ids", "1"),
+        ("distinct_item_ids", "1"),
+        ("output_index_max", "3"),
+        ("distinct_deltas_overflow", "false"),
+        ("socket_generation", "1"),
+        ("socket_reused", "false"),
+    ] {
+        assert_eq!(summary.fields[field], expected, "{field}");
+    }
+    assert_eq!(
+        summary.fields["argument_delta_bytes"],
+        if distinct { "224" } else { "198" }
+    );
+    let logs = format!("{summary:?}");
+    for secret in [
+        "PRIVATE-ITEM-ID",
+        "PRIVATE-RESPONSE-ID",
+        "PRIVATE-DELTA",
+        "mock-token",
+    ] {
+        assert!(!logs.contains(secret));
+    }
+    summary
+}
+
+#[tokio::test]
+async fn websocket_summary_repeated_deltas_have_few_hashes() {
+    let summary = delta_fingerprint(false).await;
+    assert_eq!(summary.fields["distinct_deltas"], "4");
+}
+
+#[tokio::test]
+async fn websocket_summary_distinct_deltas_have_many_hashes() {
+    let summary = delta_fingerprint(true).await;
+    assert_eq!(summary.fields["distinct_deltas"], "15");
+}
+
+#[tokio::test]
+async fn websocket_summary_separates_empty_and_whitespace_deltas() {
+    let mut events = tool_events();
+    for delta in ["", " \n"] {
+        events.insert(2, serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":delta}));
+    }
+    let mock = Mock::start(vec![events], false, false).await;
+    let summary = observed_socket_attempt(&mock).await;
+    assert_eq!(summary.fields["argument_deltas"], "3");
+    assert_eq!(summary.fields["argument_delta_bytes"], "9");
+    assert_eq!(summary.fields["whitespace_deltas"], "1");
+    assert_eq!(summary.fields["empty_deltas"], "1");
+    assert_eq!(summary.fields["distinct_deltas"], "3");
+}
+
+#[tokio::test]
+async fn websocket_summary_detects_replayed_sequence_numbers() {
+    let mut events: Vec<_> = [10, 11, 10, 11, 12].into_iter().map(|sequence| {
+        serde_json::json!({"type":"response.output_text.delta","sequence_number":sequence,"delta":"x"})
+    }).collect();
+    events.extend(text_events().into_iter().skip(1));
+    let mock = Mock::start(vec![events], false, false).await;
+    let summary = observed_socket_attempt(&mock).await;
+    assert_eq!(summary.fields["sequence_count"], "5");
+    assert_eq!(summary.fields["sequence_min"], "10");
+    assert_eq!(summary.fields["sequence_max"], "12");
+    assert_eq!(summary.fields["sequence_repeated_or_backwards"], "2");
+}
+
+#[tokio::test]
+async fn websocket_summary_allowlists_wrapped_error_codes() {
+    for (code, expected) in [
+        (
+            "websocket_connection_limit_reached",
+            "websocket_connection_limit_reached",
+        ),
+        ("PRIVATE-UNKNOWN-CODE", "other"),
+    ] {
+        let mock = Mock::start(vec![vec![serde_json::json!({"type":"error","status":400,"error":{"code":code,"message":"PRIVATE-ERROR-MESSAGE"}})]], true, false).await;
+        let summary = observed_socket_attempt(&mock).await;
+        assert_eq!(summary.level, tracing::Level::INFO);
+        assert_eq!(summary.fields["failed"], "true");
+        assert_eq!(summary.fields["wrapped_error_code"], expected);
+        assert!(!format!("{summary:?}").contains("PRIVATE-"));
+    }
+}
+
+#[tokio::test]
+async fn websocket_summary_records_numeric_close_code() {
+    let mock = Mock::start(
+        vec![vec![
+            serde_json::json!({"type":"response.output_text.delta","delta":"x"}),
+        ]],
+        true,
+        false,
+    )
+    .await;
+    let summary = observed_socket_attempt(&mock).await;
+    assert_eq!(summary.level, tracing::Level::INFO);
+    assert_eq!(summary.fields["closes_received"], "1");
+    assert_eq!(summary.fields["close_code"], "1012");
+    assert!(!format!("{summary:?}").contains("PRIVATE-CLOSE-REASON"));
+}
+
+#[tokio::test]
+async fn websocket_summary_reused_socket_resets_attempt_counters() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let provider = provider(&mock);
+    let first = observed_provider_attempt(&provider).await;
+    let second = observed_provider_attempt(&provider).await;
+    assert_eq!(first.fields["socket_reused"], "false");
+    assert_eq!(second.fields["socket_reused"], "true");
+    assert_eq!(second.fields["socket_generation"], "1");
+    for summary in [first, second] {
+        assert_eq!(summary.fields["response_create_enqueued"], "1");
+        assert_eq!(summary.fields["response_create_sent"], "1");
+        assert_eq!(summary.fields["text_received"], "2");
+        assert!(summary.fields["socket_age_ms"].parse::<u64>().is_ok());
+    }
+}
+
 #[tokio::test]
 async fn retention_websocket_diagnostics_omit_backend_content() {
     use tracing::instrument::WithSubscriber;

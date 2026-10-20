@@ -34,16 +34,18 @@ const VISIBLE: [&str; 3] = ["warn", "info", "error"];
 
 // These targets are opt-in diagnostics: the wire milestones help locate a stall, the retention
 // enrollment event counts retryable races that are not operator alerts, and request records
-// show which bound sessions still poll. Losing them at INFO hides no information that requires
-// immediate action. Only exact literal targets at DEBUG qualify; TRACE and every other target
+// show which bound sessions still poll. Fast successful websocket summaries are diagnostic;
+// failed or slow attempts still emit at INFO. Losing diagnostics at INFO hides no information
+// that requires immediate action. Only exact literal targets at DEBUG qualify; TRACE and every other target
 // stay refused, so this exception cannot silently demote ordinary operational logs.
-const DIAGNOSTIC_TARGETS: [&str; 6] = [
+const DIAGNOSTIC_TARGETS: [&str; 7] = [
     "wire.describe",
     "wire.ingress",
     "wire.egress",
     "subc.wire",
     "retention.enrollment",
     "requests",
+    "provider.websocket.attempt",
 ];
 
 fn diagnostic_debug_site(invocation: &str) -> bool {
@@ -113,6 +115,8 @@ fn diagnostic_debug_exception_is_not_a_prefix_or_trace_exception() {
         "debug!(target: \"wire.ingress_extra\", \"ordinary\");",
         "debug!(target: \"wire.egress.extra\", \"ordinary\");",
         "debug!(target: \"subc.wire.extra\", \"ordinary\");",
+        "debug!(target: \"provider.websocket.attempt.extra\", \"ordinary\");",
+        "trace!(target: \"provider.websocket.attempt\", \"ordinary\");",
         "trace!(target: \"wire.describe\", \"ordinary\");",
         "debug!(target: dynamic_target, \"ordinary\");",
         "debug!(\"ordinary\");\ntracing::debug!(target: \"wire.describe\", \"diagnostic\");",

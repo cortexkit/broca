@@ -93,6 +93,30 @@ with payload/handshake tracing disabled, including at trace level. The shared Re
 normalizer has a diagnostics-only privacy switch for sockets; HTTPS keeps its existing
 behavior and all model-output decoding is unchanged.
 
+Each websocket attempt also emits one log-only summary on the
+`provider.websocket.attempt` target: INFO for failed attempts (including refused
+upgrades) or attempts longer than 120 seconds, DEBUG for shorter successes. It
+separates enqueued `response.create` frames from successful sends, other outgoing
+Text and Pongs, and incoming Text/Ping/Pong/Close frames. It includes socket
+generation, reuse, age at send, numeric close code, and only the allowlisted
+`websocket_connection_limit_reached` wrapped error code (`other` for unknown codes).
+No message, payload, header, token, or raw identifier is included.
+
+Raw Text observations before normalization count sequence numbers, their range,
+and numbers at or below the previous high-water mark (repeats or backwards
+movement). They also count distinct response/item IDs and record the maximum
+output index, argument-delta count, total decoded UTF-8 delta bytes, counts of
+nonempty whitespace-only and empty deltas (`empty_deltas`), and distinct-delta
+count. A minimal borrowed envelope skips unrelated
+fields without building a JSON value tree; unescaped strings borrow the frame,
+while JSON-escaped strings are decoded before measuring bytes or hashing.
+Distinct counts use per-attempt randomized hashes capped at 4,096 entries each;
+an overflow flag means the count is a lower bound. Hashes themselves are not
+logged, and sets are freed at attempt end, including cancellation. Frame counts
+come from the socket pump and can include Text read ahead of the normalizer;
+sequence and delta counts cover Text consumed by the attempt. These diagnostics
+do not change request bytes, durable attempt records, retries or deadlines.
+
 ## Tests
 
 Offline socket tests are in `crates/broca-provider/src/transport_websocket_tests.rs`.
