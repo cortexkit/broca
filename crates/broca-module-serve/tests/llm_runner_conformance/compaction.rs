@@ -61,6 +61,7 @@ pub(super) struct Session {
     replacements: Vec<(EntrySource, Value)>,
     inputs: Vec<Vec<ModelEntry>>,
     pub gates: std::collections::VecDeque<Arc<HoldGate>>,
+    pub view: Option<broca_core::compaction_provider::view::CompactionView>,
 }
 
 pub(super) struct Provider {
@@ -101,6 +102,33 @@ impl subc_client_rs::ModuleHandler for Provider {
                 "ops":["role.describe","compaction.setup","view.get","compaction.ride"],"stability":"alpha"}],
                 "implementation_version":"conformance", "capabilities":[]}));
         }
+        if method == "view.get" {
+            let view = self
+                .shared
+                .compaction
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|s| s.view.as_ref())
+                .find(|v| {
+                    request["params"]["session_ref"] == v.session_ref
+                        && request["params"]["view_version"] == v.view_version
+                })
+                .cloned();
+            return response(match view {
+                Some(view) => json!({"answer":"view", "view":view}),
+                None => json!({"answer":"refuse", "code":"unknown_view", "reason":"view not held"}),
+            });
+        }
+        if method == "compaction.ride" {
+            return response(json!({"answer":"nothing"}));
+        }
+        if method != "compaction.setup" {
+            return subc_client_rs::HandlerOutcome::Error {
+                code: "unknown_method".into(),
+                message: format!("the scripted provider does not serve {method}"),
+            };
+        }
         let params = &request["params"];
         let session = params["session"].as_str().expect("provider session");
         let request_id = params["request_id"]
@@ -108,13 +136,6 @@ impl subc_client_rs::ModuleHandler for Provider {
             .expect("provider request id")
             .to_owned();
         let now = params["now"].as_u64().expect("actual runner clock");
-        if method != "compaction.setup" {
-            // Views and rides are never scripted here: this provider publishes no view.
-            return subc_client_rs::HandlerOutcome::Error {
-                code: "unknown_method".into(),
-                message: format!("the scripted provider does not serve {method}"),
-            };
-        }
         let answer = {
             let mut sessions = self.shared.compaction.lock().unwrap();
             let state = sessions
@@ -292,6 +313,73 @@ fn atomic_write(path: &Path, value: &[u8]) -> Result<(), HarnessError> {
     std::fs::rename(temporary, path).map_err(|e| HarnessError::new(e.to_string()))
 }
 impl BrocaSubject {
+    #[cfg(feature = "test-clock")]
+    pub(super) fn offer_bus_view(
+        &self,
+        session: &str,
+        view: broca_core::compaction_provider::view::CompactionView,
+        replacement: Value,
+    ) {
+        let mut sessions = self.shared.compaction.lock().unwrap();
+        let state = sessions.get_mut(session).unwrap();
+        state.replacements.push((
+            EntrySource::Replacement {
+                compaction_id: "view".into(),
+                version: view.view_version,
+                from_ordinal: 0,
+                to_ordinal: 1,
+            },
+            replacement,
+        ));
+        state.view = Some(view);
+    }
+    pub(super) fn install_setup(&self, session: &str, setup: CompactionSetup) {
+        let mut sessions = self.shared.compaction.lock().unwrap();
+        let state = sessions.entry(session.into()).or_insert_with(|| Session {
+            script: CompactionScript::new(CompactionMessage {
+                compaction_id: "initial".into(),
+                version: 1,
+                from: 0,
+                to: 0,
+                replacement: vec![],
+            }),
+            start_ms: 0,
+            emitted: 0,
+            calls: vec![],
+            raw: BTreeMap::new(),
+            replacements: vec![],
+            inputs: vec![],
+            gates: Default::default(),
+            view: None,
+        });
+        state.script.setup = setup;
+    }
+
+    pub(super) async fn observe_compaction(
+        &self,
+        session: &str,
+    ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
+        self.settle_compaction(session).await?;
+        let sessions = self.shared.compaction.lock().unwrap();
+        let state = sessions
+            .get(session)
+            .ok_or_else(|| HarnessError::new("compaction session absent"))?;
+        Ok(
+            cortexkit_role_llm_runner_conformance::CompactionObservation {
+                calls: state
+                    .calls
+                    .iter()
+                    .map(
+                        |call| cortexkit_role_llm_runner_conformance::CompactionCall {
+                            request_id: call.request_id.clone(),
+                        },
+                    )
+                    .collect(),
+                model_inputs: state.inputs.clone(),
+            },
+        )
+    }
+
     fn compaction_root(&self, session: &str) -> Result<PathBuf, HarnessError> {
         self.shared
             .session_roots
@@ -483,6 +571,7 @@ fn captured_wire_translation_preserves_tool_grouping_and_native_metadata_and_rej
         replacements: vec![],
         inputs: vec![],
         gates: Default::default(),
+        view: None,
     };
     let messages = vec![
         json!({"role":"user","content":[{"type":"text","text":"ask"}]}),

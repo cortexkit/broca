@@ -56,6 +56,9 @@ const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 const SESSION_MARKER: &str = "conformance-session:";
 /// The harness every session the suite opens is bound under.
 const HARNESS: &str = "conformance";
+#[cfg(feature = "test-clock")]
+#[path = "llm_runner_conformance/bus.rs"]
+mod bus;
 #[path = "llm_runner_conformance/compaction.rs"]
 mod compaction;
 
@@ -690,6 +693,8 @@ struct Live {
     logs_dir: PathBuf,
     tools: tokio::task::JoinHandle<()>,
     compactions: tokio::task::JoinHandle<()>,
+    #[cfg(feature = "test-clock")]
+    bus_credentials: Option<tokio::task::JoinHandle<()>>,
     connections: tokio::sync::Mutex<HashMap<String, Arc<SubcConnection>>>,
 }
 
@@ -745,6 +750,10 @@ impl Live {
         }
         self.tools.abort();
         self.compactions.abort();
+        #[cfg(feature = "test-clock")]
+        if let Some(task) = self.bus_credentials.take() {
+            task.abort();
+        }
         killed_broca
     }
 }
@@ -774,6 +783,9 @@ struct BrocaSubject {
     dump_dir: Option<PathBuf>,
     binary: Option<PathBuf>,
     backup_classes: Option<Vec<String>>,
+    bus_events_enabled: bool,
+    #[cfg(feature = "test-clock")]
+    bus: Option<Arc<bus::BusRig>>,
 }
 
 impl BrocaSubject {
@@ -790,6 +802,9 @@ impl BrocaSubject {
             dump_dir: None,
             binary: None,
             backup_classes: None,
+            bus_events_enabled: true,
+            #[cfg(feature = "test-clock")]
+            bus: None,
         }
     }
 
@@ -861,8 +876,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes}))
-                    .unwrap_or_else(|| json!({})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
             )
             .unwrap(),
         )
@@ -930,6 +945,11 @@ impl BrocaSubject {
         let compactions = tokio::spawn(async move {
             let _ = serve.await;
         });
+        #[cfg(feature = "test-clock")]
+        let bus_credentials = match &self.bus {
+            Some(bus) => Some(bus.register(&connection_file).await),
+            None => None,
+        };
         Ok(Live {
             daemon: Some(daemon),
             connection_file,
@@ -938,6 +958,8 @@ impl BrocaSubject {
             logs_dir: data_home.join("cortexkit/broca/logs"),
             tools,
             compactions,
+            #[cfg(feature = "test-clock")]
+            bus_credentials,
             connections: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -1550,6 +1572,8 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::HoldToolCalls,
             Capability::Tags,
             Capability::DeliveryOrder,
+            Capability::Compaction,
+            Capability::ModelView,
         ]
         .into_iter()
         .collect();
@@ -1593,7 +1617,9 @@ impl LlmRunnerSubject for BrocaSubject {
         let identity = self.bind_identity(session);
         let started = Instant::now();
         let route = self.open(&connection, &identity).await?;
-        if self.shared.compaction.lock().unwrap().contains_key(session) {
+        if self.shared.compaction.lock().unwrap().contains_key(session)
+            && !self.records(handle, session).is_empty()
+        {
             self.settle_compaction(session).await?;
         }
         eprintln!(
@@ -1989,6 +2015,20 @@ impl LlmRunnerSubject for BrocaSubject {
     async fn release_compaction_model(&self, session: &str) -> Result<(), HarnessError> {
         self.release_model_compaction(session).await
     }
+    async fn install_compaction_setup(
+        &self,
+        session: &str,
+        setup: cortexkit_role_llm_runner_conformance::CompactionSetup,
+    ) -> Result<(), HarnessError> {
+        self.install_setup(session, setup);
+        Ok(())
+    }
+    async fn compaction_observation(
+        &self,
+        session: &str,
+    ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
+        self.observe_compaction(session).await
+    }
     async fn durable_compaction_setup(
         &self,
         handle: &Live,
@@ -2194,6 +2234,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     // a case that drifts to skipped or inapplicable would otherwise pass this test without
     // checking anything.
     for name in [
+        "compaction_setup_durable_once",
+        "model_view_half_open_ranges_and_travel",
+        "compaction_unavailable_distinct_from_refuse",
         "run_cancel_step_boundary_finishes_tool_batch",
         "run_cancel_unlisted_at_refused",
         "run_cancel_step_boundary_escalates_to_now",
@@ -2322,6 +2365,71 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
 /// Sandboxed runs can exercise every non-kill case without claiming crash conformance.
 fn skip_crash_kills() -> bool {
     std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_bus_disabled_refuses_plan_without_writes() {
+    require_compaction_test_clock();
+    if !sibling_bin("ck-subc", "SUBC_CORE_BIN").exists()
+        || !sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN").exists()
+    {
+        assert!(
+            !require_subc(),
+            "compaction bus-off test requires the daemon fixtures"
+        );
+        return;
+    }
+    let root = broca_test_support::scratch_root().join("compaction-bus-off");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut subject = BrocaSubject::new(&root).await;
+    subject.bus_events_enabled = false;
+    let live = subject.start(&root).await.unwrap();
+    let session = "bus-off";
+    subject.install_setup(
+        session,
+        cortexkit_role_llm_runner_conformance::CompactionSetup::Ready(
+            cortexkit_role_llm_runner_conformance::CompactionMessage {
+                compaction_id: "head".into(),
+                version: 1,
+                from: 0,
+                to: 0,
+                replacement: vec![],
+            },
+        ),
+    );
+    let route = subject
+        .session_route(&live, session, &subject.owner_stamp())
+        .await
+        .unwrap();
+    let Reply::Response(describe) = route.request("role.describe", json!({})).await.unwrap() else {
+        panic!("describe refused");
+    };
+    assert!(!describe["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("compaction")));
+    let mut fields = subject.send_fields(session, true);
+    fields.insert(
+        "input".into(),
+        json!([{"role":"user","content":[{"type":"text","text":"do not write"}]}]),
+    );
+    fields.insert("send_id".into(), json!("bus-off"));
+    let reply = route
+        .request("session.send", Value::Object(fields))
+        .await
+        .unwrap();
+    let encoded = format!("{reply:?}");
+    assert!(
+        encoded.contains("invalid_params") && encoded.contains("compaction"),
+        "{encoded}"
+    );
+    assert!(
+        subject.records(&live, session).is_empty(),
+        "disabled compaction wrote WAL records"
+    );
+    assert!(subject.shared.compaction.lock().unwrap()[session]
+        .describe()
+        .contains("captured model inputs=0"));
 }
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume
@@ -3090,11 +3198,11 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
         )));
     for group in ["compaction", "model_view"] {
         assert!(
-            !describe["capabilities"]
+            describe["capabilities"]
                 .as_array()
                 .unwrap()
                 .contains(&json!(group)),
-            "the {group} group is not declared until broca applies views from view_ready events"
+            "the bus-enabled runner must declare the {group} group"
         );
     }
     assert!(!describe["majors"][0]["ops"]

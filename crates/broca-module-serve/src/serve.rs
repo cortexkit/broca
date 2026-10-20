@@ -1654,6 +1654,7 @@ async fn handle_control_request(
                     "management_ops": management_operation_counts(),
             "wal_archive_polls": crate::wal_archive::wal_archive_polls(),
             "bus_events": crate::bus_events::health(),
+            "compaction_bus": crate::compaction_bus::health(),
             // The subscriber fan-out's own counters. NOT related to frames_dropped_*
             // above, which count inbound frames on broca-subc's client socket -- I
             // first claimed they were this path's failure counters, and they are not.

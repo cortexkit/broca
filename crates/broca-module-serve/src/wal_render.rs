@@ -12,6 +12,29 @@ pub fn render_step(
     run_id: &str,
     step: u64,
 ) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
+    let (frozen, mut opts, state) = boundary_options(prefix, config, run_id, step)?;
+    let family = broca_provider::registry::wire_family(frozen.family_id)
+        .ok_or("no wire family implementation for the frozen family id")?;
+    if let Some(state) = state.state() {
+        opts = broca_core::compaction::model_options(&opts, state).map_err(|e| e.to_string())?;
+    }
+    let body = family.render(&frozen, &opts);
+    Ok((frozen, opts, body))
+}
+
+pub fn boundary_options(
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+) -> Result<
+    (
+        FrozenRenderConfig,
+        CallOptions,
+        broca_core::compaction::CompactionCheckpoint,
+    ),
+    String,
+> {
     let mut prior =
         broca_core::replay::replay(prefix).map_err(|e| format!("replay WAL prefix: {e}"))?;
     // Replay retains raw tool outputs. Before sending them to the model, the live runner
@@ -33,8 +56,6 @@ pub fn render_step(
     }
     let frozen: FrozenRenderConfig = serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|e| format!("decode frozen_render_config: {e}"))?;
-    let family = broca_provider::registry::wire_family(frozen.family_id)
-        .ok_or("no wire family implementation for the frozen family id")?;
     // Copy the runner's frozen tools, tool choice, response format, generation settings and
     // provider options. The replayed prompt and step identity are the per-step inputs.
     let mut opts = CallOptions {
@@ -54,12 +75,10 @@ pub fn render_step(
         }),
         target_model: Some(config.model.clone()),
     };
-    if let Some(state) = prior.compaction.state() {
+    if prior.compaction.state().is_some() {
         broca_protocol::content::stamp_ordinals(&mut opts.prompt);
-        opts = broca_core::compaction::model_options(&opts, state).map_err(|e| e.to_string())?;
     }
-    let body = family.render(&frozen, &opts);
-    Ok((frozen, opts, body))
+    Ok((frozen, opts, prior.compaction))
 }
 
 #[cfg(test)]

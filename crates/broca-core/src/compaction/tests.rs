@@ -1422,6 +1422,118 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
     assert_eq!(last_notice["model"], "other");
 }
 
+#[tokio::test]
+async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
+    let mut raw = vec![
+        text(Role::User, &"large history ".repeat(2000)),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "next"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut raw);
+    let options = CallOptions::new(raw.clone());
+    let shared = Shared::with_records(vec![setup_record(Some("{}"))]);
+    let writer = shared.writer();
+    writer.sync().await.unwrap();
+    let plane = Arc::new(OneView::default());
+    let ready = plane
+        .newest_ready(
+            &crate::agent_session_ref(&bind()),
+            &fixture_lineage_id().to_string(),
+            None,
+        )
+        .unwrap();
+    let size = |state: &CompactionState| -> Result<usize, String> {
+        Ok(
+            serde_json::to_vec(&model_options(&options, state).unwrap().prompt)
+                .unwrap()
+                .len(),
+        )
+    };
+    let apply = |shared: Shared,
+                 writer: crate::WalHandle,
+                 plane: Arc<OneView>,
+                 ready: crate::compaction_provider::notice::ViewReady,
+                 raw: Vec<Message>,
+                 options: CallOptions| async move {
+        let mut state = CompactionState::default();
+        for record in shared.records() {
+            state.fold(&record);
+        }
+        let plane: Arc<dyn CompactionPlane> = plane;
+        assert!(runtime::apply_idle_view(
+            &bind(),
+            &writer,
+            &plane,
+            &ready,
+            &mut state,
+            &raw,
+            &raw,
+            false,
+            "model",
+            Some(100_000),
+            |state| Ok(
+                serde_json::to_vec(&model_options(&options, state).unwrap().prompt)
+                    .unwrap()
+                    .len()
+            )
+        )
+        .await
+        .unwrap());
+        assert_eq!(shared.durable(), shared.records().len());
+        state
+    };
+    let mut initial = CompactionState::default();
+    initial.fold(&setup_record(Some("{}")));
+    let before = size(&initial).unwrap() as u64 / 2;
+    let state = apply(
+        shared.clone(),
+        writer,
+        plane.clone(),
+        ready.clone(),
+        raw.clone(),
+        options.clone(),
+    )
+    .await;
+    assert!(state.announced.as_ref().unwrap().est_tokens.unwrap() < before / 2);
+    let baseline = model_options(&options, &state).unwrap();
+    let records = shared.records();
+    assert!(matches!(
+        records[1],
+        WalRecord::CompactionViewApplied { .. }
+    ));
+    assert!(matches!(records[2], WalRecord::CompactionNotice { .. }));
+    for cut in 1..=records.len() {
+        let shared = Shared::with_records(records[..cut].to_vec());
+        let writer = shared.writer();
+        let calls = plane.fetches.lock().unwrap().len();
+        let state = apply(
+            shared.clone(),
+            writer,
+            plane.clone(),
+            ready.clone(),
+            raw.clone(),
+            options.clone(),
+        )
+        .await;
+        assert_eq!(
+            model_options(&options, &state).unwrap(),
+            baseline,
+            "cut {cut}"
+        );
+        assert_eq!(
+            state.announced.as_ref().unwrap().applied_view_version,
+            Some(2)
+        );
+        if cut >= 2 {
+            assert_eq!(
+                plane.fetches.lock().unwrap().len(),
+                calls,
+                "recorded view fetched again at cut {cut}"
+            );
+        }
+    }
+}
+
 /// A compaction session never sends a request broca counts over the model's context window:
 /// the run ends before the model call, and the boundary's notice, durable first, tells the
 /// provider how large the request is. A session without compaction sends the same request.
@@ -1505,8 +1617,34 @@ fn the_view_ready_inbox_keeps_the_newest_event_per_session() {
     assert_eq!(inbox.newest_ready("another", "l", None), None);
     assert!(inbox.announce(ready(3)));
     assert_eq!(inbox.newest_ready(session, "l", Some(2)), Some(ready(3)));
+    inbox.forget_ready(&ready(2));
+    assert_eq!(inbox.newest_ready(session, "l", None), Some(ready(3)));
+    inbox.forget_ready(&ready(3));
+    assert_eq!(inbox.newest_ready(session, "l", None), None);
+    assert!(inbox.announce(ready(3)));
     inbox.forget(session);
     assert_eq!(inbox.newest_ready(session, "l", None), None);
+}
+
+#[test]
+fn ready_inbox_is_bounded_and_cleanup_cannot_drop_a_newer_delivery() {
+    use crate::compaction_provider::notice::ViewReady;
+    let inbox = runtime::ViewReadyInbox::default();
+    let ready = |session: u64, version| {
+        ViewReady::new(format!("{session:032x}"), version, 0, "a".repeat(64))
+    };
+    for session in 0..1000 {
+        assert!(inbox.announce(ready(session, 1)));
+    }
+    assert!(!inbox.announce(ready(1000, 1)));
+    assert!(inbox.announce(ready(0, 2)));
+    inbox.forget_ready(&ready(0, 1));
+    assert_eq!(
+        inbox.newest_ready(&ready(0, 1).session_ref, "ignored", None),
+        Some(ready(0, 2))
+    );
+    inbox.forget_ready(&ready(0, 2));
+    assert!(inbox.announce(ready(1000, 1)));
 }
 
 /// A WAL store that counts how often admission asks it for the notice floor.

@@ -35,6 +35,7 @@ use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
 pub mod caps;
+pub mod compaction_receipts;
 pub mod export_index;
 mod fold_identities;
 pub mod retention;
@@ -1046,6 +1047,7 @@ impl SqliteStore {
         retention::init_work_schema(conn)?;
         session_refs::init_schema(conn)?;
         bus_events::init_schema(conn)?;
+        compaction_receipts::init_schema(conn)?;
         export_index::init_schema(conn).map_err(StoreError::from)
     }
 

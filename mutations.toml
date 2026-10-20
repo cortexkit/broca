@@ -17812,20 +17812,6 @@ old = "                    out.push(NormalizedEvent::Display(DisplayEvent::Reaso
 new = "                    let _ = (NormalizedEvent::Display(DisplayEvent::ReasoningDelta { // NON-VACUITY BREAK: drop the summary display delta\n                        message_id: mid,\n                        delta: text,"
 
 [[control]]
-id = "mode3-no-synchronous-compaction-discovery"
-guards = "the compaction group is not advertised until broca applies views from view_ready events, rides and waits at the ceiling"
-runner = "cargo"
-package = "broca-wire"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-wire/src/role.rs"
-expect_red = ["role::pinned_reply_bytes::compaction_and_model_view_are_not_declared_yet"]
-file = "crates/broca-wire/src/role.rs"
-old = "    if hook_writer {"
-new = '''    capabilities.push("compaction".into()); // NON-VACUITY BREAK: claim the asynchronous contract
-    if hook_writer {'''
-
-[[control]]
 id = "mode3-ordered-retry-terminal-state"
 guards = "superseded ordered-send retries are successful terminal replies rather than pending work"
 runner = "cargo"
@@ -18568,8 +18554,8 @@ select = "expected"
 test_file = "crates/broca-module/src/wal_proof_tests.rs"
 expect_red = ["actor::wal_proof_tests::a_ceiling_held_queue_head_stays_pending_without_writes_and_wakes_after_a_view"]
 file = "crates/broca-module/src/actor.rs"
-old = "LineageCmd::CompactionChanged => {\n                self.prior_snapshot = None;\n                if matches!(self.state, RunState::Idle) {"
-new = "LineageCmd::CompactionChanged => {\n                self.prior_snapshot = None;\n                if false && matches!(self.state, RunState::Idle) { // NON-VACUITY BREAK"
+old = "let result = if matches!(self.state, RunState::Idle) {\n                    async {\n                        self.refresh_admission_view().await?;\n                        self.drain_queue_one().await"
+new = "let result = if false && matches!(self.state, RunState::Idle) { // NON-VACUITY BREAK\n                    async {\n                        self.refresh_admission_view().await?;\n                        self.drain_queue_one().await"
 
 [[control]]
 id = "ceiling-wal-records-must-understand"
@@ -18651,3 +18637,259 @@ expect_red = ["compaction::tests::ceiling_tests::a_smaller_view_can_lower_a_usag
 file = "crates/broca-core/src/compaction.rs"
 old = "if rendered_bytes < bytes {"
 new = "if false && rendered_bytes < bytes { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-receipt-before-ack"
+guards = "the bus ACK follows both the durable receipt and inbox enqueue"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "self.handle(message, account).await?;\n        reader.ack().await.map_err(|e| e.to_string())?;"
+new = "reader.ack().await.map_err(|e| e.to_string())?; // NON-VACUITY BREAK\n        self.handle(message, account).await?;"
+
+[[control]]
+id = "compaction-bus-rebuilds-startup-inbox"
+guards = "acknowledged announcements survive restart through the receipt table"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "self.inbox.announce(receipt.ready);"
+new = "let _ = receipt.ready; // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-enqueues-after-receipt"
+guards = "a committed incoming announcement feeds the live boundary inbox before ACK"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "self.inbox.announce(ready);"
+new = "let _ = ready; // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-unknown-session-metric"
+guards = "unknown sessions are dropped without a receipt and the drop is counted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = ".dropped_unknown_session\n                .fetch_add(1, Ordering::Relaxed);"
+new = ".dropped_unknown_session\n                .fetch_add(0, Ordering::Relaxed); // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-acked-health-metric"
+guards = "health counts confirmed ACKs rather than hiding successful intake"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "self.metrics.acked.fetch_add(1, Ordering::Relaxed);"
+new = "self.metrics.acked.fetch_add(0, Ordering::Relaxed); // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-receipt-newest-version-wins"
+guards = "redelivering an older version cannot overwrite the durable latest announcement"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_receipts.rs"
+expect_red = ["compaction_receipts::tests::receipts_are_durable_newest_only_and_compare_deleted"]
+file = "crates/broca-store/src/compaction_receipts.rs"
+old = "v >= receipt.ready.view_version"
+new = "v < receipt.ready.view_version /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-receipt-conditional-clear"
+guards = "completion of an old version cannot delete a newer receipt"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_receipts.rs"
+expect_red = ["compaction_receipts::tests::receipts_are_durable_newest_only_and_compare_deleted"]
+file = "crates/broca-store/src/compaction_receipts.rs"
+old = "AND lineage_id=?2 AND view_version=?3 AND digest=?4"
+new = "AND (?2 IS NOT NULL OR ?3 IS NOT NULL OR ?4 IS NOT NULL) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-receipt-lineage-cleanup"
+guards = "completed retention deletion clears only that lineage's pending announcements"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/compaction_receipts.rs"
+expect_red = ["compaction_receipts::tests::receipts_are_durable_newest_only_and_compare_deleted"]
+file = "crates/broca-store/src/compaction_receipts.rs"
+old = "WHERE lineage_id=OLD.lineage_id;"
+new = "WHERE 0 AND lineage_id=OLD.lineage_id; -- NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-actor-installs-live-inbox"
+guards = "the actor supplies the executor's shared view-ready inbox to every run control"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::actor_installs_the_executors_compaction_inbox_on_run_control"]
+file = "crates/broca-module/src/actor.rs"
+old = "compaction_views: self.executor.compaction_views(),"
+new = "compaction_views: None, // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-idle-records-updated-estimate"
+guards = "idle application durably records its smaller request estimate and repairs a crash between view and notice"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::idle_view_records_lower_estimate_and_repairs_every_cut_before_wake"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "runtime.record_notice(state, notice).await?;"
+new = "let _ = notice; // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-ready-inbox-bounded"
+guards = "intake memory is bounded while durable receipts retain excess sessions for retry"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::ready_inbox_is_bounded_and_cleanup_cannot_drop_a_newer_delivery"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "newest.len() >= 1000"
+new = "newest.len() >= usize::MAX /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-ready-cleanup-matches-delivery"
+guards = "cleanup of a receipt cannot remove an announcement that arrived later"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::ready_inbox_is_bounded_and_cleanup_cannot_drop_a_newer_delivery"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "if newest.get(&ready.session_ref) == Some(ready) {"
+new = "if newest.contains_key(&ready.session_ref) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-describe-follows-bus-writer"
+guards = "compaction and model_view are advertised only with their installed writer"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/role.rs"
+expect_red = ["role::pinned_reply_bytes::ordered_hook_phases_follow_only_the_installed_hook_writer"]
+file = "crates/broca-wire/src/role.rs"
+old = "if compaction_writer {"
+new = "if compaction_writer || !compaction_writer { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-startup-config-gate"
+guards = "bus-off discovery omits compaction and compaction plans refuse without writes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["compaction_bus_disabled_refuses_plan_without_writes"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "if bus_event_config.enabled {\n        executor_impl = executor_impl.with_compaction_plane"
+new = "if true { // NON-VACUITY BREAK\n        executor_impl = executor_impl.with_compaction_plane"
+
+[[control]]
+id = "compaction-bus-idle-applies-before-queue-wake"
+guards = "an idle ceiling-held head requires a fetched, validated view and new durable estimate before draining"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/bus.rs"
+expect_red = ["bus::real_bus_fitting_idle_view_records_estimate_then_releases_held_queue_head"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "if !prior.run_finished_durable {"
+new = "if true || !prior.run_finished_durable { // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-idle-wakes-after-durable-notice"
+guards = "a fitting idle view wakes the existing held queue head after its updated notice is durable"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/bus.rs"
+expect_red = ["bus::real_bus_fitting_idle_view_records_estimate_then_releases_held_queue_head"]
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "                        self.registry\n                            .route_compaction_changed(&session)\n                            .await\n                            .map_err(|e| e.to_string())?;"
+new = "                        // NON-VACUITY BREAK: omit the idle queue wake"
+
+[[control]]
+id = "compaction-bus-production-startup-rebuild"
+guards = "production startup rebuilds acknowledged announcements before admitting work after a process kill"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/bus.rs"
+expect_red = ["bus::real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes"]
+edits = [
+  { file = "crates/broca-module-serve/src/main.rs", old = "service.restore().await.map_err(ServeIoError)?;", new = "// NON-VACUITY BREAK: skip durable announcement recovery" },
+  { file = "crates/broca-module-serve/src/compaction_bus.rs", old = "tokio::join!(self.consume(), self.reconcile());", new = "self.consume().await; // NON-VACUITY BREAK: suppress the recovery retry too" },
+]
+
+[[control]]
+id = "compaction-bus-attaches-only-m-broca"
+guards = "view_ready intake uses the existing m_broca durable rather than another broad consumer"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
+file = "crates/broca-module-serve/src/bus_events_nats.rs"
+old = ".consumer(DurableOwner::Module(\"broca\"))"
+new = ".consumer(DurableOwner::Module(\"prefrontal-core\")) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "compaction-bus-validates-bootstrap-consumer"
+guards = "attachment refuses an incompatible ACK wait without rewriting consumer configuration"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test run_events_bus"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/run_events_bus.rs"
+expect_red = ["real_bus_compaction_attach_never_creates_or_modifies_consumers"]
+file = "crates/broca-module-serve/src/bus_events_nats.rs"
+old = "config.ack_wait != spec.ack_wait"
+new = "false /* NON-VACUITY BREAK */"

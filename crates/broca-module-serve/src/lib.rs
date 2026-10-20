@@ -26,6 +26,7 @@ pub mod catalog_refresh;
 pub mod claude_code_identity;
 pub mod client;
 pub mod codeassist_identity;
+pub mod compaction_bus;
 pub mod config_home;
 pub mod consumer_routes;
 pub mod context_management;

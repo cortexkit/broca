@@ -90,6 +90,21 @@ pub trait RunExecutor: Send + Sync + 'static {
         None
     }
 
+    fn compaction_views(&self) -> Option<Arc<dyn broca_core::CompactionViews>> {
+        None
+    }
+
+    /// Runs only with the session idle and its single writer held by the actor.
+    async fn apply_idle_compaction(
+        &self,
+        _session: &broca_protocol::BindIdentity,
+        _writer: &broca_core::WalHandle,
+        _records: Vec<broca_wal::WalRecord>,
+        _ready: &broca_core::compaction_provider::notice::ViewReady,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// The same session-scoped hook adapter used by the run loop. Input hooks execute in
     /// the actor before a send writes or interrupts anything, never under the steer lock.
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
