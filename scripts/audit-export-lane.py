@@ -46,6 +46,9 @@ TERMINAL_STATES = (
     # `--self-test` now does, so the next terminal added in Rust fails here at CI time
     # rather than the first time an operator runs the audit.
     "transform_unavailable",
+    # A run sealed because its request stayed at or over the context ceiling after the
+    # compaction wait. It is a durable RunFinished like any other terminal and owes a fact.
+    "context_ceiling",
 )
 
 # States a run passes through without owing a fact yet. Every state the index can hold must
