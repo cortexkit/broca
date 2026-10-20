@@ -2309,6 +2309,9 @@ pub(crate) mod scope_refusal_golden {
 
 /// The error code refusing an operation on a session whose WAL a newer broca build wrote.
 pub const WAL_NEWER_WRITER: &str = "wal_newer_writer";
+/// The error code refusing a read of a session whose stored history proves it existed, while
+/// neither a live nor an archived WAL covers it. Permanent: serving the stored rows alone would
+/// present a truncated transcript, and no retry brings the log back.
 pub const HISTORY_UNREACHABLE: &str = "history_unreachable";
 
 /// The error body refusing an operation on a session whose WAL holds a complete frame that
