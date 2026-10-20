@@ -1144,11 +1144,22 @@ async fn floor_reads(control: crate::RunControl) -> usize {
 }
 
 /// Admission reads the retention tombstones for the notice floor only for a session whose plan
-/// names a compaction provider: a session without compaction does exactly the I/O it did before
-/// compaction notices existed.
+/// names a compaction provider: a session without a plan, or with a plan that names none, does
+/// exactly the I/O it did before compaction notices existed.
 #[tokio::test]
 async fn only_a_compaction_session_reads_the_notice_floor() {
     assert_eq!(floor_reads(crate::RunControl::default()).await, 0);
+    // A session with a plan that names no compaction provider.
+    let mut plain = manifest().as_ref().clone();
+    plain.plan = OpaqueJson::from_json_text(json!({"composition":{}}).to_string()).unwrap();
+    assert_eq!(
+        floor_reads(crate::RunControl {
+            manifest: Some(Arc::new(plain)),
+            ..Default::default()
+        })
+        .await,
+        0
+    );
     assert_eq!(
         floor_reads(crate::RunControl {
             manifest: Some(manifest()),
