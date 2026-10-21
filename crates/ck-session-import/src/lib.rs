@@ -89,28 +89,36 @@ pub struct CoordinateMap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportedBlockRange {
-    start: ImportedBlockCoordinate,
-    end: ImportedBlockCoordinate,
+    start: Option<ImportedBlockCoordinate>,
+    end: Option<ImportedBlockCoordinate>,
 }
 
 impl CoordinateMap {
     pub fn start_coordinate_for_ordinal(&self, ordinal: u64) -> Option<&ImportedBlockCoordinate> {
-        self.by_ordinal.get(&ordinal).map(|range| &range.start)
+        self.by_ordinal
+            .get(&ordinal)
+            .and_then(|range| range.start.as_ref())
     }
 
     pub fn start_coordinate_for_message_id(
         &self,
         message_id: &str,
     ) -> Option<&ImportedBlockCoordinate> {
-        self.by_message_id.get(message_id).map(|range| &range.start)
+        self.by_message_id
+            .get(message_id)
+            .and_then(|range| range.start.as_ref())
     }
 
     pub fn coordinate_for_ordinal(&self, ordinal: u64) -> Option<&ImportedBlockCoordinate> {
-        self.by_ordinal.get(&ordinal).map(|range| &range.end)
+        self.by_ordinal
+            .get(&ordinal)
+            .and_then(|range| range.end.as_ref())
     }
 
     pub fn coordinate_for_message_id(&self, message_id: &str) -> Option<&ImportedBlockCoordinate> {
-        self.by_message_id.get(message_id).map(|range| &range.end)
+        self.by_message_id
+            .get(message_id)
+            .and_then(|range| range.end.as_ref())
     }
 
     pub fn date_for_ordinal(&self, ordinal: u64) -> Option<&str> {
@@ -244,13 +252,22 @@ pub(crate) fn build_coordinate_map(
                 };
                 direct
                     .entry(origin.ordinal)
-                    .and_modify(|range| range.end = coordinate.clone())
+                    .and_modify(|range| range.end = Some(coordinate.clone()))
                     .or_insert(ImportedBlockRange {
-                        start: coordinate.clone(),
-                        end: coordinate,
+                        start: Some(coordinate.clone()),
+                        end: Some(coordinate),
                     });
             }
         }
+    }
+
+    let mut next_ranges = vec![None; source_messages.len()];
+    let mut next = None;
+    for (index, source) in source_messages.iter().enumerate().rev() {
+        if let Some(range) = direct.get(&source.ordinal) {
+            next = Some(range.clone());
+        }
+        next_ranges[index] = next.clone();
     }
 
     let mut by_ordinal = HashMap::new();
@@ -258,18 +275,35 @@ pub(crate) fn build_coordinate_map(
     let mut dates_by_ordinal = HashMap::new();
     let mut dates_by_message_id = HashMap::new();
     let mut prior = None;
-    for source in source_messages {
+    for (index, source) in source_messages.iter().enumerate() {
         let range = if let Some(range) = direct.get(&source.ordinal) {
-            prior = Some(range.end.clone());
+            prior = range.end.clone();
             Some(range.clone())
         } else {
-            // A dropped source row inherits only the nearest prior real block. Snapping forward
-            // would claim that a compartment summarized content which occurred after its boundary.
-            // Synthetic repair blocks can shift ordinals but are deliberately never an anchor.
-            prior.clone().map(|coordinate| ImportedBlockRange {
-                start: coordinate.clone(),
-                end: coordinate,
-            })
+            // Starts move toward the next surviving block and ends toward the previous one.
+            // A fully dropped span therefore has inverted edges; the optional compartment-state
+            // import can skip it rather than treating it as history on either side.
+            match (next_ranges[index].as_ref(), prior.as_ref()) {
+                (Some(next), Some(previous)) => Some(ImportedBlockRange {
+                    start: next.start.clone(),
+                    end: Some(previous.clone()),
+                }),
+                (Some(next), None) => Some(ImportedBlockRange {
+                    start: next.start.clone(),
+                    end: None,
+                }),
+                (None, Some(previous)) => Some(ImportedBlockRange {
+                    // The sentinel is just past imported messages. A trailing dropped span has no
+                    // forward block for its start, so this start uses the sentinel and its end
+                    // remains anchored to the previous surviving block.
+                    start: Some(ImportedBlockCoordinate {
+                        message_ordinal: imported_block_counts.len() as u64,
+                        block_index: 0,
+                    }),
+                    end: Some(previous.clone()),
+                }),
+                (None, None) => None,
+            }
         };
         if let Some(range) = range {
             by_ordinal.insert(source.ordinal, range.clone());
@@ -955,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_map_snaps_dropped_rows_backward_and_counts_synthetic_results() {
+    fn coordinate_map_snaps_dropped_starts_forward_and_ends_backward() {
         let result = |id: &str| {
             ContentBlock::ToolResult(ToolResult {
                 tool_call_id: ToolCallId(id.into()),
@@ -999,13 +1033,58 @@ mod tests {
             .collect::<Vec<_>>();
         let map = build_coordinate_map(&messages, &source, &source).unwrap();
 
-        assert_eq!(map.coordinate_for_ordinal(0).unwrap().flat_id(), "m0#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(1).unwrap().flat_id(),
+            "m1#0"
+        );
         assert_eq!(map.coordinate_for_ordinal(1).unwrap().flat_id(), "m0#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(2).unwrap().flat_id(),
+            "m1#0"
+        );
         assert_eq!(map.coordinate_for_ordinal(2).unwrap().flat_id(), "m1#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(3).unwrap().flat_id(),
+            "m3#0"
+        );
         assert_eq!(map.coordinate_for_ordinal(3).unwrap().flat_id(), "m1#0");
-        assert_eq!(map.coordinate_for_ordinal(4).unwrap().flat_id(), "m3#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(4).unwrap().flat_id(),
+            "m3#0"
+        );
         assert!(map.contains_flat_id("m2#0"));
         assert!(!map.contains_flat_id("m4#0"));
+    }
+
+    #[test]
+    fn coordinate_map_marks_a_trailing_dropped_start_as_unmapped() {
+        let messages = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "survives".into(),
+            }],
+        )];
+        let origins = vec![OriginMessageCoordinate {
+            ordinal: 0,
+            message_id: "source-0".into(),
+            date: None,
+        }];
+        let source = vec![
+            origins[0].clone(),
+            OriginMessageCoordinate {
+                ordinal: 1,
+                message_id: "source-1".into(),
+                date: None,
+            },
+        ];
+        let map = build_coordinate_map(&messages, &origins, &source).unwrap();
+
+        assert_eq!(map.coordinate_for_ordinal(1).unwrap().flat_id(), "m0#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(1).unwrap().message_ordinal,
+            1
+        );
+        assert!(!map.contains_flat_id("m1#0"));
     }
 
     #[test]

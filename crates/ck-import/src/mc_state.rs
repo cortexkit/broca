@@ -176,6 +176,7 @@ pub fn load_compartments(
 
     let mut compartments = Vec::with_capacity(database_rows.len());
     let mut previous_seq = None;
+    let mut previous_end_message = None;
     for row in database_rows {
         if previous_seq.is_some_and(|previous| row.seq <= previous) {
             return Err(format!(
@@ -196,15 +197,45 @@ pub fn load_compartments(
                 row.seq
             )
         })?;
-        let start =
-            translate_start_boundary(coordinates, source_start, &row.start_message_id, row.seq)?;
-        let end = translate_end_boundary(coordinates, source_end, &row.end_message_id, row.seq)?;
-        if start.message_ordinal > end.message_ordinal {
-            return Err(format!(
-                "magic-context compartment {} translates to an inverted range {}..{}",
-                row.seq, start.message_ordinal, end.message_ordinal
-            ));
+        let start = match translate_start_boundary(
+            coordinates,
+            source_start,
+            &row.start_message_id,
+            row.seq,
+        ) {
+            Ok(start) => start,
+            Err(error) => {
+                return Ok(CompartmentLoad::Unavailable(format!(
+                    "magic-context compartment {} has no surviving forward boundary: {error}",
+                    row.seq
+                )))
+            }
+        };
+        let end =
+            match translate_end_boundary(coordinates, source_end, &row.end_message_id, row.seq) {
+                Ok(end) => end,
+                Err(error) => {
+                    return Ok(CompartmentLoad::Unavailable(format!(
+                        "magic-context compartment {} has no surviving backward boundary: {error}",
+                        row.seq
+                    )))
+                }
+            };
+        if (start.message_ordinal, start.block_index) > (end.message_ordinal, end.block_index) {
+            return Ok(CompartmentLoad::Unavailable(format!(
+                "magic-context compartment {} contains no surviving imported blocks after its start snaps forward and its end snaps backward",
+                row.seq
+            )));
         }
+        if let Some(previous_end) = previous_end_message {
+            if start.message_ordinal <= previous_end {
+                return Err(format!(
+                    "magic-context compartment {} starts at message {} before the previous compartment ends at message {}; refusing overlapping state ranges",
+                    row.seq, start.message_ordinal, previous_end
+                ));
+            }
+        }
+        previous_end_message = Some(end.message_ordinal);
         let end_message_id = end.flat_id();
         if !coordinates.contains_flat_id(&end_message_id) {
             return Err(format!(
@@ -727,6 +758,48 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn wholly_dropped_compartment_makes_optional_state_unavailable() {
+        use ck_session_import::opencode::OpenCodeReader;
+        use ck_session_import::HarnessReader;
+
+        let source_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../ck-session-import/tests/fixtures/opencode.db");
+        let imported = OpenCodeReader::new(source_db).convert("ses-tools").unwrap();
+        let coordinates = imported.coordinate_map.as_ref().unwrap();
+        assert!(coordinates.start_coordinate_for_ordinal(0).is_some());
+        assert!(coordinates.coordinate_for_ordinal(0).is_none());
+
+        let path = broca_test_support::scratch_root().join(format!(
+            "ck-import-mc-state-dropped-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE compartments (\
+                   sequence INTEGER, start_message INTEGER, end_message INTEGER, \
+                   start_message_id TEXT, end_message_id TEXT, title TEXT, content TEXT, \
+                   legacy INTEGER, p1 TEXT, p2 TEXT, p3 TEXT, p4 TEXT, importance INTEGER, \
+                   episode_type TEXT, harness TEXT, session_id TEXT\
+                 );\
+                 INSERT INTO compartments VALUES \
+                   (1, 0, 0, '', '', 'dropped', '', \
+                    0, 'state with no surviving source blocks', NULL, NULL, NULL, 50, NULL, \
+                    'opencode', 'ses-tools');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let load = load_compartments(&path, "ses-tools", coordinates).unwrap();
+        assert!(matches!(
+            load,
+            CompartmentLoad::Unavailable(message) if message.contains("no surviving backward boundary")
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Widening a compartment's start must not make it overlap the one before it.
     ///
     /// A source row can import as several messages, so a compartment's start edge now resolves
@@ -798,6 +871,57 @@ mod tests {
                 pair[0].end_message
             );
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn overlapping_compartments_are_rejected_before_state_import() {
+        use ck_session_import::opencode::OpenCodeReader;
+        use ck_session_import::HarnessReader;
+
+        let source_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../ck-session-import/tests/fixtures/opencode.db");
+        let imported = OpenCodeReader::new(source_db).convert("ses-tools").unwrap();
+
+        let path = broca_test_support::scratch_root().join(format!(
+            "ck-import-mc-state-overlap-refused-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE compartments (\
+                   sequence INTEGER, start_message INTEGER, end_message INTEGER, \
+                   start_message_id TEXT, end_message_id TEXT, title TEXT, content TEXT, \
+                   legacy INTEGER, p1 TEXT, p2 TEXT, p3 TEXT, p4 TEXT, importance INTEGER, \
+                   episode_type TEXT, harness TEXT, session_id TEXT\
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO compartments VALUES \
+                 (4, 2, 2, 'm-assistant', 'm-assistant', 'first', '', \
+                  0, 'first', NULL, NULL, NULL, 50, NULL, 'opencode', 'ses-tools'), \
+                 (5, 2, 2, 'm-assistant', 'm-assistant', 'overlap', '', \
+                  0, 'overlap', NULL, NULL, NULL, 50, NULL, 'opencode', 'ses-tools')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let Err(error) = load_compartments(
+            &path,
+            "ses-tools",
+            imported.coordinate_map.as_ref().unwrap(),
+        ) else {
+            panic!("overlapping compartments must be rejected");
+        };
+        assert!(
+            error.contains("refusing overlapping state ranges"),
+            "{error}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

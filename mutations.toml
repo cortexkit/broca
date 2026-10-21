@@ -21413,3 +21413,31 @@ expect_red = ["claude_code::tests::tool_result_images_are_omitted_without_losing
 file = "crates/ck-session-import/src/lib.rs"
 old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
 new = "            if false { // NON-VACUITY BREAK: replay unsupported image payloads as raw data."
+
+
+[[control]]
+id = "ck-import-magic-context-compartments-do-not-overlap"
+guards = "OpenCode magic-context compartment ranges are strictly separated before any lineage commit"
+runner = "cargo"
+package = "ck-import"
+target = "--bin ck-import"
+select = "expected"
+test_file = "crates/ck-import/src/mc_state.rs"
+expect_red = ["mc_state::tests::overlapping_compartments_are_rejected_before_state_import"]
+file = "crates/ck-import/src/mc_state.rs"
+old = "        if let Some(previous_end) = previous_end_message {"
+new = "        if let Some(previous_end) = None::<u64> { // NON-VACUITY BREAK: admit overlapping ranges."
+
+
+[[control]]
+id = "ck-import-optional-magic-context-errors-continue-lineage"
+guards = "Malformed optional magic-context rows warn and allow the lineage import path to continue"
+runner = "cargo"
+package = "ck-import"
+target = "--test it"
+select = "expected"
+test_file = "crates/ck-import/tests/it/cli.rs"
+expect_red = ["cli::malformed_mc_row_warns_and_continues_lineage_setup"]
+file = "crates/ck-import/src/main.rs"
+old = "            Err(message) => {\n                mc_status = \"unavailable\".into();"
+new = "            Err(message) => return Err(message), // NON-VACUITY BREAK: abort before lineage import."

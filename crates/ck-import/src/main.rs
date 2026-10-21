@@ -233,6 +233,7 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
     } else {
         "absent".to_string()
     };
+    let session_id = args.session.unwrap_or_else(fresh_uuid);
     let mut mc_compartments = None;
     if !args.skip_mc_state && source_harness == "opencode" {
         let coordinates = imported.coordinate_map.as_ref().ok_or_else(|| {
@@ -243,22 +244,19 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
             .mc_state_db
             .clone()
             .unwrap_or_else(default_context_db_path);
-        match load_compartments(&context_db, source_id, coordinates)? {
-            CompartmentLoad::None => {}
-            CompartmentLoad::Unavailable(message) => {
+        match load_compartments(&context_db, source_id, coordinates) {
+            Ok(CompartmentLoad::None) => {}
+            Ok(CompartmentLoad::Unavailable(message)) => {
                 mc_status = "unavailable".into();
-                output.event(
-                    json!({
-                        "event": "warning",
-                        "kind": "mc_state_unavailable",
-                        "message": message,
-                    }),
-                    || format!("WARNING: Magic-context state unavailable; continuing lineage-only: {message}"),
-                );
+                warn_mc_state_unavailable(output, &message, &session_id);
             }
-            CompartmentLoad::Found(compartments) => {
+            Ok(CompartmentLoad::Found(compartments)) => {
                 mc_status = "prepared".into();
                 mc_compartments = Some(compartments);
+            }
+            Err(message) => {
+                mc_status = "unavailable".into();
+                warn_mc_state_unavailable(output, &message, &session_id);
             }
         }
     }
@@ -294,13 +292,11 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
     }
 
     let project_root = resolve_project_root(args.project_root, source_summary.as_ref());
-    let session_id = args.session.unwrap_or_else(fresh_uuid);
     let import_id = args
         .import_id
         .unwrap_or_else(|| digest_import_id(&imported.source_ref));
-    let mc_prepared = mc_compartments
-        .map(|compartments| prepare_state_import(&session_id, compartments))
-        .transpose()?;
+    let mc_prepared =
+        prepare_optional_mc_state(&session_id, mc_compartments, output, &mut mc_status);
     let mc_compartment_count = mc_prepared
         .as_ref()
         .map_or(0, |prepared| prepared.compartment_count);
@@ -471,6 +467,43 @@ fn convert_source(
     Ok((imported, source_summary))
 }
 
+fn mc_state_unavailable_message(reason: &str, session_id: &str) -> String {
+    format!(
+        "Magic-context state unavailable; continuing with lineage-only: {reason}. To retry state seeding, rerun with --session {session_id}."
+    )
+}
+
+fn warn_mc_state_unavailable(output: &Output, reason: &str, session_id: &str) {
+    let message = mc_state_unavailable_message(reason, session_id);
+    output.event(
+        json!({
+            "event": "warning",
+            "kind": "mc_state_unavailable",
+            "message": message,
+        }),
+        || format!("WARNING: {message}"),
+    );
+}
+
+fn prepare_optional_mc_state(
+    session_id: &str,
+    compartments: Option<Vec<mc_state::WireCompartment>>,
+    output: &Output,
+    status: &mut String,
+) -> Option<mc_state::PreparedStateImport> {
+    match compartments {
+        Some(compartments) => match prepare_state_import(session_id, compartments) {
+            Ok(prepared) => Some(prepared),
+            Err(message) => {
+                *status = "unavailable".into();
+                warn_mc_state_unavailable(output, &message, session_id);
+                None
+            }
+        },
+        None => None,
+    }
+}
+
 /// Build the retry instruction shown when the lineage import committed but the
 /// magic-context leg did not.
 ///
@@ -590,7 +623,9 @@ fn fresh_uuid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::retry_instruction;
+    use super::{
+        mc_state_unavailable_message, prepare_optional_mc_state, retry_instruction, Output,
+    };
 
     /// The instruction must carry the session id, because the retry it describes is only
     /// idempotent when addressed to the SAME lineage. Asserting the id is present is the
@@ -614,6 +649,23 @@ mod tests {
             msg.contains("WITHOUT --session"),
             "must warn that a bare re-run duplicates the import, got: {msg}"
         );
+    }
+
+    #[test]
+    fn optional_state_preparation_failure_becomes_a_lineage_only_status() {
+        let mut status = "prepared".to_string();
+        let prepared = prepare_optional_mc_state(
+            "ses_retry",
+            Some(Vec::new()),
+            &Output { json: true },
+            &mut status,
+        );
+
+        assert!(prepared.is_none());
+        assert_eq!(status, "unavailable");
+        let message = mc_state_unavailable_message("empty bundle", "ses_retry");
+        assert!(message.contains("continuing with lineage-only"));
+        assert!(message.contains("--session ses_retry"));
     }
 
     use std::cell::Cell;

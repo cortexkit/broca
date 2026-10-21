@@ -1573,6 +1573,13 @@ mod tests {
         assert!(coordinates.coordinate_for_ordinal(0).is_none());
         assert_eq!(
             coordinates
+                .start_coordinate_for_ordinal(0)
+                .unwrap()
+                .flat_id(),
+            "m0#0"
+        );
+        assert_eq!(
+            coordinates
                 .coordinate_for_message_id("m-user")
                 .unwrap()
                 .flat_id(),
