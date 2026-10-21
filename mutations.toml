@@ -19685,3 +19685,16 @@ expect_red = ["file_wal::tests::writer_open_uses_reference_index_and_preserves_s
 file = "crates/broca-wal/src/file_wal.rs"
 old = "        crate::migration::guard(&path, &session_ref, true)?;"
 new = "        crate::migration::guard(&path, \"\", true)?; // NON-VACUITY BREAK: discard the supplied reference."
+
+[[control]]
+id = "wal-prefix-damage-classification"
+guards = "Bounded prefix readers refuse damaged non-tail frames rather than reporting absence and never repair source bytes"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::prefix_readers_share_replay_damage_policy_without_writing"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "                decode_bytes_seeded(\n                    &frame,\n                    offset,\n                    scan.last_seq,\n                    1,\n                    Vec::new(),\n                    scan.lineage_id,\n                )?;"
+new = "                // NON-VACUITY BREAK: report damaged non-tail history as an absent prefix."

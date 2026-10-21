@@ -26,7 +26,7 @@
 //! low-volume (off the hot path) so a strong digest is cheap. `len` is capped +
 //! validated before allocation, so a corrupt length can't force a huge alloc.
 
-use serde::{de::IgnoredAny, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::record::WalRecord;
@@ -395,45 +395,16 @@ struct GatedEnvelopeOut<'a> {
     record: &'a WalRecord,
 }
 
-/// First pass over a gated payload: read `requires` and leave the record uninterpreted.
+/// Parse the envelope once, keeping the record's original JSON uninterpreted.
 ///
 /// The record is deliberately not parsed here. A record that needs a feature this build lacks
 /// may use values this build's types reject, and that failure would surface as corruption
 /// instead of as the newer-writer refusal it really is.
 #[derive(Deserialize)]
-struct GatedRequires {
+struct GatedRequires<'a> {
     requires: Vec<String>,
-    #[allow(dead_code)]
-    record: IgnoredAny,
-}
-
-/// Read requirements from an already verified, complete prefix. Keeping the
-/// original envelope matters: an explicit gate may require more than the
-/// decoded record's current `required_features()` implementation does.
-pub(crate) fn verified_prefix_features(mut bytes: &[u8]) -> Result<Vec<String>, FrameError> {
-    let mut features = std::collections::BTreeSet::new();
-    while !bytes.is_empty() {
-        let Some(header) = bytes.get(..HEADER_LEN) else {
-            return Err(FrameError::NonTailIncompleteFrame);
-        };
-        let len = u32::from_le_bytes(header[..4].try_into().expect("four-byte length")) as usize;
-        let Some(frame) = bytes.get(..HEADER_LEN + len) else {
-            return Err(FrameError::NonTailIncompleteFrame);
-        };
-        if header[4] == 3 {
-            let envelope: GatedRequires =
-                serde_json::from_slice(&frame[HEADER_LEN..]).map_err(FrameError::Deserialize)?;
-            features.extend(envelope.requires);
-        }
-        bytes = &bytes[frame.len()..];
-    }
-    Ok(features.into_iter().collect())
-}
-
-/// Second pass over a gated payload, run only once every required feature is known.
-#[derive(Deserialize)]
-struct GatedRecord {
-    record: WalRecord,
+    #[serde(borrow)]
+    record: &'a serde_json::value::RawValue,
 }
 
 /// Whether `name` is in the capability grammar: one or more of `[a-z0-9-]`, then `/v`, then
@@ -655,21 +626,18 @@ pub fn decode_next(buf: &[u8]) -> DecodeStep {
 /// [`KNOWN_FEATURES`]; tests pass a table with an entry the shipped one lacks, to prove a
 /// known name decodes without putting a name in the production table.
 fn decode_next_with(buf: &[u8], known: &[&str]) -> DecodeStep {
-    decode_projected_with(buf, known, |seq, fence, ver, payload| {
-        let record = if ver == GATED_FRAMING_VERSION {
-            serde_json::from_slice::<GatedRecord>(payload).map(|envelope| envelope.record)
-        } else {
-            serde_json::from_slice::<WalRecord>(payload)
-        }?;
+    decode_projected_with(buf, known, |seq, fence, payload| {
+        let record = serde_json::from_slice::<WalRecord>(payload)?;
         Ok(FramedRecord { seq, fence, record })
     })
 }
 
 /// Project a verified frame without constructing a full record. Feature requirements are
 /// still checked before the projection, so an admission index cannot skip a newer writer.
+/// The projection receives only the record JSON, with any gated envelope already removed.
 pub(crate) fn decode_projected<T>(
     buf: &[u8],
-    project: impl FnOnce(u64, u64, u8, &[u8]) -> Result<T, serde_json::Error>,
+    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
     decode_projected_with(buf, KNOWN_FEATURES, project)
 }
@@ -677,7 +645,7 @@ pub(crate) fn decode_projected<T>(
 fn decode_projected_with<T>(
     buf: &[u8],
     known: &[&str],
-    project: impl FnOnce(u64, u64, u8, &[u8]) -> Result<T, serde_json::Error>,
+    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
     if buf.len() < HEADER_LEN {
         return DecodeStep::TornTail; // not even a full header → torn
@@ -717,12 +685,13 @@ fn decode_projected_with<T>(
         };
     }
 
-    if ver == GATED_FRAMING_VERSION {
-        let requires = match serde_json::from_slice::<GatedRequires>(payload) {
-            Ok(envelope) => envelope.requires,
+    let payload = if ver == GATED_FRAMING_VERSION {
+        let envelope = match serde_json::from_slice::<GatedRequires>(payload) {
+            Ok(envelope) => envelope,
             Err(e) => return DecodeStep::Corrupt(FrameError::Deserialize(e)),
         };
-        let mut missing: Vec<String> = requires
+        let mut missing: Vec<String> = envelope
+            .requires
             .into_iter()
             .filter(|name| {
                 (!known.contains(&name.as_str()) || forgotten_for_test(name))
@@ -734,8 +703,11 @@ fn decode_projected_with<T>(
             missing.dedup();
             return DecodeStep::NewerWriter { ver, missing };
         }
-    }
-    match project(seq, fence, ver, payload) {
+        envelope.record.get().as_bytes()
+    } else {
+        payload
+    };
+    match project(seq, fence, payload) {
         Ok(record) => DecodeStep::Record {
             framed: Box::new(record),
             consumed: total,

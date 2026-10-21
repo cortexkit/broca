@@ -101,7 +101,6 @@ pub struct WalRangeRead {
     file_present: Option<bool>,
     archive_lookup_missed: bool,
     anchors: Vec<WalByteAnchor>,
-    used_features: Vec<String>,
 }
 
 impl WalRangeRead {
@@ -177,7 +176,6 @@ impl WalRangeRead {
             file_present: None,
             archive_lookup_missed: false,
             anchors,
-            used_features: Vec::new(),
         }
     }
 
@@ -191,7 +189,6 @@ impl WalRangeRead {
             file_present: None,
             archive_lookup_missed: false,
             anchors: Vec::new(),
-            used_features: Vec::new(),
         }
     }
 
@@ -201,12 +198,6 @@ impl WalRangeRead {
             .binary_search_by_key(&seq, |anchor| anchor.seq)
             .ok()
             .map(|index| self.anchors[index])
-    }
-
-    /// Feature requirements from the verified source frames, including explicit
-    /// gates not implied by decoded records. A suffix reports only its own frames.
-    pub fn used_features(&self) -> &[String] {
-        &self.used_features
     }
 }
 
@@ -664,12 +655,32 @@ impl FileWal {
         // Recover the valid records and metadata plus the byte offset where they end (the start of
         // any torn tail, or the whole file if intact).
         open_observed("replay");
-        let (records, valid_end, recovered_lineage_id) =
-            replay_path_with_valid_end(&path, DEFAULT_MAX_READ_BYTES)?;
+        let recovered = match File::open(&path) {
+            Ok(file) => {
+                let size = file.metadata().map_err(WalError::Io)?.len();
+                if size > DEFAULT_MAX_READ_BYTES {
+                    return Err(WalError::TooLarge {
+                        max_bytes: DEFAULT_MAX_READ_BYTES,
+                        file_size: size,
+                    });
+                }
+                scan_prefix(
+                    std::io::BufReader::new(file),
+                    DEFAULT_MAX_READ_BYTES,
+                    |_| None::<()>,
+                )?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                scan_prefix(std::io::empty(), DEFAULT_MAX_READ_BYTES, |_| None::<()>)?
+            }
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        let valid_end = recovered.valid_end;
+        let recovered_lineage_id = recovered.lineage_id;
         // Seq is 1-BASED: the first record is seq 1, so a watermark of 0
         // unambiguously means "nothing projected yet" and `tail_after_seq(0)`
         // includes the first record (the cold-start merge case).
-        let next_seq = records.last().map(|r| r.seq + 1).unwrap_or(1);
+        let next_seq = recovered.last_seq.map(|seq| seq + 1).unwrap_or(1);
         // If the file is longer than the last valid record, a torn tail exists — truncate it
         // so the file ends exactly at the last valid record, BEFORE opening the append
         // handle. The truncation uses a dedicated WRITE handle: an append-mode handle
@@ -1068,74 +1079,128 @@ pub fn first_user_message_in(record: &WalRecord) -> Option<broca_protocol::Messa
         .cloned()
 }
 
-/// Decode frames from the start of a log until `found` returns a value, never reading past
-/// `max_bytes`. Returns that value (or `None` at the end of the log or a torn tail) with the
-/// number of bytes read.
+/// Decode only as far as the requested value. Damage is classified by the same
+/// decoder as full replay, with lookahead bounded by the caller's byte budget.
 fn read_prefix_until_from<T>(
+    file: impl Read,
+    max_bytes: u64,
+    found: impl FnMut(&FramedRecord) -> Option<T>,
+) -> Result<(Option<T>, u64), WalError> {
+    let scan = scan_prefix(file, max_bytes, found)?;
+    Ok((scan.found, scan.bytes_read))
+}
+
+struct PrefixScan<T> {
+    found: Option<T>,
+    bytes_read: u64,
+    valid_end: u64,
+    last_seq: Option<u64>,
+    lineage_id: Option<WalLineageId>,
+}
+
+fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError> {
+    let mut n = 0;
+    while n < bytes.len() {
+        match file.read(&mut bytes[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(WalError::Io(error)),
+        }
+    }
+    Ok(n)
+}
+
+/// Strictly decode one body at a time, retaining only the caller's selected value.
+/// Recovery needs the verified end and sequence, not all historical message bodies.
+fn scan_prefix<T>(
     mut file: impl Read,
     max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
-) -> Result<(Option<T>, u64), WalError> {
-    let mut offset = 0usize;
-    let mut previous = None;
-    let mut lineage = None;
+) -> Result<PrefixScan<T>, WalError> {
+    let mut scan = PrefixScan {
+        found: None,
+        bytes_read: 0,
+        valid_end: 0,
+        last_seq: None,
+        lineage_id: None,
+    };
     loop {
+        let offset = scan.valid_end;
         let mut header = [0; crate::framing::HEADER_LEN];
-        match file.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok((None, offset as u64))
+        let available = max_bytes.saturating_sub(offset);
+        let header_budget = available.min(header.len() as u64) as usize;
+        let n = read_up_to(&mut file, &mut header[..header_budget])?;
+        scan.bytes_read += n as u64;
+        if n == 0 && header_budget != 0 {
+            return Ok(scan);
+        }
+        let mut frame = header[..n].to_vec();
+        if n == header.len() {
+            let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            if len <= crate::framing::MAX_PAYLOAD_LEN {
+                let size = header.len() + len as usize;
+                if size as u64 > available {
+                    return Err(WalError::TooLarge {
+                        max_bytes,
+                        file_size: offset + size as u64,
+                    });
+                }
+                frame.resize(size, 0);
+                let n = read_up_to(&mut file, &mut frame[header.len()..])?;
+                frame.truncate(header.len() + n);
+                scan.bytes_read += n as u64;
             }
-            Err(error) => return Err(WalError::Io(error)),
         }
-        let len = u32::from_le_bytes(header[..4].try_into().unwrap());
-        if len > crate::framing::MAX_PAYLOAD_LEN {
-            return Err(WalError::Corrupt {
-                offset,
-                source: FrameError::PayloadTooLarge { len },
-            });
-        }
-        let size = header.len() + len as usize;
-        if (offset as u64).saturating_add(size as u64) > max_bytes {
-            return Err(WalError::TooLarge {
-                max_bytes,
-                file_size: offset as u64 + size as u64,
-            });
-        }
-        let mut frame = Vec::with_capacity(size);
-        frame.extend_from_slice(&header);
-        frame.resize(size, 0);
-        match file.read_exact(&mut frame[header.len()..]) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok((None, (offset + size) as u64))
-            }
-            Err(error) => return Err(WalError::Io(error)),
-        }
-        match crate::framing::decode_next(&frame) {
-            crate::framing::DecodeStep::Record { framed, .. } => {
-                validate_contiguous_sequence(previous, 1, framed.seq)?;
-                previous = Some(framed.seq);
+        match decode_next_counted(&frame) {
+            DecodeStep::Record { framed, consumed } => {
+                validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
+                scan.last_seq = Some(framed.seq);
+                scan.valid_end += consumed as u64;
                 if let Some(value) = found(&framed) {
-                    return Ok((Some(value), (offset + size) as u64));
+                    scan.found = Some(value);
+                    return Ok(scan);
                 }
             }
-            crate::framing::DecodeStep::Lineage { lineage_id, .. } => {
-                fold_lineage_id(&mut lineage, lineage_id)?
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } => {
+                fold_lineage_id(&mut scan.lineage_id, lineage_id)?;
+                scan.valid_end += consumed as u64;
             }
-            crate::framing::DecodeStep::Corrupt(source) => {
-                return Err(WalError::Corrupt { offset, source })
-            }
-            crate::framing::DecodeStep::NewerWriter { ver, missing } => {
+            DecodeStep::NewerWriter { ver, missing } => {
                 return Err(WalError::NewerWriter {
-                    offset,
+                    offset: offset as usize,
                     ver,
                     missing,
-                })
+                });
             }
-            crate::framing::DecodeStep::TornTail => return Ok((None, (offset + size) as u64)),
+            DecodeStep::Corrupt(_) | DecodeStep::TornTail => {
+                // Only the exceptional path reads ahead. A damaged length cannot tell
+                // us whether intact records follow it, so inspect the bounded suffix.
+                let before = frame.len();
+                file.take(available.saturating_sub(before as u64).saturating_add(1))
+                    .read_to_end(&mut frame)
+                    .map_err(WalError::Io)?;
+                scan.bytes_read += (frame.len() - before) as u64;
+                if frame.len() as u64 > available {
+                    return Err(WalError::TooLarge {
+                        max_bytes,
+                        file_size: offset + frame.len() as u64,
+                    });
+                }
+                decode_bytes_seeded(
+                    &frame,
+                    offset,
+                    scan.last_seq,
+                    1,
+                    Vec::new(),
+                    scan.lineage_id,
+                )?;
+                return Ok(scan);
+            }
         }
-        offset += size;
     }
 }
 
@@ -1273,7 +1338,6 @@ pub fn read_records_range(
                 complete_byte_end: None,
                 archive_lookup_missed: false,
                 anchors: Vec::new(),
-                used_features: Vec::new(),
             });
         }
         Err(error) => return Err(WalError::Io(error)),
@@ -1726,19 +1790,12 @@ fn decode_bytes_seeded(
 
 fn select_decoded_range(
     decoded: DecodedBytes,
-    bytes: &[u8],
-    absolute_start: u64,
+    _bytes: &[u8],
+    _absolute_start: u64,
     file_id: Option<u64>,
     after_seq: u64,
     through_seq: Option<u64>,
 ) -> Result<WalRangeRead, WalError> {
-    let used_features = crate::framing::verified_prefix_features(
-        &bytes[..(decoded.valid_end - absolute_start) as usize],
-    )
-    .map_err(|source| WalError::Corrupt {
-        offset: absolute_start as usize,
-        source,
-    })?;
     let source_head = decoded.records.last().map(|(r, _)| r.seq);
     let complete_end = decoded.valid_end;
     let mut range = select_range(
@@ -1748,7 +1805,6 @@ fn select_decoded_range(
         through_seq,
         decoded.lineage_id,
     );
-    range.used_features = used_features;
     if source_head.is_some() && range.next_anchor.map(|a| a.seq) == source_head {
         range.complete_byte_end = Some(complete_end);
     }
@@ -1893,6 +1949,115 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_readers_share_replay_damage_policy_without_writing() {
+        let first = encode(1, 1, &WalRecord::StepStarted { step_id: StepId(1) }).unwrap();
+        let second = encode(2, 1, &WalRecord::StepStarted { step_id: StepId(2) }).unwrap();
+        for (tag, bytes, corrupt) in [
+            (
+                "bad-final-digest",
+                {
+                    let mut bytes = first.clone();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    bytes
+                },
+                false,
+            ),
+            (
+                "damaged-nontail-length",
+                {
+                    let mut bytes = first.clone();
+                    bytes[..4].copy_from_slice(&4096u32.to_le_bytes());
+                    bytes.extend_from_slice(&second);
+                    bytes
+                },
+                true,
+            ),
+            (
+                "incomplete-final-frame",
+                first[..first.len() - 1].to_vec(),
+                false,
+            ),
+            (
+                "bad-nontail-digest",
+                {
+                    let mut bytes = first.clone();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    bytes.extend_from_slice(&second);
+                    bytes
+                },
+                true,
+            ),
+        ] {
+            let path = tmp(tag);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(replay_file(&path, 8192).is_err(), corrupt, "{tag}");
+            assert_eq!(
+                read_first_run_started(&path, 8192).is_err(),
+                corrupt,
+                "{tag}"
+            );
+            assert_eq!(
+                read_first_user_message(&path, 8192).is_err(),
+                corrupt,
+                "{tag}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "readers must not repair {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_scan_decodes_strict_bodies_one_frame_at_a_time() {
+        struct BoundedReads(std::io::Cursor<Vec<u8>>);
+        impl Read for BoundedReads {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                assert!(out.len() <= 256, "recovery must not buffer the whole WAL");
+                self.0.read(out)
+            }
+        }
+        let mut bytes = Vec::new();
+        for seq in 1..=1000 {
+            bytes.extend_from_slice(
+                &encode(
+                    seq,
+                    1,
+                    &WalRecord::StepStarted {
+                        step_id: StepId(seq),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let size = bytes.len() as u64;
+        let scan = scan_prefix(
+            BoundedReads(std::io::Cursor::new(bytes.clone())),
+            size,
+            |_| None::<()>,
+        )
+        .unwrap();
+        assert_eq!(scan.last_seq, Some(1000));
+        assert_eq!(scan.valid_end, size);
+        let invalid = crate::framing::encode_payload(
+            1001,
+            1,
+            br#"{"type":"step_started","step_id":"wrong"}"#,
+        )
+        .unwrap();
+        bytes.extend_from_slice(&invalid);
+        assert!(matches!(
+            scan_prefix(
+                std::io::Cursor::new(bytes),
+                size + invalid.len() as u64,
+                |_| None::<()>
+            ),
+            Err(WalError::Corrupt { .. })
+        ));
+    }
+
     #[test]
     fn preencoded_mismatches_leave_wal_and_floor_unchanged() {
         let path = tmp("preencoded-validation");

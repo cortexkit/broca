@@ -101,8 +101,11 @@ fn count_from(
         frame.resize(size, 0);
         file.read_exact(&mut frame[header.len()..])
             .map_err(WalError::Io)?;
-        match framing::decode_projected(&frame, |seq, _, ver, payload| {
-            Ok((seq, human_prompts_in_payload(ver, payload)?))
+        match framing::decode_projected(&frame, |seq, _, payload| {
+            Ok((
+                seq,
+                human_prompts_in_payload(framing::FRAMING_VERSION, payload)?,
+            ))
         }) {
             DecodeStep::Record { framed, .. } => {
                 let (seq, prompts) = *framed;
