@@ -3724,6 +3724,9 @@ pub fn classify_account_limit_exhausted(
         crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
             chatgpt_usage_limit_reached(status, body, now, error)
         }
+        crate::spec::WireFamilyId::OpenAiResponses => {
+            meta_subscription_quota_exhausted(status, body, error)
+        }
         crate::spec::WireFamilyId::OpenAiChat => kimi_weekly_usage_limit_reached(body, error),
         // Code Assist wraps the Gemini request but answers errors in the same Google RPC shape,
         // so both families share one decoder.
@@ -3731,6 +3734,53 @@ pub fn classify_account_limit_exhausted(
             google_quota_exhausted(body, now, error)
         }
         _ => error,
+    }
+}
+
+/// Meta's Muse subscription quota refusal is an account wall, not a short rate limit: its HTTP
+/// 429 carries a structured `rate_limit_error`, an absolute `resets_at`, and a subscription
+/// exhaustion message. The reset is required so a per-minute Responses-family throttle stays
+/// retryable even if its prose happens to mention a subscription.
+fn meta_subscription_quota_exhausted(
+    status: u16,
+    body: &str,
+    error: ProviderError,
+) -> ProviderError {
+    if status != 429 {
+        return error;
+    }
+    let Ok(body) = serde_json::from_str::<Value>(body) else {
+        return error;
+    };
+    let Some(detail) = body.get("error") else {
+        return error;
+    };
+    if detail.get("type").and_then(Value::as_str) != Some("rate_limit_error")
+        || !detail
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Subscription quota exhausted"))
+    {
+        return error;
+    }
+    let Some(resets_at_ms) = detail
+        .get("resets_at")
+        .and_then(Value::as_u64)
+        .and_then(|seconds| seconds.checked_mul(1_000))
+    else {
+        return error;
+    };
+    ProviderError {
+        refusal: None,
+        class: ErrorClass::Transient,
+        provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_string()),
+        resets_at_ms: Some(resets_at_ms),
+        resets_at_source: Some("body".to_owned()),
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+        ..error
     }
 }
 
@@ -6490,10 +6540,25 @@ mod tests {
 
     const KIMI_WEEKLY_USAGE_LIMIT_BODY: &str = r#"{"error":{"message":"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota","type":"access_terminated_error"}}"#;
 
+    const META_SUBSCRIPTION_QUOTA_429_BODY: &str = r#"{"error":{"code":"rate_limit_exceeded","message":"Subscription quota exhausted. Your usage window resets at 2026-10-26T00:00:00Z.","param":null,"resets_at":1792972800,"type":"rate_limit_error"}}"#;
+
     fn classify_chatgpt_429(family: WireFamilyId, body: &str, now: SystemTime) -> ProviderError {
         let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
         let error = classify_http_error(429, body, None, None);
         classify_account_limit_exhausted(family, 429, &headers, body, now, error)
+    }
+
+    fn classify_meta_429(body: &str) -> ProviderError {
+        let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+        let error = classify_http_error(429, body, None, None);
+        classify_account_limit_exhausted(
+            WireFamilyId::OpenAiResponses,
+            429,
+            &headers,
+            body,
+            UNIX_EPOCH,
+            error,
+        )
     }
 
     #[test]
@@ -6518,6 +6583,18 @@ mod tests {
         assert_eq!(error.retry_after_secs, None);
         assert_eq!(error.message, format!("429: {CHATGPT_USAGE_LIMIT_BODY}"));
         assert_ne!(error.class, ErrorClass::Auth);
+    }
+
+    #[test]
+    fn meta_429_without_resets_at_stays_rate_limited() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"Request rate limit reached","type":"rate_limit_error"}}"#;
+        let error = classify_meta_429(body);
+
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert!(error.is_rate_limited());
+        assert!(!error.is_account_limit_exhausted());
+        assert_eq!(error.provider_code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(error.resets_at_ms, None);
     }
 
     #[test]
@@ -7356,6 +7433,16 @@ mod tests {
         provider
     }
 
+    fn meta_responses_retry_test_provider(
+        server: &ScriptedServer,
+    ) -> LiveProvider<RetryTestFamily> {
+        let mut provider = retry_test_provider(server, 0);
+        let mut frozen = (*provider.frozen).clone();
+        frozen.family_id = WireFamilyId::OpenAiResponses;
+        provider.frozen = Arc::new(frozen);
+        provider
+    }
+
     #[tokio::test]
     async fn a_chatgpt_usage_limit_ends_the_step_after_one_attempt() {
         let server = ScriptedServer::start(vec![ScriptResponse::Http {
@@ -7372,6 +7459,36 @@ mod tests {
         assert!(error.is_account_limit_exhausted());
         assert_eq!(error.resets_at_ms, Some(1_790_021_043_000));
         assert_eq!(error.resets_at_source.as_deref(), Some("body"));
+        assert_eq!(
+            server.request_bodies().len(),
+            1,
+            "never re-sent within the step"
+        );
+        assert!(waits.lock().unwrap().is_empty(), "no retry wait");
+    }
+
+    #[tokio::test]
+    async fn meta_subscription_quota_429_ends_the_step_after_one_attempt() {
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 429,
+            headers: Vec::new(),
+            body: META_SUBSCRIPTION_QUOTA_429_BODY.as_bytes(),
+        }])
+        .await;
+        let mut provider = meta_responses_retry_test_provider(&server);
+        let waits = use_virtual_retry_waits(&mut provider);
+
+        let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+        let error = terminal_error(&events);
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some(ACCOUNT_LIMIT_EXHAUSTED)
+        );
+        assert_eq!(error.status, Some(429));
+        assert_eq!(error.resets_at_ms, Some(1_792_972_800_000));
+        assert_eq!(error.resets_at_source.as_deref(), Some("body"));
+        assert_eq!(error.limit_window, None);
         assert_eq!(
             server.request_bodies().len(),
             1,
