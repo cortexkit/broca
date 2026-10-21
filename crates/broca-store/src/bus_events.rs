@@ -22,6 +22,41 @@ use crate::{SqliteStore, StoreError};
 
 pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// How old a queued run event may be, by its own `at_ms`, and still be published when a bus
+/// connection comes up. Older ones are replaced by one `run.skipped` marker per session.
+///
+/// Core polls every run while events are down, so an event this old tells it nothing new, and
+/// replaying it does harm: each stale `run.ended` sets off a status poll, so a backlog becomes
+/// a burst, and a stale `run.progress` refreshes a worker's liveness clock with replay time,
+/// hiding a worker that is stuck. A replay shorter than two minutes cannot hide anything, and
+/// publishing it keeps a brief broker blip from delaying the run ends Core is waiting for.
+pub const STALE_BACKLOG_MS: u64 = 2 * 60 * 1000;
+
+/// The event name of the marker that stands in for skipped stale events of one session.
+pub const SKIPPED_EVENT: &str = "run.skipped";
+
+/// What one stale-backlog pass replaced with markers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SkipSummary {
+    /// Sessions that received a marker.
+    pub sessions: u64,
+    /// Queued events the markers replaced.
+    pub skipped: u64,
+}
+
+/// The body of a `run.skipped` marker: which of one session's events were not published.
+/// `from_seq` and `to_seq` are the first and last skipped events in WAL order; `from_ms` and
+/// `to_ms` are the earliest and latest of their own clocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipMarker {
+    pub session_ref: String,
+    pub from_seq: u64,
+    pub to_seq: u64,
+    pub from_ms: u64,
+    pub to_ms: u64,
+    pub count: u64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     pub bus_events_published: AtomicU64,
@@ -658,11 +693,16 @@ impl SqliteStore {
                 let session: String = r.get(5)?;
                 let session: BindIdentity = serde_json::from_str(&session).map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
                 let subject: String = r.get(1)?;
-                Ok(Publication { event_key:r.get(0)?, headers: Headers::from([
+                let mut headers = Headers::from([
                     ("kind".into(), subject.split(".event.broca.").nth(1).unwrap_or_default().trim_end_matches(".v1").into()),
                     ("epoch".into(),r.get(2)?), ("run_id".into(),r.get(3)?),
                     ("seq".into(),r.get::<_,u64>(4)?.to_string()), ("session_ref".into(),agent_session_ref(&session)),
-                ]), subject, body:r.get(6)?, digest: None })
+                ]);
+                // A skip marker spans runs, so it names none.
+                if headers.get("run_id").is_some_and(String::is_empty) {
+                    headers.remove("run_id");
+                }
+                Ok(Publication { event_key:r.get(0)?, headers, subject, body:r.get(6)?, digest: None })
             },
         ).optional()?;
         match lifecycle {
@@ -719,6 +759,123 @@ impl SqliteStore {
                 Ok(DrainResult::Retry)
             }
         }
+    }
+
+    /// Replace queued run events older than [`STALE_BACKLOG_MS`] with one `run.skipped` marker
+    /// per session. Call it when a bus connection comes up, before the first publish on it.
+    ///
+    /// Every unpublished lifecycle row either stays to be published or leaves the outbox in
+    /// the same transaction that inserts the marker covering it, so no row is ever lost
+    /// without a marker, and a crash at any point leaves either the rows (the next pass
+    /// replaces them again) or the marker (published like any other event), never both.
+    ///
+    /// A session's skipped range is everything queued for it up to its last stale event, so
+    /// a younger event queued between stale ones is covered too and nothing published for
+    /// the session predates its marker. The marker takes the rowid of the first row it
+    /// replaces, which keeps it ahead of the session's remaining events in the drain's
+    /// rowid order. Markers already queued are never folded into a new one.
+    pub fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError> {
+        let account = self
+            .bus_events
+            .account
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| StoreError::BusEvent("run event account is not known yet".into()))?;
+        let subject = account
+            .event_subject("broca", SKIPPED_EVENT, 1)
+            .map_err(|e| StoreError::BusEvent(e.to_string()))?;
+        let cutoff = now_ms.saturating_sub(STALE_BACKLOG_MS);
+        struct Row {
+            rowid: i64,
+            seq: u64,
+            epoch: String,
+            at_ms: u64,
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Sessions in the order their first queued row appears, each with its rows in order.
+        let mut sessions: Vec<(String, Vec<Row>)> = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT rowid,session,seq,epoch,body FROM bus_event_outbox INDEXED BY bus_event_unpublished \
+                 WHERE published_ms IS NULL AND best_effort=0 AND subject<>?1 ORDER BY rowid",
+            )?;
+            let mut rows = statement.query([&subject])?;
+            let mut index: std::collections::HashMap<String, usize> = Default::default();
+            while let Some(r) = rows.next()? {
+                let session: String = r.get(1)?;
+                let body: Vec<u8> = r.get(4)?;
+                // An event without a readable clock cannot prove it is young.
+                let at_ms = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("at_ms").and_then(serde_json::Value::as_u64))
+                    .unwrap_or(0);
+                let row = Row {
+                    rowid: r.get(0)?,
+                    seq: r.get(2)?,
+                    epoch: r.get(3)?,
+                    at_ms,
+                };
+                let slot = *index.entry(session.clone()).or_insert_with(|| {
+                    sessions.push((session, Vec::new()));
+                    sessions.len() - 1
+                });
+                sessions[slot].1.push(row);
+            }
+        }
+        let mut summary = SkipSummary::default();
+        for (session_json, rows) in sessions {
+            let Some(last_stale) = rows.iter().rposition(|row| row.at_ms < cutoff) else {
+                continue;
+            };
+            let skipped = &rows[..=last_stale];
+            let (first, last) = (&skipped[0], &skipped[last_stale]);
+            let session: BindIdentity = serde_json::from_str(&session_json)?;
+            let marker = SkipMarker {
+                session_ref: agent_session_ref(&session),
+                from_seq: first.seq,
+                to_seq: last.seq,
+                from_ms: skipped.iter().map(|row| row.at_ms).min().unwrap_or(0),
+                to_ms: skipped.iter().map(|row| row.at_ms).max().unwrap_or(0),
+                count: skipped.len() as u64,
+            };
+            let body = serde_jcs::to_vec(&marker)?;
+            // The same idempotency style as run events: a key hashed from what the marker
+            // names, so a republish after a crash carries the identical key and digest.
+            let key_bytes = serde_jcs::to_vec(&(
+                &last.epoch,
+                &marker.session_ref,
+                marker.from_seq,
+                marker.to_seq,
+                &subject,
+            ))?;
+            let event_key = format!("{:x}", Sha256::digest(key_bytes));
+            for row in skipped {
+                tx.execute("DELETE FROM bus_event_outbox WHERE rowid=?1", [row.rowid])?;
+            }
+            tx.execute(
+                "INSERT INTO bus_event_outbox(rowid,event_key,run_id,seq,subject,epoch,session,body,at_ms,best_effort) \
+                 VALUES(?1,?2,'',?3,?4,?5,?6,?7,?8,0)",
+                params![
+                    first.rowid,
+                    event_key,
+                    marker.to_seq,
+                    subject,
+                    last.epoch,
+                    session_json,
+                    body,
+                    now_ms
+                ],
+            )?;
+            summary.sessions += 1;
+            summary.skipped += marker.count;
+        }
+        tx.commit()?;
+        drop(conn);
+        // Each session's rows became one pending marker.
+        self.lower_bus_depth(summary.skipped - summary.sessions);
+        Ok(summary)
     }
 
     pub fn acknowledge_bus_event(
@@ -1384,5 +1541,263 @@ mod tests {
             store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
             0
         );
+    }
+
+    fn started_at(seq: u64, run_id: &str, session: &BindIdentity, ts: u64) -> FramedRecord {
+        let mut frame = crate::conformance::run_started(
+            seq,
+            run_id,
+            session,
+            "prompt",
+            ModelHandle::new("test", "model"),
+        );
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut frame.record {
+            *ts_ms = Some(ts);
+        }
+        frame
+    }
+    fn finished_at(seq: u64, ts: u64) -> FramedRecord {
+        let mut frame = finish(seq, RunFinishReason::Completed);
+        if let WalRecord::RunFinished { ts_ms, .. } = &mut frame.record {
+            *ts_ms = Some(ts);
+        }
+        frame
+    }
+
+    type Recorded = (String, String, String, Vec<u8>);
+    /// Every publication, as `(kind, session_ref, event_key, body)`, acknowledged or not.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Recorded>>);
+    #[async_trait]
+    impl BusPublisher for Recorder {
+        async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
+            let mut seen = self.0.lock().unwrap();
+            seen.push((
+                event.headers["kind"].clone(),
+                event.headers["session_ref"].clone(),
+                event.event_key.clone(),
+                event.body.clone(),
+            ));
+            Ok(PublishReceipt::new(seen.len() as u64, false))
+        }
+    }
+    async fn drain_all(store: &SqliteStore, bus: &Recorder, now: u64) {
+        while store.drain_bus_event(bus, now).await.unwrap() == DrainResult::Published {}
+    }
+
+    const NOW: u64 = 1_800_000_000_000;
+    const MINUTE: u64 = 60_000;
+
+    /// Three sessions with queued events: `a` has an old finished run and a young run, `b`
+    /// only old events, `c` only a young one. Returns them in that order.
+    fn mixed_backlog(store: &SqliteStore) -> [BindIdentity; 3] {
+        let [a, b, c] = ["a", "b", "c"].map(|n| BindIdentity::new("/project", "test", n));
+        store
+            .project_bus_events(
+                &a,
+                "epoch-a",
+                &[
+                    started_at(1, "a-old", &a, NOW - 10 * MINUTE),
+                    finished_at(2, NOW - 9 * MINUTE),
+                    started_at(3, "a-young", &a, NOW - MINUTE / 2),
+                ],
+                NOW,
+            )
+            .unwrap();
+        store
+            .project_bus_events(
+                &b,
+                "epoch-b",
+                &[
+                    started_at(1, "b-old", &b, NOW - 5 * MINUTE),
+                    finished_at(2, NOW - 4 * MINUTE),
+                ],
+                NOW,
+            )
+            .unwrap();
+        store
+            .project_bus_events(
+                &c,
+                "epoch-c",
+                &[started_at(1, "c-young", &c, NOW - 10_000)],
+                NOW,
+            )
+            .unwrap();
+        [a, b, c]
+    }
+
+    /// A backlog found when a connection comes up: each session's events older than two
+    /// minutes become exactly one marker naming their range, published before that
+    /// session's younger events, and no stale event is published.
+    #[tokio::test]
+    async fn bus_stale_backlog_becomes_one_marker_per_session_ahead_of_its_young_events() {
+        let store = enabled();
+        let [a, b, c] = mixed_backlog(&store);
+        let stale_keys: Vec<String> = rows(&store)
+            .into_iter()
+            .filter(|row| {
+                let body: serde_json::Value = serde_json::from_slice(&row.3).unwrap();
+                body["at_ms"].as_u64().unwrap() < NOW - STALE_BACKLOG_MS
+            })
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(stale_keys.len(), 4);
+        assert_eq!(
+            store.skip_stale_bus_events(NOW).unwrap(),
+            SkipSummary {
+                sessions: 2,
+                skipped: 4
+            }
+        );
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            4,
+            "two markers and two young events remain"
+        );
+        let bus = Recorder::default();
+        drain_all(&store, &bus, NOW).await;
+        let seen = bus.0.lock().unwrap().clone();
+        let order: Vec<(&str, String)> = seen
+            .iter()
+            .map(|(kind, session_ref, ..)| (kind.as_str(), session_ref.clone()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("run.skipped", agent_session_ref(&a)),
+                ("run.started", agent_session_ref(&a)),
+                ("run.skipped", agent_session_ref(&b)),
+                ("run.started", agent_session_ref(&c)),
+            ],
+            "each marker goes out before its session's younger events"
+        );
+        for (_, _, key, _) in &seen {
+            assert!(!stale_keys.contains(key), "a stale event was published");
+        }
+        let marker = |n: usize| serde_json::from_slice::<SkipMarker>(&seen[n].3).unwrap();
+        assert_eq!(
+            marker(0),
+            SkipMarker {
+                session_ref: agent_session_ref(&a),
+                from_seq: 1,
+                to_seq: 2,
+                from_ms: NOW - 10 * MINUTE,
+                to_ms: NOW - 9 * MINUTE,
+                count: 2,
+            }
+        );
+        assert_eq!(
+            marker(2),
+            SkipMarker {
+                session_ref: agent_session_ref(&b),
+                from_seq: 1,
+                to_seq: 2,
+                from_ms: NOW - 5 * MINUTE,
+                to_ms: NOW - 4 * MINUTE,
+                count: 2,
+            }
+        );
+        // The marker body is JCS and served by claim check like any run event.
+        assert_eq!(seen[0].3, serde_jcs::to_vec(&marker(0)).unwrap());
+        let (owner, body) = store.get_bus_event(&seen[0].2).unwrap().unwrap();
+        assert_eq!((owner, body), (a.clone(), seen[0].3.clone()));
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            0
+        );
+        // Every row that left the pending set was published or is covered by a published
+        // marker: the stale rows are gone, everything else is marked published.
+        let remaining = rows(&store);
+        assert_eq!(remaining.len(), 4);
+        assert!(remaining.iter().all(|row| row.4.is_some()));
+        // A second pass finds nothing stale: the markers themselves are never folded.
+        assert_eq!(
+            store.skip_stale_bus_events(NOW + 10 * MINUTE).unwrap(),
+            SkipSummary::default()
+        );
+    }
+
+    /// A crash inside the replacement leaves the stale rows, never a gap; a crash after it
+    /// leaves exactly the marker, which is published after restart; a crash after the
+    /// marker's publish but before its acknowledgement republishes the identical marker. At
+    /// no point is a stale event published.
+    #[tokio::test]
+    async fn bus_stale_backlog_replacement_survives_a_crash_at_each_point() {
+        let dir = broca_test_support::scratch_root().join(format!(
+            "bus-skip-crash-{}-{}",
+            std::process::id(),
+            NOW
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run-index.db");
+        let open = || {
+            let store = SqliteStore::open(&path).unwrap();
+            store.enable_bus_events("box_test").unwrap();
+            store
+        };
+        let store = open();
+        mixed_backlog(&store);
+        let before = rows(&store);
+        // A failure between deleting the stale rows and inserting their marker rolls the
+        // whole replacement back.
+        store.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_marker BEFORE INSERT ON bus_event_outbox WHEN NEW.subject LIKE '%.run.skipped.v1' \
+             BEGIN SELECT RAISE(ABORT,'injected crash'); END;",
+        ).unwrap();
+        assert!(store.skip_stale_bus_events(NOW).is_err());
+        assert_eq!(
+            rows(&store),
+            before,
+            "a failed replacement must change nothing"
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_marker;")
+            .unwrap();
+        // The replacement commits, then the process stops before publishing anything.
+        store.skip_stale_bus_events(NOW).unwrap();
+        let stale_keys: Vec<String> = before
+            .iter()
+            .map(|row| row.0.clone())
+            .filter(|key| !rows(&store).iter().any(|row| &row.0 == key))
+            .collect();
+        assert_eq!(stale_keys.len(), 4);
+        drop(store);
+        let store = open();
+        let marker = store.pending_bus_event().unwrap().unwrap();
+        assert_eq!(marker.headers["kind"], "run.skipped");
+        assert!(!marker.headers.contains_key("run_id"));
+        // The marker reaches the broker, then the process stops before acknowledging it.
+        let bus = Recorder::default();
+        let _receipt = bus.publish(&marker).await.unwrap();
+        drop(store);
+        let store = open();
+        assert_eq!(
+            store.skip_stale_bus_events(NOW + MINUTE).unwrap(),
+            SkipSummary::default(),
+            "the replaced rows are not replaced again"
+        );
+        drain_all(&store, &bus, NOW + MINUTE).await;
+        let seen = bus.0.lock().unwrap().clone();
+        let markers: Vec<_> = seen.iter().filter(|p| p.0 == "run.skipped").collect();
+        assert_eq!(
+            markers.len(),
+            3,
+            "one republished marker and the second session's"
+        );
+        assert_eq!(
+            markers[0].2, markers[1].2,
+            "the republish has the identical key"
+        );
+        assert_eq!(markers[0].3, markers[1].3);
+        assert_ne!(markers[1].2, markers[2].2);
+        for (_, _, key, _) in &seen {
+            assert!(!stale_keys.contains(key), "a stale event was published");
+        }
+        assert!(store.pending_bus_event().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
