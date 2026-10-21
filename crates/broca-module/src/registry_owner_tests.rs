@@ -688,6 +688,10 @@ struct CountingWal {
 }
 
 impl WalStore for CountingWal {
+    fn check_move(&self, session: &LineageKey, write: bool) -> Result<(), broca_wal::WalError> {
+        self.inner.check_move(session, write)
+    }
+
     fn open(&self, _: &LineageKey) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
         panic!("authorization never opens a WAL writer")
     }
@@ -712,6 +716,25 @@ impl WalStore for CountingWal {
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
         self.reads.lock().unwrap().push(after);
         self.requests.lock().unwrap().push((after, through));
+        let fault = self.fault.load(Ordering::Relaxed);
+        let suffix_fault = after > 0 && matches!(fault, 6 | 8);
+        let first_fault = after == 0 && through == Some(1) && matches!(fault, 7 | 9);
+        if (suffix_fault || first_fault)
+            && self
+                .fault
+                .compare_exchange(fault, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            // Fail only this read. A retry from another snapshot would succeed and would
+            // hide the failed read, which the refusal tests below must detect.
+            return if fault >= 8 {
+                Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()))
+            } else {
+                Err(broca_wal::WalError::Io(std::io::Error::other(
+                    "injected one-shot ownership read failure",
+                )))
+            };
+        }
         if self.fault.load(Ordering::Relaxed) == 2 {
             return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
         }
@@ -1704,4 +1727,132 @@ async fn cold_flow_sender_refuses_degraded_read_but_warm_sender_remains_authorit
         .authorize_session(&fresh, Some(&reserved("basal")))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn ownership_suffix_read_failure_never_tries_another_snapshot() {
+    for fault in [6, 8] {
+        for bind in [false, true] {
+            let fixture = Fixture::new();
+            fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+            let projected = snapshot(&fixture);
+            let (registry, wal, store) = registry(&fixture, Ok(None));
+            registry.owner_ownership(&fixture.session).await.unwrap();
+            *store.snapshot.lock().unwrap() = Ok(Some(projected));
+            store.reads.store(0, Ordering::Relaxed);
+            wal.requests.lock().unwrap().clear();
+            wal.fault.store(fault, Ordering::Relaxed);
+            if bind {
+                assert!(
+                    registry
+                        .session_ownership_for_bind(&fixture.session)
+                        .await
+                        .is_none(),
+                    "a failed suffix cannot fall through to a different snapshot: fault {fault}"
+                );
+            } else {
+                assert!(
+                    registry.owner_ownership(&fixture.session).await.is_err(),
+                    "a failed suffix cannot fall through to a different snapshot: fault {fault}"
+                );
+            }
+            assert_eq!(store.reads.load(Ordering::Relaxed), 0);
+            assert_eq!(wal.requests.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ownership_first_episode_read_failure_never_tries_another_snapshot() {
+    for fault in [7, 9] {
+        let fixture = Fixture::new();
+        fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+        let projected = snapshot(&fixture);
+        let (registry, wal, store) = registry(&fixture, Ok(None));
+        registry.owner_ownership(&fixture.session).await.unwrap();
+        *store.snapshot.lock().unwrap() = Ok(Some(projected));
+        store.reads.store(0, Ordering::Relaxed);
+        wal.requests.lock().unwrap().clear();
+        wal.fault.store(fault, Ordering::Relaxed);
+        assert!(registry.session_ownership_for_bind(&fixture.session).await.is_none(),
+            "a failed first-episode read cannot fall through to a different snapshot: fault {fault}");
+        assert_eq!(store.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(wal.requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn move_fenced_ownership_never_reuses_a_corrupt_cached_prefix() {
+    for fence in ["moving", "moved"] {
+        for source in ["memory", "store", "live"] {
+            let fixture = Fixture::new();
+            fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+            let projected = snapshot(&fixture);
+            let (registry, wal, _) =
+                registry(&fixture, Ok((source == "store").then(|| projected.clone())));
+            if source == "live" {
+                install_live(
+                    &registry,
+                    &fixture.session,
+                    projected.checkpoint.as_ref().unwrap(),
+                );
+            } else if source == "memory" {
+                registry
+                    .session_ownership_for_bind(&fixture.session)
+                    .await
+                    .unwrap();
+            }
+            let path = fixture.wal.wal_path(&fixture.session);
+            if fence == "moving" {
+                broca_wal::migration::atomic_json(
+                    &fixture.root,
+                    &path.with_extension("moving"),
+                    &broca_wal::migration::Freeze {
+                        cut_id: "cut-a".into(),
+                        end_offset: 0,
+                        lineage_id: "lineage".into(),
+                    },
+                )
+                .unwrap();
+            } else {
+                broca_wal::migration::atomic_json(
+                    &fixture.root,
+                    &path.with_extension("moved"),
+                    &broca_wal::migration::Moved {
+                        cut_id: "cut-a".into(),
+                        holder: "remote".into(),
+                        lineage_id: "lineage".into(),
+                    },
+                )
+                .unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[0] ^= 0xff;
+            std::fs::write(&path, &bytes).unwrap();
+            wal.requests.lock().unwrap().clear();
+            assert!(
+                registry.owner_ownership(&fixture.session).await.is_err(),
+                "{source}"
+            );
+            assert!(
+                registry
+                    .session_ownership_for_bind(&fixture.session)
+                    .await
+                    .is_none(),
+                "{source}"
+            );
+            assert!(wal
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(after, _)| *after == 0));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "readers cannot repair corruption"
+            );
+        }
+    }
 }
