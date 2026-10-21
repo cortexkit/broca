@@ -154,6 +154,45 @@ fn convert_rollout(path: &Path, session_id: &str) -> ReaderResult<ImportedSessio
                 skipped_state += 1;
             }
             "response_item" => convert_response_item(payload, &mut messages, &mut conversion),
+            "compacted" => {
+                conversion.batch.flush(&mut messages);
+                // Codex replacement history supersedes the transcript before this row. Keeping
+                // both would replay compacted context and can make the imported history exceed
+                // what the source session actually retained.
+                messages.clear();
+                if let Some(replacement) =
+                    payload.get("replacement_history").and_then(Value::as_array)
+                {
+                    if replacement.is_empty() {
+                        conversion.warnings.push(
+                            "Codex compaction has an empty replacement_history; older history was omitted"
+                                .into(),
+                        );
+                    }
+                    for item in replacement {
+                        convert_response_item(item, &mut messages, &mut conversion);
+                    }
+                } else if let Some(summary) = payload.get("message").and_then(Value::as_str) {
+                    if !summary.is_empty() {
+                        messages.push(Message::new(
+                            Role::User,
+                            vec![ContentBlock::Text {
+                                text: summary.to_string(),
+                            }],
+                        ));
+                    } else {
+                        conversion.warnings.push(
+                            "Codex compaction has an empty legacy summary; older history was omitted"
+                                .into(),
+                        );
+                    }
+                } else {
+                    conversion.warnings.push(
+                        "Codex compaction has no supported replacement_history or legacy summary; older history was omitted"
+                            .into(),
+                    );
+                }
+            }
             kind if STATE_ROW_TYPES.contains(&kind) => skipped_state += 1,
             other => remember_kind(&mut skipped_rows, other),
         }
@@ -163,7 +202,12 @@ fn convert_rollout(path: &Path, session_id: &str) -> ReaderResult<ImportedSessio
     if skipped_state > 0 {
         conversion.warnings.push(format!(
             "Skipped {skipped_state} Codex event/state rows ({})",
-            STATE_ROW_TYPES.join(", ")
+            STATE_ROW_TYPES
+                .iter()
+                .copied()
+                .filter(|kind| *kind != "compacted")
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if conversion.skipped_system > 0 {
@@ -698,6 +742,62 @@ mod tests {
         assert!(!canonical_json.contains("SIGNED-CALL-MUST-NOT-SURVIVE"));
         assert!(!canonical_json.contains("SYSTEM-PROMPT-MUST-NOT-SURVIVE"));
         assert_wire_round_trip(&imported, "codex-tool-round-trip");
+    }
+
+    #[test]
+    fn codex_compaction_replaces_older_history_and_keeps_following_turns() {
+        let root = temp_root("compaction");
+        let path = root.join("2026/01/01/rollout-compacted.jsonl");
+        let rows = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"compacted","cwd":"/tmp/project"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"OLD_CONTEXT_MUST_NOT_SURVIVE"}]}}),
+            serde_json::json!({"type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"REPLACEMENT_CONTEXT"}]}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"POST_COMPACTION_ANSWER"}]}}),
+        ];
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let imported = convert_rollout(&path, "compacted").unwrap();
+        let transcript = serde_json::to_string(&imported.messages).unwrap();
+        assert!(!transcript.contains("OLD_CONTEXT_MUST_NOT_SURVIVE"));
+        assert!(transcript.contains("REPLACEMENT_CONTEXT"));
+        assert!(transcript.contains("POST_COMPACTION_ANSWER"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_legacy_compaction_summary_replaces_older_history() {
+        let root = temp_root("legacy-compaction");
+        let path = root.join("2026/01/01/rollout-legacy-compacted.jsonl");
+        let rows = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"legacy-compacted"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"OLD_CONTEXT_MUST_NOT_SURVIVE"}]}}),
+            serde_json::json!({"type":"compacted","payload":{"message":"LEGACY_COMPACTION_SUMMARY"}}),
+        ];
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let imported = convert_rollout(&path, "legacy-compacted").unwrap();
+        let transcript = serde_json::to_string(&imported.messages).unwrap();
+        assert!(!transcript.contains("OLD_CONTEXT_MUST_NOT_SURVIVE"));
+        assert!(transcript.contains("LEGACY_COMPACTION_SUMMARY"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

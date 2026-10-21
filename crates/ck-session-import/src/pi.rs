@@ -23,7 +23,9 @@ use broca_protocol::{
 };
 use serde_json::Value;
 
-use crate::{finalize_import, HarnessReader, ImportedSession, SessionSummary};
+use crate::{
+    finalize_import, omit_nested_tool_images, HarnessReader, ImportedSession, SessionSummary,
+};
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -166,7 +168,47 @@ impl HarnessReader for PiReader {
                     format!("Pi session '{session_id}' was not found"),
                 )
             })?;
-        let path = session.selected_path()?;
+        let mut warnings = Vec::new();
+        let mut path = session.selected_path()?;
+        let mut compaction_summary = None;
+        if let Some(compaction_index) = path.iter().rposition(|node| node.kind == "compaction") {
+            let compaction = path[compaction_index];
+            compaction_summary = compaction
+                .value
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|summary| !summary.is_empty())
+                .map(str::to_owned);
+            let first_kept_id = compaction
+                .value
+                .get("firstKeptEntryId")
+                .and_then(Value::as_str);
+            if let Some(first_kept_id) = first_kept_id {
+                if first_kept_id == compaction.id {
+                    path = path[compaction_index + 1..].to_vec();
+                } else if let Some(first_kept_index) = path
+                    .iter()
+                    .position(|node| node.id == first_kept_id)
+                    .filter(|index| *index < compaction_index)
+                {
+                    let mut retained = path[first_kept_index..compaction_index].to_vec();
+                    retained.extend_from_slice(&path[compaction_index + 1..]);
+                    path = retained;
+                } else {
+                    warnings.push(format!(
+                        "Pi compaction {} refers to invalid firstKeptEntryId '{}'; importing records after the compaction row",
+                        compaction.id, first_kept_id
+                    ));
+                    path = path[compaction_index + 1..].to_vec();
+                }
+            } else {
+                warnings.push(format!(
+                    "Pi compaction {} has no firstKeptEntryId; importing records after the compaction row",
+                    compaction.id
+                ));
+                path = path[compaction_index + 1..].to_vec();
+            }
+        }
         let first_order = path.first().map_or(usize::MAX, |node| node.order);
         let mut current_model = session
             .nodes
@@ -177,10 +219,16 @@ impl HarnessReader for PiReader {
             .max_by_key(|node| node.order)
             .and_then(|node| model_change(&node.value));
         let mut messages = Vec::new();
-        let mut warnings = Vec::new();
         let mut skipped_controls = Vec::new();
         let mut skipped_blocks = Vec::new();
         let mut skipped_rows = Vec::new();
+
+        if let Some(summary) = compaction_summary {
+            messages.push(Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: summary }],
+            ));
+        }
 
         for node in path {
             match node.kind.as_str() {
@@ -201,6 +249,7 @@ impl HarnessReader for PiReader {
                         messages.push(message);
                     }
                 }
+                "compaction" => {}
                 kind if SKIPPED_CONTROL_ROW_KINDS.contains(&kind) => {
                     push_unique(&mut skipped_controls, kind);
                 }
@@ -543,6 +592,14 @@ fn convert_tool_result(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut sanitized = Value::Array(blocks);
+    let omitted_images = omit_nested_tool_images(&mut sanitized);
+    if omitted_images > 0 {
+        warnings.push(format!(
+            "Omitted {omitted_images} unsupported Pi tool-result image block(s)"
+        ));
+    }
+    let blocks = sanitized.as_array().cloned().unwrap_or_default();
     let is_error = message
         .get("isError")
         .and_then(Value::as_bool)
@@ -647,7 +704,8 @@ mod tests {
     use broca_protocol::{ContentBlock, Role, ToolOutput};
 
     use super::{
-        convert_message, HarnessReader, LoadedSession, Node, PiReader, SKIPPED_CONTROL_ROW_KINDS,
+        convert_message, convert_tool_result, HarnessReader, LoadedSession, Node, PiReader,
+        SKIPPED_CONTROL_ROW_KINDS,
     };
 
     fn fixture_root() -> PathBuf {
@@ -788,6 +846,70 @@ mod tests {
     }
 
     #[test]
+    fn compaction_summary_and_first_kept_entry_replace_older_history() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("ck-pi-compaction-{}", std::process::id()));
+        let project = root.join("project");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("compacted.jsonl");
+        let rows = [
+            serde_json::json!({"type":"session","id":"pi-compacted","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/pi"}),
+            serde_json::json!({"type":"message","id":"old","parentId":null,"message":{"role":"user","content":"OLD_PI_CONTEXT_MUST_NOT_SURVIVE"}}),
+            serde_json::json!({"type":"message","id":"kept","parentId":"old","message":{"role":"user","content":"KEPT_AFTER_COMPACTION"}}),
+            serde_json::json!({"type":"compaction","id":"compact","parentId":"kept","summary":"PI_COMPACTION_SUMMARY","firstKeptEntryId":"kept"}),
+            serde_json::json!({"type":"message","id":"answer","parentId":"compact","message":{"role":"assistant","content":"POST_COMPACTION_ANSWER"}}),
+        ];
+        fs::write(
+            &path,
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let imported = PiReader::new(&root).convert("pi-compacted").unwrap();
+        let transcript = serde_json::to_string(&imported.messages).unwrap();
+        assert!(!transcript.contains("OLD_PI_CONTEXT_MUST_NOT_SURVIVE"));
+        assert!(transcript.contains("PI_COMPACTION_SUMMARY"));
+        assert!(transcript.contains("KEPT_AFTER_COMPACTION"));
+        assert!(transcript.contains("POST_COMPACTION_ANSWER"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_result_images_are_omitted_with_an_actionable_warning() {
+        let node = Node {
+            id: "image-result".into(),
+            parent_id: None,
+            kind: "message".into(),
+            value: serde_json::json!({
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "call-image",
+                    "content": [
+                        {"type": "text", "text": "before image"},
+                        {"type": "image", "data": "PRIVATE_BASE64"},
+                        {"type": "text", "text": "after image"}
+                    ]
+                }
+            }),
+            order: 1,
+        };
+        let mut warnings = Vec::new();
+        let message =
+            convert_tool_result(&node, node.value.get("message").unwrap(), &mut warnings).unwrap();
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains("before image"));
+        assert!(encoded.contains("after image"));
+        assert!(encoded.contains("image omitted from imported tool output"));
+        assert!(!encoded.contains("PRIVATE_BASE64"));
+        assert!(warnings.iter().any(|warning| warning.contains("Omitted 1")));
+    }
+
+    #[test]
     fn converts_tool_reasoning_and_per_message_origins() {
         let imported = fixture()
             .convert("00000000-0000-4000-8000-000000000001")
@@ -802,14 +924,20 @@ mod tests {
                 .iter()
                 .map(|message| message.role)
                 .collect::<Vec<_>>(),
-            vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+            vec![
+                Role::User,
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Assistant
+            ]
         );
         assert!(!imported
             .messages
             .iter()
             .any(|message| message.role == Role::System));
 
-        let first_assistant = &imported.messages[1];
+        let first_assistant = &imported.messages[2];
         assert_eq!(
             first_assistant.origin.as_ref().unwrap().provider_module_id,
             "anthropic"
@@ -818,7 +946,7 @@ mod tests {
             first_assistant.origin.as_ref().unwrap().model_id,
             "claude-scrubbed"
         );
-        let final_assistant = &imported.messages[3];
+        let final_assistant = &imported.messages[4];
         assert_eq!(
             final_assistant.origin.as_ref().unwrap().provider_module_id,
             "openai"
@@ -828,7 +956,7 @@ mod tests {
             "gpt-scrubbed"
         );
         assert!(matches!(
-            &imported.messages[2].content[0],
+            &imported.messages[3].content[0],
             ContentBlock::ToolResult(result)
                 if matches!(&result.output, ToolOutput::Text { text } if text == "scrubbed output")
         ));
@@ -849,7 +977,7 @@ mod tests {
         let imported = fixture()
             .convert("00000000-0000-4000-8000-000000000001")
             .unwrap();
-        let assistant = &imported.messages[1];
+        let assistant = &imported.messages[2];
         assert!(assistant.content.iter().any(|block| matches!(
             block,
             ContentBlock::Reasoning {

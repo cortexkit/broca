@@ -21374,3 +21374,42 @@ expect_red = ["bus_events::tests::bus_stale_backlog_becomes_one_marker_per_sessi
 file = "crates/broca-store/src/bus_events.rs"
 old = "            let Some(last_stale) = rows.iter().rposition(|row| row.at_ms < cutoff) else {"
 new = "            let Some(last_stale) = rows.iter().rposition(|row| false && row.at_ms < cutoff) else { // NON-VACUITY BREAK: publish the stale backlog instead of replacing it"
+
+[[control]]
+id = "codex-compaction-replaces-old-history"
+guards = "Codex replacement history supersedes compacted transcript rows while retaining later conversation"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::codex_compaction_replaces_older_history_and_keeps_following_turns", "codex::tests::codex_legacy_compaction_summary_replaces_older_history"]
+file = "crates/ck-session-import/src/codex.rs"
+old = "                messages.clear();"
+new = "                let _ = &mut messages; // NON-VACUITY BREAK: retain superseded history."
+
+[[control]]
+id = "pi-compaction-keeps-declared-history-tail"
+guards = "Pi compaction replaces history before firstKeptEntryId but preserves the declared retained tail"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::compaction_summary_and_first_kept_entry_replace_older_history"]
+file = "crates/ck-session-import/src/pi.rs"
+old = "                    path = retained;"
+new = "                    path = path[compaction_index + 1..].to_vec(); // NON-VACUITY BREAK: discard the retained tail."
+
+[[control]]
+id = "imported-tool-images-never-replay-base64"
+guards = "Claude, Goose and Pi imports replace nested tool-result images with bounded placeholders"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["claude_code::tests::tool_result_images_are_omitted_without_losing_surrounding_text", "goose::tests::tool_result_images_are_omitted_and_text_is_retained", "pi::tests::tool_result_images_are_omitted_with_an_actionable_warning"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
+new = "            if false { // NON-VACUITY BREAK: replay unsupported image payloads as raw data."

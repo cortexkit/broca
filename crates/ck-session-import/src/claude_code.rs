@@ -24,7 +24,9 @@ use broca_protocol::{
 };
 use serde_json::Value;
 
-use crate::{finalize_import, HarnessReader, ImportedSession, SessionSummary};
+use crate::{
+    finalize_import, omit_nested_tool_images, HarnessReader, ImportedSession, SessionSummary,
+};
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -209,6 +211,7 @@ impl HarnessReader for ClaudeCodeReader {
         let mut dropped_system = 0usize;
         let mut dropped_api_errors = 0usize;
         let mut dropped_redacted = 0usize;
+        let mut omitted_images = 0usize;
         let mut skipped_blocks = BTreeSet::new();
         let mut skipped_rows = BTreeSet::new();
 
@@ -249,6 +252,7 @@ impl HarnessReader for ClaudeCodeReader {
                     row,
                     &mut messages,
                     &mut dropped_redacted,
+                    &mut omitted_images,
                     &mut skipped_blocks,
                     join_previous_assistant,
                 ),
@@ -275,6 +279,11 @@ impl HarnessReader for ClaudeCodeReader {
         if dropped_redacted > 0 {
             warnings.push(format!(
                 "Dropped {dropped_redacted} Claude Code redacted_thinking block(s); foreign encrypted reasoning cannot be replayed"
+            ));
+        }
+        if omitted_images > 0 {
+            warnings.push(format!(
+                "Omitted {omitted_images} unsupported Claude Code tool-result image block(s)"
             ));
         }
         if !skipped_blocks.is_empty() {
@@ -431,6 +440,7 @@ fn convert_message_row(
     row: &Value,
     messages: &mut Vec<Message>,
     dropped_redacted: &mut usize,
+    omitted_images: &mut usize,
     skipped_blocks: &mut BTreeSet<String>,
     join_previous_assistant: bool,
 ) {
@@ -472,7 +482,9 @@ fn convert_message_row(
     let mut pending_role = None;
     let mut pending = Vec::new();
     for block in blocks {
-        let Some(converted) = convert_block(block, dropped_redacted, skipped_blocks) else {
+        let Some(converted) =
+            convert_block(block, dropped_redacted, omitted_images, skipped_blocks)
+        else {
             continue;
         };
         let role = if matches!(converted, ContentBlock::ToolResult(_)) {
@@ -512,6 +524,7 @@ fn singleton_text_block(value: &Value) -> Option<&str> {
 fn convert_block(
     block: &Value,
     dropped_redacted: &mut usize,
+    omitted_images: &mut usize,
     skipped_blocks: &mut BTreeSet<String>,
 ) -> Option<ContentBlock> {
     let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -552,7 +565,8 @@ fn convert_block(
             thought_signature: None,
         })),
         "tool_result" => {
-            let content = block.get("content").cloned().unwrap_or(Value::Null);
+            let mut content = block.get("content").cloned().unwrap_or(Value::Null);
+            *omitted_images += omit_nested_tool_images(&mut content);
             let output = match content {
                 Value::String(text) => ToolOutput::Text { text },
                 value => match singleton_text_block(&value) {
@@ -895,10 +909,17 @@ mod tests {
             "is_error": is_error,
         });
         let mut dropped_redacted = 0;
+        let mut omitted_images = 0;
         let mut skipped_blocks = BTreeSet::new();
-        let converted = convert_block(&block, &mut dropped_redacted, &mut skipped_blocks)
-            .expect("tool result should convert");
+        let converted = convert_block(
+            &block,
+            &mut dropped_redacted,
+            &mut omitted_images,
+            &mut skipped_blocks,
+        )
+        .expect("tool result should convert");
         assert_eq!(dropped_redacted, 0);
+        assert_eq!(omitted_images, 0);
         assert!(skipped_blocks.is_empty());
         match converted {
             ContentBlock::ToolResult(result) => result,
@@ -930,6 +951,37 @@ mod tests {
 
         assert_eq!(result.output, ToolOutput::Json { value: content });
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn tool_result_images_are_omitted_without_losing_surrounding_text() {
+        let block = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_image",
+            "content": [
+                {"type": "text", "text": "before image"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "PRIVATE_BASE64"}},
+                {"type": "text", "text": "after image"}
+            ]
+        });
+        let mut dropped_redacted = 0;
+        let mut omitted_images = 0;
+        let converted = convert_block(
+            &block,
+            &mut dropped_redacted,
+            &mut omitted_images,
+            &mut BTreeSet::new(),
+        )
+        .expect("tool result should remain importable");
+        let ContentBlock::ToolResult(result) = converted else {
+            panic!("expected a tool result")
+        };
+        let encoded = serde_json::to_string(&result.output).unwrap();
+        assert_eq!(omitted_images, 1);
+        assert!(encoded.contains("before image"));
+        assert!(encoded.contains("after image"));
+        assert!(encoded.contains("image omitted from imported tool output"));
+        assert!(!encoded.contains("PRIVATE_BASE64"));
     }
 
     #[test]

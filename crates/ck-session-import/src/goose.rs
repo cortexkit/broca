@@ -20,7 +20,7 @@ use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::{
-    finalize_import,
+    finalize_import, omit_nested_tool_images,
     sqlite_read::{open_read_only_database, ReadOnlyDatabase},
     HarnessReader, ImportedSession, SessionSummary,
 };
@@ -151,6 +151,7 @@ impl HarnessReader for GooseReader {
 
         let mut messages = Vec::new();
         let mut skipped_signed = 0usize;
+        let mut omitted_images = 0usize;
         let mut skipped_unknown = Vec::new();
 
         for (row_id, role, raw_content, raw_metadata) in source_messages {
@@ -215,7 +216,7 @@ impl HarnessReader for GooseReader {
                     }
                     "toolRequest" => convert_tool_request(part)
                         .map(|call| (source_role, ContentBlock::ToolCall(call))),
-                    "toolResponse" => convert_tool_response(part)
+                    "toolResponse" => convert_tool_response(part, &mut omitted_images)
                         .map(|result| (Role::Tool, ContentBlock::ToolResult(result))),
                     other => {
                         if !skipped_unknown.iter().any(|known| known == other) {
@@ -247,6 +248,11 @@ impl HarnessReader for GooseReader {
             warnings.push(format!(
                 "Stripped {skipped_signed} opaque Goose reasoning parts ({})",
                 STRIPPED_CONTENT_KINDS.join(", ")
+            ));
+        }
+        if omitted_images > 0 {
+            warnings.push(format!(
+                "Omitted {omitted_images} unsupported Goose tool-result image block(s)"
             ));
         }
         if !skipped_unknown.is_empty() {
@@ -347,7 +353,7 @@ fn convert_tool_request(part: &Value) -> Option<ToolCall> {
     })
 }
 
-fn convert_tool_response(part: &Value) -> Option<ToolResult> {
+fn convert_tool_response(part: &Value, omitted_images: &mut usize) -> Option<ToolResult> {
     let call_id = part.get("id").and_then(Value::as_str)?;
     let result = part.get("toolResult")?;
     let status = result.get("status").and_then(Value::as_str).unwrap_or("");
@@ -357,11 +363,12 @@ fn convert_tool_response(part: &Value) -> Option<ToolResult> {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let content = if value.is_array() {
+        let mut content = if value.is_array() {
             value.clone()
         } else {
             value.get("content").cloned().unwrap_or(Value::Null)
         };
+        *omitted_images += omit_nested_tool_images(&mut content);
         if is_error {
             (
                 ToolOutput::Error {
@@ -389,10 +396,11 @@ fn convert_tool_response(part: &Value) -> Option<ToolResult> {
             (content_output(content), false)
         }
     } else {
-        let error = result
+        let mut error = result
             .get("error")
             .cloned()
             .unwrap_or_else(|| Value::String("Goose tool execution failed".into()));
+        *omitted_images += omit_nested_tool_images(&mut error);
         (
             ToolOutput::Error {
                 message: value_text(&error),
@@ -485,8 +493,9 @@ mod tests {
 
     use broca_module_serve::wire::{ImportOriginKind, ImportOriginParams, ImportParams};
     use broca_protocol::{ContentBlock, Role, ToolOutput};
+    use serde_json::json;
 
-    use super::{GooseReader, HarnessReader, STRIPPED_CONTENT_KINDS};
+    use super::{convert_tool_response, GooseReader, HarnessReader, STRIPPED_CONTENT_KINDS};
 
     fn fixture() -> GooseReader {
         GooseReader::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goose.db"))
@@ -526,6 +535,32 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_result_images_are_omitted_and_text_is_retained() {
+        let part = json!({
+            "id": "call-image",
+            "toolResult": {
+                "status": "success",
+                "value": {"content": [
+                    {"type": "text", "text": "before image"},
+                    {"type": "image", "source": {"type": "base64", "data": "PRIVATE_BASE64"}},
+                    {"type": "text", "text": "after image"}
+                ]}
+            }
+        });
+        let mut omitted_images = 0;
+        let result = convert_tool_response(&part, &mut omitted_images).unwrap();
+        assert_eq!(omitted_images, 1);
+        assert!(matches!(
+            result.output,
+            ToolOutput::Text { ref text }
+                if text.contains("before image")
+                    && text.contains("after image")
+                    && text.contains("image omitted from imported tool output")
+                    && !text.contains("PRIVATE_BASE64")
+        ));
     }
 
     #[test]

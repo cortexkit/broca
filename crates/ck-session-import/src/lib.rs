@@ -12,6 +12,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use broca_protocol::{ContentBlock, Message, Role, ToolCallId};
+use serde_json::Value;
 
 pub mod claude_code;
 pub mod codex;
@@ -20,6 +21,37 @@ pub mod opencode;
 pub mod pi;
 
 mod sqlite_read;
+
+/// Replace image blocks nested in imported tool output before it reaches a model prompt.
+///
+/// Canonical tool output has no image block, so keeping the source JSON can turn a large
+/// base64 payload into ordinary prompt text. A fixed text placeholder preserves the position
+/// of omitted media without retaining its bytes.
+pub(crate) fn omit_nested_tool_images(value: &mut Value) -> usize {
+    match value {
+        Value::Array(items) => items.iter_mut().map(omit_nested_tool_images).sum(),
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str);
+            let has_base64_source =
+                object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .is_some_and(|source| {
+                        source.get("type").and_then(Value::as_str) == Some("base64")
+                            && source.get("data").and_then(Value::as_str).is_some()
+                    });
+            if matches!(kind, Some("image" | "image_url" | "input_image")) || has_base64_source {
+                *value = serde_json::json!({
+                    "type": "text",
+                    "text": "[image omitted from imported tool output]"
+                });
+                return 1;
+            }
+            object.values_mut().map(omit_nested_tool_images).sum()
+        }
+        _ => 0,
+    }
+}
 
 /// Metadata cheap enough to show while choosing a source session.
 #[derive(Debug, Clone, PartialEq, Eq)]
