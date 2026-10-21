@@ -115,10 +115,21 @@ struct Rig {
     connection_file: PathBuf,
     events: PathBuf,
     ck_cli: PathBuf,
+    last_wait: std::sync::Mutex<String>,
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("last rig wait: {}", self.last_wait.lock().unwrap());
+            eprintln!(
+                "{}",
+                broca_test_support::rig_log_diagnostics(
+                    &self.dir.join("runtime/data-home/cortexkit"),
+                    &self.dir.join("runtime/broca-state"),
+                )
+            );
+        }
         broca_test_support::kill_and_reap_tree(&mut self.daemon);
         broca_test_support::dump_rig_process_logs_on_failure(&self.dir, "daemon");
         broca_test_support::remove_rig_dir(&self.dir);
@@ -126,7 +137,23 @@ impl Drop for Rig {
 }
 
 impl Rig {
+    fn observe_wait(&self, observation: impl Into<String>) {
+        *self.last_wait.lock().unwrap() = observation.into();
+    }
+
     async fn start(model_url: &str) -> Option<Self> {
+        // Periodic health eviction would race the manual restart under test. Drain probes
+        // are direct health.check calls and ignore this cadence.
+        Self::start_with_health(
+            model_url,
+            serde_json::json!({
+                "cadence_ms": 3600000, "deadline_ms": 5000, "failure_threshold": 3
+            }),
+        )
+        .await
+    }
+
+    async fn start_with_health(model_url: &str, health: Value) -> Option<Self> {
         let subc_source = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -180,7 +207,7 @@ impl Rig {
                         "BROCA_TOOL_MODULE": "aft"
                     },
                     "enabled": true,
-                    "health": {"cadence_ms": 10000, "deadline_ms": 2000}
+                    "health": health
                 },
                 "aft": {
                     "program": fake_aft,
@@ -214,15 +241,18 @@ impl Rig {
             connection_file,
             events,
             ck_cli,
+            last_wait: std::sync::Mutex::new("waiting for the daemon connection file".into()),
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !rig.connection_file.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the daemon never published its connection file"
-            );
-            sleep(Duration::from_millis(25)).await;
-        }
+        broca_test_support::wait_for(
+            "the daemon's published connection file",
+            async {
+                while !rig.connection_file.exists() {
+                    sleep(Duration::from_millis(25)).await;
+                }
+            },
+            || rig.restart_diagnostics(),
+        )
+        .await;
         assert!(rig.wait_for_module_live().await, "broca never became live");
         Some(rig)
     }
@@ -231,10 +261,17 @@ impl Rig {
         let probe = broca_protocol::BindIdentity::new(&self.dir, "probe", "graceful-stop");
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
-            if let Ok(conn) = broca_subc::SubcConnection::connect(&self.connection_file).await {
-                if conn.route_open_management("broca", &probe).await.is_ok() {
-                    return true;
+            match broca_subc::SubcConnection::connect(&self.connection_file).await {
+                Ok(conn) => {
+                    let opened = conn.route_open_management("broca", &probe).await;
+                    self.observe_wait(format!("waiting for broca's management route: {opened:?}"));
+                    if opened.is_ok() {
+                        return true;
+                    }
                 }
+                Err(error) => self.observe_wait(format!(
+                    "waiting for broca's management route: connect {error:?}"
+                )),
             }
             sleep(Duration::from_millis(50)).await;
         }
@@ -254,7 +291,7 @@ impl Rig {
     }
 
     /// Restart with an explicit drain ceiling. Returns how many restart drains of broca the
-    /// daemon had already logged, so [`Self::wait_for_restart_drain_verdict`] reads the line
+    /// daemon had already logged, so [`Self::restart_drain_verdict`] reads the line
     /// for this restart and never an earlier one. The count is taken before the request: this
     /// drain can't end before the restart is asked for.
     async fn restart_with_drain(&self, drain: Duration) -> usize {
@@ -281,10 +318,14 @@ impl Rig {
                 .spawn()
         })
         .expect("spawn ck module restart broca");
-        let output = child
-            .wait_with_output()
-            .await
-            .expect("run ck module restart broca");
+        self.observe_wait("waiting for ck module restart broca acknowledgement");
+        let output = broca_test_support::wait_for(
+            "ck module restart broca acknowledgement",
+            child.wait_with_output(),
+            || self.restart_diagnostics(),
+        )
+        .await
+        .expect("run ck module restart broca");
         assert!(output.status.success(), "ck restart failed: {output:?}");
     }
 
@@ -323,63 +364,83 @@ impl Rig {
     async fn wait_for_tool(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !self.stub_holds_the_call() {
+            self.observe_wait(format!(
+                "waiting for the tagged tool call; last stub events: {:?}",
+                std::fs::read_to_string(&self.events)
+            ));
             assert!(Instant::now() < deadline, "tool never received call");
             sleep(Duration::from_millis(25)).await;
         }
     }
 
-    async fn wait_for_replacement(&self, launch: &Value, budget: Duration) {
-        let deadline = Instant::now() + budget;
-        loop {
-            if let Ok(conn) = broca_subc::SubcConnection::connect(&self.connection_file).await {
-                if let Ok(health) = conn.supervisor_health_probe("broca").await {
-                    if health
-                        .metrics
-                        .as_ref()
-                        .is_some_and(|m| m["launch_id"] != *launch)
-                    {
+    async fn wait_for_replacement(&self, launch: &Value) {
+        let description = format!("routable replacement of broca launch {launch}");
+        self.observe_wait(format!("waiting for {description}; no health reply yet"));
+        broca_test_support::wait_for(
+            &description,
+            async {
+                loop {
+                    let health =
+                        match broca_subc::SubcConnection::connect(&self.connection_file).await {
+                            Ok(conn) => conn
+                                .supervisor_health_probe("broca")
+                                .await
+                                .map_err(|e| format!("health: {e:?}")),
+                            Err(error) => Err(format!("connect: {error:?}")),
+                        };
+                    self.observe_wait(format!(
+                        "waiting for {description}; last observation: {health:?}"
+                    ));
+                    if health.ok().and_then(|h| h.metrics).is_some_and(|m| {
+                        m["launch_id"]
+                            .as_str()
+                            .is_some_and(|id| Some(id) != launch.as_str())
+                    }) {
                         return;
                     }
+                    sleep(Duration::from_millis(50)).await;
                 }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "restart did not replace broca within {budget:?}"
-            );
-            sleep(Duration::from_millis(50)).await;
-        }
+            },
+            || self.restart_diagnostics(),
+        )
+        .await;
     }
 
     /// The daemon's own record of how broca's restart drain ended, read from its log.
     ///
     /// When a drain ends the daemon logs `module drain complete` with `drained=true` only if
     /// broca had no forwarded request in flight and every busy gauge it declared read zero;
-    /// `drained=false` means the drain ceiling passed first, or the wait itself failed, and the
-    /// daemon forced teardown.
-    /// Returns `drained` and the line it came from, for the first restart drain after the
-    /// `earlier` ones [`Self::restart_with_drain`] counted. The wait is bounded by `budget`,
-    /// which a caller sets past the drain ceiling so that a drain held to its ceiling still
-    /// reports `drained=false` here, rather than looking like a line that never came.
-    async fn wait_for_restart_drain_verdict(
-        &self,
-        earlier: usize,
-        budget: Duration,
-    ) -> (bool, String) {
-        let deadline = Instant::now() + budget;
-        loop {
-            if let Some(line) = self.restart_drain_lines().into_iter().nth(earlier) {
-                let drained = line
-                    .split_whitespace()
-                    .find_map(|field| field.strip_prefix("drained="))
-                    .unwrap_or_else(|| panic!("the drain line carries no drained field: {line}"));
-                return (drained == "true", line);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the daemon logged no end of broca's restart drain within {budget:?}"
-            );
-            sleep(Duration::from_millis(50)).await;
-        }
+    /// `drained=false` means the drain ceiling passed first and the daemon forced teardown.
+    /// Read only after the replacement is routable: the daemon writes this record synchronously
+    /// before replacing the module. A manual restart coalesced with a health-triggered restart
+    /// has no second verdict; restarting without a registered connection can also skip draining.
+    /// Waiting for those nonexistent records would turn a completed restart into a spurious hang.
+    fn restart_drain_verdict(&self, earlier: usize) -> Result<(bool, String), String> {
+        let lines = self.restart_drain_lines();
+        let line = lines.into_iter().nth(earlier).ok_or_else(|| {
+            format!(
+                "broca was replaced without restart drain verdict #{earlier}; {}",
+                self.restart_diagnostics()
+            )
+        })?;
+        let drained = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("drained="))
+            .ok_or_else(|| format!("the drain line carries no drained field: {line}"))?;
+        Ok((drained == "true", line))
+    }
+
+    fn restart_diagnostics(&self) -> String {
+        let lines = self.daemon_log_lines();
+        let health = health_restart_evidence(&lines);
+        let events: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                line.contains("broca") || line.contains("drain") || line.contains("ERROR")
+            })
+            .collect();
+        format!("{}; {health}; restart drain records: {:?}; daemon lifecycle/health/drain events (timestamps retained): {:?}",
+            self.last_wait.lock().unwrap(), self.restart_drain_lines(), events)
     }
 
     /// Every `module drain complete` line for a restart of broca in the daemon's log, oldest
@@ -387,35 +448,18 @@ impl Rig {
     /// each rig has its own data home, and every day's file is read in date order, so a test
     /// that runs across midnight still finds its line.
     fn restart_drain_lines(&self) -> Vec<String> {
-        let logs = self.dir.join("runtime/data-home/cortexkit/run/logs");
-        let Ok(entries) = std::fs::read_dir(logs) else {
-            return Vec::new();
-        };
-        let mut segments: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("subc.") && name.ends_with(".log"))
-            })
-            .collect();
-        segments.sort();
-        segments
-            .iter()
-            .flat_map(|path| {
-                std::fs::read_to_string(path)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|line| {
-                        line.contains("module drain complete;")
-                            && line.contains(" module_id=broca ")
-                            && line.contains(" reason=Restart ")
-                    })
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+        self.daemon_log_lines()
+            .into_iter()
+            .filter(|line| {
+                line.contains("module drain complete;")
+                    && line.contains(" module_id=broca ")
+                    && line.contains(" reason=Restart ")
             })
             .collect()
+    }
+
+    fn daemon_log_lines(&self) -> Vec<String> {
+        daemon_log_lines(&self.dir)
     }
 
     /// Whether the stub has received the tagged tool call, which it then holds.
@@ -429,6 +473,180 @@ impl Rig {
                     && event["body_json"]["arguments"]["tag"] == "graceful-stop"
             })
     }
+}
+
+fn health_restart_evidence(lines: &[String]) -> String {
+    let for_broca = |line: &&String| {
+        line.split_whitespace()
+            .any(|field| field == "module_id=broca")
+    };
+    let failures: Vec<_> = lines
+        .iter()
+        .filter(for_broca)
+        .filter(|line| {
+            line.contains("health.check probe failed")
+                || line.contains("module health threshold breached")
+                || line.contains("critical module health alert")
+                || line.contains("health restart budget exhausted")
+        })
+        .collect();
+    let restarts: Vec<_> = lines
+        .iter()
+        .filter(for_broca)
+        .filter(|line| line.contains("health-triggered module restart"))
+        .collect();
+    format!("observed broca periodic health failures/alerts: {failures:?}; observed broca health-triggered module restarts: {restarts:?}")
+}
+
+fn daemon_log_lines(dir: &Path) -> Vec<String> {
+    let logs = dir.join("runtime/data-home/cortexkit/run/logs");
+    let Ok(entries) = std::fs::read_dir(logs) else {
+        return Vec::new();
+    };
+    let mut segments: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("subc.") && name.ends_with(".log"))
+        })
+        .collect();
+    segments.sort();
+    segments
+        .iter()
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn restart_health_evidence_reads_all_dated_logs_and_retains_timestamps() {
+    let dir = broca_test_support::scratch_root().join("restart-health-evidence");
+    let logs = dir.join("runtime/data-home/cortexkit/run/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let failure =
+        "2026-10-20T23:59:59Z WARN subc health.check probe failed module_id=broca detail=timeout";
+    let restart =
+        "2026-10-21T00:00:01Z WARN subc health-triggered module restart module_id=broca delay_ms=0";
+    std::fs::write(logs.join("subc.2026-10-20.log"), failure).unwrap();
+    std::fs::write(logs.join("subc.2026-10-21.log"), restart).unwrap();
+    let evidence = health_restart_evidence(&daemon_log_lines(&dir));
+    assert!(evidence.contains(failure), "{evidence}");
+    assert!(evidence.contains(restart), "{evidence}");
+}
+
+#[test]
+fn restart_health_evidence_does_not_infer_eviction_from_other_events() {
+    let lines = [
+        "INFO subc module drain complete; module_id=broca reason=Restart drained=true",
+        "WARN subc health.check probe failed module_id=aft detail=timeout",
+        "WARN subc health-triggered module restart module_id=broca-other delay_ms=0",
+    ]
+    .map(str::to_owned);
+    assert_eq!(health_restart_evidence(&lines),
+        "observed broca periodic health failures/alerts: []; observed broca health-triggered module restarts: []");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_restart_can_coalesce_manual_restart_without_another_drain_verdict() {
+    let url = serve_model(Arc::new(AtomicUsize::new(0))).await;
+    let Some(rig) = Rig::start_with_health(
+        &url,
+        serde_json::json!({
+            "cadence_ms": 100, "deadline_ms": 500, "failure_threshold": 1
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let launch = rig.health().await["launch_id"].clone();
+    let children = broca_children(rig.daemon.id().unwrap());
+    assert_eq!(children.len(), 1);
+    let signal = |name: &str| {
+        std::process::Command::new("kill")
+            .args([name, &children[0].to_string()])
+            .status()
+            .unwrap()
+    };
+    assert!(signal("-STOP").success());
+    // Hold the real module, not a CPU burner: periodic health evicts it, and that restart's
+    // drain reaches its ceiling. Queue the manual restart while the health-triggered restart
+    // is tearing down the held module: it coalesces with that restart, with no second drain.
+    // Release the process even when the hang guard fires so teardown can finish normally.
+    let observed = broca_test_support::event_timeout(
+        "health-triggered restart drain of held broca",
+        async {
+            loop {
+                let evidence = health_restart_evidence(&rig.daemon_log_lines());
+                rig.observe_wait(format!("waiting for periodic health eviction: {evidence}"));
+                if evidence.contains("health-triggered module restart")
+                    && !rig.restart_drain_lines().is_empty()
+                {
+                    return evidence;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        },
+        || rig.restart_diagnostics(),
+    )
+    .await;
+    if observed.is_err() {
+        assert!(signal("-CONT").success());
+    }
+    let evidence = observed.expect("the held module must trigger a logged periodic health restart");
+    assert!(
+        evidence.contains("module health threshold breached"),
+        "{evidence}"
+    );
+    assert!(evidence.contains("module_id=broca"), "{evidence}");
+    eprintln!("held-process evidence: {evidence}");
+    let (earlier, released) =
+        tokio::join!(rig.restart_with_drain(Duration::from_secs(120)), async {
+            let received = broca_test_support::event_timeout(
+                "manual restart queued during health teardown",
+                async {
+                    loop {
+                        if rig.daemon_log_lines().iter().any(|line| {
+                            line.contains("supervisor request received")
+                                && line.contains("op=supervisor.restart")
+                                && line.contains("module_id=broca")
+                        }) {
+                            break;
+                        }
+                        sleep(Duration::from_millis(25)).await;
+                    }
+                },
+                || rig.restart_diagnostics(),
+            )
+            .await;
+            assert!(signal("-CONT").success());
+            received
+        });
+    released.expect("manual restart must reach the daemon before releasing the held module");
+    rig.wait_for_replacement(&launch).await;
+    assert_eq!(
+        rig.restart_drain_lines().len(),
+        earlier,
+        "the coalesced restart must not emit a second drain verdict"
+    );
+    let message = rig
+        .restart_drain_verdict(earlier)
+        .expect_err("a replaced module with no second drain must be diagnosed immediately");
+    assert!(
+        message.contains("was replaced without restart drain verdict"),
+        "{message}"
+    );
+    assert!(
+        message.contains("health-triggered module restart"),
+        "{message}"
+    );
 }
 
 /// The records of the WAL whose `RunStarted` names `session`, found by scanning the directory:
@@ -629,17 +847,25 @@ async fn start_keyed_run(rig: &Rig, policy: Option<&str>) -> String {
     reply["result"]["run_id"].as_str().unwrap().to_owned()
 }
 
-async fn wait_records(rig: &Rig, predicate: impl Fn(&[WalRecord]) -> bool) -> Vec<WalRecord> {
+async fn wait_records(
+    rig: &Rig,
+    description: &str,
+    predicate: impl Fn(&[WalRecord]) -> bool,
+) -> Vec<WalRecord> {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        if let Some(records) = session_records(&rig.wal_dir(), "restart-run") {
+        let records = session_records(&rig.wal_dir(), "restart-run");
+        rig.observe_wait(format!(
+            "waiting for {description}; last WAL records: {records:?}"
+        ));
+        if let Some(records) = records {
             if predicate(&records) {
                 return records;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "WAL did not reach expected state: {:?}",
+            "WAL did not reach {description}: {:?}",
             session_records(&rig.wal_dir(), "restart-run")
         );
         sleep(Duration::from_millis(25)).await;
@@ -691,23 +917,20 @@ async fn idle_module_restart_declares_busy_gauges_and_ends_drain_early() {
     for gauge in ["runs_in_flight", "opening", "closing"] {
         assert_eq!(metrics[gauge], 0, "idle gauge {gauge}");
     }
-    // The 120 s drain ceiling only bounds a hang. The proof is the daemon's own verdict: it
-    // ends the drain by quiescence only once nothing forwarded to broca is in flight and it has
-    // read broca's declared gauges as zero; otherwise it holds the drain to the ceiling and
-    // records that instead. The verdict wait runs past the ceiling, so a drain held to it
-    // fails on the verdict, not on a missing line.
+    // Keep the drain ceiling beyond the shared hang guard: only quiescence can replace this
+    // idle instance before the guard fires. Check the daemon's verdict after that observable
+    // effect, rather than waiting for a verdict that a coalesced restart never emits.
     let drain = Duration::from_secs(120);
     let earlier = rig.restart_with_drain(drain).await;
+    rig.wait_for_replacement(&metrics["launch_id"]).await;
     let (drained, line) = rig
-        .wait_for_restart_drain_verdict(earlier, drain + Duration::from_secs(30))
-        .await;
+        .restart_drain_verdict(earlier)
+        .unwrap_or_else(|message| panic!("{message}"));
     assert!(
         drained,
         "the daemon must end an idle broca's restart drain by quiescence, not at its \
          {drain:?} ceiling: {line}"
     );
-    rig.wait_for_replacement(&metrics["launch_id"], Duration::from_secs(80))
-        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -731,13 +954,11 @@ async fn module_restart_during_long_tool_pauses_with_idle_gauge_before_goodbye()
     );
     assert_eq!(active["opening"], 0);
     assert_eq!(active["closing"], 0);
-    // The tool takes 15 s, so the run reaches its boundary at about 15 s. The 120 s drain
-    // ceiling only bounds a hang: under heavy host load the daemon can wait out a slow health
-    // probe, so against the default 30 s ceiling a drain could reach its ceiling with nothing
-    // left holding it open. The proof is the daemon's verdict below.
+    // Leave the daemon time to observe the tool boundary without reaching its drain ceiling.
+    // The shared hang guard bounds replacement; the daemon's verdict proves quiescence.
     let drain = Duration::from_secs(120);
     let earlier = rig.restart_with_drain(drain).await;
-    let records = wait_records(&rig, |records| {
+    let records = wait_records(&rig, "restart-run terminal or pause", |records| {
         records.iter().any(|r| {
             matches!(
                 r,
@@ -768,19 +989,17 @@ async fn module_restart_during_long_tool_pauses_with_idle_gauge_before_goodbye()
     );
     // During a drain the daemon refuses ordinary client health probes, so the test can't read
     // broca's gauge directly. The daemon itself still reads it, and ends the drain by
-    // quiescence only once the paused run has stopped counting as busy. Its verdict wait runs
-    // past the ceiling, so a run that held the drain open fails on the verdict.
+    // quiescence only once the paused run has stopped counting as busy.
+    rig.wait_for_replacement(&active["launch_id"]).await;
     let (drained, line) = rig
-        .wait_for_restart_drain_verdict(earlier, drain + Duration::from_secs(30))
-        .await;
+        .restart_drain_verdict(earlier)
+        .unwrap_or_else(|message| panic!("{message}"));
     assert!(
         drained,
         "restart-paused work must let the daemon end the drain by quiescence, not at its \
          {drain:?} ceiling: {line}"
     );
-    rig.wait_for_replacement(&active["launch_id"], Duration::from_secs(80))
-        .await;
-    let records = wait_records(&rig, |records| {
+    let records = wait_records(&rig, "resumed run completion", |records| {
         records.iter().any(|r| {
             matches!(
                 r,
@@ -829,7 +1048,7 @@ async fn module_restart_interrupt_policy_finishes_long_tool_at_boundary() {
     start_keyed_run(&rig, None).await;
     rig.wait_for_tool().await;
     rig.restart().await;
-    let records = wait_records(&rig, |records| {
+    let records = wait_records(&rig, "interrupted run at tool boundary", |records| {
         records
             .iter()
             .any(|r| matches!(r, WalRecord::RunFinished { .. }))
@@ -866,7 +1085,7 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
     };
     let run_id = start_keyed_run(&rig, Some("resume")).await;
     signal_during_tool(&rig, "-TERM").await;
-    let records = wait_records(&rig, |records| {
+    let records = wait_records(&rig, "resumed run completion", |records| {
         records.iter().any(|record| {
             matches!(
                 record,
@@ -941,7 +1160,7 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
         serve_recording_model(control_requests.clone(), control_bodies.clone(), 3000).await;
     let control = Rig::start(&control_url).await.unwrap();
     start_keyed_run(&control, Some("resume")).await;
-    wait_records(&control, |records| {
+    wait_records(&control, "uninterrupted control completion", |records| {
         records.iter().any(|record| {
             matches!(
                 record,
@@ -969,7 +1188,7 @@ async fn explicit_interrupt_preserves_graceful_terminal() {
     };
     start_keyed_run(&rig, Some("interrupt")).await;
     signal_during_tool(&rig, "-TERM").await;
-    let records = wait_records(&rig, |records| {
+    let records = wait_records(&rig, "explicit-interrupt terminal", |records| {
         records
             .iter()
             .any(|record| matches!(record, WalRecord::RunFinished { .. }))
@@ -1001,7 +1220,7 @@ async fn resume_policy_with_tool_past_drain_is_interrupted_unknown_never_paused(
     };
     start_keyed_run(&rig, Some("resume")).await;
     signal_during_tool(&rig, "-TERM").await;
-    let records = wait_records(&rig, |records| {
+    let records = wait_records(&rig, "interrupted run with unresolved tool", |records| {
         records
             .iter()
             .any(|record| matches!(record, WalRecord::RunFinished { .. }))
@@ -1035,9 +1254,8 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
     let run_id = start_keyed_run(&rig, Some("resume")).await;
     let launch = rig.health().await["launch_id"].clone();
     signal_during_tool(&rig, "-KILL").await;
-    rig.wait_for_replacement(&launch, Duration::from_secs(30))
-        .await;
-    let records = wait_records(&rig, |records| {
+    rig.wait_for_replacement(&launch).await;
+    let records = wait_records(&rig, "crash-orphan terminal", |records| {
         records
             .iter()
             .any(|record| matches!(record, WalRecord::RunFinished { .. }))
@@ -1187,14 +1405,13 @@ async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
         } else {
             signal_during_tool(&rig, "-KILL").await;
         }
-        rig.wait_for_replacement(&launch, Duration::from_secs(30))
-            .await;
+        rig.wait_for_replacement(&launch).await;
         let expected = if planned {
             "runner_shutdown"
         } else {
             "runner_crash"
         };
-        let records = wait_records(&rig, |records| {
+        let records = wait_records(&rig, "planned-shutdown or crash terminal", |records| {
             records
                 .iter()
                 .any(|record| matches!(record, WalRecord::RunFinished { .. }))
@@ -1215,9 +1432,8 @@ async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
             .status()
             .unwrap()
             .success());
-        rig.wait_for_replacement(&launch, Duration::from_secs(30))
-            .await;
-        let after = wait_records(&rig, |records| {
+        rig.wait_for_replacement(&launch).await;
+        let after = wait_records(&rig, "durable terminal after second kill", |records| {
             records
                 .iter()
                 .any(|record| matches!(record, WalRecord::RunFinished { .. }))
