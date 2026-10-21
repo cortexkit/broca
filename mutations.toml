@@ -9,6 +9,20 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "session-read-discarded-prefix-still-proves-history"
+guards = "Discarding an unidentified prefix cannot hide an unreachable WAL as an empty session"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::unidentified_prefix_does_not_hide_an_unreachable_wal"]
+expect_message = "discarded unidentified rows still prove unreachable history"
+file = "crates/broca-module/src/registry.rs"
+old = "        if store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) {"
+new = "        if store_has_history && snapshot.watermark_seq > 0 && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK: forget history when discarding the prefix."
+
+[[control]]
 id = "session-read-model-persists-lineage-repair"
 guards = "Model-view reads persist the replayed prefix identity rather than repeatedly replaying unidentified rows"
 runner = "cargo"

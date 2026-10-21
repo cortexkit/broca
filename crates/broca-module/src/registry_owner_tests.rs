@@ -113,6 +113,52 @@ async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
 }
 
 #[tokio::test]
+async fn unidentified_prefix_does_not_hide_an_unreachable_wal() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(&fixture.session, None, None),
+        super::tests::assistant_record(),
+        finished(),
+    ]);
+    let store = fixture.sqlite();
+    store
+        .project_range(
+            &fixture.session,
+            &fixture
+                .wal
+                .read_records_range(&fixture.session, 0, None, None)
+                .unwrap(),
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(fixture.root.join("store.db")).unwrap();
+    conn.execute("UPDATE meta SET lineage_id=NULL", []).unwrap();
+    assert!(
+        store
+            .read_prefix_with_watermark(&fixture.session)
+            .unwrap()
+            .watermark_seq
+            > 0
+    );
+    std::fs::remove_file(fixture.wal.wal_path(&fixture.session)).unwrap();
+    let registry =
+        LineageRegistry::new_with_reader(Arc::new(NeverOpener), fixture.wal.clone(), Some(store));
+    let raw = registry
+        .route_read_page(&fixture.session, Some(0), Some(100), true)
+        .await;
+    assert!(
+        matches!(raw, Err(OpenError::HistoryUnreachable { .. })),
+        "discarded unidentified rows still prove unreachable history"
+    );
+    let model = registry
+        .route_read_model_page(&fixture.session, &broca_core::ModelPageRequest::default())
+        .await;
+    assert!(
+        matches!(model, Err(OpenError::HistoryUnreachable { .. })),
+        "model reads must not turn unreachable history into an empty page: {model:?}"
+    );
+}
+
+#[tokio::test]
 async fn session_read_replays_and_repairs_unidentified_prefix() {
     recreated_prefix_session_read(true, false).await;
 }

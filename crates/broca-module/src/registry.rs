@@ -3043,6 +3043,13 @@ impl LineageRegistry {
             )
             .await?;
 
+        // Keep existence evidence even when lineage validation discards the rows below.
+        // An unreachable WAL cannot turn a previously materialized session into an empty one.
+        let stored_watermark = snapshot.watermark_seq;
+        let stored_prefix_len = snapshot.prefix_len;
+        let store_has_history =
+            stored_prefix_len > 0 || stored_watermark > 0 || snapshot.last_run_id.is_some();
+
         // A watermark orders records within one WAL; it cannot prove that materialized
         // rows belong to a recreated WAL at the same address. Missing identity must take
         // the same full replay as a mismatch. Reprojection records the observed identity
@@ -3093,16 +3100,14 @@ impl LineageRegistry {
 
         // A stored run id or materialized prefix proves the session existed. Without a live or
         // archived WAL, serving store rows alone could silently present a truncated transcript.
-        let store_has_history =
-            snapshot.prefix_len > 0 || snapshot.watermark_seq > 0 || snapshot.last_run_id.is_some();
         if store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) {
             return Err(OpenError::HistoryUnreachable {
                 session_ref: broca_core::agent_session_ref(key),
                 reason: format!(
                     "session {} has materialized history (watermark {}; messages {}) but its WAL is unreachable: not live, not archived",
                     broca_core::session_addr(key),
-                    snapshot.watermark_seq,
-                    snapshot.prefix_len
+                    stored_watermark,
+                    stored_prefix_len
                 ),
             });
         }
