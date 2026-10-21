@@ -158,7 +158,13 @@ fn every_renderer_version_bump_decides_whether_the_old_version_is_reproducible()
 /// declaration must not exist without its proof.
 #[test]
 fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
-    let pins = legacy_pins();
+    let mut pins = legacy_pins();
+    // Version 6 bounded explicit output by the tier ceiling, not the frozen model maximum.
+    // Keep that request separate from the pre-provider-text-state fixtures, which predate it.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v6.json"))
+            .expect("Code Assist v6 pins are JSON"),
+    );
     let opts = legacy_call_options();
     let mut proven = BTreeSet::new();
     for family in all_families() {
