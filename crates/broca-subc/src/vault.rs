@@ -52,6 +52,9 @@ use crate::connection::{
 /// route.open calls per second at most.
 const VAULT_ROUTE_OPEN_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Refresh may contact an upstream OAuth endpoint; it is not a ten-second local control RPC.
+const VAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Slack on top of the backstop in `resolve_route`, past the readiness deadline plus one
 /// [`ROUTE_OPEN_ATTEMPT_TIMEOUT`]. The retry loop can start its last attempt AT the readiness
 /// deadline, and that attempt ends on its own clock with an error naming the route-open
@@ -604,7 +607,7 @@ fn decode_list_scoped_reply(body: &serde_json::Value) -> Result<ScopedList, Vaul
 /// The route handle is a CACHE, not a permanent binding: when the credentials module is
 /// drain-restarted, the daemon frees its slot and the next request on it is rejected
 /// `unknown_channel`. Every call therefore resolves the route on demand and, on a
-/// transport failure or `unknown_channel`, evicts the cached handle and retries ONCE against
+/// proven stale-route failure or `unknown_channel`, evicts the cached handle and retries ONCE against
 /// a fresh route — a vault restart costs one transparent retry instead of a terminal error on
 /// every send until this process is bounced. (The same learned-dead-route discipline the
 /// tool plane uses.)
@@ -659,7 +662,8 @@ impl VaultConnection for SubcConnection {
         route: &RouteHandle,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, ConnError> {
-        SubcConnection::route_request_raw(self, route, body).await
+        SubcConnection::route_request_raw_with_deadline(self, route, body, VAULT_REPLY_TIMEOUT)
+            .await
     }
 
     async fn route_close(&self, route: &RouteHandle) -> Result<(), ConnError> {
@@ -671,6 +675,12 @@ enum RouteState {
     Empty,
     Opening(Arc<RouteOpenAttempt>),
     Ready(RouteHandle),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VaultRequestEffect {
+    MayRefreshOrMutate,
+    ReadOnly,
 }
 
 struct RouteOpenAttempt {
@@ -914,29 +924,51 @@ impl VaultClient {
     }
 
     /// Send one request on the resolved route, retrying once only when the route
-    /// is known stale (`unknown_channel`) or the connection itself failed. Other
-    /// daemon rejections and protocol errors are authoritative and are not retried.
+    /// is proven not to have delivered the request (`unknown_channel` or a stale local handle).
+    /// A transport failure after enqueue may have refreshed a credential and must not be replayed.
     ///
     /// `Ok` carries the vault's undecoded reply body: it means the vault answered, whatever the
     /// body turns out to say.
     async fn route_request_with_retry(&self, body: Vec<u8>) -> Result<Vec<u8>, VaultError> {
+        self.route_request_with_effect(body, VaultRequestEffect::MayRefreshOrMutate)
+            .await
+    }
+
+    async fn route_request_with_effect(
+        &self,
+        body: Vec<u8>,
+        effect: VaultRequestEffect,
+    ) -> Result<Vec<u8>, VaultError> {
+        // Only metadata-only operations can safely repeat after delivery is ambiguous.
+        let can_retry = |error: &ConnError| {
+            conn_error_is_retryable(error)
+                || (effect == VaultRequestEffect::ReadOnly
+                    && matches!(error, ConnError::Transport(_)))
+        };
         let route = self.route().await?;
         match self.conn.route_request(&route, body.clone()).await {
             Ok(reply) => Ok(reply),
-            Err(first) if conn_error_is_retryable(&first) => {
+            Err(first) if can_retry(&first) => {
                 self.invalidate_failed_route(route, &first);
                 let retry_route = self.route().await?;
                 match self.conn.route_request(&retry_route, body).await {
                     Ok(reply) => Ok(reply),
                     Err(second) => {
-                        if conn_error_is_retryable(&second) {
+                        if conn_error_is_retryable(&second)
+                            || matches!(second, ConnError::Transport(_))
+                        {
                             self.invalidate_failed_route(retry_route, &second);
                         }
                         Err(map_exhausted_conn_err(second))
                     }
                 }
             }
-            Err(error) => Err(map_conn_err(error)),
+            Err(error) => {
+                if matches!(error, ConnError::Transport(_)) {
+                    self.invalidate_failed_route(route, &error);
+                }
+                Err(map_conn_err(error))
+            }
         }
     }
 
@@ -1029,12 +1061,14 @@ impl VaultClient {
             "params": {},
         }))
         .map_err(|e| VaultError::Protocol(format!("encode credential.list_scoped: {e}")))?;
-        let reply = self.route_request_with_retry(body).await?;
+        let reply = self
+            .route_request_with_effect(body, VaultRequestEffect::ReadOnly)
+            .await?;
         decode_list_scoped_reply(&decode_reply_json(&reply)?)
     }
 
     /// Read a handle's metadata without decrypting or refreshing its credential.
-    /// Uses the same route deadlines and single stale-route retry as `get`; never
+    /// Unlike refresh-capable `get`, this read-only operation can retry a transport failure. It never
     /// reports authentication failures. Gauge policy belongs to the calling layer,
     /// not this transport client, which owns no health gauge.
     pub async fn status(&self, handle: &str) -> Result<CredentialStatus, VaultError> {
@@ -1054,7 +1088,9 @@ impl VaultClient {
         };
         let body = serde_json::to_vec(&req)
             .map_err(|e| VaultError::Protocol(format!("encode credential.status: {e}")))?;
-        let reply = self.route_request_with_retry(body).await?;
+        let reply = self
+            .route_request_with_effect(body, VaultRequestEffect::ReadOnly)
+            .await?;
         decode_status_reply(&decode_reply_json(&reply)?)
     }
 
@@ -1137,10 +1173,8 @@ fn decode_reply_json(body: &[u8]) -> Result<serde_json::Value, VaultError> {
 }
 
 fn conn_error_is_retryable(error: &ConnError) -> bool {
-    matches!(
-        error,
-        ConnError::Transport(_) | ConnError::StaleRouteHandle(_)
-    ) || matches!(error, ConnError::Rejected(message) if crate::rejection_is_unknown_channel(message))
+    matches!(error, ConnError::StaleRouteHandle(_))
+        || matches!(error, ConnError::Rejected(message) if crate::rejection_is_unknown_channel(message))
 }
 
 /// A second `unknown_channel` means the replacement route also disappeared during a
@@ -1175,6 +1209,54 @@ fn map_conn_err(e: ConnError) -> VaultError {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn delivered_force_refresh_timeout_is_not_retried() {
+        use futures::FutureExt;
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let client = test_client(Arc::new(conn), RouteState::Ready(route));
+        let mut request = Box::pin(tokio::time::timeout(
+            VAULT_REPLY_TIMEOUT + std::time::Duration::from_secs(20),
+            client.get("handle", None, true),
+        ));
+        assert!(request.as_mut().now_or_never().is_none());
+        let delivered = module.next_request().await;
+        let body: serde_json::Value = serde_json::from_slice(&delivered.body).unwrap();
+        assert_eq!(body["method"], "credential.get");
+        assert_eq!(body["params"]["force_refresh"], true);
+        let result = request.await.expect("vault timeout must terminate");
+        assert!(!result.vault_replied);
+        assert!(matches!(result.result, Err(VaultError::Transport(_))));
+        assert!(
+            module
+                .take_written_for_test()
+                .iter()
+                .all(|frame| frame.header.ty != subc_protocol::FrameType::Request),
+            "a delivered refresh timeout must not reopen or resend"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_reply_can_outlast_the_local_control_deadline() {
+        use futures::FutureExt;
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let client = test_client(Arc::new(conn), RouteState::Ready(route));
+        let mut request = Box::pin(client.get("handle", None, true));
+        assert!(request.as_mut().now_or_never().is_none());
+        let delivered = module.next_request().await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        assert!(
+            request.as_mut().now_or_never().is_none(),
+            "refresh must still be waiting after ten seconds"
+        );
+        assert!(module.reply(
+            &delivered,
+            serde_json::to_vec(&json!({"result": {"payload": [97], "record_version": 1}})).unwrap()
+        ));
+        let result = request.await;
+        assert!(result.vault_replied);
+        assert_eq!(result.result.unwrap().token, "a");
+    }
+
     use std::{
         collections::VecDeque,
         path::PathBuf,
@@ -1865,8 +1947,8 @@ mod tests {
         );
         assert_eq!(
             stub.request_count(),
-            2,
-            "the vault retries its idempotent read once"
+            1,
+            "credential.get may refresh a token, so an ambiguous reply must not replay it"
         );
         stub.assert_healthy();
     }
@@ -2046,10 +2128,19 @@ mod tests {
         let stale = RouteHandle::synthetic(10);
         let client = test_client(conn.clone(), RouteState::Ready(stale));
 
-        let _ = client.route_request_with_retry(vec![]).await.unwrap();
+        assert!(matches!(
+            client.route_request_with_retry(vec![]).await,
+            Err(VaultError::Transport(_))
+        ));
         wait_for_route_closes(&conn, 1).await;
 
         assert_eq!(conn.closes.lock().unwrap().as_slice(), &[stale]);
+        assert_eq!(
+            conn.requests.load(Ordering::SeqCst),
+            1,
+            "an ambiguous timeout must not replay credential work"
+        );
+        assert_eq!(conn.opens.load(Ordering::SeqCst), 0);
     }
 
     #[test]

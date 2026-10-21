@@ -19797,3 +19797,29 @@ file = "crates/broca-subc/src/scope_describe.rs"
 old = "        let reply = match tokio::time::timeout(DESCRIBE_TIMEOUT, async {"
 new = '''        writer.send(frame.clone()).await.map_err(|_| "closed".to_owned())?; // NON-VACUITY BREAK: wait before the deadline.
         let reply = match tokio::time::timeout(DESCRIBE_TIMEOUT, async {'''
+
+[[control]]
+id = "subc-vault-refresh-never-replays-ambiguous-delivery"
+guards = "A delivered refresh-capable credential request is not retried after its reply times out"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/vault.rs"
+expect_red = ["vault::tests::delivered_force_refresh_timeout_is_not_retried"]
+file = "crates/broca-subc/src/vault.rs"
+old = "self.route_request_with_effect(body, VaultRequestEffect::MayRefreshOrMutate)"
+new = "self.route_request_with_effect(body, VaultRequestEffect::ReadOnly) // NON-VACUITY BREAK: replay refreshes as if they were metadata reads."
+
+[[control]]
+id = "subc-vault-refresh-reply-budget"
+guards = "Refresh-capable vault requests use an upstream-work reply budget rather than the ten-second local control deadline"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/vault.rs"
+expect_red = ["vault::tests::refresh_reply_can_outlast_the_local_control_deadline"]
+file = "crates/broca-subc/src/vault.rs"
+old = "const VAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);"
+new = "const VAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10); // NON-VACUITY BREAK: refresh uses local-control patience."
