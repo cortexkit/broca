@@ -56,6 +56,20 @@ old = "retracted.into_result().map(|_| ())"
 new = "{ let _ = retracted; Ok(()) } // NON-VACUITY BREAK: remove a refused retraction from the live inbox."
 
 [[control]]
+id = "core-resume-reuses-bounded-approval-history"
+guards = "Approval-free resume decodes only the materialized prefix's WAL suffix and does not copy old WAL payloads"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::resume_decodes_and_copies_only_the_unmaterialized_suffix"]
+expect_message = "decoded"
+file = "crates/broca-core/src/run.rs"
+old = "        Some(frames) => frames,"
+new = "        Some(_frames) => Arc::new(approval_store.unwrap().read_records(&req.session)?), // NON-VACUITY BREAK: reread complete history."
+
+[[control]]
 id = "claude-code-split-message-retains-parallel-results"
 guards = "Adjacent Claude Code assistant fragments sharing an API message ID keep both real parallel tool results through durable import and replay"
 runner = "cargo"

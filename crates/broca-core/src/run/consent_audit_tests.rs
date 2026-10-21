@@ -538,12 +538,20 @@ async fn legacy_stop_facts_seed_requires_full_fold_before_late_dispatch() {
         let mut legacy = serde_json::to_value(&history.projection).unwrap();
         legacy.as_object_mut().unwrap().remove("stopped_runs");
         history.projection = serde_json::from_value(legacy).unwrap();
-        history.frames.retain(|frame| {
-            matches!(
-                frame.record,
-                WalRecord::RunStarted { .. } | WalRecord::ToolBatchStarted { .. }
-            )
-        });
+        history.frames = approval_gate::History::new(
+            &rig.writer,
+            full.iter()
+                .filter(|frame| {
+                    matches!(
+                        frame.record,
+                        WalRecord::RunStarted { .. } | WalRecord::ToolBatchStarted { .. }
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .frames;
         let incomplete = approval_gate::admission(
             &mut history,
             &rig.writer,
@@ -557,7 +565,9 @@ async fn legacy_stop_facts_seed_requires_full_fold_before_late_dispatch() {
             "unknown stop facts require a complete authoritative prefix, not an origin-only cache"
         );
         assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
-        history.frames = full;
+        history.frames = approval_gate::History::new(&rig.writer, full)
+            .unwrap()
+            .frames;
         approval_gate::admission(
             &mut history,
             &rig.writer,

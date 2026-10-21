@@ -3815,9 +3815,10 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
     let mut snapshot = PriorWalSnapshot {
         base_watermark: 0,
         head_seq: 0,
-        tail: Vec::new(),
+        tail: Arc::new(Vec::new()),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            has_deferred_calls: None,
             tags: None,
             pending_order: None,
             input_budget: None,
@@ -3883,7 +3884,7 @@ async fn prior_frames_snapshot_skips_reconstruct_read() {
         base_watermark: 0,
         head_seq: prior.last().map_or(0, |frame| frame.seq),
         checkpoint_at_head: AdmissionCheckpointV1::from_frames(&prior).expect("checkpoint"),
-        tail: prior,
+        tail: Arc::new(prior),
         checkpoint_at_base: None,
     };
 
@@ -3940,7 +3941,7 @@ async fn stale_prior_frames_fall_back_to_reconstruct_read() {
         head_seq: stale_prefix.last().map_or(0, |frame| frame.seq),
         checkpoint_at_head: AdmissionCheckpointV1::from_frames(&stale_prefix)
             .expect("stale checkpoint"),
-        tail: stale_prefix,
+        tail: Arc::new(stale_prefix),
         checkpoint_at_base: None,
     };
 
