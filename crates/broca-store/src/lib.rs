@@ -710,17 +710,19 @@ impl SqliteStore {
     ) -> Result<ActiveRowReconcileCounts, StoreError> {
         use broca_protocol::caller::RunFinishReason;
         use broca_wal::WalRecord;
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(if commit {
-            rusqlite::TransactionBehavior::Immediate
-        } else {
-            rusqlite::TransactionBehavior::Deferred
-        })?;
+        // Snapshot candidates briefly; WAL decoding must not retain a connection mutex
+        // or SQLite writer reservation. The later UPDATE rechecks the candidate identity.
         let active_rows = {
-            let mut statement =
-                tx.prepare("SELECT run_id, session FROM run_index WHERE state = 'active'")?;
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn.prepare(
+                "SELECT run_id, session, lineage_id FROM run_index WHERE state = 'active'",
+            )?;
             let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -728,7 +730,7 @@ impl SqliteStore {
             scanned: active_rows.len() as u64,
             ..ActiveRowReconcileCounts::default()
         };
-        for (run_id, key) in active_rows {
+        for (run_id, key, expected_lineage) in active_rows {
             // `run_index.session` is the JSON triple (see `index_run_active`), not the flat
             // `meta.session` key the control-head repair parses. Same store, two encodings;
             // reaching for the sibling's parser here read every row as "declined".
@@ -802,11 +804,14 @@ impl SqliteStore {
             // `Option` wrapper, so a row written here reads back exactly like one the actor wrote.
             let usage_json = serde_json::to_string(&usage).map_err(StoreError::Json)?;
             if commit {
-                tx.execute(
+                let mut conn = self.conn.lock().unwrap();
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let changed = tx.execute(
                     "UPDATE run_index
                     SET state = ?2, usage_json = ?3, retries_used = ?4,
                         state_changed_ms = ?5, withdrawals_owed = MAX(withdrawals_owed, ?6)
-                  WHERE run_id = ?1 AND state = 'active'",
+                  WHERE run_id = ?1 AND state = 'active' AND session = ?7 AND lineage_id IS ?8",
                     rusqlite::params![
                         run_id,
                         state.as_str(),
@@ -814,15 +819,17 @@ impl SqliteStore {
                         i64::from(retries_used),
                         Self::now_epoch_ms(),
                         withdrawals_owed,
+                        key,
+                        expected_lineage,
                     ],
                 )?;
+                tx.commit()?;
+                if changed == 0 {
+                    counts.declined += 1;
+                    continue;
+                }
             }
             counts.reconciled += 1;
-        }
-        if commit {
-            tx.commit()?;
-        } else {
-            tx.rollback()?;
         }
         Ok(counts)
     }
@@ -850,20 +857,21 @@ impl SqliteStore {
         wal_store: &dyn WalStore,
         commit: bool,
     ) -> Result<ControlHeadRepairCounts, StoreError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(if commit {
-            rusqlite::TransactionBehavior::Immediate
-        } else {
-            rusqlite::TransactionBehavior::Deferred
-        })?;
+        // A watermark observed here is only a candidate until the short UPDATE
+        // confirms that the same projection still needs its control-head repair.
         let legacy_rows = {
-            let mut statement = tx.prepare(
-                "SELECT session, watermark_seq
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn.prepare(
+                "SELECT session, watermark_seq, lineage_id
                    FROM meta
                   WHERE watermark_seq > 0 AND control_head_wal_seq IS NULL",
             )?;
             let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -872,7 +880,7 @@ impl SqliteStore {
             scanned: legacy_rows.len() as u64,
             ..ControlHeadRepairCounts::default()
         };
-        for (key, watermark) in legacy_rows {
+        for (key, watermark, expected_lineage) in legacy_rows {
             let derived = bind_identity_from_store_key(&key)
                 .and_then(|session| wal_store.read_records(&session).ok())
                 .and_then(|records| last_control_cursor_through(&records, Some(watermark)));
@@ -892,19 +900,22 @@ impl SqliteStore {
             };
 
             if commit {
-                tx.execute(
+                let mut conn = self.conn.lock().unwrap();
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let changed = tx.execute(
                     "UPDATE meta
                     SET control_head_wal_seq=?2, control_head_sub_index=?3
-                  WHERE session=?1 AND control_head_wal_seq IS NULL",
-                    rusqlite::params![key, cursor.wal_seq as i64, i64::from(cursor.sub_index),],
-                )?;
+                  WHERE session=?1 AND control_head_wal_seq IS NULL AND watermark_seq=?4 AND lineage_id IS ?5",
+                rusqlite::params![key, cursor.wal_seq as i64, i64::from(cursor.sub_index), watermark, expected_lineage],
+            )?;
+                tx.commit()?;
+                if changed == 0 {
+                    counts.declined += 1;
+                    continue;
+                }
             }
             counts.repaired += 1;
-        }
-        if commit {
-            tx.commit()?;
-        } else {
-            tx.rollback()?;
         }
         Ok(counts)
     }
@@ -2630,6 +2641,162 @@ fn decode_messages(encoded: Vec<EncodedMessage>) -> Result<Vec<Message>, StoreEr
 
 #[cfg(test)]
 mod tests {
+    struct RepairReadProbe<'a> {
+        store: &'a SqliteStore,
+        wal: &'a broca_core::FileWalStore,
+        db: std::path::PathBuf,
+        change_candidate: bool,
+    }
+    impl RepairReadProbe<'_> {
+        fn before_read(&self) {
+            assert!(
+                self.store.conn.try_lock().is_ok(),
+                "WAL replay must not hold the store connection mutex"
+            );
+            let mut conn = rusqlite::Connection::open(&self.db).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("WAL replay must not hold a SQLite writer reservation");
+            if self.change_candidate {
+                tx.execute(
+                    "UPDATE run_index SET lineage_id='replacement' WHERE run_id='r'",
+                    [],
+                )
+                .unwrap();
+                tx.execute("UPDATE meta SET watermark_seq=watermark_seq+1", [])
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+    }
+    impl WalStore for RepairReadProbe<'_> {
+        fn open(
+            &self,
+            session: &broca_protocol::BindIdentity,
+        ) -> Result<Box<dyn Wal + Send>, WalError> {
+            self.wal.open(session)
+        }
+        fn read_records(
+            &self,
+            session: &broca_protocol::BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            self.before_read();
+            self.wal.read_records(session)
+        }
+        fn read_records_range(
+            &self,
+            session: &broca_protocol::BindIdentity,
+            after: u64,
+            through: Option<u64>,
+            anchor: Option<&broca_wal::WalByteAnchor>,
+        ) -> Result<WalRangeRead, WalError> {
+            self.before_read();
+            self.wal.read_records_range(session, after, through, anchor)
+        }
+    }
+
+    fn maintenance_replay_fixture(active: bool, change_candidate: bool) {
+        let root = broca_test_support::scratch_root()
+            .join(format!("repair-unlocked-{active}-{change_candidate}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("run-index.db");
+        let store = SqliteStore::open(&db).unwrap();
+        let wal_store = broca_core::FileWalStore::new(root.join("wal"));
+        let session = crate::conformance::session("repair-unlocked");
+        let mut frames = crate::conformance::base_records(&session);
+        frames.extend(crate::conformance::text_turn(2, 1, "done"));
+        let mut wal = wal_store.open(&session).unwrap();
+        for frame in frames {
+            wal.append(1, &frame.record, true).unwrap();
+        }
+        wal.append(
+            1,
+            &broca_wal::WalRecord::RunFinished {
+                reason: broca_protocol::caller::RunFinishReason::Completed,
+                ts_ms: Some(1),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+                interrupt_reason: None,
+            },
+            true,
+        )
+        .unwrap();
+        drop(wal);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO run_index(run_id,session,state) VALUES('r',?1,'active')",
+                [serde_json::to_string(&session).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meta(session,watermark_seq,context_epoch) VALUES(?1,3,0)",
+                [SqliteStore::key(&session)],
+            )
+            .unwrap();
+        }
+        let probe = RepairReadProbe {
+            store: &store,
+            wal: &wal_store,
+            db,
+            change_candidate,
+        };
+        if active {
+            let counts = store.reconcile_active_rows(&probe).unwrap();
+            assert_eq!(
+                (counts.reconciled, counts.declined),
+                if change_candidate { (0, 1) } else { (1, 0) }
+            );
+            let state: String = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT state FROM run_index WHERE run_id='r'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                state,
+                if change_candidate {
+                    "active"
+                } else {
+                    "completed"
+                }
+            );
+        } else {
+            let counts = store.repair_control_heads(&probe).unwrap();
+            assert_eq!(
+                (counts.repaired, counts.declined),
+                if change_candidate { (0, 1) } else { (1, 0) }
+            );
+            let cursor: Option<i64> = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT control_head_wal_seq FROM meta", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(cursor.is_some(), !change_candidate);
+        }
+    }
+
+    #[test]
+    fn active_repair_replays_without_holding_store_or_writer_lock() {
+        maintenance_replay_fixture(true, false);
+    }
+    #[test]
+    fn control_repair_replays_without_holding_store_or_writer_lock() {
+        maintenance_replay_fixture(false, false);
+    }
+    #[test]
+    fn maintenance_repairs_recheck_snapshot_candidates_before_writing() {
+        maintenance_replay_fixture(true, true);
+        maintenance_replay_fixture(false, true);
+    }
+
     #[test]
     fn attribution_probe_uses_partial_session_index() {
         let store = SqliteStore::open_in_memory().unwrap();

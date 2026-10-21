@@ -19919,3 +19919,55 @@ expect_red = ["tests::journal_mode_initialization_retries_only_busy_within_its_b
 file = "crates/broca-store/src/lib.rs"
 old = "                if !retry {"
 new = "                if true || !retry { // NON-VACUITY BREAK: fail an upgrade that skipped SQLite's busy handler."
+
+[[control]]
+id = "store-active-repair-unlocked-replay"
+guards = "Active-row repair releases both the serving connection mutex and SQLite writer reservation before reading WAL history"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::active_repair_replays_without_holding_store_or_writer_lock"]
+file = "crates/broca-store/src/lib.rs"
+old = "                .and_then(|session| wal_store.read_records_range(&session, 0, None, None).ok())"
+new = "                .and_then(|session| { let _held = self.conn.lock().unwrap(); wal_store.read_records_range(&session, 0, None, None).ok() }) // NON-VACUITY BREAK: hold the serving connection during replay."
+
+[[control]]
+id = "store-control-repair-unlocked-replay"
+guards = "Control-head repair releases the serving connection and writer reservation before WAL replay"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::control_repair_replays_without_holding_store_or_writer_lock"]
+file = "crates/broca-store/src/lib.rs"
+old = "                .and_then(|session| wal_store.read_records(&session).ok())"
+new = "                .and_then(|session| { let _held = self.conn.lock().unwrap(); wal_store.read_records(&session).ok() }) // NON-VACUITY BREAK: hold the serving connection during replay."
+
+[[control]]
+id = "store-active-repair-candidate-lineage"
+guards = "An active-row repair derived outside SQLite cannot overwrite a replacement run-index lineage"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::maintenance_repairs_recheck_snapshot_candidates_before_writing"]
+file = "crates/broca-store/src/lib.rs"
+old = "AND session = ?7 AND lineage_id IS ?8"
+new = "AND session = ?7 AND ?8 IS ?8 /* NON-VACUITY BREAK: ignore replacement lineage */"
+
+[[control]]
+id = "store-control-repair-candidate-watermark"
+guards = "Control-head repair cannot publish a cursor after the candidate projection watermark changes during replay"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::maintenance_repairs_recheck_snapshot_candidates_before_writing"]
+file = "crates/broca-store/src/lib.rs"
+old = "AND watermark_seq=?4 AND lineage_id IS ?5"
+new = "AND ?4=?4 AND lineage_id IS ?5 /* NON-VACUITY BREAK: ignore changed watermark */"
