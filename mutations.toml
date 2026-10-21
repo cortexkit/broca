@@ -19698,3 +19698,102 @@ expect_red = ["file_wal::tests::prefix_readers_share_replay_damage_policy_withou
 file = "crates/broca-wal/src/file_wal.rs"
 old = "                decode_bytes_seeded(\n                    &frame,\n                    offset,\n                    scan.last_seq,\n                    1,\n                    Vec::new(),\n                    scan.lineage_id,\n                )?;"
 new = "                // NON-VACUITY BREAK: report damaged non-tail history as an absent prefix."
+
+[[control]]
+id = "subc-ordinary-send-certainty"
+guards = "Ordinary dispatch preserves proven pre-enqueue failures separately from post-enqueue ambiguity"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::approved_queue_contract_tests::ordinary_send_certainty_tracks_the_real_enqueue_boundary"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''            &broca_core::tool_plane::DispatchSignals::default(),
+        )
+        .await'''
+new = '''            &broca_core::tool_plane::DispatchSignals::default(),
+        )
+        .await.map_err(|error| match error { // NON-VACUITY BREAK: lose proven non-delivery.
+            crate::connection::ApprovedCallError::BeforePush(error) => crate::connection::ApprovedCallError::AfterPush(ConnError::Transport(error.to_string())),
+            error => error,
+        })'''
+
+[[control]]
+id = "subc-approval-scope-recheck-holds"
+guards = "Approval scope rechecks hold temporary owner-sync refusals instead of permanently dropping approved work"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::scope_carrier::approval_recheck_retries_temporary_scope_refusals_but_not_final_refusals"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "                deadline: Instant::now() + self.scope_sync_hold,"
+new = "                deadline: Instant::now(), // NON-VACUITY BREAK: expire the approval recheck hold immediately."
+
+[[control]]
+id = "subc-batch-send-agent-stamp"
+guards = "A batch composed under one agent cannot use a sibling's newly cached route to another agent"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::scope_carrier::sibling_rebind_never_sends_an_old_batch_to_a_new_agent"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "            if !compatible {"
+new = "            if !compatible && false { // NON-VACUITY BREAK: trust a newly cached route's agent."
+
+[[control]]
+id = "subc-incompatible-reopen-evicted"
+guards = "A replacement route rejected for a changed agent cannot poison sibling sends through the cache"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::scope_carrier::sibling_rebind_never_sends_an_old_batch_to_a_new_agent"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "            self.forget_route(ctx, module_id, fresh);"
+new = "            // NON-VACUITY BREAK: keep the rejected replacement cached."
+
+[[control]]
+id = "subc-session-close-clears-unfinished-fence"
+guards = "Closing a session releases results and eviction keys even when its tool batch never finished"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::scope_carrier::session_close_drops_unfinished_fence_results_and_eviction_keys"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "        self.fence.lock().unwrap().evict_session(&session);"
+new = "        // NON-VACUITY BREAK: retain abandoned results after session close."
+
+[[control]]
+id = "subc-scope-describe-cancel-cleanup"
+guards = "Cancelling a scope describe removes its pending correlation before or after writer enqueue"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/scope_describe.rs"
+expect_red = ["scope_describe::tests::cancelled_describe_cleans_pending_before_and_after_enqueue"]
+file = "crates/broca-subc/src/scope_describe.rs"
+old = "        self.describer.pending.lock().unwrap().remove(&self.corr);"
+new = "        let _ = (&self.describer, self.corr); // NON-VACUITY BREAK: leak abandoned correlation."
+
+[[control]]
+id = "subc-scope-describe-enqueue-deadline"
+guards = "Scope describe writer backpressure shares the bounded reply deadline"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/scope_describe.rs"
+expect_red = ["scope_describe::tests::describe_backpressure_is_inside_the_reply_deadline"]
+file = "crates/broca-subc/src/scope_describe.rs"
+old = "        let reply = match tokio::time::timeout(DESCRIBE_TIMEOUT, async {"
+new = '''        writer.send(frame.clone()).await.map_err(|_| "closed".to_owned())?; // NON-VACUITY BREAK: wait before the deadline.
+        let reply = match tokio::time::timeout(DESCRIBE_TIMEOUT, async {'''
