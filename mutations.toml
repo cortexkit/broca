@@ -2789,6 +2789,34 @@ file = "crates/broca-module-serve/src/main.rs"
 old = "            let prior_snapshot = &job.prior_snapshot;"
 new = "            let _ = self.wal_store.read_records(&job.req.session); // NON-VACUITY BREAK\n            let prior_snapshot = &job.prior_snapshot;"
 
+[[control]]
+id = "module-bind-reuses-owner-snapshot"
+guards = "repeated bind ownership and frozen-plan probes reuse validated ownership instead of decoding the whole WAL"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads"]
+expect_message = "only the final-frame suffix or the bounded first episode may be read"
+file = "crates/broca-module/src/registry.rs"
+old = "        match self.durable_session_ownership(key, true).await {"
+new = "        // NON-VACUITY BREAK: bypass cached ownership and decode the complete WAL on every bind.\n        match self.read_owner_fallback(self.inner.reader.as_ref()?, key, None, true).await {"
+
+[[control]]
+id = "module-bind-validates-first-episode-anchor"
+guards = "a cached first-episode frame position must be revalidated before supplying a frozen plan"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::stale_first_episode_positions_revalidate_recreated_or_truncated_wals"]
+expect_message = "a stale first-frame anchor or lineage must fall back to full revalidation"
+file = "crates/broca-module/src/registry.rs"
+old = "            || range.anchor_at(position.seq) != position.at"
+new = "            || false // NON-VACUITY BREAK: trust a cached position after the frame was replaced."
+
 # This proof checks the following behavior: RunStarted hook output requires step-transforms/v1, even
 # without a manifest.
 # Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
@@ -9002,8 +9030,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::fresh_bind_is_known_empty_without_a_warning"]
 file = "crates/broca-module/src/registry.rs"
-old = "empty.ownership = Some(broca_core::SessionOwnershipV1::default());"
-new = "empty.ownership = None; // NON-VACUITY BREAK: confuse authoritative absence with unknown history"
+old = "            Ok(ownership) => Some(ownership),"
+new = "            Ok(ownership) => (ownership.episodes > 0).then_some(ownership), // NON-VACUITY BREAK: confuse authoritative absence with unknown history"
 
 [[control]]
 id = "retention-audit-lost-history-stays-unknown"
@@ -9016,12 +9044,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::missing_materialized_history_is_not_known_empty_ownership"]
 file = "crates/broca-module/src/registry.rs"
-old = '''                    if !sources
-                        .wal_store
-                        .lineage_exists(&key, meta.as_ref())'''
-new = '''                    if true || !sources // NON-VACUITY BREAK: treat real history loss as empty
-                        .wal_store
-                        .lineage_exists(&key, meta.as_ref())'''
+old = "        if for_bind && records.is_empty() {"
+new = "        if for_bind && records.is_empty() && !matches!(range.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK: treat missing history as empty"
 
 [[control]]
 id = "retention-audit-group-explicit-refusal"
@@ -9118,8 +9142,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::zero_record_wal_does_not_hide_materialized_ownership_history"]
 file = "crates/broca-module/src/registry.rs"
-old = "            if records.is_empty() {\n                let meta = sources"
-new = "            if false && records.is_empty() { // NON-VACUITY BREAK: treat lost WAL as fresh\n                let meta = sources"
+old = "        if for_bind && records.is_empty() {"
+new = "        if for_bind && records.is_empty() && matches!(range.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK: treat zero-record WAL as fresh"
 
 [[control]]
 id = "retention-followup-bounded-first-episode"
