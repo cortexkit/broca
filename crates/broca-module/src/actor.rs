@@ -496,6 +496,12 @@ pub enum RetractOutcome {
     NotPending,
     /// The actor is closing — re-route through the registry (re-open).
     Reopen,
+    SessionTooLarge {
+        max_bytes: u64,
+    },
+    RetainedSessionTooLarge {
+        max_bytes: u64,
+    },
     /// Writing the retract tombstone failed durably.
     Error(String),
 }
@@ -4603,7 +4609,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // it: a caller told its send is queued can rely on the queued record (and its send key)
         // surviving a crash.
         let writer = self.writer.as_ref().expect("writer live while open");
-        writer.record(WalRecord::Queued {
+        let queued = writer.record(WalRecord::Queued {
             retention: self.admitting_retention,
             ts_ms: self.retention_timestamp(),
             hooks,
@@ -4617,6 +4623,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             principal,
         });
+        if let Err(error) = queued.into_result() {
+            return match error {
+                broca_core::WalWriteError::SessionTooLarge { max_bytes } => {
+                    SendOutcome::SessionTooLarge { max_bytes }
+                }
+                broca_core::WalWriteError::RetainedSessionTooLarge { max_bytes } => {
+                    SendOutcome::RetainedSessionTooLarge { max_bytes }
+                }
+                broca_core::WalWriteError::Failed(error) => SendOutcome::Error(error),
+            };
+        }
         if let Err(error) = writer.sync().await {
             return SendOutcome::Error(error.to_string());
         }
@@ -5041,19 +5058,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return match broca_core::retract_decision(&records, &submission_id) {
                 broca_core::RetractDecision::Retract => {
                     let writer = self.writer.as_ref().expect("writer live while open");
-                    let record = || {
-                        writer.record(WalRecord::Retracted {
+                    let record = || -> Result<(), broca_core::WalWriteError> {
+                        let retracted = writer.record(WalRecord::Retracted {
                             submission_id: submission_id.clone(),
                             failure: None,
                         });
+                        retracted.into_result().map(|_| ())
                     };
                     let recorded = match &self.state {
                         RunState::Active { steer, .. } => {
                             steer.retract_ordered(&submission_id, record)
                         }
-                        _ => {
-                            record();
-                            true
+                        _ => record().map(|()| true),
+                    };
+                    let recorded = match recorded {
+                        Ok(recorded) => recorded,
+                        Err(error) => {
+                            return match error {
+                                broca_core::WalWriteError::SessionTooLarge { max_bytes } => {
+                                    RetractOutcome::SessionTooLarge { max_bytes }
+                                }
+                                broca_core::WalWriteError::RetainedSessionTooLarge {
+                                    max_bytes,
+                                } => RetractOutcome::RetainedSessionTooLarge { max_bytes },
+                                broca_core::WalWriteError::Failed(error) => {
+                                    RetractOutcome::Error(error)
+                                }
+                            }
                         }
                     };
                     if !recorded {

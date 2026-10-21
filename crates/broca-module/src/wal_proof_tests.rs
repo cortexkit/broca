@@ -11,6 +11,7 @@ struct FaultWal {
     range_reads: AtomicUsize,
     tail_reads: AtomicUsize,
     tail_limit: AtomicUsize,
+    after_read: std::sync::Mutex<Option<std::sync::Weak<WalHandle>>>,
 }
 
 impl WalStore for FaultWal {
@@ -50,6 +51,13 @@ impl WalStore for FaultWal {
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
         self.range_reads.fetch_add(1, Ordering::Relaxed);
         let range = self.inner.read_records_range(key, after, through, anchor)?;
+        if let Some(writer) = self.after_read.lock().unwrap().take() {
+            writer
+                .upgrade()
+                .unwrap()
+                .record_terminal(refusal_terminal())
+                .unwrap();
+        }
         let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
             return Ok(range);
         };
@@ -150,7 +158,90 @@ fn queued_record(
     }
 }
 
+// Inject a real enqueue-budget refusal. The selected sync enqueues a reserved RunFinished
+// record, which bypasses and clears the earlier byte-budget refusal. No timing race is needed.
+struct RefusingWal {
+    inner: Box<dyn broca_wal::Wal + Send>,
+    writer: Arc<std::sync::Mutex<std::sync::Weak<WalHandle>>>,
+    sync_count: AtomicUsize,
+    clear_at: usize,
+}
+
+const REFUSAL_MAX_BYTES: u64 = 1_000_000;
+
+fn refusal_terminal() -> WalRecord {
+    WalRecord::RunFinished {
+        interrupt_reason: None,
+        reason: broca_protocol::RunFinishReason::Completed,
+        ts_ms: None,
+        usage: Default::default(),
+        error: None,
+        retries_used: 0,
+    }
+}
+
+impl broca_wal::Wal for RefusingWal {
+    fn append(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+    ) -> Result<u64, broca_wal::WalError> {
+        self.inner.append(fence, record, sync)
+    }
+    fn sync(&self) -> Result<(), broca_wal::WalError> {
+        self.inner.sync()?;
+        let Some(writer) = self.writer.lock().unwrap().upgrade() else {
+            return Ok(());
+        };
+        if self.sync_count.fetch_add(1, Ordering::Relaxed) + 1 == self.clear_at {
+            writer.record_terminal(refusal_terminal()).unwrap();
+        }
+        Ok(())
+    }
+    fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.inner.replay()
+    }
+    fn tail_after_seq(
+        &self,
+        after: u64,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.inner.tail_after_seq(after)
+    }
+    fn last_seq(&self) -> u64 {
+        self.inner.last_seq()
+    }
+    fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+        self.inner.lineage_id()
+    }
+    fn append_budget(&self) -> Option<(u64, u64, u64)> {
+        Some((
+            REFUSAL_MAX_BYTES,
+            REFUSAL_MAX_BYTES - broca_wal::size_limit::reserve_bytes(0),
+            0,
+        ))
+    }
+}
+
 impl Fixture {
+    async fn refuse_next_append(&mut self, clear_at_sync: usize) {
+        self.actor.shutdown_writer().await;
+        let writer = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
+        let handle = Arc::new(
+            WalHandle::spawn(
+                Box::new(RefusingWal {
+                    inner: self.actor.wal_store.open(&self.actor.key).unwrap(),
+                    writer: writer.clone(),
+                    sync_count: AtomicUsize::new(0),
+                    clear_at: clear_at_sync,
+                }),
+                1,
+            )
+            .unwrap(),
+        );
+        *writer.lock().unwrap() = Arc::downgrade(&handle);
+        self.actor.writer = Some(handle);
+    }
     async fn new() -> Self {
         Self::with_history(true).await
     }
@@ -176,6 +267,7 @@ impl Fixture {
             range_reads: AtomicUsize::new(0),
             tail_reads: AtomicUsize::new(0),
             tail_limit: AtomicUsize::new(0),
+            after_read: Default::default(),
         });
         let request = submission_from_config(min_config(), text_req(&key, "old").input);
         let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
@@ -357,6 +449,160 @@ impl Fixture {
         drop(self.actor.lease.take());
         std::fs::remove_dir_all(self.root).unwrap();
     }
+}
+
+#[tokio::test]
+async fn refused_queue_and_retract_leave_memory_unchanged() {
+    let mut failures = Vec::new();
+    let mut queue = Fixture::new().await;
+    queue.actor.ensure_wal_scan_loaded().await.unwrap();
+    let send_keys = queue.actor.recorded_send_keys.clone();
+    queue.refuse_next_append(1).await;
+    // Keep a real append awaiting sync so the physical barrier runs the injected
+    // terminal-clear race even though the Queued append itself will be refused.
+    queue
+        .actor
+        .writer
+        .as_ref()
+        .unwrap()
+        .record_terminal(refusal_terminal())
+        .unwrap();
+    let outcome = queue
+        .actor
+        .queue_prepared_submission(
+            RunId("refused".into()),
+            queue.request.clone(),
+            SendIdentity {
+                conversation_key: None,
+                title: None,
+                send_id: Some("refused".into()),
+                request_identity_digest: Some("digest".into()),
+            },
+            true,
+            broca_protocol::Delivery::Queue,
+            Some(pre_user::PreparedInput {
+                input: queue.request.input.clone(),
+                hooks: None,
+                refused: None,
+            }),
+        )
+        .await;
+    if outcome
+        != (SendOutcome::SessionTooLarge {
+            max_bytes: REFUSAL_MAX_BYTES,
+        })
+        || !queue.actor.pending_fifo.is_empty()
+        || queue.actor.recorded_send_keys != send_keys
+        || !queue.actor.skip_materialization_submissions.is_empty()
+    {
+        failures.push(format!(
+            "refused queue changed memory or lost its type: {outcome:?}"
+        ));
+    }
+    // A successful later barrier cannot retroactively accept the refused append.
+    queue.actor.writer.as_ref().unwrap().sync().await.unwrap();
+    assert!(!queue
+        .actor
+        .wal_store
+        .read_records(&queue.actor.key)
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f.record, WalRecord::Queued { .. })));
+    queue.close().await;
+
+    let mut retract = Fixture::new().await;
+    let id = broca_protocol::SubmissionId("sub-queued".into());
+    let queued = retract
+        .actor
+        .queue_prepared_submission(
+            RunId("queued".into()),
+            retract.request.clone(),
+            SendIdentity {
+                conversation_key: None,
+                title: None,
+                send_id: Some("queued".into()),
+                request_identity_digest: None,
+            },
+            true,
+            broca_protocol::Delivery::Queue,
+            Some(pre_user::PreparedInput {
+                input: retract.request.input.clone(),
+                hooks: None,
+                refused: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        queued,
+        SendOutcome::Pending {
+            submission_id: id.clone()
+        }
+    );
+    retract.actor.ensure_wal_scan_loaded().await.unwrap();
+    let steer = broca_core::SteerInbox::new();
+    steer.seed_ordered(vec![broca_core::delivery_order::OrderedSend {
+        submission_id: id.clone(),
+        principal: None,
+        input: retract.request.input.clone(),
+        order: broca_protocol::DeliveryOrder {
+            modes: vec![broca_protocol::DeliveryMode::Steer],
+            dedupe_key: None,
+            expires_at_ms: None,
+            template: None,
+        },
+    }]);
+    retract.actor.set_active(RunState::Active {
+        run_id: RunId("latest".into()),
+        task_run_id: RunId("latest".into()),
+        attempt_id: 1,
+        skip_materialization: false,
+        cancel: CancellationToken::new(),
+        steer: steer.clone(),
+        shutdown_seal: Default::default(),
+        progress: Arc::default(),
+        step_progress: Default::default(),
+        handle: tokio::spawn(async {}),
+        durable_finish: Arc::default(),
+    });
+    retract.refuse_next_append(1).await;
+    // The run appends after the actor captures its read head, leaving work for the
+    // retract barrier without changing the queued submission's pending fate.
+    *retract.actor.wal_store.after_read.lock().unwrap() =
+        Some(Arc::downgrade(retract.actor.writer.as_ref().unwrap()));
+    let outcome = retract.actor.on_retract(id.clone()).await;
+    if outcome
+        != (RetractOutcome::SessionTooLarge {
+            max_bytes: REFUSAL_MAX_BYTES,
+        })
+        || retract.actor.pending_fifo.len() != 1
+        || !retract.actor.skip_materialization_submissions.contains(&id)
+        || retract.actor.retracted_submissions.contains(&id)
+        || retract.actor.prior_snapshot.is_none()
+    {
+        failures.push(format!(
+            "refused retract changed memory or lost its type: {outcome:?}"
+        ));
+    }
+    let live = steer
+        .try_take_at_step_ordered(&RunId("latest".into()), 0, |_| Vec::new())
+        .unwrap();
+    if live.len() != 1 {
+        failures.push("refused retract removed its live inbox copy".into());
+    }
+    retract.actor.writer.as_ref().unwrap().sync().await.unwrap();
+    assert!(!retract
+        .actor
+        .wal_store
+        .read_records(&retract.actor.key)
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f.record, WalRecord::Retracted { .. })));
+    retract.actor.set_idle();
+    retract.close().await;
+    assert!(
+        failures.is_empty(),
+        "refused writes must not take effect: {failures:?}"
+    );
 }
 
 #[tokio::test]
