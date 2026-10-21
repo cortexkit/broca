@@ -9,6 +9,20 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "claude-code-split-message-retains-parallel-results"
+guards = "Adjacent Claude Code assistant fragments sharing an API message ID keep both real parallel tool results through durable import and replay"
+runner = "cargo"
+package = "ck-import"
+target = "--test it"
+select = "expected"
+test_file = "crates/ck-import/tests/it/claude_code_split_import.rs"
+expect_red = ["claude_code_split_import::split_claude_code_tools_import_without_synthesizing_or_dropping_results"]
+expect_message = "split response must not synthesize interruptions"
+file = "crates/ck-session-import/src/claude_code.rs"
+old = "    if role == Role::Assistant && join_previous_assistant {"
+new = "    if false && role == Role::Assistant && join_previous_assistant { // NON-VACUITY BREAK: emit each response fragment separately."
+
+[[control]]
 id = "module-status-wakes-durable-queued-work"
 guards = "A status poll wakes durable queued work left behind a terminal instead of stranding FIFO after a crash"
 runner = "cargo"
