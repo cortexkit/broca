@@ -847,22 +847,53 @@ impl RetentionService {
             .map(|stone| stone.expired_at_ms))
     }
 
-    /// Reuse the actor's already validated durable prefix instead of decoding it twice.
-    pub(crate) fn rederive_records(
+    /// Keep actor maintenance bounded; enrollment repairs longer histories under the lease.
+    pub(crate) fn sync_actor_head(
         &self,
+        reader: &dyn broca_core::WalStore,
         key: &BindIdentity,
         id: broca_wal::WalLineageId,
-        records: &[FramedRecord],
         head: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u64>, String> {
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         let path = self
             .wal
             .resolve_live_path(key)
             .map_err(|e| e.to_string())?
             .ok_or("retention WAL disappeared before projection")?;
-        let bytes = durable_prefix_bytes(&path, head)?;
-        self.project_records(key, id, records, bytes)
+        let bytes = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        if let Some(row) = self.index.live(key)?.filter(|row| {
+            row.session == *key && row.lineage_id == id.to_string() && row.wal_bytes == bytes
+        }) {
+            if durable_prefix_bytes(&path, head)? == bytes {
+                return Ok(row.expires_at_ms);
+            }
+        }
+        const TAIL_BYTES: u64 = 256 * 1024;
+        if let Some(read) = reader
+            .read_records_tail_bounded(key, TAIL_BYTES)
+            .map_err(|e| e.to_string())?
+        {
+            if let broca_wal::WalRangeRecords::Complete(records) = read.records() {
+                // Complete describes the selected suffix, not the entire lineage. Both
+                // endpoints and its identity must prove coverage of this durable prefix.
+                if read.lineage_id == Some(id)
+                    && records.first().is_some_and(|frame| frame.seq == 1)
+                    && records.last().is_some_and(|frame| frame.seq >= head)
+                {
+                    let records = &records[..records.partition_point(|frame| frame.seq <= head)];
+                    let bytes = durable_prefix_bytes(&path, head)?;
+                    self.project_records(key, id, records, bytes)?;
+                    return Ok(policy(records).and_then(|(_, _, deadline)| deadline));
+                }
+            }
+        }
+        self.remember_session(key)?;
+        // Boot enrollment detects unfinished repair after restart by comparing the live
+        // WAL's byte length with the index row, if present. The retry set deduplicates
+        // the path while the actor's lease defers enrollment repair.
+        self.enrollment.lock().unwrap().retry.insert(path);
+        Ok(None)
     }
 
     fn project_records(

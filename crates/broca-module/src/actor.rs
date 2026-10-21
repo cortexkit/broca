@@ -11240,34 +11240,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let Some(service) = self.registry.retention_service() else {
             return Ok(());
         };
-        let records = match self.read_wal_framed_records().await {
-            Ok(records) => records,
-            Err(error) => {
-                self.registry.repair_retention(&self.key);
-                self.retention_deadline = Some(service.clock.now_ms().saturating_add(1000));
-                return Err(error);
-            }
-        };
-        self.retention_deadline =
-            crate::retention::policy(&records).and_then(|(_, _, deadline)| deadline);
-        self.retention_lineage = broca_core::is_retention_lineage(&records);
-        if !self.retention_lineage {
+        self.retention_deadline = None;
+        let writer = self.writer.as_ref().expect("open writer");
+        if writer.is_retention_lineage() == Some(false) && self.admitting_retention.is_none() {
+            self.retention_lineage = false;
+            self.retention_deadline = None;
             return Ok(());
         }
-        let key = self.key.clone();
-        let writer = self.writer.as_ref().expect("open writer");
-        let head = records.last().map_or(0, |frame| frame.seq);
+        writer.sync().await.map_err(|error| error.to_string())?;
+        let head = writer.durable_head().load(Ordering::Acquire);
         let id = writer.lineage_id().ok_or("retention WAL has no identity")?;
-        let result =
-            tokio::task::spawn_blocking(move || service.rederive_records(&key, id, &records, head))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|result| result);
+        self.retention_lineage = writer.is_retention_lineage() == Some(true);
+        // Never schedule irreversible deletion from a stale summary. If a later send
+        // shortened retention, deferring until repair may expire late, but never early.
+        let key = self.key.clone();
+        let retention_wal = self.wal_store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            service.sync_actor_head(retention_wal.as_ref(), &key, id, head)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result);
         if result.is_err() {
             self.registry.repair_retention(&self.key);
             tracing::warn!(target: "retention", "content-free index write failed; repair enrolled");
         }
-        result
+        self.retention_deadline = result?;
+        Ok(())
     }
 
     async fn expire_actor(&mut self, now_ms: u64) -> bool {

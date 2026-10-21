@@ -23,6 +23,20 @@ old = "        self.warm_task.take();"
 new = "        // NON-VACUITY BREAK: retain the completed warm's move fence."
 
 [[control]]
+id = "actor-retention-sync-bounded-history"
+guards = "Actor retention sync reads only a bounded tail when the durable summary cannot prove the current head and defers full repair"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::long_retention_sync_is_bounded_and_repair_survives_restart"]
+expect_message = "retention sync must not decode full history"
+file = "crates/broca-module/src/actor.rs"
+old = "        let retention_wal = self.wal_store.clone();"
+new = "        let _ = self.read_wal_framed_records().await?; // NON-VACUITY BREAK: decode the full retention history.\n        let retention_wal = self.wal_store.clone();"
+
+[[control]]
 id = "claude-code-split-message-retains-parallel-results"
 guards = "Adjacent Claude Code assistant fragments sharing an API message ID keep both real parallel tool results through durable import and replay"
 runner = "cargo"

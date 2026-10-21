@@ -4,10 +4,13 @@ use broca_core::{FileLeaseStore, FileWalStore, LeaseStore};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 struct FaultWal {
-    inner: FileWalStore,
+    inner: Arc<FileWalStore>,
     mode: AtomicUsize,
     fail_snapshot: AtomicBool,
     snapshot_reads: AtomicUsize,
+    range_reads: AtomicUsize,
+    tail_reads: AtomicUsize,
+    tail_limit: AtomicUsize,
 }
 
 impl WalStore for FaultWal {
@@ -45,6 +48,7 @@ impl WalStore for FaultWal {
         through: Option<u64>,
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        self.range_reads.fetch_add(1, Ordering::Relaxed);
         let range = self.inner.read_records_range(key, after, through, anchor)?;
         let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
             return Ok(range);
@@ -64,6 +68,16 @@ impl WalStore for FaultWal {
             )),
             _ => Ok(range),
         }
+    }
+
+    fn read_records_tail_bounded(
+        &self,
+        key: &LineageKey,
+        bytes: u64,
+    ) -> Result<Option<broca_wal::WalRangeRead>, broca_wal::WalError> {
+        self.tail_reads.fetch_add(1, Ordering::Relaxed);
+        self.tail_limit.fetch_max(bytes as usize, Ordering::Relaxed);
+        self.inner.read_records_tail_bounded(key, bytes)
     }
 }
 
@@ -114,12 +128,38 @@ struct Fixture {
     request: SubmissionRequest,
 }
 
+fn queued_record(
+    request: SubmissionRequest,
+    id: &str,
+    retention: Option<u64>,
+    ts_ms: Option<u64>,
+) -> WalRecord {
+    WalRecord::Queued {
+        retention,
+        ts_ms,
+        hooks: None,
+        keep_warm: None,
+        conversation_key: None,
+        delivery: None,
+        send_id: Some(id.into()),
+        title: None,
+        submission_id: broca_protocol::SubmissionId(format!("sub-{id}")),
+        request: Box::new(request),
+        request_identity_digest: None,
+        principal: None,
+    }
+}
+
 impl Fixture {
     async fn new() -> Self {
         Self::with_history(true).await
     }
 
     async fn with_history(history: bool) -> Self {
+        Self::with_retention(history, false).await
+    }
+
+    async fn with_retention(history: bool, retained: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "broca-wal-proof-{}-{}",
@@ -129,21 +169,27 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let key = LineageKey::new(root.join("project"), "agent", "session");
         let wal_store = Arc::new(FaultWal {
-            inner: FileWalStore::new(root.join("wal")),
+            inner: Arc::new(FileWalStore::new(root.join("wal"))),
             mode: AtomicUsize::new(0),
             fail_snapshot: AtomicBool::new(false),
             snapshot_reads: AtomicUsize::new(0),
+            range_reads: AtomicUsize::new(0),
+            tail_reads: AtomicUsize::new(0),
+            tail_limit: AtomicUsize::new(0),
         });
         let request = submission_from_config(min_config(), text_req(&key, "old").input);
         let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
-        let mut wal = wal_store.open(&key).unwrap();
+        let mut wal = wal_store
+            .inner
+            .open_with_retention(&key, retained.then_some(3600))
+            .unwrap();
         for run in ["old", "latest"].into_iter().filter(|_| history) {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
                     tags: None,
                     session_class: None,
-                    retention: None,
+                    retention: retained.then_some(3600),
                     hooks: None,
                     title: None,
                     on_restart: None,
@@ -191,6 +237,19 @@ impl Fixture {
             idle_ttl: Duration::from_secs(60),
             executor: executor.clone(),
         }));
+        if retained {
+            let store = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+            registry.set_retention_service(Arc::new(
+                crate::retention::RetentionService::new(
+                    wal_store.inner.clone(),
+                    store.clone(),
+                    Arc::new(FileLeaseStore::new(root.join("leases"))),
+                    store,
+                    Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1)),
+                )
+                .unwrap(),
+            ));
+        }
         let (fanout, _) = crate::fanout::Fanout::new(wal_store.clone(), key.clone());
         let approvals = fanout.approval_state();
         let (self_tx, rx) = mpsc::channel(64);
@@ -297,6 +356,116 @@ impl Fixture {
         self.actor.shutdown_writer().await;
         drop(self.actor.lease.take());
         std::fs::remove_dir_all(self.root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn long_retention_sync_is_bounded_and_repair_survives_restart() {
+    let mut fixture = Fixture::with_retention(true, true).await;
+    let service = fixture.actor.registry.retention_service().unwrap();
+    let writer = fixture.actor.writer.as_ref().unwrap().clone();
+    let mut large = fixture.request.clone();
+    large.input[0].content = vec![broca_protocol::ContentBlock::Text {
+        text: "x".repeat(1_000_000),
+    }];
+    writer
+        .record(queued_record(large, "large", Some(3600), Some(1000)))
+        .into_result()
+        .unwrap();
+    writer
+        .record(queued_record(
+            fixture.request.clone(),
+            "tail",
+            Some(1),
+            Some(2000),
+        ))
+        .into_result()
+        .unwrap();
+    writer.sync().await.unwrap();
+    fixture
+        .actor
+        .wal_store
+        .range_reads
+        .store(0, Ordering::Relaxed);
+    for _ in 0..3 {
+        fixture.actor.sync_retention_index().await.unwrap();
+    }
+    assert_eq!(
+        fixture.actor.wal_store.range_reads.load(Ordering::Relaxed),
+        0,
+        "retention sync must not decode full history"
+    );
+    assert_eq!(
+        fixture.actor.wal_store.tail_reads.load(Ordering::Relaxed),
+        3
+    );
+    assert_eq!(
+        fixture.actor.wal_store.tail_limit.load(Ordering::Relaxed),
+        256 * 1024
+    );
+    assert!(fixture.actor.retention_deadline.is_none());
+    assert!(service.index.live(&fixture.actor.key).unwrap().is_none());
+    // The actor's lease defers enrollment repair; repeated syncs enqueue one retry path.
+    assert_eq!(service.enroll_changes().unwrap(), 0);
+    drop(writer);
+    fixture.actor.shutdown_writer().await;
+    drop(fixture.actor.lease.take());
+    let restarted = crate::retention::RetentionService::new(
+        service.wal.clone(),
+        service.index.clone(),
+        Arc::new(FileLeaseStore::new(fixture.root.join("leases"))),
+        Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
+        Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1)),
+    )
+    .unwrap();
+    assert_eq!(restarted.recover_enrollment().unwrap(), 1);
+    let row = service.index.live(&fixture.actor.key).unwrap().unwrap();
+    assert_eq!(row.retention_s, 1);
+    assert_eq!(row.expires_at_ms, Some(3000));
+    assert_eq!(service.enroll_changes().unwrap(), 0);
+    assert_eq!(
+        row.wal_bytes,
+        std::fs::metadata(service.wal.ephemeral_wal_path(&fixture.actor.key))
+            .unwrap()
+            .len()
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn stale_retention_summary_never_schedules_early_deletion() {
+    for seconds in [1, 7200] {
+        let mut fixture = Fixture::with_retention(true, true).await;
+        let service = fixture.actor.registry.retention_service().unwrap();
+        service.rederive(&fixture.actor.key).unwrap();
+        let old = service.index.live(&fixture.actor.key).unwrap().unwrap();
+        let writer = fixture.actor.writer.as_ref().unwrap().clone();
+        let mut large = fixture.request.clone();
+        large.input[0].content = vec![broca_protocol::ContentBlock::Text {
+            text: "x".repeat(1_000_000),
+        }];
+        writer
+            .record(queued_record(large, "large", Some(seconds), Some(2000)))
+            .into_result()
+            .unwrap();
+        writer.sync().await.unwrap();
+        fixture.actor.retention_deadline = old.expires_at_ms;
+        fixture.actor.sync_retention_index().await.unwrap();
+        assert!(
+            fixture.actor.retention_deadline.is_none(),
+            "stale summary must not schedule deletion"
+        );
+        assert_eq!(
+            service.index.live(&fixture.actor.key).unwrap().unwrap(),
+            old
+        );
+        drop(writer);
+        fixture.actor.shutdown_writer().await;
+        drop(fixture.actor.lease.take());
+        assert_eq!(service.enroll_changes().unwrap(), 1);
+        let repaired = service.index.live(&fixture.actor.key).unwrap().unwrap();
+        assert_eq!(repaired.expires_at_ms, Some(2000 + seconds * 1000));
+        fixture.close().await;
     }
 }
 
