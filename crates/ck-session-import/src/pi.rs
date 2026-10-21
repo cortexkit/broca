@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Error as IoError, ErrorKind};
+use std::io::{BufReader, Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -24,7 +24,8 @@ use broca_protocol::{
 use serde_json::Value;
 
 use crate::{
-    finalize_import, omit_nested_tool_images, HarnessReader, ImportedSession, SessionSummary,
+    check_session_source_size, finalize_import, omit_nested_tool_images, read_bounded_jsonl_line,
+    truncate_session_title, HarnessReader, ImportedSession, SessionSummary,
 };
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -58,11 +59,7 @@ impl PiReader {
         self.discover_with_loader(selected_id, LoadedSession::load)
     }
 
-    fn discover_with_loader(
-        &self,
-        selected_id: Option<&str>,
-        mut load: impl FnMut(PathBuf) -> ReaderResult<LoadedSession>,
-    ) -> ReaderResult<Vec<LoadedSession>> {
+    fn session_paths(&self) -> ReaderResult<Vec<PathBuf>> {
         let mut paths = Vec::new();
         for directory in std::fs::read_dir(&self.root)? {
             let directory = directory?;
@@ -80,7 +77,15 @@ impl PiReader {
             }
         }
         paths.sort();
+        Ok(paths)
+    }
 
+    fn discover_with_loader(
+        &self,
+        selected_id: Option<&str>,
+        mut load: impl FnMut(PathBuf) -> ReaderResult<LoadedSession>,
+    ) -> ReaderResult<Vec<LoadedSession>> {
+        let paths = self.session_paths()?;
         let mut sessions: HashMap<String, LoadedSession> = HashMap::new();
         for path in paths {
             // A session header is mandatory in `load`, so a missing or different header cannot
@@ -133,28 +138,73 @@ impl HarnessReader for PiReader {
     }
 
     fn enumerate(&self) -> ReaderResult<Vec<SessionSummary>> {
-        let mut sessions = self.discover(None)?;
-        sessions.sort_by(|left, right| {
-            right
-                .timestamp
-                .cmp(&left.timestamp)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        sessions
-            .into_iter()
-            .map(|session| {
-                let path = session.selected_path()?;
-                let title = first_user_text(&path);
-                let message_count = path.iter().filter(|node| node.kind == "message").count();
-                Ok(SessionSummary {
-                    id: session.id,
+        let mut newest = HashMap::<String, (SystemTime, u64, PathBuf)>::new();
+        for path in self.session_paths()? {
+            let session = match LoadedSession::load(path.clone()) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!(
+                        "WARNING: skipped unreadable Pi session {} during enumeration: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let key = (session.modified, session.size, session.path.clone());
+            let replace = newest
+                .get(&session.id)
+                .is_none_or(|current| key.cmp(current).is_gt());
+            if replace {
+                newest.insert(session.id, key);
+            }
+        }
+
+        // Retain only the winning paths between passes; each parsed session drops before the
+        // next file is opened, so enumeration does not hold every source transcript in memory.
+        let mut summaries = Vec::with_capacity(newest.len());
+        for (id, (_, _, path)) in newest {
+            let session = match LoadedSession::load(path.clone()) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!(
+                        "WARNING: skipped unreadable Pi session {} during enumeration: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let selected = match session.selected_path() {
+                Ok(selected) => selected,
+                Err(error) => {
+                    eprintln!(
+                        "WARNING: skipped malformed Pi parent tree for session '{}': {error}",
+                        session.id
+                    );
+                    continue;
+                }
+            };
+            let title = first_user_text(&selected).map(truncate_session_title);
+            let message_count = selected
+                .iter()
+                .filter(|node| node.kind == "message")
+                .count();
+            summaries.push((
+                session.timestamp.clone(),
+                SessionSummary {
+                    id,
                     title,
                     cwd: nonempty(session.cwd),
                     message_count,
-                    approximate_size_bytes: session.size,
-                })
-            })
-            .collect()
+                    approximate_size_bytes: Some(session.size),
+                },
+            ));
+        }
+        summaries.sort_by(|(left_timestamp, left), (right_timestamp, right)| {
+            right_timestamp
+                .cmp(left_timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(summaries.into_iter().map(|(_, summary)| summary).collect())
     }
 
     fn convert(&self, session_id: &str) -> ReaderResult<ImportedSession> {
@@ -278,6 +328,14 @@ impl HarnessReader for PiReader {
 
         finalize_import(messages, format!("pi:{}", session.id), warnings, "pi")
     }
+
+    fn session_cwd(&self, session_id: &str) -> ReaderResult<Option<String>> {
+        Ok(self
+            .discover(Some(session_id))?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| nonempty(session.cwd)))
+    }
 }
 
 #[derive(Debug)]
@@ -294,9 +352,11 @@ struct LoadedSession {
 impl LoadedSession {
     fn header_id(path: &Path) -> Option<String> {
         let file = File::open(path).ok()?;
-        for line in BufReader::new(file).lines() {
-            let line = line.ok()?;
-            let value: Value = serde_json::from_str(&line).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut bytes_read = 0;
+        while read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).ok()? {
+            let value: Value = serde_json::from_slice(&line).ok()?;
             if value.get("type").and_then(Value::as_str) == Some("session") {
                 return value.get("id").and_then(Value::as_str).map(str::to_owned);
             }
@@ -305,24 +365,30 @@ impl LoadedSession {
     }
 
     fn load(path: PathBuf) -> ReaderResult<Self> {
+        let size = check_session_source_size(&path)?;
         let metadata = std::fs::metadata(&path)?;
         let file = File::open(&path)?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut bytes_read = 0;
         let mut header: Option<(String, String, String)> = None;
         let mut nodes = Vec::new();
         let mut ids = HashSet::new();
+        let mut index = 0;
 
-        for (index, line) in BufReader::new(file).lines().enumerate() {
+        while read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).map_err(|error| {
+            invalid_data(format!(
+                "read Pi session {} line {}: {error}",
+                path.display(),
+                index + 1
+            ))
+        })? {
             let line_number = index + 1;
-            let line = line.map_err(|error| {
-                invalid_data(format!(
-                    "read Pi session {} line {line_number}: {error}",
-                    path.display()
-                ))
-            })?;
-            if line.trim().is_empty() {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                index += 1;
                 continue;
             }
-            let value: Value = serde_json::from_str(&line).map_err(|error| {
+            let value: Value = serde_json::from_slice(&line).map_err(|error| {
                 invalid_data(format!(
                     "decode Pi session {} line {line_number}: {error}",
                     path.display()
@@ -345,9 +411,11 @@ impl LoadedSession {
                     .unwrap_or_default()
                     .to_string();
                 header = Some((id, timestamp, cwd));
+                index += 1;
                 continue;
             }
             let Some(id) = value.get("id").and_then(Value::as_str) else {
+                index += 1;
                 continue;
             };
             if !ids.insert(id.to_string()) {
@@ -367,6 +435,7 @@ impl LoadedSession {
                 value,
                 order: line_number,
             });
+            index += 1;
         }
 
         let (id, timestamp, cwd) = header.ok_or_else(|| {
@@ -381,7 +450,7 @@ impl LoadedSession {
             timestamp,
             cwd,
             nodes,
-            size: metadata.len(),
+            size,
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         })
     }
@@ -774,8 +843,17 @@ mod tests {
             Some("Inspect the scrubbed fixture.")
         );
         assert_eq!(sessions[0].cwd.as_deref(), Some("/tmp/scrubbed-project"));
+        assert_eq!(
+            fixture()
+                .session_cwd("00000000-0000-4000-8000-000000000001")
+                .unwrap()
+                .as_deref(),
+            Some("/tmp/scrubbed-project")
+        );
         assert_eq!(sessions[0].message_count, 5);
-        assert!(sessions[0].approximate_size_bytes > 0);
+        assert!(sessions[0]
+            .approximate_size_bytes
+            .is_some_and(|size| size > 0));
     }
 
     #[test]
@@ -1059,6 +1137,69 @@ mod tests {
         assert_eq!(reader.convert(&sessions[0].id).unwrap().messages.len(), 2);
         assert!(reader.convert("pi-torn").is_err());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_parent_tree_is_skipped_from_enumeration_but_selected_import_fails() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("ck-pi-parent-tree-{}", std::process::id()));
+        let project = root.join("project");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&project).unwrap();
+        write_pi_session(&project.join("valid.jsonl"), "valid", "usable", 1);
+        fs::write(
+            project.join("malformed.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"id\":\"malformed\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"cwd\":\"/tmp/pi\"}\n",
+                "{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":\"missing\",\"message\":{\"role\":\"user\",\"content\":\"unreachable parent\"}}\n"
+            ),
+        )
+        .unwrap();
+        let reader = PiReader::new(&root);
+
+        let summaries = reader.enumerate().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "valid");
+        assert!(reader.convert("valid").is_ok());
+        assert!(reader.convert("malformed").is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_pi_session_rejects_an_oversized_jsonl_record() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("ck-pi-line-cap-{}", std::process::id()));
+        let project = root.join("project");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&project).unwrap();
+        let rows = [
+            serde_json::json!({
+                "type": "session",
+                "id": "large",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "cwd": "/tmp/project"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "large-message",
+                "parentId": null,
+                "message": {"role": "user", "content": "x".repeat(crate::MAX_JSONL_LINE_BYTES)}
+            }),
+        ];
+        fs::write(
+            project.join("large.jsonl"),
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let error = PiReader::new(&root).convert("large").unwrap_err();
+
+        assert!(error.to_string().contains("line limit"));
         let _ = fs::remove_dir_all(root);
     }
 

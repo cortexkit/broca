@@ -20,7 +20,8 @@ use serde_json::Value;
 use crate::{
     build_coordinate_map, finalize_import,
     sqlite_read::{open_read_only_database, ReadOnlyDatabase},
-    HarnessReader, ImportedSession, OriginMessageCoordinate, SessionSummary,
+    truncate_session_title, HarnessReader, ImportedSession, OriginMessageCoordinate,
+    SessionSummary,
 };
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -109,10 +110,7 @@ impl HarnessReader for OpenCodeReader {
         }
         let mut statement = connection
             .prepare(
-                "SELECT s.id, s.title, s.directory, COUNT(DISTINCT m.id), \
-                 COALESCE(SUM(LENGTH(CAST(m.data AS BLOB))), 0) + COALESCE(( \
-                   SELECT SUM(LENGTH(CAST(p.data AS BLOB))) FROM part p WHERE p.session_id = s.id \
-                 ), 0) \
+                "SELECT s.id, s.title, s.directory, COUNT(DISTINCT m.id) \
                  FROM session s LEFT JOIN message m ON m.session_id = s.id \
                  GROUP BY s.id, s.title, s.directory, s.time_updated \
                  ORDER BY s.time_updated DESC, s.id",
@@ -123,13 +121,12 @@ impl HarnessReader for OpenCodeReader {
                 let title: String = row.get(1)?;
                 let directory: String = row.get(2)?;
                 let count: i64 = row.get(3)?;
-                let size: i64 = row.get(4)?;
                 Ok(SessionSummary {
                     id: row.get(0)?,
-                    title: nonempty(title),
+                    title: nonempty(title).map(truncate_session_title),
                     cwd: nonempty(directory),
                     message_count: usize::try_from(count.max(0)).unwrap_or(usize::MAX),
-                    approximate_size_bytes: u64::try_from(size.max(0)).unwrap_or(u64::MAX),
+                    approximate_size_bytes: None,
                 })
             })
             .map_err(|error| sqlite_snapshot_error("enumerate sessions", error))?;
@@ -165,6 +162,19 @@ impl HarnessReader for OpenCodeReader {
         let source_rows = load_messages(&connection, session_id)?;
         let parts_by_message = load_parts(&connection, session_id)?;
         convert_rows(source_rows, parts_by_message, fallback_warning, session_id)
+    }
+
+    fn session_cwd(&self, session_id: &str) -> ReaderResult<Option<String>> {
+        let ReadOnlyDatabase { connection, .. } = self.open()?;
+        let directory = connection
+            .query_row(
+                "SELECT directory FROM session WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| sqlite_snapshot_error("look up selected session cwd", error))?;
+        Ok(directory.and_then(nonempty))
     }
 }
 
@@ -1121,8 +1131,12 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, "ses-tools");
         assert_eq!(sessions[0].cwd.as_deref(), Some("/tmp/scrubbed-project"));
+        assert_eq!(
+            fixture().session_cwd("ses-tools").unwrap().as_deref(),
+            Some("/tmp/scrubbed-project")
+        );
         assert_eq!(sessions[0].message_count, 3);
-        assert!(sessions[0].approximate_size_bytes > 0);
+        assert!(sessions[0].approximate_size_bytes.is_none());
     }
 
     #[test]
@@ -1308,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_size_estimate_counts_utf8_bytes() {
+    fn sqlite_size_estimate_is_deferred_until_import() {
         let path = broca_test_support::scratch_root()
             .join(format!("ck-opencode-bytes-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
@@ -1332,10 +1346,7 @@ mod tests {
         drop(connection);
 
         let summary = OpenCodeReader::new(&path).enumerate().unwrap().remove(0);
-        assert_eq!(
-            summary.approximate_size_bytes,
-            "é".len() as u64 + "🙂".len() as u64
-        );
+        assert_eq!(summary.approximate_size_bytes, None);
 
         let _ = fs::remove_file(path);
     }

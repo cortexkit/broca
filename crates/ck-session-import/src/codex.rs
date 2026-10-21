@@ -12,7 +12,7 @@
 use std::cell::Cell;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Error as IoError, ErrorKind};
+use std::io::{BufReader, Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use broca_protocol::{
@@ -20,7 +20,10 @@ use broca_protocol::{
 };
 use serde_json::Value;
 
-use crate::{finalize_import, HarnessReader, ImportedSession, SessionSummary};
+use crate::{
+    check_session_source_size, finalize_import, read_bounded_jsonl_line, truncate_session_title,
+    HarnessReader, ImportedSession, SessionSummary,
+};
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -124,7 +127,7 @@ impl HarnessReader for CodexReader {
                 title: metadata.title,
                 cwd: metadata.cwd,
                 message_count: metadata.response_item_count,
-                approximate_size_bytes: fs::metadata(path)?.len(),
+                approximate_size_bytes: Some(fs::metadata(path)?.len()),
             });
         }
         Ok(sessions)
@@ -133,6 +136,11 @@ impl HarnessReader for CodexReader {
     fn convert(&self, session_id: &str) -> ReaderResult<ImportedSession> {
         let path = self.find_session(session_id)?;
         convert_rollout(&path, session_id)
+    }
+
+    fn session_cwd(&self, session_id: &str) -> ReaderResult<Option<String>> {
+        let path = self.find_session(session_id)?;
+        Ok(inspect_rollout(&path)?.cwd)
     }
 }
 
@@ -272,26 +280,56 @@ fn collect_rollout_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> ReaderRe
 
 fn probe_rollout_id(path: &Path) -> ReaderResult<Option<String>> {
     let file = File::open(path)?;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let row = decode_rollout_row(path, index, &line?)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut bytes_read = 0;
+    let mut index = 0;
+    while read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            format!(
+                "read Codex rollout {} line {}: {error}",
+                path.display(),
+                index + 1
+            ),
+        )
+    })? {
+        let row = decode_rollout_row(path, index, &line)?;
         if string_field(&row, "type") == Some("session_meta") {
             return Ok(row
                 .get("payload")
                 .and_then(|payload| string_field(payload, "id"))
                 .map(str::to_owned));
         }
+        index += 1;
     }
     Ok(None)
 }
 
 fn inspect_rollout(path: &Path) -> ReaderResult<RolloutMetadata> {
-    let rows = read_rows(path)?;
+    check_session_source_size(path)?;
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut bytes_read = 0;
+    let mut line_index = 0;
     let mut id = None;
     let mut cwd = None;
     let mut title = None;
     let mut response_item_count = 0usize;
 
-    for row in rows {
+    while read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            format!(
+                "read Codex rollout {} line {}: {error}",
+                path.display(),
+                line_index + 1
+            ),
+        )
+    })? {
+        let row = decode_rollout_row(path, line_index, &line)?;
+        line_index += 1;
         let row_type = string_field(&row, "type").unwrap_or("");
         let payload = row.get("payload").unwrap_or(&Value::Null);
         if row_type == "session_meta" && id.is_none() {
@@ -305,7 +343,7 @@ fn inspect_rollout(path: &Path) -> ReaderResult<RolloutMetadata> {
                 && string_field(payload, "type") == Some("message")
                 && string_field(payload, "role") == Some("user")
             {
-                title = first_text(payload, "input_text");
+                title = first_text(payload, "input_text").map(truncate_session_title);
             }
         }
     }
@@ -328,16 +366,31 @@ fn read_rows(path: &Path) -> ReaderResult<Vec<Value>> {
     #[cfg(test)]
     FULL_PARSE_COUNT.with(|count| count.set(count.get() + 1));
 
+    check_session_source_size(path)?;
     let file = File::open(path)?;
-    BufReader::new(file)
-        .lines()
-        .enumerate()
-        .map(|(index, line)| decode_rollout_row(path, index, &line?))
-        .collect()
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut bytes_read = 0;
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            format!(
+                "read Codex rollout {} line {}: {error}",
+                path.display(),
+                index + 1
+            ),
+        )
+    })? {
+        rows.push(decode_rollout_row(path, index, &line)?);
+        index += 1;
+    }
+    Ok(rows)
 }
 
-fn decode_rollout_row(path: &Path, index: usize, line: &str) -> ReaderResult<Value> {
-    serde_json::from_str(line).map_err(|error| {
+fn decode_rollout_row(path: &Path, index: usize, line: &[u8]) -> ReaderResult<Value> {
+    serde_json::from_slice(line).map_err(|error| {
         IoError::new(
             ErrorKind::InvalidData,
             format!(
@@ -664,8 +717,24 @@ mod tests {
             Some("Inspect the scrubbed file.")
         );
         assert_eq!(sessions[1].cwd.as_deref(), Some("/tmp/scrubbed-project"));
+        assert_eq!(
+            fixture().session_cwd("codex-tools").unwrap().as_deref(),
+            Some("/tmp/scrubbed-project")
+        );
         assert_eq!(sessions[1].message_count, 9);
-        assert!(sessions[1].approximate_size_bytes > 0);
+        assert!(sessions[1]
+            .approximate_size_bytes
+            .is_some_and(|size| size > 0));
+    }
+
+    #[test]
+    fn enumeration_streams_rollouts_without_collecting_full_rows() {
+        let _ = take_full_parse_count();
+
+        let sessions = fixture().enumerate().unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(take_full_parse_count(), 0);
     }
 
     #[test]
@@ -797,6 +866,31 @@ mod tests {
         assert!(!transcript.contains("OLD_CONTEXT_MUST_NOT_SURVIVE"));
         assert!(transcript.contains("LEGACY_COMPACTION_SUMMARY"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_codex_rollout_rejects_an_oversized_jsonl_record() {
+        let root = temp_root("line-cap");
+        let path = root.join("2026/01/01/rollout-large.jsonl");
+        let header = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": "large", "cwd": "/tmp/project"}
+        });
+        let oversized = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "x".repeat(crate::MAX_JSONL_LINE_BYTES)}]
+            }
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{}\n{}\n", header, oversized)).unwrap();
+
+        let error = CodexReader::new(&root).convert("large").unwrap_err();
+
+        assert!(error.to_string().contains("line limit"));
         let _ = fs::remove_dir_all(root);
     }
 

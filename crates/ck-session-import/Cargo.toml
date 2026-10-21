@@ -11,6 +11,7 @@ description = "Foreign harness session readers that convert transcripts to broca
 broca-protocol = { path = "../broca-protocol" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

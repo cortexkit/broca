@@ -136,6 +136,7 @@ fn goose_json_list_uses_registered_reader() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(events[0]["id"], "goose-tools");
+    assert!(events[0]["approximate_size_bytes"].is_null());
     assert_eq!(events.last().unwrap()["event"], "done");
 }
 

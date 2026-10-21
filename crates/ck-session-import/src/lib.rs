@@ -9,7 +9,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 use broca_protocol::{ContentBlock, Message, Role, ToolCallId};
 use serde_json::Value;
@@ -21,6 +22,89 @@ pub mod opencode;
 pub mod pi;
 
 mod sqlite_read;
+
+pub(crate) const MAX_SESSION_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SESSION_TITLE_CHARS: usize = 80;
+
+pub(crate) fn truncate_session_title(title: String) -> String {
+    if title.chars().count() <= MAX_SESSION_TITLE_CHARS {
+        return title;
+    }
+    let mut truncated = title
+        .chars()
+        .take(MAX_SESSION_TITLE_CHARS - 1)
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+/// Refuse oversized JSONL sources before retaining their parsed rows.
+pub(crate) fn check_session_source_size(path: &Path) -> io::Result<u64> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_SESSION_SOURCE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source session {} is {size} bytes; the import reader limit is {} bytes",
+                path.display(),
+                MAX_SESSION_SOURCE_BYTES
+            ),
+        ));
+    }
+    Ok(size)
+}
+
+/// Read one JSONL record without allowing an unbounded line or source to grow the buffer.
+pub(crate) fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    bytes_read: &mut u64,
+) -> io::Result<bool> {
+    line.clear();
+    let mut read_any = false;
+    loop {
+        let (count, ended_line) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(read_any);
+            }
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("JSONL record exceeds the {MAX_JSONL_LINE_BYTES}-byte line limit"),
+                ));
+            }
+            if bytes_read.saturating_add(count as u64) > MAX_SESSION_SOURCE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source session exceeds the {MAX_SESSION_SOURCE_BYTES}-byte import reader limit"
+                    ),
+                ));
+            }
+            line.extend_from_slice(&available[..count]);
+            (count, available[count - 1] == b'\n')
+        };
+        reader.consume(count);
+        *bytes_read += count as u64;
+        read_any = true;
+        if ended_line {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
+    Ok(true)
+}
 
 /// Replace image blocks nested in imported tool output before it reaches a model prompt.
 ///
@@ -60,7 +144,8 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub cwd: Option<String>,
     pub message_count: usize,
-    pub approximate_size_bytes: u64,
+    /// `None` when obtaining a size would require scanning stored session payloads.
+    pub approximate_size_bytes: Option<u64>,
 }
 
 /// One surviving imported block used to translate a source transcript coordinate.
@@ -176,6 +261,16 @@ pub trait HarnessReader {
     fn harness(&self) -> &'static str;
     fn enumerate(&self) -> Result<Vec<SessionSummary>, Box<dyn Error + Send + Sync>>;
     fn convert(&self, session_id: &str) -> Result<ImportedSession, Box<dyn Error + Send + Sync>>;
+    /// Return the selected session's project directory without listing every session.
+    ///
+    /// Readers that do not store a directory may return `None`; callers then use their own
+    /// current directory. Implementations should keep this lookup scoped to `session_id`.
+    fn session_cwd(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn finalize_import(
@@ -615,15 +710,60 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Cursor;
+
     use broca_protocol::{
         ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
     };
 
     use super::{
-        build_coordinate_map, estimate_from_metrics, estimate_tokens, finalize_import,
-        measure_serialized_messages, normalize_for_session_import, normalize_tool_blocks_and_ids,
-        NoImportableContentError, OriginMessageCoordinate,
+        build_coordinate_map, check_session_source_size, estimate_from_metrics, estimate_tokens,
+        finalize_import, measure_serialized_messages, normalize_for_session_import,
+        normalize_tool_blocks_and_ids, read_bounded_jsonl_line, NoImportableContentError,
+        OriginMessageCoordinate, MAX_JSONL_LINE_BYTES, MAX_SESSION_SOURCE_BYTES,
     };
+
+    #[test]
+    fn jsonl_reader_rejects_oversized_records_before_buffering_them() {
+        let bytes = vec![b'x'; MAX_JSONL_LINE_BYTES + 1];
+        let mut reader = Cursor::new(bytes);
+        let mut line = Vec::new();
+        let mut bytes_read = 0;
+
+        let error = read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).unwrap_err();
+
+        assert!(error.to_string().contains("line limit"));
+        assert!(line.len() <= MAX_JSONL_LINE_BYTES);
+        assert!(bytes_read <= MAX_JSONL_LINE_BYTES as u64);
+    }
+
+    #[test]
+    fn jsonl_reader_refuses_bytes_after_the_source_limit() {
+        let mut reader = Cursor::new(b"x".to_vec());
+        let mut line = Vec::new();
+        let mut bytes_read = MAX_SESSION_SOURCE_BYTES;
+
+        let error = read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).unwrap_err();
+
+        assert!(error.to_string().contains("source session exceeds"));
+        assert!(line.is_empty());
+        assert_eq!(bytes_read, MAX_SESSION_SOURCE_BYTES);
+    }
+
+    #[test]
+    fn session_source_size_is_rejected_before_reading_contents() {
+        let path = broca_test_support::scratch_root()
+            .join(format!("ck-import-source-cap-{}.jsonl", std::process::id()));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_SOURCE_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = check_session_source_size(&path).unwrap_err();
+
+        assert!(error.to_string().contains("import reader limit"));
+        let _ = std::fs::remove_file(path);
+    }
 
     fn tool_call(id: &str, name: &str) -> ContentBlock {
         ContentBlock::ToolCall(ToolCall {

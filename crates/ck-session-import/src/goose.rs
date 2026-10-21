@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::{
     finalize_import, omit_nested_tool_images,
     sqlite_read::{open_read_only_database, ReadOnlyDatabase},
-    HarnessReader, ImportedSession, SessionSummary,
+    truncate_session_title, HarnessReader, ImportedSession, SessionSummary,
 };
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -79,8 +79,7 @@ impl HarnessReader for GooseReader {
             eprintln!("{warning}");
         }
         let mut statement = connection.prepare(
-            "SELECT s.id, s.name, s.working_dir, COUNT(m.id), \
-             COALESCE(SUM(LENGTH(CAST(m.content_json AS BLOB)) + COALESCE(LENGTH(CAST(m.metadata_json AS BLOB)), 0)), 0) \
+            "SELECT s.id, s.name, s.working_dir, COUNT(m.id) \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
              GROUP BY s.id, s.name, s.working_dir, s.updated_at \
              ORDER BY s.updated_at DESC, s.id",
@@ -89,13 +88,12 @@ impl HarnessReader for GooseReader {
             let title: String = row.get(1)?;
             let directory: String = row.get(2)?;
             let count: i64 = row.get(3)?;
-            let size: i64 = row.get(4)?;
             Ok(SessionSummary {
                 id: row.get(0)?,
-                title: nonempty(title),
+                title: nonempty(title).map(truncate_session_title),
                 cwd: nonempty(directory),
                 message_count: usize::try_from(count.max(0)).unwrap_or(usize::MAX),
-                approximate_size_bytes: u64::try_from(size.max(0)).unwrap_or(u64::MAX),
+                approximate_size_bytes: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -263,6 +261,18 @@ impl HarnessReader for GooseReader {
         }
 
         finalize_import(messages, format!("goose:{session_id}"), warnings, "goose")
+    }
+
+    fn session_cwd(&self, session_id: &str) -> ReaderResult<Option<String>> {
+        let ReadOnlyDatabase { connection, .. } = self.open()?;
+        let directory = connection
+            .query_row(
+                "SELECT working_dir FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(directory.and_then(nonempty))
     }
 }
 
@@ -508,12 +518,16 @@ mod tests {
         assert_eq!(sessions[0].id, "goose-tools");
         assert_eq!(sessions[0].title.as_deref(), Some("Tool fixture"));
         assert_eq!(sessions[0].cwd.as_deref(), Some("/tmp/scrubbed-goose"));
+        assert_eq!(
+            fixture().session_cwd("goose-tools").unwrap().as_deref(),
+            Some("/tmp/scrubbed-goose")
+        );
         assert_eq!(sessions[0].message_count, 5);
-        assert!(sessions[0].approximate_size_bytes > 0);
+        assert!(sessions[0].approximate_size_bytes.is_none());
     }
 
     #[test]
-    fn sqlite_size_estimate_counts_utf8_bytes() {
+    fn sqlite_size_estimate_is_deferred_until_import() {
         let path = broca_test_support::scratch_root()
             .join(format!("ck-goose-bytes-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
@@ -529,10 +543,7 @@ mod tests {
         drop(connection);
 
         let summary = GooseReader::new(&path).enumerate().unwrap().remove(0);
-        assert_eq!(
-            summary.approximate_size_bytes,
-            "é".len() as u64 + "🙂".len() as u64
-        );
+        assert_eq!(summary.approximate_size_bytes, None);
 
         let _ = fs::remove_file(path);
     }
