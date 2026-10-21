@@ -357,7 +357,7 @@ impl AssistantMessage {
 }
 
 /// Unified finish reason, normalized from the provider's raw reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -368,9 +368,37 @@ pub enum FinishReason {
     Other,
 }
 
+impl<'de> Deserialize<'de> for FinishReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "stop" => Self::Stop,
+            "length" => Self::Length,
+            "tool_calls" => Self::ToolCalls,
+            "content_filter" => Self::ContentFilter,
+            "error" => Self::Error,
+            "other" => Self::Other,
+            _ => Self::Other,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_provider_finish_reason_uses_the_other_fallback() {
+        let reason: FinishReason = serde_json::from_str("\"future_reason\"").unwrap();
+        assert_eq!(reason, FinishReason::Other);
+        assert_eq!(
+            serde_json::to_string(&FinishReason::Other).unwrap(),
+            "\"other\""
+        );
+    }
 
     fn text_message(role: Role, text: &str) -> Message {
         Message::new(

@@ -66,6 +66,58 @@ impl ErrorClass {
     }
 }
 
+/// A caller-facing error class kept as a wire string so newer producer vocabularies remain
+/// readable without widening the runner's closed producer enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpenErrorClass(String);
+
+impl OpenErrorClass {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn from_wire(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<ErrorClass> for OpenErrorClass {
+    fn from(class: ErrorClass) -> Self {
+        let wire = match class.shared_class() {
+            ErrorClass::Transient => "transient",
+            ErrorClass::Permanent => "permanent",
+            ErrorClass::Auth => "auth_required",
+            ErrorClass::ContextOverflow => "context_overflow",
+            ErrorClass::ProviderUnavailable => unreachable!("shared_class maps local classes"),
+        };
+        Self(wire.to_string())
+    }
+}
+
+#[cfg(test)]
+mod open_error_class_tests {
+    use super::{ErrorClass, OpenErrorClass};
+
+    #[test]
+    fn producer_classes_map_to_the_closed_shared_vocabulary() {
+        assert_eq!(
+            OpenErrorClass::from(ErrorClass::ProviderUnavailable).as_str(),
+            "transient"
+        );
+        assert_eq!(
+            OpenErrorClass::from(ErrorClass::Auth).as_str(),
+            "auth_required"
+        );
+    }
+
+    #[test]
+    fn caller_error_class_keeps_an_unrecognized_string() {
+        let class: OpenErrorClass = serde_json::from_str("\"future_class\"").unwrap();
+        assert_eq!(class.as_str(), "future_class");
+    }
+}
+
 impl ErrorClass {
     /// Whether the transport may re-issue the model step for this class (the model
     /// leg writes no WAL record, so re-running it is safe).

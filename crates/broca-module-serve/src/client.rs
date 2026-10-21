@@ -133,6 +133,24 @@ fn decode_result_envelope<T: serde::de::DeserializeOwned>(
     }
 }
 
+fn send_outcome(result: SendResult) -> Result<SendOutcome, ConnError> {
+    match result {
+        SendResult::Finished { run_id, reason } => Ok(SendOutcome::Finished { run_id, reason }),
+        SendResult::Paused {
+            run_id,
+            pause_reason,
+        } => Ok(SendOutcome::Paused {
+            run_id,
+            pause_reason,
+        }),
+        SendResult::Active { run_id } => Ok(SendOutcome::Active { run_id }),
+        SendResult::Pending { submission_id } => Ok(SendOutcome::Pending { submission_id }),
+        SendResult::Unknown => Err(ConnError::Protocol(
+            "session.send returned an unrecognized runner state".into(),
+        )),
+    }
+}
+
 impl SessionClient {
     /// Open a management-surface route to `module_id` for `session` (the inverse of the
     /// serve loop's route.bind). Subsequent ops ride the returned route channel.
@@ -195,18 +213,7 @@ impl SessionClient {
         let result: SendResult = self
             .request("session.send", &params, "decode send result")
             .await?;
-        Ok(match result {
-            SendResult::Finished { run_id, reason } => SendOutcome::Finished { run_id, reason },
-            SendResult::Paused {
-                run_id,
-                pause_reason,
-            } => SendOutcome::Paused {
-                run_id,
-                pause_reason,
-            },
-            SendResult::Active { run_id } => SendOutcome::Active { run_id },
-            SendResult::Pending { submission_id } => SendOutcome::Pending { submission_id },
-        })
+        send_outcome(result)
     }
 
     /// `session.import`: seed canonical history as one completed provider-free episode.
@@ -533,6 +540,27 @@ mod tests {
         let legacy: T = legacy_decode_result(&body, error_context).unwrap();
         assert_eq!(typed, legacy);
         assert_eq!(&typed, result);
+    }
+
+    #[test]
+    fn typed_client_decoder_accepts_an_unknown_run_status_state() {
+        let body = br#"{"result":{"state":"future_runner_state","extra":"future field"}}"#;
+        let status: RunStatusResponse = decode_result_envelope(body, "decode run status").unwrap();
+        assert!(matches!(status, RunStatusResponse::Unknown));
+    }
+
+    #[test]
+    fn unknown_send_state_uses_an_explicit_protocol_fallback() {
+        let body = br#"{"result":{"state":"future_send_state"}}"#;
+        let result: SendResult = decode_result_envelope(body, "decode send result").unwrap();
+
+        assert!(matches!(result, SendResult::Unknown));
+        match send_outcome(result) {
+            Err(ConnError::Protocol(message)) => {
+                assert!(message.contains("unrecognized runner state"));
+            }
+            other => panic!("unknown send state must remain non-actionable: {other:?}"),
+        }
     }
 
     #[test]

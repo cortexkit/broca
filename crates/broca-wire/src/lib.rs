@@ -38,6 +38,24 @@ pub fn serialized_result_frame_bytes(result: &impl Serialize) -> u64 {
         .saturating_add(SUBC_FRAME_HEADER_BYTES)
 }
 
+fn deserialize_caller_pause_reason<'de, D>(
+    deserializer: D,
+) -> Result<broca_protocol::PauseReason, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    broca_protocol::caller::deserialize_caller_pause_reason(deserializer)
+}
+
+fn deserialize_optional_caller_pause_reason<'de, D>(
+    deserializer: D,
+) -> Result<Option<broca_protocol::PauseReason>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    broca_protocol::caller::deserialize_optional_caller_pause_reason(deserializer)
+}
+
 /// A route request: the method name plus its operation-specific params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteRequest {
@@ -993,6 +1011,7 @@ pub enum FromWire {
 pub enum SendResult {
     Paused {
         run_id: String,
+        #[serde(deserialize_with = "deserialize_caller_pause_reason")]
         pause_reason: broca_protocol::PauseReason,
     },
     Active {
@@ -1005,6 +1024,9 @@ pub enum SendResult {
     Pending {
         submission_id: String,
     },
+    /// A newer runner state this client does not interpret; callers keep it non-actionable.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
@@ -1021,15 +1043,71 @@ fn serialize_caller_message<S: serde::Serializer>(
     {
         return message.serialize(serializer);
     }
-    let mut caller = message.clone();
-    for block in &mut caller.content {
-        if let ContentBlock::TextWithState { text, .. } = block {
-            *block = ContentBlock::Text {
-                text: std::mem::take(text),
-            };
+    CallerMessageRef(message).serialize(serializer)
+}
+
+struct CallerMessageRef<'a>(&'a broca_protocol::Message);
+
+impl serde::Serialize for CallerMessageRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut fields = 2;
+        fields += usize::from(self.0.cache_prefix_blocks.is_some());
+        fields += usize::from(self.0.origin.is_some());
+        let mut state = serializer.serialize_struct("Message", fields)?;
+        state.serialize_field("role", &self.0.role)?;
+        state.serialize_field("content", &CallerContentRef(&self.0.content))?;
+        if let Some(cache_prefix_blocks) = self.0.cache_prefix_blocks {
+            state.serialize_field("cache_prefix_blocks", &cache_prefix_blocks)?;
+        }
+        if let Some(origin) = &self.0.origin {
+            state.serialize_field("origin", origin)?;
+        }
+        state.end()
+    }
+}
+
+struct CallerContentRef<'a>(&'a [broca_protocol::ContentBlock]);
+
+impl serde::Serialize for CallerContentRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for block in self.0 {
+            sequence.serialize_element(&CallerBlockRef(block))?;
+        }
+        sequence.end()
+    }
+}
+
+struct CallerBlockRef<'a>(&'a broca_protocol::ContentBlock);
+
+impl serde::Serialize for CallerBlockRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use broca_protocol::ContentBlock;
+        use serde::ser::SerializeStruct;
+
+        match self.0 {
+            ContentBlock::TextWithState { text, .. } => {
+                let mut state = serializer.serialize_struct("ContentBlock", 2)?;
+                state.serialize_field("type", "text")?;
+                state.serialize_field("text", text)?;
+                state.end()
+            }
+            block => block.serialize(serializer),
         }
     }
-    caller.serialize(serializer)
 }
 
 /// One message in a `session.read` page.
@@ -1540,7 +1618,11 @@ pub enum RunStatusResponse {
     },
     Paused {
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_caller_pause_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         pause_reason: Option<broca_protocol::PauseReason>,
         #[serde(
             default,
@@ -1769,7 +1851,115 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
+    /// Fallback for a newer state string; old-runner clients do not treat it as terminal.
+    #[serde(other)]
     Unknown,
+}
+
+#[cfg(test)]
+mod open_state_tests {
+    use super::{
+        AccountSelectionRefusedDetail, DisplayEvent, FlowPrincipalRefusal, QueuedSendState,
+        RunStatusResponse, SendResult, SubscribeEvent,
+    };
+
+    #[test]
+    fn unknown_run_status_state_decodes_to_a_nonterminal_fallback() {
+        let status: RunStatusResponse =
+            serde_json::from_str(r#"{"state":"future_runner_state","extra":"future field"}"#)
+                .unwrap();
+        assert!(matches!(status, RunStatusResponse::Unknown));
+    }
+
+    #[test]
+    fn unknown_send_state_decodes_without_closing_the_wire_vocabulary() {
+        let result: SendResult = serde_json::from_str(r#"{"state":"future_send_state"}"#).unwrap();
+        assert!(matches!(result, SendResult::Unknown));
+    }
+
+    #[test]
+    fn unknown_queued_send_state_decodes_to_a_non_actionable_fallback() {
+        let state: QueuedSendState =
+            serde_json::from_str(r#"{"state":"future_queue_state"}"#).unwrap();
+        assert_eq!(state, QueuedSendState::Unknown);
+    }
+
+    #[test]
+    fn unknown_pause_reason_keeps_the_status_paused_for_human_review() {
+        let status: RunStatusResponse =
+            serde_json::from_str(r#"{"state":"paused","pause_reason":"future_pause"}"#).unwrap();
+        assert!(matches!(
+            status,
+            RunStatusResponse::Paused {
+                pause_reason: Some(broca_protocol::PauseReason::AuthRequired),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_subscribe_envelopes_and_event_types_reset_display_state() {
+        let envelope: SubscribeEvent =
+            serde_json::from_str(r#"{"kind":"future_lane_event"}"#).unwrap();
+        assert_eq!(
+            envelope,
+            SubscribeEvent::Display(DisplayEvent::DisplayReset)
+        );
+
+        let display: SubscribeEvent = serde_json::from_value(serde_json::json!({
+            "kind": "display",
+            "event": {"type": "future_display_event", "payload": "ignored"}
+        }))
+        .unwrap();
+        assert_eq!(display, SubscribeEvent::Display(DisplayEvent::DisplayReset));
+
+        let control: SubscribeEvent = serde_json::from_value(serde_json::json!({
+            "kind": "control",
+            "cursor": {"wal_seq": 1, "sub_index": 0},
+            "unit": {"type": "future_control_unit", "payload": "ignored"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            control,
+            SubscribeEvent::Control {
+                unit: broca_protocol::caller::ControlUnit::DisplayReset,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refusal_classes_are_open_when_consumers_decode_them() {
+        let mut principal =
+            serde_json::to_value(FlowPrincipalRefusal::new(true, "reserved:agent")).unwrap();
+        principal["class"] = serde_json::json!("future_class");
+        let principal: FlowPrincipalRefusal = serde_json::from_value(principal).unwrap();
+        assert_eq!(principal.class.as_str(), "future_class");
+
+        let account: AccountSelectionRefusedDetail = serde_json::from_value(serde_json::json!({
+            "routing_code": "account_pool_exhausted",
+            "class": "future_class"
+        }))
+        .unwrap();
+        assert_eq!(account.class.as_str(), "future_class");
+    }
+
+    #[test]
+    fn run_status_error_keeps_an_unrecognized_provider_class() {
+        let status: RunStatusResponse = serde_json::from_value(serde_json::json!({
+            "state": "error",
+            "error": {"class": "future_class", "message": "new provider outcome"}
+        }))
+        .unwrap();
+        let RunStatusResponse::Error {
+            error: Some(error), ..
+        } = status
+        else {
+            panic!("expected the error status")
+        };
+        assert_eq!(error.class_wire(), "future_class");
+        assert!(error.has_unknown_class());
+    }
 }
 
 impl RunStatusResponse {
@@ -1805,7 +1995,7 @@ impl RunStatusResponse {
 /// - once it started its own run: that run's status, which is an ordinary run status;
 /// - once it ended undelivered: `{"state": "superseded"}`, `{"state": "expired"}` or
 ///   `{"state": "retracted"}`, for good.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RunStatusReply {
     Run {
@@ -1817,6 +2007,37 @@ pub enum RunStatusReply {
         delivered: Option<cortexkit_role_llm_runner::send::Delivered>,
     },
     Send(QueuedSendState),
+}
+
+impl<'de> Deserialize<'de> for RunStatusReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RunPayload {
+            #[serde(flatten)]
+            status: Box<RunStatusResponse>,
+            #[serde(default)]
+            delivered: Option<cortexkit_role_llm_runner::send::Delivered>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let state = value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if matches!(state, "pending" | "superseded" | "expired" | "retracted") {
+            let send = serde_json::from_value::<QueuedSendState>(value)
+                .map_err(serde::de::Error::custom)?;
+            return Ok(Self::Send(send));
+        }
+        let run = serde_json::from_value::<RunPayload>(value).map_err(serde::de::Error::custom)?;
+        Ok(Self::Run {
+            status: run.status,
+            delivered: run.delivered,
+        })
+    }
 }
 
 impl From<RunStatusResponse> for RunStatusReply {
@@ -1840,6 +2061,8 @@ pub enum QueuedSendState {
     Expired,
     /// Withdrawn by `session.retract` before it started.
     Retracted,
+    #[serde(other)]
+    Unknown,
 }
 
 /// One decoded subscribe-stream event. Keep its control payload by value: boxing it would change
@@ -1902,6 +2125,8 @@ enum SubscribeEventOwned {
     Display {
         event: DisplayEvent,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 impl Serialize for SubscribeEvent {
@@ -1939,6 +2164,7 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
                 unit,
             }),
             SubscribeEventOwned::Display { event } => Ok(Self::Display(event)),
+            SubscribeEventOwned::Unknown => Ok(Self::Display(DisplayEvent::DisplayReset)),
         }
     }
 }
@@ -2151,7 +2377,7 @@ mod scope_adoption_refused_golden {
 pub struct FlowPrincipalRefusal {
     pub code: String,
     pub message: String,
-    pub class: broca_protocol::ErrorClass,
+    pub class: broca_protocol::OpenErrorClass,
     pub detail: FlowPrincipalRefusalDetail,
 }
 
@@ -2177,7 +2403,7 @@ impl FlowPrincipalRefusal {
         Self {
             code: code.into(),
             message: message.into(),
-            class: broca_protocol::ErrorClass::Permanent,
+            class: broca_protocol::ErrorClass::Permanent.into(),
             detail: FlowPrincipalRefusalDetail {
                 kind: code.into(),
                 principal: principal.into(),
@@ -2403,6 +2629,7 @@ pub struct RunPaused {
 pub enum RunPausedDetail {
     RunPaused {
         run_id: String,
+        #[serde(deserialize_with = "deserialize_caller_pause_reason")]
         reason: broca_protocol::PauseReason,
     },
 }
@@ -2615,7 +2842,7 @@ pub struct AccountSelectionRefusedDetail {
     /// exhausted or reserve-limited pool, unknown quota, a stale roster), `permanent` when it
     /// cannot without someone acting first (every candidate excluded, or a request routing
     /// rejected as malformed or conflicting).
-    pub class: broca_protocol::ErrorClass,
+    pub class: broca_protocol::OpenErrorClass,
     /// Routing's `retry_after_s`, verbatim, when it sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_s: Option<u64>,
@@ -2647,7 +2874,7 @@ impl AccountSelectionRefused {
             ),
             detail: AccountSelectionRefusedDetail {
                 routing_code,
-                class,
+                class: class.into(),
                 retry_after_s,
                 retry_after_secs: retry_after_s.map(|seconds| seconds as f64),
                 decision_id,
@@ -4500,7 +4727,7 @@ impl ScopeRunMismatch {
 pub struct AgentRunScopesUnsupported {
     pub code: String,
     pub message: String,
-    pub class: broca_protocol::ErrorClass,
+    pub class: broca_protocol::OpenErrorClass,
     pub detail: broca_protocol::SessionScope,
 }
 
@@ -4511,7 +4738,7 @@ impl AgentRunScopesUnsupported {
             message:
                 "this build reads agent-run scopes but cannot start or advance work under them"
                     .into(),
-            class: broca_protocol::ErrorClass::Permanent,
+            class: broca_protocol::ErrorClass::Permanent.into(),
             detail: scope,
         }
     }
@@ -4722,6 +4949,56 @@ mod caller_message_tests {
         );
         assert!(!wire.to_string().contains("provider_state"));
         assert!(!wire.to_string().contains("final_answer"));
+    }
+
+    #[test]
+    fn borrowed_stateful_message_keeps_cache_and_origin_metadata() {
+        let mut message = broca_protocol::Message::assistant_from(
+            vec![ContentBlock::TextWithState {
+                text: "final text".into(),
+                provider_state: TextProviderState {
+                    format: TextProviderFormat::OpenAiResponsesChatgpt,
+                    data: "opaque".into(),
+                },
+            }],
+            broca_protocol::ModelHandle::new("openai", "gpt-test"),
+        );
+        message.cache_prefix_blocks = Some(1);
+        let response = SessionReadMessage {
+            delivered_as: None,
+            tags: Vec::new(),
+            ordinal: 0,
+            mid: "m0".into(),
+            message,
+            run: None,
+            tool_calls: Vec::new(),
+        };
+
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["message"]["cache_prefix_blocks"], 1);
+        assert_eq!(wire["message"]["origin"]["provider_module_id"], "openai");
+        assert_eq!(wire["message"]["origin"]["model_id"], "gpt-test");
+        assert_eq!(
+            wire["message"]["content"],
+            json!([{"type": "text", "text": "final text"}])
+        );
+    }
+
+    #[test]
+    fn stateful_caller_message_serializer_uses_borrowed_content() {
+        let source = include_str!("lib.rs");
+        let start = source.find("fn serialize_caller_message").unwrap();
+        let end = source[start..]
+            .find("/// One message in a `session.read` page.")
+            .map(|offset| start + offset)
+            .unwrap();
+        let serializer = &source[start..end];
+
+        assert!(serializer.contains("CallerMessageRef(message).serialize(serializer)"));
+        assert!(
+            !serializer.contains(".clone()"),
+            "caller-facing state conversion must not clone message blocks"
+        );
     }
 
     /// Messages without provider state serialize exactly as the canonical message does, so the

@@ -65,7 +65,9 @@ pub use cortexkit_role_llm_runner::errors::ContextCeilingDetail;
 pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;
 pub use diagnostic::diag;
 pub use display::DisplayEvent;
-pub use error::{ErrorClass, ProviderError, ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED};
+pub use error::{
+    ErrorClass, OpenErrorClass, ProviderError, ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED,
+};
 pub use ids::{BatchId, MessageId, RunId, StepId, StreamGen, SubmissionId, ToolCallId};
 pub use provider::{
     AttemptAccountLimit, AttemptAccountObservation, AttemptOutcome, CredentialRefresh,

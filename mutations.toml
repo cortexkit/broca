@@ -21561,3 +21561,174 @@ expect_red = ["codex::tests::enumeration_streams_rollouts_without_collecting_ful
 file = "crates/ck-session-import/src/codex.rs"
 old = "fn inspect_rollout(path: &Path) -> ReaderResult<RolloutMetadata> {\n    check_session_source_size(path)?;"
 new = "fn inspect_rollout(path: &Path) -> ReaderResult<RolloutMetadata> {\n    let _ = read_rows(path)?; // NON-VACUITY BREAK: collect full rows during listing.\n    check_session_source_size(path)?;"
+
+
+[[control]]
+id = "wire-run-status-unknown-state-fallback"
+guards = "An unrecognized run.status state decodes to the nonterminal fallback rather than failing the typed response"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_run_status_state_decodes_to_a_nonterminal_fallback"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    /// Fallback for a newer state string; old-runner clients do not treat it as terminal.\n    #[serde(other)]\n    Unknown,"
+new = "    /// Fallback for a newer state string; old-runner clients do not treat it as terminal.\n    Unknown, // NON-VACUITY BREAK: reject future run states."
+
+[[control]]
+id = "wire-send-unknown-state-fallback"
+guards = "An unfamiliar session.send state decodes before the client applies its explicit non-actionable fallback"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_send_state_decodes_without_closing_the_wire_vocabulary"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    /// A newer runner state this client does not interpret; callers keep it non-actionable.\n    #[serde(other)]\n    Unknown,"
+new = "    /// A newer runner state this client does not interpret; callers keep it non-actionable.\n    Unknown, // NON-VACUITY BREAK: reject future send states."
+
+[[control]]
+id = "wire-queued-send-unknown-state-fallback"
+guards = "An unfamiliar queued-send status decodes to a non-actionable fallback"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_queued_send_state_decodes_to_a_non_actionable_fallback"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    Retracted,\n    #[serde(other)]\n    Unknown,"
+new = "    Retracted,\n    Unknown, // NON-VACUITY BREAK: reject future queued states."
+
+[[control]]
+id = "caller-unknown-control-event-reset-fallback"
+guards = "An unknown caller control event clears partial display state instead of failing stream decoding"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_control_event_uses_the_display_reset_fallback"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "    /// Unknown future control events use this conservative reset fallback.\n    #[serde(other)]\n    DisplayReset,"
+new = "    /// Unknown future control events use this conservative reset fallback.\n    DisplayReset, // NON-VACUITY BREAK: reject unfamiliar control events."
+
+[[control]]
+id = "display-unknown-event-reset-fallback"
+guards = "An unknown display event resets partial state instead of failing the stream frame"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/display.rs"
+expect_red = ["display::tests::unknown_display_event_uses_the_reset_fallback"]
+file = "crates/broca-protocol/src/display.rs"
+old = "    /// Unknown future display events use the same conservative reset fallback.\n    #[serde(other)]\n    DisplayReset,"
+new = "    /// Unknown future display events use the same conservative reset fallback.\n    DisplayReset, // NON-VACUITY BREAK: reject unfamiliar display events."
+
+[[control]]
+id = "subscribe-unknown-envelope-reset-fallback"
+guards = "An unfamiliar subscribe envelope is handled as a display reset instead of failing frame decoding"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_subscribe_envelopes_and_event_types_reset_display_state"]
+file = "crates/broca-wire/src/lib.rs"
+old = "enum SubscribeEventOwned {\n    Control {\n        cursor: CursorWire,\n        unit: broca_protocol::caller::ControlUnit,\n    },\n    Display {\n        event: DisplayEvent,\n    },\n    #[serde(other)]\n    Unknown,"
+new = "enum SubscribeEventOwned {\n    Control {\n        cursor: CursorWire,\n        unit: broca_protocol::caller::ControlUnit,\n    },\n    Display {\n        event: DisplayEvent,\n    },\n    Unknown, // NON-VACUITY BREAK: reject future subscribe lanes"
+
+
+[[control]]
+id = "provider-finish-reason-unknown-fallback"
+guards = "An unfamiliar provider finish reason is retained as the generic other reason rather than failing event decoding"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/content.rs"
+expect_red = ["content::tests::unknown_provider_finish_reason_uses_the_other_fallback"]
+file = "crates/broca-protocol/src/content.rs"
+old = "            _ => Self::Other,"
+new = "            _ => Self::Stop, // NON-VACUITY BREAK: label a new provider reason as stop."
+
+[[control]]
+id = "run-finish-reason-unknown-fallback"
+guards = "An unfamiliar run finish reason degrades to error rather than failing caller event decoding"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_finish_and_pause_reasons_use_caller_fallbacks"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "            \"transform_unavailable\" => Self::TransformUnavailable,\n            _ => Self::Error,"
+new = "            \"transform_unavailable\" => Self::TransformUnavailable,\n            _ => Self::Completed, // NON-VACUITY BREAK: report an unknown failure as completed."
+
+[[control]]
+id = "caller-pause-reason-unknown-fallback"
+guards = "An unfamiliar caller pause reason remains paused for human review instead of being treated as a restart"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_finish_and_pause_reasons_use_caller_fallbacks"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "        \"restart\" => PauseReason::Restart,\n        _ => PauseReason::AuthRequired,"
+new = "        \"restart\" => PauseReason::Restart,\n        _ => PauseReason::Restart, // NON-VACUITY BREAK: resume without human auth."
+
+[[control]]
+id = "caller-error-class-open-string-decode"
+guards = "An unfamiliar provider error class is retained on caller reads while the inner routing fallback cannot retry"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_caller_error_class_is_preserved_with_a_non_retrying_fallback"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "let known = serde_json::from_value::<crate::ErrorClass>(serde_json::Value::String(\n            raw_class.clone(),\n        ))\n        .is_ok();"
+new = "let known = true; // NON-VACUITY BREAK: route unknown classes through the closed enum."
+
+[[control]]
+id = "shared-refusal-class-maps-provider-local-values"
+guards = "Every provider-local ErrorClass is mapped into the pinned four-class shared vocabulary before a refusal is served"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/error.rs"
+expect_red = ["error::open_error_class_tests::producer_classes_map_to_the_closed_shared_vocabulary"]
+file = "crates/broca-protocol/src/error.rs"
+old = "let wire = match class.shared_class() {"
+new = "let wire = match class { // NON-VACUITY BREAK: expose producer-local provider_unavailable."
+
+[[control]]
+id = "wire-principal-refusal-class-is-open-to-readers"
+guards = "A principal refusal's served class is constrained on write but remains open for a future caller read"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::refusal_classes_are_open_when_consumers_decode_them"]
+file = "crates/broca-wire/src/lib.rs"
+old = "pub struct FlowPrincipalRefusal {\n    pub code: String,\n    pub message: String,\n    pub class: broca_protocol::OpenErrorClass,"
+new = "pub struct FlowPrincipalRefusal {\n    pub code: String,\n    pub message: String,\n    pub class: broca_protocol::ErrorClass, // NON-VACUITY BREAK: close caller decoding."
+
+[[control]]
+id = "wire-caller-message-serialization-does-not-clone"
+guards = "A caller-facing stateful message rewrites only the stateful block in a borrowed view, not the whole message"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::stateful_caller_message_serializer_uses_borrowed_content"]
+file = "crates/broca-wire/src/lib.rs"
+old = "CallerMessageRef(message).serialize(serializer)"
+new = "CallerMessageRef(&(*message).clone()).serialize(serializer) // NON-VACUITY BREAK: clone all message blocks"

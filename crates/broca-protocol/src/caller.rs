@@ -9,12 +9,12 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     approval::ApprovalRequest,
     content::{AssistantMessage, FinishReason, ToolCall, ToolResult},
-    error::ProviderError,
+    error::{OpenErrorClass, ProviderError},
     ids::{RunId, StepId, SubmissionId, ToolCallId},
     request::BudgetKind,
     usage::Usage,
@@ -73,9 +73,6 @@ pub enum ControlUnit {
     ApprovalRequest {
         request: ApprovalRequest,
     },
-    /// Tell the caller to discard partial display state (paired with a display-lane
-    /// reset) — e.g. when a stream generation is abandoned.
-    DisplayReset,
     /// Terminal typed error.
     Error {
         error: SharedProviderError,
@@ -86,6 +83,7 @@ pub enum ControlUnit {
     /// the run is RESUMABLE under the same run_id once the cause clears.
     Paused {
         run_id: RunId,
+        #[serde(deserialize_with = "deserialize_caller_pause_reason")]
         reason: PauseReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<SharedProviderError>,
@@ -120,26 +118,97 @@ pub enum ControlUnit {
         #[serde(default)]
         retries_used: u32,
     },
+    /// Tell the caller to discard partial display state (paired with a display-lane
+    /// reset) — e.g. when a stream generation is abandoned.
+    /// Unknown future control events use this conservative reset fallback.
+    #[serde(other)]
+    DisplayReset,
 }
 
 /// A provider error on a caller-facing surface.
 ///
 /// Serialization maps the runner-local `ProviderUnavailable` class to the shared `transient`
 /// class. The owned wrapper prevents a caller-facing schema from accidentally storing a raw
-/// [`ProviderError`], while durable WAL records continue to use that raw type.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(transparent)]
-pub struct SharedProviderError(ProviderError);
+/// [`ProviderError`], while durable WAL records continue to use that raw type. On a caller read,
+/// an unfamiliar class stays available through `class_wire`; `as_inner` uses `permanent` only as
+/// a non-retrying compatibility fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedProviderError {
+    inner: Box<ProviderError>,
+    wire_class: Option<OpenErrorClass>,
+}
 
 impl SharedProviderError {
     /// Borrow the provider error retained after deserializing a caller-facing response.
+    ///
+    /// If a newer caller class is unknown to this process, `inner.class` is the conservative
+    /// `permanent` fallback. Use [`Self::class_wire`] to inspect the original open string.
     pub fn as_inner(&self) -> &ProviderError {
-        &self.0
+        &self.inner
     }
 
-    /// Recover the raw provider error for non-caller-facing processing.
+    /// Recover the provider error for non-caller-facing processing.
     pub fn into_inner(self) -> ProviderError {
-        self.0
+        *self.inner
+    }
+
+    /// The caller-facing class spelling, including an unfamiliar value from a newer producer.
+    pub fn class_wire(&self) -> &str {
+        if let Some(class) = &self.wire_class {
+            return class.as_str();
+        }
+        match self.inner.class.shared_class() {
+            crate::ErrorClass::Transient => "transient",
+            crate::ErrorClass::Permanent => "permanent",
+            crate::ErrorClass::Auth => "auth_required",
+            crate::ErrorClass::ContextOverflow => "context_overflow",
+            crate::ErrorClass::ProviderUnavailable => {
+                unreachable!("shared_class maps local classes")
+            }
+        }
+    }
+
+    /// Whether the producer sent a class outside this build's pinned shared vocabulary.
+    pub fn has_unknown_class(&self) -> bool {
+        self.wire_class.is_some()
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedProviderError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let raw_class = value
+            .get("class")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| D::Error::custom("caller provider error is missing string class"))?;
+        let known = serde_json::from_value::<crate::ErrorClass>(serde_json::Value::String(
+            raw_class.clone(),
+        ))
+        .is_ok();
+        if known {
+            let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
+            return Ok(Self {
+                inner: Box::new(inner),
+                wire_class: None,
+            });
+        }
+
+        let Some(object) = value.as_object_mut() else {
+            return Err(D::Error::custom("caller provider error must be an object"));
+        };
+        object.insert(
+            "class".into(),
+            serde_json::Value::String("permanent".into()),
+        );
+        let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            inner: Box::new(inner),
+            wire_class: Some(OpenErrorClass::from_wire(raw_class)),
+        })
     }
 }
 
@@ -153,13 +222,16 @@ impl Deref for SharedProviderError {
 
 impl From<ProviderError> for SharedProviderError {
     fn from(error: ProviderError) -> Self {
-        Self(error)
+        Self {
+            inner: Box::new(error),
+            wire_class: None,
+        }
     }
 }
 
 impl From<SharedProviderError> for ProviderError {
     fn from(error: SharedProviderError) -> Self {
-        error.0
+        *error.inner
     }
 }
 
@@ -168,18 +240,32 @@ impl Serialize for SharedProviderError {
     where
         S: Serializer,
     {
-        let shared_class = self.0.class.shared_class();
-        if shared_class == self.0.class {
-            self.0.serialize(serializer)
+        if let Some(class) = &self.wire_class {
+            let mut value = serde_json::to_value(&self.inner).map_err(serde::ser::Error::custom)?;
+            let Some(object) = value.as_object_mut() else {
+                return Err(serde::ser::Error::custom(
+                    "provider error did not serialize as an object",
+                ));
+            };
+            object.insert(
+                "class".into(),
+                serde_json::Value::String(class.as_str().to_owned()),
+            );
+            value.serialize(serializer)
         } else {
-            let mut error = self.0.clone();
-            error.class = shared_class;
-            error.serialize(serializer)
+            let shared_class = self.inner.class.shared_class();
+            if shared_class == self.inner.class {
+                self.inner.serialize(serializer)
+            } else {
+                let mut error = self.inner.clone();
+                error.class = shared_class;
+                error.serialize(serializer)
+            }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunFinishReason {
     /// `stop_when` satisfied / no more tool calls.
@@ -232,6 +318,26 @@ pub enum RunFinishReason {
     TransformUnavailable,
 }
 
+impl<'de> Deserialize<'de> for RunFinishReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "completed" => Self::Completed,
+            "max_steps" => Self::MaxSteps,
+            "budget_exhausted" => Self::BudgetExhausted,
+            "context_ceiling" => Self::ContextCeiling,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
+            "error" => Self::Error,
+            "transform_unavailable" => Self::TransformUnavailable,
+            _ => Self::Error,
+        })
+    }
+}
+
 /// Why a run is PAUSED (non-terminal, resumable) rather than finished. The shared
 /// vocabulary for a resumable pause — used both on the caller-facing control surface
 /// (`ControlUnit::Paused`) and in the durable WAL (`WalRecord::RunPaused`), so the two
@@ -253,6 +359,35 @@ impl PauseReason {
             PauseReason::AuthRequired => "auth_required",
             PauseReason::Restart => "restart",
         }
+    }
+}
+
+/// Decode a caller-facing pause reason without making durable WAL reasons extensible. Unknown
+/// caller tags keep the run paused for human review rather than claiming a graceful restart.
+pub fn deserialize_caller_pause_reason<'de, D>(deserializer: D) -> Result<PauseReason, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(caller_pause_reason_from_wire(&raw))
+}
+
+/// The optional caller-surface form of [`deserialize_caller_pause_reason`].
+pub fn deserialize_optional_caller_pause_reason<'de, D>(
+    deserializer: D,
+) -> Result<Option<PauseReason>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.as_deref().map(caller_pause_reason_from_wire))
+}
+
+fn caller_pause_reason_from_wire(raw: &str) -> PauseReason {
+    match raw {
+        "auth_required" => PauseReason::AuthRequired,
+        "restart" => PauseReason::Restart,
+        _ => PauseReason::AuthRequired,
     }
 }
 
@@ -502,6 +637,57 @@ mod tests {
             error.as_inner().class,
             ErrorClass::ProviderUnavailable,
             "legacy raw class remains readable before a caller response is re-serialized"
+        );
+    }
+
+    #[test]
+    fn unknown_caller_error_class_is_preserved_with_a_non_retrying_fallback() {
+        let unit: ControlUnit = serde_json::from_value(serde_json::json!({
+            "type": "error",
+            "error": {"class": "future_class", "message": "new provider outcome"}
+        }))
+        .unwrap();
+        let ControlUnit::Error { error } = unit else {
+            panic!("expected error control unit")
+        };
+
+        assert!(error.has_unknown_class());
+        assert_eq!(error.class_wire(), "future_class");
+        assert_eq!(error.as_inner().class, ErrorClass::Permanent);
+        assert_eq!(
+            serde_json::to_value(&error).unwrap()["class"],
+            "future_class"
+        );
+    }
+
+    #[test]
+    fn unknown_control_event_uses_the_display_reset_fallback() {
+        let unit: ControlUnit = serde_json::from_value(serde_json::json!({
+            "type": "future_control_unit",
+            "payload": {"run_id": "run-1"}
+        }))
+        .unwrap();
+        assert_eq!(unit, ControlUnit::DisplayReset);
+    }
+
+    #[test]
+    fn unknown_finish_and_pause_reasons_use_caller_fallbacks() {
+        let finish: RunFinishReason = serde_json::from_str("\"future_finish\"").unwrap();
+        assert_eq!(finish, RunFinishReason::Error);
+
+        let paused: ControlUnit = serde_json::from_value(serde_json::json!({
+            "type": "paused",
+            "run_id": "run-1",
+            "reason": "future_pause"
+        }))
+        .unwrap();
+        assert_eq!(
+            paused,
+            ControlUnit::Paused {
+                run_id: RunId("run-1".into()),
+                reason: PauseReason::AuthRequired,
+                error: None,
+            }
         );
     }
 }

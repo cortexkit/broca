@@ -59,6 +59,8 @@ tool-calls are its content blocks — no separate tool_call unit) · `step_finis
 `tool_result` · `step_finished` · `approval_request` · `display_reset` · `error`
 · `run_finished{reason}`.
 
+Readers are not closed to future tags: an unfamiliar `run.status.state` or `session.send.state` decodes to the non-actionable `unknown` fallback; the typed send client reports a protocol fallback rather than treating it as an active or terminal run. An unfamiliar control or display event becomes `display_reset`, clearing partial rendering without inventing a durable event. Caller error classes retain unfamiliar strings through the open `SharedProviderError` wrapper. Producers still write only the pinned values above, so existing bytes do not change.
+
 **Approval back-channel** (caller → runner, control lane): `ApprovalResponse` =
 `allow` | `allow_narrowed{input}` | `deny{reason}`, correlated by `tool_call_id`
 (+ envelope `corr`). Approval may NARROW, never widen.

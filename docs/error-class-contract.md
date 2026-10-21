@@ -133,14 +133,22 @@ broca specifics:
 - The `Auth` arm's wire spelling is `auth_required`, with `auth` accepted on read
   indefinitely (serde alias) so WAL records written before the rename replay clean.
 - `ErrorClass::shared_class()` is the boundary mapping for cross-producer
-  consumers.
-- Served management refusals carry their class in their error code, never in the
-  message. The codes whose class is fixed:
+  consumers. Durable provider records keep the closed producer enum; caller error
+  wrappers and served refusal class fields decode through open strings.
+- Served management refusals with a fixed class are identified by their error code; the
+  corresponding code-to-class pairs are:
 
   | Code | Class | Detail |
   |---|---|---|
   | `variant_unsupported` | `permanent` | `{model, variant, defined}` |
   | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
+  | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
+
+- Principal-specific admission refusals `flow_scope_required` and `sender_not_owner` carry a
+  top-level `class: "permanent"` beside `code`, `message`, and `detail: {kind, principal}`.
+  Their served bytes are pinned by `crates/broca-wire/tests/golden/flow_scope_required.json`
+  and `sender_not_owner.json`; the class is mapped by `ErrorClass::shared_class()` before
+  serialization.
 
   One served admission refusal carries its class in its detail, because its class depends on
   which refusal routing sent:
