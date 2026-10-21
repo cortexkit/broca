@@ -20,6 +20,7 @@ use tracing_subscriber::prelude::*;
 
 const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.send",
+    "send.status",
     "session.import",
     "session.retract",
     "run.cancel",
