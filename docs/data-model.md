@@ -245,7 +245,15 @@ the next one). Synced before the caller sees the terminal.
 `ProviderError`: `class` (`transient`, `permanent`, `auth_required` (older records may say
 `auth`), `context_overflow`, `provider_unavailable`), `message`, and absent-when-unset
 `status` (u16), `retry_after_secs` (float), `provider_code`, `provider_subcode`, `resets_at_ms`
-(u64), `limit_window`, `account_ref`, `credential_id`, `affordable_max_tokens` (u32).
+(u64), `limit_window`, `account_ref`, `credential_id`, `affordable_max_tokens` (u32), and
+`provider_details` (object). Google `provider_details` retains bounded `errorInfo` (`reason`,
+`domain`, string-valued `metadata`), `quotaFailure.violations` (`subject`, `description`,
+`quotaMetric`, `quotaId`, string-valued `quotaDimensions`, `quotaValue`, `futureQuotaValue`), and
+`retryInfo.retryDelay` fields from `google.rpc.Status.details`; it omits unrecognized fields and
+is absent when no recognized details exist. Most text values are capped at 128 Unicode scalar values;
+`subject` and `description` are capped at 256. Metadata has at most 16 keys, quota dimensions at most 8,
+and there are at most 8 violations. A record carrying it is MUST-UNDERSTAND (feature
+`google-rpc-error-details/v1`) and is written only in a `ver = 3` frame requiring that name.
 
 `provider_code: "request_invalid"` marks a provider's HTTP 400 that rejected the request itself
 (`invalid_request_error`, or Google's `INVALID_ARGUMENT`) when no more specific code applies;

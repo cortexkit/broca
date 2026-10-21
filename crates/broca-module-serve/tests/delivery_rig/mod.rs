@@ -409,6 +409,7 @@ impl RunExecutor for CoreExec {
             // The run pauses for re-authentication right after admission, as a run whose
             // credential needs it does.
             control.pause_for_auth_at_start = Some(broca_protocol::ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,

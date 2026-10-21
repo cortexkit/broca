@@ -626,6 +626,7 @@ fn paused_run_projects_pause_as_terminal() {
                 ts_ms: None,
                 reason: PauseReason::AuthRequired,
                 error: Some(ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Auth,
@@ -679,6 +680,7 @@ fn error_terminal_surfaces_error_then_finished() {
                 reason: RunFinishReason::Error,
                 usage: Usage::default(),
                 error: Some(ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
@@ -707,6 +709,7 @@ fn error_terminal_surfaces_error_then_finished() {
 #[test]
 fn failed_queued_admission_projects_atomic_terminal() {
     let error = ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -834,6 +837,7 @@ fn every_loop_emitted_control_unit_is_projectable() {
         },
         ControlUnit::Error {
             error: ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Permanent,
@@ -1003,6 +1007,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Permanent,

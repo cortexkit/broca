@@ -1863,6 +1863,9 @@ mod tests {
             // Populate step identity so the GoogleCodeAssist family (which requires it for
             // its deterministic requestId) renders; every other family ignores it.
             opts.step_context = Some(broca_protocol::StepContext {
+                session_address: None,
+                credential_id: None,
+                account_ref: None,
                 run_id: "fixed-run".into(),
                 step_index: 1,
             });

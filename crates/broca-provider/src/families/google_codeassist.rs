@@ -500,6 +500,9 @@ mod tests {
 
     fn step(run_id: &str, idx: u64) -> StepContext {
         StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: run_id.to_string(),
             step_index: idx,
         }

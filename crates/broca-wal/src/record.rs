@@ -1310,10 +1310,31 @@ impl WalRecord {
         } else {
             base
         };
-        if self.carries_runner_tags() {
+        let base = if self.carries_runner_tags() {
             with_feature(base, crate::framing::RUNNER_TAGS_FEATURE)
         } else {
             base
+        };
+        if self.carries_google_rpc_error_details() {
+            with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
+        } else {
+            base
+        }
+    }
+
+    fn carries_google_rpc_error_details(&self) -> bool {
+        match self {
+            WalRecord::RunFinished {
+                error: Some(error), ..
+            }
+            | WalRecord::RunPaused {
+                error: Some(error), ..
+            } => error.provider_details.is_some(),
+            WalRecord::Retracted {
+                failure: Some(failure),
+                ..
+            } => failure.error.provider_details.is_some(),
+            _ => false,
         }
     }
 
@@ -3412,6 +3433,7 @@ mod schema_tests {
     #[test]
     fn every_v2_record_round_trips() {
         let provider_err = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -3561,6 +3583,7 @@ mod schema_tests {
                 failure: Some(QueuedAdmissionFailure {
                     run_id: RunId("r3".into()),
                     error: ProviderError {
+                        provider_details: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -3598,6 +3621,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
@@ -3619,6 +3643,7 @@ mod schema_tests {
             ts_ms: Some(1_790_000_000_001),
             reason: PauseReason::AuthRequired,
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -3652,6 +3677,7 @@ mod schema_tests {
         reason: RunFinishReason::Error,
         usage: Usage::default(),
         error: Some(ProviderError {
+        provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -3687,6 +3713,7 @@ mod schema_tests {
                      retry_after_secs,
                      code: Option<&str>,
                      account: Option<&str>| ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -3788,6 +3815,7 @@ mod schema_tests {
             reason: RunFinishReason::Error,
             usage: Usage::default(),
             error: Some(ProviderError {
+                provider_details: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::ProviderUnavailable,

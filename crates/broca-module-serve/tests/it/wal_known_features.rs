@@ -31,11 +31,12 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
     // expected list covers the features this build can read, including step transforms,
     // the compaction records (the removed synchronous client's, read only, and asynchronous
     // views and notices), deferred-call records, step-boundary cancellation and
-    // first-send session classes, hard input-token caps, provider text state, OpenRouter reasoning, runner tags,
+    // first-send session classes, hard input-token caps, Google RPC quota diagnostics,
+    // provider text state, OpenRouter reasoning, runner tags,
     // and structured-output state including durable compiler-refusal downgrades.
     assert_eq!(
         expected,
-        "agent-run-scopes/v1\narchive-index/v2\ncompaction-view/v1\ncompaction-wait/v1\ncompaction/v1\ncontext-ceiling/v1\ndeferred-call/v1\ndelivery-order/v1\ndispatch-module/v1\nflow-scopes/v1\ninput-token-cap/v1\ninterrupt-reason/v1\nopenrouter-reasoning/v1\nplan-manifest/v1\nprovider-text-state/v1\nrestart-pause/v1\nretention/v1\nrun-cancel-at/v1\nrunner-tags/v1\nscope/v1\nsession-class/v1\nsteer-queue/v1\nstep-transforms/v1\nstructured-output-downgrade/v1\nstructured-output/v1\nturn-directives/v1\n"
+        "agent-run-scopes/v1\narchive-index/v2\ncompaction-view/v1\ncompaction-wait/v1\ncompaction/v1\ncontext-ceiling/v1\ndeferred-call/v1\ndelivery-order/v1\ndispatch-module/v1\nflow-scopes/v1\ngoogle-rpc-error-details/v1\ninput-token-cap/v1\ninterrupt-reason/v1\nopenrouter-reasoning/v1\nplan-manifest/v1\nprovider-text-state/v1\nrestart-pause/v1\nretention/v1\nrun-cancel-at/v1\nrunner-tags/v1\nscope/v1\nsession-class/v1\nsteer-queue/v1\nstep-transforms/v1\nstructured-output-downgrade/v1\nstructured-output/v1\nturn-directives/v1\n"
     );
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert!(

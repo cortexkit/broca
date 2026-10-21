@@ -83,6 +83,9 @@ pub(crate) fn fixed_request() -> CallOptions {
     opts.tool_choice = ToolChoice::Auto.into();
     // Fixed run/step identity → a fixed deterministic requestId in the golden.
     opts.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-golden-0001".into(),
         step_index: 2,
     });
@@ -147,6 +150,9 @@ fn repeated_tool_call_id_request() -> CallOptions {
         },
     ]);
     opts.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-collision-0001".into(),
         step_index: 3,
     });
@@ -180,6 +186,9 @@ fn google_codeassist_session_envelope_matches_golden() {
         vec![ContentBlock::Text { text: "hi".into() }],
     )]);
     opts.step_context = Some(StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "run-1".into(),
         step_index: 1,
     });

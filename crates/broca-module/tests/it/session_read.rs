@@ -446,6 +446,7 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
 
 fn error_value(message: &str) -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -1048,6 +1049,7 @@ async fn run_status_reports_an_exhausted_account_with_its_reset_window_and_accou
     let rig = Rig::new("status-account-limit", Arc::new(NoopExec));
     let key = rig.key("account-limit");
     let exhausted = ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,

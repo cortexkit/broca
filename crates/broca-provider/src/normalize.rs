@@ -418,6 +418,7 @@ impl AnthropicNormalizer {
                 let provider_code = overflow_code.map(str::to_owned).or(provider_code);
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
                     error: ProviderError {
+                        provider_details: None,
                         provider_subcode: None,
                         refusal: None,
                         // An unrecognised in-band code lands on Permanent, which is the less

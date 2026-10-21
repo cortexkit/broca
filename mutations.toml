@@ -1719,6 +1719,19 @@ old = "                classify_account_limit_exhausted(\n                    fa
 new = "                classify_account_limit_exhausted(\n                    family,\n                    code,\n                    &headers,\n                    &text,\n                    UNIX_EPOCH + Duration::from_millis(system_time_millis(SystemTime::now())), // NON-VACUITY BREAK\n                    error,\n                )"
 
 [[control]]
+id = "google-rpc-quota-details-survive-message-truncation"
+guards = "Google quota refusals retain bounded ErrorInfo, QuotaFailure and RetryInfo fields beyond the stored message cap"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::google_rpc_quota_details_survive_error_message_truncation", "transport::tests::google_rpc_quota_details_are_bounded_and_malformed_details_do_not_break_classification"]
+file = "crates/broca-provider/src/transport.rs"
+old = "    let provider_details = google_rpc_error_details(body).map(Box::new);"
+new = "    let provider_details = None; // NON-VACUITY BREAK: Google RPC quota details are discarded"
+
+[[control]]
 id = "kimi-403-account-limit"
 guards = "a Kimi 403 access_terminated_error for a usage limit is account_limit_exhausted"
 runner = "cargo"

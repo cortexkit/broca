@@ -38,6 +38,9 @@ pub(crate) fn legacy_call_options() -> CallOptions {
     ]);
     opts.target_model = Some(ModelHandle::new("provider", "model"));
     opts.step_context = Some(broca_protocol::StepContext {
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
         run_id: "legacy".into(),
         step_index: 2,
     });

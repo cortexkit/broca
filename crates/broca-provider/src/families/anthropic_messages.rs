@@ -1220,6 +1220,9 @@ mod tests {
     fn opts(prompt: Vec<Message>) -> CallOptions {
         let mut opts = CallOptions::new(prompt);
         opts.step_context = Some(StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: "run-1".into(),
             step_index: 1,
         });

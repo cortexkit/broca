@@ -2441,6 +2441,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(error) => {
                     let refusal = ProviderError {
+                        provider_details: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -6163,6 +6164,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         provider_code: &'static str,
     ) -> Result<(), String> {
         let terminal = ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -6729,21 +6731,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> Result<bool, String> {
         // Use the terminal's existing diagnostic field without changing its Interrupted reason.
         // Recovery knows the old process left this run unsealed, not how that process ended.
-        let error = (cause == SealCause::CrashOrphan).then(|| ProviderError {
-            provider_subcode: None,
-            class: broca_protocol::ErrorClass::Transient,
-            message: "the previous broca process ended without sealing this run: host crash, kill, or power loss".into(),
-            provider_code: Some("previous_process_ended_unsealed".into()),
-            status: None,
-            retry_after_secs: None,
-            refusal: None,
-            resets_at_ms: None,
-            resets_at_source: None,
-            limit_window: None,
-            account_ref: None,
-            credential_id: None,
-            affordable_max_tokens: None,
-        });
+        let error = (cause == SealCause::CrashOrphan).then(|| ProviderError { provider_details: None, provider_subcode: None,
+        class: broca_protocol::ErrorClass::Transient,
+        message: "the previous broca process ended without sealing this run: host crash, kill, or power loss".into(),
+        provider_code: Some("previous_process_ended_unsealed".into()),
+        status: None,
+        retry_after_secs: None,
+        refusal: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None, });
         self.write_interrupted_seal_with_error(sealed_attempt, cause, error)
             .await
     }

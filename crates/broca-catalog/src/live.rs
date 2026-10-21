@@ -2311,6 +2311,9 @@ mod tests {
             expected.project_id = Some("wire-bytes-project".into());
             let mut request = anthropic_options();
             request.step_context = Some(broca_protocol::StepContext {
+                session_address: None,
+                credential_id: None,
+                account_ref: None,
                 run_id: "live-route-bytes".into(),
                 step_index: 0,
             });

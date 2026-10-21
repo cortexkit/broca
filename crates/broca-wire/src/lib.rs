@@ -1798,8 +1798,10 @@ pub enum QueuedSendState {
     Retracted,
 }
 
-/// One decoded subscribe-stream event.
+/// One decoded subscribe-stream event. Keep its control payload by value: boxing it would change
+/// the public Rust shape even though optional provider details make that variant larger.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SubscribeEvent {
     Control {
         wal_seq: u64,
@@ -1843,8 +1845,11 @@ pub fn encode_subscribe_display(event: &DisplayEvent) -> serde_json::Result<Vec<
     serde_json::to_vec(&SubscribeEventRef::Display { event })
 }
 
+// This owned mirror decodes the public by-value event shape; changing it to a box just to satisfy
+// a size lint would make the event payloads asymmetric internally.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum SubscribeEventOwned {
     Control {
         cursor: CursorWire,
@@ -3082,6 +3087,7 @@ mod tests {
 
     fn unavailable_error() -> ProviderError {
         ProviderError {
+            provider_details: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,

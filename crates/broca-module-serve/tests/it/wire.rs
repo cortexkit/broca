@@ -172,6 +172,7 @@ fn chatgpt_stub_provider(credential_ready: bool) -> ResolvedStubProvider {
 
 fn auth_required_error() -> ProviderError {
     ProviderError {
+        provider_details: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Auth,

@@ -192,6 +192,15 @@ pub struct StepContext {
     pub run_id: String,
     /// The 1-based step index within the run.
     pub step_index: u64,
+    /// The session's WAL address, passed only to transport diagnostics and never rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_address: Option<String>,
+    /// The frozen credential identity, passed only to transport diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    /// The frozen provider account, passed only to transport diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
 }
 
 fn arc_value_is_null(value: &Arc<Value>) -> bool {

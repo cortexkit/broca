@@ -70,6 +70,9 @@ pub fn boundary_options(
         generation: Arc::new(config.generation.clone()),
         provider_options: Arc::new(config.provider_options.clone()),
         step_context: Some(StepContext {
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
             run_id: run_id.to_owned(),
             step_index: step,
         }),

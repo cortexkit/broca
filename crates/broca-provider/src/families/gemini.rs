@@ -775,6 +775,7 @@ impl GeminiNormalizer {
             // here is the same request-validation refusal as one sent as an HTTP 400.
             let error = crate::request_invalid::classify_request_invalid(
                 broca_protocol::ProviderError {
+                    provider_details: None,
                     provider_subcode: None,
                     class,
                     message: message.to_owned(),
