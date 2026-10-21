@@ -9186,7 +9186,7 @@ expect_red = ["actor::crash_orphan_tests::crash_orphan_seal_carries_previous_pro
 expect_message = "crash orphan must report its cause"
 file = "crates/broca-module/src/actor.rs"
 old = "let error = (cause == SealCause::CrashOrphan).then(|| ProviderError {"
-new = "let error = false.then(|| ProviderError { // NON-VACUITY BREAK: drop startup cause"
+new = "let error = false.then(|| ProviderError { /* NON-VACUITY BREAK: drop startup cause */"
 
 [[control]]
 id = "crash-orphan-seal-keeps-never-sent-call-result"
@@ -9252,7 +9252,7 @@ expect_red = ["actor::shutdown_tests::shutdown_seal_does_not_claim_previous_proc
 expect_message = "previous_process_ended_unsealed"
 file = "crates/broca-module/src/actor.rs"
 old = "let error = (cause == SealCause::CrashOrphan).then(|| ProviderError {"
-new = "let error = true.then(|| ProviderError { // NON-VACUITY BREAK: mislabel graceful seal"
+new = "let error = true.then(|| ProviderError { /* NON-VACUITY BREAK: mislabel graceful seal */"
 
 [[control]]
 id = "run-attribution-producing-episode"
