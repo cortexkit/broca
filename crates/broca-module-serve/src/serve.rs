@@ -1481,16 +1481,20 @@ async fn handle_control_request(
             let counts = health_registry.slot_counts();
             // During a drain the daemon ends early only once these three gauges read idle, and
             // client health probes are refused then, so nothing else can show what it read.
-            // Log each distinct reading once per process, so a drain held to its ceiling names
-            // the gauge that kept it busy.
+            // Log a reading when it changes, and at probe 1, 2, 4, 8, ..., so a drain held to
+            // its ceiling shows both the gauge that kept it busy and whether probes kept
+            // arriving at all; a repeated reading alone could not tell those apart.
             if health_registry.stopping_signal().is_cancelled() {
-                static LAST_DRAIN_GAUGES: std::sync::Mutex<Option<(usize, usize, usize)>> =
-                    std::sync::Mutex::new(None);
+                type Gauges = (usize, usize, usize);
+                static LAST_DRAIN_GAUGES: std::sync::Mutex<(u64, Option<Gauges>)> =
+                    std::sync::Mutex::new((0, None));
                 let reading = (counts.runs_in_flight, counts.opening, counts.closing);
                 let mut last = LAST_DRAIN_GAUGES.lock().unwrap_or_else(|p| p.into_inner());
-                if *last != Some(reading) {
-                    *last = Some(reading);
-                    tracing::info!(target: "lifecycle", runs_in_flight = reading.0,
+                last.0 += 1;
+                let probe = last.0;
+                if last.1 != Some(reading) || probe.is_power_of_two() {
+                    last.1 = Some(reading);
+                    tracing::info!(target: "lifecycle", probe, runs_in_flight = reading.0,
                         opening = reading.1, closing = reading.2,
                         "drain health probe answered with busy gauges");
                 }
