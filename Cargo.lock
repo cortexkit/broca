@@ -414,6 +414,7 @@ dependencies = [
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "flate2",
+ "futures",
  "getrandom 0.3.4",
  "libc",
  "nkeys",

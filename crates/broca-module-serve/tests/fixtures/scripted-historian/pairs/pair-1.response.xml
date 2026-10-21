@@ -1,0 +1,11 @@
+<output>
+<compartments>
+<compartment start="1" end="5" title="Scripted fold 1-5" episode_type="feature" importance="50">
+<p1>Scripted summary of raw messages 1-5: 2 transcript blocks.</p1>
+<p2>Scripted summary of raw messages 1-5.</p2>
+<p3>Messages 1-5.</p3>
+<p4 />
+</compartment>
+</compartments>
+<meta><messages_processed>1-5</messages_processed><unprocessed_from>6</unprocessed_from></meta>
+</output>
