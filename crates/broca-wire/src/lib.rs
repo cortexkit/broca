@@ -3401,7 +3401,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.account_limit_exhausted_code_assist.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "60f81787d89b463cae21b1d45cf58036ae6a5bd629d343f6b07c85cc0291015d"
+            "145639eefc4bbaea47e7e69f683c6e2306385e773089aa8e05f5a740aa96ffce"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -3416,6 +3416,11 @@ mod tests {
         assert_eq!(value["error"]["account_ref"], "acct-g");
         assert_eq!(value["error"]["credential_id"], "antigravity:google");
         assert_eq!(value["error"]["resets_at_ms"], 1_800_294_489_199_u64);
+        // Google's structured RPC details ride along as an optional, additive field.
+        assert_eq!(
+            value["error"]["provider_details"]["errorInfo"]["reason"],
+            "QUOTA_EXHAUSTED"
+        );
         assert_eq!(value["retries_used"], 0);
     }
 
