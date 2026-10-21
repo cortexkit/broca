@@ -223,13 +223,26 @@ impl HarnessReader for ClaudeCodeReader {
             }
         }
 
+        let mut previous_assistant_id = None;
         for index in selected {
             let row = &rows[index].value;
             if is_api_error_message(row) {
+                previous_assistant_id = None;
                 dropped_api_errors += 1;
                 continue;
             }
             let kind = row.get("type").and_then(Value::as_str).unwrap_or("");
+            // A streamed API response has one transcript row per content block, with distinct
+            // row UUIDs but the same message.id. Only adjacent assistant fragments belong together;
+            // a user/tool-result row must retain its position between assistant messages.
+            let assistant_id = (kind == "assistant")
+                .then(|| row.get("message")?.get("id")?.as_str())
+                .flatten()
+                .filter(|id| !id.is_empty());
+            let join_previous_assistant =
+                assistant_id.is_some() && assistant_id == previous_assistant_id;
+            previous_assistant_id = assistant_id;
+            let message_count = messages.len();
             match kind {
                 "system" => dropped_system += 1,
                 "user" | "assistant" => convert_message_row(
@@ -237,8 +250,14 @@ impl HarnessReader for ClaudeCodeReader {
                     &mut messages,
                     &mut dropped_redacted,
                     &mut skipped_blocks,
+                    join_previous_assistant,
                 ),
                 _ => {}
+            }
+            if !join_previous_assistant && messages.len() == message_count {
+                // A wholly omitted first fragment owns no output to extend. The last emitted
+                // assistant message may belong to a different API response.
+                previous_assistant_id = None;
             }
         }
 
@@ -413,6 +432,7 @@ fn convert_message_row(
     messages: &mut Vec<Message>,
     dropped_redacted: &mut usize,
     skipped_blocks: &mut BTreeSet<String>,
+    join_previous_assistant: bool,
 ) {
     let source_role = match row.get("type").and_then(Value::as_str) {
         Some("user") => Role::User,
@@ -440,6 +460,7 @@ fn convert_message_row(
             vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            join_previous_assistant,
         );
         return;
     }
@@ -460,14 +481,20 @@ fn convert_message_row(
             source_role
         };
         if pending_role.is_some_and(|pending_role| pending_role != role) {
-            push_grouped_message(messages, pending_role.unwrap(), origin.clone(), pending);
+            push_grouped_message(
+                messages,
+                pending_role.unwrap(),
+                origin.clone(),
+                pending,
+                join_previous_assistant,
+            );
             pending = Vec::new();
         }
         pending_role = Some(role);
         pending.push(converted);
     }
     if let Some(role) = pending_role {
-        push_grouped_message(messages, role, origin, pending);
+        push_grouped_message(messages, role, origin, pending, join_previous_assistant);
     }
 }
 
@@ -566,9 +593,19 @@ fn push_grouped_message(
     role: Role,
     origin: Option<ModelHandle>,
     content: Vec<ContentBlock>,
+    join_previous_assistant: bool,
 ) {
     if content.is_empty() {
         return;
+    }
+    if role == Role::Assistant && join_previous_assistant {
+        if let Some(previous) = messages
+            .last_mut()
+            .filter(|last| last.role == Role::Assistant)
+        {
+            previous.content.extend(content);
+            return;
+        }
     }
     let message = if role == Role::Assistant {
         match origin {
@@ -692,6 +729,162 @@ mod tests {
         let decoded: ImportParams =
             serde_json::from_slice(&serde_json::to_vec(&params).unwrap()).unwrap();
         assert_eq!(decoded.messages, imported.messages);
+    }
+
+    fn split_rows() -> Vec<Value> {
+        load_rows(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/claude-code-split/-tmp-split-project/split.jsonl"),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.value)
+        .collect()
+    }
+
+    fn convert_split_rows(rows: &[Value], label: &str) -> crate::ImportedSession {
+        let root = broca_test_support::scratch_root()
+            .join(format!("ck-claude-split-{label}-{}", std::process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("split.jsonl"),
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let imported = ClaudeCodeReader::new(&root).convert("split").unwrap();
+        fs::remove_dir_all(root).unwrap();
+        imported
+    }
+
+    #[test]
+    fn split_assistant_rows_preserve_block_order_and_strip_foreign_signatures() {
+        let mut rows = split_rows();
+        for (index, label) in [(1, "first"), (2, "second")] {
+            let content = rows[index]["message"]["content"].as_array_mut().unwrap();
+            content[0]["thought_signature"] = json!("foreign-tool-signature");
+            content.insert(0, json!({"type": "text", "text": label}));
+            content.insert(
+                0,
+                json!({"type": "thinking", "thinking": label, "signature": "foreign-thinking-signature"}),
+            );
+        }
+        let imported = convert_split_rows(&rows, "block-order");
+        assert_eq!(imported.messages.len(), 3);
+        let blocks = &imported.messages[1].content;
+        let ordered = blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Reasoning { text, signature } => {
+                    assert!(signature.is_none());
+                    ("thinking", text.as_str())
+                }
+                ContentBlock::Text { text } => ("text", text.as_str()),
+                ContentBlock::ToolCall(call) => {
+                    assert!(call.thought_signature.is_none());
+                    ("tool_use", call.tool_call_id.0.as_str())
+                }
+                other => panic!("unexpected block {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            [
+                ("thinking", "first"),
+                ("text", "first"),
+                ("tool_use", "toolu_A"),
+                ("thinking", "second"),
+                ("text", "second"),
+                ("tool_use", "toolu_B"),
+            ]
+        );
+        round_trip(&imported, "claude-split-order");
+    }
+
+    #[test]
+    fn different_or_missing_api_ids_never_merge_assistant_rows() {
+        for (label, id) in [
+            ("different", Some(json!("msg_other"))),
+            ("empty", Some(json!(""))),
+            ("missing", None),
+        ] {
+            let mut rows = split_rows();
+            if label != "different" {
+                rows[1]["message"].as_object_mut().unwrap().remove("id");
+            }
+            let message = rows[2]["message"].as_object_mut().unwrap();
+            match id {
+                Some(id) => {
+                    message.insert("id".into(), id);
+                }
+                None => {
+                    message.remove("id");
+                }
+            }
+            let imported = convert_split_rows(&rows, label);
+            assert_eq!(
+                imported
+                    .messages
+                    .iter()
+                    .map(|message| message.role)
+                    .collect::<Vec<_>>(),
+                [Role::User, Role::Assistant, Role::Assistant, Role::Tool],
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_usage_snapshots_do_not_change_imported_messages() {
+        let mut rows = split_rows();
+        let snapshots = convert_split_rows(&rows, "usage-snapshots");
+        rows[2]["message"]["usage"] = rows[1]["message"]["usage"].clone();
+        let repeated = convert_split_rows(&rows, "usage-repeated");
+        for row in &mut rows {
+            row["message"].as_object_mut().unwrap().remove("usage");
+        }
+        let without_usage = convert_split_rows(&rows, "usage-absent");
+        assert_eq!(snapshots.messages, repeated.messages);
+        assert_eq!(snapshots.messages, without_usage.messages);
+    }
+
+    #[test]
+    fn omitted_fragment_does_not_join_a_different_api_message() {
+        let mut rows = split_rows();
+        rows[1]["message"]["id"] = json!("msg_other");
+        let mut omitted = rows[2].clone();
+        omitted["uuid"] = json!("omitted");
+        omitted["message"]["content"] =
+            json!([{"type": "redacted_thinking", "data": "foreign-blob"}]);
+        rows[2]["parentUuid"] = json!("omitted");
+        rows.insert(2, omitted);
+        let imported = convert_split_rows(&rows, "omitted-fragment");
+        assert_eq!(
+            imported
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            [Role::User, Role::Assistant, Role::Assistant, Role::Tool]
+        );
+    }
+
+    #[test]
+    fn split_and_joined_api_messages_convert_identically() {
+        let mut rows = split_rows();
+        let split = convert_split_rows(&rows, "split-control");
+        let second = rows.remove(2);
+        rows[1]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .extend(second["message"]["content"].as_array().unwrap().clone());
+        rows[2]["parentUuid"] = json!("a1");
+        let joined = convert_split_rows(&rows, "joined-control");
+        assert_eq!(split.messages, joined.messages);
+        assert_eq!(split.warnings, joined.warnings);
     }
 
     fn converted_tool_result(content: Value, is_error: bool) -> ToolResult {

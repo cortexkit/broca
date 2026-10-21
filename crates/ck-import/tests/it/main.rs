@@ -10,6 +10,7 @@
 //! process's own environment. That is safe to share: the removal only ever moves toward the state
 //! every test here wants, and nothing restores the variables.
 
+mod claude_code_split_import;
 mod cli;
 mod codex_parallel_import;
 mod real_module_e2e;
