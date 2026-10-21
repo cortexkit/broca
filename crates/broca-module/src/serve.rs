@@ -2588,6 +2588,12 @@ impl ServeHandler for crate::LineageRegistry {
         match self.route_retract(session, submission_id).await? {
             RetractOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             RetractOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
+            RetractOutcome::SessionTooLarge { max_bytes } => {
+                Err(ServeError::SessionTooLarge { max_bytes })
+            }
+            RetractOutcome::RetainedSessionTooLarge { max_bytes } => {
+                Err(ServeError::RetainedSessionTooLarge { max_bytes })
+            }
             RetractOutcome::Retracted => Ok(RetractResponse::Retracted),
             RetractOutcome::AlreadyStarted => Ok(RetractResponse::AlreadyStarted),
             RetractOutcome::NotPending => Ok(RetractResponse::NotPending),

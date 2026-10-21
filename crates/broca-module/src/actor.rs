@@ -496,6 +496,12 @@ pub enum RetractOutcome {
     NotPending,
     /// The actor is closing — re-route through the registry (re-open).
     Reopen,
+    SessionTooLarge {
+        max_bytes: u64,
+    },
+    RetainedSessionTooLarge {
+        max_bytes: u64,
+    },
     /// Writing the retract tombstone failed durably.
     Error(String),
 }
@@ -4603,7 +4609,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // it: a caller told its send is queued can rely on the queued record (and its send key)
         // surviving a crash.
         let writer = self.writer.as_ref().expect("writer live while open");
-        writer.record(WalRecord::Queued {
+        let queued = writer.record(WalRecord::Queued {
             retention: self.admitting_retention,
             ts_ms: self.retention_timestamp(),
             hooks,
@@ -4617,6 +4623,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             principal,
         });
+        if let Err(error) = queued.into_result() {
+            return match error {
+                broca_core::WalWriteError::SessionTooLarge { max_bytes } => {
+                    SendOutcome::SessionTooLarge { max_bytes }
+                }
+                broca_core::WalWriteError::RetainedSessionTooLarge { max_bytes } => {
+                    SendOutcome::RetainedSessionTooLarge { max_bytes }
+                }
+                broca_core::WalWriteError::Failed(error) => SendOutcome::Error(error),
+            };
+        }
         if let Err(error) = writer.sync().await {
             return SendOutcome::Error(error.to_string());
         }
@@ -5041,19 +5058,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return match broca_core::retract_decision(&records, &submission_id) {
                 broca_core::RetractDecision::Retract => {
                     let writer = self.writer.as_ref().expect("writer live while open");
-                    let record = || {
-                        writer.record(WalRecord::Retracted {
+                    let record = || -> Result<(), broca_core::WalWriteError> {
+                        let retracted = writer.record(WalRecord::Retracted {
                             submission_id: submission_id.clone(),
                             failure: None,
                         });
+                        retracted.into_result().map(|_| ())
                     };
                     let recorded = match &self.state {
                         RunState::Active { steer, .. } => {
                             steer.retract_ordered(&submission_id, record)
                         }
-                        _ => {
-                            record();
-                            true
+                        _ => record().map(|()| true),
+                    };
+                    let recorded = match recorded {
+                        Ok(recorded) => recorded,
+                        Err(error) => {
+                            return match error {
+                                broca_core::WalWriteError::SessionTooLarge { max_bytes } => {
+                                    RetractOutcome::SessionTooLarge { max_bytes }
+                                }
+                                broca_core::WalWriteError::RetainedSessionTooLarge {
+                                    max_bytes,
+                                } => RetractOutcome::RetainedSessionTooLarge { max_bytes },
+                                broca_core::WalWriteError::Failed(error) => {
+                                    RetractOutcome::Error(error)
+                                }
+                            }
                         }
                     };
                     if !recorded {
@@ -5296,6 +5327,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         pending: PendingWarm,
         result: Result<broca_core::WarmSent, crate::executor::WarmError>,
     ) {
+        // Warm completion releases the session-move fence even on failure or after the
+        // caller stops waiting.
+        self.warm_task.take();
         let PendingWarm {
             permit: _permit,
             reply,
@@ -11237,34 +11271,47 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let Some(service) = self.registry.retention_service() else {
             return Ok(());
         };
-        let records = match self.read_wal_framed_records().await {
-            Ok(records) => records,
+        self.retention_deadline = None;
+        let writer = self.writer.as_ref().expect("open writer");
+        if writer.is_retention_lineage() == Some(false) && self.admitting_retention.is_none() {
+            self.retention_lineage = false;
+            self.retention_deadline = None;
+            return Ok(());
+        }
+        // A failed sync or a missing identity leaves the row unprojected exactly as a failed
+        // index write does, so it enrolls the same repair rather than waiting for a reopen.
+        let identified = match writer.sync().await {
+            Ok(_) => writer
+                .lineage_id()
+                .ok_or_else(|| "retention WAL has no identity".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        let id = match identified {
+            Ok(id) => id,
             Err(error) => {
                 self.registry.repair_retention(&self.key);
-                self.retention_deadline = Some(service.clock.now_ms().saturating_add(1000));
+                tracing::warn!(target: "retention", "retention sync could not read the durable head; repair enrolled");
                 return Err(error);
             }
         };
-        self.retention_deadline =
-            crate::retention::policy(&records).and_then(|(_, _, deadline)| deadline);
-        self.retention_lineage = broca_core::is_retention_lineage(&records);
-        if !self.retention_lineage {
-            return Ok(());
-        }
+        let head = writer.durable_head().load(Ordering::Acquire);
+        self.retention_lineage = writer.is_retention_lineage() == Some(true);
+        // Never schedule irreversible deletion from a stale summary. If a later send
+        // shortened retention, deferring until repair may expire late, but never early.
         let key = self.key.clone();
-        let writer = self.writer.as_ref().expect("open writer");
-        let head = records.last().map_or(0, |frame| frame.seq);
-        let id = writer.lineage_id().ok_or("retention WAL has no identity")?;
-        let result =
-            tokio::task::spawn_blocking(move || service.rederive_records(&key, id, &records, head))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|result| result);
+        let retention_wal = self.wal_store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            service.sync_actor_head(retention_wal.as_ref(), &key, id, head)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result);
         if result.is_err() {
             self.registry.repair_retention(&self.key);
             tracing::warn!(target: "retention", "content-free index write failed; repair enrolled");
         }
-        result
+        self.retention_deadline = result?;
+        Ok(())
     }
 
     async fn expire_actor(&mut self, now_ms: u64) -> bool {

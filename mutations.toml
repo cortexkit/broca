@@ -9,6 +9,53 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "actor-completed-warm-releases-move-fence"
+guards = "Completed manual warms release the session move fence on success, failure and caller cancellation while live warms remain busy"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/cache_warm_tests.rs"
+expect_red = ["actor::cache_warm_tests::completed_warm_releases_move_fence_but_live_warm_blocks_it"]
+expect_message = "completed warm must release move fence"
+file = "crates/broca-module/src/actor.rs"
+old = "        self.warm_task.take();"
+new = "        // NON-VACUITY BREAK: retain the completed warm's move fence."
+
+[[control]]
+id = "actor-retention-sync-bounded-history"
+guards = "Actor retention sync reads only a bounded tail when the durable summary cannot prove the current head and defers full repair"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::long_retention_sync_is_bounded_and_repair_survives_restart"]
+expect_message = "retention sync must not decode full history"
+file = "crates/broca-module/src/actor.rs"
+old = "        let retention_wal = self.wal_store.clone();"
+new = "        let _ = self.read_wal_framed_records().await?; // NON-VACUITY BREAK: decode the full retention history.\n        let retention_wal = self.wal_store.clone();"
+
+[[control]]
+id = "actor-refused-queue-and-retract-have-no-effect"
+guards = "Refused Queued and Retracted appends preserve actor caches and live inbox state even when a reserved terminal lets a later sync succeed"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::refused_queue_and_retract_leave_memory_unchanged"]
+expect_message = "refused writes must not take effect"
+[[control.edits]]
+file = "crates/broca-module/src/actor.rs"
+old = "if let Err(error) = queued.into_result() {"
+new = "if let Err(error) = { let _ = queued; Ok::<u64, broca_core::WalWriteError>(0) } { // NON-VACUITY BREAK: ignore refused queue append."
+[[control.edits]]
+file = "crates/broca-module/src/actor.rs"
+old = "retracted.into_result().map(|_| ())"
+new = "{ let _ = retracted; Ok(()) } // NON-VACUITY BREAK: remove a refused retraction from the live inbox."
+
+[[control]]
 id = "claude-code-split-message-retains-parallel-results"
 guards = "Adjacent Claude Code assistant fragments sharing an API message ID keep both real parallel tool results through durable import and replay"
 runner = "cargo"
@@ -19042,7 +19089,7 @@ test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 expect_red = ["pending_delivery_order_send_is_retracted_before_tool_result"]
 file = "crates/broca-module/src/actor.rs"
 old = 'steer.retract_ordered(&submission_id, record)'
-new = '{ let _ = steer; record(); true } // NON-VACUITY BREAK: leave the inbox copy deliverable'
+new = '{ let _ = steer; record().map(|()| true) } // NON-VACUITY BREAK: leave the inbox copy deliverable'
 
 [[control]]
 id = "delivered-steer-resend-never-regresses-to-pending"

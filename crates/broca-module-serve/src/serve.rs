@@ -1479,6 +1479,22 @@ async fn handle_control_request(
         ModuleControlRequest::HealthCheck {} => {
             stall::method_context(2);
             let counts = health_registry.slot_counts();
+            // During a drain the daemon ends early only once these three gauges read idle, and
+            // client health probes are refused then, so nothing else can show what it read.
+            // Log each distinct reading once per process, so a drain held to its ceiling names
+            // the gauge that kept it busy.
+            if health_registry.stopping_signal().is_cancelled() {
+                static LAST_DRAIN_GAUGES: std::sync::Mutex<Option<(usize, usize, usize)>> =
+                    std::sync::Mutex::new(None);
+                let reading = (counts.runs_in_flight, counts.opening, counts.closing);
+                let mut last = LAST_DRAIN_GAUGES.lock().unwrap_or_else(|p| p.into_inner());
+                if *last != Some(reading) {
+                    *last = Some(reading);
+                    tracing::info!(target: "lifecycle", runs_in_flight = reading.0,
+                        opening = reading.1, closing = reading.2,
+                        "drain health probe answered with busy gauges");
+                }
+            }
             let vault = vault_gauge.read();
             let now_ms = now_epoch_ms();
             let mut details = Vec::new();

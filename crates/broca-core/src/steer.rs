@@ -193,22 +193,23 @@ impl SteerInbox {
 
     /// The ordered sends this turn delivered or ended since the last call.
     /// Record a validated queued send's retraction and remove its live copy under the same
-    /// lock as boundary delivery. False means the run consumed it after the actor's WAL read;
-    /// the actor must re-read that fate instead of writing a contradictory tombstone.
-    pub fn retract_ordered(
+    /// lock as boundary delivery. A refused append leaves the live copy deliverable.
+    /// False means the run consumed it after the actor's WAL read; the actor must re-read
+    /// that fate instead of writing a contradictory tombstone.
+    pub fn retract_ordered<E>(
         &self,
         submission_id: &broca_protocol::SubmissionId,
-        record: impl FnOnce(),
-    ) -> bool {
+        record: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
         let mut state = self.lock();
         if state.consumed.contains(submission_id) {
-            return false;
+            return Ok(false);
         }
-        record();
+        record()?;
         state
             .ordered
             .retain(|send| &send.submission_id != submission_id);
-        true
+        Ok(true)
     }
 
     pub fn take_consumed(&self) -> Vec<broca_protocol::SubmissionId> {
@@ -512,7 +513,12 @@ mod retract_tests {
             let inbox = SteerInbox::new();
             inbox.seed_ordered(vec![queued(mode)]);
             let mut recorded = false;
-            assert!(inbox.retract_ordered(&SubmissionId("queued".into()), || recorded = true));
+            assert!(inbox
+                .retract_ordered(&SubmissionId("queued".into()), || {
+                    recorded = true;
+                    Ok::<_, ()>(())
+                })
+                .unwrap());
             assert!(recorded);
             let result = ToolResult {
                 tool_call_id: broca_protocol::ToolCallId("call".into()),
@@ -547,10 +553,10 @@ mod retract_tests {
                 .len(),
             1
         );
-        assert!(
-            !inbox.retract_ordered(&SubmissionId("queued".into()), || panic!(
+        assert!(!inbox
+            .retract_ordered::<()>(&SubmissionId("queued".into()), || panic!(
                 "delivery already won; no retraction may be recorded"
             ))
-        );
+            .unwrap());
     }
 }
