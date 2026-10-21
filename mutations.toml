@@ -9,6 +9,22 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "core-admission-rejects-unidentified-checkpoint"
+guards = "An admission checkpoint with missing lineage cannot replace the authoritative full-WAL summary"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::unidentified_prefix_is_replayed_and_repaired_once_on_resume"]
+expect_message = "unidentified or mismatched admission must replay from origin"
+file = "crates/broca-core/src/run.rs"
+old = """                            (Some(stored), Some(observed)) => stored == observed,
+                            _ => false,"""
+new = """                            (Some(stored), Some(observed)) => stored == observed,
+                            _ => true, // NON-VACUITY BREAK: trust an unidentified admission checkpoint."""
+
+[[control]]
 id = "session-read-discarded-prefix-still-proves-history"
 guards = "Discarding an unidentified prefix cannot hide an unreachable WAL as an empty session"
 runner = "cargo"

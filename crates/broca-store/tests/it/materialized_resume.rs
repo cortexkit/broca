@@ -582,11 +582,23 @@ async fn recreated_prefix_resume(unidentified: bool) {
         old_prefix.lineage_id.as_ref().unwrap().as_str()
     );
     let new_lineage = recreated.lineage_id().unwrap();
+    let recreated_head = recreated.last_seq();
     drop(recreated);
     assert_eq!(
         store.read_prefix_with_watermark(&new_req.session).unwrap(),
         stale_prefix,
         "the stale prefix must still be present when resume starts"
+    );
+    let admission = broca_core::load_prior_wal_snapshot(
+        &wal_store,
+        &new_req.session,
+        recreated_head,
+        Some(store.as_ref()),
+    )
+    .unwrap();
+    assert_eq!(
+        admission.base_watermark, 0,
+        "unidentified or mismatched admission must replay from origin"
     );
 
     let provider = RecordingProvider::new(vec![
