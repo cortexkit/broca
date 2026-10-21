@@ -19066,20 +19066,20 @@ new = '''        // The running loop can deliver an ordered send while this acto
 
 [[control]]
 id = "delivery-list-requires-a-declared-mode"
-guards = "An entirely undeclared delivery list is refused with delivery_unsupported and the original detail.delivery array"
+guards = "A list containing only modes absent from role.describe.delivery_order_modes is refused with delivery_unsupported and its original delivery array"
 runner = "cargo"
 select = "expected"
 package = "broca-module-serve"
 target = "--lib"
 test_file = "crates/broca-module-serve/src/serve.rs"
-expect_red = ["serve::delivery_list_tests::undeclared_delivery_lists_match_published_refusal_vectors"]
+expect_red = ["serve::delivery_list_tests::only_undeclared_delivery_modes_are_refused"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = 'if modes.iter().any(|mode| mode.is_declared(declared)) {'
-new = 'if true || modes.iter().any(|mode| mode.is_declared(declared)) { // NON-VACUITY BREAK: accept undeclared lists'
+old = 'if modes.iter().any(|mode| mode.is_declared_by(describe)) {'
+new = 'if true || modes.iter().any(|mode| mode.is_declared_by(describe)) { // NON-VACUITY BREAK: accept undeclared lists'
 
 [[control]]
 id = "delivery-list-one-declared-mode-is-enough"
-guards = "A delivery list with a declared fallback is accepted unchanged even when earlier modes are undeclared"
+guards = "A delivery list with one declared fallback is accepted unchanged even when earlier modes are absent from role.describe.delivery_order_modes"
 runner = "cargo"
 select = "expected"
 package = "broca-module-serve"
@@ -19087,5 +19087,5 @@ target = "--lib"
 test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::delivery_list_tests::one_declared_mode_keeps_the_original_delivery_list_accepted"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = 'if modes.iter().any(|mode| mode.is_declared(declared)) {'
-new = 'if modes.iter().all(|mode| mode.is_declared(declared)) { // NON-VACUITY BREAK: require every mode to be declared'
+old = 'if modes.iter().any(|mode| mode.is_declared_by(describe)) {'
+new = 'if modes.iter().all(|mode| mode.is_declared_by(describe)) { // NON-VACUITY BREAK: require every mode to be declared'

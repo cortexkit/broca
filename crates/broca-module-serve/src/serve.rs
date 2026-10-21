@@ -2263,15 +2263,14 @@ where
                 )
                 .await;
             }
-            let declared = broca_wire::broca_role_describe_with_writers(
+            let describe = broca_wire::broca_role_describe_with_writers(
                 env!("CARGO_PKG_VERSION"),
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
             )
-            .role
-            .capabilities;
-            if let Some(refusal) = delivery_list_refusal(params.delivery.as_ref(), &declared) {
+            .role;
+            if let Some(refusal) = delivery_list_refusal(params.delivery.as_ref(), &describe) {
                 return send_error_body(writer, ver, channel, epoch, corr, refusal).await;
             }
             if params
@@ -3623,14 +3622,14 @@ async fn send_invalid_params(
     send_error_body(writer, ver, channel, epoch, corr, body).await
 }
 
-fn delivery_list_refusal<S: AsRef<str>>(
+fn delivery_list_refusal(
     delivery: Option<&broca_wire::SendDelivery>,
-    declared: &[S],
+    describe: &cortexkit_role_llm_runner::describe::RoleDescribe,
 ) -> Option<ErrorBody> {
     let broca_wire::SendDelivery::Order(modes) = delivery? else {
         return None;
     };
-    if modes.iter().any(|mode| mode.is_declared(declared)) {
+    if modes.iter().any(|mode| mode.is_declared_by(describe)) {
         return None;
     }
     Some(
@@ -7095,6 +7094,13 @@ mod agent_data_refusal_vectors {
 mod delivery_list_tests {
     use super::*;
 
+    fn describe_with_capabilities(
+        capabilities: &[String],
+    ) -> cortexkit_role_llm_runner::describe::RoleDescribe {
+        cortexkit_role_llm_runner::describe::RoleDescribe::new(Vec::new(), "test")
+            .with_capabilities(capabilities.to_vec())
+    }
+
     #[test]
     fn undeclared_delivery_lists_match_published_refusal_vectors() {
         let raw = cortexkit_role_llm_runner::vectors::FILES
@@ -7106,9 +7112,11 @@ mod delivery_list_tests {
         assert!(!cases.is_empty());
         for case in cases {
             let params: SendParams = serde_json::from_value(case["request"].clone()).unwrap();
-            let declared: Vec<String> = serde_json::from_value(case["declares"].clone()).unwrap();
+            let capabilities: Vec<String> =
+                serde_json::from_value(case["declares"].clone()).unwrap();
+            let describe = describe_with_capabilities(&capabilities);
             let refusal = serde_json::to_value(
-                delivery_list_refusal(params.delivery.as_ref(), &declared)
+                delivery_list_refusal(params.delivery.as_ref(), &describe)
                     .expect("a wholly undeclared list must be refused"),
             )
             .unwrap();
@@ -7118,18 +7126,35 @@ mod delivery_list_tests {
     }
 
     #[test]
-    fn one_declared_mode_keeps_the_original_delivery_list_accepted() {
+    fn only_undeclared_delivery_modes_are_refused() {
         let params: SendParams = serde_json::from_value(
-            serde_json::json!({"prompt":"reminder", "delivery":["steer","idle_start"]}),
+            serde_json::json!({"prompt":"reminder", "delivery":["turn_system"]}),
         )
         .unwrap();
         let before = serde_json::to_value(&params.delivery).unwrap();
-        assert!(
-            delivery_list_refusal(params.delivery.as_ref(), &["delivery_order", "queue"]).is_none()
-        );
-        assert_eq!(serde_json::to_value(&params.delivery).unwrap(), before);
+        let describe = broca_wire::broca_role_describe("test").role;
         let refusal = serde_json::to_value(
-            delivery_list_refusal(params.delivery.as_ref(), &["delivery_order"]).unwrap(),
+            delivery_list_refusal(params.delivery.as_ref(), &describe)
+                .expect("turn_system has no landing path"),
+        )
+        .unwrap();
+        assert_eq!(refusal["code"], broca_wire::DELIVERY_UNSUPPORTED);
+        assert_eq!(refusal["detail"]["delivery"], before);
+    }
+
+    #[test]
+    fn one_declared_mode_keeps_the_original_delivery_list_accepted() {
+        let params: SendParams = serde_json::from_value(
+            serde_json::json!({"prompt":"reminder", "delivery":["turn_system","idle_start"]}),
+        )
+        .unwrap();
+        let before = serde_json::to_value(&params.delivery).unwrap();
+        let describe = broca_wire::broca_role_describe("test").role;
+        assert!(delivery_list_refusal(params.delivery.as_ref(), &describe).is_none());
+        assert_eq!(serde_json::to_value(&params.delivery).unwrap(), before);
+        let none_declared = describe.with_delivery_order_modes(Vec::new());
+        let refusal = serde_json::to_value(
+            delivery_list_refusal(params.delivery.as_ref(), &none_declared).unwrap(),
         )
         .unwrap();
         assert_eq!(refusal["detail"]["delivery"], before);

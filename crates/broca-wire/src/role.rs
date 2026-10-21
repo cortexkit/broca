@@ -318,9 +318,8 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::NO_TOOLS,
         TAGS_CAPABILITY,
         RUN_TOOL_CALLS_GROUP,
-        // `session.send` takes an ordered `delivery` list with `dedupe_key` and `expires_at_ms`.
-        // `turn_system` is accepted in a list but is never possible on this runner yet, so the
-        // list falls through to its next mode.
+        // Ordered sends can land beside tool results, at a running step boundary, or when an
+        // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
     ]
     .map(String::from)
@@ -342,6 +341,11 @@ pub fn broca_role_describe_with_writers(
         implementation_version,
     )
     .with_capabilities(capabilities)
+    .with_delivery_order_modes(vec![
+        "tool_result".into(),
+        "steer".into(),
+        "idle_start".into(),
+    ])
     // A session's own capabilities come back on the reply to the send that admits (first
     // writes) the session, not from a separate `session.baseline` call.
     .with_session_capabilities_from("admission")
@@ -804,6 +808,15 @@ mod pinned_reply_bytes {
     }
 
     #[test]
+    fn role_describe_advertises_only_landing_delivery_order_modes() {
+        let encoded = serde_json::to_value(broca_role_describe("test")).unwrap();
+        assert_eq!(
+            encoded["delivery_order_modes"],
+            serde_json::json!(["tool_result", "steer", "idle_start"])
+        );
+    }
+
+    #[test]
     fn role_describe_bytes_are_pinned() {
         assert_golden(
             broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true),
@@ -854,7 +867,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "b672175e3fe5cd8027c766c9262593c0c0de8c55b8c23fe7e0b34ccd80361e1c",
+            "63e6a764de7d4665f6fdea1487e22dca4acc415fbfe4ab4f0f8f48294fa4ff8e",
         );
     }
 
@@ -1008,7 +1021,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "334449647a4f58817b9244255706baaa2be43f584975355714b61aac2d58345d";
+        "e881d2c1e3d387b8550684e88d60aecdab8e31193fb8f0ac9ce9337c6b56cd8b";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
