@@ -67,6 +67,14 @@ fn init_schema_measured(
             DELETE FROM agent_data_census_done;
          END",
     ];
+    if !conn.is_autocommit() {
+        // Store initialization already owns the schema transaction. Standalone
+        // migration calls below retain their paced, short writer transactions.
+        for sql in schema {
+            conn.execute_batch(sql)?;
+        }
+        return Ok(());
+    }
     let mut used = 0;
     while used < schema.len() {
         used += batches::write_batch(

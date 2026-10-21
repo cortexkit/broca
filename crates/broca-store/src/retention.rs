@@ -7,8 +7,7 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::{bind_identity_from_store_key, SqliteStore, StoreError};
 
-pub(crate) fn init_work_schema(conn: &rusqlite::Connection) -> Result<(), StoreError> {
-    let tx = conn.unchecked_transaction()?;
+pub(crate) fn init_work_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     let initialized: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='retention_discovery')", [], |row| row.get(0))?;
     // Triggers cover all run-index writers, including repair and legacy admission.
     // The inventory is a candidate hint; projection still rechecks the leased WAL.
@@ -54,7 +53,6 @@ pub(crate) fn init_work_schema(conn: &rusqlite::Connection) -> Result<(), StoreE
         tx.execute_batch("INSERT OR IGNORE INTO retention_discovery SELECT l.lineage_id FROM retention_lineage l
             CROSS JOIN run_index r ON r.lineage_id=l.lineage_id WHERE l.expired_at_ms IS NULL AND r.withdrawals_owed=1;")?;
     }
-    tx.commit()?;
     Ok(())
 }
 

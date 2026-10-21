@@ -19823,3 +19823,47 @@ expect_red = ["vault::tests::refresh_reply_can_outlast_the_local_control_deadlin
 file = "crates/broca-subc/src/vault.rs"
 old = "const VAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);"
 new = "const VAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10); // NON-VACUITY BREAK: refresh uses local-control patience."
+
+[[control]]
+id = "store-schema-upgrade-atomic"
+guards = "An interrupted schema upgrade cannot publish a partial column/table migration"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::schema_upgrade_failure_rolls_back_every_partial_change"]
+file = "crates/broca-store/src/lib.rs"
+old = "        #[cfg(test)]\n        SCHEMA_UPGRADE_HOOK.with"
+new = "        conn.execute_batch(\"COMMIT; BEGIN IMMEDIATE\")?; // NON-VACUITY BREAK: publish the partial schema.\n        #[cfg(test)]\n        SCHEMA_UPGRADE_HOOK.with"
+
+[[control]]
+id = "store-attribution-partial-index"
+guards = "Attribution completeness probes use a partial session index instead of scanning historical message bodies"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::attribution_probe_uses_partial_session_index"]
+file = "crates/broca-store/src/lib.rs"
+old = '''        conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;'''
+new = "        // NON-VACUITY BREAK: omit the attribution completeness index."
+
+[[control]]
+id = "store-legacy-prefix-discovery-read-only"
+guards = "Legacy prefix length discovery cannot upgrade a deferred reader into a writer"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::legacy_prefix_discovery_is_read_only"]
+file = "crates/broca-store/src/lib.rs"
+old = '''                |row| row.get::<_, i64>(0),
+            )?;
+            Ok((watermark as u64, prefix_len))'''
+new = '''                |row| row.get::<_, i64>(0),
+            )?;
+            tx.execute("UPDATE meta SET prefix_len=?2 WHERE session=?1 AND prefix_len IS NULL", rusqlite::params![key, prefix_len])?; // NON-VACUITY BREAK: write through a deferred read.
+            Ok((watermark as u64, prefix_len))'''

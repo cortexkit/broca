@@ -424,6 +424,14 @@ fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
+type SchemaUpgradeHook = fn() -> Result<(), StoreError>;
+
+#[cfg(test)]
+std::thread_local! {
+    static SCHEMA_UPGRADE_HOOK: std::cell::RefCell<Option<SchemaUpgradeHook>> = const { std::cell::RefCell::new(None) };
+}
+
 impl SqliteStore {
     /// Open (creating + migrating) a store at `path`.
     ///
@@ -847,6 +855,11 @@ impl SqliteStore {
         if let Err(error) = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true) {
             tracing::warn!(%error, "could not retain SQLite WAL sidecars on close");
         }
+        // Start the schema transaction before inspecting columns. Schema creation
+        // and upgrade steps share it so concurrent opens cannot see a partial upgrade.
+        let schema_tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let conn = &schema_tx;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
                  session TEXT PRIMARY KEY,
@@ -960,6 +973,11 @@ impl SqliteStore {
                 )?;
             }
         }
+        #[cfg(test)]
+        SCHEMA_UPGRADE_HOOK.with(|hook| match *hook.borrow() {
+            Some(hook) => hook(),
+            None => Ok(()),
+        })?;
         let message_columns = {
             let mut stmt = conn.prepare("PRAGMA table_info(message)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -975,6 +993,9 @@ impl SqliteStore {
             // message, and on every row written before tags existed: those sessions have none.
             conn.execute("ALTER TABLE message ADD COLUMN tags_json TEXT", [])?;
         }
+        // The one-time index build scans existing messages during upgrade. Thereafter
+        // completeness probes visit only this session's unattributed rows, not its bodies.
+        conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;
         // The runner-tag index: which materialized message and block hold each tag, written
         // with the message rows, so `session.resolve` finds a part without reading the
         // transcript. Rows follow their message: a truncated or reset projection drops them.
@@ -1050,7 +1071,9 @@ impl SqliteStore {
         bus_events::init_schema(conn)?;
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
-        export_index::init_schema(conn).map_err(StoreError::from)
+        let source = export_index::init_schema(conn).map_err(StoreError::from)?;
+        schema_tx.commit()?;
+        Ok(source)
     }
 
     /// Wall-clock millis for a run-index state transition. Only ever compared against other
@@ -1261,12 +1284,13 @@ impl SqliteStore {
         tx: &rusqlite::Transaction<'_>,
         key: &str,
     ) -> Result<ProjectionSnapshot, StoreError> {
-        let seed = projection_seed_from_tx(tx, key)?;
+        let complete = attribution_complete(tx, key)?;
+        let seed = projection_seed_from_complete_tx(tx, key, complete)?;
         let (watermark, next_ord) = current_projection_position(tx, key)?;
         let lineage_id = current_projection_lineage_id(tx, key)?;
         let previous_control_head = current_control_head(tx, key)?;
         Ok(ProjectionSnapshot {
-            attribution_complete: attribution_complete(tx, key)?,
+            attribution_complete: complete,
             seed,
             watermark,
             lineage_id,
@@ -2326,10 +2350,6 @@ fn current_projection_position(
                 [key],
                 |row| row.get::<_, i64>(0),
             )?;
-            tx.execute(
-                "UPDATE meta SET prefix_len=?2 WHERE session=?1 AND prefix_len IS NULL",
-                rusqlite::params![key, prefix_len],
-            )?;
             Ok((watermark as u64, prefix_len))
         }
         None => {
@@ -2347,6 +2367,9 @@ fn current_projection_position(
 /// any other version were written by an older format and are backfilled from the WAL.
 pub(crate) const RUN_ATTRIBUTION_VERSION: i64 = 2;
 
+const UNATTRIBUTED_MESSAGE_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM message WHERE session=?1 AND run_json IS NULL LIMIT 1)";
+
 fn attribution_complete(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<bool, StoreError> {
     let version: Option<i64> = tx
         .query_row(
@@ -2360,12 +2383,8 @@ fn attribution_complete(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<boo
     if version.is_some_and(|version| version != RUN_ATTRIBUTION_VERSION) {
         return Ok(false);
     }
-    // Session-scoped only: no global index build or startup scan of historical bodies.
-    let unknown: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM message WHERE session=?1 AND run_json IS NULL LIMIT 1)",
-        [key],
-        |row| row.get(0),
-    )?;
+    // The partial session index avoids scanning attributed transcript bodies.
+    let unknown: bool = tx.query_row(UNATTRIBUTED_MESSAGE_SQL, [key], |row| row.get(0))?;
     Ok(!unknown)
 }
 
@@ -2373,7 +2392,15 @@ fn projection_seed_from_tx(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
 ) -> Result<Option<ProjectionSeed>, StoreError> {
-    if !attribution_complete(tx, key)? {
+    projection_seed_from_complete_tx(tx, key, attribution_complete(tx, key)?)
+}
+
+fn projection_seed_from_complete_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    complete: bool,
+) -> Result<Option<ProjectionSeed>, StoreError> {
+    if !complete {
         return Ok(None);
     }
     let (watermark_seq, prefix_len) = current_projection_position(tx, key)?;
@@ -2538,6 +2565,123 @@ fn decode_messages(encoded: Vec<EncodedMessage>) -> Result<Vec<Message>, StoreEr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attribution_probe_uses_partial_session_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut conn = store.conn.lock().unwrap();
+        let plans: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::UNATTRIBUTED_MESSAGE_SQL
+            ))
+            .unwrap()
+            .query_map(["legacy"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.contains("message_unattributed_session_idx")),
+            "{plans:?}"
+        );
+        conn.execute(
+            "INSERT INTO message(session,ord,json,run_json) VALUES('legacy',0,'{}','null')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(super::attribution_complete(&tx, "legacy").unwrap());
+        tx.commit().unwrap();
+        conn.execute(
+            "UPDATE message SET run_json=NULL WHERE session='legacy'",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(!super::attribution_complete(&tx, "legacy").unwrap());
+    }
+
+    #[test]
+    fn schema_upgrade_failure_rolls_back_every_partial_change() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::SCHEMA_UPGRADE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(|| {
+                Err(super::StoreError::InconsistentSnapshot(
+                    "injected schema failure",
+                ))
+            })
+        });
+        let result = SqliteStore::init(&conn);
+        super::SCHEMA_UPGRADE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(result.is_err());
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tables, 0,
+            "failed initialization must not publish an upgraded prefix of the schema"
+        );
+        SqliteStore::init(&conn).unwrap();
+        SqliteStore::init(&conn).unwrap();
+    }
+
+    #[test]
+    fn concurrent_store_opens_share_one_complete_schema_and_export_identity() {
+        let path = broca_test_support::scratch_root().join("concurrent-store-init.sqlite");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteStore::open(path).unwrap().export_source_instance_id
+                })
+            })
+            .collect();
+        let identities: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(identities.iter().all(|identity| identity == &identities[0]));
+    }
+
+    #[test]
+    fn legacy_prefix_discovery_is_read_only() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute("INSERT INTO meta(session,watermark_seq,context_epoch,run_attribution_version) VALUES('legacy',7,0,2)", []).unwrap();
+        conn.execute(
+            "INSERT INTO message(session,ord,json,run_json) VALUES('legacy',0,'{}','null')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "query_only", true).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            super::current_projection_position(&tx, "legacy").unwrap(),
+            (7, 1)
+        );
+        assert!(super::attribution_complete(&tx, "legacy").unwrap());
+        tx.commit().unwrap();
+        let prefix: Option<i64> = conn
+            .query_row(
+                "SELECT prefix_len FROM meta WHERE session='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            prefix, None,
+            "read-only discovery must leave legacy repair to a projection writer"
+        );
+    }
+
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use broca_core::{MaterializedStore, Persister, RunIndex, WalStore};
@@ -3710,7 +3854,7 @@ mod tests {
     }
 
     #[test]
-    fn null_prefix_length_is_recomputed_and_persisted() {
+    fn null_prefix_length_is_discovered_read_only_and_repaired_by_projection() {
         use broca_core::MaterializedStore;
         use broca_protocol::content::{ContentBlock, Message, Role};
 
@@ -3759,7 +3903,43 @@ mod tests {
                 |row| row.get::<_, Option<i64>>(0),
             )
             .unwrap();
-        assert_eq!(persisted, Some(1));
+        assert_eq!(
+            persisted, None,
+            "snapshot reads must not upgrade their transaction"
+        );
+        let mut records = crate::conformance::base_records(&session);
+        records.extend(crate::conformance::text_turn(2, 1, "projected"));
+        let wal_path = broca_test_support::scratch_root().join("legacy-prefix-repair.wal");
+        let mut wal = broca_wal::FileWal::open(&wal_path)
+            .unwrap()
+            .with_feature_floor(wal_path.with_extension("floor"));
+        for frame in records {
+            wal.append(1, &frame.record, true).unwrap();
+        }
+        let range = broca_wal::read_records_range(
+            &wal_path,
+            broca_wal::DEFAULT_MAX_READ_BYTES,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        Persister::project_range(&store, &session, &range).unwrap();
+        let repaired: Option<i64> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT prefix_len FROM meta WHERE session=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            repaired,
+            Some(2),
+            "the explicit projection writer persists the discovered length"
+        );
     }
 
     #[test]
