@@ -326,8 +326,18 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
                 1,
                 NotReproducible("v2 normalizes model-visible tool names at the render edge"),
             ),
-            // Older versions retain their per-call cap behavior when replayed.
-            (2, Reproducible),
+            (
+                2,
+                NotReproducible(
+                    "earlier versions sent no toolConfig on a finalize request whose history carries tool blocks",
+                ),
+            ),
+            (
+                3,
+                NotReproducible(
+                    "earlier versions sent no toolConfig on a finalize request whose history carries tool blocks",
+                ),
+            ),
         ],
         WireFamilyId::OpenAiResponses => &[
             (
@@ -740,7 +750,8 @@ pub fn openai_chat_frozen_config(wire_model_id: impl Into<String>) -> FrozenRend
 /// bytes.
 /// v2: normalize model-visible tool names at the render edge.
 /// v3: bound new per-call output limits by the frozen model maximum; retain v2 replay bytes.
-pub const BEDROCK_RENDERER_VERSION: u32 = 3;
+/// v4: keep tool definitions when finalizing a conversation that has tool-call history.
+pub const BEDROCK_RENDERER_VERSION: u32 = 4;
 
 /// Default AWS region used by the convenience Bedrock frozen config. Real provider
 /// specs resolve the region from `AuthKind::SigV4`.
