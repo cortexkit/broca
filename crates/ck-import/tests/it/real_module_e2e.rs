@@ -337,6 +337,7 @@ async fn imports_reads_and_continues_on_real_module_rig() {
             service_tier: None,
             tools: Some(Vec::new()),
             send_id: Some("continue-import-e2e"),
+            max_output_tokens: None,
             cache: None,
             budget: None,
             auth: None,

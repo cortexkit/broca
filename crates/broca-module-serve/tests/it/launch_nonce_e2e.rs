@@ -261,6 +261,7 @@ async fn with_only_the_descriptor_hello_registers_and_a_later_route_is_attested_
             service_tier: None,
             tools: Some(vec![tool]),
             send_id: None,
+            max_output_tokens: None,
             cache: None,
             budget: None,
             auth: None,

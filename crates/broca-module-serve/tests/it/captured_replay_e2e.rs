@@ -793,6 +793,7 @@ async fn send_anthropic_turn(
             service_tier: None,
             tools: Some(tools),
             send_id: None,
+            max_output_tokens: None,
             cache: None,
             budget: Some(
                 serde_json::from_str(
