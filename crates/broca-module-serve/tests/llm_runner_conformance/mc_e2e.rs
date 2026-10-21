@@ -1,12 +1,13 @@
 //! Opt-in real Magic Context compaction. Every module and database is private to this rig.
-//! Run with test-clock, BROCA_MC_E2E_BIN and BROCA_MC_E2E_DB; no external model is called.
+//! Run with test-clock, BROCA_MC_E2E_BIN, BROCA_MC_E2E_BIN_SHA256 and BROCA_MC_E2E_DB; no
+//! external model is called. MC stages a new build per change, so the operator states the
+//! sha256 MC published for the build under test, and the rig refuses any other bytes.
 use super::*;
 use broca_core::WalStore;
 use broca_wal::{CompactionMessageKind, WalRecord};
 use sha2::{Digest, Sha256};
 
 const SESSION: &str = "mc-e2e";
-const BIN_SHA: &str = "8eeeaae339d2db3d1942f5b6b151ba9735a9b202cb59a598a99f41104ff9bfdc";
 const DB_SHA: &str = "c84e26b0d4e394dcc2288dc9290539633e890c0c564bd7dba7309d5e5edd2060";
 
 #[derive(Clone)]
@@ -16,14 +17,14 @@ pub(super) struct McConfig {
 }
 
 impl McConfig {
-    fn prepare(root: &Path, binary: &Path, database: &Path) -> Self {
+    fn prepare(root: &Path, binary: &Path, binary_sha: &str, database: &Path) -> Self {
         let root = root.join("mc");
         let data = root.join("data/cortexkit/magic-context");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(root.join("config/cortexkit")).unwrap();
         std::fs::create_dir_all(root.join("home")).unwrap();
         for (source, destination, digest) in [
-            (binary, root.join("ckdev-mc"), BIN_SHA),
+            (binary, root.join("ckdev-mc"), binary_sha),
             (database, data.join("context.db"), DB_SHA),
         ] {
             let bytes =
@@ -327,6 +328,8 @@ async fn real_mc_async_compaction_end_to_end() {
     // Once opted in, every prerequisite is mandatory, including under BROCA_REQUIRE_SUBC.
     let database = std::env::var_os("BROCA_MC_E2E_DB")
         .expect("BROCA_MC_E2E_DB must name the staged v102 fixture");
+    let binary_sha = std::env::var("BROCA_MC_E2E_BIN_SHA256")
+        .expect("BROCA_MC_E2E_BIN_SHA256 must name the sha256 MC published for this build");
     for (name, env) in [
         ("ck-subc", "SUBC_CORE_BIN"),
         ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
@@ -353,7 +356,7 @@ async fn real_mc_async_compaction_end_to_end() {
         !root.join("broca-state").exists(),
         "use a fresh artifact directory for each run"
     );
-    let mc = McConfig::prepare(&root, Path::new(&binary), Path::new(&database));
+    let mc = McConfig::prepare(&root, Path::new(&binary), &binary_sha, Path::new(&database));
     let mut subject = BrocaSubject::new(&root).await;
     subject.mc = Some(mc.clone());
     subject
@@ -371,7 +374,7 @@ async fn real_mc_async_compaction_end_to_end() {
         root: root.clone(),
         identity: subject.bind_identity(SESSION),
     };
-    note(&root, format!("Authenticated MC sha256={BIN_SHA}; fixture sha256={DB_SHA}; no billed models; artifacts={}", root.display()));
+    note(&root, format!("Authenticated MC sha256={binary_sha}; fixture sha256={DB_SHA}; no billed models; artifacts={}", root.display()));
     subject
         .install_script(
             SESSION,

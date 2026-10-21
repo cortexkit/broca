@@ -1777,8 +1777,12 @@ async fn finish_bind(
         )
         .await;
     }
+    // The whole bind triple, not only the session: a caller that reads back under the wrong
+    // harness or root addresses a different (often empty) WAL, and only this line shows it.
     tracing::debug!(target: "wire.ingress", stage = "bound", channel = completed.channel,
-        epoch = completed.epoch, session = %completed.identity.session, "module route bound");
+        epoch = completed.epoch, session = %completed.identity.session,
+        harness = %completed.identity.harness, project_root = %completed.identity.project_root.display(),
+        "module route bound");
     if let Some(cancel) = routes.agent_data_cancel.remove(&completed.channel) {
         cancel.cancel();
     }
