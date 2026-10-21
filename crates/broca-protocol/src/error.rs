@@ -198,6 +198,8 @@ pub struct GoogleRpcRetryInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub class: ErrorClass,
+    /// Provider text is retained verbatim for diagnostics and may echo request content or
+    /// credentials. No redaction or secret-removal guarantee applies to this field.
     pub message: String,
     /// HTTP status when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,7 +214,7 @@ pub struct ProviderError {
     /// `provider_code`, kept as a finer-grained diagnostic beneath it. Today it is set only on a
     /// [`REQUEST_INVALID`] error, where it carries the provider's reason for refusing the request
     /// (OpenAI's `invalid_json_schema`, for example), so a caller can see WHICH request field was
-    /// wrong without broca keeping the provider's message, which may echo request content or
+    /// wrong without parsing the provider's message, which may echo request content or
     /// credentials.
     ///
     /// It is an open vocabulary the provider defines, so a consumer must never route on it:
@@ -372,6 +374,18 @@ impl ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_message_is_retained_verbatim() {
+        let bytes =
+            r#"{"class":"permanent","message":"provider echoed private request detail: SECRET"}"#;
+        let error: ProviderError = serde_json::from_str(bytes).unwrap();
+        assert_eq!(
+            error.message,
+            "provider echoed private request detail: SECRET"
+        );
+        assert_eq!(serde_json::to_string(&error).unwrap(), bytes);
+    }
 
     #[test]
     fn pre_provenance_error_bytes_remain_unchanged() {

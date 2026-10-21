@@ -85,6 +85,10 @@ reporting; a 403 must not invalidate a valid credential.
 - Producer detail (broca `provider_code`/`status`, vault `ReadError` name)
   travels alongside for diagnostics, logging, and corroboration ONLY. A consumer
   branching generically on detail is the bug this contract kills.
+- `ProviderError.message` is retained verbatim from the provider on caller and status surfaces. It
+  may echo request content or credentials; callers must treat it as untrusted text, and this
+  contract makes no redaction or secret-removal guarantee. Classification must never be inferred
+  from it.
 
 ## Guard: arm-admission test
 
