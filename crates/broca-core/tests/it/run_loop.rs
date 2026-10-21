@@ -885,7 +885,8 @@ async fn nonzero_step_count_is_admitted() {
     .await;
 
     let summary = result.expect("nonzero step_count must admit");
-    assert_eq!(summary.reason, RunFinishReason::MaxSteps);
+    // The one allowed step is text, so the run ended on its own: `completed`, not `max_steps`.
+    assert_eq!(summary.reason, RunFinishReason::Completed);
     assert_eq!(summary.steps, 1);
     assert_eq!(
         provider.calls().len(),
@@ -964,7 +965,8 @@ async fn zero_step_count_in_frozen_config_remains_resumable() {
     collector.await.unwrap();
 
     let summary = result.expect("a frozen zero step_count must not wedge resume admission");
-    assert_eq!(summary.reason, RunFinishReason::MaxSteps);
+    // The resumed step is text, so the run ended on its own: `completed`, not `max_steps`.
+    assert_eq!(summary.reason, RunFinishReason::Completed);
     assert_eq!(summary.steps, 1);
     assert_eq!(
         provider.calls().len(),
@@ -1628,6 +1630,74 @@ async fn multi_step_tool_batches_borrow_one_large_manifest() {
         "every batch must borrow the same run-owned manifest"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `max_steps` means the step limit cut off a run that wanted to continue. A limiting step that
+/// requests no tools ended the run on its own and is `completed`, with its final text; a
+/// limiting step that requests tools is cut off and ends `max_steps`. The module path
+/// (`emit_control_payloads: false`, as the serve binary runs) and the direct path end a step
+/// in different branches of the loop, so both are checked.
+#[tokio::test]
+async fn the_step_limit_ends_max_steps_only_when_the_limiting_step_requested_tools() {
+    for emit_control_payloads in [false, true] {
+        let (store, dir) = tmp_lease_store(&format!("limit-text-{emit_control_payloads}"));
+        let control = RunControl {
+            emit_control_payloads,
+            ..RunControl::default()
+        };
+        let (summary, _, records) = drive_with_control(
+            req(
+                &format!("limit-text-{emit_control_payloads}"),
+                vec![tool("lookup", ExecutionMode::Parallel)],
+                vec![StopCondition::StepCount { n: 1 }],
+            ),
+            StubProvider::new(vec![text_step("the whole answer")]),
+            &StubToolPlane::new(),
+            &store,
+            &AllowAll,
+            control.clone(),
+        )
+        .await;
+        let summary = summary.expect("the text step ends the run");
+        assert_eq!(
+            summary.reason,
+            RunFinishReason::Completed,
+            "a no-tool step at the limit ended on its own (emit_control_payloads={emit_control_payloads})"
+        );
+        assert!(records.iter().any(|r| matches!(
+            &r.record,
+            WalRecord::RunFinished {
+                reason: RunFinishReason::Completed,
+                ..
+            }
+        )));
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (store, dir) = tmp_lease_store(&format!("limit-tool-{emit_control_payloads}"));
+        let (summary, _, _) = drive_with_control(
+            req(
+                &format!("limit-tool-{emit_control_payloads}"),
+                vec![tool("lookup", ExecutionMode::Parallel)],
+                vec![StopCondition::StepCount { n: 1 }],
+            ),
+            StubProvider::new(vec![tool_step(&[(
+                "toolu_limit",
+                "lookup",
+                json!({"q": 1}),
+            )])]),
+            &StubToolPlane::new().with_canned_text("lookup", "never runs"),
+            &store,
+            &AllowAll,
+            control,
+        )
+        .await;
+        assert_eq!(
+            summary.expect("the limit seals the tool turn").reason,
+            RunFinishReason::MaxSteps,
+            "a tool-requesting step at the limit is cut off (emit_control_payloads={emit_control_payloads})"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[tokio::test]

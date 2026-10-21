@@ -147,12 +147,15 @@ fn assert_terminal_cut(records: &[WalRecord], expected: RunFinishReason) {
 #[tokio::test]
 async fn step_count_and_ordered_stop_conditions_preserve_live_reason_at_terminal_cut() {
     use StopCondition::{LoopFinished, StepCount};
+    // These runs' only step is text: a step that requests no tools ends the run `completed`
+    // even when it is also the step limit. Tool turns at the limit are covered by the hard-stop
+    // tests, which end `max_steps`.
     for (conditions, expected) in [
-        (vec![StepCount { n: 1 }], RunFinishReason::MaxSteps),
+        (vec![StepCount { n: 1 }], RunFinishReason::Completed),
         (vec![StepCount { n: 2 }], RunFinishReason::Completed),
         (
             vec![StepCount { n: 1 }, LoopFinished],
-            RunFinishReason::MaxSteps,
+            RunFinishReason::Completed,
         ),
         (
             vec![LoopFinished, StepCount { n: 1 }],

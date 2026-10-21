@@ -330,7 +330,8 @@ fn a_steer_pending_after_a_final_answer_keeps_the_episode_running() {
 }
 
 /// A step a stop condition ended is not extended by a steer: the limit wins, the steer stays
-/// undelivered and is placed at the close.
+/// undelivered and is placed at the close. The step requested no tools, so the run ended on its
+/// own and is `completed`, not `max_steps`.
 #[test]
 fn a_steer_never_extends_a_step_a_limit_ended() {
     let records = vec![
@@ -346,7 +347,7 @@ fn a_steer_never_extends_a_step_a_limit_ended() {
     assert_eq!(
         state.resolution,
         ReplayResolution::LineageIdle {
-            last_reason: RunFinishReason::MaxSteps
+            last_reason: RunFinishReason::Completed
         }
     );
 }

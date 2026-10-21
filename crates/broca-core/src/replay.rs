@@ -1538,20 +1538,17 @@ fn replay_seeded_with_compaction<'a>(
                         step_tags,
                     ));
                     ep.natural_end = true;
-                    // Match live evaluation before its natural-end fallback, using the original
-                    // assistant message. Budget-finalize turns above bypass stop_when in both paths.
+                    // Match live evaluation, using the original assistant message: a step that
+                    // requests no tools ends the run `completed`, even when it is also the
+                    // `max_steps` limit, because the limit cut nothing off. Budget-finalize turns
+                    // above bypass stop_when in both paths.
                     ep.natural_stop_reason = run_config.as_ref().and_then(|config| {
                         crate::run::stop_satisfied(
                             &config.stop_when,
                             ep.completed_steps,
                             assistant_message,
                         )
-                        .map(|condition| match condition {
-                            broca_protocol::request::StopCondition::StepCount { .. } => {
-                                RunFinishReason::MaxSteps
-                            }
-                            _ => RunFinishReason::Completed,
-                        })
+                        .map(|_| RunFinishReason::Completed)
                     });
                     ep.natural_end_extendable = run_config.as_ref().is_none_or(|config| {
                         !crate::run::limiting_stop_satisfied(

@@ -15,7 +15,8 @@ use broca_wal::WalRecord;
 use tokio::sync::mpsc;
 
 #[tokio::test]
-async fn replay_before_run_finished_preserves_live_max_steps_reason_for_text_only_step() {
+async fn replay_before_run_finished_preserves_live_completed_reason_for_text_only_step_at_the_limit(
+) {
     let dir = broca_test_support::scratch_root().join(format!(
         "broca-terminal-reason-crash-cut-{}-{}",
         std::process::id(),
@@ -102,12 +103,14 @@ async fn replay_before_run_finished_preserves_live_max_steps_reason_for_text_onl
         .collect();
     std::fs::remove_dir_all(&dir).unwrap();
 
+    // The only step is text and is also the step limit. It requested no tools, so the run
+    // ended on its own and is `completed`: the limit cut nothing off.
     assert_eq!(summary.steps, 1);
-    assert_eq!(summary.reason, RunFinishReason::MaxSteps);
+    assert_eq!(summary.reason, RunFinishReason::Completed);
     assert!(matches!(
         records.last(),
         Some(WalRecord::RunFinished {
-            reason: RunFinishReason::MaxSteps,
+            reason: RunFinishReason::Completed,
             ..
         })
     ));
@@ -119,8 +122,8 @@ async fn replay_before_run_finished_preserves_live_max_steps_reason_for_text_onl
     );
 
     // Keep the actual durable prefix, not a hand-built proxy for the loop's records.
-    // A text-only response also hits the step cap here. Losing only RunFinished must
-    // not change the caller-visible reason from MaxSteps to a natural Completed stop.
+    // Losing only RunFinished must not change the caller-visible reason: replay must also
+    // read a text-only step at the limit as `completed`, never `max_steps`.
     let cut = &records[..records.len() - 1];
     assert!(!cut
         .iter()

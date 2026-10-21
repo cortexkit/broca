@@ -357,7 +357,8 @@ pub const REPETITION_GUIDANCE: Scenario = Scenario {
     expected: RunFinishReason::Completed,
 };
 
-/// One text step under a one-step limit, which ends MaxSteps.
+/// One text step under a one-step limit. The step requested no tools, so the run ended on its
+/// own and is `completed`, even though the step was also the limit.
 pub const TEXT_ONLY_MAX_STEPS: Scenario = Scenario {
     name: "text_only_max_steps",
     request: max_steps_request,
@@ -365,7 +366,7 @@ pub const TEXT_ONLY_MAX_STEPS: Scenario = Scenario {
     scripts: one_text_step_scripts,
     render: Render::Canonical,
     plane: empty_plane,
-    expected: RunFinishReason::MaxSteps,
+    expected: RunFinishReason::Completed,
 };
 
 pub const ALL: &[Scenario] = &[

@@ -19706,3 +19706,45 @@ expect_red = ["bedrock_converse_golden::bedrock_finalize_turn_keeps_tool_config_
 file = "crates/broca-provider/src/families/bedrock_converse.rs"
 old = "    if matches!(choice, ToolChoice::None) && !has_tool_history {"
 new = "    if matches!(choice, ToolChoice::None) { // NON-VACUITY BREAK: omit config despite historical tools"
+
+[[control]]
+id = "run-text-step-at-limit-completes"
+guards = "On the module path (no control payloads), a step that requests no tools ends the run completed even when it is also the max_steps limit"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-core/tests/it/run_loop.rs"
+expect_red = ["run_loop::the_step_limit_ends_max_steps_only_when_the_limiting_step_requested_tools"]
+file = "crates/broca-core/src/run.rs"
+old = '''                    let no_tool_reason = RunFinishReason::Completed;'''
+new = '''                    let no_tool_reason = stop_satisfied(&stop_when, completed_steps + 1, &message).filter(|c| matches!(c, StopCondition::StepCount { .. })).map_or(RunFinishReason::Completed, |_| RunFinishReason::MaxSteps); // NON-VACUITY BREAK: the limit names a natural end max_steps.'''
+
+[[control]]
+id = "run-text-step-at-limit-completes-direct"
+guards = "On the direct path (control payloads on), the post-step stop check ends a no-tool limiting step completed; only a limiting step with tool calls ends max_steps"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-core/tests/it/run_loop.rs"
+expect_red = ["run_loop::the_step_limit_ends_max_steps_only_when_the_limiting_step_requested_tools"]
+file = "crates/broca-core/src/run.rs"
+old = '''                StopCondition::StepCount { .. } if !pending.is_empty() => RunFinishReason::MaxSteps,'''
+new = '''                StopCondition::StepCount { .. } => RunFinishReason::MaxSteps, // NON-VACUITY BREAK: any limiting step ends max_steps.'''
+
+[[control]]
+id = "replay-text-step-at-limit-completes"
+guards = "Crash replay reads a text-only step at the max_steps limit as completed, the same as the live run loop"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+features = ["test-clock"]
+target = "--test it"
+test_file = "crates/broca-core/tests/it/terminal_reason_crash_cut.rs"
+expect_red = ["terminal_reason_crash_cut::replay_before_run_finished_preserves_live_completed_reason_for_text_only_step_at_the_limit"]
+file = "crates/broca-core/src/replay.rs"
+old = '''                        .map(|_| RunFinishReason::Completed)'''
+new = '''                        .map(|condition| if matches!(condition, broca_protocol::request::StopCondition::StepCount { .. }) { RunFinishReason::MaxSteps } else { RunFinishReason::Completed }) // NON-VACUITY BREAK: replay names a natural end max_steps.'''

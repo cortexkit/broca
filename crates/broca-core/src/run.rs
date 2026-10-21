@@ -4770,16 +4770,12 @@ where
                     // counters and finish reason below. Replay and materialization rebuild the
                     // terminal prompt from this WAL record, so the live path can transfer its
                     // sole message graph instead of retaining an otherwise-unread clone.
-                    let no_tool_reason = if finalize_turn {
-                        RunFinishReason::Completed
-                    } else {
-                        stop_satisfied(&stop_when, completed_steps + 1, &message)
-                            .map(|condition| match condition {
-                                StopCondition::StepCount { .. } => RunFinishReason::MaxSteps,
-                                _ => RunFinishReason::Completed,
-                            })
-                            .unwrap_or(RunFinishReason::Completed)
-                    };
+                    // A step that requests no tools ended the run on its own, so the run is
+                    // `completed` even when this step is also the `max_steps` limit: the limit
+                    // cut nothing off. `max_steps` is reserved for a limiting step that asked
+                    // for tools, which the hard stop below seals. A completed run keeps its final
+                    // text, directives and structured output, which a `max_steps` run never has.
+                    let no_tool_reason = RunFinishReason::Completed;
                     if no_tool_reason == RunFinishReason::Completed && wants_final_text {
                         natural_final_text = Some(joined_text(&message));
                     }
@@ -5111,11 +5107,15 @@ where
         if let Some(cond) =
             stop_satisfied(&stop_when, completed_steps, &assembled).filter(|_| !extend_for_steer)
         {
+            let pending: Vec<ToolCall> = assembled.tool_calls().cloned().collect();
+            // `max_steps` means the limit cut off a run that wanted to continue: only a
+            // limiting step that requested tools ends that way. A step with no tool calls
+            // ended the run on its own, so it is `completed` even at the limit, the same as
+            // the no-tool branch above and as replay reads it.
             let reason = match cond {
-                StopCondition::StepCount { .. } => RunFinishReason::MaxSteps,
+                StopCondition::StepCount { .. } if !pending.is_empty() => RunFinishReason::MaxSteps,
                 _ => RunFinishReason::Completed,
             };
-            let pending: Vec<ToolCall> = assembled.tool_calls().cloned().collect();
             if !pending.is_empty() {
                 let outcome = match cond {
                     StopCondition::StepCount { .. } => DispatchOutcome::MaxSteps,
