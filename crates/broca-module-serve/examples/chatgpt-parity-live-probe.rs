@@ -352,7 +352,10 @@ async fn live(model: &str) -> Result<(), &'static str> {
             ..EpisodeRenderConfig::default()
         },
     )
-    .map_err(|_| "catalog_provider_resolution_failed")?;
+    .map_err(|error| {
+        eprintln!("catalog resolution error: {error}");
+        "catalog_provider_resolution_failed"
+    })?;
     println!(
         "{}",
         json!({"event":"probe_started","logical_steps":3,"per_step_deadline_secs":180,"credential_min_validity_ms":20 * 60 * 1000,"in_run_credential_refresh":false,"provider_retries":"production_enabled","headers":"withheld","reply_contents":"withheld"})
