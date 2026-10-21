@@ -21730,5 +21730,5 @@ select = "expected"
 test_file = "crates/broca-wire/src/lib.rs"
 expect_red = ["caller_message_tests::stateful_caller_message_serializer_uses_borrowed_content"]
 file = "crates/broca-wire/src/lib.rs"
-old = "CallerMessageRef(message).serialize(serializer)"
-new = "CallerMessageRef(&(*message).clone()).serialize(serializer) // NON-VACUITY BREAK: clone all message blocks"
+old = "    CallerMessageRef(message).serialize(serializer)\n}\n\nstruct CallerMessageRef"
+new = "    CallerMessageRef(&(*message).clone()).serialize(serializer) // NON-VACUITY BREAK: clone all message blocks\n}\n\nstruct CallerMessageRef"
