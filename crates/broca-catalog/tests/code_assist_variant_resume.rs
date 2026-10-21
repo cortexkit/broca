@@ -69,6 +69,7 @@ mod gated {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            chatgpt_wire: None,
             reasoning_content_required: None,
             reasoning_echo: None,
             provider_text_state: None,

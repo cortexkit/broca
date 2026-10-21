@@ -44,10 +44,55 @@ fn cut_tool_events(ceiling: bool) -> Vec<Value> {
 struct Observed {
     handshakes: usize,
     headers: Vec<BTreeMap<String, String>>,
+    upgrade_bytes: Vec<Vec<u8>>,
     requests: Vec<Vec<u8>>,
     http_bodies: Vec<Vec<u8>>,
+    http_headers: Vec<String>,
     closes: usize,
     held_cuts: usize,
+}
+
+struct CaptureUpgrade<S> {
+    inner: S,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CaptureUpgrade<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let mut captured = self.bytes.lock().unwrap();
+            if !captured.windows(4).any(|part| part == b"\r\n\r\n") {
+                captured.extend_from_slice(&buf.filled()[before..]);
+            }
+        }
+        result
+    }
+}
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CaptureUpgrade<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 struct Mock {
     url: String,
@@ -122,7 +167,8 @@ impl Mock {
                                 while !header.ends_with(b"\r\n\r\n") {
                                     header.push(tcp.read_u8().await.unwrap());
                                 }
-                                let header = String::from_utf8(header).unwrap();
+                                 let header = String::from_utf8(header).unwrap();
+                                 seen.lock().unwrap().http_headers.push(header.clone());
                                 let length = header.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").map(|value| value.parse::<usize>().unwrap())).unwrap();
                                 let mut body = vec![0; length];
                                 tcp.read_exact(&mut body).await.unwrap();
@@ -139,7 +185,9 @@ impl Mock {
                             let capture = Arc::clone(&seen);
                             let mut config = tungstenite::protocol::WebSocketConfig::default();
                             config.extensions.permessage_deflate = Some(tungstenite::extensions::compression::deflate::DeflateConfig::default());
-                            let upgrade = tokio_tungstenite::accept_hdr_async_with_config(tcp, move |request: &Request, response: Response| {
+                             let raw = Arc::new(Mutex::new(Vec::new()));
+                             let tcp = CaptureUpgrade { inner: tcp, bytes: Arc::clone(&raw) };
+                             let upgrade = tokio_tungstenite::accept_hdr_async_with_config(tcp, move |request: &Request, response: Response| {
                                 let headers = request.headers().iter().map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned())).collect();
                                 let mut observed = capture.lock().unwrap();
                                 observed.handshakes += 1;
@@ -158,7 +206,8 @@ impl Mock {
                                     return Err(tungstenite::http::Response::builder().status(status).body(Some("PRIVATE-UPGRADE-BODY Bearer mock-token".into())).unwrap());
                                 }
                                 Ok(response)
-                            }, Some(config)).await;
+                             }, Some(config)).await;
+                             seen.lock().unwrap().upgrade_bytes.push(raw.lock().unwrap().clone());
                             let Ok(mut socket) = upgrade else { return; };
                             while let Some(Ok(message)) = socket.next().await {
                                 match message {
@@ -257,6 +306,879 @@ fn provider(mock: &Mock) -> LiveProvider<OpenAiResponsesChatgpt> {
             ("user-agent".into(), "codex_cli_rs/0.144.0".into()),
         ]),
     )
+}
+
+fn codex_provider(mock: &Mock) -> LiveProvider<OpenAiResponsesChatgpt> {
+    let mut provider = provider(mock);
+    let mut frozen = (*provider.frozen).clone();
+    frozen.chatgpt_wire = Some(
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/chatgpt_codex_0_163_identity.json"
+        ))
+        .unwrap(),
+    );
+    frozen.prompt_cache_key = Some("caller-cache-key".into());
+    provider.frozen = Arc::new(frozen);
+    provider
+}
+
+#[tokio::test]
+async fn codex_profile_headers_are_observed_from_real_upgrade() {
+    let mock = Mock::start(vec![text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let events = step(&provider, 1, &opts()).await;
+    assert!(attempts(&events)
+        .iter()
+        .all(|a| a.outcome == AttemptOutcome::Complete));
+    let observed = mock.observed.lock().unwrap();
+    let raw = String::from_utf8(observed.upgrade_bytes[0].clone()).unwrap();
+    let lines: Vec<_> = raw.split("\r\n").collect();
+    for expected in [
+        "originator: codex_cli_rs",
+        "user-agent: codex_cli_rs/0.163.0 (Mac OS 26.0.1; arm64) Apple_Terminal/455",
+        "thread-id: 11111111-2222-5333-8444-555555555555",
+        "x-client-request-id: 11111111-2222-5333-8444-555555555555",
+        "session-id: caller-cache-key",
+        "x-codex-window-id: 12345678-1234-4234-8234-123456789abc",
+        "openai-beta: responses_websockets=2026-02-06",
+        "chatgpt-account-id: account",
+        "authorization: Bearer mock-token",
+    ] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?} in captured upgrade {raw:?}"
+        );
+    }
+    assert!(!lines
+        .iter()
+        .any(|line| line.starts_with("accept:") || line.starts_with("content-type:")));
+    let names: Vec<_> = lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| line.split_once(": ").map(|(key, _)| key))
+        .collect();
+    let expected_body: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/chatgpt_codex_0_163_plain.json"
+    ))
+    .unwrap();
+    let expected_metadata = format!(
+        "x-codex-turn-metadata: {}",
+        expected_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .unwrap()
+    );
+    assert!(lines.contains(&expected_metadata.as_str()));
+    assert_eq!(
+        names,
+        [
+            "Host",
+            "Connection",
+            "Upgrade",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Key",
+            "chatgpt-account-id",
+            "authorization",
+            "user-agent",
+            "openai-beta",
+            "x-codex-turn-metadata",
+            "originator",
+            "x-client-request-id",
+            "session-id",
+            "thread-id",
+            "x-codex-window-id",
+            "sec-websocket-extensions"
+        ]
+    );
+    let canonical = provider.render_request(&opts());
+    let attempt = attempts(&events)[0];
+    assert_eq!(
+        attempt.request_body_sha256,
+        RequestDigest::of(&canonical).sha256
+    );
+    assert!(observed.requests[0]
+        .starts_with(b"{\"type\":\"response.create\",\"model\":\"m\",\"stream\":true,\"input\":"));
+}
+
+#[tokio::test]
+async fn codex_profile_https_orders_wire_without_changing_canonical_digest() {
+    let mock = Mock::start(vec![text_events()], false, true).await;
+    let provider = codex_provider(&mock);
+    let canonical = provider.render_request(&opts());
+    let events = step(&provider, 1, &opts()).await;
+    let observed = mock.observed.lock().unwrap();
+    assert_eq!(observed.http_bodies.len(), 1);
+    assert!(observed.http_headers[0]
+        .contains("x-client-request-id: 11111111-2222-5333-8444-555555555555\r\n"));
+    assert!(observed.http_bodies[0].starts_with(b"{\"model\":\"m\",\"stream\":true,\"input\":"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&observed.http_bodies[0]).unwrap(),
+        serde_json::from_slice::<Value>(&canonical).unwrap()
+    );
+    assert_eq!(
+        attempts(&events)[0].request_body_sha256,
+        RequestDigest::of(&canonical).sha256
+    );
+}
+
+#[tokio::test]
+async fn codex_profile_refresh_preserves_frozen_identity() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let refresh = Arc::new(RefreshScript {
+        expiring: Mutex::new(std::collections::VecDeque::from([
+            None,
+            Some(fresh_credential("fresh-token", "account", "expiring")),
+        ])),
+        rejected: Mutex::new(None),
+        rereads: AtomicUsize::new(0),
+    });
+    let provider = codex_provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(refresh);
+    let first = step(&provider, 1, &opts()).await;
+    let second = step(&provider, 2, &opts()).await;
+    assert!(attempts(&second)[0].credential_refresh.is_some());
+    assert_eq!(
+        attempts(&first)[0].request_body_sha256,
+        attempts(&second)[0].request_body_sha256
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.headers[1]["authorization"], "Bearer fresh-token");
+    for name in [
+        "originator",
+        "user-agent",
+        "thread-id",
+        "x-client-request-id",
+        "session-id",
+        "x-codex-window-id",
+        "x-codex-turn-metadata",
+    ] {
+        assert_eq!(seen.headers[0][name], seen.headers[1][name], "{name}");
+    }
+    let mut first_body: Value = serde_json::from_slice(&seen.requests[0]).unwrap();
+    let mut second_body: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    for (body, events) in [(&mut first_body, &first), (&mut second_body, &second)] {
+        let sent = attempts(events)[0].sent_at_ms.unwrap().to_string();
+        assert_eq!(
+            body["client_metadata"]["x-codex-ws-stream-request-start-ms"],
+            sent
+        );
+        body["client_metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("x-codex-ws-stream-request-start-ms");
+    }
+    assert_eq!(
+        first_body["client_metadata"],
+        second_body["client_metadata"]
+    );
+}
+
+fn follow_up(mut options: CallOptions, events: &[NormalizedEvent], text: &str) -> CallOptions {
+    let assistant = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .expect("successful canonical assistant output");
+    let mut message = Message::new(Role::Assistant, assistant.content.clone());
+    message.origin = options.target_model.clone();
+    options.prompt.push(message);
+    options.prompt.push(Message::new(
+        Role::User,
+        vec![ContentBlock::Text { text: text.into() }],
+    ));
+    options
+}
+
+fn codex_trace(
+    events: &[NormalizedEvent],
+    index: usize,
+) -> &broca_protocol::provider::ChatgptContinuationTrace {
+    attempts(events)[index]
+        .websocket_request
+        .as_ref()
+        .unwrap()
+        .codex
+        .as_deref()
+        .unwrap()
+}
+
+fn assert_canonical(attempt: &ModelAttempt, canonical: &[u8]) {
+    assert_eq!(attempt.request_body_len, canonical.len() as u64);
+    let sha: String = Sha256::digest(canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(attempt.request_body_sha256, sha);
+}
+
+#[tokio::test]
+async fn codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let mut initial = opts();
+    initial.prompt[0].content = vec![ContentBlock::Text {
+        text: "deterministic cache prefix. ".repeat(150_000),
+    }];
+    let first = step(&provider, 1, &initial).await;
+    let next = follow_up(initial, &first, "Next question");
+    let canonical = provider.render_request(&next);
+    assert!(canonical.len() > 3 * 1024 * 1024);
+    let before = now_millis();
+    let second = step(&provider, 2, &next).await;
+    let after = now_millis();
+    assert_eq!(attempts(&second).len(), 1);
+    assert_canonical(attempts(&second)[0], &canonical);
+    let codex = codex_trace(&second, 0);
+    assert!(codex.continuation);
+    assert_eq!(codex.suffix_item_count, 1);
+    assert_eq!(codex.physical_send_count, 1);
+    assert!(codex.connection_generation > 0);
+    assert!(codex.previous_response_id_present);
+    assert_eq!(codex.full_input_reason, None);
+    assert_eq!(
+        codex.connection_generation,
+        codex_trace(&first, 0).connection_generation
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1);
+    assert_eq!(seen.requests.len(), 2);
+    assert!(seen.requests[1].len() < 2048);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["previous_response_id"], "r");
+    assert_eq!(
+        frame["input"],
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Next question"}]}])
+    );
+    let stamp = frame["client_metadata"]["x-codex-ws-stream-request-start-ms"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(stamp >= before && stamp <= after);
+    assert_eq!(Some(stamp), attempts(&second)[0].sent_at_ms);
+    assert!(
+        serde_json::from_slice::<Value>(&canonical).unwrap()["client_metadata"]
+            .get("x-codex-ws-stream-request-start-ms")
+            .is_none()
+    );
+    let digest = attempts(&second)[0].websocket_request.as_ref().unwrap();
+    assert_eq!(digest.len, seen.requests[1].len() as u64);
+    let sha: String = Sha256::digest(&seen.requests[1])
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(digest.sha256, sha);
+}
+
+#[tokio::test]
+async fn codex_continuation_equal_input_sends_empty_suffix() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let mut next = follow_up(opts(), &first, "unused");
+    next.prompt.pop();
+    let second = step(&provider, 2, &next).await;
+    assert!(codex_trace(&second, 0).continuation);
+    assert_eq!(codex_trace(&second, 0).suffix_item_count, 0);
+    let seen = mock.observed.lock().unwrap();
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["input"], serde_json::json!([]));
+    assert_eq!(frame["previous_response_id"], "r");
+}
+
+async fn codex_reset_case(case: &str) {
+    let close_after = case == "closed";
+    let mock = Mock::start(vec![text_events(), text_events()], close_after, false).await;
+    let mut provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let canonical = provider.render_request(&next);
+    match case {
+        "age" => provider
+            .websocket
+            .advance_clock(Duration::from_secs(56 * 60)),
+        "headers" => {
+            let mut current = provider.auth.write().unwrap();
+            let AuthHandle::Headers(headers) = Arc::make_mut(&mut current.auth) else {
+                panic!("fixture headers")
+            };
+            headers.push(("x-test-rotation".into(), "new".into()));
+        }
+        "auth_revision" => provider.auth.write().unwrap().revision += 1,
+        "retire" => provider.close_run_transport(),
+        "resume" => {
+            provider.close_run_transport();
+            provider = codex_provider(&mock);
+        }
+        "closed" => provider.websocket.wait_closed().await,
+        _ => panic!("unknown reset case"),
+    }
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(
+        attempts(&second).len(),
+        1,
+        "reset must precede send for {case}"
+    );
+    assert_canonical(attempts(&second)[0], &canonical);
+    assert!(!codex_trace(&second, 0).continuation, "{case}");
+    assert_eq!(codex_trace(&second, 0).suffix_item_count, 0);
+    assert!(!codex_trace(&second, 0).previous_response_id_present);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2, "{case}");
+    assert_eq!(seen.requests.len(), 2, "{case}");
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    let full: Value = serde_json::from_slice(&canonical).unwrap();
+    assert_eq!(frame["input"], full["input"], "{case}");
+    assert!(frame.get("previous_response_id").is_none());
+    if case != "resume" {
+        assert!(
+            codex_trace(&second, 0).connection_generation
+                > codex_trace(&first, 0).connection_generation
+        );
+    }
+}
+#[tokio::test]
+async fn codex_continuation_age_reset_is_full() {
+    codex_reset_case("age").await;
+}
+#[tokio::test]
+async fn codex_continuation_header_reset_is_full() {
+    codex_reset_case("headers").await;
+}
+#[tokio::test]
+async fn codex_continuation_auth_revision_reset_is_full() {
+    codex_reset_case("auth_revision").await;
+}
+#[tokio::test]
+async fn codex_continuation_explicit_retirement_is_full() {
+    codex_reset_case("retire").await;
+}
+#[tokio::test]
+async fn codex_continuation_resume_first_request_is_full() {
+    codex_reset_case("resume").await;
+}
+#[tokio::test]
+async fn codex_continuation_closed_socket_reset_is_full() {
+    codex_reset_case("closed").await;
+}
+
+#[tokio::test]
+async fn codex_continuation_endpoint_change_is_full() {
+    let first_mock = Mock::start(vec![text_events()], false, false).await;
+    let second_mock = Mock::start(vec![text_events()], false, false).await;
+    let mut provider = codex_provider(&first_mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    Arc::make_mut(&mut provider.frozen).base_url = Some(second_mock.url.clone());
+    let second = step(&provider, 2, &next).await;
+    assert!(!codex_trace(&second, 0).continuation);
+    assert_eq!(first_mock.observed.lock().unwrap().requests.len(), 1);
+    assert_eq!(second_mock.observed.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test]
+async fn codex_continuation_same_token_refresh_retires_socket() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let refresh = Arc::new(RefreshScript {
+        expiring: Mutex::new(std::collections::VecDeque::from([
+            None,
+            Some(fresh_credential("mock-token", "account", "expiring")),
+        ])),
+        rejected: Mutex::new(None),
+        rereads: AtomicUsize::new(0),
+    });
+    let provider = codex_provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(refresh);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert!(attempts(&second)[0].credential_refresh.is_some());
+    assert!(!codex_trace(&second, 0).continuation);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    for (name, value) in &seen.headers[0] {
+        if name != "sec-websocket-key" {
+            assert_eq!(seen.headers[1].get(name), Some(value));
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_failed_stream_retires_socket_and_retry_is_full() {
+    let failed = vec![
+        serde_json::json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"test"}}}),
+    ];
+    let mock = Mock::start(vec![text_events(), failed, text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 2);
+    assert_eq!(attempts(&second)[1].outcome, AttemptOutcome::Complete);
+    assert!(codex_trace(&second, 0).continuation);
+    assert!(!codex_trace(&second, 1).continuation);
+    let canonical = provider.render_request(&next);
+    for attempt in attempts(&second) {
+        assert_canonical(attempt, &canonical);
+    }
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.requests.len(), 3);
+    let frame: Value = serde_json::from_slice(&seen.requests[2]).unwrap();
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(
+        frame["input"],
+        serde_json::from_slice::<Value>(&canonical).unwrap()["input"]
+    );
+}
+
+#[tokio::test]
+async fn codex_continuation_incomplete_consumes_receipt_without_seeding_another() {
+    for reason in ["max_output_tokens", "interrupted", "content_filter"] {
+        let mut incomplete = text_events();
+        incomplete[1]["type"] = serde_json::json!("response.incomplete");
+        incomplete[1]["response"]["status"] = serde_json::json!("incomplete");
+        incomplete[1]["response"]["incomplete_details"] = serde_json::json!({"reason":reason});
+        let mock = Mock::start(vec![text_events(), incomplete, text_events()], false, false).await;
+        let provider = codex_provider(&mock);
+        let first = step(&provider, 1, &opts()).await;
+        let next = follow_up(opts(), &first, "Next");
+        let second = step(&provider, 2, &next).await;
+        assert!(codex_trace(&second, 0).continuation);
+        let third_options = follow_up(next, &second, "After incomplete");
+        let third = step(&provider, 3, &third_options).await;
+        assert!(!codex_trace(&third, 0).continuation, "{reason}");
+        assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_tool_argument_cut_retires_without_retry() {
+    let cut = vec![
+        serde_json::json!({"type":"response.created","response":{"id":"resp_cut"}}),
+        serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"bad","name":"lookup","arguments":""}}),
+        serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"key\":\"alpha\"}"}),
+        serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":" ".repeat(4097)}),
+    ];
+    let mock = Mock::start(vec![text_events(), cut, text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 1);
+    assert_eq!(
+        attempts(&second)[0].outcome,
+        AttemptOutcome::ToolArgsTrailingGarbage
+    );
+    assert!(codex_trace(&second, 0).continuation);
+    mock.wait_closes(1).await;
+    let third_options = follow_up(next, &second, "After cut");
+    let third = step(&provider, 3, &third_options).await;
+    assert!(!codex_trace(&third, 0).continuation);
+    assert_eq!(attempts(&third).len(), 1);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.requests.len(), 3);
+    assert!(seen.http_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn codex_continuation_consumer_drop_retires_pending_stream() {
+    let mock = Mock::start_internal(
+        vec![text_events(), vec![], text_events()],
+        false,
+        false,
+        None,
+        true,
+    )
+    .await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let receiver = provider.step(StepId(2), &next).await;
+    mock.wait_held_cut(1).await;
+    drop(receiver);
+    mock.cut_gates.add_permits(1);
+    mock.wait_closes(1).await;
+    let third = step(&provider, 3, &next).await;
+    assert!(!codex_trace(&third, 0).continuation);
+    assert_eq!(attempts(&third).len(), 1);
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 2);
+}
+
+#[tokio::test]
+async fn codex_continuation_https_switch_discards_socket_baseline() {
+    let mock = Mock::start(
+        vec![text_events(), text_events(), text_events()],
+        false,
+        false,
+    )
+    .await;
+    let provider = codex_provider(&mock);
+    let https = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&https);
+    provider.set_chatgpt_https_policy(Arc::new(move || flag.load(Ordering::Acquire)));
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    https.store(true, Ordering::Release);
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second)[0].transport.as_deref(), Some("https"));
+    mock.wait_closes(1).await;
+    https.store(false, Ordering::Release);
+    let third_options = follow_up(next, &second, "After HTTPS");
+    let third = step(&provider, 3, &third_options).await;
+    assert!(!codex_trace(&third, 0).continuation);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2);
+    assert_eq!(seen.requests.len(), 2);
+    assert_eq!(seen.http_bodies.len(), 1);
+}
+
+struct CountingCodex(Arc<AtomicUsize>);
+impl WireFamily for CountingCodex {
+    fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        OpenAiResponsesChatgpt.shape(frozen, opts)
+    }
+    fn endpoint(
+        &self,
+        frozen: &FrozenRenderConfig,
+        auth: &AuthHandle,
+        body: Vec<u8>,
+    ) -> HttpRequest {
+        OpenAiResponsesChatgpt.endpoint(frozen, auth, body)
+    }
+    fn normalizer(
+        &self,
+        frozen: &FrozenRenderConfig,
+        step_id: StepId,
+    ) -> Box<dyn StreamNormalizer> {
+        OpenAiResponsesChatgpt.normalizer(frozen, step_id)
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_renders_each_canonical_request_once() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let base = codex_provider(&mock);
+    let count = Arc::new(AtomicUsize::new(0));
+    let provider = LiveProvider::new(
+        CountingCodex(Arc::clone(&count)),
+        (*base.frozen).clone(),
+        (*base.current_auth().auth).clone(),
+    );
+    let first = step(&provider, 1, &opts()).await;
+    let second = step(&provider, 2, &follow_up(opts(), &first, "Next")).await;
+    assert!(codex_trace(&second, 0).continuation);
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn codex_continuation_property_mismatch_records_full_input_reason() {
+    let mock = Mock::start(
+        vec![text_events(), text_events(), text_events()],
+        false,
+        false,
+    )
+    .await;
+    let mut provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    Arc::make_mut(&mut provider.frozen).service_tier = Some("priority".into());
+    let second = step(&provider, 2, &next).await;
+    assert!(!codex_trace(&second, 0).continuation);
+    assert_eq!(
+        codex_trace(&second, 0).full_input_reason.as_deref(),
+        Some("service_tier_changed")
+    );
+    let third = step(
+        &provider,
+        3,
+        &follow_up(next, &second, "After changed tier"),
+    )
+    .await;
+    assert!(codex_trace(&third, 0).continuation);
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+}
+
+async fn codex_tool_run(
+    replies: Vec<Vec<Value>>,
+    expected_creates: usize,
+    expected_handshakes: usize,
+) -> Vec<WalRecord> {
+    let mock = Mock::start(replies, false, false).await;
+    let provider = codex_provider(&mock);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = broca_test_support::scratch_root().join(format!(
+        "codex-tool-turn-{}-{}",
+        expected_creates,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bind = BindIdentity::new(dir.join("project"), "websocket", "turn");
+    let request = tool_run_request(&bind);
+    let wal = FileWalStore::new(dir.join("wal"));
+    let count = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&count);
+    let plane = StubToolPlane::new().with_tool("lookup", move |_| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        broca_core::StubReply::Output(broca_protocol::ToolOutput::Text {
+            text: "found".into(),
+        })
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_loop(
+            request,
+            &provider,
+            &plane,
+            &FileLeaseStore::new(dir.join("lease")),
+            &AllowAll,
+            &wal,
+            &tx,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(tx);
+    collect.await.unwrap();
+    assert_eq!(result.reason, RunFinishReason::Completed);
+    assert_eq!(result.steps, 2);
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "one actual tool handler invocation"
+    );
+    mock.wait_closes(1).await;
+    let records = wal.read_records(&bind).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ToolResult { .. }))
+            .count(),
+        1
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.requests.len(), expected_creates);
+    assert_eq!(seen.handshakes, expected_handshakes);
+    assert!(seen.http_bodies.is_empty());
+    let continuation: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(continuation["previous_response_id"], "r1");
+    assert_eq!(continuation["input"].as_array().unwrap().len(), 1);
+    assert_eq!(continuation["input"][0]["type"], "function_call_output");
+    if expected_creates == 3 {
+        let retry: Value = serde_json::from_slice(&seen.requests[2]).unwrap();
+        assert!(retry.get("previous_response_id").is_none());
+        assert!(retry["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call"));
+        assert!(retry["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+    }
+    records.into_iter().map(|frame| frame.record).collect()
+}
+
+#[tokio::test]
+async fn codex_continuation_tool_turn_uses_canonical_output_and_dispatches_once() {
+    let records = codex_tool_run(vec![tool_events(), text_events()], 2, 1).await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn codex_continuation_completed_without_id_does_not_seed_receipt() {
+    for missing in [false, true] {
+        let mut no_id = text_events();
+        if missing {
+            no_id[1]["response"].as_object_mut().unwrap().remove("id");
+        } else {
+            no_id[1]["response"]["id"] = serde_json::json!("");
+        }
+        let mock = Mock::start(vec![text_events(), no_id, text_events()], false, false).await;
+        let provider = codex_provider(&mock);
+        let first = step(&provider, 1, &opts()).await;
+        let next = follow_up(opts(), &first, "Next");
+        let second = step(&provider, 2, &next).await;
+        assert!(codex_trace(&second, 0).continuation);
+        let third = step(&provider, 3, &follow_up(next, &second, "After missing id")).await;
+        assert!(!codex_trace(&third, 0).continuation);
+        assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+    }
+}
+
+#[tokio::test]
+async fn codex_continuation_failed_normalization_retires_completed_response() {
+    let mock = Mock::start(
+        vec![text_events(), cut_tool_events(false), text_events()],
+        false,
+        false,
+    )
+    .await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 2);
+    assert!(codex_trace(&second, 0).continuation);
+    assert!(!codex_trace(&second, 1).continuation);
+    assert_eq!(attempts(&second)[1].outcome, AttemptOutcome::Complete);
+    let canonical = provider.render_request(&next);
+    for attempt in attempts(&second) {
+        assert_canonical(attempt, &canonical);
+    }
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 2);
+}
+
+async fn codex_previous_response_miss(status: Option<u16>) {
+    let mut miss = serde_json::json!({"type":"error","error":{"code":"previous_response_not_found","message":"PRIVATE-BACKEND-MESSAGE"}});
+    if let Some(status) = status {
+        miss["status"] = serde_json::json!(status);
+    }
+    let records = codex_tool_run(vec![tool_events(), vec![miss], text_events()], 3, 2).await;
+    let second_step: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ModelAttemptFinished {
+                step_id,
+                attempt,
+                request_body_len,
+                request_body_sha256,
+                websocket_request,
+                outcome,
+                ..
+            } if *step_id == StepId(2) => Some((
+                attempt,
+                request_body_len,
+                request_body_sha256,
+                websocket_request.as_ref().unwrap(),
+                outcome,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        second_step.len(),
+        2,
+        "cache miss recovery must be an accounted retry"
+    );
+    assert_eq!(*second_step[0].0, 0);
+    assert_eq!(*second_step[1].0, 1);
+    assert_eq!(second_step[0].1, second_step[1].1);
+    assert_eq!(second_step[0].2, second_step[1].2);
+    assert_eq!(*second_step[0].4, AttemptOutcome::ChunkError);
+    assert_eq!(*second_step[1].4, AttemptOutcome::Complete);
+    assert!(second_step[0].3.codex.as_ref().unwrap().continuation);
+    assert!(!second_step[1].3.codex.as_ref().unwrap().continuation);
+    assert_eq!(
+        second_step[0].3.codex.as_ref().unwrap().physical_send_count,
+        1
+    );
+    assert_eq!(
+        second_step[1].3.codex.as_ref().unwrap().physical_send_count,
+        1
+    );
+    assert_ne!(
+        second_step[0]
+            .3
+            .codex
+            .as_ref()
+            .unwrap()
+            .connection_generation,
+        second_step[1]
+            .3
+            .codex
+            .as_ref()
+            .unwrap()
+            .connection_generation
+    );
+}
+
+#[tokio::test]
+async fn codex_previous_response_not_found_without_status_is_accounted_retry() {
+    codex_previous_response_miss(None).await;
+}
+#[tokio::test]
+async fn codex_previous_response_not_found_400_is_accounted_retry() {
+    codex_previous_response_miss(Some(400)).await;
+}
+
+#[test]
+fn codex_previous_response_code_precedes_generic_status_mapping() {
+    for status in [None, Some(400)] {
+        let mut raw = serde_json::json!({"type":"error","error":{"code":"previous_response_not_found","message":"PRIVATE-BACKEND-MESSAGE"}});
+        if let Some(status) = status {
+            raw["status"] = serde_json::json!(status);
+        }
+        let failure = responses_websocket::wrapped_error(
+            &serde_json::to_vec(&raw).unwrap(),
+            &mut AttemptTrace::default(),
+        )
+        .expect("named cache miss is transport-retryable without a status");
+        assert_eq!(failure.error.class, ErrorClass::Transient);
+        assert_eq!(failure.outcome, AttemptOutcome::ChunkError);
+        assert!(!failure.retry_forbidden);
+        assert_eq!(
+            failure.error.provider_code.as_deref(),
+            Some("previous_response_not_found")
+        );
+        assert!(!failure.error.message.contains("PRIVATE"));
+    }
+    let other = serde_json::json!({"type":"error","status":400,"error":{"code":"other_error","message":"test"}});
+    let failure = responses_websocket::wrapped_error(
+        &serde_json::to_vec(&other).unwrap(),
+        &mut AttemptTrace::default(),
+    )
+    .unwrap();
+    assert_eq!(failure.outcome, AttemptOutcome::HttpError);
+    assert_ne!(failure.error.class, ErrorClass::Transient);
+}
+
+#[test]
+fn codex_previous_response_retry_advice_is_nested_first_with_top_level_fallback() {
+    for (nested, top, expected) in [
+        (
+            serde_json::json!({"Retry-After":"1"}),
+            serde_json::json!({"Retry-After":"2"}),
+            Some(1.0),
+        ),
+        (
+            serde_json::json!({"Retry-After":"invalid"}),
+            serde_json::json!({"Retry-After":"2"}),
+            Some(2.0),
+        ),
+        (
+            serde_json::json!({"Retry-After-Ms":"250"}),
+            serde_json::json!({}),
+            Some(0.25),
+        ),
+        (Value::Null, Value::Null, None),
+    ] {
+        let raw = serde_json::json!({"type":"error","status":400,"headers":top,"error":{"code":"previous_response_not_found","headers":nested}});
+        let failure = responses_websocket::wrapped_error(
+            &serde_json::to_vec(&raw).unwrap(),
+            &mut AttemptTrace::default(),
+        )
+        .unwrap();
+        assert_eq!(failure.error.retry_after_secs, expected);
+    }
 }
 fn opts() -> CallOptions {
     serde_json::from_value(serde_json::json!({

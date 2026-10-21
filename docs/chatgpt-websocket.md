@@ -34,13 +34,13 @@ connection has a 15-second connect/upgrade deadline. Both transports share the s
 normalizer and semantic idle bounds: 300 seconds without a complete record, 1800
 seconds of only keepalives. Ping/pong traffic counts as keepalive, not model progress.
 
-Every `response.create` contains the **full canonical input**. There is no
+Without a frozen `chatgpt_wire` profile, every `response.create` contains the **full canonical input**. There is no
 `previous_response_id`, incremental continuation, cut-response resume or socket warmup.
 The JSON object differs from the rendered HTTPS body only by `type: "response.create"`
 and, when supplied by the server, `client_metadata["x-codex-turn-state"]`. Request field
 order need not equal HTTPS's canonical order; the framed payload has its own digest.
 
-Handshake headers retain the existing backend authorization/account/session/originator/
+Legacy handshake headers retain the existing backend authorization/account/session/originator/
 user-agent and content headers, plus `OpenAI-Beta: responses_websockets=2026-02-06`,
 `thread-id` and `x-client-request-id` (broca's session identity serves as its thread
 identity). The client negotiates permessage-deflate using a pinned client fork.
@@ -49,6 +49,35 @@ captures it from upgrade headers or `response.metadata` and attaches it to subse
 request metadata. Optional beta-feature headers already present in auth headers are
 preserved. Attestation, routing hints and timing instrumentation are not
 synthesized without their corresponding sources.
+
+New ChatGPT admissions freeze profile `codex-0.163.0` and its sourced identity. It sends
+developer instruction fragments, typed text arrays, explicit parallel-tool policy, empty
+tools and default choice, encrypted-reasoning include, and ordinary identity metadata.
+Unknown model effort/summary/verbosity defaults are not guessed; caller controls remain
+authoritative. Its User-Agent and originator are frozen at admission, thread and request
+headers use full-conversation identity rather than cache scope, and upgrades omit HTTP-only
+SSE entity defaults. Routing fields precede large input only in transport encoding.
+
+For this profile, the canonical full body is still rendered and hashed once. A live socket
+can consume its preceding successfully normalized `response.completed` receipt exactly once.
+Continuation compares Codex 0.163.0's eleven properties: `model`, raw `tools`, `tool_choice`,
+`parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`, `service_tier`,
+`prompt_cache_key` and `text`. Current input must extend or equal prior input followed by
+completed assistant output, converted to input items by the full-history renderer.
+Annotations under `internal_chat_message_metadata_passthrough` may differ, but
+`executed_tool_calls` entries carrying `tool_result_metadata` must retain their positions,
+tool names, arguments and metadata values. A suffix cannot update those earlier results.
+A proven match sends `previous_response_id` plus only the suffix; empty suffixes and
+`store:false` are allowed. Broca samples wall-clock milliseconds before frame serialization
+for `client_metadata["x-codex-ws-stream-request-start-ms"]`, outside the canonical digest.
+Frame hashes can therefore differ between retries; the stamp is not a network acknowledgement.
+
+Receipts never cross socket generations or runs. Reconnect, endpoint/header/auth revision
+changes, age, teardown, HTTPS switching, failed send/stream, consumer cancellation, incomplete
+responses and a resumed run's first request all require full input. All incomplete reasons,
+including interrupted, conservatively avoid seeding a receipt. There is no cross-run cache,
+socket warmup or cut-response continuation. Recorded profile absence remains legacy on resume;
+the renderer ABI does not change.
 
 A failed connection/upgrade (including timeout and HTTP refusal other than 401)
 falls back to HTTPS **before any response.create was sent**, within that same model attempt.
@@ -75,6 +104,10 @@ A close/error before completion is `chunk_error`. Code 1012 means server restart
 At 895 seconds or later that cut follows the existing non-reissuable `response_deadline`
 rule. Responses error-event wrappers with HTTP statuses use the existing HTTP classifier;
 ordinary Responses events, including tool calls, use the existing Responses normalizer.
+The named `previous_response_not_found` code is recognized before generic status mapping,
+including missing status and wrapped 400. Broca retires the failed socket and retries with full
+input through the normal accounted attempt loop, not a same-attempt resend. Retry advice is read from
+nested error headers first, with top-level fallback when nested advice is unusable.
 
 ## Durable evidence
 
@@ -82,7 +115,11 @@ New `model_attempt_finished` records contain optional `transport` (`websocket` o
 Old records decode with the field absent and re-encode byte-identically. The existing
 `request_body_len` and `request_body_sha256` still cover the canonical rendered body,
 so cache-dump and prefix/cache identity are unchanged. `websocket_request` separately
-records the length and SHA-256 of the exact UTF-8 request payload before compression;
+records the length and SHA-256 of the exact UTF-8 request payload before compression.
+Codex-profile frames additionally record continuation, suffix item count (zero on full input),
+connection generation, previous-ID presence, confirmed physical send count and full-input
+reason. These nested fields, and run starts/refreezes carrying the profile, require
+`chatgpt-codex-wire/v1`; the feature floor is published before the gated frame.
 `websocket_close_code` records a received server close code. Response digests cover
 HTTP body bytes or socket text payloads before adaptation, not WebSocket framing or
 ping/pong payloads. The mid-stream WARN identifies transport and numeric close code;

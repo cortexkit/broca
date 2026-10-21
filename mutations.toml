@@ -70,6 +70,1372 @@ old = "    if role == Role::Assistant && join_previous_assistant {"
 new = "    if false && role == Role::Assistant && join_previous_assistant { // NON-VACUITY BREAK: emit each response fragment separately."
 
 [[control]]
+id = "chatgpt-write-before-ack-accounting"
+guards = "A completed physical write remains counted when cancellation wins before its acknowledgement"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::codex_completed_write_is_counted_when_cancelled_before_acknowledgement"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '''trace.websocket_sends = Some(PhysicalSends {
+            frames: Arc::clone(&socket.frames),
+            before: socket.frames.response_create_sent.load(Ordering::Relaxed),
+        });'''
+new = 'trace.websocket_sends = None; // NON-VACUITY BREAK: lose writes completed before acknowledgement.'
+
+[[control]]
+id = "chatgpt-final-developer-role"
+guards = "The instruction fragment has the released developer role"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instructions_are_developer_input"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"type":"message", "id":self.instruction_id(text), "role":"developer",'
+new = '"type":"message", "id":self.instruction_id(text), "role":"system", // NON-VACUITY BREAK: use legacy instruction authority.'
+
+[[control]]
+id = "chatgpt-final-developer-content"
+guards = "Developer instruction content uses typed input_text parts"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instructions_are_developer_input"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"content":[{"type":"input_text","text":text}],'
+new = '"content":[{"type":"output_text","text":text}], // NON-VACUITY BREAK: misclassify instruction content.'
+
+[[control]]
+id = "chatgpt-final-instruction-classification"
+guards = "The released instruction fragment retains its internal content classification"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instructions_are_developer_input"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}'
+new = '"internal_chat_message_metadata_passthrough":{"content_item_kinds":[]} // NON-VACUITY BREAK: erase instruction classification.'
+
+[[control]]
+id = "chatgpt-final-upgrade-content-type"
+guards = "HTTP Content-Type defaults are absent from the actual profile upgrade"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '!["content-type", "accept"]'
+new = '!["unused-content-type", "accept"] /* NON-VACUITY BREAK: keep the SSE entity type. */'
+
+[[control]]
+id = "chatgpt-final-upgrade-accept"
+guards = "HTTP SSE Accept defaults are absent from the actual profile upgrade"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '!["content-type", "accept"]'
+new = '!["content-type", "unused-accept"] /* NON-VACUITY BREAK: keep the SSE accept default. */'
+
+[[control]]
+id = "chatgpt-final-feature-name"
+guards = "The published must-understand feature name is the approved v1 contract"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::the_shipped_known_feature_table_holds_exactly_the_interpreted_features"]
+file = "crates/broca-wal/src/framing.rs"
+old = 'pub const CHATGPT_CODEX_WIRE_FEATURE: &str = "chatgpt-codex-wire/v1";'
+new = 'pub const CHATGPT_CODEX_WIRE_FEATURE: &str = "chatgpt-codex-wire/v2"; // NON-VACUITY BREAK: publish an unapproved floor name.'
+
+[[control]]
+id = "chatgpt-final-previous-response-id"
+guards = "The frame references exactly its consumed completed-response receipt"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'Value::String(previous.response_id)'
+new = 'Value::String("wrong".into()) /* NON-VACUITY BREAK: reference an unrelated response. */'
+
+[[control]]
+id = "chatgpt-final-suffix-input"
+guards = "A compatible socket actually sends only suffix input rather than full canonical history"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'logical["input"].as_array().unwrap()[start..].to_vec()'
+new = 'logical["input"].as_array().unwrap().to_vec() /* NON-VACUITY BREAK: resend the full input. */'
+
+[[control]]
+id = "chatgpt-identity-real-os"
+guards = "Admission captures real host OS identity in the frozen User-Agent"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = '''ChatgptWire::VERSION,
+        os.os_type(),'''
+new = '''ChatgptWire::VERSION,
+        "InventedOS", // NON-VACUITY BREAK: fabricate host identity.'''
+
+[[control]]
+id = "chatgpt-identity-originator"
+guards = "Admission freezes the actual supported Codex originator"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'originator: ChatgptWire::ORIGINATOR.into(),'
+new = 'originator: "wrong".into(), // NON-VACUITY BREAK: lose admitting originator.'
+
+[[control]]
+id = "chatgpt-identity-session"
+guards = "Admission sources session identity from the admitted bind"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'session_id: session.session.as_str().to_string(),'
+new = 'session_id: "wrong".into(), // NON-VACUITY BREAK: invent a session identity.'
+
+[[control]]
+id = "chatgpt-identity-thread"
+guards = "Thread identity is stable and scoped by the full conversation bind"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'thread_id: ChatgptWire::scoped_id("chatgpt-thread", &bind),'
+new = 'thread_id: session.session.as_str().to_string(), // NON-VACUITY BREAK: collapse unrelated conversations.'
+
+[[control]]
+id = "chatgpt-identity-installation"
+guards = "Installation identity retains the persisted installation seed"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'installation_id: ChatgptWire::scoped_id("chatgpt-installation", install_id),'
+new = 'installation_id: ChatgptWire::scoped_id("chatgpt-installation", "constant"), // NON-VACUITY BREAK: drop the persisted seed.'
+
+[[control]]
+id = "chatgpt-identity-window"
+guards = "Window identity is process-local rather than regenerated for each turn"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'window_id: WINDOW_ID.get().unwrap().clone(),'
+new = 'window_id: ChatgptWire::scoped_id("window", turn_id), // NON-VACUITY BREAK: regenerate window per turn.'
+
+[[control]]
+id = "chatgpt-identity-turn"
+guards = "Turn identity comes from the admitted run"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'turn_id: turn_id.to_string(),'
+new = 'turn_id: "wrong".into(), // NON-VACUITY BREAK: replace admitted run identity.'
+
+[[control]]
+id = "chatgpt-identity-turn-time"
+guards = "Turn-start time is frozen from admission rather than fabricated at render time"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = 'turn_started_at_unix_ms: admitted_at_ms,'
+new = 'turn_started_at_unix_ms: 0, // NON-VACUITY BREAK: lose admitted turn time.'
+
+[[control]]
+id = "chatgpt-identity-profile"
+guards = "The durable profile selector is exactly the approved released wire profile"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+test_file = "crates/broca-provider/tests/it/openai_responses_chatgpt_render_golden.rs"
+expect_red = ["openai_responses_chatgpt_render_golden::frozen_profile_round_trips_without_legacy_defaults"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '#[serde(rename = "codex-0.163.0")]'
+new = '#[serde(rename = "codex-future")] // NON-VACUITY BREAK: drift durable selector.'
+
+[[control]]
+id = "chatgpt-header-session"
+guards = "The real upgrade retains caller cache affinity independently from thread identity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'cache_key.unwrap_or(&self.session_id).into(),'
+new = 'self.session_id.clone(), // NON-VACUITY BREAK: ignore explicit caller cache affinity.'
+
+[[control]]
+id = "chatgpt-header-window"
+guards = "The real upgrade carries the frozen process window identity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("x-codex-window-id".into(), self.window_id.clone()),'
+new = '("x-codex-window-id".into(), "wrong".into()), // NON-VACUITY BREAK: lose window header.'
+
+[[control]]
+id = "chatgpt-header-turn-metadata"
+guards = "The real upgrade and rendered body share the frozen sourced turn metadata"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("x-codex-turn-metadata".into(), self.turn_metadata()),'
+new = '("x-codex-turn-metadata".into(), "{}".into()), // NON-VACUITY BREAK: drop sourced header metadata.'
+
+[[control]]
+id = "chatgpt-cache-miss-recognition"
+guards = "A wrapped 400 cache miss recovers through an accounted full-input retry"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_previous_response_not_found_400_is_accounted_retry"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if code == Some("previous_response_not_found") {'
+new = 'if code == Some("previous_response_unrecognized") { // NON-VACUITY BREAK: lose named cache-miss classification.'
+
+[[control]]
+id = "chatgpt-cache-miss-status-missing"
+guards = "Named cache misses are retryable without an HTTP status"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_previous_response_code_precedes_generic_status_mapping"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if code == Some("previous_response_not_found") {'
+new = 'if code == Some("previous_response_unrecognized") { // NON-VACUITY BREAK: require generic status mapping.'
+
+[[control]]
+id = "chatgpt-cache-miss-retry-advice"
+guards = "Named cache miss retry advice prefers nested error headers"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_previous_response_retry_advice_is_nested_first_with_top_level_fallback"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '[value.pointer("/error/headers"), value.get("headers")]'
+new = '[value.get("headers"), value.pointer("/error/headers")] /* NON-VACUITY BREAK: reverse retry advice precedence. */'
+
+[[control]]
+id = "chatgpt-cache-miss-retry-advice-fallback"
+guards = "Malformed nested retry advice permits usable top-level fallback"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_previous_response_retry_advice_is_nested_first_with_top_level_fallback"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '.find_map(|source| {'
+new = '.take(1).find_map(|source| { // NON-VACUITY BREAK: suppress top-level fallback.'
+
+[[control]]
+id = "chatgpt-cache-miss-safe-diagnostic"
+guards = "The exact known cache-miss code survives privacy filtering without opening arbitrary diagnostics"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/safe_provider_code.rs"
+expect_red = ["safe_provider_code::tests::allowlist_rejects_arbitrary_provider_content"]
+file = "crates/broca-provider/src/safe_provider_code.rs"
+old = '| "previous_response_not_found"'
+new = '| "previous_response_unrecognized" // NON-VACUITY BREAK: strip the safe known code.'
+
+[[control]]
+id = "chatgpt-cache-miss-invalidation"
+guards = "Named cache-miss recovery retires the socket through both failure fences"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_previous_response_not_found_400_is_accounted_retry"]
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if self.enabled && !self.keep_socket {'
+new = 'if false && self.enabled && !self.keep_socket { // NON-VACUITY BREAK: retain cache-miss socket.'
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '''if failure.outcome != AttemptOutcome::HttpError
+            || (request.codex_wire && trace.socket_generation.is_some())'''
+new = '''if !request.codex_wire && failure.outcome != AttemptOutcome::HttpError // NON-VACUITY BREAK: retain cache-miss authority.'''
+
+[[control]]
+id = "chatgpt-continuation-model"
+guards = "Continuation rejects a changed model"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::model_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("model", "model_changed"),'
+new = '("unused_model", "model_changed"), // NON-VACUITY BREAK: skip model comparison.'
+
+[[control]]
+id = "chatgpt-continuation-tools"
+guards = "Continuation rejects changed raw tools"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::tools_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("tools", "tools_changed"),'
+new = '("unused_tools", "tools_changed"), // NON-VACUITY BREAK: skip tools comparison.'
+
+[[control]]
+id = "chatgpt-continuation-tool-choice"
+guards = "Continuation rejects a changed tool choice"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::tool_choice_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("tool_choice", "tool_choice_changed"),'
+new = '("unused_tool_choice", "tool_choice_changed"), // NON-VACUITY BREAK: skip tool choice.'
+
+[[control]]
+id = "chatgpt-continuation-parallel"
+guards = "Continuation rejects changed parallel-tool policy"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::parallel_tool_calls_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("parallel_tool_calls", "parallel_tool_calls_changed"),'
+new = '("unused_parallel_tool_calls", "parallel_tool_calls_changed"), // NON-VACUITY BREAK: skip parallel policy.'
+
+[[control]]
+id = "chatgpt-continuation-reasoning"
+guards = "Continuation rejects changed reasoning policy"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::reasoning_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("reasoning", "reasoning_changed"),'
+new = '("unused_reasoning", "reasoning_changed"), // NON-VACUITY BREAK: skip reasoning comparison.'
+
+[[control]]
+id = "chatgpt-continuation-store"
+guards = "Continuation compares store without vetoing store false"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::store_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("store", "store_changed"),'
+new = '("unused_store", "store_changed"), // NON-VACUITY BREAK: skip store comparison.'
+
+[[control]]
+id = "chatgpt-continuation-stream"
+guards = "Continuation rejects changed stream policy"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::stream_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("stream", "stream_changed"),'
+new = '("unused_stream", "stream_changed"), // NON-VACUITY BREAK: skip stream comparison.'
+
+[[control]]
+id = "chatgpt-continuation-include"
+guards = "Continuation rejects a changed include vector"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::include_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("include", "include_changed"),'
+new = '("unused_include", "include_changed"), // NON-VACUITY BREAK: skip include comparison.'
+
+[[control]]
+id = "chatgpt-continuation-tier"
+guards = "Continuation rejects a changed service tier"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::service_tier_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("service_tier", "service_tier_changed"),'
+new = '("unused_service_tier", "service_tier_changed"), // NON-VACUITY BREAK: skip service tier.'
+
+[[control]]
+id = "chatgpt-continuation-cache-key"
+guards = "Continuation rejects changed cache affinity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::prompt_cache_key_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("prompt_cache_key", "prompt_cache_key_changed"),'
+new = '("unused_prompt_cache_key", "prompt_cache_key_changed"), // NON-VACUITY BREAK: skip cache key.'
+
+[[control]]
+id = "chatgpt-continuation-text"
+guards = "Continuation rejects changed text output policy"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::text_change_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '("text", "text_changed"),'
+new = '("unused_text", "text_changed"), // NON-VACUITY BREAK: skip text comparison.'
+
+[[control]]
+id = "chatgpt-continuation-prefix-length"
+guards = "Shortened input cannot reference the previous response"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::shorter_and_mismatching_inputs_are_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = 'if current.len() < prefix_len {'
+new = 'if false && current.len() < prefix_len { // NON-VACUITY BREAK: accept shortened input.'
+
+[[control]]
+id = "chatgpt-continuation-prefix-items"
+guards = "Changed prefix items force full input"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::shorter_and_mismatching_inputs_are_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = '.all(|(a, b)| items_equal(a, b))'
+new = '.all(|(a, b)| { let _ = (a, b); true }) /* NON-VACUITY BREAK: ignore prefix items. */'
+
+[[control]]
+id = "chatgpt-continuation-result-metadata"
+guards = "Late result metadata and its call bindings cannot disappear into a suffix"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::metadata_only_difference_is_ignored_but_late_result_bindings_are_not"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = 'if result_metadata(previous) != result_metadata(current) {'
+new = 'if false && result_metadata(previous) != result_metadata(current) { // NON-VACUITY BREAK: discard late metadata.'
+
+[[control]]
+id = "chatgpt-continuation-internal-metadata"
+guards = "Unrelated internal annotations do not disable compatible continuation"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::metadata_only_difference_is_ignored_but_late_result_bindings_are_not"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = 'object.remove("internal_chat_message_metadata_passthrough");'
+new = 'object.get("internal_chat_message_metadata_passthrough"); // NON-VACUITY BREAK: retain warehouse-only annotations.'
+
+[[control]]
+id = "chatgpt-continuation-empty-id"
+guards = "An empty completion ID cannot authorize continuation"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_continuation.rs"
+expect_red = ["chatgpt_continuation::tests::empty_completed_response_id_is_full"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = 'if self.response_id.is_empty() {'
+new = 'if false && self.response_id.is_empty() { // NON-VACUITY BREAK: reference an empty ID.'
+
+[[control]]
+id = "chatgpt-continuation-one-shot"
+guards = "An incomplete stream consumes the preceding completion receipt"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_incomplete_consumes_receipt_without_seeding_another"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if let Some(previous) = socket.continuation.lock().unwrap().take() {'
+new = 'if let Some(previous) = socket.continuation.lock().unwrap().clone() { // NON-VACUITY BREAK: retain a reusable old receipt.'
+
+[[control]]
+id = "chatgpt-continuation-incomplete"
+guards = "Incomplete responses never seed a reusable baseline"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_incomplete_consumes_receipt_without_seeding_another"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if value["type"] == "response.completed" {'
+new = 'if matches!(value["type"].as_str(), Some("response.completed" | "response.incomplete")) { // NON-VACUITY BREAK: seed incomplete output.'
+
+[[control]]
+id = "chatgpt-continuation-output-representation"
+guards = "Receipts include the completed assistant in canonical replay form"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'let output = render_output(assistant);'
+new = 'let output = Vec::new(); let _ = (render_output, assistant); // NON-VACUITY BREAK: forget completed output.'
+
+[[control]]
+id = "chatgpt-continuation-age-reset"
+guards = "An aged socket is retired before sending a suffix"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_age_reset_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '&& now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE'
+new = '&& now.saturating_duration_since(socket.established_at) < Duration::MAX // NON-VACUITY BREAK: ignore socket age.'
+
+[[control]]
+id = "chatgpt-continuation-header-reset"
+guards = "Changed upgrade headers retire the old authenticated socket"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_header_reset_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '&& socket.headers == request.headers'
+new = '&& true // NON-VACUITY BREAK: reuse changed headers.'
+
+[[control]]
+id = "chatgpt-continuation-auth-reset"
+guards = "Changed auth revision forces full input even with identical header bytes"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_auth_revision_reset_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '&& (!request.codex_wire || socket.auth_revision == request.auth_revision)'
+new = '&& true // NON-VACUITY BREAK: ignore auth revision.'
+
+[[control]]
+id = "chatgpt-continuation-same-token-refresh"
+guards = "Accepted same-token refreshes still advance connection authentication"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_same_token_refresh_retires_socket"]
+file = "crates/broca-provider/src/transport.rs"
+old = 'if refreshed.auth != *recovery.sent_auth || request.codex_wire {'
+new = 'if refreshed.auth != *recovery.sent_auth { // NON-VACUITY BREAK: ignore accepted same-token refreshes.'
+
+[[control]]
+id = "chatgpt-continuation-endpoint-reset"
+guards = "A changed endpoint cannot inherit live response authority"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_endpoint_change_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '&& (!request.codex_wire || socket.url == request.url)'
+new = '&& true // NON-VACUITY BREAK: reuse a different endpoint.'
+
+[[control]]
+id = "chatgpt-continuation-closed-reset"
+guards = "A peer-closed connection is replaced before the next physical attempt"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_closed_socket_reset_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if !socket.closed.load(Ordering::Acquire)'
+new = 'if true /* NON-VACUITY BREAK: try a closed socket again. */'
+
+[[control]]
+id = "chatgpt-continuation-explicit-reset"
+guards = "Explicit run transport retirement discards continuation state"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_explicit_retirement_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'pub(super) fn close(&self) {'
+new = '''pub(super) fn close(&self) {
+        return; // NON-VACUITY BREAK: retain the live socket and receipt.'''
+
+[[control]]
+id = "chatgpt-continuation-https-reset"
+guards = "Switching to HTTPS discards a live socket baseline"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_https_switch_discards_socket_baseline"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if let Some(socket) = session.state.lock().unwrap().socket.take() {'
+new = 'if let Some(socket) = session.state.lock().unwrap().socket.clone().filter(|_| false) { // NON-VACUITY BREAK: retain baseline across HTTPS.'
+
+[[control]]
+id = "chatgpt-continuation-resume-reset"
+guards = "New sockets and resumed runs start without a completed-response receipt"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_resume_first_request_is_full"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '''url: request.url.clone(),
+        continuation: Mutex::new(None),'''
+new = '''url: request.url.clone(),
+        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse { request: serde_json::from_slice(&request.body).unwrap(), output: vec![], response_id: "unproven".into() })), // NON-VACUITY BREAK: fabricate a resumed baseline.'''
+
+[[control]]
+id = "chatgpt-continuation-send-reset"
+guards = "A failed send retires its socket and consumes the prior receipt"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket.rs"
+expect_red = ["transport::responses_websocket::codex_failed_send_retires_socket_and_consumes_receipt"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if self.enabled && !self.keep_socket {'
+new = 'if false && self.enabled && !self.keep_socket { // NON-VACUITY BREAK: keep failed sends alive.'
+
+[[control]]
+id = "chatgpt-continuation-consumer-reset"
+guards = "Both consumer-drop retirement fences prevent a pending response from contaminating a later step"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_consumer_drop_retires_pending_stream"]
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if self.enabled && !self.keep_socket {'
+new = 'if false && self.enabled && !self.keep_socket { // NON-VACUITY BREAK: leave dropped consumers connected.'
+[[control.edits]]
+file = "crates/broca-provider/src/transport.rs"
+old = 'if self.cancel.is_cancelled() || self.tx.is_closed() {'
+new = 'if false && (self.cancel.is_cancelled() || self.tx.is_closed()) { // NON-VACUITY BREAK: disable outer consumer retirement.'
+
+[[control]]
+id = "chatgpt-continuation-stream-reset"
+guards = "Both stream-failure retirement fences prevent same-socket recovery"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_failed_stream_retires_socket_and_retry_is_full"]
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if self.enabled && !self.keep_socket {'
+new = 'if false && self.enabled && !self.keep_socket { // NON-VACUITY BREAK: disable stream guard.'
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '''if failure.outcome != AttemptOutcome::HttpError
+            || (request.codex_wire && trace.socket_generation.is_some())'''
+new = '''if !request.codex_wire && failure.outcome != AttemptOutcome::HttpError // NON-VACUITY BREAK: disable outer retirement.'''
+
+[[control]]
+id = "chatgpt-continuation-tool-cut-reset"
+guards = "A local tool-argument cut retires through both teardown and dropped-stream fences"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_tool_argument_cut_retires_without_retry"]
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'if self.enabled && !self.keep_socket {'
+new = 'if false && self.enabled && !self.keep_socket { // NON-VACUITY BREAK: disable cut guard.'
+[[control.edits]]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'pub(super) fn close(&self) {'
+new = '''pub(super) fn close(&self) {
+        return; // NON-VACUITY BREAK: disable cut teardown.'''
+
+[[control]]
+id = "chatgpt-continuation-empty-suffix"
+guards = "Equal input is eligible for an empty same-socket suffix"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_equal_input_sends_empty_suffix"]
+file = "crates/broca-provider/src/chatgpt_continuation.rs"
+old = 'if current.len() < prefix_len {'
+new = 'if current.len() <= prefix_len { // NON-VACUITY BREAK: reject empty suffixes.'
+
+[[control]]
+id = "chatgpt-continuation-flag-telemetry"
+guards = "Attempt telemetry records the actual suffix decision"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = '''Box::new(broca_protocol::provider::ChatgptContinuationTrace {
+                continuation,'''
+new = '''Box::new(broca_protocol::provider::ChatgptContinuationTrace {
+                continuation: false, // NON-VACUITY BREAK: misreport suffix selection.'''
+
+[[control]]
+id = "chatgpt-continuation-suffix-count"
+guards = "Attempt telemetry counts the actual suffix items"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'suffix_item_count: if continuation {'
+new = 'suffix_item_count: if false && continuation { // NON-VACUITY BREAK: lose suffix count.'
+
+[[control]]
+id = "chatgpt-continuation-generation"
+guards = "Attempt telemetry identifies the actual live socket generation"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'connection_generation: socket.generation,'
+new = 'connection_generation: 0, // NON-VACUITY BREAK: lose socket generation.'
+
+[[control]]
+id = "chatgpt-continuation-previous-id-presence"
+guards = "Telemetry reports response-ID presence without recording the ID"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'previous_response_id_present: payload.get("previous_response_id").is_some(),'
+new = 'previous_response_id_present: false, // NON-VACUITY BREAK: hide live response-ID use.'
+
+[[control]]
+id = "chatgpt-continuation-physical-count"
+guards = "Confirmed response.create sends remain exactly counted"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport.rs"
+old = 'codex.physical_send_count = sends.count();'
+new = 'codex.physical_send_count = 0; // NON-VACUITY BREAK: erase a physical send.'
+
+[[control]]
+id = "chatgpt-continuation-fallback-reason"
+guards = "Property mismatches report why full input was sent"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_property_mismatch_records_full_input_reason"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'full_input_reason: (!continuation).then(|| full_input_reason.into()),'
+new = 'full_input_reason: None, // NON-VACUITY BREAK: omit fallback reason.'
+
+[[control]]
+id = "chatgpt-continuation-frame-length"
+guards = "Frame byte counts measure transmitted suffix bytes rather than canonical full input"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'len: digest.len,'
+new = 'len: request.body.len() as u64, // NON-VACUITY BREAK: count full body instead of frame.'
+
+[[control]]
+id = "chatgpt-continuation-frame-digest"
+guards = "Frame hashes measure the actual encoded suffix and timestamp"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'sha256: digest.sha256,'
+new = 'sha256: RequestDigest::of(&request.body).sha256, // NON-VACUITY BREAK: hash the wrong domain.'
+
+[[control]]
+id = "chatgpt-continuation-send-stamp"
+guards = "The send-only stamp is a real request-start sample outside canonical bytes"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_large_canonical_request_has_small_suffix_and_real_stamp"]
+file = "crates/broca-provider/src/transport_websocket.rs"
+old = 'Value::String(send_started_at_ms.to_string())'
+new = 'Value::String("0".into()) /* NON-VACUITY BREAK: substitute a frozen non-send timestamp. */'
+
+[[control]]
+id = "chatgpt-continuation-canonical-once"
+guards = "Completion receipt construction never rerenders the canonical full request"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_continuation_renders_each_canonical_request_once"]
+file = "crates/broca-provider/src/transport.rs"
+old = 'let body = self.family.render(&self.frozen, &self.opts);'
+new = '''let body = self.family.render(&self.frozen, &self.opts);
+        let _ = self.family.render(&self.frozen, &self.opts); // NON-VACUITY BREAK: render the full prompt twice.'''
+
+[[control]]
+id = "chatgpt-continuation-attempt-gate"
+guards = "New continuation attempt fields require the Codex must-understand feature"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::chatgpt_continuation_attempt_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = 'if codex_attempt || codex_wire.is_some_and(|value| !value.is_null()) {'
+new = 'if false && codex_attempt || codex_wire.is_some_and(|value| !value.is_null()) { // NON-VACUITY BREAK: omit attempt feature gate.'
+
+[[control]]
+id = "chatgpt-parity-parallel-tools"
+guards = "The released profile explicitly permits parallel tool proposals"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::parallel_tools_are_explicit"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'body["parallel_tool_calls"] = json!(true);'
+new = 'body["parallel_tool_calls"] = json!(false); // NON-VACUITY BREAK: disable parallel policy.'
+
+[[control]]
+id = "chatgpt-parity-tools"
+guards = "The released profile emits empty tools"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::empty_tools_are_explicit"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'object.entry("tools").or_insert_with(|| json!([]));'
+new = 'object.entry("tools").or_insert_with(|| json!(null)); // NON-VACUITY BREAK: omit empty tools.'
+
+[[control]]
+id = "chatgpt-parity-tool-choice"
+guards = "Empty-tool turns retain an explicit auto choice"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::empty_tool_choice_defaults_to_auto"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'crate::families::openai_responses::convert_tool_choice(&opts.tool_choice, &names)'
+new = '{ let _ = names; json!(null) } // NON-VACUITY BREAK: lose the explicit tool choice.'
+
+[[control]]
+id = "chatgpt-parity-include"
+guards = "Encrypted reasoning is requested without a reasoning option"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::encrypted_reasoning_is_unconditional"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'includes.push(json!("reasoning.encrypted_content"));'
+new = 'includes.push(json!("output.encrypted_content")); // NON-VACUITY BREAK: request the wrong ciphertext.'
+
+[[control]]
+id = "chatgpt-parity-instructions"
+guards = "Instructions leave the top-level field for a developer fragment"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instructions_are_developer_input"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'body.as_object_mut().unwrap().remove("instructions")'
+new = 'body.get("instructions").cloned() /* NON-VACUITY BREAK: retain legacy instructions. */'
+
+[[control]]
+id = "chatgpt-parity-instruction-id"
+guards = "Instruction message IDs have Codex's prefixed UUIDv5 shape"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::instruction_id_matches_codex_uuid_v5"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'format!("msg_{}", Uuid::new_v5(&namespace, text.as_bytes()))'
+new = 'format!("message_{}", Uuid::new_v5(&namespace, text.as_bytes())) // NON-VACUITY BREAK: wrong ID prefix.'
+
+[[control]]
+id = "chatgpt-parity-message-content"
+guards = "New-profile assistant history uses output_text content arrays"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::text_messages_are_typed_content_arrays"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'item["content"] = json!([{"type":kind,"text":text}]);'
+new = 'item["content"] = json!({"type":kind,"text":text}); // NON-VACUITY BREAK: remove content array.'
+
+[[control]]
+id = "chatgpt-parity-reasoning-object"
+guards = "Unknown model defaults leave an empty reasoning object and no verbosity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::no_unknown_reasoning_or_verbosity_defaults"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = 'object.entry("reasoning").or_insert_with(|| json!({}));'
+new = 'object.entry("reasoning").or_insert_with(|| json!({"effort":"medium"})); // NON-VACUITY BREAK: guess effort.'
+
+[[control]]
+id = "chatgpt-parity-installation-metadata"
+guards = "Flat client metadata carries the frozen installation identity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-installation-id":self.installation_id,'
+new = '"x-codex-installation-id":"wrong", // NON-VACUITY BREAK: lose installation identity.'
+
+[[control]]
+id = "chatgpt-parity-session-metadata"
+guards = "Metadata session identity is distinct from prompt-cache scope"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"session_id":self.session_id, "thread_id":self.thread_id,'
+new = '"session_id":"wrong", "thread_id":self.thread_id, // NON-VACUITY BREAK: lose session identity.'
+
+[[control]]
+id = "chatgpt-parity-thread-metadata"
+guards = "Metadata thread identity is the full-conversation identity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"session_id":self.session_id, "thread_id":self.thread_id,'
+new = '"session_id":self.session_id, "thread_id":"wrong", // NON-VACUITY BREAK: lose thread identity.'
+
+[[control]]
+id = "chatgpt-parity-window-metadata"
+guards = "Metadata window identity is frozen from the admitting process"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-window-id":self.window_id, "turn_id":self.turn_id,'
+new = '"x-codex-window-id":"wrong", "turn_id":self.turn_id, // NON-VACUITY BREAK: lose window identity.'
+
+[[control]]
+id = "chatgpt-parity-turn-metadata"
+guards = "Metadata turn identity comes from the admitted run"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-window-id":self.window_id, "turn_id":self.turn_id,'
+new = '"x-codex-window-id":self.window_id, "turn_id":"wrong", // NON-VACUITY BREAK: lose turn identity.'
+
+[[control]]
+id = "chatgpt-parity-nested-metadata"
+guards = "Nested turn metadata preserves sourced identity and turn time"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::sourced_metadata_and_frozen_headers_agree"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '"x-codex-turn-metadata":self.turn_metadata()'
+new = '"x-codex-turn-metadata":"{}" // NON-VACUITY BREAK: drop nested identity.'
+
+[[control]]
+id = "chatgpt-parity-user-agent"
+guards = "The real upgrade uses admission's User-Agent instead of the refreshed host"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("user-agent".into(), self.user_agent.clone()),'
+new = '("user-agent".into(), "legacy-host".into()), // NON-VACUITY BREAK: discard frozen User-Agent.'
+
+[[control]]
+id = "chatgpt-parity-originator"
+guards = "The real upgrade uses the frozen originator"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("originator".into(), self.originator.clone()),'
+new = '("originator".into(), "unknown".into()), // NON-VACUITY BREAK: discard originator.'
+
+[[control]]
+id = "chatgpt-parity-request-header"
+guards = "Request ID uses the thread identity at the pinned tag"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_https_orders_wire_without_changing_canonical_digest"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("x-client-request-id".into(), self.thread_id.clone()),'
+new = '("x-client-request-id".into(), self.session_id.clone()), // NON-VACUITY BREAK: conflate cache and request identity.'
+
+[[control]]
+id = "chatgpt-parity-thread-header"
+guards = "Thread ID is distinct from session/cache affinity"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '("thread-id".into(), self.thread_id.clone()),'
+new = '("thread-id".into(), self.session_id.clone()), // NON-VACUITY BREAK: conflate thread and session.'
+
+[[control]]
+id = "chatgpt-parity-sse-upgrade-headers"
+guards = "New-profile websocket upgrades omit HTTP-only entity defaults"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
+expect_red = ["transport::websocket_tests::codex_profile_headers_are_observed_from_real_upgrade"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '!order.iter().any(|key| name.eq_ignore_ascii_case(key))'
+new = 'true || !order.iter().any(|key| name.eq_ignore_ascii_case(key)) // NON-VACUITY BREAK: carry HTTP headers into upgrade.'
+
+[[control]]
+id = "chatgpt-parity-wire-order"
+guards = "Routing fields precede full input outside canonical digest bytes"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/chatgpt_wire.rs"
+expect_red = ["chatgpt_wire::tests::routing_order_does_not_change_canonical_rendering"]
+file = "crates/broca-provider/src/chatgpt_wire.rs"
+old = '''        "model",
+        "stream",'''
+new = '''        "stream", // NON-VACUITY BREAK: move routing fields.
+        "model",'''
+
+[[control]]
+id = "chatgpt-wire-admission"
+guards = "Fresh ChatGPT episodes opt into the frozen profile"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = "fresh().map(Some)"
+new = "fresh().map(|_| None) // NON-VACUITY BREAK: omit fresh profile."
+
+[[control]]
+id = "chatgpt-wire-restore"
+guards = "Resume restores recorded presence or absence without host discovery"
+runner = "cargo"
+select = "expected"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+expect_red = ["chatgpt_identity::tests::admission_and_resume_preserve_profile_presence_and_absence"]
+file = "crates/broca-module-serve/src/chatgpt_identity.rs"
+old = "if let Some(config) = recorded_config {"
+new = "if let Some(config) = recorded_config.filter(|_| false) { // NON-VACUITY BREAK: discard recording."
+
+[[control]]
+id = "chatgpt-wire-catalog-freeze"
+guards = "Provider construction retains the admitted ChatGPT profile"
+runner = "cargo"
+select = "expected"
+package = "broca-catalog"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-catalog/src/live.rs"
+expect_red = ["live::responses_tool_admission_tests::chatgpt_wire_is_frozen_without_inventing_legacy_defaults"]
+file = "crates/broca-catalog/src/live.rs"
+old = "config.chatgpt_wire = self.chatgpt_wire.cloned();"
+new = "config.chatgpt_wire = None; // NON-VACUITY BREAK: lose frozen profile."
+
+[[control]]
+id = "chatgpt-wire-run-start-gate"
+guards = "RunStarted with a ChatGPT profile refuses older readers"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::chatgpt_wire_run_started_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = 'Self::RunStarted { config, .. } => config.frozen_render_config.get("chatgpt_wire"),'
+new = 'Self::RunStarted { .. } => None, // NON-VACUITY BREAK: omit run-start gate.'
+
+[[control]]
+id = "chatgpt-wire-refreeze-gate"
+guards = "RunConfigRefrozen with a ChatGPT profile refuses older readers"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::chatgpt_wire_refrozen_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = '} => frozen_render_config.get("chatgpt_wire"),'
+new = '} => None, // NON-VACUITY BREAK: omit refreeze gate.'
+
+[[control]]
 id = "module-status-wakes-durable-queued-work"
 guards = "A status poll wakes durable queued work left behind a terminal instead of stranding FIFO after a crash"
 runner = "cargo"

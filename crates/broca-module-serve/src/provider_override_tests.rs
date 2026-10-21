@@ -49,6 +49,7 @@ fn resolve_runtime_override(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            chatgpt_wire: None,
             // As the executor restores it: a recorded blob without the field reads as false.
             reasoning_content_required: frozen.map(|recorded| {
                 recorded
@@ -113,6 +114,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            chatgpt_wire: None,
             reasoning_content_required: None,
             reasoning_echo: None,
             provider_text_state: None,
@@ -452,6 +454,7 @@ fn resolve_drift_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            chatgpt_wire: None,
             reasoning_content_required: None,
             reasoning_echo: None,
             provider_text_state: None,
@@ -796,6 +799,7 @@ fn resolve_tier_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            chatgpt_wire: None,
             reasoning_content_required: None,
             reasoning_echo: None,
             provider_text_state: None,
@@ -915,6 +919,7 @@ fn resolve_variant_revision(
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
+            chatgpt_wire: None,
             reasoning_content_required: None,
             reasoning_echo: None,
             provider_text_state: None,
@@ -1561,6 +1566,41 @@ fn frozen_provider_text_state_reads_an_absent_field_as_false() {
     assert!(!frozen_provider_text_state(&recorded));
 }
 
+#[tokio::test]
+async fn chatgpt_profile_resumes_through_provider_and_core_without_host_discovery() {
+    use broca_core::Provider;
+    let route = DeclaredRoute {
+        family: WireFamilyId::OpenAiResponsesChatgpt,
+        model: "openai/gpt-5.3-codex",
+        method: AuthMethod::Chatgpt,
+        family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
+        project_id: None,
+    };
+    for legacy in [false, true] {
+        let root = broca_test_support::scratch_root().join(format!("chatgpt-profile-resume-{}-{legacy}", std::process::id()));
+        let request = drift_request(&root);
+        let wire = if legacy { None } else {
+            broca_module_serve::chatgpt_identity::for_episode(route.family_override, None, || {
+                broca_module_serve::chatgpt_identity::fresh("persistent-seed", &request.session, "admitted-run", 123)
+            }).unwrap()
+        };
+        let started = resolve_declared_route(&route, broca_catalog::live::EpisodeRenderConfig { chatgpt_wire: wire.as_ref(), ..Default::default() });
+        let recorded = drift_run_config(&request, &started);
+        let options = broca_protocol::CallOptions::new(request.input.clone());
+        let canonical = started.provider.render_request(&options);
+        let restored = broca_module_serve::chatgpt_identity::for_episode(route.family_override, Some(&recorded.frozen_render_config), || Err("changed host must not be discovered".into())).unwrap();
+        assert_eq!(restored, wire);
+        let resumed = resolve_declared_route(&route, broca_catalog::live::EpisodeRenderConfig { chatgpt_wire: restored.as_ref(), ..restored_episode_render(&recorded, None) });
+        assert_eq!(resumed.provider.render_config_blob(), recorded.frozen_render_config);
+        assert_eq!(resumed.provider.render_request(&options), canonical);
+        let (codes, reason, calls) = resume_through_core(&root, recorded, resumed).await;
+        assert!(codes.is_empty());
+        assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
+        assert_eq!(calls, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 /// The render inputs the executor restores when it resumes `recorded`, each read through the
 /// executor's own reader, as the episode admission in this file's executor builds them. The
 /// variant and structured output are left out: the recorded configs below carry neither.
@@ -1570,6 +1610,7 @@ fn restored_episode_render<'a>(
 ) -> broca_catalog::live::EpisodeRenderConfig<'a> {
     broca_catalog::live::EpisodeRenderConfig {
         codeassist_identity,
+        chatgpt_wire: None,
         base_url: recorded
             .frozen_render_config
             .get("base_url")

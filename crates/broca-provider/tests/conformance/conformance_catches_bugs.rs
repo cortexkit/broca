@@ -42,6 +42,7 @@ fn frozen() -> FrozenRenderConfig {
         variant: None,
         responses_tools_non_strict: false,
         chatgpt_effort_updates: false,
+        chatgpt_wire: None,
         provider_text_state: false,
         bedrock_reasoning: false,
         structured_output: None,

@@ -37,6 +37,7 @@ subc-protocol = { workspace = true, optional = true }
 subc-transport = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+uuid = { version = "1", features = ["v5"] }
 tracing.workspace = true
 tokio.workspace = true
 # The decoders are exactly the `accept-encoding` Claude Code sends to Anthropic's first-party API

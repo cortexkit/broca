@@ -167,6 +167,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TURN_DIRECTIVES_FEATURE,
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
+    CHATGPT_CODEX_WIRE_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
     COMPACTION_FEATURE,
@@ -197,6 +198,9 @@ pub const GOOGLE_RPC_ERROR_DETAILS_FEATURE: &str = "google-rpc-error-details/v1"
 
 /// Text-part state and the frozen codec policy are required for faithful provider replay.
 pub const PROVIDER_TEXT_STATE_FEATURE: &str = "provider-text-state/v1";
+
+/// Ignoring frozen Codex policy or identity would change a resumed request.
+pub const CHATGPT_CODEX_WIRE_FEATURE: &str = "chatgpt-codex-wire/v1";
 
 /// OpenRouter-tagged reasoning and its frozen echo policy cannot be read faithfully by older
 /// builds. This is distinct from text-part phase/signature state in provider-text-state/v1.
@@ -919,6 +923,7 @@ mod tests {
                 TURN_DIRECTIVES_FEATURE,
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
+                CHATGPT_CODEX_WIRE_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
                 COMPACTION_FEATURE,
@@ -952,6 +957,7 @@ mod tests {
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
+        assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
@@ -1102,6 +1108,119 @@ mod tests {
         .unwrap();
         assert!(legacy.required_features().is_empty());
         assert_eq!(encode(1, 1, &legacy).unwrap()[4], FRAMING_VERSION);
+    }
+
+    #[test]
+    fn chatgpt_wire_run_started_is_must_understand() {
+        chatgpt_wire_gate(
+            serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":8},"input":[],"origin":{"kind":"fresh"}}),
+            "/config/frozen_render_config",
+        );
+    }
+
+    #[test]
+    fn chatgpt_wire_refrozen_is_must_understand() {
+        chatgpt_wire_gate(
+            serde_json::json!({"type":"run_config_refrozen","renderer_version":8,"frozen_render_config":{}}),
+            "/frozen_render_config",
+        );
+    }
+
+    #[test]
+    fn chatgpt_continuation_attempt_is_must_understand() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/model_attempt_before_progress.json"
+        ))
+        .unwrap();
+        let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+        let before = encode(1, 1, &legacy).unwrap();
+        value["websocket_request"] = serde_json::json!({"len":123,"sha256":"frame-digest","codex":{"continuation":true,"suffix_item_count":1,"connection_generation":2,"previous_response_id_present":true,"physical_send_count":1}});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        let bytes = encode(1, 1, &record).unwrap();
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != CHATGPT_CODEX_WIRE_FEATURE)
+            .collect();
+        assert!(matches!(
+            decode_next_with(&before, &older),
+            DecodeStep::Record { .. }
+        ));
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [CHATGPT_CODEX_WIRE_FEATURE])
+        );
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+    }
+
+    fn chatgpt_wire_gate(mut value: serde_json::Value, pointer: &str) {
+        use crate::file_wal::Wal;
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != CHATGPT_CODEX_WIRE_FEATURE)
+            .collect();
+        let parent = if pointer.starts_with("/config/") {
+            &mut value["config"]
+        } else {
+            &mut value
+        };
+        parent["frozen_render_config"] = serde_json::json!({});
+        let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+        let legacy_bytes = encode(1, 1, &legacy).unwrap();
+        assert_eq!(legacy_bytes[4], FRAMING_VERSION);
+        assert!(matches!(
+            decode_next_with(&legacy_bytes, &older),
+            DecodeStep::Record { .. }
+        ));
+        // The outer feature fence applies even to an opaque future profile.
+        value.pointer_mut(pointer).unwrap()["chatgpt_wire"] =
+            serde_json::json!({"profile":"codex-future"});
+        let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+        let bytes = encode(1, 1, &record).unwrap();
+        assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+        let root = broca_test_support::scratch_root().join(format!(
+            "codex-floor-{}-{}",
+            std::process::id(),
+            pointer.replace('/', "-")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let floor = root.join("floor");
+        std::fs::write(&floor, b"not a directory").unwrap();
+        let wal_path = root.join("writer.wal");
+        let mut wal = crate::file_wal::FileWal::open(&wal_path)
+            .unwrap()
+            .with_feature_floor(floor.join("feature-floor"));
+        wal.append(1, &legacy, true).unwrap();
+        let before_append = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal.append(1, &record, true).is_err());
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            before_append,
+            "floor failure must prevent the gated append"
+        );
+        drop(wal);
+        std::fs::remove_file(&floor).unwrap();
+        let mut wal = crate::file_wal::FileWal::open(&wal_path)
+            .unwrap()
+            .with_feature_floor(&floor);
+        wal.append(1, &record, true).unwrap();
+        assert!(std::fs::read_to_string(&floor)
+            .unwrap()
+            .contains(CHATGPT_CODEX_WIRE_FEATURE));
+        drop(wal);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [CHATGPT_CODEX_WIRE_FEATURE])
+        );
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+        value
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("chatgpt_wire");
+        let restored: WalRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(encode(1, 1, &restored).unwrap(), legacy_bytes);
     }
 
     /// Every record kind that carries runner tags, and a run start frozen to render them, is a
