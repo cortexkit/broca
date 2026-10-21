@@ -61,6 +61,9 @@ const HARNESS: &str = "conformance";
 mod bus;
 #[path = "llm_runner_conformance/compaction.rs"]
 mod compaction;
+#[cfg(feature = "test-clock")]
+#[path = "llm_runner_conformance/mc_e2e.rs"]
+mod mc_e2e;
 
 fn require_compaction_test_clock() {
     #[cfg(not(feature = "test-clock"))]
@@ -154,6 +157,8 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    #[cfg(feature = "test-clock")]
+    mc_historian: std::sync::atomic::AtomicBool,
     plan_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
@@ -387,6 +392,14 @@ async fn serve_model_request(
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
     let model = request["model"].as_str().unwrap_or_default();
     let model = model.strip_prefix("mock/").unwrap_or(model);
+    #[cfg(feature = "test-clock")]
+    if shared
+        .mc_historian
+        .load(std::sync::atomic::Ordering::SeqCst)
+        && matches!(model, "historian" | "scripted/historian")
+    {
+        return mc_e2e::serve_historian(stream, &request).await;
+    }
     let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
             .plan_sessions
@@ -835,6 +848,8 @@ struct BrocaSubject {
     process_kills_disabled: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
+    #[cfg(feature = "test-clock")]
+    mc: Option<mc_e2e::McConfig>,
 }
 
 impl BrocaSubject {
@@ -855,10 +870,16 @@ impl BrocaSubject {
             process_kills_disabled: false,
             #[cfg(feature = "test-clock")]
             bus: None,
+            #[cfg(feature = "test-clock")]
+            mc: None,
         }
     }
 
     fn bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
+        #[cfg(feature = "test-clock")]
+        if self.mc.is_some() {
+            return broca_protocol::BindIdentity::new(self.project_root.clone(), "broca", session);
+        }
         broca_protocol::BindIdentity::new(self.project_root.clone(), HARNESS, session)
     }
 
@@ -919,6 +940,10 @@ impl BrocaSubject {
             }
         });
         let mut config = config;
+        #[cfg(feature = "test-clock")]
+        if let Some(mc) = &self.mc {
+            config["modules"]["magic-context"] = mc.module();
+        }
         let broca_config = config_home.join("cortexkit/broca.jsonc");
         std::fs::write(
             &broca_config,
