@@ -1783,6 +1783,52 @@ async fn a_second_warm_during_the_first_is_refused() {
     first.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_warm_releases_move_fence_but_live_warm_blocks_it() {
+    for (answer, cancel_caller) in [
+        (warm_answer(), false),
+        (
+            Reply::Full {
+                status: 529,
+                headers: vec![("Content-Type", "application/json")],
+                body: br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#.to_vec(),
+            },
+            false,
+        ),
+        (warm_answer(), true),
+    ] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fixture = Arc::new(Fixture::start(vec![
+            text_turn("hello"),
+            Reply::Gated(release.clone(), Box::new(answer)),
+        ]).await);
+        fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+        let warming = fixture.clone();
+        let caller = tokio::spawn(async move { warming.warm(None).await });
+        fixture.server.wait_for(2).await;
+        let live = fixture.registry.lock_move_sessions(std::slice::from_ref(&fixture.key), false).await.unwrap();
+        assert_eq!(live.busy[0].1.as_deref(), Some("cache_warm"));
+        drop(live);
+        if cancel_caller {
+            caller.abort();
+        }
+        release.notify_one();
+        if cancel_caller {
+            let _ = caller.await;
+            // A cancelled waiter does not cancel the provider request. Wait for the actor to
+            // clear the move fence; a socket reply alone does not prove completion was processed.
+            broca_test_support::wait_until("completed warm must release move fence after caller cancellation", || async {
+                let cut = fixture.registry.lock_move_sessions(std::slice::from_ref(&fixture.key), false).await.unwrap();
+                if cut.busy[0].1.is_none() { Ok(()) } else { Err(format!("{:?}", cut.busy)) }
+            }).await;
+        } else {
+            let _ = caller.await.unwrap();
+            let cut = fixture.registry.lock_move_sessions(std::slice::from_ref(&fixture.key), false).await.unwrap();
+            assert!(cut.busy[0].1.is_none(), "completed warm must release move fence: {:?}", cut.busy);
+        }
+    }
+}
+
 /// A warm that finishes after the session's next run started still writes its record (it is
 /// informational) and exports its fact under the run whose request it re-sent.
 #[tokio::test(flavor = "multi_thread")]

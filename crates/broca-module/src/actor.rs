@@ -5296,6 +5296,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         pending: PendingWarm,
         result: Result<broca_core::WarmSent, crate::executor::WarmError>,
     ) {
+        // Warm completion releases the session-move fence even on failure or after the
+        // caller stops waiting.
+        self.warm_task.take();
         let PendingWarm {
             permit: _permit,
             reply,

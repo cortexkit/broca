@@ -9,6 +9,20 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "actor-completed-warm-releases-move-fence"
+guards = "Completed manual warms release the session move fence on success, failure and caller cancellation while live warms remain busy"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/cache_warm_tests.rs"
+expect_red = ["actor::cache_warm_tests::completed_warm_releases_move_fence_but_live_warm_blocks_it"]
+expect_message = "completed warm must release move fence"
+file = "crates/broca-module/src/actor.rs"
+old = "        self.warm_task.take();"
+new = "        // NON-VACUITY BREAK: retain the completed warm's move fence."
+
+[[control]]
 id = "claude-code-split-message-retains-parallel-results"
 guards = "Adjacent Claude Code assistant fragments sharing an API message ID keep both real parallel tool results through durable import and replay"
 runner = "cargo"
