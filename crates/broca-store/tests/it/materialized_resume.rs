@@ -63,6 +63,7 @@ impl broca_core::tool_plane::ElicitationPlane for InstalledConsentPlane {}
 /// counting the length of a result that might have been filtered after a full read.
 struct DecodingWalStore {
     inner: FileWalStore,
+    lineage_id: Option<broca_wal::WalLineageId>,
     encoded: Vec<Vec<u8>>,
     decoded: AtomicUsize,
     decoded_sequences: Mutex<Vec<u64>>,
@@ -102,9 +103,9 @@ impl WalStore for DecodingWalStore {
         through: Option<u64>,
         _: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
-        Ok(broca_wal::WalRangeRead::without_anchors(
-            self.decode(after, through),
-        ))
+        let mut range = broca_wal::WalRangeRead::without_anchors(self.decode(after, through));
+        range.lineage_id = self.lineage_id;
+        Ok(range)
     }
 }
 
@@ -197,6 +198,7 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
             .map(|frame| serde_json::to_vec(&(frame.fence, &frame.record)).unwrap())
             .collect();
         let store = DecodingWalStore {
+            lineage_id: prefix.lineage_id,
             inner,
             encoded,
             decoded: AtomicUsize::new(0),
@@ -487,8 +489,19 @@ fn request(dir: &std::path::Path) -> RunRequest {
 
 #[tokio::test]
 async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
-    let dir =
-        broca_test_support::scratch_root().join(format!("recreated-prefix-{}", std::process::id()));
+    recreated_prefix_resume(false).await;
+}
+
+#[tokio::test]
+async fn unidentified_prefix_is_replayed_and_repaired_once_on_resume() {
+    recreated_prefix_resume(true).await;
+}
+
+async fn recreated_prefix_resume(unidentified: bool) {
+    let dir = broca_test_support::scratch_root().join(format!(
+        "recreated-prefix-{}-{unidentified}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut old_req = request(&dir);
@@ -521,6 +534,12 @@ async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
         old_prefix.lineage_id.as_deref(),
         Some(old_wal.lineage_id.unwrap().to_string().as_str())
     );
+    if unidentified {
+        let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+        conn.execute("UPDATE meta SET lineage_id=NULL", []).unwrap();
+    }
+    let stale_prefix = store.read_prefix_with_watermark(&old_req.session).unwrap();
+    assert_eq!(stale_prefix.lineage_id.is_none(), unidentified);
 
     let mut new_req = old_req.clone();
     new_req.input = vec![Message::new(
@@ -562,10 +581,11 @@ async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
         recreated.lineage_id().unwrap().to_string(),
         old_prefix.lineage_id.as_ref().unwrap().as_str()
     );
+    let new_lineage = recreated.lineage_id().unwrap();
     drop(recreated);
     assert_eq!(
         store.read_prefix_with_watermark(&new_req.session).unwrap(),
-        old_prefix,
+        stale_prefix,
         "the stale prefix must still be present when resume starts"
     );
 
@@ -574,13 +594,13 @@ async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
         text_turn("resumed", "done"),
     ]);
     run_loop_with_store(
-        new_req,
+        new_req.clone(),
         &provider,
         &StubToolPlane::new(),
         &FileLeaseStore::new(dir.join("resume-leases")),
         &AllowAll,
         &wal_store,
-        Some(store),
+        Some(store.clone()),
         &out,
     )
     .await
@@ -595,6 +615,43 @@ async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
     assert!(
         !rendered.contains("old conversation"),
         "resume served a stale materialized prefix: {rendered}"
+    );
+    let repaired = store.read_prefix_with_watermark(&new_req.session).unwrap();
+    assert_eq!(
+        repaired.lineage_id,
+        Some(new_lineage.to_string()),
+        "projection must identify the repaired prefix"
+    );
+    let repaired_json = serde_json::to_string(&repaired.prefix).unwrap();
+    assert!(
+        repaired_json.contains("new conversation input")
+            && !repaired_json.contains("old conversation"),
+        "reprojection must replace unidentified rows, not relabel them: {repaired_json}"
+    );
+    let current = wal_store.read_records(&new_req.session).unwrap();
+    let counted = DecodingWalStore {
+        lineage_id: Some(new_lineage),
+        inner: wal_store,
+        encoded: current
+            .iter()
+            .map(|frame| serde_json::to_vec(&(frame.fence, &frame.record)).unwrap())
+            .collect(),
+        decoded: AtomicUsize::new(0),
+        decoded_sequences: Mutex::new(Vec::new()),
+    };
+    let head = current.last().unwrap().seq;
+    let snapshot =
+        broca_core::load_prior_wal_snapshot(&counted, &new_req.session, head, Some(store.as_ref()))
+            .unwrap();
+    assert_eq!(snapshot.base_watermark, repaired.watermark_seq);
+    assert!(
+        counted
+            .decoded_sequences
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|seq| *seq > repaired.watermark_seq),
+        "repair must restore suffix-only admission"
     );
 }
 

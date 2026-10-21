@@ -104,8 +104,8 @@ pub struct StorePageRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageSnapshot {
     pub watermark_seq: u64,
-    /// WAL identity represented by the materialized rows. `None` means the row predates
-    /// lineage tracking, so callers preserve the legacy merge behavior.
+    /// WAL identity represented by the materialized rows. Without a known matching
+    /// WAL identity, readers must discard these rows and replay the complete WAL.
     pub lineage_id: Option<String>,
     /// Last control-stream unit represented by the materialized watermark state.
     pub control_head: Option<crate::Cursor>,
@@ -266,12 +266,13 @@ pub trait MaterializedStore: Send + Sync {
         }
     }
 
-    /// Atomically replace a projection only while it still represents `stale_lineage_id`.
+    /// Atomically replace a projection only while its identity equals `stale_lineage_id`.
+    /// `None` repairs a prefix whose identity was never recorded.
     /// `complete_wal` starts at sequence zero and belongs to the replacement lineage.
     fn reproject_if_lineage_mismatch(
         &self,
         _session: &BindIdentity,
-        _stale_lineage_id: &str,
+        _stale_lineage_id: Option<&str>,
         _complete_wal: &WalRangeRead,
     ) -> Result<(), String> {
         Err("materialized store does not support lineage reprojection".into())

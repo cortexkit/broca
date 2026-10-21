@@ -9,6 +9,38 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "session-read-model-persists-lineage-repair"
+guards = "Model-view reads persist the replayed prefix identity rather than repeatedly replaying unidentified rows"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::session_read_model_replays_and_repairs_unidentified_prefix"]
+expect_message = "model reads must persist repaired lineage too"
+file = "crates/broca-module/src/registry.rs"
+old = """            if let Some((store, session, stale_lineage_id)) = lineage_repair {
+                repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
+            }
+            return Ok(RoutedPage::Model(page));"""
+new = """            // NON-VACUITY BREAK: return a full model page without repairing stored identity.
+            return Ok(RoutedPage::Model(page));"""
+
+[[control]]
+id = "store-unidentified-prefix-reprojection-replaces-rows"
+guards = "Reprojection replaces rather than relabels unidentified materialized history before recording WAL identity"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::unidentified_prefix_is_replayed_and_repaired_once_on_resume"]
+expect_message = "reprojection must replace unidentified rows"
+file = "crates/broca-core/src/projection_plan.rs"
+old = "        || (incoming_lineage_id.is_some() && expected_lineage_id.is_none());"
+new = "        || false; // NON-VACUITY BREAK: relabel the unidentified prefix without rebuilding its messages."
+
+[[control]]
 id = "session-read-checks-materialized-prefix-lineage"
 guards = "session.read serves only the replacement WAL after a same-watermark lineage recreation"
 runner = "cargo"
@@ -19,8 +51,48 @@ test_file = "crates/broca-module/src/registry_owner_tests.rs"
 expect_red = ["registry::owner_tests::session_read_rejects_equal_watermark_prefix_after_wal_recreation"]
 expect_message = "new conversation"
 file = "crates/broca-module/src/registry.rs"
-old = "            (Some(stored), Some(observed)) if stored != observed => Some(stored.to_string()),"
-new = "            (Some(stored), Some(observed)) if false && stored != observed => Some(stored.to_string()), // NON-VACUITY BREAK: serve stale materialized rows."
+old = "            (Some(stored), Some(observed)) => stored == observed,"
+new = "            (Some(_stored), Some(_observed)) => true, // NON-VACUITY BREAK: serve stale materialized rows."
+
+[[control]]
+id = "core-resume-rejects-unidentified-prefix"
+guards = "A lineage-less prefix cannot hide a recreated WAL and successful projection repairs identity for suffix-only admission"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::unidentified_prefix_is_replayed_and_repaired_once_on_resume"]
+expect_message = "resume must render the recreated WAL"
+file = "crates/broca-core/src/run.rs"
+old = """                        && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
+                            (Some(stored), Some(observed)) => stored == observed.to_string(),
+                            _ => false,
+                        }"""
+new = """                        && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
+                            (Some(stored), Some(observed)) => stored == observed.to_string(),
+                            _ => true, // NON-VACUITY BREAK: trust an unidentified prefix.
+                        }"""
+
+[[control]]
+id = "session-read-rejects-unidentified-prefix"
+guards = "session.read rebuilds unidentified materialized rows and records the new WAL identity"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::session_read_replays_and_repairs_unidentified_prefix"]
+expect_message = "new conversation"
+file = "crates/broca-module/src/registry.rs"
+old = """        let lineage_matches = match (snapshot.lineage_id.as_deref(), observed_lineage_id) {
+            (Some(stored), Some(observed)) => stored == observed,
+            _ => false,
+        };"""
+new = """        let lineage_matches = match (snapshot.lineage_id.as_deref(), observed_lineage_id) {
+            (Some(stored), Some(observed)) => stored == observed,
+            _ => true, // NON-VACUITY BREAK: unidentified materialized rows are trusted.
+        };"""
 
 [[control]]
 id = "core-resume-checks-materialized-prefix-lineage"

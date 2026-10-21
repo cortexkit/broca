@@ -1553,13 +1553,13 @@ impl SqliteStore {
     fn reproject_if_lineage_mismatch_inner(
         &self,
         session: &BindIdentity,
-        stale_lineage_id: &str,
+        stale_lineage_id: Option<&str>,
         complete_wal: &WalRangeRead,
     ) -> Result<(), StoreError> {
         let incoming_lineage_id = complete_wal.lineage_id.map(|id| id.to_string());
         if incoming_lineage_id
             .as_deref()
-            .is_none_or(|id| id == stale_lineage_id)
+            .is_none_or(|id| Some(id) == stale_lineage_id)
         {
             return Err(StoreError::InconsistentSnapshot(
                 "lineage repair requires a different identified WAL",
@@ -1569,7 +1569,7 @@ impl SqliteStore {
         let key = Self::key(session);
         for _ in 0..OPTIMISTIC_PROJECTION_ATTEMPTS {
             let snapshot = self.projection_snapshot(&key)?;
-            if snapshot.lineage_id.as_deref() != Some(stale_lineage_id) {
+            if snapshot.lineage_id.as_deref() != stale_lineage_id {
                 return Ok(());
             }
             let plan = Self::prepare_projection(
@@ -1591,7 +1591,7 @@ impl SqliteStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let snapshot = Self::projection_snapshot_from_tx(&tx, &key)?;
-        if snapshot.lineage_id.as_deref() != Some(stale_lineage_id) {
+        if snapshot.lineage_id.as_deref() != stale_lineage_id {
             tx.commit()?;
             return Ok(());
         }
@@ -1975,7 +1975,7 @@ impl MaterializedStore for SqliteStore {
     fn reproject_if_lineage_mismatch(
         &self,
         session: &BindIdentity,
-        stale_lineage_id: &str,
+        stale_lineage_id: Option<&str>,
         complete_wal: &WalRangeRead,
     ) -> Result<(), String> {
         self.reproject_if_lineage_mismatch_inner(session, stale_lineage_id, complete_wal)

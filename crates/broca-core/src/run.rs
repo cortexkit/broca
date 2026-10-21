@@ -346,7 +346,7 @@ where
                             range.lineage_id.map(|lineage_id| lineage_id.to_string()),
                         ) {
                             (Some(stored), Some(observed)) => stored == observed,
-                            _ => true,
+                            _ => false,
                         };
                         // Preserve the existing replay policy for every source state; the
                         // safe-head and checkpoint checks below still decide seed validity.
@@ -1601,7 +1601,7 @@ where
                         .contains(&prefix.watermark_seq)
                         && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
                             (Some(stored), Some(observed)) => stored == observed.to_string(),
-                            _ => true,
+                            _ => false,
                         }
                         && (!budgeted || prefix.watermark_seq == snapshot.base_watermark) =>
                 {

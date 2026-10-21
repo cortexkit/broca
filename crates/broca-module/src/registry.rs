@@ -79,6 +79,29 @@ impl<V> BoundedSessionCache<V> {
 static SESSION_READS: AtomicU64 = AtomicU64::new(0);
 static ACTOR_OPENS: AtomicU64 = AtomicU64::new(0);
 
+async fn repair_materialized_lineage(
+    store: Arc<dyn broca_core::MaterializedStore>,
+    session: LineageKey,
+    stale_lineage_id: Option<String>,
+    tail: broca_wal::WalRangeRead,
+) {
+    match spawn_blocking(JobKind::Projection, move || {
+        store.reproject_if_lineage_mismatch(&session, stale_lineage_id.as_deref(), &tail)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "session",
+            "session.read lineage reprojection failed; the returned page remains WAL-authoritative: {error}"
+        ),
+        Err(error) => tracing::warn!(
+            target: "session",
+            "session.read lineage reprojection task failed; the returned page remains WAL-authoritative: {error}"
+        ),
+    }
+}
+
 tokio::task_local! {
     static SERVED_REQUEST_ACTOR_OPENED: Arc<AtomicBool>;
 }
@@ -2882,7 +2905,7 @@ impl LineageRegistry {
     }
 
     /// Model reads serve only fsynced WAL records and discard a store prefix whose
-    /// lineage differs from the WAL, just like transcript reads, without opening an actor.
+    /// lineage is missing or differs from the WAL, just like transcript reads, without opening an actor.
     /// Unlike raw reads, model reads request the checkpoint's compaction state.
     pub async fn route_read_model_page(
         &self,
@@ -3020,34 +3043,24 @@ impl LineageRegistry {
             )
             .await?;
 
-        // ABSENCE MEANS UNKNOWN, NOT MISMATCH. Only two PRESENT ids that DIFFER are a mismatch;
-        // every other pairing falls through deliberately.
-        //
-        // Do not "tighten" this to treat a missing stored id as a mismatch. Every row written
-        // before this column existed carries NULL -- 24,860 materialized sessions at the time it
-        // shipped -- so that change would force a full-WAL reread for all of them on their next
-        // read, turning a correctness guard into a fleet-wide performance cliff. A missing id is
-        // the absence of evidence, and the incremental path it enables is the one that was
-        // already correct for those sessions.
-        // Formatted on the STACK rather than into a String, because the matching path -- which
-        // is every ordinary read -- would allocate the text only to drop it unread. Measured at
-        // 64 bytes and four allocator events per lineaged read.
-        //
-        // The mismatch arm still allocates, and should: it is rare, it logs, and it hands the
-        // stale id to a repair task that outlives this frame.
+        // A watermark orders records within one WAL; it cannot prove that materialized
+        // rows belong to a recreated WAL at the same address. Missing identity must take
+        // the same full replay as a mismatch. Reprojection records the observed identity
+        // so the next read can use the bounded suffix again.
         let mut observed_text = LineageIdText::new();
         let observed_lineage_id = tail
             .lineage_id
             .map(|lineage_id| observed_text.format(lineage_id));
-        let lineage_mismatch = match (snapshot.lineage_id.as_deref(), observed_lineage_id) {
-            (Some(stored), Some(observed)) if stored != observed => Some(stored.to_string()),
-            _ => None,
+        let lineage_matches = match (snapshot.lineage_id.as_deref(), observed_lineage_id) {
+            (Some(stored), Some(observed)) => stored == observed,
+            _ => false,
         };
         let mut lineage_repair = None;
-        if let Some(stale_lineage_id) = lineage_mismatch {
+        if snapshot.watermark_seq > 0 && !lineage_matches {
+            let stale_lineage_id = snapshot.lineage_id.clone();
             tracing::warn!(
                 target: "session",
-                "session.read materialized lineage differs from the WAL; replaying from sequence zero"
+                "session.read materialized lineage is unknown or differs from the WAL; replaying from sequence zero"
             );
             snapshot = broca_core::StorePageSnapshot::empty();
             tail = self
@@ -3151,6 +3164,9 @@ impl LineageRegistry {
             }
             .map_err(|error| OpenError::Open(format!("model replay failed: {error}")))?;
             page.lineage_id = lineage_id.map(|id| id.to_string()).or(page.lineage_id);
+            if let Some((store, session, stale_lineage_id)) = lineage_repair {
+                repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
+            }
             return Ok(RoutedPage::Model(page));
         }
         // Read the watermark before the snapshot moves into the page. When one of the
@@ -3264,21 +3280,7 @@ impl LineageRegistry {
         };
 
         if let Some((store, session, stale_lineage_id)) = lineage_repair {
-            match spawn_blocking(JobKind::Projection, move || {
-                store.reproject_if_lineage_mismatch(&session, &stale_lineage_id, &tail)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(
-                    target: "session",
-                    "session.read lineage reprojection failed; the returned page remains WAL-authoritative: {error}"
-                ),
-                Err(error) => tracing::warn!(
-                    target: "session",
-                    "session.read lineage reprojection task failed; the returned page remains WAL-authoritative: {error}"
-                ),
-            }
+            repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
         }
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
             page,

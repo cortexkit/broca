@@ -109,6 +109,20 @@ impl Drop for Fixture {
 
 #[tokio::test]
 async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
+    recreated_prefix_session_read(false, false).await;
+}
+
+#[tokio::test]
+async fn session_read_replays_and_repairs_unidentified_prefix() {
+    recreated_prefix_session_read(true, false).await;
+}
+
+#[tokio::test]
+async fn session_read_model_replays_and_repairs_unidentified_prefix() {
+    recreated_prefix_session_read(true, true).await;
+}
+
+async fn recreated_prefix_session_read(unidentified: bool, model: bool) {
     let fixture = Fixture::new();
     let mut old = started(&fixture.session, None, None);
     if let WalRecord::RunStarted { input, .. } = &mut old {
@@ -139,6 +153,12 @@ async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
         )
         .unwrap();
     let stale = store.read_prefix_with_watermark(&fixture.session).unwrap();
+    if unidentified {
+        let conn = rusqlite::Connection::open(fixture.root.join("store.db")).unwrap();
+        conn.execute("UPDATE meta SET lineage_id=NULL", []).unwrap();
+    }
+    let stale_prefix = store.read_prefix_with_watermark(&fixture.session).unwrap();
+    assert_eq!(stale_prefix.lineage_id.is_none(), unidentified);
     std::fs::remove_file(fixture.wal.wal_path(&fixture.session)).unwrap();
     let mut new = started(&fixture.session, None, None);
     if let WalRecord::RunStarted { input, .. } = &mut new {
@@ -150,13 +170,7 @@ async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
         )]
         .into();
     }
-    fixture.append(&[
-        new,
-        WalRecord::StepStarted {
-            step_id: broca_protocol::StepId(1),
-        },
-        super::tests::assistant_record(),
-    ]);
+    fixture.append(&[new, super::tests::assistant_record(), finished()]);
     let replacement = fixture
         .wal
         .read_records_range(&fixture.session, 0, None, None)
@@ -170,11 +184,35 @@ async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
     );
     assert_eq!(
         store.read_prefix_with_watermark(&fixture.session).unwrap(),
-        stale
+        stale_prefix
     );
 
-    let registry =
-        LineageRegistry::new_with_reader(Arc::new(NeverOpener), fixture.wal.clone(), Some(store));
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(NeverOpener),
+        fixture.wal.clone(),
+        Some(store.clone()),
+    );
+    if model {
+        let page = registry
+            .route_read_model_page(&fixture.session, &broca_core::ModelPageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page.lineage_id, Some(lineage.to_string()));
+        assert_eq!(
+            page.messages[0].message.content,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "new conversation".into()
+            }]
+        );
+        assert_eq!(
+            store
+                .read_prefix_with_watermark(&fixture.session)
+                .unwrap()
+                .lineage_id,
+            Some(lineage.to_string()),
+            "model reads must persist repaired lineage too"
+        );
+    }
     let page = registry
         .route_read_page(&fixture.session, Some(0), Some(100), true)
         .await
@@ -188,6 +226,19 @@ async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
             text: "new conversation".into()
         }]
     );
+    assert_eq!(
+        store
+            .read_prefix_with_watermark(&fixture.session)
+            .unwrap()
+            .lineage_id,
+        Some(lineage.to_string())
+    );
+    let repeated = registry
+        .route_read_page(&fixture.session, Some(0), Some(100), true)
+        .await
+        .unwrap()
+        .page;
+    assert_eq!(repeated.messages, page.messages);
 }
 
 #[tokio::test]
