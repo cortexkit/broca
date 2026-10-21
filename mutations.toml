@@ -19867,3 +19867,16 @@ new = '''                |row| row.get::<_, i64>(0),
             )?;
             tx.execute("UPDATE meta SET prefix_len=?2 WHERE session=?1 AND prefix_len IS NULL", rusqlite::params![key, prefix_len])?; // NON-VACUITY BREAK: write through a deferred read.
             Ok((watermark as u64, prefix_len))'''
+
+[[control]]
+id = "store-manifest-all-live-roots"
+guards = "Manifest reconstruction resolves ordinary, ephemeral and durable WAL placement and rejects conflicting copies"
+runner = "cargo"
+package = "broca-store"
+target = "--bin store-maintenance"
+select = "expected"
+test_file = "crates/broca-store/src/bin/store-maintenance.rs"
+expect_red = ["tests::manifest_rebuild_resolves_all_live_roots_and_refuses_conflicts"]
+file = "crates/broca-store/src/lib.rs"
+old = "            let path = wal_store.resolve_live_path(&identity).map_err(|source| {"
+new = '''            let path = Ok::<_, broca_wal::WalError>(wal_store.wal_path(&identity).exists().then(|| wal_store.wal_path(&identity))).map_err(|source| { // NON-VACUITY BREAK: inspect only the ordinary live root.'''

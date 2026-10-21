@@ -1164,17 +1164,16 @@ impl SqliteStore {
         let mut project_observations = std::collections::BTreeMap::new();
         let mut sessions_without_wal = 0u64;
         for identity in identities {
-            let path = wal_store.wal_path(&identity);
-            if !path
-                .try_exists()
-                .map_err(|source| WalManifestRebuildError::Wal {
-                    path: path.clone(),
-                    source: broca_wal::WalError::Io(source),
-                })?
-            {
+            let path = wal_store.resolve_live_path(&identity).map_err(|source| {
+                WalManifestRebuildError::Wal {
+                    path: wal_store.wal_path(&identity),
+                    source,
+                }
+            })?;
+            let Some(path) = path else {
                 sessions_without_wal += 1;
                 continue;
-            }
+            };
             let records =
                 broca_wal::read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None)
                     .map_err(|source| WalManifestRebuildError::Wal {

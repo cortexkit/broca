@@ -836,6 +836,56 @@ fn wal_fold(root: &std::path::Path, args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_rebuild_resolves_all_live_roots_and_refuses_conflicts() {
+        use broca_store::SqliteStore;
+        use broca_wal::{FileWal, Wal, WalRecord};
+        let root = temp_root("manifest-live-roots");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+        let wal_store = FileWalStore::new(root.join("wal"));
+        for (i, directory) in ["wal", "wal-ephemeral", "wal-durable"]
+            .into_iter()
+            .enumerate()
+        {
+            let session = BindIdentity::new("/project", "test", directory);
+            index_session(&store, &format!("run-{i}"), session.clone());
+            let ordinary = wal_store.wal_path(&session);
+            let path = root.join(directory).join(ordinary.file_name().unwrap());
+            let mut wal = FileWal::open(path).unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(1),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        let rebuilt = store.rebuild_wal_manifest(&wal_store).unwrap();
+        assert_eq!(rebuilt.addresses.len(), 3);
+        assert_eq!(rebuilt.sessions_without_wal, 0);
+        drop(store);
+        assert_eq!(
+            wal_manifest_with(&root, true, WriterLiveness::stopped()),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            std::fs::read_to_string(wal_store.manifest_path())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        let session = BindIdentity::new("/project", "test", "wal-durable");
+        FileWal::open(wal_store.wal_path(&session)).unwrap();
+        let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+        assert!(
+            store.rebuild_wal_manifest(&wal_store).is_err(),
+            "conflicting placements must not become an arbitrary manifest mapping"
+        );
+    }
+
     use super::{state_root_refusal, wal_manifest_with, WriterLiveness};
     use broca_core::{
         session_addr, FileWalStore, RunIndex, RunIndexRow, RunIndexState, WalStore,
