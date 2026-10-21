@@ -1622,7 +1622,7 @@ impl MaterializedStore for SqliteStore {
         let meta = tx
             .query_row(
                 "SELECT watermark_seq, context_epoch, completed_steps, usage_json, \
-                  retries_used, last_step_usage_json, last_step_finish_reason_json \
+                  retries_used, last_step_usage_json, last_step_finish_reason_json, lineage_id \
                   FROM meta WHERE session=?1",
                 [&key],
                 |r| {
@@ -1634,6 +1634,7 @@ impl MaterializedStore for SqliteStore {
                         r.get::<_, Option<i64>>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
@@ -1656,7 +1657,9 @@ impl MaterializedStore for SqliteStore {
                 retries_used,
                 last_step_usage_json,
                 last_step_finish_reason_json,
+                lineage_id,
             )) => StorePrefix {
+                lineage_id,
                 prefix,
                 completed_steps,
                 usage: serde_json::from_str(&usage_json).map_err(|e| e.to_string())?,

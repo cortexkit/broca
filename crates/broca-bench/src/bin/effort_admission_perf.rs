@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let full = replay(&rows)?;
         let projected = replay(&rows[..boundary])?;
         let prefix = StorePrefix {
+            lineage_id: None,
             prefix: projected.prompt,
             completed_steps: projected.completed_steps,
             usage: projected.usage,

@@ -477,6 +477,119 @@ fn request(dir: &std::path::Path) -> RunRequest {
     }
 }
 
+#[tokio::test]
+async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
+    let dir =
+        broca_test_support::scratch_root().join(format!("recreated-prefix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut old_req = request(&dir);
+    old_req.input = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "old conversation input".into(),
+        }],
+    )];
+    let wal_store = FileWalStore::new(dir.join("wal"));
+    let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let (out, _events) = mpsc::channel(1000);
+    run_loop(
+        old_req.clone(),
+        &RecordingProvider::new(vec![text_turn("old", "old conversation reply")]),
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("old-leases")),
+        &AllowAll,
+        &wal_store,
+        &out,
+    )
+    .await
+    .unwrap();
+    let old_wal = wal_store
+        .read_records_range(&old_req.session, 0, None, None)
+        .unwrap();
+    store.project_range(&old_req.session, &old_wal).unwrap();
+    let old_prefix = store.read_prefix_with_watermark(&old_req.session).unwrap();
+    assert_eq!(
+        old_prefix.lineage_id.as_deref(),
+        Some(old_wal.lineage_id.unwrap().to_string().as_str())
+    );
+
+    let mut new_req = old_req.clone();
+    new_req.input = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "new conversation input".into(),
+        }],
+    )];
+    let source = FileWalStore::new(dir.join("new-source"));
+    run_loop(
+        new_req.clone(),
+        &RecordingProvider::new(vec![text_turn("new", "new conversation reply")]),
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("new-leases")),
+        &AllowAll,
+        &source,
+        &out,
+    )
+    .await
+    .unwrap();
+    let frames = source.read_records(&new_req.session).unwrap();
+    assert!(matches!(
+        frames.last().unwrap().record,
+        WalRecord::RunFinished { .. }
+    ));
+    std::fs::remove_file(wal_store.wal_path(&new_req.session)).unwrap();
+    let mut recreated = wal_store.open(&new_req.session).unwrap();
+    for record in queued_title(&new_req, 0, 10) {
+        recreated.append(1, &record, false).unwrap();
+    }
+    recreated.append(1, &frames[0].record, false).unwrap();
+    recreated.sync().unwrap();
+    assert_eq!(
+        recreated.last_seq(),
+        old_prefix.watermark_seq,
+        "watermarks must not identify a lineage"
+    );
+    assert_ne!(
+        recreated.lineage_id().unwrap().to_string(),
+        old_prefix.lineage_id.as_ref().unwrap().as_str()
+    );
+    drop(recreated);
+    assert_eq!(
+        store.read_prefix_with_watermark(&new_req.session).unwrap(),
+        old_prefix,
+        "the stale prefix must still be present when resume starts"
+    );
+
+    let provider = RecordingProvider::new(vec![
+        text_turn("resumed", "done"),
+        text_turn("resumed", "done"),
+    ]);
+    run_loop_with_store(
+        new_req,
+        &provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("resume-leases")),
+        &AllowAll,
+        &wal_store,
+        Some(store),
+        &out,
+    )
+    .await
+    .unwrap();
+    let requests = provider.sent.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let rendered = std::str::from_utf8(requests.values().next().unwrap()).unwrap();
+    assert!(
+        rendered.contains("new conversation input"),
+        "resume must render the recreated WAL: {rendered}"
+    );
+    assert!(
+        !rendered.contains("old conversation"),
+        "resume served a stale materialized prefix: {rendered}"
+    );
+}
+
 fn hard_stop_request(dir: &std::path::Path, stop_when: StopCondition) -> RunRequest {
     let mut request = request(dir);
     request.stop_when = vec![stop_when];

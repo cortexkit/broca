@@ -1599,6 +1599,10 @@ where
                 Ok(prefix)
                     if (snapshot.base_watermark..=snapshot.head_seq)
                         .contains(&prefix.watermark_seq)
+                        && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
+                            (Some(stored), Some(observed)) => stored == observed.to_string(),
+                            _ => true,
+                        }
                         && (!budgeted || prefix.watermark_seq == snapshot.base_watermark) =>
                 {
                     let tail: Vec<WalRecord> = snapshot

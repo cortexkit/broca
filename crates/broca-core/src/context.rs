@@ -49,6 +49,9 @@ pub use model_page::{
 /// counters it reflects + the WAL seq watermark + the context epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePrefix {
+    /// WAL identity captured in the same transaction as the messages and watermark.
+    /// Readers must compare it with the authoritative WAL before merging this prefix.
+    pub lineage_id: Option<String>,
     /// The provider-valid prompt prefix materialized so far (committed turns).
     pub prefix: Vec<Message>,
     /// Durable model steps folded into `prefix` (so resume continues StepId
@@ -76,6 +79,7 @@ impl StorePrefix {
     /// (the merge then degenerates to a full-WAL replay).
     pub fn empty() -> Self {
         Self {
+            lineage_id: None,
             prefix: Vec::new(),
             completed_steps: 0,
             usage: Usage::default(),
@@ -2305,6 +2309,7 @@ mod tests {
         (
             framed,
             StorePrefix {
+                lineage_id: None,
                 prefix,
                 completed_steps: committed_state.completed_steps,
                 usage: committed_state.usage,
@@ -2584,6 +2589,7 @@ mod tests {
         let watermark = framed.len() as u64 - 1;
         let committed = replay(&wal[..watermark as usize]).expect("committed prefix replays");
         let mut prefix = StorePrefix {
+            lineage_id: None,
             prefix: committed.prompt,
             completed_steps: committed.completed_steps,
             usage: committed.usage,
@@ -2979,6 +2985,7 @@ mod episode_merge_regression {
             message.ordinal = None;
         }
         let prefix = StorePrefix {
+            lineage_id: None,
             prefix: stored_messages,
             completed_steps: projected.completed_steps,
             usage: projected.usage,

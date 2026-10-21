@@ -108,6 +108,89 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
+    let fixture = Fixture::new();
+    let mut old = started(&fixture.session, None, None);
+    if let WalRecord::RunStarted { input, .. } = &mut old {
+        *input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "old conversation".into(),
+            }],
+        )]
+        .into();
+    }
+    fixture.append(&[
+        old,
+        WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        super::tests::assistant_record(),
+        finished(),
+    ]);
+    let store = fixture.sqlite();
+    store
+        .project_range(
+            &fixture.session,
+            &fixture
+                .wal
+                .read_records_range(&fixture.session, 0, None, None)
+                .unwrap(),
+        )
+        .unwrap();
+    let stale = store.read_prefix_with_watermark(&fixture.session).unwrap();
+    std::fs::remove_file(fixture.wal.wal_path(&fixture.session)).unwrap();
+    let mut new = started(&fixture.session, None, None);
+    if let WalRecord::RunStarted { input, .. } = &mut new {
+        *input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "new conversation".into(),
+            }],
+        )]
+        .into();
+    }
+    fixture.append(&[
+        new,
+        WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        super::tests::assistant_record(),
+    ]);
+    let replacement = fixture
+        .wal
+        .read_records_range(&fixture.session, 0, None, None)
+        .unwrap();
+    assert_eq!(stale.watermark_seq, 3);
+    assert_eq!(fixture.wal.read_records(&fixture.session).unwrap().len(), 3);
+    let lineage = replacement.lineage_id.unwrap();
+    assert_ne!(
+        stale.lineage_id.as_deref(),
+        Some(lineage.to_string().as_str())
+    );
+    assert_eq!(
+        store.read_prefix_with_watermark(&fixture.session).unwrap(),
+        stale
+    );
+
+    let registry =
+        LineageRegistry::new_with_reader(Arc::new(NeverOpener), fixture.wal.clone(), Some(store));
+    let page = registry
+        .route_read_page(&fixture.session, Some(0), Some(100), true)
+        .await
+        .unwrap()
+        .page;
+    assert_eq!(page.lineage_id, Some(lineage));
+    assert_eq!(page.messages.len(), 2);
+    assert_eq!(
+        page.messages[0].message.content,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "new conversation".into()
+        }]
+    );
+}
+
+#[tokio::test]
 #[ignore = "manual timing probe on a 15 MB production-framed WAL"]
 async fn owner_authorization_on_15mb_wal() {
     let fixture = Fixture::new();

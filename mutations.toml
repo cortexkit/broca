@@ -9,6 +9,34 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "session-read-checks-materialized-prefix-lineage"
+guards = "session.read serves only the replacement WAL after a same-watermark lineage recreation"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::session_read_rejects_equal_watermark_prefix_after_wal_recreation"]
+expect_message = "new conversation"
+file = "crates/broca-module/src/registry.rs"
+old = "            (Some(stored), Some(observed)) if stored != observed => Some(stored.to_string()),"
+new = "            (Some(stored), Some(observed)) if false && stored != observed => Some(stored.to_string()), // NON-VACUITY BREAK: serve stale materialized rows."
+
+[[control]]
+id = "core-resume-checks-materialized-prefix-lineage"
+guards = "Resume rejects a stale materialized transcript even when the recreated WAL reaches the same watermark"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::recreated_wal_rejects_equal_watermark_prefix_on_resume"]
+expect_message = "resume must render the recreated WAL"
+file = "crates/broca-core/src/run.rs"
+old = "                            (Some(stored), Some(observed)) => stored == observed.to_string(),"
+new = "                            (Some(_stored), Some(_observed)) => true, // NON-VACUITY BREAK: trust the watermark across recreated WALs."
+
+[[control]]
 id = "actor-completed-warm-releases-move-fence"
 guards = "Completed manual warms release the session move fence on success, failure and caller cancellation while live warms remain busy"
 runner = "cargo"
