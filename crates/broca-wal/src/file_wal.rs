@@ -1950,6 +1950,25 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn range_reads_do_not_restore_unused_feature_collection_api_or_pass() {
+        let reader = include_str!("file_wal.rs");
+        let framing = include_str!("framing.rs");
+        for obsolete in [
+            concat!("pub fn used_", "features("),
+            concat!("used_", "features: Vec<String>"),
+        ] {
+            assert!(
+                !reader.contains(obsolete),
+                "range reads must not retain unused feature collection: {obsolete}"
+            );
+        }
+        assert!(
+            !framing.contains(concat!("fn verified_prefix_", "features(")),
+            "feature checks belong to the decoder, not a second pass over verified records"
+        );
+    }
+
+    #[test]
     fn prefix_readers_share_replay_damage_policy_without_writing() {
         let first = encode(1, 1, &WalRecord::StepStarted { step_id: StepId(1) }).unwrap();
         let second = encode(2, 1, &WalRecord::StepStarted { step_id: StepId(2) }).unwrap();

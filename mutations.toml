@@ -20011,3 +20011,32 @@ expect_red = ["session_refs::tests::census_quarantines_damage_and_commits_health
 file = "crates/broca-store/src/session_refs/census.rs"
 old = "    if !pending && counts.unreadable == 0 {"
 new = "    if true || (!pending && counts.unreadable == 0) { // NON-VACUITY BREAK: attest incomplete history."
+
+[[control]]
+id = "wal-range-no-unused-feature-api"
+guards = "Range reads do not reintroduce the unused feature-reporting API or the redundant verified-prefix feature pass"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::range_reads_do_not_restore_unused_feature_collection_api_or_pass"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "impl WalRangeRead {"
+new = "impl WalRangeRead {\n    pub fn used_features(&self) -> &[String] { &[] } // NON-VACUITY BREAK: restore the unused reporting surface."
+
+[[control]]
+id = "wal-open-recovery-streams-bodies"
+guards = "Strict recovery scans one frame at a time instead of materializing the whole historical WAL"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::recovery_scan_decodes_strict_bodies_one_frame_at_a_time"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "    let mut scan = PrefixScan {"
+new = '''    let mut whole_history = Vec::new(); // NON-VACUITY BREAK: buffer the complete recovery input.
+    file.read_to_end(&mut whole_history).map_err(WalError::Io)?;
+    let mut file = std::io::Cursor::new(whole_history);
+    let mut scan = PrefixScan {'''
