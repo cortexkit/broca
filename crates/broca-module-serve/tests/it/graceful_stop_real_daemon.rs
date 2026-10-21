@@ -374,36 +374,47 @@ impl Rig {
     }
 
     async fn wait_for_replacement(&self, launch: &Value) {
+        self.wait_for_replacement_within(launch, broca_test_support::EVENT_HANG_GUARD)
+            .await;
+    }
+
+    /// Wait up to `budget` for a routable replacement of `launch`. A restart drain may run
+    /// until its ceiling, so a test that reads the drain verdict afterwards passes a budget past
+    /// that ceiling: a drain held to its ceiling then fails on `drained=false`, which names the
+    /// cause, instead of on a replacement wait that ran out first.
+    async fn wait_for_replacement_within(&self, launch: &Value, budget: Duration) {
         let description = format!("routable replacement of broca launch {launch}");
         self.observe_wait(format!("waiting for {description}; no health reply yet"));
-        broca_test_support::wait_for(
-            &description,
-            async {
-                loop {
-                    let health =
-                        match broca_subc::SubcConnection::connect(&self.connection_file).await {
-                            Ok(conn) => conn
-                                .supervisor_health_probe("broca")
-                                .await
-                                .map_err(|e| format!("health: {e:?}")),
-                            Err(error) => Err(format!("connect: {error:?}")),
-                        };
-                    self.observe_wait(format!(
-                        "waiting for {description}; last observation: {health:?}"
-                    ));
-                    if health.ok().and_then(|h| h.metrics).is_some_and(|m| {
-                        m["launch_id"]
-                            .as_str()
-                            .is_some_and(|id| Some(id) != launch.as_str())
-                    }) {
-                        return;
-                    }
-                    sleep(Duration::from_millis(50)).await;
+        let replaced = tokio::time::timeout(budget, async {
+            loop {
+                let health = match broca_subc::SubcConnection::connect(&self.connection_file).await
+                {
+                    Ok(conn) => conn
+                        .supervisor_health_probe("broca")
+                        .await
+                        .map_err(|e| format!("health: {e:?}")),
+                    Err(error) => Err(format!("connect: {error:?}")),
+                };
+                self.observe_wait(format!(
+                    "waiting for {description}; last observation: {health:?}"
+                ));
+                if health.ok().and_then(|h| h.metrics).is_some_and(|m| {
+                    m["launch_id"]
+                        .as_str()
+                        .is_some_and(|id| Some(id) != launch.as_str())
+                }) {
+                    return;
                 }
-            },
-            || self.restart_diagnostics(),
-        )
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
         .await;
+        if replaced.is_err() {
+            panic!(
+                "timed out waiting for {description} after {budget:?}; {}",
+                self.restart_diagnostics()
+            );
+        }
     }
 
     /// The daemon's own record of how broca's restart drain ended, read from its log.
@@ -990,7 +1001,11 @@ async fn module_restart_during_long_tool_pauses_with_idle_gauge_before_goodbye()
     // During a drain the daemon refuses ordinary client health probes, so the test can't read
     // broca's gauge directly. The daemon itself still reads it, and ends the drain by
     // quiescence only once the paused run has stopped counting as busy.
-    rig.wait_for_replacement(&active["launch_id"]).await;
+    // The long tool must finish before the run pauses and the drain can end, which on a loaded
+    // runner can outlast the shared hang guard. Wait past the drain ceiling instead, so the
+    // verdict below distinguishes a slow quiescent drain from one held to its ceiling.
+    rig.wait_for_replacement_within(&active["launch_id"], drain + Duration::from_secs(30))
+        .await;
     let (drained, line) = rig
         .restart_drain_verdict(earlier)
         .unwrap_or_else(|message| panic!("{message}"));
