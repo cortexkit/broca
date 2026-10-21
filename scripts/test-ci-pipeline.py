@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise archive/shard guards and the workflow dependency graph without compiling."""
 import json
+import hashlib
 import io
 import importlib.util
 import os
@@ -167,6 +168,22 @@ class WorkflowGraph(unittest.TestCase):
         suites = next(i for i, step in enumerate(steps) if step.get('run') == 'scripts/script-suites.sh')
         self.assertLess(fetch, suites)
         self.assertTrue(any(step.get('uses', '').startswith('dtolnay/rust-toolchain@') for step in steps[:fetch]))
+
+    def test_real_bus_jobs_install_and_require_the_pinned_broker(self):
+        for workflow, name in (('ci.yml', 'integration'), ('mutations.yml', 'mutations'),
+                               ('mutations-windows.yml', 'mutations-windows')):
+            job = self.workflow(workflow)['jobs'][name]
+            self.assertEqual(job['env']['CK_BUS_TESTKIT_REQUIRE'], '1', workflow)
+            install = next(i for i, step in enumerate(job['steps'])
+                           if step.get('run') == 'python3 scripts/install-ci-nats.py')
+            self.assertNotIn('if', job['steps'][install], workflow)
+            replay = next(i for i, step in enumerate(job['steps'])
+                          if 'ci-integration.sh run' in step.get('run', '')
+                          or 'ckdev-mutate run' in step.get('run', ''))
+            self.assertLess(install, replay, workflow)
+        gate = (ROOT / 'scripts/gate.sh').read_text()
+        self.assertIn('export CK_BUS_TESTKIT_REQUIRE=1', gate)
+        self.assertIn('/opt/homebrew/bin:$PATH', gate)
 
     def test_fixtures_are_pinned_and_shared_without_changing_mutation_selection(self):
         fixtures = self.workflow('fixtures.yml')['jobs']['fixtures']
@@ -598,6 +615,58 @@ class ArtifactWait(unittest.TestCase):
         response = self.artifacts(*['other-' + str(i) for i in range(100)])
         api = self.run_wait([response, self.artifacts('fixtures-Windows', 'integration-windows')])
         self.assertTrue(api.call_args.args[0].endswith('page=2'))
+
+
+class NatsInstall(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('install_nats', ROOT / 'scripts/install-ci-nats.py')
+        self.installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.installer)
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-nats-install-')
+        self.addCleanup(self.tmp.cleanup)
+        self.destination = Path(self.tmp.name) / 'broker with spaces'
+
+    def archive(self, os_name, content=b'broker fixture'):
+        target = self.installer.ARCHIVES[os_name][0]
+        name = 'nats-server.exe' if os_name == 'Windows' else 'nats-server'
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode='w:gz') as package:
+            member = tarfile.TarInfo(f'nats-server-v{self.installer.VERSION}-{target}/{name}')
+            member.size = len(content)
+            package.addfile(member, io.BytesIO(content))
+        return data.getvalue()
+
+    def test_installs_each_platform_archive_and_checks_its_version(self):
+        for os_name in ('Linux', 'Windows'):
+            with self.subTest(os_name=os_name):
+                archive = self.archive(os_name)
+                target = self.installer.ARCHIVES[os_name][0]
+                with patch.dict(self.installer.ARCHIVES, {
+                    os_name: (target, hashlib.sha256(archive).hexdigest())
+                }), patch.object(self.installer.urllib.request, 'urlopen',
+                                 return_value=io.BytesIO(archive)), \
+                        patch.object(self.installer.subprocess, 'run', return_value=
+                                     subprocess.CompletedProcess([], 0, 'nats-server: v2.10.26\n')) as run:
+                    binary = self.installer.install(self.destination, os_name, 'AMD64')
+                self.assertEqual(binary.read_bytes(), b'broker fixture')
+                self.assertEqual(binary.suffix, '.exe' if os_name == 'Windows' else '')
+                self.assertEqual(run.call_args.args[0], [str(binary), '--version'])
+                self.assertTrue(run.call_args.kwargs['check'])
+
+    def test_rejects_wrong_checksum_before_writing_or_executing(self):
+        with patch.object(self.installer.urllib.request, 'urlopen',
+                          return_value=io.BytesIO(self.archive('Linux'))), \
+                patch.object(self.installer.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                self.installer.install(self.destination, 'Linux', 'x86_64')
+        self.assertFalse(self.destination.exists())
+        run.assert_not_called()
+
+    def test_refuses_an_unpinned_platform_before_downloading(self):
+        with patch.object(self.installer.urllib.request, 'urlopen') as download:
+            with self.assertRaisesRegex(RuntimeError, 'no pinned NATS archive'):
+                self.installer.install(self.destination, 'Linux', 'aarch64')
+        download.assert_not_called()
 
 
 class FixtureUnpack(unittest.TestCase):

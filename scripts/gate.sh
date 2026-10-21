@@ -31,6 +31,9 @@ set -u
 cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.cargo/bin:$PATH"
+# Homebrew is not on PATH in every agent shell, but the real-bus tests need its nats-server.
+if [ "$(uname -s)" = Darwin ]; then export PATH="/opt/homebrew/bin:$PATH"; fi
+export CK_BUS_TESTKIT_REQUIRE=1
 # The gate builds the workspace under several feature sets, and incremental compilation keeps a
 # separate cache for each one, which grew to 122 GB in one target folder on the shared Mac. A
 # gate rarely recompiles the same crate twice in a way incremental can reuse, so turn it off.

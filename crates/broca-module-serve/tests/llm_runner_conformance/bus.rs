@@ -37,13 +37,19 @@ fn jwt(signer: &KeyPair, subject: &str, nats: Value) -> String {
     )
 }
 impl BusRig {
-    pub async fn new(root: &Path) -> Self {
-        let server = BusServer::start(BusOptions {
+    pub async fn new(root: &Path) -> Option<Self> {
+        let server = match BusServer::start(BusOptions {
             directory: Some(root.join("broker")),
             ..Default::default()
         })
         .await
-        .expect("private NATS prerequisite");
+        {
+            Ok(server) => server,
+            Err(error) => {
+                cortexkit_bus_testkit::skip_or_fail(error);
+                return None;
+            }
+        };
         println!("private {}", server.version);
         let account = KeyPair::new_account();
         std::fs::write(server.dir.join("jwt").join(format!("{}.jwt", account.public_key())), jwt(
@@ -94,13 +100,13 @@ impl BusRig {
             })
             .await
             .unwrap();
-        Self {
+        Some(Self {
             server,
             connection,
             names,
             user,
             jwt,
-        }
+        })
     }
     pub async fn register(self: &Arc<Self>, connection_file: &Path) -> tokio::task::JoinHandle<()> {
         let manifest = subc_protocol::manifest::ModuleManifest::builder("ckbus", "test")
@@ -222,7 +228,7 @@ async fn at_receipt_cut(
     runtime: &Path,
     project: &Path,
     cut: &str,
-) -> (BrocaSubject, Live, BrocaRoute, PathBuf) {
+) -> Option<(BrocaSubject, Live, BrocaRoute, PathBuf)> {
     use broca_core::{
         compaction_provider::{
             lineage::MessageRef,
@@ -241,7 +247,7 @@ async fn at_receipt_cut(
     std::fs::create_dir_all(runtime).unwrap();
     let mut subject = BrocaSubject::new(runtime).await;
     subject.project_root = project.canonicalize().unwrap();
-    subject.bus = Some(Arc::new(BusRig::new(runtime).await));
+    subject.bus = Some(Arc::new(BusRig::new(runtime).await?));
     let session = "bus-crash";
     subject
         .install_script(
@@ -318,7 +324,7 @@ async fn at_receipt_cut(
         .unwrap();
     assert_eq!(receipts.len(), 1, "receipt was not durable before {cut}");
     println!("accepted send reached {cut}: one durable receipt, no mid-step view application");
-    (subject, live, route, gate)
+    Some((subject, live, route, gate))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -327,7 +333,11 @@ async fn real_bus_mid_run_receipt_reaches_both_crash_cuts_without_killing() {
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
     for cut in ["ViewReceiptRecorded", "ViewReadyAcked"] {
-        let (_subject, _live, _route, gate) = at_receipt_cut(&root.join(cut), &project, cut).await;
+        let Some((_subject, _live, _route, gate)) =
+            at_receipt_cut(&root.join(cut), &project, cut).await
+        else {
+            return;
+        };
         std::fs::remove_file(gate).unwrap();
     }
 }
@@ -341,7 +351,10 @@ async fn real_bus_mid_run_receipt_crash_cuts_resume_identical_request_bytes() {
     let mut captured = Vec::new();
     for cut in ["ViewReceiptRecorded", "ViewReadyAcked"] {
         let runtime = root.join(cut);
-        let (subject, mut live, route, gate) = at_receipt_cut(&runtime, &project, cut).await;
+        let Some((subject, mut live, route, gate)) = at_receipt_cut(&runtime, &project, cut).await
+        else {
+            return;
+        };
         let session = "bus-crash";
         assert!(live.kill_all(), "no runner process was SIGKILLed at {cut}");
         drop(route);
@@ -428,7 +441,10 @@ async fn real_bus_fitting_idle_view_records_estimate_then_releases_held_queue_he
     let root = broca_test_support::scratch_root().join("bus-idle-ceiling-head");
     std::fs::create_dir_all(&root).unwrap();
     let mut subject = BrocaSubject::new(&root).await;
-    subject.bus = Some(Arc::new(BusRig::new(&root).await));
+    let Some(bus) = BusRig::new(&root).await else {
+        return;
+    };
+    subject.bus = Some(Arc::new(bus));
     let session = "bus-idle";
     subject
         .install_script(
