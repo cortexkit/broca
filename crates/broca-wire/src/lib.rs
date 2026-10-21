@@ -1934,7 +1934,10 @@ mod open_state_tests {
             serde_json::to_value(FlowPrincipalRefusal::new(true, "reserved:agent")).unwrap();
         principal["class"] = serde_json::json!("future_class");
         let principal: FlowPrincipalRefusal = serde_json::from_value(principal).unwrap();
-        assert_eq!(principal.class.as_str(), "future_class");
+        assert_eq!(
+            serde_json::to_value(&principal).unwrap()["class"],
+            "future_class"
+        );
 
         let account: AccountSelectionRefusedDetail = serde_json::from_value(serde_json::json!({
             "routing_code": "account_pool_exhausted",

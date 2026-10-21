@@ -21383,7 +21383,7 @@ package = "ck-session-import"
 target = "--lib"
 select = "expected"
 test_file = "crates/ck-session-import/src/codex.rs"
-expect_red = ["codex::tests::codex_compaction_replaces_older_history_and_keeps_following_turns", "codex::tests::codex_legacy_compaction_summary_replaces_older_history"]
+expect_red = ["codex::tests::codex_compaction_replaces_older_history_and_keeps_following_turns"]
 file = "crates/ck-session-import/src/codex.rs"
 old = "                messages.clear();"
 new = "                let _ = &mut messages; // NON-VACUITY BREAK: retain superseded history."
@@ -21409,7 +21409,7 @@ package = "ck-session-import"
 target = "--lib"
 select = "expected"
 test_file = "crates/ck-session-import/src/lib.rs"
-expect_red = ["claude_code::tests::tool_result_images_are_omitted_without_losing_surrounding_text", "goose::tests::tool_result_images_are_omitted_and_text_is_retained", "pi::tests::tool_result_images_are_omitted_with_an_actionable_warning"]
+expect_red = ["claude_code::tests::tool_result_images_are_omitted_without_losing_surrounding_text"]
 file = "crates/ck-session-import/src/lib.rs"
 old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
 new = "            if false { // NON-VACUITY BREAK: replay unsupported image payloads as raw data."
@@ -21439,7 +21439,7 @@ select = "expected"
 test_file = "crates/ck-import/tests/it/cli.rs"
 expect_red = ["cli::malformed_mc_row_warns_and_continues_lineage_setup"]
 file = "crates/ck-import/src/main.rs"
-old = "            Err(message) => {\n                mc_status = \"unavailable\".into();"
+old = "            Err(message) => {\n                mc_status = \"unavailable\".into();\n                warn_mc_state_unavailable(output, &message, &session_id);\n            }"
 new = "            Err(message) => return Err(message), // NON-VACUITY BREAK: abort before lineage import."
 
 
@@ -21491,7 +21491,7 @@ package = "ck-session-import"
 target = "--lib"
 select = "expected"
 test_file = "crates/ck-session-import/src/lib.rs"
-expect_red = ["claude_code::tests::selected_claude_session_rejects_an_oversized_jsonl_record", "codex::tests::selected_codex_rollout_rejects_an_oversized_jsonl_record", "pi::tests::selected_pi_session_rejects_an_oversized_jsonl_record", "tests::jsonl_reader_rejects_oversized_records_before_buffering_them"]
+expect_red = ["claude_code::tests::selected_claude_session_rejects_an_oversized_jsonl_record"]
 file = "crates/ck-session-import/src/lib.rs"
 old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
 new = "            if false { // NON-VACUITY BREAK: allow an oversized JSONL line to allocate."
@@ -21732,3 +21732,82 @@ expect_red = ["caller_message_tests::stateful_caller_message_serializer_uses_bor
 file = "crates/broca-wire/src/lib.rs"
 old = "    CallerMessageRef(message).serialize(serializer)\n}\n\nstruct CallerMessageRef"
 new = "    CallerMessageRef(&(*message).clone()).serialize(serializer) // NON-VACUITY BREAK: clone all message blocks\n}\n\nstruct CallerMessageRef"
+
+
+[[control]]
+id = "codex-legacy-compaction-summary-replaces-old-history"
+guards = "A legacy Codex compaction summary replaces all history accumulated before its row"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::codex_legacy_compaction_summary_replaces_older_history"]
+file = "crates/ck-session-import/src/codex.rs"
+old = "                messages.clear();"
+new = "                let _ = &mut messages; // NON-VACUITY BREAK: retain history superseded by a legacy summary."
+
+[[control]]
+id = "goose-imported-tool-images-never-replay-base64"
+guards = "Goose imported tool results replace image blocks with bounded placeholders and keep nearby text"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/goose.rs"
+expect_red = ["goose::tests::tool_result_images_are_omitted_and_text_is_retained"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
+new = "            if false { // NON-VACUITY BREAK: keep unsupported image payloads in tool output."
+
+[[control]]
+id = "pi-imported-tool-images-never-replay-base64"
+guards = "Pi imported tool results replace image blocks with bounded placeholders and keep nearby text"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::tool_result_images_are_omitted_with_an_actionable_warning"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
+new = "            if false { // NON-VACUITY BREAK: keep unsupported image payloads in tool output."
+
+[[control]]
+id = "codex-selected-rollout-line-size-limit"
+guards = "Codex import refuses an oversized JSONL record before allocating it as a parsed row"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::selected_codex_rollout_rejects_an_oversized_jsonl_record"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."
+
+[[control]]
+id = "pi-selected-session-line-size-limit"
+guards = "Pi import refuses an oversized JSONL record before allocating it as a parsed node"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::selected_pi_session_rejects_an_oversized_jsonl_record"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."
+
+[[control]]
+id = "session-import-line-helper-size-limit"
+guards = "The shared JSONL reader refuses a record that exceeds its fixed buffer bound"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["tests::jsonl_reader_rejects_oversized_records_before_buffering_them"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."
