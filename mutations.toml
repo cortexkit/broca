@@ -19659,3 +19659,29 @@ expect_red = ["bedrock_converse_golden::bedrock_finalize_turn_keeps_tool_config_
 file = "crates/broca-provider/src/families/bedrock_converse.rs"
 old = "    if matches!(choice, ToolChoice::None) && !has_tool_history {"
 new = "    if matches!(choice, ToolChoice::None) { // NON-VACUITY BREAK: omit config despite historical tools"
+
+[[control]]
+id = "wal-preencoded-rejects-mismatched-frames"
+guards = "Preencoded frames agree with their sequence, fence, record and required features before bytes or floor publication"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::preencoded_mismatches_leave_wal_and_floor_unchanged"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "        if preencoded {"
+new = "        if preencoded && false { // NON-VACUITY BREAK: trust caller frame bytes."
+
+[[control]]
+id = "wal-open-reference-index"
+guards = "Writer open uses the shared session reference for the cut index without weakening standalone migration checks"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::writer_open_uses_reference_index_and_preserves_standalone_guard"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "        crate::migration::guard(&path, &session_ref, true)?;"
+new = "        crate::migration::guard(&path, \"\", true)?; // NON-VACUITY BREAK: discard the supplied reference."

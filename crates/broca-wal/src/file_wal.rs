@@ -585,7 +585,7 @@ impl FileWal {
     /// bricking an otherwise-recoverable session. A crash during an append followed by a
     /// resume-append is exactly the core recovery path, so this must be clean.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
-        Self::open_inner(path.into(), None, None)
+        Self::open_inner(path.into(), None, String::new(), None)
     }
 
     // Callers of this test seam are all `#[cfg(unix)]` (the directory-fsync probe tests), so on
@@ -593,7 +593,7 @@ impl FileWal {
     #[cfg(test)]
     #[cfg_attr(not(unix), allow(dead_code))]
     fn open_with_probe(path: impl Into<PathBuf>, sync_probe: SyncProbe) -> Result<Self, WalError> {
-        Self::open_inner(path.into(), None, Some(sync_probe))
+        Self::open_inner(path.into(), None, String::new(), Some(sync_probe))
     }
 
     /// Open a WAL and record its diagnostic address when this call creates the file.
@@ -607,6 +607,24 @@ impl FileWal {
         session_addr: impl Into<String>,
         identity: impl Into<String>,
     ) -> Result<Self, WalError> {
+        Self::open_with_manifest_and_session_ref(
+            path,
+            manifest_path,
+            session_addr,
+            identity,
+            String::new(),
+        )
+    }
+
+    /// Open with the shared session reference already available to migration fencing.
+    /// Supplying it after open is too late to use the per-reference cut index.
+    pub fn open_with_manifest_and_session_ref(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+    ) -> Result<Self, WalError> {
         Self::open_inner(
             path.into(),
             Some(ManifestAppend {
@@ -614,6 +632,7 @@ impl FileWal {
                 session_addr: session_addr.into(),
                 identity: identity.into(),
             }),
+            session_ref,
             None,
         )
     }
@@ -621,10 +640,11 @@ impl FileWal {
     fn open_inner(
         path: PathBuf,
         manifest: Option<ManifestAppend>,
+        session_ref: String,
         #[cfg(test)] sync_probe: Option<SyncProbe>,
         #[cfg(not(test))] _sync_probe: Option<()>,
     ) -> Result<Self, WalError> {
-        crate::migration::guard(&path, "", true)?;
+        crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
         broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?;
         let mut newly_created_dirs = Vec::new();
@@ -718,7 +738,7 @@ impl FileWal {
             append_budget: DEFAULT_MAX_READ_BYTES,
             budget_scope: crate::size_limit::SizeScope::Session,
             feature_floor: None,
-            session_ref: String::new(),
+            session_ref,
             #[cfg(test)]
             sync_probe,
         })
@@ -839,6 +859,7 @@ impl FileWal {
             self.append_budget = self.recovery_cap;
         }
         let seq = self.next_seq;
+        let preencoded = frame.is_some();
         let record_bytes = match frame {
             Some(frame) => frame,
             None => encode(seq, fence, record).map_err(WalError::Frame)?,
@@ -863,6 +884,10 @@ impl FileWal {
                 max_bytes: self.append_budget,
                 file_size: required,
             });
+        }
+        if preencoded {
+            crate::framing::validate_preencoded(&record_bytes, seq, fence, record)
+                .map_err(WalError::Frame)?;
         }
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
@@ -1868,6 +1893,87 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preencoded_mismatches_leave_wal_and_floor_unchanged() {
+        let path = tmp("preencoded-validation");
+        let floor = path.with_extension("floor");
+        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
+        let record = WalRecord::StepStarted { step_id: StepId(1) };
+        let other = WalRecord::StepStarted { step_id: StepId(2) };
+        let valid = encode(1, 7, &record).unwrap();
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut extra = valid.clone();
+        extra.extend_from_slice(&valid);
+        let before = std::fs::read(&path).unwrap();
+        for frame in [
+            encode(2, 7, &record).unwrap(),
+            encode(1, 8, &record).unwrap(),
+            encode(1, 7, &other).unwrap(),
+            valid[..valid.len() - 1].to_vec(),
+            corrupt,
+            extra,
+        ] {
+            assert!(wal.append_preencoded(7, &record, true, frame).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!floor.exists());
+            assert_eq!(wal.last_seq(), 0);
+        }
+        let gated: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"run_cancel_requested", "run_id":"run", "at":"now"
+        }))
+        .unwrap();
+        let ungated =
+            crate::framing::encode_payload(1, 7, &serde_json::to_vec(&gated).unwrap()).unwrap();
+        assert!(wal.append_preencoded(7, &gated, true, ungated).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            !floor.exists(),
+            "rejected frames must not publish feature requirements"
+        );
+        assert_eq!(wal.append_preencoded(7, &record, true, valid).unwrap(), 1);
+        assert_eq!(
+            FileWal::open(&path).unwrap().replay().unwrap()[0].record,
+            record
+        );
+    }
+
+    #[test]
+    fn writer_open_uses_reference_index_and_preserves_standalone_guard() {
+        let root = tmp("indexed-open");
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let reference = "0123456789abcdef0123456789abcdef";
+        let cut = root.join("agent-data/cuts/cut.json");
+        crate::migration::atomic_json(&root, &cut, &serde_json::json!({"intent":null})).unwrap();
+        crate::migration::rebuild_fence_index(&root).unwrap();
+        // A ready index makes an unrelated cut body unnecessary for this reference.
+        std::fs::write(&cut, b"not json").unwrap();
+        let path = root.join("wal/session.wal");
+        let open = || {
+            FileWal::open_with_manifest_and_session_ref(
+                &path,
+                root.join("manifest"),
+                "address",
+                "identity",
+                reference.into(),
+            )
+        };
+        assert!(open().is_ok());
+        assert!(
+            FileWal::open(&path).is_err(),
+            "unindexed opens must retain the full guard"
+        );
+        std::fs::write(
+            path.with_extension("moving"),
+            br#"{"cutId":"cut","endOffset":0,"lineage_id":"id"}"#,
+        )
+        .unwrap();
+        assert!(
+            open().is_err(),
+            "indexed opens must still check moving sidecars"
+        );
+    }
+
     #[test]
     fn first_episode_discriminator_reads_only_its_bounded_prefix() {
         struct Count {

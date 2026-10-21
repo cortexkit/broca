@@ -486,6 +486,42 @@ pub fn encode(seq: u64, fence: u64, record: &WalRecord) -> Result<Vec<u8>, Frame
     encode_with_requires(seq, fence, &[], record)
 }
 
+/// Check caller-supplied bytes against the record whose features the writer will publish.
+/// A valid alternative JSON layout is retained, but trailing frames and omitted gates are refused.
+pub(crate) fn validate_preencoded(
+    bytes: &[u8],
+    seq: u64,
+    fence: u64,
+    record: &WalRecord,
+) -> Result<(), FrameError> {
+    let matches = matches!(decode_next(bytes), DecodeStep::Record { framed, consumed }
+        if consumed == bytes.len() && framed.seq == seq && framed.fence == fence && &framed.record == record);
+    let required = record.required_features();
+    let gated = if !matches {
+        false
+    } else if bytes.get(4) == Some(&GATED_FRAMING_VERSION) {
+        let envelope: GatedRequires =
+            serde_json::from_slice(&bytes[HEADER_LEN..]).map_err(FrameError::Deserialize)?;
+        required
+            .iter()
+            .all(|name| envelope.requires.iter().any(|actual| actual == name))
+            && envelope
+                .requires
+                .iter()
+                .all(|name| required.contains(&name.as_str()))
+    } else {
+        required.is_empty()
+    };
+    if !matches || !gated {
+        return Err(FrameError::Serialize(
+            <serde_json::Error as serde::ser::Error>::custom(
+                "preencoded WAL frame differs from its sequence, fence, record or requirements",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Encode a record that may need features an older reader lacks.
 ///
 /// The record's own [`WalRecord::required_features`] are always added to `requires`, so a

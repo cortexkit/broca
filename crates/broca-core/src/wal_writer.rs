@@ -816,19 +816,19 @@ impl FileWalStore {
             session.session
         );
         let retained = path == self.ephemeral_wal_path(session);
-        let wal = FileWal::open_with_manifest(
+        let wal = FileWal::open_with_manifest_and_session_ref(
             path,
             self.manifest_path(),
             session_addr(session),
             identity,
+            cortexkit_role_llm_runner::session_ref(
+                &session.harness,
+                &session.project_root.to_string_lossy(),
+                &session.session,
+            ),
         )?
         .with_recovery_cap(self.max_read_bytes)
-        .with_feature_floor(self.feature_floor_path())
-        .with_session_ref(cortexkit_role_llm_runner::session_ref(
-            &session.harness,
-            &session.project_root.to_string_lossy(),
-            &session.session,
-        ));
+        .with_feature_floor(self.feature_floor_path());
         let retained_policy = if retained {
             let records = wal.replay()?;
             records
