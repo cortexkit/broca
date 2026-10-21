@@ -1413,6 +1413,7 @@ fn spec<'a>(send_id: &'a str, auth: Option<broca_wire::AuthParams>) -> SendSpec<
         service_tier: None,
         tools: Some(Vec::new()),
         send_id: Some(send_id),
+        max_output_tokens: None,
         cache: None,
         budget: None,
         auth,

@@ -60,6 +60,8 @@ pub struct SendSpec<'a> {
     /// `None` omits the wire field and inherits; `Some([])` requests a tool-less run.
     pub tools: Option<Vec<Tool>>,
     pub send_id: Option<&'a str>,
+    /// Per-send output-token cap, forwarded as `generation.max_output_tokens`.
+    pub max_output_tokens: Option<u64>,
     pub cache: Option<CacheParams>,
     pub budget: Option<broca_protocol::BudgetConfig>,
     pub auth: Option<AuthParams>,
@@ -189,44 +191,7 @@ impl SessionClient {
     /// `session.send`: start a run (idle lineage) or durably queue it (active). Arguments
     /// are bundled in `SendSpec` so the call stays tidy.
     pub async fn send(&self, spec: SendSpec<'_>) -> Result<SendOutcome, ConnError> {
-        let params = SendParams {
-            directives: None,
-            session_class: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            retention: None,
-            conversation_key: None,
-            service_tier: spec.service_tier,
-            prompt: spec.prompt.to_string(),
-            prompt_blocks: None,
-            system: spec.system.map(str::to_owned),
-            send_id: spec.send_id.map(str::to_owned),
-            model: Some(ModelParams {
-                provider: spec.provider.to_string(),
-                model: spec.model.to_string(),
-                variant: spec.variant.map(str::to_owned),
-            }),
-            tools: spec.tools,
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            stop_when: Vec::new(),
-            cache: spec.cache,
-            budget: spec.budget,
-            structured_output: None,
-            auth: spec.auth,
-            context_limit: None,
-            work_class: None,
-            one_shot: spec.one_shot,
-            delivery: None,
-            dedupe_key: None,
-            expires_at_ms: None,
-            template: None,
-            // Inert (back-compat wire field); the coordinator decides append-vs-no-op from
-            // run_id identity. A fresh send over an idle lineage auto-appends a new episode.
-            append_episode: false,
-            context_management: spec.context_management,
-        };
+        let params = send_params(spec);
         let result: SendResult = self
             .request("session.send", &params, "decode send result")
             .await?;
@@ -396,7 +361,7 @@ impl SessionClient {
                 }
             }),
         };
-        let body = self.request_body("session.subscribe", &params)?;
+        let body = request_body("session.subscribe", &params)?;
         // A dedicated management route for the stream (same session, own channel).
         let sub_route = self
             .conn
@@ -428,18 +393,58 @@ impl SessionClient {
         method: &str,
         params: &P,
     ) -> Result<Vec<u8>, ConnError> {
-        let body = self.request_body(method, params)?;
+        let body = request_body(method, params)?;
         self.conn.route_request_raw(&self.cmd_route, body).await
     }
+}
 
-    fn request_body<P: serde::Serialize>(
-        &self,
-        method: &str,
-        params: &P,
-    ) -> Result<Vec<u8>, ConnError> {
-        let req = RequestRef { method, params };
-        serde_json::to_vec(&req)
-            .map_err(|error| ConnError::Transport(format!("encode {method} params: {error}")))
+fn request_body<P: serde::Serialize>(method: &str, params: &P) -> Result<Vec<u8>, ConnError> {
+    let req = RequestRef { method, params };
+    serde_json::to_vec(&req)
+        .map_err(|error| ConnError::Transport(format!("encode {method} params: {error}")))
+}
+
+fn send_params(spec: SendSpec<'_>) -> SendParams {
+    SendParams {
+        directives: None,
+        session_class: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        retention: None,
+        conversation_key: None,
+        service_tier: spec.service_tier,
+        prompt: spec.prompt.to_string(),
+        prompt_blocks: None,
+        system: spec.system.map(str::to_owned),
+        send_id: spec.send_id.map(str::to_owned),
+        model: Some(ModelParams {
+            provider: spec.provider.to_string(),
+            model: spec.model.to_string(),
+            variant: spec.variant.map(str::to_owned),
+        }),
+        tools: spec.tools,
+        tool_choice: Default::default(),
+        generation: broca_protocol::request::GenerationConfig {
+            max_output_tokens: spec.max_output_tokens,
+            ..Default::default()
+        },
+        stop_when: Vec::new(),
+        cache: spec.cache,
+        budget: spec.budget,
+        structured_output: None,
+        auth: spec.auth,
+        context_limit: None,
+        work_class: None,
+        one_shot: spec.one_shot,
+        delivery: None,
+        dedupe_key: None,
+        expires_at_ms: None,
+        template: None,
+        // Inert (back-compat wire field); the coordinator decides append-vs-no-op from
+        // run_id identity. A fresh send over an idle lineage auto-appends a new episode.
+        append_episode: false,
+        context_management: spec.context_management,
     }
 }
 
@@ -630,6 +635,46 @@ mod tests {
                 other => panic!("unexpected envelope error: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn session_send_body_keeps_output_cap_and_cache_key_verbatim() {
+        let cache_key = "shared:prompt/東京:\"quoted\"\\path";
+        let params = send_params(SendSpec {
+            prompt: "test prompt",
+            system: None,
+            provider: "provider",
+            model: "model",
+            variant: None,
+            service_tier: None,
+            tools: None,
+            send_id: None,
+            max_output_tokens: Some(137),
+            cache: Some(CacheParams {
+                role: Some(broca_protocol::request::CacheRole::Primary),
+                ttl: Some("1h".into()),
+                key: Some(cache_key.into()),
+                tail: None,
+                mode: None,
+            }),
+            budget: None,
+            auth: None,
+            one_shot: None,
+            context_management: None,
+        });
+        let body = request_body("session.send", &params).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(request["method"], "session.send");
+        assert_eq!(request["params"]["generation"]["max_output_tokens"], 137);
+        assert_eq!(request["params"]["cache"]["key"], cache_key);
+        assert!(body
+            .windows(b"\"max_output_tokens\":137".len())
+            .any(|window| window == b"\"max_output_tokens\":137"));
+        let exact_key_bytes = serde_json::to_vec(cache_key).unwrap();
+        assert!(body
+            .windows(exact_key_bytes.len())
+            .any(|window| window == exact_key_bytes));
     }
 
     #[test]

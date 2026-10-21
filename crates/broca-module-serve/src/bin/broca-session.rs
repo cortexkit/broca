@@ -247,6 +247,12 @@ enum Cmd {
         /// same send id twice.
         #[arg(long)]
         send_id: Option<String>,
+        /// Maximum output tokens for every send. Must be greater than zero.
+        #[arg(long = "max-output-tokens")]
+        max_output_tokens: Option<u64>,
+        /// Shared provider prompt-cache key for every send.
+        #[arg(long = "cache-key")]
+        cache_key: Option<String>,
         /// Admission-time cache role for each send in this invocation.
         #[arg(long = "cache-role")]
         cache_role: Option<CliCacheRole>,
@@ -255,7 +261,7 @@ enum Cmd {
         cache_ttl: Option<String>,
         /// Send `cache.mode: "none"`: no prompt-cache markers, not even a provider's default
         /// ones (first-party Anthropic places them when a send states no cache preference).
-        #[arg(long = "no-cache", conflicts_with_all = ["cache_role", "cache_ttl"])]
+        #[arg(long = "no-cache", conflicts_with_all = ["cache_role", "cache_ttl", "cache_key"])]
         no_cache: bool,
         /// Reasoning variant for the model, e.g. "high".
         #[arg(long)]
@@ -448,15 +454,16 @@ fn parse_service_tier(
 fn cache_params(
     role: Option<CliCacheRole>,
     ttl: Option<String>,
+    key: Option<String>,
     no_cache: bool,
 ) -> Option<CacheParams> {
-    if role.is_none() && ttl.is_none() && !no_cache {
+    if role.is_none() && ttl.is_none() && key.is_none() && !no_cache {
         return None;
     }
     Some(CacheParams {
         role: role.map(Into::into),
         ttl,
-        key: None,
+        key,
         // This proof CLI exposes no flag for the tail declaration; a caller that needs it
         // sends `cache.tail` over the JSON-RPC surface directly.
         tail: None,
@@ -503,7 +510,21 @@ async fn main() {
     });
 }
 
+fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
+    if matches!(
+        cmd,
+        Cmd::Send {
+            max_output_tokens: Some(0),
+            ..
+        }
+    ) {
+        return Err("--max-output-tokens must be greater than 0".into());
+    }
+    Ok(())
+}
+
 async fn run(args: Args) -> Result<i32, String> {
+    validate_max_output_tokens(&args.cmd)?;
     let json = args.json_events;
     // The audit is dispatched before the broca management-surface bind, and it returns its own
     // exit code rather than an error: every way it can fail to run is exit 2, and an `Err` out
@@ -615,7 +636,7 @@ async fn run(args: Args) -> Result<i32, String> {
                 &tools,
                 SendKnobs {
                     budget: parse_budget(&budget_json)?,
-                    cache: cache_params(cache_role, cache_ttl, no_cache),
+                    cache: cache_params(cache_role, cache_ttl, None, no_cache),
                     auth: auth_params(auth_method, auth_account),
                     context_management: parse_context_management(context_management)?,
                     variant,
@@ -632,6 +653,8 @@ async fn run(args: Args) -> Result<i32, String> {
             system,
             system_file,
             send_id,
+            max_output_tokens,
+            cache_key,
             cache_role,
             cache_ttl,
             no_cache,
@@ -643,7 +666,7 @@ async fn run(args: Args) -> Result<i32, String> {
                 return Err("send needs at least one --prompt".into());
             }
             let system = resolve_system_prompt(system, system_file)?;
-            let cache = cache_params(cache_role, cache_ttl, no_cache);
+            let cache = cache_params(cache_role, cache_ttl, cache_key, no_cache);
             let (provider, model_id) = split_model(&model)?;
             let tools = parse_tools(&tools)?;
             let budget = parse_budget(&budget_json)?;
@@ -669,6 +692,7 @@ async fn run(args: Args) -> Result<i32, String> {
                         service_tier,
                         tools: tools.clone(),
                         send_id: prompt_send_id.as_deref(),
+                        max_output_tokens,
                         cache: cache.clone(),
                         budget: budget.clone(),
                         auth: None,
@@ -1345,6 +1369,7 @@ async fn run_turn(
             service_tier,
             tools,
             send_id: None,
+            max_output_tokens: None,
             cache,
             budget,
             auth,
@@ -1818,7 +1843,7 @@ fn emit_to(
 mod tests {
     use std::sync::Arc;
 
-    use super::read_page_event;
+    use super::{cache_params, read_page_event, run, Args, Cmd};
 
     #[test]
     fn cache_dump_reads_all_compaction_records_live_and_archived() {
@@ -2091,8 +2116,7 @@ mod tests {
 
     use super::{
         content_import_id, emit_control_to, emit_run_final_text_to, parse_tools,
-        run_id_for_combined_turn, Args, Cmd, ControlRenderMode, RunTurnAction, RunTurnRefusal,
-        RunTurnTracker,
+        run_id_for_combined_turn, ControlRenderMode, RunTurnAction, RunTurnRefusal, RunTurnTracker,
     };
     use broca_module_serve::client::SendOutcome;
     use broca_protocol::caller::{ControlUnit, PauseReason, RunFinishReason};
@@ -2236,6 +2260,101 @@ mod tests {
         );
 
         assert_eq!(content_import_id(&messages).unwrap(), legacy);
+    }
+
+    #[test]
+    fn send_flags_build_cache_key_with_role_and_ttl() {
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "/tmp/subc.json",
+            "--project-root",
+            "/tmp/project",
+            "--session",
+            "s1",
+            "send",
+            "--prompt",
+            "hello",
+            "--model",
+            "provider/model",
+            "--cache-key",
+            "shared-key/東京",
+            "--cache-role",
+            "primary",
+            "--cache-ttl",
+            "1h",
+            "--max-output-tokens",
+            "137",
+        ])
+        .expect("parse send command");
+        let Cmd::Send {
+            max_output_tokens,
+            cache_key,
+            cache_role,
+            cache_ttl,
+            no_cache,
+            ..
+        } = args.cmd
+        else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(max_output_tokens, Some(137));
+        let cache = cache_params(cache_role, cache_ttl, cache_key, no_cache).unwrap();
+        assert_eq!(cache.key.as_deref(), Some("shared-key/東京"));
+        assert_eq!(cache.ttl.as_deref(), Some("1h"));
+        assert!(matches!(
+            cache.role,
+            Some(broca_protocol::request::CacheRole::Primary)
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_max_output_tokens_zero_is_refused_locally() {
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "/tmp/subc.json",
+            "--project-root",
+            "/tmp/project",
+            "--session",
+            "s1",
+            "send",
+            "--prompt",
+            "hello",
+            "--model",
+            "provider/model",
+            "--max-output-tokens",
+            "0",
+        ])
+        .expect("zero is parsed so the CLI can explain its refusal");
+
+        assert_eq!(
+            run(args).await.unwrap_err(),
+            "--max-output-tokens must be greater than 0"
+        );
+    }
+
+    #[test]
+    fn send_cache_key_conflicts_with_no_cache() {
+        let result = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "/tmp/subc.json",
+            "--project-root",
+            "/tmp/project",
+            "--session",
+            "s1",
+            "send",
+            "--prompt",
+            "hello",
+            "--model",
+            "provider/model",
+            "--cache-key",
+            "shared-key",
+            "--no-cache",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

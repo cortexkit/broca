@@ -358,6 +358,7 @@ async fn time_first_send(
             service_tier: None,
             tools: Some(vec![tool]),
             send_id: None,
+            max_output_tokens: None,
             cache: None,
             budget: None,
             auth: None,
