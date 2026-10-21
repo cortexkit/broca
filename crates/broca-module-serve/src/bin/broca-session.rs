@@ -302,6 +302,9 @@ enum Cmd {
         #[arg(long, requires = "run_id")]
         raw: bool,
     },
+    /// `role.describe`: write the running daemon's exact reply bytes to stdout and their count
+    /// and SHA-256 to stderr, so a consumer can check what the deployed build advertises.
+    Describe,
     /// `run.result`: the decoded state and final-message summary for one specific run.
     Result {
         #[arg(long)]
@@ -569,7 +572,7 @@ async fn run(args: Args) -> Result<i32, String> {
     };
     let raw_output = matches!(
         &args.cmd,
-        Cmd::Status { raw: true, .. } | Cmd::Result { raw: true, .. }
+        Cmd::Status { raw: true, .. } | Cmd::Result { raw: true, .. } | Cmd::Describe
     );
     if !raw_output {
         emit(
@@ -759,6 +762,14 @@ async fn run(args: Args) -> Result<i32, String> {
                     );
                 }
             }
+            Ok(0)
+        }
+        Cmd::Describe => {
+            let body = client
+                .role_describe_raw()
+                .await
+                .map_err(|e| format!("role_describe: {e}"))?;
+            write_raw_reply(&body)?;
             Ok(0)
         }
         Cmd::Result { run_id, raw } => {

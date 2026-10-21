@@ -335,6 +335,13 @@ impl SessionClient {
         self.request_raw("run.result", &params).await
     }
 
+    /// `role.describe` as the running daemon returned it, before JSON decoding: the groups and
+    /// capabilities the deployed build actually advertises, which a source golden cannot show.
+    pub async fn role_describe_raw(&self) -> Result<Vec<u8>, ConnError> {
+        self.request_raw("role.describe", &serde_json::json!({}))
+            .await
+    }
+
     /// `session.read`: read a durable transcript page. An omitted `from_ordinal` returns the
     /// newest page; an explicit ordinal starts a forward range.
     pub async fn read(
