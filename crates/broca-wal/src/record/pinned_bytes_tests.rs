@@ -879,3 +879,30 @@ fn interrupt_reason_and_directives_require_named_reader_features_only_when_prese
         include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end()
     );
 }
+
+/// Records holding tools a caller declared directly on `session.send` (no fetch plan), exactly as
+/// builds wrote them before a declared tool could carry its own reply deadline. They must keep
+/// these bytes and stay ungated: a session whose tools declare no deadline must remain readable
+/// by every build that read it before.
+#[test]
+fn pre_tool_reply_send_declared_tools_keep_their_bytes_and_frame_requirements() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+    for pinned in [
+        r#"{"type":"run_started","run_id":"run-9","session":{"project_root":"/tmp/project","harness":"runner","session":"lead"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"research","description":"Ask sidekick a question.","input_schema":{"properties":{"request":{"type":"string"}},"required":["request"],"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"},{"name":"note","description":"Record a note.","input_schema":{"type":"object"},"execution_mode":"sequential"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        r#"{"type":"queued","submission_id":"sub-run-10","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"tools":[{"name":"research","description":"Ask sidekick a question.","input_schema":{"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert!(
+            matches!(
+                record,
+                WalRecord::RunStarted { .. } | WalRecord::Queued { .. }
+            ),
+            "{pinned}"
+        );
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty(), "{pinned}");
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}

@@ -4010,6 +4010,27 @@ mod keep_warm_tests {
 }
 
 #[cfg(test)]
+mod send_tool_shape_tests {
+    use super::*;
+
+    /// The `session.send` tool shape as callers send it and broca re-encodes it, before a
+    /// declared tool could carry its own reply deadline. Absent members must keep costing no
+    /// bytes, so these exact bytes survive every later optional member of `Tool`.
+    #[test]
+    fn send_declared_tools_keep_their_bytes() {
+        let tools = r#"[{"name":"research","description":"Ask sidekick a question.","input_schema":{"properties":{"request":{"type":"string"}},"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"},{"name":"note","description":"","input_schema":{"type":"object"},"execution_mode":"sequential"}]"#;
+        let params: SendParams = serde_json::from_value(serde_json::json!({
+            "prompt": "hello",
+            "tools": serde_json::from_str::<serde_json::Value>(tools).unwrap(),
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_string(&params.tools).unwrap(), tools);
+        let decoded: Vec<Tool> = serde_json::from_str(tools).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), tools);
+    }
+}
+
+#[cfg(test)]
 mod restart_wire_tests {
     use super::*;
 
