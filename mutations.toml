@@ -1157,9 +1157,9 @@ package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/actor.rs"
 expect_red = ["actor::tests::resend_after_durable_terminal_answers_finished_before_completion_is_processed"]
-file = "crates/broca-module/src/actor.rs"
-old = "if let Some(reason) = self.durable_finish_of_active(&run_id) {\n                        return SendOutcome::Finished {\n                            run_id,\n                            reason,"
-new = "if let Some(_reason) = self.durable_finish_of_active(&run_id) {\n                        return SendOutcome::Finished {\n                            run_id,\n                            reason: broca_protocol::RunFinishReason::Completed, // NON-VACUITY BREAK"
+file = "crates/broca-module/src/send_fate.rs"
+old = "if let Some(reason) = indexed_finish_reason(&state.state) {\n        SendOutcome::Finished {\n            run_id: run_id.clone(),\n            reason,"
+new = "if let Some(_reason) = indexed_finish_reason(&state.state) {\n        SendOutcome::Finished {\n            run_id: run_id.clone(),\n            reason: broca_protocol::RunFinishReason::Completed, // NON-VACUITY BREAK"
 
 [[control]]
 id = "scan-operator-logs-visible"
