@@ -701,8 +701,11 @@ fn terminal(reason: RunFinishReason, interrupt_reason: Option<&str>) -> WalRecor
 
 #[tokio::test]
 async fn interrupt_reason_surfaces_recorded_values_and_leaves_old_seals_absent() {
-    for reason in [None, Some("runner_shutdown"), Some("runner_crash")] {
-        let mut session = ClosedSession::new(&format!("interrupt-reason-{reason:?}"));
+    for (case, reason) in [None, Some("runner_shutdown"), Some("runner_crash")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut session = ClosedSession::new(&format!("interrupt-reason-{case}"));
         session.append(terminal(RunFinishReason::Interrupted, reason));
         session.close_writer();
         let run = broca_protocol::RunId("run-1".into());
@@ -858,11 +861,9 @@ fn wake_v1_frozen_run_answer_is_pinned_independently_of_current_vectors() {
 
 #[tokio::test]
 async fn completed_status_without_final_text_omits_directives() {
-    for directives in [None, Some(json!(["wake"]))] {
-        let mut session = ClosedSession::with_directives(
-            &format!("status-without-text-{directives:?}"),
-            directives,
-        );
+    for (case, directives) in [None, Some(json!(["wake"]))].into_iter().enumerate() {
+        let mut session =
+            ClosedSession::with_directives(&format!("status-without-text-{case}"), directives);
         session.append(terminal(RunFinishReason::Completed, None));
         session.close_writer();
         let status = ServeHandler::run_status(

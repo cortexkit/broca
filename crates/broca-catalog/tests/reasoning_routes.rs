@@ -141,7 +141,7 @@ fn bedrock_admission_freezes_reasoning_without_changing_renderer_version() {
         resolve_frozen(&spec, &model, 2048, renderer_version_for(spec.wire_family)).unwrap();
     assert!(frozen.bedrock_reasoning);
     // Reasoning is metadata on the output-cap ABI, not a separate render version.
-    assert_eq!(frozen.renderer_version, 3);
+    assert_eq!(frozen.renderer_version, 4);
     let recorded = serde_json::to_value(&frozen).unwrap();
     assert_eq!(recorded["bedrock_reasoning"], true);
 }

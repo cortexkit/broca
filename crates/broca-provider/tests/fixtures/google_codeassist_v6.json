@@ -1,0 +1,6 @@
+[
+  {
+    "body": "{\"model\":\"gemini-3.5-flash-low\",\"project\":\"test-project\",\"request\":{\"contents\":[{\"parts\":[{\"text\":\"question\"}],\"role\":\"user\"},{\"parts\":[{\"text\":\"commentary\"},{\"text\":\"answer\"}],\"role\":\"model\"}],\"generationConfig\":{\"maxOutputTokens\":65536,\"thinkingConfig\":{\"includeThoughts\":true,\"thinkingBudget\":4000}}},\"requestId\":\"agent/dec3c48c-96f7-7cde-670c-9be8ef9f3295/2/df4b0c50-9a6a-ea1c-ee1a-2806f075a3bb/2\",\"requestType\":\"agent\",\"userAgent\":\"antigravity\"}",
+    "frozen": {"caller_max_output_tokens":100000,"family_id":"google_codeassist","max_output_tokens":32000,"project_id":"test-project","provider_text_state":true,"reasoning":{"mode":"none"},"renderer_version":6,"system_prompt":{"mode":"system_instruction_field"},"token_limit_field":"gemini_max_output_tokens","tool_id":"synthetic_index","usage":"gemini_usage_metadata","wire_model_id":"gemini-3.5-flash-low"}
+  }
+]

@@ -191,6 +191,7 @@ jobs:
         shell: bash
     env:
       BROCA_REQUIRE_SUBC: '1'
+      CK_BUS_TESTKIT_REQUIRE: '1'
       BROCA_REQUIRE_AIMOCK: '1'
       BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ matrix.os == 'windows' && '.exe' || '' }}
@@ -210,6 +211,8 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
+      - name: Install pinned private NATS broker
+        run: python3 scripts/install-ci-nats.py
       - name: Wait for this platform's fixtures and test archive
         env:
           GH_TOKEN: ${{ github.token }}

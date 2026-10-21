@@ -63,6 +63,7 @@ jobs:
       BROCA_REQUIRE_SUBC: "1"
       BROCA_REQUIRE_VAULT: "1"
       BROCA_REQUIRE_AIMOCK: "1"
+      CK_BUS_TESTKIT_REQUIRE: "1"
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
       FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub
       CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum
@@ -86,6 +87,8 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
+      - name: Install pinned private NATS broker
+        run: python3 scripts/install-ci-nats.py
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: cargo-cache
         with:

@@ -29,6 +29,9 @@ fn send(
     order: Option<DeliveryOrder>,
 ) -> SendRequest {
     let req = req(key, run);
+    let mut request = req.to_submission();
+    // Plan sessions freeze tools at admission; later sends must inherit them by omission.
+    request.tools = None;
     SendRequest {
         session_class: None,
         retention: None,
@@ -39,7 +42,7 @@ fn send(
         session: key.clone(),
         run_id: req.run_id.clone(),
         send_id: Some(format!("send-{run}")),
-        request: Box::new(req.to_submission()),
+        request: Box::new(request),
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
         plan: None,

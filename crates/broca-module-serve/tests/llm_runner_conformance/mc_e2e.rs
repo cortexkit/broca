@@ -395,7 +395,11 @@ async fn real_mc_async_compaction_end_to_end() {
         .unwrap(),
     )
     .unwrap();
-    let bus = Arc::new(bus::BusRig::new(&root).await);
+    // `BusRig::new` has already reported the skip, or failed under CK_BUS_TESTKIT_REQUIRE.
+    let Some(bus) = bus::BusRig::new(&root).await else {
+        return;
+    };
+    let bus = Arc::new(bus);
     provision_consumers(&bus).await;
     let events = observe_events(&bus).await;
     evidence.events = Some(events.messages.clone());
@@ -772,7 +776,11 @@ async fn replay_preserved_mc_read() {
         .mc_historian
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let replay_bus = root.join(format!("read-replay-bus-{}", std::process::id()));
-    let bus = Arc::new(bus::BusRig::new(&replay_bus).await);
+    // `BusRig::new` has already reported the skip, or failed under CK_BUS_TESTKIT_REQUIRE.
+    let Some(bus) = bus::BusRig::new(&replay_bus).await else {
+        return;
+    };
+    let bus = Arc::new(bus);
     provision_consumers(&bus).await;
     subject.bus = Some(bus.clone());
     let live = subject.start(&root).await.unwrap();
