@@ -46,8 +46,8 @@ fn list_human_output_snapshot() {
     assert_eq!(
         stderr,
         "ID\tMESSAGES\tSIZE_BYTES\tTITLE\tCWD\n\
-         ses-tools\t3\t590\tTool fixture\t/tmp/scrubbed-project\n\
-         ses-text\t2\t177\tText fixture\t/tmp/text-project\n"
+         ses-tools\t3\t-\tTool fixture\t/tmp/scrubbed-project\n\
+         ses-text\t2\t-\tText fixture\t/tmp/text-project\n"
     );
 }
 
