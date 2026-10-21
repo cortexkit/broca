@@ -152,7 +152,11 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
     let active_resent = rig
         .send_with("note", "also this", None, steer_or_idle_start())
         .await;
-    assert_eq!(active_status.body, active_resent.body);
+    assert_eq!(
+        String::from_utf8_lossy(&active_status.body),
+        String::from_utf8_lossy(&active_resent.body),
+        "send.status answers the same bytes as a re-send while the step is active"
+    );
     let active_reply = result(&active_status);
     assert_eq!(active_reply["state"], "active");
     assert_eq!(active_reply["run_id"], joined);

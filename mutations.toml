@@ -18733,7 +18733,7 @@ new = "        self.actor_for(session).await?; // NON-VACUITY BREAK: open an act
 
 [[control]]
 id = "send-status-resend-bytes"
-guards = "send.status has the identical durable receipt bytes as a re-send after restart"
+guards = "send.status answers the identical receipt bytes as a re-send, while the step is active and after restart"
 runner = "cargo"
 select = "expected"
 package = "broca-module-serve"
@@ -18741,7 +18741,7 @@ target = "--test it"
 platforms = ["linux", "macos"]
 test_file = "crates/broca-module-serve/tests/it/provisional_run_status.rs"
 expect_red = ["provisional_run_status::a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart"]
-expect_message = "the reply bytes pinned in send_status.step.json"
+expect_message = "send.status answers the same bytes as a re-send while the step is active"
 file = "crates/broca-module/src/serve.rs"
 old = '''        Ok(broca_wire::SendReplyWire {
             result,
