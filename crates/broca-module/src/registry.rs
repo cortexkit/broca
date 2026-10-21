@@ -1221,6 +1221,19 @@ impl LineageRegistry {
         key: &LineageKey,
         for_bind: bool,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        match self.check_move(key, true) {
+            // Moving and moved sessions must fail closed if any of the log is unreadable.
+            // A cached prefix or a suffix read from a WAL byte anchor covers only part of
+            // the history, so revalidate the whole log before deciding ownership here.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => {
+                let reader = self.inner.reader.as_ref().ok_or_else(|| {
+                    OpenError::Open("owner authorization reader is not configured".into())
+                })?;
+                return self.read_owner_fallback(reader, key, None, for_bind).await;
+            }
+            Err(error) => return Err(error),
+            Ok(()) => {}
+        }
         let (live, live_first) = {
             let slots = self.inner.slots.lock().unwrap();
             match slots.get(key) {
@@ -1272,6 +1285,8 @@ impl LineageRegistry {
         }
         if let Some(store) = reader.store.clone() {
             let read_key = key.clone();
+            // A failed projection lookup supplies no ownership. Only a subsequent WAL
+            // read may establish it; WAL errors below must not retry another projection.
             let snapshot = spawn_blocking(JobKind::StoreRead, move || {
                 store.read_admission_snapshot(&read_key)
             })
@@ -1422,7 +1437,7 @@ impl LineageRegistry {
         if live_head.is_some_and(|head| snapshot.watermark_seq > head) {
             return Ok(None);
         }
-        let range = match self
+        let range = self
             .read_durable_range_for(
                 reader,
                 key,
@@ -1434,22 +1449,19 @@ impl LineageRegistry {
                     purpose: ReadPurpose::Authorization,
                 },
             )
-            .await
-        {
-            Ok(range) => range,
-            Err(_) => return Ok(None),
-        };
+            .await?;
+        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
+                .records()
+                .map_err(|reason| OpenError::Classified {
+                    reason: format!("owner authorization suffix: {reason}"),
+                    class: broca_protocol::ErrorClass::Transient,
+                })?;
         if snapshot.lineage_id.as_deref() != range.lineage_id.map(|id| id.to_string()).as_deref()
             || snapshot.lineage_id.is_none()
         {
             return Ok(None);
         }
-        let Ok(records) =
-            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
-                .records()
-        else {
-            return Ok(None);
-        };
         let head = records
             .last()
             .map_or(snapshot.watermark_seq, |record| record.seq);
@@ -1505,7 +1517,7 @@ impl LineageRegistry {
     ) -> Result<Option<broca_core::FirstEpisodeV1>, OpenError> {
         // Keep only frame positions in the ownership cache, not tool or provider text.
         // Bind pays one bounded RunStarted-frame read when no live/store summary supplies it.
-        let range = match self
+        let range = self
             .read_durable_range_for(
                 reader,
                 key,
@@ -1517,11 +1529,17 @@ impl LineageRegistry {
                     purpose: ReadPurpose::Authorization,
                 },
             )
-            .await
-        {
-            Ok(range) => range,
-            Err(_) => return Ok(None),
-        };
+            .await?;
+        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,
+            Some(position.seq),
+        )
+        .records()
+        .map_err(|reason| OpenError::Classified {
+            reason: format!("owner authorization first episode: {reason}"),
+            class: broca_protocol::ErrorClass::Transient,
+        })?;
         if position.seq > head
             || position.at.is_none()
             || range.anchor_at(position.seq) != position.at
@@ -1530,14 +1548,6 @@ impl LineageRegistry {
         {
             return Ok(None);
         }
-        let Ok(records) = crate::durable_read::DurableRead::classify(
-            &range,
-            position.seq - 1,
-            Some(position.seq),
-        )
-        .records() else {
-            return Ok(None);
-        };
         match records {
             [frame] if matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }) => {
                 first_episode_from_frame(frame).map(Some)

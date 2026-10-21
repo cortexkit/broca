@@ -1292,6 +1292,115 @@ file = "crates/broca-module/src/registry.rs"
 old = "            || range.anchor_at(position.seq) != position.at"
 new = "            || false // NON-VACUITY BREAK: trust a cached position after the frame was replaced."
 
+[[control]]
+id = "module-moved-ownership-revalidates-full-history"
+guards = "move-fenced ownership refuses unreadable history instead of disclosing an owner from a cached prefix"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::unreadable_moved_ownership_fails_closed_without_repair"]
+expect_message = 'left: "scope_owner_mismatch"'
+file = "crates/broca-module/src/registry.rs"
+old = "                return self.read_owner_fallback(reader, key, None, for_bind).await;"
+new = "                let _ = reader; // NON-VACUITY BREAK: allow moved ownership to reuse a cached prefix."
+
+[[control]]
+id = "module-owner-suffix-read-error-is-not-a-cache-miss"
+guards = "an actual ownership suffix read error cannot retry a cached or materialized owner"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_suffix_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed suffix cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''            .await?;
+        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)'''
+new = '''            .await;
+        let range = match range {
+            Ok(range) => range,
+            Err(_) => return Ok(None), // NON-VACUITY BREAK: hide an actual suffix read error.
+        };
+        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)'''
+
+[[control]]
+id = "module-owner-first-episode-read-error-is-not-a-cache-miss"
+guards = "an actual first-episode read error cannot retry a cached or materialized owner"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_first_episode_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed first-episode read cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''            .await?;
+        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,'''
+new = '''            .await;
+        let range = match range {
+            Ok(range) => range,
+            Err(_) => return Ok(None), // NON-VACUITY BREAK: hide an actual first-episode read error.
+        };
+        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,'''
+
+[[control]]
+id = "module-owner-unproven-suffix-is-not-a-cache-miss"
+guards = "unproven suffix coverage cannot retry a different ownership snapshot"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_suffix_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed suffix cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
+                .records()
+                .map_err(|reason| OpenError::Classified {
+                    reason: format!("owner authorization suffix: {reason}"),
+                    class: broca_protocol::ErrorClass::Transient,
+                })?;'''
+new = '''        let Ok(records) =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head).records()
+        else { return Ok(None); }; // NON-VACUITY BREAK: unproven coverage becomes a cache miss.'''
+
+[[control]]
+id = "module-owner-unproven-first-episode-is-not-a-cache-miss"
+guards = "unproven first-episode coverage cannot retry a different ownership snapshot"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_first_episode_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed first-episode read cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,
+            Some(position.seq),
+        )
+        .records()
+        .map_err(|reason| OpenError::Classified {
+            reason: format!("owner authorization first episode: {reason}"),
+            class: broca_protocol::ErrorClass::Transient,
+        })?;'''
+new = '''        let Ok(records) = crate::durable_read::DurableRead::classify(
+            &range, position.seq - 1, Some(position.seq),
+        ).records() else { return Ok(None); }; // NON-VACUITY BREAK: unproven first episode becomes a cache miss.'''
+
 # This proof checks the following behavior: RunStarted hook output requires step-transforms/v1, even
 # without a manifest.
 # Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
