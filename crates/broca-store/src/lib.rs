@@ -427,6 +427,32 @@ fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 type SchemaUpgradeHook = fn() -> Result<(), StoreError>;
 
+fn initialize_journal_mode(
+    deadline: std::time::Instant,
+    mut initialize: impl FnMut() -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    loop {
+        match initialize() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Journal-mode changes must precede the schema transaction. SQLite
+                // can skip its busy handler for a lock upgrade, so retry the whole
+                // pragma under the same bounded wait rather than weakening schema locking.
+                let retry = matches!(&error, rusqlite::Error::SqliteFailure(error, _)
+                    if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+                    && std::time::Instant::now() < deadline;
+                if !retry {
+                    return Err(error);
+                }
+                crate::busy::sleep_between_busy_attempts(
+                    std::time::Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static SCHEMA_UPGRADE_HOOK: std::cell::RefCell<Option<SchemaUpgradeHook>> = const { std::cell::RefCell::new(None) };
@@ -885,7 +911,10 @@ impl SqliteStore {
 
     fn init(conn: &Connection) -> Result<(String, u64, u64), StoreError> {
         crate::busy::configure_writer_connection(conn)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let deadline = std::time::Instant::now() + crate::busy::STORE_BUSY_TIMEOUT;
+        crate::busy::with_write_deadline(deadline, || {
+            initialize_journal_mode(deadline, || conn.execute_batch("PRAGMA journal_mode=WAL;"))
+        })?;
         // Retain WAL sidecars while broca is down so read-only readers can open the index.
         // SQLITE_FCNTL_PERSIST_WAL requires unsafe FFI, which this crate forbids; disabling
         // the close-time checkpoint uses rusqlite's safe API instead.
@@ -2685,6 +2714,49 @@ mod tests {
             .map(|thread| thread.join().unwrap())
             .collect();
         assert!(identities.iter().all(|identity| identity == &identities[0]));
+    }
+
+    #[test]
+    fn journal_mode_initialization_retries_only_busy_within_its_budget() {
+        let busy = || {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+        };
+        let mut attempts = 0;
+        super::initialize_journal_mode(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(busy())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        for expired in [true, false] {
+            let mut attempts = 0;
+            let deadline = std::time::Instant::now()
+                + if expired {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs(1)
+                };
+            assert!(super::initialize_journal_mode(deadline, || {
+                attempts += 1;
+                if expired {
+                    Err(busy())
+                } else {
+                    Err(rusqlite::Error::InvalidQuery)
+                }
+            })
+            .is_err());
+            assert_eq!(attempts, 1);
+        }
     }
 
     #[test]

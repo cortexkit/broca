@@ -19906,3 +19906,16 @@ expect_red = ["tests::every_mutating_maintenance_open_refuses_live_or_unknown_be
 file = "crates/broca-store/src/bin/store-maintenance.rs"
 old = "    if !read_only && liveness.state != \"no\" {"
 new = "    if !read_only && liveness.state != \"no\" && false { // NON-VACUITY BREAK: open before proving offline."
+
+[[control]]
+id = "store-journal-mode-busy-upgrade-retry"
+guards = "Concurrent store opens retry SQLite journal-mode lock upgrades under a bounded wait before the serialized schema transaction"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::journal_mode_initialization_retries_only_busy_within_its_budget"]
+file = "crates/broca-store/src/lib.rs"
+old = "                if !retry {"
+new = "                if true || !retry { // NON-VACUITY BREAK: fail an upgrade that skipped SQLite's busy handler."
