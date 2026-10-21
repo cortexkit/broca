@@ -433,6 +433,25 @@ std::thread_local! {
 }
 
 impl SqliteStore {
+    /// Open an existing projection for inspection without creating a database or running migrations.
+    /// Read-only SQLite connections still read committed WAL frames not yet checkpointed into the database.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let (source_instance_id, source_epoch, high_water) = conn.query_row(
+            "SELECT source_instance_id, source_epoch, high_water FROM export_meta WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            bus_events: bus_events::State::default(),
+            export_source_instance_id: source_instance_id,
+            export_source_epoch: source_epoch,
+            export_high_water: AtomicU64::new(high_water),
+        })
+    }
+
     /// Open (creating + migrating) a store at `path`.
     ///
     /// On Unix the file is restricted to its owner after creation. This database holds the
@@ -515,7 +534,11 @@ impl SqliteStore {
         commit: bool,
     ) -> Result<PageUsageBackfillCounts, StoreError> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = conn.transaction_with_behavior(if commit {
+            rusqlite::TransactionBehavior::Immediate
+        } else {
+            rusqlite::TransactionBehavior::Deferred
+        })?;
         let legacy_rows = {
             let mut statement = tx.prepare(
                 "SELECT session, last_run_id, admission_checkpoint_json
@@ -554,10 +577,12 @@ impl SqliteStore {
             }
 
             let usage_json = serde_json::to_string(&last_episode.usage)?;
-            tx.execute(
-                "UPDATE meta SET last_episode_usage_json=?2 WHERE session=?1",
-                rusqlite::params![session, usage_json],
-            )?;
+            if commit {
+                tx.execute(
+                    "UPDATE meta SET last_episode_usage_json=?2 WHERE session=?1",
+                    rusqlite::params![session, usage_json],
+                )?;
+            }
             if last_episode.usage.is_some() {
                 counts.converted += 1;
             } else {
@@ -660,7 +685,11 @@ impl SqliteStore {
         use broca_protocol::caller::RunFinishReason;
         use broca_wal::WalRecord;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = conn.transaction_with_behavior(if commit {
+            rusqlite::TransactionBehavior::Immediate
+        } else {
+            rusqlite::TransactionBehavior::Deferred
+        })?;
         let active_rows = {
             let mut statement =
                 tx.prepare("SELECT run_id, session FROM run_index WHERE state = 'active'")?;
@@ -746,20 +775,22 @@ impl SqliteStore {
             // Same column, same encoding as `index_run_terminal`: the bare `Usage`, never an
             // `Option` wrapper, so a row written here reads back exactly like one the actor wrote.
             let usage_json = serde_json::to_string(&usage).map_err(StoreError::Json)?;
-            tx.execute(
-                "UPDATE run_index
+            if commit {
+                tx.execute(
+                    "UPDATE run_index
                     SET state = ?2, usage_json = ?3, retries_used = ?4,
                         state_changed_ms = ?5, withdrawals_owed = MAX(withdrawals_owed, ?6)
                   WHERE run_id = ?1 AND state = 'active'",
-                rusqlite::params![
-                    run_id,
-                    state.as_str(),
-                    usage_json,
-                    i64::from(retries_used),
-                    Self::now_epoch_ms(),
-                    withdrawals_owed,
-                ],
-            )?;
+                    rusqlite::params![
+                        run_id,
+                        state.as_str(),
+                        usage_json,
+                        i64::from(retries_used),
+                        Self::now_epoch_ms(),
+                        withdrawals_owed,
+                    ],
+                )?;
+            }
             counts.reconciled += 1;
         }
         if commit {
@@ -794,7 +825,11 @@ impl SqliteStore {
         commit: bool,
     ) -> Result<ControlHeadRepairCounts, StoreError> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = conn.transaction_with_behavior(if commit {
+            rusqlite::TransactionBehavior::Immediate
+        } else {
+            rusqlite::TransactionBehavior::Deferred
+        })?;
         let legacy_rows = {
             let mut statement = tx.prepare(
                 "SELECT session, watermark_seq
@@ -830,12 +865,14 @@ impl SqliteStore {
                 continue;
             };
 
-            tx.execute(
-                "UPDATE meta
+            if commit {
+                tx.execute(
+                    "UPDATE meta
                     SET control_head_wal_seq=?2, control_head_sub_index=?3
                   WHERE session=?1 AND control_head_wal_seq IS NULL",
-                rusqlite::params![key, cursor.wal_seq as i64, i64::from(cursor.sub_index),],
-            )?;
+                    rusqlite::params![key, cursor.wal_seq as i64, i64::from(cursor.sub_index),],
+                )?;
+            }
             counts.repaired += 1;
         }
         if commit {
