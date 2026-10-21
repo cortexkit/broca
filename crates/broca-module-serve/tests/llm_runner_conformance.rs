@@ -78,6 +78,8 @@ mod boundary_cancel;
 mod evidence;
 #[path = "llm_runner_conformance/optional_tools.rs"]
 mod optional_tools;
+#[path = "llm_runner_conformance/reader_identity.rs"]
+mod reader_identity;
 /// Retention deletion scenarios on the same real-daemon rig. They move the daemon's clock
 /// through its `test-clock` control file, which only a `test-clock` build reads.
 #[cfg(feature = "test-clock")]
@@ -846,6 +848,7 @@ struct BrocaSubject {
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
+    reserved_reader: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
     #[cfg(feature = "test-clock")]
@@ -868,6 +871,7 @@ impl BrocaSubject {
             backup_classes: None,
             bus_events_enabled: true,
             process_kills_disabled: false,
+            reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
@@ -940,6 +944,18 @@ impl BrocaSubject {
             }
         });
         let mut config = config;
+        if self.reserved_reader {
+            config["modules"]["magic-context"] = json!({
+                "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+                "args": [],
+                "env": {
+                    "FAKE_AFT_MODULE_ID": "magic-context",
+                    "FAKE_AFT_LAUNCH_NONCE_PATH": root.join("reader.nonce"),
+                },
+                "enabled": true,
+                "reserved": true,
+            });
+        }
         #[cfg(feature = "test-clock")]
         if let Some(mc) = &self.mc {
             config["modules"]["magic-context"] = mc.module();
@@ -1059,6 +1075,7 @@ impl BrocaSubject {
             let nonce_path = match module {
                 OWNER_MODULE => live.owner_nonce.clone(),
                 SENDER_MODULE => live.owner_nonce.with_file_name("sender.nonce"),
+                "magic-context" => live.owner_nonce.with_file_name("reader.nonce"),
                 _ => return Err(HarnessError::new("unknown conformance module principal")),
             };
             let deadline = Instant::now() + Duration::from_secs(20);

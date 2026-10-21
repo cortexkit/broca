@@ -2,7 +2,7 @@
 use super::*;
 use cortexkit_role_llm_runner_conformance::ScriptedTurn;
 
-fn rigs_present() -> bool {
+pub(super) fn rigs_present() -> bool {
     for (name, key) in [
         ("ck-subc", "SUBC_CORE_BIN"),
         ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
@@ -20,7 +20,7 @@ fn rigs_present() -> bool {
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     true
 }
-fn scratch(tag: &str) -> PathBuf {
+pub(super) fn scratch(tag: &str) -> PathBuf {
     let path = broca_test_support::scratch_root().join(format!("{tag}-{}", std::process::id()));
     broca_test_support::remove_rig_dir(&path);
     std::fs::create_dir_all(&path).unwrap();

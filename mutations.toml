@@ -56,6 +56,21 @@ old = "retracted.into_result().map(|_| ())"
 new = "{ let _ = retracted; Ok(()) } // NON-VACUITY BREAK: remove a refused retraction from the live inbox."
 
 [[control]]
+id = "module-reserved-reader-past-end-lineage"
+guards = "A reserved non-owner reading a written session sees its transcript and WAL lineage, including on a page past the end"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/reader_identity.rs"
+expect_red = ["reader_identity::reserved_reader_same_triple_gets_written_lineage"]
+expect_message = "past-end read must retain the written lineage"
+file = "crates/broca-module/src/registry.rs"
+old = "        page.lineage_id = lineage_id;"
+new = "        page.lineage_id = if page.messages.is_empty() { None } else { lineage_id }; // NON-VACUITY BREAK: drop the written lineage on empty pages."
+
+[[control]]
 id = "claude-code-split-message-retains-parallel-results"
 guards = "Adjacent Claude Code assistant fragments sharing an API message ID keep both real parallel tool results through durable import and replay"
 runner = "cargo"
