@@ -245,6 +245,133 @@ fn locked_projection_keeps_admission_and_repair_recovers_session() {
 }
 
 #[test]
+fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
+    let root = broca_test_support::scratch_root().join("census-quarantine-restart");
+    std::fs::create_dir_all(&root).unwrap();
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+    let mut sessions = Vec::new();
+    for i in 0..3 {
+        let session = BindIdentity::new("/census/project", "broca", format!("damage-{i}"));
+        wal.open(&session)
+            .unwrap()
+            .append(1, &started(&session, false), true)
+            .unwrap();
+        sessions.push(session);
+    }
+    sessions.sort_by_key(broca_core::session_addr);
+    let path = wal.wal_path(&sessions[1]);
+    let original = std::fs::read(&path).unwrap();
+    let mut damaged = original.clone();
+    damaged[21] ^= 1;
+    std::fs::write(&path, &damaged).unwrap();
+    backfill(&store.conn.lock().unwrap()).unwrap();
+    let first = census::run(
+        &mut store.conn.lock().unwrap(),
+        &ReadOnlyWalReader::new(&root),
+        Some(2),
+        false,
+    )
+    .unwrap();
+    assert!(!first.complete);
+    assert_eq!(first.unreadable, 1);
+    {
+        let conn = store.conn.lock().unwrap();
+        let covered: u64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_data_census WHERE covered=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            covered, 1,
+            "damage must not discard an earlier healthy action in the same batch"
+        );
+        let error: String = conn
+            .query_row(
+                "SELECT reason FROM agent_data_census_unreadable WHERE address=?1",
+                [broca_core::session_addr(&sessions[1])],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!error.is_empty());
+        // Simulate a committed candidate without its Covered action. Restart must
+        // replay this address even though its first candidate row already exists.
+        conn.execute(
+            "UPDATE agent_data_census SET covered=0 WHERE address=?1",
+            [broca_core::session_addr(&sessions[0])],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_data_census_inflight VALUES(?1)",
+            [broca_core::session_addr(&sessions[0])],
+        )
+        .unwrap();
+    }
+    drop(store);
+    let reopened = SqliteStore::open(root.join("run-index.db")).unwrap();
+    let second = census::run(
+        &mut reopened.conn.lock().unwrap(),
+        &ReadOnlyWalReader::new(&root),
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(!second.complete);
+    assert_eq!(second.unreadable, 1);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        damaged,
+        "census readers must not repair WAL bytes"
+    );
+    for session in [&sessions[0], &sessions[2]] {
+        let reference = agent_session_ref(session);
+        let refs = reopened
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap();
+        assert!(!refs.complete, "quarantined history is not absence");
+        assert_eq!(&refs.sessions[&reference].1, session);
+    }
+    let conn = reopened.conn.lock().unwrap();
+    let covered: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM agent_data_census WHERE covered=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(covered, 2);
+    let inflight: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM agent_data_census_inflight",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(inflight, 0);
+    drop(conn);
+    std::fs::write(&path, &original).unwrap();
+    let repaired = census::run(
+        &mut reopened.conn.lock().unwrap(),
+        &ReadOnlyWalReader::new(&root),
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(repaired.complete);
+    assert_eq!(repaired.unreadable, 0);
+    for session in sessions {
+        let reference = agent_session_ref(&session);
+        let refs = reopened
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap();
+        assert!(refs.complete);
+        assert_eq!(refs.sessions[&reference].1, session);
+    }
+}
+
+#[test]
 fn census_resumes_coverage_without_replaying_covered_wals() {
     let root =
         broca_test_support::scratch_root().join(format!("census-resume-{}", std::process::id()));

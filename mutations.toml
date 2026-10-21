@@ -19971,3 +19971,43 @@ expect_red = ["tests::maintenance_repairs_recheck_snapshot_candidates_before_wri
 file = "crates/broca-store/src/lib.rs"
 old = "AND watermark_seq=?4 AND lineage_id IS ?5"
 new = "AND ?4=?4 AND lineage_id IS ?5 /* NON-VACUITY BREAK: ignore changed watermark */"
+
+[[control]]
+id = "store-census-healthy-progress-around-damage"
+guards = "A damaged WAL cannot discard accumulated healthy coverage or permanently stall later addresses"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::census_quarantines_damage_and_commits_healthy_coverage_across_restarts"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = "                        let reason = error.to_string();"
+new = "                        let reason = error.to_string(); if !reason.is_empty() { return Err(StoreError::InconsistentSnapshot(\"cannot read uncovered WAL\")); } // NON-VACUITY BREAK: abort before committing healthy siblings."
+
+[[control]]
+id = "store-census-persists-unreadable-state"
+guards = "An unreadable address retains a named per-address quarantine state across census restarts"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::census_quarantines_damage_and_commits_healthy_coverage_across_restarts"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = '''                            tx.execute("INSERT INTO agent_data_census_unreadable(address,reason) VALUES(?1,?2)
+                                ON CONFLICT(address) DO UPDATE SET reason=excluded.reason", rusqlite::params![address, reason])?;'''
+new = "                            let _ = (address, reason); // NON-VACUITY BREAK: forget the unreadable address on restart."
+
+[[control]]
+id = "store-census-damage-never-complete"
+guards = "Healthy census progress cannot attest completeness while any address remains uncovered or unreadable"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::census_quarantines_damage_and_commits_healthy_coverage_across_restarts"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = "    if !pending && counts.unreadable == 0 {"
+new = "    if true || (!pending && counts.unreadable == 0) { // NON-VACUITY BREAK: attest incomplete history."

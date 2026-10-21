@@ -9,6 +9,8 @@ pub struct CensusCounts {
     pub addresses: u64,
     pub resumed: u64,
     pub not_represented: u64,
+    /// Addresses whose WAL could not be read, never evidence that a session is absent.
+    pub unreadable: u64,
     pub bytes_read: u64,
     pub elapsed_ms: u128,
     pub complete: bool,
@@ -19,6 +21,7 @@ enum Action {
     Begin(String),
     Candidate(String, broca_protocol::BindIdentity),
     Covered(String),
+    Unreadable(String, String),
 }
 
 fn pace_duration(elapsed: std::time::Duration, enabled: bool) {
@@ -76,24 +79,42 @@ pub(super) fn run(
         |row| row.get(0),
     )?;
     let mut processed = 0;
+    let mut retrying_unreadable = false;
+    let mut cursor = String::new();
+    let mut attempted = std::collections::BTreeSet::new();
     loop {
         let work = Instant::now();
         let todo = {
             let mut statement = conn.prepare(
-                "SELECT address FROM agent_data_census WHERE covered=0 ORDER BY address LIMIT 128",
+                "SELECT address FROM agent_data_census c WHERE covered=0 AND address>?2
+                 AND EXISTS(SELECT 1 FROM agent_data_census_unreadable u WHERE u.address=c.address)=?1
+                 ORDER BY address LIMIT 128",
             )?;
             let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map(rusqlite::params![retrying_unreadable, cursor], |row| {
+                    row.get::<_, String>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
         if todo.is_empty() {
-            break;
+            if retrying_unreadable {
+                break;
+            }
+            // Healthy addresses get coverage first, including on a limited restart.
+            // Quarantined addresses are then retried once per pass, without claiming coverage.
+            retrying_unreadable = true;
+            cursor.clear();
+            continue;
         }
         let mut actions = Vec::new();
         for address in todo {
             if limit.is_some_and(|limit| processed >= limit) {
                 break;
+            }
+            cursor = address.clone();
+            if !attempted.insert(address.clone()) {
+                continue;
             }
             if addresses.contains(&address) {
                 let represented: bool = conn.query_row(
@@ -102,20 +123,25 @@ pub(super) fn run(
                     [&address],
                     |row| row.get(0),
                 )?;
-                if represented {
-                    counts.bytes_read += wal.probe(&address).map_err(|_| {
-                        StoreError::InconsistentSnapshot(
-                            "cannot probe represented WAL for session-ref census",
-                        )
-                    })?;
+                let read = if represented {
+                    wal.probe(&address).map(|bytes| (None, bytes))
                 } else {
                     counts.not_represented += 1;
-                    let (records, bytes) = wal.records(&address).map_err(|_| {
-                        StoreError::InconsistentSnapshot(
-                            "cannot read uncovered WAL for session-ref census",
-                        )
-                    })?;
-                    counts.bytes_read += bytes;
+                    wal.records(&address)
+                        .map(|(records, bytes)| (Some(records), bytes))
+                };
+                let (records, bytes) = match read {
+                    Ok(read) => read,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        tracing::warn!(%address, %reason, "session-ref census quarantined an unreadable WAL; coverage remains incomplete");
+                        actions.push(Action::Unreadable(address, reason));
+                        processed += 1;
+                        continue;
+                    }
+                };
+                counts.bytes_read += bytes;
+                if let Some(records) = records {
                     // Persist an in-flight row before candidate insertion. After a
                     // crash, a partial ref row must not make resume skip the rest
                     // of this WAL; Covered removes the row after all candidates.
@@ -167,6 +193,14 @@ pub(super) fn run(
                                 "DELETE FROM agent_data_census_inflight WHERE address=?1",
                                 [address],
                             )?;
+                            tx.execute(
+                                "DELETE FROM agent_data_census_unreadable WHERE address=?1",
+                                [address],
+                            )?;
+                        }
+                        Action::Unreadable(address, reason) => {
+                            tx.execute("INSERT INTO agent_data_census_unreadable(address,reason) VALUES(?1,?2)
+                                ON CONFLICT(address) DO UPDATE SET reason=excluded.reason", rusqlite::params![address, reason])?;
                         }
                     }
                     Ok(())
@@ -176,32 +210,51 @@ pub(super) fn run(
         }
         pace_duration(read_work, paced);
         if limit.is_some_and(|limit| processed >= limit) {
+            counts.unreadable = conn.query_row(
+                "SELECT count(*) FROM agent_data_census_unreadable",
+                [],
+                |row| row.get(0),
+            )?;
             counts.elapsed_ms = start.elapsed().as_millis();
             return Ok(counts);
         }
     }
-    write_batch(
-        conn,
-        &[()],
-        &mut counts.writes,
-        paced,
-        |tx, _| {
-            tx.execute("INSERT INTO agent_data_census_done VALUES(1)", [])?;
-            Ok(())
-        },
-        |_, _| Ok(()),
+    counts.unreadable = conn.query_row(
+        "SELECT count(*) FROM agent_data_census_unreadable",
+        [],
+        |row| row.get(0),
     )?;
-    counts.complete = true;
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !pending && counts.unreadable == 0 {
+        write_batch(
+            conn,
+            &[()],
+            &mut counts.writes,
+            paced,
+            |tx, _| {
+                tx.execute("INSERT INTO agent_data_census_done VALUES(1)", [])?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )?;
+        counts.complete = true;
+    }
     counts.elapsed_ms = start.elapsed().as_millis();
     tracing::info!(
         addresses = counts.addresses,
         resumed = counts.resumed,
         bytes_read = counts.bytes_read,
         not_represented = counts.not_represented,
+        unreadable = counts.unreadable,
+        complete = counts.complete,
         elapsed_ms = counts.elapsed_ms,
         max_write_lock_us = counts.writes.max_lock_us,
         write_transactions = counts.writes.transactions,
-        "session-ref census complete"
+        "session-ref census pass finished"
     );
     Ok(counts)
 }
