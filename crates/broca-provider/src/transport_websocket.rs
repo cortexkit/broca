@@ -80,6 +80,25 @@ impl FrameCounts {
     }
 }
 
+/// Count outbound `response.create` writes confirmed by the pump, not completed-response
+/// continuation receipts. Cancellation can prevent a write acknowledgement from reaching
+/// the awaiting task without changing this count.
+#[derive(Clone)]
+pub(super) struct PhysicalSends {
+    frames: Arc<FrameCounts>,
+    before: u64,
+}
+impl PhysicalSends {
+    pub(super) fn count(&self) -> u32 {
+        self.frames
+            .response_create_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.before)
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+}
+
 // A newtype lets Serde's borrowing support reach strings inside Option. Plain
 // Option<Cow<str>> would allocate even for strings without JSON escapes.
 #[derive(serde::Deserialize)]
@@ -957,6 +976,12 @@ async fn drive_socket(
     }));
     trace.websocket_close_code = Some(Arc::clone(&socket.close_code));
     if request.codex_wire {
+        trace.websocket_sends = Some(PhysicalSends {
+            frames: Arc::clone(&socket.frames),
+            before: socket.frames.response_create_sent.load(Ordering::Relaxed),
+        });
+    }
+    if request.codex_wire {
         if let Some(observation) = trace.websocket_observation.upgrade() {
             let mut observation = observation.lock().unwrap();
             let frame = trace.websocket_request.as_ref().unwrap();
@@ -997,13 +1022,6 @@ async fn drive_socket(
             transport_error("Responses socket send failed"),
             AttemptOutcome::ChunkError,
         ));
-    }
-    if let Some(codex) = trace
-        .websocket_request
-        .as_mut()
-        .and_then(|frame| frame.codex.as_mut())
-    {
-        codex.physical_send_count = 1;
     }
     let completed_id = Mutex::new(None);
     let mut recv = socket.recv.lock().await;
@@ -1125,6 +1143,24 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
             AttemptOutcome::ChunkError,
         ));
     }
+    if code == Some("previous_response_not_found") {
+        // Codex 0.163.0 treats this named cache miss as retryable before status mapping,
+        // even for a wrapped 400. Failure guards retire the established socket; the normal
+        // accounted attempt loop retries with full input, never a resend inside this attempt.
+        let retry = [value.pointer("/error/headers"), value.get("headers")]
+            .into_iter()
+            .flatten()
+            .find_map(|source| {
+                let mut headers = reqwest::header::HeaderMap::new();
+                extend_wrapped_headers(&mut headers, source);
+                parse_retry_after_header(&headers)
+            });
+        let mut error = transport_error("Previous response was not found; retrying full input");
+        error.class = ErrorClass::Transient;
+        error.provider_code = Some("previous_response_not_found".into());
+        error.retry_after_secs = retry;
+        return Some(AttemptFailure::transport(error, AttemptOutcome::ChunkError));
+    }
     let status = value
         .get("status")
         .or_else(|| value.get("status_code"))?
@@ -1138,21 +1174,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
         .into_iter()
         .flatten()
     {
-        if let Some(source) = source.as_object() {
-            for (key, value) in source {
-                let text = match value {
-                    Value::String(text) => text.clone(),
-                    Value::Number(number) => number.to_string(),
-                    _ => continue,
-                };
-                if let (Ok(name), Ok(value)) = (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(&text),
-                ) {
-                    headers.insert(name, value);
-                }
-            }
-        }
+        extend_wrapped_headers(&mut headers, source);
     }
     let retry = parse_retry_after_header(&headers);
     trace.account_observation.ratelimit_headers = ratelimit_unified_headers(&headers);
@@ -1176,6 +1198,24 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
             .get("x-should-retry")
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
     Some(AttemptFailure::http(error, forbidden))
+}
+
+fn extend_wrapped_headers(headers: &mut reqwest::header::HeaderMap, source: &Value) {
+    if let Some(source) = source.as_object() {
+        for (key, value) in source {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => continue,
+            };
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&text),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
 }
 
 /// Response headers of a refused upgrade that are safe to log: the request ids an operator can
@@ -1852,5 +1892,82 @@ async fn codex_failed_send_retires_socket_and_consumes_receipt() {
             .unwrap()
             .physical_send_count,
         0
+    );
+}
+
+#[tokio::test]
+async fn codex_completed_write_is_counted_when_cancelled_before_acknowledgement() {
+    use crate::families::{openai_responses_chatgpt_frozen_config, OpenAiResponsesChatgpt};
+    let logical = serde_json::json!({"model":"m","stream":true,"input":[],"tools":[],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{},"store":false,"include":["reasoning.encrypted_content"]});
+    let mut request: PreparedHttpRequest = HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url: "http://127.0.0.1:1/responses".into(),
+        headers: vec![],
+        body: broca_protocol::canonical_json_bytes(&logical),
+    }
+    .into();
+    request.codex_wire = true;
+    let (send, mut commands) = mpsc::channel(1);
+    let (_messages, records) = mpsc::channel(1);
+    let (attempt_active, _) = tokio::sync::watch::channel(false);
+    let socket = Arc::new(Socket {
+        auth_revision: 0,
+        url: request.url.clone(),
+        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
+            request: logical,
+            output: vec![],
+            response_id: "resp_prior".into(),
+        })),
+        send,
+        recv: tokio::sync::Mutex::new(records),
+        shutdown: CancellationToken::new(),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_code: Arc::new(AtomicU16::new(0)),
+        frames: Arc::new(FrameCounts::default()),
+        headers: vec![],
+        generation: 1,
+        established_at: Instant::now(),
+        last_completed_at: Mutex::new(None),
+        attempt_active,
+    });
+    let session = Session::default();
+    session.state.lock().unwrap().socket = Some(Arc::clone(&socket));
+    let (tx, _rx) = mpsc::channel(256);
+    let client = build_provider_http_client();
+    let clock = Clock::default();
+    let mut trace = AttemptTrace::default();
+    let normalizer =
+        OpenAiResponsesChatgpt.normalizer(&openai_responses_chatgpt_frozen_config("m"), StepId(1));
+    let mut attempt = Box::pin(drive_socket(
+        &session, &client, &request, &clock, normalizer, &tx, &mut trace,
+    ));
+    let command = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut attempt => panic!("send must await its acknowledgement"),
+            command = commands.recv() => command.expect("one response.create command"),
+        }
+    })
+    .await
+    .expect("request reaches the socket pump");
+    // The pump confirms the write but has not delivered its acknowledgement to the attempt.
+    socket
+        .frames
+        .response_create_sent
+        .fetch_add(1, Ordering::Relaxed);
+    drop(attempt);
+    drop(command);
+    let record = trace.into_attempt(
+        0,
+        &RequestDigest::of(&request.body),
+        AttemptOutcome::Cancelled,
+    );
+    assert_eq!(
+        record
+            .websocket_request
+            .unwrap()
+            .codex
+            .unwrap()
+            .physical_send_count,
+        1
     );
 }

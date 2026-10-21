@@ -1046,6 +1046,140 @@ async fn codex_continuation_failed_normalization_retires_completed_response() {
     }
     assert_eq!(mock.observed.lock().unwrap().handshakes, 2);
 }
+
+async fn codex_previous_response_miss(status: Option<u16>) {
+    let mut miss = serde_json::json!({"type":"error","error":{"code":"previous_response_not_found","message":"PRIVATE-BACKEND-MESSAGE"}});
+    if let Some(status) = status {
+        miss["status"] = serde_json::json!(status);
+    }
+    let records = codex_tool_run(vec![tool_events(), vec![miss], text_events()], 3, 2).await;
+    let second_step: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ModelAttemptFinished {
+                step_id,
+                attempt,
+                request_body_len,
+                request_body_sha256,
+                websocket_request,
+                outcome,
+                ..
+            } if *step_id == StepId(2) => Some((
+                attempt,
+                request_body_len,
+                request_body_sha256,
+                websocket_request.as_ref().unwrap(),
+                outcome,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        second_step.len(),
+        2,
+        "cache miss recovery must be an accounted retry"
+    );
+    assert_eq!(*second_step[0].0, 0);
+    assert_eq!(*second_step[1].0, 1);
+    assert_eq!(second_step[0].1, second_step[1].1);
+    assert_eq!(second_step[0].2, second_step[1].2);
+    assert_eq!(*second_step[0].4, AttemptOutcome::ChunkError);
+    assert_eq!(*second_step[1].4, AttemptOutcome::Complete);
+    assert!(second_step[0].3.codex.as_ref().unwrap().continuation);
+    assert!(!second_step[1].3.codex.as_ref().unwrap().continuation);
+    assert_eq!(
+        second_step[0].3.codex.as_ref().unwrap().physical_send_count,
+        1
+    );
+    assert_eq!(
+        second_step[1].3.codex.as_ref().unwrap().physical_send_count,
+        1
+    );
+    assert_ne!(
+        second_step[0]
+            .3
+            .codex
+            .as_ref()
+            .unwrap()
+            .connection_generation,
+        second_step[1]
+            .3
+            .codex
+            .as_ref()
+            .unwrap()
+            .connection_generation
+    );
+}
+
+#[tokio::test]
+async fn codex_previous_response_not_found_without_status_is_accounted_retry() {
+    codex_previous_response_miss(None).await;
+}
+#[tokio::test]
+async fn codex_previous_response_not_found_400_is_accounted_retry() {
+    codex_previous_response_miss(Some(400)).await;
+}
+
+#[test]
+fn codex_previous_response_code_precedes_generic_status_mapping() {
+    for status in [None, Some(400)] {
+        let mut raw = serde_json::json!({"type":"error","error":{"code":"previous_response_not_found","message":"PRIVATE-BACKEND-MESSAGE"}});
+        if let Some(status) = status {
+            raw["status"] = serde_json::json!(status);
+        }
+        let failure = responses_websocket::wrapped_error(
+            &serde_json::to_vec(&raw).unwrap(),
+            &mut AttemptTrace::default(),
+        )
+        .expect("named cache miss is transport-retryable without a status");
+        assert_eq!(failure.error.class, ErrorClass::Transient);
+        assert_eq!(failure.outcome, AttemptOutcome::ChunkError);
+        assert!(!failure.retry_forbidden);
+        assert_eq!(
+            failure.error.provider_code.as_deref(),
+            Some("previous_response_not_found")
+        );
+        assert!(!failure.error.message.contains("PRIVATE"));
+    }
+    let other = serde_json::json!({"type":"error","status":400,"error":{"code":"other_error","message":"test"}});
+    let failure = responses_websocket::wrapped_error(
+        &serde_json::to_vec(&other).unwrap(),
+        &mut AttemptTrace::default(),
+    )
+    .unwrap();
+    assert_eq!(failure.outcome, AttemptOutcome::HttpError);
+    assert_ne!(failure.error.class, ErrorClass::Transient);
+}
+
+#[test]
+fn codex_previous_response_retry_advice_is_nested_first_with_top_level_fallback() {
+    for (nested, top, expected) in [
+        (
+            serde_json::json!({"Retry-After":"1"}),
+            serde_json::json!({"Retry-After":"2"}),
+            Some(1.0),
+        ),
+        (
+            serde_json::json!({"Retry-After":"invalid"}),
+            serde_json::json!({"Retry-After":"2"}),
+            Some(2.0),
+        ),
+        (
+            serde_json::json!({"Retry-After-Ms":"250"}),
+            serde_json::json!({}),
+            Some(0.25),
+        ),
+        (Value::Null, Value::Null, None),
+    ] {
+        let raw = serde_json::json!({"type":"error","status":400,"headers":top,"error":{"code":"previous_response_not_found","headers":nested}});
+        let failure = responses_websocket::wrapped_error(
+            &serde_json::to_vec(&raw).unwrap(),
+            &mut AttemptTrace::default(),
+        )
+        .unwrap();
+        assert_eq!(failure.error.retry_after_secs, expected);
+    }
+}
 fn opts() -> CallOptions {
     serde_json::from_value(serde_json::json!({
         "model":{"provider_module_id":"openai","model_id":"m"},

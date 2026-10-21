@@ -292,6 +292,7 @@ struct AttemptTrace {
     ephemeral_session: bool,
     transport: Option<String>,
     websocket_request: Option<Box<broca_protocol::provider::WebSocketRequestDigest>>,
+    websocket_sends: Option<responses_websocket::PhysicalSends>,
     websocket_close_code: Option<Arc<std::sync::atomic::AtomicU16>>,
     websocket_observation:
         std::sync::Weak<std::sync::Mutex<responses_websocket::AttemptObservation>>,
@@ -359,11 +360,16 @@ impl AttemptTrace {
     }
 
     fn into_attempt(
-        self,
+        mut self,
         attempt: usize,
         request: &RequestDigest,
         outcome: AttemptOutcome,
     ) -> ModelAttempt {
+        if let (Some(sends), Some(frame)) = (&self.websocket_sends, &mut self.websocket_request) {
+            if let Some(codex) = frame.codex.as_mut() {
+                codex.physical_send_count = sends.count();
+            }
+        }
         ModelAttempt {
             attempt: attempt as u32,
             request_body_len: request.len,

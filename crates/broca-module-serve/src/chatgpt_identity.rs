@@ -168,6 +168,14 @@ mod tests {
         assert_ne!(first.thread_id, first.session_id);
         assert_ne!(first.turn_id, next.turn_id);
         assert!(first.user_agent.starts_with("codex_cli_rs/0.163.0 ("));
+        let os = os_info::get();
+        let real_host_prefix = format!(
+            "codex_cli_rs/0.163.0 ({} {}; {}) ",
+            os.os_type(),
+            os.version(),
+            os.architecture().unwrap_or("unknown")
+        );
+        assert!(first.user_agent.starts_with(&real_host_prefix));
         assert_eq!(first.originator, "codex_cli_rs");
         assert_eq!(first.session_id, "s");
         assert_eq!(first.turn_id, "run-1");

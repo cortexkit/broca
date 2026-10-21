@@ -30,6 +30,7 @@ pub fn safe_provider_code(code: &str) -> bool {
             | "previous_process_ended_unsealed"
             | "websocket_auth_rejected"
             | "request_invalid"
+            | "previous_response_not_found"
     )
 }
 
@@ -59,6 +60,7 @@ mod tests {
             "previous_process_ended_unsealed",
             "websocket_auth_rejected",
             "request_invalid",
+            "previous_response_not_found",
         ] {
             assert!(safe_provider_code(code), "known safe code rejected: {code}");
         }

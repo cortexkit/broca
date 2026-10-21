@@ -276,6 +276,7 @@ pub(crate) fn completed_output_as_input(
 ) -> Vec<Value> {
     let mut message = Message::new(Role::Assistant, assistant.content.clone());
     message.origin = target_model.cloned();
+    let stateless = frozen.static_options.get("store") == Some(&Value::Bool(false));
     let mut items = convert_assistant_items(
         &message,
         name_map,
@@ -283,7 +284,7 @@ pub(crate) fn completed_output_as_input(
             target_model,
             target_family: frozen.family_id,
             provider_text_state: frozen.provider_text_state,
-            stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
+            stateless,
         },
     );
     if frozen.chatgpt_wire.is_some() {
