@@ -286,6 +286,14 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
             *reference.sent.lock().unwrap(),
             "resume must render byte-identical provider requests"
         );
+        // Captured with run.rs from 55949716cd2425bf97fec2611e36f44a9a3b3859
+        // replaying these same records, before bounded approval-history reconstruction.
+        let legacy_bytes = include_bytes!("fixtures/resume_before_bounded_history.json");
+        assert_eq!(
+            provider.sent.lock().unwrap()[&1].as_slice(),
+            legacy_bytes.strip_suffix(b"\n").unwrap(),
+            "resume request bytes changed from the pre-optimization run loop"
+        );
         let decoded = store.decoded.load(Ordering::SeqCst);
         // Projection may read the two-record tail again; no reader may decode the old prefix.
         assert!(
