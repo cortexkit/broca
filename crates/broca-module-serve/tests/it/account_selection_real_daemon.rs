@@ -310,6 +310,15 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                     listed("oauth:anthropic:acct-b", "acct-b"),
                     listed("oauth:anthropic:spare", "acct-s"),
                     json!({
+                        "id": "oauth:meta",
+                        "categories": ["llm-provider"],
+                        "type": "oauth",
+                        "serves": ["meta"],
+                        "state": "active",
+                        "record_version": 1,
+                        "operations": ["read"],
+                    }),
+                    json!({
                         "id": "apikey:xai",
                         "categories": ["llm-provider"],
                         "type": "apikey",
@@ -468,6 +477,9 @@ const ANTHROPIC_CREDIT_BALANCE_BODY: &str = r#"{"type":"error","error":{"type":"
 /// kept here, and those were not recorded.
 const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
 
+/// Captured from Meta's Muse Responses endpoint: the reset is an absolute epoch timestamp.
+const META_SUBSCRIPTION_QUOTA_429_BODY: &str = r#"{"error":{"code":"rate_limit_exceeded","message":"Subscription quota exhausted. Your usage window resets at 2026-10-26T00:00:00Z.","param":null,"resets_at":1792972800,"type":"rate_limit_error"}}"#;
+
 fn reported_headers() -> Value {
     json!({
         "anthropic-ratelimit-unified-5h-utilization": "0.4200",
@@ -521,6 +533,7 @@ struct Upstream {
     context_overflow: std::sync::atomic::AtomicBool,
     billing_exhausted_xai: std::sync::atomic::AtomicBool,
     account_limit_exhausted_code_assist: std::sync::atomic::AtomicBool,
+    account_limit_exhausted_meta: std::sync::atomic::AtomicBool,
     /// Answer Anthropic's out-of-credit 400 (its public shape; no real refusal is captured).
     credit_exhausted_anthropic: std::sync::atomic::AtomicBool,
     /// Answer OpenAI's request-validation 400 for a rejected structured-output schema.
@@ -537,6 +550,7 @@ struct Upstream {
 const CREDENTIALS: &[&str] = &[
     "oauth:anthropic",
     "oauth:anthropic:acct-b",
+    "oauth:meta",
     "oauth:anthropic:work",
     "oauth:anthropic:spare",
     "apikey:xai",
@@ -670,6 +684,17 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     let body = br#"{"error":{"code":429,"message":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 81h48m9s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"uiMessage":"true","model":"gemini-3.8-flash-high","quotaResetDelay":"81h48m9.198441001s"}}]}}"#;
+                    let reply = format!("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    return;
+                }
+                if upstream
+                    .account_limit_exhausted_meta
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let body = META_SUBSCRIPTION_QUOTA_429_BODY.as_bytes();
                     let reply = format!("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
                     socket.write_all(reply.as_bytes()).await.unwrap();
                     socket.write_all(body).await.unwrap();
@@ -873,6 +898,15 @@ impl Rig {
                         "limit.context": 200000,
                         "limit.output": 8192,
                     },
+                    "meta/muse-spark-1.3-contributor": {
+                        "capability.structured_output": true,
+                        "capability.attachment": false,
+                        "capability.reasoning": false,
+                        "capability.tool_call": true,
+                        "existence": "present",
+                        "limit.context": 200000,
+                        "limit.output": 8192,
+                    },
                     "xai/grok-4.7": {
                         "capability.attachment": false,
                         "capability.reasoning": false,
@@ -924,6 +958,7 @@ impl Rig {
                     "openrouter": { "base_url": upstream_url },
                     "google": { "base_url": upstream_url },
                     "openai": { "base_url": upstream_url },
+                    "meta": { "base_url": upstream_url },
                 }
             })
             .to_string(),
@@ -932,7 +967,7 @@ impl Rig {
         let methods = root.join("auth-methods.json");
         std::fs::write(
             &methods,
-            br#"{"defaults":{"anthropic":"oauth","xai":"apikey","google":"antigravity","openai":"apikey","openrouter":"apikey"}}"#,
+            br#"{"defaults":{"anthropic":"oauth","xai":"apikey","google":"antigravity","openai":"apikey","openrouter":"apikey","meta":"oauth"}}"#,
         )
         .unwrap();
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
@@ -2923,6 +2958,66 @@ async fn account_limit_exhausted_code_assist_status_matches_golden_through_real_
     let golden = std::fs::read(&path)
         .expect("generate the Code Assist account-limit golden through the real serve path");
     assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
+}
+
+/// Meta's captured Muse subscription-quota response ends the run as an account wall after one
+/// attempt, with the provider's absolute reset carried into the real run.status reply.
+/// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meta_subscription_quota_status_matches_golden_through_real_serve() {
+    let rig = Rig::start()
+        .await
+        .expect("the Meta subscription-quota golden requires the real daemon");
+    rig.upstream
+        .account_limit_exhausted_meta
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = rig.client("meta-subscription-quota").await;
+    let mut meta_spec = spec("send-meta-subscription-quota", None);
+    meta_spec.provider = "meta";
+    meta_spec.model = "muse-spark-1.3-contributor";
+    let run_id = match client.send(meta_spec).await.expect("send") {
+        SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. } => run_id,
+        other => panic!("unexpected send outcome {other:?}"),
+    };
+    let frames = rig.finished("meta-subscription-quota").await;
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+            .count(),
+        1,
+        "an exhausted subscription is never re-sent within the run"
+    );
+    assert_eq!(
+        rig.upstream.authorized_as.lock().unwrap().as_slice(),
+        ["oauth:meta"]
+    );
+    let status = broca_test_support::wait_until(
+        "meta_subscription_quota_status_matches_golden_through_real_serve: run status",
+        || async {
+            let status = client.run_status(&run_id).await.unwrap();
+            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
+                Ok(status)
+            } else {
+                Err(format!("{status:?}"))
+            }
+        },
+    )
+    .await;
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["state"], "error");
+    assert_eq!(value["error"]["class"], "transient");
+    assert_eq!(value["error"]["provider_code"], "account_limit_exhausted");
+    assert_eq!(value["error"]["status"], 429);
+    assert_eq!(value["error"]["credential_id"], "oauth:meta");
+    assert!(value["error"].get("account_ref").is_none());
+    assert_eq!(value["error"]["resets_at_ms"], 1_792_972_800_000_u64);
+    assert_eq!(value["error"]["resets_at_source"], "body");
+    assert_eq!(value["retries_used"], 0);
+    assert_golden_file(
+        &serde_json::to_vec(&status).unwrap(),
+        "run_status.account_limit_exhausted_meta.json",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

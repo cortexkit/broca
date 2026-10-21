@@ -21142,3 +21142,19 @@ expect_red = ["terminal_reason_crash_cut::replay_before_run_finished_preserves_l
 file = "crates/broca-core/src/replay.rs"
 old = '''                        .map(|_| RunFinishReason::Completed)'''
 new = '''                        .map(|condition| if matches!(condition, broca_protocol::request::StopCondition::StepCount { .. }) { RunFinishReason::MaxSteps } else { RunFinishReason::Completed }) // NON-VACUITY BREAK: replay names a natural end max_steps.'''
+
+[[control]]
+id = "meta-subscription-quota-exhaustion-classification"
+guards = "Meta Muse's structured subscription quota 429 keeps its epoch reset and ends the step without reissue, while ordinary 429s stay rate limited"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::meta_subscription_quota_429_ends_the_step_after_one_attempt"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''        crate::spec::WireFamilyId::OpenAiResponses => {
+            meta_subscription_quota_exhausted(status, body, error)
+        }'''
+new = '''        crate::spec::WireFamilyId::OpenAiResponses => error, // NON-VACUITY BREAK: drop the Meta subscription quota mapping.'''
