@@ -747,7 +747,7 @@ or that cannot be encoded at all, is never put on the wire. The stream ends with
 (`too_large` or `unencodable`), the unit's control `cursor` (`{wal_seq, sub_index}`, or null for
 a display event), and for `too_large` the `frame_bytes` and `limit`. The served bytes are pinned
 by `crates/broca-module-serve/tests/golden/subscribe_unit_undeliverable.too_large.json`.
-Resubscribing from before that cursor reaches the same unit again.
+For a control unit, resubscribing from before its cursor reaches the same unit again.
 
 Route requests authorize the caller before method parameter validation or migration
 checks. In particular, an unauthorized `session.subscribe` reports the authorization

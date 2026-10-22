@@ -513,7 +513,8 @@ impl CutStore {
                 Err(error) => {
                     // Pending intents still fence their sessions. A missing
                     // door or damaged staging must not prevent the service
-                    // from answering status or the driver's repeat.
+                    // from answering status requests or retries of the
+                    // pending operation.
                     tracing::warn!(
                         cut_id,
                         code = error.code.as_str(),

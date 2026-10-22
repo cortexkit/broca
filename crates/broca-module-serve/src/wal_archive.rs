@@ -186,8 +186,9 @@ impl WalArchiveConfig {
                             interval.as_secs()
                         );
                     }
-                    // No pass has ever run under this root, so there is no durable anchor to
-                    // measure from. Measuring from this process's start would let a daemon
+                    // No usable pass timestamp was found under this root (none was ever
+                    // recorded, or the archive directories cannot be read), so there is no
+                    // durable anchor to measure from. Measuring from this process's start would let a daemon
                     // restarted more often than the interval wait forever, and with no first
                     // pass no anchor would ever appear. The first poll of uptime is the grace
                     // period; the pass it runs records the anchor every later decision uses.
@@ -216,7 +217,8 @@ impl WalArchiveConfig {
 /// An operator's `store-maintenance wal-fold` writes the same names, so a manual fold
 /// postpones the scheduled one exactly as a scheduled fold would.
 ///
-/// `None` means no pass exists yet, NOT "long ago": the caller runs the first pass on its
+/// `None` means no usable pass timestamp was found (none recorded yet, or the archive
+/// directories are unreadable), NOT "long ago": the caller runs the pass on its
 /// first poll, which records the anchor, rather than measuring an interval from its own
 /// start time, which a daemon restarted more often than the interval would never reach.
 fn last_pass(root: &Path) -> Option<SystemTime> {

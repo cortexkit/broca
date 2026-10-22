@@ -379,8 +379,8 @@ pub fn spawn_catalog_poll(poller: Arc<CatalogPoller>) -> tokio::task::JoinHandle
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     // Count it where the health probe can see it. A transport failure never
-                    // reaches `cache.refresh`, so without this the probe reads ZERO refusals
-                    // through a total refresh outage -- which is what happened on 09-14. Which
+                    // reaches `cache.refresh`, so without this the probe would read ZERO
+                    // refusals through a total refresh outage. Which
                     // failures count here, and why a Cache error must not, is the rule at
                     // `counts_at_the_loop`.
                     if counts_at_the_loop(&error) {

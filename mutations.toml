@@ -16364,13 +16364,21 @@ features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["boot_keeps_an_unreadable_cut_pending_and_status_read_only"]
 only = false
+# The property is held at two layers: an unavailable door leaves the cut (the agent-data move's
+# durable state file) with its operation pending, and boot reconciliation isolates any per-cut
+# failure. The break removes both.
+[[control.edits]]
 file = "crates/broca-module/src/cut_state.rs"
-old = '''"cut boot reconciliation remains pending"
-                        );
-                        continue;'''
-new = '''"cut boot reconciliation remains pending"
-                        );
-                        return Err(error); // NON-VACUITY BREAK'''
+old = "            if let Err(error) = self.reconcile_boot_cut(&path, artifacts).await {"
+new = "            self.reconcile_boot_cut(&path, artifacts).await?; // NON-VACUITY BREAK: one cut fails boot.\n            if let Err(error) = Ok::<(), ErrorBody>(()) {"
+[[control.edits]]
+file = "crates/broca-module/src/cut_state.rs"
+old = """"cut boot reconciliation remains pending"
+                    );
+                    return Ok(());"""
+new = """"cut boot reconciliation remains pending"
+                    );
+                    return Err(error); // NON-VACUITY BREAK: an unavailable door fails the cut."""
 
 [[control]]
 id = "agent-data-activation-uses-durable-import"
