@@ -581,7 +581,7 @@ WALs.
 | `final_step_finish_reason_json` | TEXT | JSON string of the last step's `finish_reason`, if one was observed. |
 | `retries_used` | INTEGER NOT NULL DEFAULT 0 | |
 | `state_changed_ms` | INTEGER | See section 5. NULL on rows written before the column existed (v0.3.24). |
-| `title` | TEXT | The title the run's `run_started` records, written at admission; the first title written for a run is kept. NULL for a send without one and for runs admitted before the column existed. When this column is NULL, `run.status` answers from the run's `run_started` in the WAL. Never rebuilt: like every other column here it is maintained only by the actor. |
+| `title` | TEXT | The title the run's `run_started` records, written at admission; the first title written for a run is kept. NULL for a send without one, for runs admitted before the column existed, and always for a run of a session with `retention`: its row outlives the deletion of its WAL, and a title is caller content, so the title stays only in the WAL and is deleted with it. When this column is NULL, `run.status` answers from the run's `run_started` in the WAL. Never rebuilt: like every other column here it is maintained only by the actor. |
 
 **Writers.** The session actor, not the projector:
 

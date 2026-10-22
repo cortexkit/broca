@@ -1475,6 +1475,76 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
     rig.finish().await;
 }
 
+/// The title the `run_started` record of `run_id` carries, read from the session's WAL.
+fn started_title(records: &[WalRecord], run_id: &str) -> Option<String> {
+    records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted {
+                run_id: started,
+                title,
+                ..
+            } if started.0 == run_id => Some(title.clone()),
+            _ => None,
+        })
+        .expect("the run has a run_started record")
+}
+
+/// An ordered send's title reaches the index row of the run it starts, on both ordered start
+/// paths. An `["idle_start"]` send on a fresh, idle session starts its run while it is being
+/// admitted; the same send made while another run is active waits in the queue and starts its
+/// run once that run ends. Each run's index row holds exactly the title its `run_started`
+/// records. (Direct sends and plain queued sends are covered by the titled-send test above.)
+#[tokio::test]
+async fn an_ordered_sends_title_reaches_the_index_row_of_the_run_it_starts() {
+    let mut rig = Rig::start("title-ordered").await;
+    let idle_start = |title: &str| serde_json::json!({"delivery": ["idle_start"], "title": title});
+    rig.script.hold_model(true);
+    let immediate = run_id_of(
+        &rig.send_with("ordered-1", "hi", None, idle_start("Ordered on idle"))
+            .await,
+    );
+    rig.wait_entered().await;
+    assert_eq!(
+        started_title(&rig.records(), &immediate).as_deref(),
+        Some("Ordered on idle")
+    );
+    assert_eq!(
+        indexed_title(&rig, &immediate).as_deref(),
+        Some("Ordered on idle"),
+        "the run an idle_start send starts at once indexes its title"
+    );
+
+    let drained = pending_run_id(
+        &rig.send_with(
+            "ordered-2",
+            "next",
+            None,
+            idle_start("Ordered from the queue"),
+        )
+        .await,
+    );
+    rig.script.hold_model(false);
+    let records = rig.wait_for_finished(2).await;
+    assert_eq!(starts(&records), [immediate.clone(), drained.clone()]);
+    assert_eq!(
+        started_title(&records, &drained).as_deref(),
+        Some("Ordered from the queue")
+    );
+    rig.wait_idle().await;
+    assert_eq!(
+        indexed_title(&rig, &drained).as_deref(),
+        Some("Ordered from the queue"),
+        "the run a queued idle_start send starts indexes its title"
+    );
+    assert_eq!(
+        indexed_title(&rig, &immediate).as_deref(),
+        Some("Ordered on idle"),
+        "finishing the run keeps its title"
+    );
+    rig.finish().await;
+}
+
 /// A steer's title is stored on its `Steered` record and becomes the session's newest title;
 /// a retry of the steer with another title is answered as the first one was, writes nothing,
 /// and keeps the first title.

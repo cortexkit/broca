@@ -5837,6 +5837,22 @@ file = "crates/broca-module/src/actor.rs"
 old = "!= Some(true)\n                }),"
 new = "!= Some(false) // NON-VACUITY BREAK\n                }),"
 
+# An ordered send keeps its title on its pending queue entry, and the run that entry starts
+# records it on its `run_started` and on its run-index row. The break drops the title from the
+# ordered entry only; plain queued and direct sends keep theirs.
+[[control]]
+id = "ordered-send-run-index-title"
+guards = "a run an ordered idle_start send starts indexes the title its run_started records"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
+expect_red = ["send_delivery::an_ordered_sends_title_reaches_the_index_row_of_the_run_it_starts"]
+file = "crates/broca-module/src/actor.rs"
+old = "            delivery: None,\n            send_id: send_id.clone(),\n            title: title.clone(),"
+new = "            delivery: None,\n            send_id: send_id.clone(),\n            title: None, // NON-VACUITY BREAK: drop an ordered send's title"
+
 [[control]]
 id = "retention-rederive-run-upsert"
 guards = "re-derivation inserts the runs even when the initial active insert failed"
