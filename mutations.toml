@@ -23034,3 +23034,29 @@ expect_red = ["families::openai_responses_chatgpt::tests::codex_body_prepares_th
 file = "crates/broca-provider/src/families/openai_responses_chatgpt.rs"
 old = "        if let Some(anchor) = effort_anchor {"
 new = "        let _ = effort_anchor; let prepared = crate::structured_output::prepare(frozen, opts); // NON-VACUITY BREAK: prepare and plan a second time.\n        if let Some((anchor, _)) = effort_plan(frozen, prepared.as_ref()) {"
+
+[[control]]
+id = "structured-output-paragraph-break-gated"
+guards = "A frozen structured-output paragraph break is never written ungated: its frames require structured-output-paragraph/v1, so an older reader refuses the WAL by name instead of resuming without the break"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::structured_output_paragraph_break_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = "        let base = if self.carries_structured_output_paragraph_break() {"
+new = "        let base = if false && self.carries_structured_output_paragraph_break() { // NON-VACUITY BREAK: write the paragraph break ungated."
+
+[[control]]
+id = "structured-output-paragraph-break-run-start-gate"
+guards = "RunStarted whose frozen structured output carries the paragraph break refuses older readers"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::structured_output_paragraph_break_is_must_understand"]
+file = "crates/broca-wal/src/record.rs"
+old = "            WalRecord::RunStarted { config, .. } => frozen(&config.frozen_render_config),\n            WalRecord::RunConfigRefrozen {\n                frozen_render_config,\n                ..\n            } => frozen(frozen_render_config),\n            _ => false,\n        }\n    }\n\n    fn base_required_features"
+new = "            WalRecord::RunStarted { .. } => false, // NON-VACUITY BREAK: omit the run-start gate.\n            WalRecord::RunConfigRefrozen {\n                frozen_render_config,\n                ..\n            } => frozen(frozen_render_config),\n            _ => false,\n        }\n    }\n\n    fn base_required_features"

@@ -1313,6 +1313,11 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_structured_output_paragraph_break() {
+            with_feature(base, crate::framing::STRUCTURED_OUTPUT_PARAGRAPH_FEATURE)
+        } else {
+            base
+        };
         let base = if matches!(
             self,
             WalRecord::CompactionMessage {
@@ -1512,6 +1517,25 @@ impl WalRecord {
                 reason: Some(reason),
                 ..
             } => reason == broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT,
+            _ => false,
+        }
+    }
+
+    /// A frozen render config whose structured output starts its schema instructions on a new
+    /// paragraph (`structured_output.instructions_paragraph_break: true`).
+    fn carries_structured_output_paragraph_break(&self) -> bool {
+        let frozen = |config: &Value| {
+            config
+                .pointer("/structured_output/instructions_paragraph_break")
+                .and_then(Value::as_bool)
+                == Some(true)
+        };
+        match self {
+            WalRecord::RunStarted { config, .. } => frozen(&config.frozen_render_config),
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen(frozen_render_config),
             _ => false,
         }
     }

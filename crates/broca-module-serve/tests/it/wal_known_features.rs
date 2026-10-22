@@ -33,11 +33,12 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
     // views and notices), deferred-call records, step-boundary cancellation and
     // first-send session classes, hard input-token caps, Google RPC quota diagnostics,
     // provider text state, OpenRouter reasoning, runner tags,
-    // structured-output state including durable compiler-refusal downgrades, and reply
+    // structured-output state including durable compiler-refusal downgrades and the frozen
+    // paragraph break before schema instructions, and reply
     // deadlines on tools declared directly on a send.
     assert_eq!(
         expected,
-        "agent-run-scopes/v1\narchive-index/v2\nchatgpt-codex-wire/v1\ncompaction-view/v1\ncompaction-wait/v1\ncompaction/v1\ncontext-ceiling/v1\ndeferred-call/v1\ndelivery-order/v1\ndispatch-module/v1\nflow-scopes/v1\ngoogle-rpc-error-details/v1\ninput-token-cap/v1\ninterrupt-reason/v1\nopenrouter-reasoning/v1\nplan-manifest/v1\nprovider-text-state/v1\nrestart-pause/v1\nretention/v1\nrun-cancel-at/v1\nrunner-tags/v1\nscope/v1\nsession-class/v1\nsteer-queue/v1\nstep-transforms/v1\nstructured-output-downgrade/v1\nstructured-output/v1\ntool-reply/v1\nturn-directives/v1\n"
+        "agent-run-scopes/v1\narchive-index/v2\nchatgpt-codex-wire/v1\ncompaction-view/v1\ncompaction-wait/v1\ncompaction/v1\ncontext-ceiling/v1\ndeferred-call/v1\ndelivery-order/v1\ndispatch-module/v1\nflow-scopes/v1\ngoogle-rpc-error-details/v1\ninput-token-cap/v1\ninterrupt-reason/v1\nopenrouter-reasoning/v1\nplan-manifest/v1\nprovider-text-state/v1\nrestart-pause/v1\nretention/v1\nrun-cancel-at/v1\nrunner-tags/v1\nscope/v1\nsession-class/v1\nsteer-queue/v1\nstep-transforms/v1\nstructured-output-downgrade/v1\nstructured-output-paragraph/v1\nstructured-output/v1\ntool-reply/v1\nturn-directives/v1\n"
     );
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert!(
