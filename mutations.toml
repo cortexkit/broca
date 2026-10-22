@@ -24168,3 +24168,15 @@ expect_red = ["compaction::view::tests::ordinal_ranges_bound_the_work_to_the_req
 file = "crates/broca-core/src/compaction/view.rs"
 old = "let start = prompt.partition_point(|m| m.ordinal.is_none_or(|o| o < from));"
 new = "let start = { let _ = from; 0 }; // NON-VACUITY BREAK: walk the hidden prefix"
+
+[[control]]
+id = "compaction-boundary-request-reuses-wire-render"
+guards = "a boundary reuses model options and their exact rendered byte count until an accepted view changes"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::boundary_request_reuses_exact_bytes_until_a_view_changes"]
+file = "crates/broca-core/src/compaction.rs"
+old = "if self.options.is_some() && self.view_version == version {"
+new = "if false && self.options.is_some() && self.view_version == version { // NON-VACUITY BREAK: render on every estimate"

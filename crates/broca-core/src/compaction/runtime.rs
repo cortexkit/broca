@@ -411,16 +411,18 @@ impl Runtime<'_> {
         out: &tokio::sync::mpsc::Sender<crate::OutputEvent>,
         opts: &broca_protocol::CallOptions,
         systems: &[usize],
+        request: &mut super::BoundaryRequest,
         stored: &[Message],
         provider: &dyn crate::Provider,
         window: Option<u64>,
     ) -> Result<Option<broca_protocol::ContextCeilingDetail>, crate::RunError> {
         use crate::compaction_provider::ceiling::WaitEnd;
         let mut events = Vec::new();
-        let estimate = |state: &CompactionState| -> Result<u64, crate::RunError> {
-            let model = super::model_options_indexed(opts, state, systems)
+        let mut estimate = |state: &CompactionState| -> Result<u64, crate::RunError> {
+            request
+                .refresh(opts, state, systems, |model| provider.render_request(model))
                 .map_err(|e| crate::RunError::Wal(e.to_string()))?;
-            Ok(request_estimate(provider.render_request(&model).len(), &state.history).0)
+            Ok(request_estimate(request.bytes, &state.history).0)
         };
         if let Some(CeilingCheck::Decided {
             step_id: checked,

@@ -823,6 +823,39 @@ fn retained_episodes(
         .collect()
 }
 
+/// One boundary's rendered model input and its exact wire size. Only an accepted view can
+/// change this input during a ceiling wait; notices and wait records do not change it.
+#[derive(Default)]
+pub(crate) struct BoundaryRequest {
+    options: Option<broca_protocol::CallOptions>,
+    view_version: Option<u64>,
+    pub(crate) bytes: usize,
+}
+
+impl BoundaryRequest {
+    pub(crate) fn refresh(
+        &mut self,
+        opts: &broca_protocol::CallOptions,
+        state: &CompactionState,
+        systems: &[usize],
+        render: impl FnOnce(&broca_protocol::CallOptions) -> Vec<u8>,
+    ) -> Result<(), view::ViewNotRenderable> {
+        let version = state.view.as_ref().map(|view| view.view.view_version);
+        if self.options.is_some() && self.view_version == version {
+            return Ok(());
+        }
+        let options = model_options_indexed(opts, state, systems)?;
+        self.bytes = render(&options).len();
+        self.options = Some(options);
+        self.view_version = version;
+        Ok(())
+    }
+
+    pub(crate) fn into_options(self) -> broca_protocol::CallOptions {
+        self.options.expect("boundary request was rendered")
+    }
+}
+
 pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) -> u64 {
     let convert = |bytes: usize| (bytes as u64).div_ceil(ESTIMATE_BYTES_PER_TOKEN);
     previous.map_or_else(

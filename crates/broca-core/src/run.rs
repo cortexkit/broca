@@ -4546,9 +4546,13 @@ where
                 ))
                 .await?
             };
-            let view = crate::compaction::model_options_indexed(&opts, state, &system_positions)
+            let mut request = crate::compaction::BoundaryRequest::default();
+            request
+                .refresh(&opts, state, &system_positions, |view| {
+                    provider.render_request(view)
+                })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
-            notice_request_bytes = provider.render_request(&view).len();
+            notice_request_bytes = request.bytes;
             let (estimate, _) =
                 crate::compaction::request_estimate(notice_request_bytes, &compaction_history);
             // Tell the provider what the session wrote since its last notice. The notice is
@@ -4581,15 +4585,19 @@ where
                 out,
                 &opts,
                 &system_positions,
+                &mut request,
                 raw,
                 provider,
                 context_limit,
             ))
             .await?;
             // A ceiling ride or a view-ready notification may have changed the durable view.
-            let view = crate::compaction::model_options_indexed(&opts, state, &system_positions)
+            request
+                .refresh(&opts, state, &system_positions, |view| {
+                    provider.render_request(view)
+                })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
-            notice_request_bytes = provider.render_request(&view).len();
+            notice_request_bytes = request.bytes;
             if let Some(notice) = crate::compaction::view::next_notice(
                 state,
                 raw,
@@ -4620,7 +4628,7 @@ where
                 interrupt_reason = Some("runner_shutdown".to_owned());
                 break RunFinishReason::Interrupted;
             }
-            model_opts = Some(Arc::new(view));
+            model_opts = Some(Arc::new(request.into_options()));
             #[cfg(feature = "test-clock")]
             {
                 // The model prompt is Setup's message or the applied view, with the raw
@@ -4679,9 +4687,7 @@ where
                 Ok(())
             })
         };
-        let sent_bytes = compaction_runtime
-            .as_ref()
-            .map(|_| provider.render_request(sent_opts).len());
+        let sent_bytes = compaction_runtime.as_ref().map(|_| notice_request_bytes);
         // The receipt-polling wrapper is generic over this future. Heap-own the future
         // before either await arm so the wrapper cannot duplicate its large inline frame.
         let mut schema_resent = false;

@@ -135,6 +135,47 @@ fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
     assert_eq!(coords, vec![(2, Some(2)), (3, Some(3))]);
 }
 
+#[test]
+fn boundary_request_reuses_exact_bytes_until_a_view_changes() {
+    let opts = CallOptions::new(conversation());
+    let mut state = after_setup();
+    let mut request = crate::compaction::BoundaryRequest::default();
+    let renders = std::cell::Cell::new(0);
+    let render = |opts: &CallOptions| {
+        renders.set(renders.get() + 1);
+        crate::canonical_request_bytes(opts)
+    };
+    for _ in 0..4 {
+        request.refresh(&opts, &state, &[], render).unwrap();
+        assert_eq!(
+            request.bytes,
+            crate::canonical_request_bytes(&model_options(&opts, &state).unwrap()).len()
+        );
+    }
+    assert_eq!(renders.get(), 1);
+    let (view, _) = make_view(
+        2,
+        2,
+        vec![ViewRange::replace(
+            0,
+            3,
+            replace_bytes(&[text(Role::User, "short")]),
+        )],
+    );
+    state.view = Some(AppliedView {
+        view,
+        choice: broca_wal::CompactionViewChoice::Applied,
+    });
+    request.refresh(&opts, &state, &[], render).unwrap();
+    assert_eq!(renders.get(), 2);
+    let expected = crate::canonical_request_bytes(&model_options(&opts, &state).unwrap());
+    assert_eq!(request.bytes, expected.len());
+    assert_eq!(
+        crate::canonical_request_bytes(&request.into_options()),
+        expected
+    );
+}
+
 /// A view may replace several ranges and edit single parts of the messages it keeps. The
 /// history it gives is the role's reference assembly, with broca's transcript messages keeping
 /// their ordinals and the provider's messages carrying none.
