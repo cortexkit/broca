@@ -13,10 +13,14 @@ rules every external reader must follow. Read both before building on anything e
 
 All state lives under one directory, the **state root**:
 
-- `$BROCA_STATE_ROOT` when that variable is set and non-empty;
-- otherwise `<directory of the subc connection file>/broca-state`.
+- `$BROCA_STATE_ROOT` when that variable is set and non-empty, used exactly as given;
+- otherwise `<data home>/cortexkit/broca`, where the data home is `XDG_DATA_HOME`, else (on
+  Windows) `APPDATA` or `USERPROFILE\AppData\Roaming`, else `HOME/.local/share`;
+- otherwise broca refuses to start.
 
-broca does not consult `XDG_DATA_HOME`.
+Older builds defaulted to `broca-state` beside the subc connection file. When only that
+directory holds state and `BROCA_STATE_ROOT` is unset, broca refuses to start and names both
+paths rather than begin an empty history (`crates/broca-module-serve/src/state_root.rs`).
 
 ```text
 <state root>/
@@ -415,15 +419,50 @@ predate it skip it as an unknown type.
 | `redone` | array | required | What the resume does again, entries tagged by `kind`: `model_step{step_id}` (no output of that step was durable), `tool_dispatch{tool_call_id}` (a planned call with no durable intent). A later build may add kinds. |
 | `indeterminate` | array | required | Tool-call ids with an intent and no result, or an `unknown` outcome. Each gets an `unknown` `tool_result` if it has none, and is never re-sent. |
 
+#### Other record types
+
+The records below are not given field tables here. Their fields are defined, with the rule for
+each, on the `WalRecord` variant of the same name in `crates/broca-wal/src/record.rs`, which is
+authoritative. "Must-understand" means broca writes the record only in a `ver = 3` frame that
+requires the named feature (section 2.2), so a reader that does not know the feature refuses
+the whole WAL instead of skipping it.
+
+| Record | Gate | Meaning |
+|---|---|---|
+| `input_token_cap_frozen` | must-understand, `input-token-cap/v1` | The session's input-token policy frozen at admission, even when the session was previously unlimited. |
+| `input_token_budget_exhausted` | must-understand, `input-token-cap/v1` | The input-token budget ran out; written in the terminal barrier with any never-dispatched tool results. |
+| `context_ceiling_wait` | must-understand, `context-ceiling/v1` | A step's bounded wait at the context ceiling. |
+| `context_ceiling_decided` | must-understand, `context-ceiling/v1` | The durable decision of a ceiling check, before any model I/O: permit the step, or seal the run without sending. |
+| `structured_output_downgraded` | must-understand, `structured-output-downgrade/v1` | The provider refused the strict schema's grammar; from this barrier on the run renders non-strict, including after a crash. |
+| `structured_output_result` | must-understand, `structured-output/v1` | The run's structured output and its validation, written in the same commit as `run_finished` and never recomputed on read. |
+| `run_cancel_requested` | must-understand, `run-cancel-at/v1` | An accepted cancellation, synced before it is acknowledged. It does not seal the episode; recovery still repairs the open tool batch. |
+| `cache_warmed` | none; informational | A keep-warm re-send of a run's request. Never a transcript message. Billing exports it as its own `warm` fact; an older build skips it and exports nothing for it. |
+| `compaction_request`, `compaction_message`, `compaction_answer` | must-understand, `compaction/v1` | The issued high-water before a compaction step call, the complete applied view, and every other step outcome with the cursor it moves. |
+| `compaction_wait` | must-understand, `compaction-wait/v1` | A durable exit from a compaction wait. |
+| `compaction_view_applied`, `compaction_notice` | must-understand, `compaction-view/v1` | A compaction view every later request of the lineage renders until a newer one applies, and the bus notice published for it. |
+| `tool_call_deferred` | must-understand, `deferred-call/v1` | A tool call an approve hook held for a person's answer, synced before the question is filed. |
+| `approval_recorded` | must-understand, `deferred-call/v1` | The answer to a held call. When the answer is `expired` or `unavailable` it carries the call's closing result and is the call's terminal. |
+| `awaiting_approval` | must-understand, `deferred-call/v1` | Which held calls the run is waiting on, with each call's latest `elicitation_id`; the calls' own records decide membership. |
+| `late_approval_recorded` | must-understand, `deferred-call/v1` | An answer read after its call was closed as expired; exactly one per expired call. Never enters a prompt. |
+| `late_dispatch_intent`, `late_result` | must-understand, `deferred-call/v1` | The before half and the terminal of a late approved call's dispatch; an intent with no result resumes as an `unknown` result and is never sent again. Never enter a prompt. |
+| `question_withdrawal_acknowledged` | none; informational | How the withdrawal of a held call's question ended. An older build skips it and computes the same session. |
+
+Several records documented above also become must-understand when they carry certain fields
+(for example `run_started` with a scope, a plan manifest or retention, and `run_paused` with
+reason `restart`). `WalRecord::required_features` in the same file lists every case.
+
 #### Unknown record types
 
-Since **v0.3.120**, a record
-whose `type` the running build does not know is decoded as a placeholder and **skipped
-everywhere**: replay, projection, the control stream, billing and export. This is what lets
-a newer build add a record type while an older build can still read the session. broca only
-adds a new record type if it is purely informational in this sense. A reader should do the
-same: skip unknown `type`s and never treat them as corruption. broca never writes the
-placeholder back.
+Since **v0.3.120**, a record in an ordinary (`ver = 1`) frame whose `type` the running build
+does not know is decoded as a placeholder and **skipped everywhere**: replay, projection, the
+control stream, billing and export. broca writes a new record type in such a frame only when an
+older build can skip it and still compute the same session (such as `cache_warmed` and
+`question_withdrawal_acknowledged` above). A record that changes what a session means is
+written in a `ver = 3` frame requiring a feature instead, and a reader that does not know that
+feature must refuse the whole WAL as written by a newer build (section 2.6): skipping it would
+compute the wrong session. A reader should do the same: skip an unknown `type` in a `ver = 1`
+frame and never treat it as corruption, but never skip a `ver = 3` frame whose features it does
+not know. broca never writes the placeholder back.
 
 ### 2.5 Usage
 
@@ -462,7 +501,7 @@ have all five keys always present; facts above it omit unreported keys.
   be in the middle of an append.
 - Accept `ver = 2` frames anywhere, including before the first record. Check that every
   lineage frame in the file carries the same 16 bytes.
-- Skip unknown record `type`s.
+- Skip unknown record `type`s in `ver = 1` frames.
 - Refuse a `ver = 3` frame whose `requires` names a feature you do not know, and refuse the
   whole file, not just that record. Report it as a newer writer, never as corruption. The
   scripts under `scripts/` that read WAL frames (`step-timing.py`, `find-finalize-leaks.py`,

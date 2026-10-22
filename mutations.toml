@@ -23197,3 +23197,53 @@ expect_red = ["transport::tests::stream_floor_breach_is_transient_and_not_reissu
 file = "crates/broca-provider/src/transport.rs"
 old = '''        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued";'''
 new = '''        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued_renamed"; // NON-VACUITY BREAK'''
+
+[[control]]
+id = "stall-watchdog-repeat-spacing"
+guards = "an ongoing stall is snapshotted again only after the repeat interval, judged from the records' own clock"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/stall/tests.rs"
+expect_red = ["stall::tests::repeats_are_limited_and_recovery_is_emitted_once"]
+file = "crates/broca-module-serve/src/stall.rs"
+old = "                .is_none_or(|last| now.saturating_sub(last) >= self.repeat_ms)"
+new = "                .is_none_or(|last| now.saturating_sub(last) >= self.repeat_ms / 100) // NON-VACUITY BREAK: repeat every 10 ms"
+
+[[control]]
+id = "stall-watchdog-healthy-reader-is-quiet"
+guards = "a reader waiting for its next frame is healthy and writes no stall snapshot, whatever heartbeat starvation the host adds"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/stall/tests.rs"
+expect_red = ["stall::tests::healthy_reader_and_heartbeat_write_no_snapshots"]
+file = "crates/broca-module-serve/src/stall.rs"
+old = "            !matches!(phase, Phase::AwaitFrame | Phase::Idle) && reader_age > self.stale_ms;"
+new = "            !matches!(phase, Phase::Idle) && reader_age > self.stale_ms; // NON-VACUITY BREAK: waiting for a frame counts as stalled"
+
+[[control]]
+id = "ci-production-lane-checks-the-declared-msrv"
+guards = "the production-features lane checks the workspace on the exact compiler Cargo.toml's rust-version promises"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_production_clock_code_is_linted_and_tested_and_msrv_checked"]
+file = ".github/workflows/ci.yml"
+old = "          toolchain: '1.96'"
+new = "          toolchain: '1.95' # NON-VACUITY BREAK: an older compiler than rust-version"
+
+[[control]]
+id = "ci-production-lane-runs-without-test-clock"
+guards = "the production-features lane tests broca-core, broca-module and broca-module-serve without test-clock"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_production_clock_code_is_linted_and_tested_and_msrv_checked"]
+file = ".github/workflows/ci.yml"
+old = "        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast"
+new = "        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast -F broca-module-serve/test-clock # NON-VACUITY BREAK"

@@ -908,7 +908,7 @@ keep their existing behavior and omit this diagnostic.
 - **State enum:** `Idle | Active{run_id, step} | Paused{run_id, reason} | Interrupted{run_id} |
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
   in-process active run first, then WAL inference.
-- **Durable run index** in `store.db`: `run_id → {session, lineage, submission_id, state,
+- **Durable run index** in `run-index.db`: `run_id → {session, lineage, submission_id, state,
   wal_path}` so run-keyed ops survive restart. Resume **reuses the original run_id**
   (today it mints `req.run_id`).
 - **Busy-vs-stale:** `session.send` on a live-active lineage returns `session_busy{run_id,
@@ -1119,7 +1119,7 @@ Fence keyed `(session, tool_call_id)` **with eviction** on batch/run terminal; *
 window** resolved from the specific provider at route-open (not memoized once); **route
 eviction** (TTL/LRU + GOODBYE on idle) against `u16` channel exhaustion; **route
 invalidation on GOODBYE/status** (learn a dead route); document the per-module
-`store.db` `Mutex<Connection>` as a scalability limit (read/write split or pool if it
+`run-index.db` `Mutex<Connection>` as a scalability limit (read/write split or pool if it
 bites).
 
 **Reverse requests are refused, not dropped.** Broca opens its tool and vault
@@ -1134,12 +1134,19 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
 
 ```
 ~/.local/share/cortexkit/broca/
-  store.db ← sessions + the durable run index + projection cursor state
-  wal/<project-id>/<session>.wal ← per-session lineage WAL (sequence of runs)
-  leases/<project-id>/… ← single-writer lease files
+  wal/<addr>.wal            ← one WAL per session (sequence of runs), flat; <addr> is the
+                              session address derived from the bind triple
+  wal-durable/<addr>.wal    ← sessions selected for backup at first send
+  wal-ephemeral/<addr>.wal  ← sessions with retention; never backed up or folded
+  wal-archive/, wal-archive-durable/ ← sealed archive containers of cold WALs
+  run-index.db              ← SQLite: the durable run index, materialized transcript,
+                              admission checkpoints, usage export facts
+  caps.db                   ← SQLite: budget caps, a durability domain of its own
+  leases/                   ← single-writer lease files
 ```
-WAL = source of truth (portable unit); DB = derived projection. Resume = DB-prefix ⊕
-WAL-tail.
+WAL = source of truth (portable unit); `run-index.db` = derived projection. Resume =
+DB-prefix ⊕ WAL-tail. The full layout, with every file and its section, is maintained in
+[data-model.md §1](data-model.md#1-the-state-root); that list wins where the two differ.
 
 The state root shown above is the default. It resolves to `BROCA_STATE_ROOT` when set and
 non-empty, else `$XDG_DATA_HOME/cortexkit/broca`, else `~/.local/share/cortexkit/broca`, and

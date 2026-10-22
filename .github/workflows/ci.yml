@@ -284,11 +284,69 @@ jobs:
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
 
+  # Every other Rust lane builds with broca-module-serve/test-clock, which turns on the
+  # controllable clock in broca-core and broca-module, so the code behind
+  # cfg(not(feature = "test-clock")) -- what a release runs -- was compiled by the release build
+  # but never linted or tested. This lane lints and tests those crates without it. It also
+  # checks the workspace on the oldest compiler Cargo.toml's rust-version promises; the other
+  # lanes use the newest stable.
+  production-features:
+    name: Production features and MSRV
+    needs: fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: broca
+        shell: bash
+    env:
+      BROCA_REQUIRE_SUBC: '1'
+      BROCA_REQUIRE_AIMOCK: '1'
+      BROCA_REQUIRE_VAULT: '1'
+      SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
+      FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub
+      CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum
+      CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth
+      CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: broca
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fixtures-Linux
+          path: ${{ runner.temp }}/fixtures
+      - run: bash scripts/unpack-fixtures.sh "$RUNNER_TEMP/fixtures/fixtures-Linux.tar.gz" "$GITHUB_WORKSPACE"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: broca -> target
+          shared-key: production-features
+          cache-on-failure: 'true'
+      - name: Clippy without test-clock
+        run: cargo clippy --locked -p broca-core -p broca-module -p broca-module-serve --all-targets -- -D warnings
+      - name: Lib/bin tests without test-clock
+        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, given the MSRV below
+        with:
+          toolchain: '1.96'
+      - name: Workspace check on the MSRV
+        run: cargo +1.96 check --locked --workspace --all-targets
+      - name: Verify clean worktree
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
   # Preserve the required status names, and refuse a skipped/red dependency.
   test:
     name: Test (${{ matrix.os }})
     if: always()
-    needs: [lint, scripts, unit, store-contention-macos, integration-build, fixtures, integration, linux-deploy]
+    needs: [lint, scripts, unit, production-features, store-contention-macos, integration-build, fixtures, integration, linux-deploy]
     runs-on: ubuntu-latest
     strategy:
       matrix:
