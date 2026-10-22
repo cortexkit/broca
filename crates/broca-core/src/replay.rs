@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 use broca_protocol::{
     caller::RunFinishReason,
     content::{AssistantMessage, ContentBlock, Message, Role, ToolOutput, ToolResult},
@@ -1000,8 +1001,12 @@ struct Episode {
 impl Episode {
     /// Place every pending steered message at the end of `prompt`: the step boundary the
     /// replay has just reached.
-    fn place_steers(&mut self, prompt: &mut Vec<Message>) {
-        prompt.append(&mut self.pending_steers);
+    fn place_steers(&mut self, prompt: &mut Vec<Message>, actions: &[PlacementAction]) {
+        for action in actions {
+            if let PlacementAction::PlaceHeld { count, .. } = *action {
+                prompt.extend(self.pending_steers.drain(..count as usize));
+            }
+        }
     }
 }
 
@@ -1387,6 +1392,12 @@ fn replay_seeded_with_compaction<'a>(
     tag_seed: crate::tags::TagSeed,
 ) -> Result<ReplayState, ReplayError> {
     let (ordinal_base, require_caller_text) = position;
+    let mut placement = Placement::seeded(
+        ordinal_base,
+        seed_run_id.clone(),
+        seed_budget.clone(),
+        seed_budget_state.clone().unwrap_or_default(),
+    );
     // Tag numbers under the computed rules, given in the order the transcript renders: each
     // message as it is placed in the prompt, a run's rules from its `RunStarted` on.
     let mut numbering = crate::tags::TagNumbering::new(tag_seed, 0);
@@ -1460,6 +1471,12 @@ fn replay_seeded_with_compaction<'a>(
                 state.history = compaction_history.clone();
             }
         }
+        let actions = placement
+            .observe(rec)
+            .map_err(|reason| ReplayError::CorruptLineage {
+                episode_run_id: run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                reason,
+            })?;
         match rec {
             WalRecord::RunStarted {
                 on_restart: on_restart_policy,
@@ -1545,18 +1562,31 @@ fn replay_seeded_with_compaction<'a>(
                 let idle_delivery = submission_id
                     .as_ref()
                     .is_some_and(|id| ordered_submissions.remove(id));
-                prompt.extend(input.iter().enumerate().map(|(index, message)| {
-                    let mut message = tagged(message.clone(), input_tags.get(index));
-                    if idle_delivery {
+                let count = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        PlacementAction::Append {
+                            count,
+                            kind: AppendKind::Input,
+                            ..
+                        } => Some(*count),
+                        _ => None,
+                    })
+                    .expect("RunStarted places input");
+                prompt.extend(input.iter().take(count as usize).enumerate().map(
+                    |(index, message)| {
+                        let mut message = tagged(message.clone(), input_tags.get(index));
+                        if idle_delivery {
+                            message
+                                .tags
+                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
+                                    mode: broca_protocol::DeliveryMode::IdleStart,
+                                    tool_call_id: None,
+                                });
+                        }
                         message
-                            .tags
-                            .set_delivery(broca_protocol::tags::DeliveryAttribution {
-                                mode: broca_protocol::DeliveryMode::IdleStart,
-                                tool_call_id: None,
-                            });
-                    }
-                    message
-                }));
+                    },
+                ));
             }
             WalRecord::ModelStepFinished {
                 step_id,
@@ -1644,7 +1674,15 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_step_record = Some(record_index);
                     ep.open_batch_id = None; // a new tool turn; its batch hasn't opened yet
                     ep.natural_end = false;
-                } else {
+                } else if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Assistant,
+                            ..
+                        }
+                    )
+                }) {
                     // Terminal turn (no tools) — commit immediately. This step ends
                     // the loop, so the episode ended naturally here.
                     ep.first_step_message.get_or_insert(prompt.len());
@@ -1842,9 +1880,20 @@ fn replay_seeded_with_compaction<'a>(
             // never lands between a tool call and its result or ahead of the step it arrived in.
             WalRecord::Steered { input, .. } => {
                 let steer_tags = rec.runner_tags();
+                let count = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        PlacementAction::Hold {
+                            count,
+                            kind: HoldKind::Steer,
+                        } => Some(*count),
+                        _ => None,
+                    })
+                    .expect("Steered holds input");
                 ep.pending_steers.extend(
                     input
                         .iter()
+                        .take(count as usize)
                         .enumerate()
                         .map(|(index, message)| tagged(message.clone(), steer_tags.get(index))),
                 );
@@ -1864,17 +1913,30 @@ fn replay_seeded_with_compaction<'a>(
                 ordered_submissions.remove(submission_id);
                 if let Some(input) = input {
                     let delivered_tags = rec.runner_tags();
+                    let count = actions
+                        .iter()
+                        .find_map(|action| match action {
+                            PlacementAction::Hold {
+                                count,
+                                kind: HoldKind::Steer,
+                            } => Some(*count),
+                            _ => None,
+                        })
+                        .expect("SendDelivered holds its input");
                     ep.pending_steers
-                        .extend(input.iter().enumerate().map(|(index, message)| {
-                            let mut message = tagged(message.clone(), delivered_tags.get(index));
-                            message
-                                .tags
-                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
-                                    mode: *mode,
-                                    tool_call_id: None,
-                                });
-                            message
-                        }));
+                        .extend(input.iter().take(count as usize).enumerate().map(
+                            |(index, message)| {
+                                let mut message =
+                                    tagged(message.clone(), delivered_tags.get(index));
+                                message.tags.set_delivery(
+                                    broca_protocol::tags::DeliveryAttribution {
+                                        mode: *mode,
+                                        tool_call_id: None,
+                                    },
+                                );
+                                message
+                            },
+                        ));
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
                     crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
@@ -1974,7 +2036,7 @@ fn replay_seeded_with_compaction<'a>(
                 }
                 // A steer no later step rendered stays in the transcript exactly once, at the
                 // episode's close, after anything the terminal's barrier committed.
-                ep.place_steers(&mut prompt);
+                ep.place_steers(&mut prompt, &actions);
                 ep.finished = Some(*reason);
                 ep.retries_used = *retries_used;
                 // A terminal SEALS any earlier pause in this episode (e.g. a cancel of a
@@ -2044,7 +2106,7 @@ fn replay_seeded_with_compaction<'a>(
                 ep.paused = None;
                 ep.provider_call_started = true;
                 // Pending steers are rendered by this step, after everything before it.
-                ep.place_steers(&mut prompt);
+                ep.place_steers(&mut prompt, &actions);
                 // A step after a no-tool step means that step did not end the episode: the live
                 // loop continued to render a steer.
                 ep.natural_end = false;
