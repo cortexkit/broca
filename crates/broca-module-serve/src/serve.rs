@@ -334,6 +334,12 @@ fn launch_nonce() -> &'static str {
     })
 }
 
+/// This process's launch id (the nonce above), for a holder name that must differ between
+/// processes, such as the owner System One writes on a batch it holds.
+pub fn process_launch_id() -> &'static str {
+    launch_nonce()
+}
+
 /// Mint a globally-unique run_id for a fresh send. `run-<session>-<launch-nonce>-<seq>`:
 /// unique across connections (process-global seq) and restarts (per-launch nonce), so a
 /// new run NEVER collides with an old finished run's id — which would otherwise let the
@@ -434,6 +440,9 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BindObservation {
     agent_data: bool,
+    /// The route was opened declaring the `classifier/v1` role: it serves only that role's
+    /// ops (System One), holds no session, and reads no session history.
+    classifier: bool,
     /// The producer's registered project id, as the client supplied it (unattested).
     project_id: Option<String>,
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
@@ -511,6 +520,8 @@ fn to_bind_principal(principal: &subc_protocol::Principal) -> broca_protocol::Bi
 /// an explicit unsubscribe tears the forward task down promptly).
 struct Routes {
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
+    /// System One, when this build serves it; a classifier bind is refused without it.
+    system_one: Option<Arc<crate::system_one::SystemOne>>,
     // The bind observations (project id, principal) stay beside the session key rather than
     // inside it: BindIdentity also keys the actor registry, so folding them in would give one
     // session WAL a separate actor per distinct observation, all writing the same file.
@@ -531,6 +542,7 @@ impl Routes {
     fn new(daemon_scopes: bool) -> Self {
         Self {
             agent_data: None,
+            system_one: None,
             by_channel: std::collections::HashMap::new(),
             pending_binds: std::collections::HashMap::new(),
             bind_tasks: JoinSet::new(),
@@ -851,6 +863,48 @@ where
 /// Serve the internal `agent-data` session-WAL move service alongside the management surface.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_connection_with_agent_data<R, W, H>(
+    read_half: R,
+    write_half: W,
+    module_id: &str,
+    handler: Arc<H>,
+    health_registry: Arc<LineageRegistry>,
+    vault_gauge: Arc<VaultGauge>,
+    catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
+    archive: crate::wal_archive::WalArchiveConfig,
+    consumer_routes: crate::consumer_routes::ConsumerRoutes,
+    vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
+    daemon_capabilities: Option<Vec<String>>,
+    scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
+    agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
+) -> Result<ServeEnd, ServeIoError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: ServeHandler + 'static,
+{
+    serve_connection_with_services(
+        read_half,
+        write_half,
+        module_id,
+        handler,
+        health_registry,
+        vault_gauge,
+        catalog_cache,
+        archive,
+        consumer_routes,
+        vault_auditor,
+        daemon_capabilities,
+        scope_describer,
+        agent_data,
+        None,
+    )
+    .await
+}
+
+/// Serve the management surface with every optional service: `agent-data` and System One's
+/// `classifier/v1` role, reached by routes that declare it.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_connection_with_services<R, W, H>(
     mut read_half: R,
     write_half: W,
     module_id: &str,
@@ -864,6 +918,7 @@ pub async fn serve_connection_with_agent_data<R, W, H>(
     daemon_capabilities: Option<Vec<String>>,
     scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
+    system_one: Option<Arc<crate::system_one::SystemOne>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -898,6 +953,7 @@ where
             daemon_capabilities,
             scope_describer.as_deref(),
             agent_data,
+            system_one,
         ),
     );
     let mut writer_finished = false;
@@ -952,6 +1008,7 @@ async fn run_frame_loop<R, H>(
     daemon_capabilities: Option<Vec<String>>,
     scope_describer: Option<&broca_subc::ModuleScopeDescriber>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
+    system_one: Option<Arc<crate::system_one::SystemOne>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -974,6 +1031,7 @@ where
 
     let mut routes = Routes::new(daemon_scopes);
     routes.agent_data = agent_data;
+    routes.system_one = system_one;
     let request_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTE_REQUESTS));
     let mut request_tasks = JoinSet::new();
 
@@ -1277,6 +1335,16 @@ where
                 }));
                 return Ok(true);
             }
+            if bind.classifier {
+                spawn_classifier_request(
+                    frame.body,
+                    routes.system_one.clone(),
+                    writer,
+                    request_tasks,
+                    (ver, channel, epoch, corr),
+                );
+                return Ok(true);
+            }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1418,9 +1486,25 @@ async fn handle_control_request(
             principal,
             scope,
             target,
+            role_versions,
             ..
         } => {
             stall::method_context(1);
+            let classifier = match bind_role(role_versions.as_ref(), routes.system_one.is_some()) {
+                Ok(classifier) => classifier,
+                Err(message) => {
+                    return send_error(
+                        writer,
+                        frame.header.ver,
+                        0,
+                        0,
+                        frame.header.corr,
+                        ROLE_VERSIONS_UNSUPPORTED,
+                        &message,
+                    )
+                    .await;
+                }
+            };
             // Keep the daemon's principal with the channel so every episode this route starts
             // records who started it. A session may later adopt a scope only if the scope's
             // owner is the principal on every earlier episode, and an episode recorded without
@@ -1428,6 +1512,8 @@ async fn handle_control_request(
             let bind = BindObservation {
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
                     if service_id == broca_wire::agent_data::SERVICE_ID),
+                classifier: classifier
+                    && matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
@@ -1447,7 +1533,8 @@ async fn handle_control_request(
                 .await;
             }
             let identity = to_broca_identity(&identity);
-            if let Err(error) = if bind.agent_data {
+            // A classifier route names no session, so its identity keys nothing.
+            if let Err(error) = if bind.agent_data || bind.classifier {
                 Ok(())
             } else {
                 identity.validate_keyable()
@@ -1482,6 +1569,7 @@ async fn handle_control_request(
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
             if !completed.bind.agent_data
+                && !completed.bind.classifier
                 && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
             {
                 let registry = health_registry.clone();
@@ -1652,6 +1740,9 @@ async fn handle_control_request(
                     // `active_sessions` counts idle-but-open slots and would answer a different
                     // question with a plausible number.
                     "runs_in_flight": counts.runs_in_flight,
+                    // System One batch calls running now. They hold no session, so they are not
+                    // runs, but a drain waits for them the same way (within the same grace).
+                    "system_one_batches_in_flight": counts.batches_in_flight,
                     "opening": counts.opening,
                     "closing": counts.closing,
                     "vault": vault_metric,
@@ -3915,6 +4006,82 @@ fn send_field_of(differing: &str) -> Option<&'static str> {
         "context_management" => "context_management",
         _ => return None,
     })
+}
+
+/// The bind refusal for a route whose declared roles this build cannot answer as one role: a
+/// `classifier` version it does not serve, or `classifier` beside `llm-runner` (a route has
+/// one `role.describe`, so it cannot be both).
+pub const ROLE_VERSIONS_UNSUPPORTED: &str = "role_versions_unsupported";
+
+/// Which role a bind's `role_versions` asks this route to serve: `Ok(true)` for
+/// `classifier/v1`, `Ok(false)` for llm-runner (no classifier declared), or the refusal.
+fn bind_role(
+    role_versions: Option<&std::collections::BTreeMap<String, String>>,
+    serves_classifier: bool,
+) -> Result<bool, String> {
+    let (role, version) = broca_subc::CLASSIFIER_ROLE_VERSIONS;
+    let Some(declared) = role_versions.and_then(|roles| roles.get(role)) else {
+        return Ok(false);
+    };
+    if declared != version {
+        return Err(format!(
+            "this build serves {role} {version} only; the route declares {role} {declared}"
+        ));
+    }
+    if role_versions.is_some_and(|roles| roles.contains_key("llm-runner")) {
+        return Err(format!(
+            "a route serves one role; this one declares both {role} and llm-runner"
+        ));
+    }
+    if !serves_classifier {
+        return Err(format!("this build does not serve {role} {version}"));
+    }
+    Ok(true)
+}
+
+/// Answer one request on a classifier route, on tasks of its own: never the frame loop, and
+/// none of the connection's request slots, so a slow provider cannot hold up any session's
+/// work. The answer runs on a separate task from the one that writes the reply, so a panic
+/// while answering becomes this request's `internal_error` instead of a failed request task
+/// (which would end the connection).
+fn spawn_classifier_request(
+    body: Vec<u8>,
+    service: Option<Arc<crate::system_one::SystemOne>>,
+    writer: &EgressSender<Frame>,
+    request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+) {
+    let writer = writer.clone();
+    request_tasks.spawn(async move {
+        let answered = match service {
+            Some(service) => tokio::spawn(async move { service.answer(&body).await }).await,
+            None => Ok(Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                "unknown_method",
+                "this build serves no classifier/v1 role",
+            ))
+            .unwrap_or_default())),
+        };
+        match answered {
+            Ok(Ok(result)) => send_json_response(&writer, ver, channel, epoch, corr, &result).await,
+            Ok(Err(body)) => send_error_bytes(&writer, ver, channel, epoch, corr, body).await,
+            Err(error) => {
+                tracing::error!(target: "system_one", %error,
+                    "answering a classifier request failed; it is answered internal_error");
+                let refusal = crate::system_one::internal_refusal(
+                    "serving this request failed inside broca; send it again",
+                );
+                send_error_bytes(
+                    &writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    crate::system_one::refusal_body(&refusal),
+                )
+                .await
+            }
+        }
+    });
 }
 
 /// `role.describe` params: none.
@@ -6551,6 +6718,7 @@ mod tests {
                 identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
                 bind: BindObservation {
                     agent_data: false,
+                    classifier: false,
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
@@ -6815,6 +6983,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7004,6 +7173,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7175,6 +7345,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7329,6 +7500,7 @@ mod tests {
                 None,
                 Some(loop_describer.as_ref()),
                 None,
+                None,
             )
             .await
         });
@@ -7431,6 +7603,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -7579,6 +7752,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -8016,3 +8190,7 @@ mod delivery_list_tests {
         assert_eq!(refusal["detail"]["delivery"], before);
     }
 }
+
+#[cfg(test)]
+#[path = "serve_classifier_tests.rs"]
+mod classifier_route_tests;

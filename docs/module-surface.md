@@ -620,6 +620,33 @@ sending the model with no variant through an explicit Code Assist route.
 variants select the corresponding native tier ids. Argon tiers use uppercase `thinkingLevel`
 (`LOW`, `MEDIUM`, `HIGH`) with `includeThoughts: true`, no `thinkingBudget`, and no `toolConfig`.
 
+### 4b. `classifier/v1`: System One decision models
+
+broca also serves the `classifier/v1` role (`cortexkit-role-classifier`, with the
+batch rules of `cortexkit-model-batch`) from the same management surface, for the
+decision models it routes: TypeSafe's `typesafe/jev-1.13.0` in this build. The
+manifest lists `classifier/v1` in `capabilities.provides`.
+
+- **One route, one role.** A `route.open` declaring `role_versions
+  {"classifier": "v1"}` is a classifier route. On it `role.describe` answers the
+  classifier describe (`{role, limits, models}`, its models resolved from the live
+  catalog) and `classify.run` is served; every llm-runner op is refused
+  `unknown_method`. A route without that declaration is an llm-runner route and
+  refuses `classify.run` with `unknown_method`. A bind declaring both `classifier`
+  and `llm-runner`, or a `classifier` version other than `v1`, is refused at bind
+  with `role_versions_unsupported`.
+- **No session.** A classifier route names no session: nothing opens a session,
+  takes a lease, or touches a WAL or `run-index.db`. Each call runs on its own task,
+  capped per process and per model, and holds none of the connection's request slots.
+- **Durable batches.** `system-one.db` under the state root records each admitted
+  batch and every item outcome before the reply, and is the authority for them.
+  Batches a dead process left `running` are released at startup. A batch and its
+  outcomes are deleted seven days after first admission. The file is excluded from
+  Engram backups.
+- **Catalog.** A row whose `model.kind` is `decision` is a classifier; another
+  stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
+  does not list is `model_unknown`.
+
 ## 5. Reliability model (the egress reality)
 
 subc module→client egress is best-effort `try_send` into a 64-deep buffer; a full client
@@ -1243,8 +1270,8 @@ connection loss) starts the final 10 s grace and 20 s total shutdown budget: a t
 gets the daemon's drain window **plus** the grace to reach that boundary. A tool
 still in flight after grace is sealed `Interrupted` with `outcome_unknown` even
 when it opted into resume. Crashes keep their terminal interruption behavior.
-The manifest declares `runs_in_flight`, `opening`, and `closing` as busy health
-gauges; paused actors are idle, so a restart pause does not hold the drain open.
+The manifest declares `runs_in_flight`, `opening`, `closing`, and
+`system_one_batches_in_flight` as busy health gauges; paused actors are idle, so a restart pause does not hold the drain open.
 See [module lifecycle and shutdown](module-lifecycle.md) for timings and the
 daemon's irreversible drain contract.
 

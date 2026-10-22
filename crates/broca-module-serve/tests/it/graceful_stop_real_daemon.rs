@@ -921,11 +921,21 @@ async fn idle_module_restart_declares_busy_gauges_and_ends_drain_early() {
     assert_eq!(
         busy[0].anchored_to,
         subc_protocol::manifest::SignalAnchor::HealthGauges {
-            gauges: vec!["runs_in_flight".into(), "opening".into(), "closing".into()],
+            gauges: vec![
+                "runs_in_flight".into(),
+                "opening".into(),
+                "closing".into(),
+                "system_one_batches_in_flight".into(),
+            ],
         }
     );
     let metrics = rig.health().await;
-    for gauge in ["runs_in_flight", "opening", "closing"] {
+    for gauge in [
+        "runs_in_flight",
+        "opening",
+        "closing",
+        "system_one_batches_in_flight",
+    ] {
         assert_eq!(metrics[gauge], 0, "idle gauge {gauge}");
     }
     // Keep the drain ceiling beyond the shared hang guard: only quiescence can replace this

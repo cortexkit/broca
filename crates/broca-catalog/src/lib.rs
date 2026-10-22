@@ -30,7 +30,7 @@ pub mod runtime;
 pub use runtime::{
     catalog, global_catalog_cache, install_global_catalog_cache, CatalogCache, CatalogHealth,
     CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogUnavailable,
-    FusiformCatalogResponse, FUSIFORM_FACT_PREFIXES,
+    FusiformCatalogResponse, ModelBatchRow, FUSIFORM_FACT_PREFIXES,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

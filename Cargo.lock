@@ -425,7 +425,10 @@ dependencies = [
  "cortexkit-bus-testkit",
  "cortexkit-bus-trait",
  "cortexkit-log",
+ "cortexkit-model-batch",
  "cortexkit-role-agent-data",
+ "cortexkit-role-classifier",
+ "cortexkit-role-classifier-conformance",
  "cortexkit-role-harness",
  "cortexkit-role-llm-runner",
  "cortexkit-role-llm-runner-conformance",
@@ -437,6 +440,7 @@ dependencies = [
  "libc",
  "nkeys",
  "os_info",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_jcs",
@@ -951,6 +955,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-model-batch"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4968e1a75d01f22d0354a3e3ea58d04c04ffa2134a8a6734deb861e2b3c94734"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cortexkit-role-agent-data"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -958,6 +975,33 @@ checksum = "5ef3637421e4b6f5474d8b948cef116d6c99ab8592aa8f2bd21ec2e0ff74ec6e"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-classifier"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a62afea9a8e4a6a9416f79ae9f353f75dfb508ef4ce5e32c75e1f6133162bdfc"
+dependencies = [
+ "cortexkit-model-batch",
+ "indexmap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-classifier-conformance"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c982795aa2aff1e461da189e0d925670b9c82eaef71414979c58bd5c50fd1f2"
+dependencies = [
+ "async-trait",
+ "cortexkit-role-classifier",
+ "futures-util",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "subc-protocol",
 ]
 
 [[package]]
@@ -1746,6 +1790,18 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "indexmap"
+version = "2.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

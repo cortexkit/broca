@@ -2817,6 +2817,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "retention_unreadable_sessions",
         "retention_repairs_pending",
         "agent_data_ops",
+        // Decision-model batches currently calling a provider. It is one of the gauges the
+        // daemon's restart drain waits on, so an idle daemon must read 0 here or every restart
+        // would wait out its drain ceiling.
+        "system_one_batches_in_flight",
     ]
     .into_iter()
     .collect();
@@ -2847,6 +2851,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));
     assert_eq!(metrics["opening"], serde_json::json!(0));
     assert_eq!(metrics["closing"], serde_json::json!(0));
+    assert_eq!(
+        metrics["system_one_batches_in_flight"],
+        serde_json::json!(0)
+    );
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
     assert_eq!(metrics["projection_failures"], serde_json::json!(0));
     assert_eq!(metrics["projection_behind_sessions"], serde_json::json!(0));

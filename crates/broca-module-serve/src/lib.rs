@@ -40,6 +40,7 @@ pub mod serve;
 pub mod session_class;
 pub mod stall;
 pub mod state_root;
+pub mod system_one;
 pub mod transport_config;
 pub mod vault_audit;
 pub mod vault_config;
