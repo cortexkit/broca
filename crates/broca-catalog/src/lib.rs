@@ -1420,6 +1420,11 @@ mod tests {
                 "https://opencode.ai/inference/go",
             ),
             (
+                "deepseek-v4.1-flash",
+                WireFamilyId::OpenAiChat,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
                 "kimi-k2.7-code",
                 WireFamilyId::OpenAiChat,
                 "https://opencode.ai/inference/go/v1",
