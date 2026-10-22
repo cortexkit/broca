@@ -122,6 +122,10 @@ struct LoadedCatalog {
     /// version as the next poll and no kinds, and reusing its index would keep admitting a
     /// non-chat model to `session.send` until fusiform happened to mint a new version.
     carries_model_kinds: bool,
+    /// Present rows this catalog left out or kept from the catalog it replaced, because their
+    /// facts could not be used. Shared with an equal-version republish, which reuses the index
+    /// these describe.
+    excluded_rows: Arc<[RowExclusion]>,
 }
 
 /// Whether a response's model rows carry `model.kind`. Stops at the first row that has it.
@@ -130,6 +134,16 @@ fn response_carries_model_kinds(response: &FusiformCatalogResponse) -> bool {
         .models
         .values()
         .any(|facts| facts.contains_key("model.kind"))
+}
+
+impl LoadedCatalog {
+    /// One WARN per excluded row. Called each time a catalog is installed, so a row that stays
+    /// malformed is reported on every refresh rather than once and then forgotten.
+    fn warn_excluded_rows(&self) {
+        for row in self.excluded_rows.iter() {
+            row.warn();
+        }
+    }
 }
 
 /// Whether a response's model rows carry any mode rate. Stops at the first one.
@@ -166,8 +180,9 @@ struct DraftServingProvider {
 
 /// The exact model facts retained between polls.
 ///
-/// Fusiform requires all three flags on a present row. They remain three-state typed values so an
-/// explicit `null` still fails closed when a family would consume it.
+/// The capability flags remain three-state typed values, so an explicit `null` still fails
+/// closed when a family would consume it, and a flag fusiform omits reads as Absent (see
+/// `optional_capability_fact`).
 #[derive(Clone)]
 struct ServingModel {
     display_name: String,
@@ -181,8 +196,8 @@ struct ServingModel {
     attachment: CapabilityFlag,
     reasoning: CapabilityFlag,
     tool_call: CapabilityFlag,
-    /// `capability.structured_output`. Unlike the three flags above, fusiform omits it on rows
-    /// whose upstream does not state it, and absence reads as unknown rather than refusing the
+    /// `capability.structured_output`. Like the three flags above, fusiform omits it on rows
+    /// whose upstream does not state it, and absence reads as unknown rather than excluding the
     /// row.
     structured_output: CapabilityFlag,
     /// `capability.reasoning_options`: null, `[]` and a populated array stay distinct. A catalog
@@ -274,6 +289,82 @@ struct ServingCatalog {
     providers: BTreeMap<String, ServingProvider>,
     overlay_removed_models: BTreeMap<String, BTreeSet<String>>,
     withdrawn_models: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// What one assembly of fusiform's model map produced.
+struct AssembledCatalog {
+    catalog: ServingCatalog,
+    /// Every identity the response listed, including excluded rows.
+    model_identities: BTreeSet<String>,
+    /// Present rows whose facts could not be used, in identity order.
+    excluded_rows: Vec<RowExclusion>,
+}
+
+/// A present fusiform row left out of the catalog because one of its facts could not be used.
+///
+/// Fusiform serves thousands of rows, a few of them hand-curated with only the facts their
+/// vendor states. Refusing the whole catalog over one such row froze every other model at the
+/// last accepted poll, three times. So a bad row is excluded on its own, and it is made visible
+/// instead of silent: one WARN per excluded row on every refresh that installs the catalog, and
+/// a count with the latest reason on `health.check` (`catalog_rows_excluded`). A systematic
+/// upstream fault that spoils many rows therefore shows up as a large count rather than as a
+/// quietly shrinking catalog.
+///
+/// A row the replaced catalog served keeps its earlier model, so an identity that was working
+/// does not stop working because its latest facts are malformed. Only a row never seen before
+/// (or one seen first after a restart, which loads the on-disk copy with no earlier catalog to
+/// borrow from) goes missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowExclusion {
+    /// The fusiform identity, `provider_id/model_id`.
+    model: String,
+    /// The fact that could not be used, or `identity` when the key itself is malformed.
+    fact: String,
+    reason: String,
+    /// Whether the replaced catalog's model for this identity is still being served.
+    kept_previous: bool,
+}
+
+impl RowExclusion {
+    fn from_error(identity: &str, error: CatalogError, kept_previous: bool) -> Self {
+        let (fact, reason) = match error {
+            CatalogError::FusiformFact { fact, reason, .. } => (fact, reason),
+            other => (String::new(), other.to_string()),
+        };
+        Self {
+            model: identity.to_string(),
+            fact,
+            reason,
+            kept_previous,
+        }
+    }
+
+    /// The one-line form used for the health reason.
+    fn describe(&self) -> String {
+        format!(
+            "fusiform model '{}' has unusable fact '{}': {}; {}",
+            self.model,
+            self.fact,
+            self.reason,
+            if self.kept_previous {
+                "serving its last-known-good model"
+            } else {
+                "not served"
+            }
+        )
+    }
+
+    fn warn(&self) {
+        tracing::warn!(
+            target: "catalog",
+            model = %self.model,
+            fact = %self.fact,
+            reason = %self.reason,
+            last_known_good_kept = self.kept_previous,
+            "fusiform catalog row excluded: {}",
+            self.describe(),
+        );
+    }
 }
 
 /// An immutable admission snapshot. Taking one clones an `Arc`; it performs no file or network IO.
@@ -387,10 +478,26 @@ impl CatalogSnapshot {
 impl ServingCatalog {
     /// Consume fusiform's identity map exactly once. The overlay is already typed and is applied
     /// while compact rows are assembled; no generic provider/model tree is ever created.
+    ///
+    /// `previous` is the catalog this one replaces, if any. A present row whose facts cannot be
+    /// assembled keeps serving the model `previous` served for that identity; see
+    /// [`RowExclusion`].
     fn from_fusiform(
         models: &BTreeMap<String, BTreeMap<String, Value>>,
+        previous: Option<&ServingCatalog>,
+    ) -> Result<AssembledCatalog, CatalogError> {
+        Self::assemble_with_overlay(models, RuntimeOverlay::parse()?, previous)
+    }
+
+    /// [`Self::assemble_with_overlay`] with no previous catalog, for tests that only need the
+    /// index and the identity set.
+    #[cfg(test)]
+    fn from_fusiform_with_overlay(
+        models: &BTreeMap<String, BTreeMap<String, Value>>,
+        overlay: RuntimeOverlay,
     ) -> Result<(Self, BTreeSet<String>), CatalogError> {
-        Self::from_fusiform_with_overlay(models, RuntimeOverlay::parse()?)
+        Self::assemble_with_overlay(models, overlay, None)
+            .map(|assembled| (assembled.catalog, assembled.model_identities))
     }
 
     /// The overlay as a parameter, so a test can hand in a `remove` for a model its fixture
@@ -398,20 +505,45 @@ impl ServingCatalog {
     /// overlay carried a real suppression (deepseek-chat) until upstream withdrew the id on
     /// 2026-09-18, and a test of how removal is RECORDED must not depend on a vendor keeping
     /// a dead row around to suppress.
-    fn from_fusiform_with_overlay(
+    ///
+    /// One bad row is isolated, not fatal. A present row whose identity does not split or
+    /// whose facts cannot be read is left out of this catalog (or keeps the model `previous`
+    /// served for it) and is recorded in `excluded_rows`; every other row still assembles.
+    /// The row's identity is still recorded as known, so the vanished-identity guard in
+    /// `refresh_inner` does not mistake an excluded row for a truncated response.
+    ///
+    /// What stays fatal is a problem with the document rather than with one row: an
+    /// `existence` value this build does not understand (that vocabulary decides whether a
+    /// model serves at all, so an unknown state means the protocol moved under us) and an
+    /// overlay `add` colliding with a fusiform provider. Qualified facts, truncation and
+    /// staleness are refused by `loaded` and `refresh_inner` before or after this runs.
+    fn assemble_with_overlay(
         models: &BTreeMap<String, BTreeMap<String, Value>>,
         overlay: RuntimeOverlay,
-    ) -> Result<(Self, BTreeSet<String>), CatalogError> {
+        previous: Option<&ServingCatalog>,
+    ) -> Result<AssembledCatalog, CatalogError> {
         let mut providers: BTreeMap<String, DraftServingProvider> = BTreeMap::new();
         let mut overlay_removed_models: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut withdrawn_models: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut model_identities = BTreeSet::new();
+        let mut excluded_rows = Vec::new();
 
         for (identity, facts) in models {
-            let (provider_id, model_id) = identity
+            let Some((provider_id, model_id)) = identity
                 .split_once('/')
                 .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
-                .ok_or_else(|| CatalogError::FusiformModelIdentity(identity.clone()))?;
+            else {
+                // No provider/model pair means no slot to serve it in and no previous model
+                // to keep, so the row is simply left out.
+                excluded_rows.push(RowExclusion {
+                    model: identity.clone(),
+                    fact: "identity".to_string(),
+                    reason: CatalogError::FusiformModelIdentity(identity.clone()).to_string(),
+                    kept_previous: false,
+                });
+                model_identities.insert(identity.clone());
+                continue;
+            };
             let provider_id = provider_id.to_string();
             let model_id = model_id.to_string();
 
@@ -440,49 +572,31 @@ impl ServingCatalog {
                             .or_default()
                             .insert(model_id.clone());
                     } else {
-                        let kind = model_kind_fact(identity, facts)?;
-                        // A row whose stated kind is not chat (a decision or extraction model)
-                        // can never be admitted by `session.send`, and fusiform's curated rows for
-                        // such models carry only the facts their source publishes: no reasoning
-                        // or tool-call flag, sometimes no context window. Requiring the chat
-                        // facts there would let one such row refuse the whole catalog, so they
-                        // decode as not stated. Rows without a stated non-chat kind keep the
-                        // strict chat contract described on `capability_fact`.
-                        let chat_row = kind.as_deref().is_none_or(|kind| kind == MODEL_KIND_CHAT);
-                        let flag = |fact: &'static str| {
-                            if chat_row {
-                                capability_fact(identity, facts, fact)
-                            } else {
-                                optional_capability_fact(identity, facts, fact)
+                        match serving_model_from_facts(identity, facts) {
+                            Ok(mut model) => {
+                                if let Some(patch) = overlay.model_patch(&provider_id, &model_id) {
+                                    patch.apply(&mut model);
+                                }
+                                provider.models.insert(model_id.clone(), model);
                             }
-                        };
-                        let context_limit = if chat_row || facts.contains_key("limit.context") {
-                            context_fact(identity, facts)?
-                        } else {
-                            None
-                        };
-                        let mut model = ServingModel {
-                            display_name: String::new(),
-                            cost: warm_cost_fact(facts),
-                            context_limit,
-                            output_limit: output_fact(identity, facts)?,
-                            attachment: flag("capability.attachment")?,
-                            reasoning: flag("capability.reasoning")?,
-                            tool_call: flag("capability.tool_call")?,
-                            structured_output: optional_capability_fact(
-                                identity,
-                                facts,
-                                "capability.structured_output",
-                            )?,
-                            reasoning_options: reasoning_options_fact(identity, facts)?,
-                            priced_modes: priced_modes_fact(identity, facts)?,
-                            wire_family: None,
-                            kind,
-                        };
-                        if let Some(patch) = overlay.model_patch(&provider_id, &model_id) {
-                            patch.apply(&mut model);
+                            Err(error) => {
+                                // The previous model already had the overlay applied when it
+                                // was assembled, so it is reinstated as it was served.
+                                let kept = previous
+                                    .and_then(|catalog| {
+                                        catalog.provider_and_model(&provider_id, &model_id)
+                                    })
+                                    .map(|(_, model)| model.clone());
+                                excluded_rows.push(RowExclusion::from_error(
+                                    identity,
+                                    error,
+                                    kept.is_some(),
+                                ));
+                                if let Some(model) = kept {
+                                    provider.models.insert(model_id.clone(), model);
+                                }
+                            }
                         }
-                        provider.models.insert(model_id.clone(), model);
                     }
                 }
                 Some(Value::String(value))
@@ -579,14 +693,15 @@ impl ServingCatalog {
             })
             .collect();
 
-        Ok((
-            Self {
+        Ok(AssembledCatalog {
+            catalog: Self {
                 providers,
                 overlay_removed_models,
                 withdrawn_models,
             },
             model_identities,
-        ))
+            excluded_rows,
+        })
     }
 
     fn from_catalog(catalog: &Catalog) -> Self {
@@ -916,24 +1031,37 @@ where
     }
 }
 
-/// Read one capability fact, distinguishing "not stated" from "missing".
+/// Assemble one present row's serving model from its facts, before any overlay patch.
 ///
-/// An explicit null is the producer saying the upstream does not state this, which is a fact
-/// about knowledge. An absent key is a fact that should have been there and was not, and it is
-/// an error rather than a default: defaulting to false would silently stop a capable model
-/// reasoning, and nothing downstream would report anything -- the run would simply be worse.
-///
-/// KNOW THE BLAST RADIUS BEFORE RELAXING THIS. The error propagates out of `from_fusiform`, so
-/// ONE malformed model refuses the WHOLE catalog -- currently about 6,300 of them. The daemon
-/// then keeps serving its last-known-good, which is complete and correct as of the last accepted
-/// poll, so nothing that worked stops working; what stops is new models appearing. Since the
-/// refusal repeats while the upstream serves that row, `catalog_refusals` on `health.check`
-/// surfaces it within the hour.
-///
-/// That all-or-nothing shape is deliberate. Dropping just the bad model would keep the catalog
-/// fresh, but a systematic upstream fault would then shrink the serving set quietly while every
-/// reading looked healthy -- trading a loud whole-catalog stall for a silent partial one, which
-/// is the worse direction and the same size-as-proxy-for-content failure in a new place.
+/// An error here excludes this row only (see [`RowExclusion`]); it never refuses the catalog.
+/// Which absent facts are tolerated, and why, is documented on each reader below.
+fn serving_model_from_facts(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+) -> Result<ServingModel, CatalogError> {
+    Ok(ServingModel {
+        display_name: String::new(),
+        cost: warm_cost_fact(facts),
+        context_limit: context_fact(identity, facts)?,
+        output_limit: output_fact(identity, facts)?,
+        attachment: optional_capability_fact(identity, facts, "capability.attachment")?,
+        reasoning: reasoning_fact(identity, facts)?,
+        tool_call: optional_capability_fact(identity, facts, "capability.tool_call")?,
+        structured_output: optional_capability_fact(
+            identity,
+            facts,
+            "capability.structured_output",
+        )?,
+        reasoning_options: reasoning_options_fact(identity, facts)?,
+        priced_modes: priced_modes_fact(identity, facts)?,
+        wire_family: None,
+        kind: model_kind_fact(identity, facts)?,
+    })
+}
+
+/// Read one capability fact that is present: a boolean is known, an explicit null is the
+/// producer saying the upstream does not state it (`Unknown`), and any other value is
+/// malformed. A malformed value excludes the row rather than guessing.
 fn capability_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -956,8 +1084,24 @@ fn capability_fact(
 }
 
 /// A capability fact fusiform may omit: absence reads as [`CapabilityFlag::Absent`] (the
-/// catalog does not say), never as a refusal of the row. A present value must still be a
+/// catalog does not say), never as an exclusion of the row. A present value must still be a
 /// boolean or null.
+///
+/// Fusiform omits a flag when the vendor does not state it; hand-curated decision and
+/// extraction rows (jev, clef, clairic) carry no reasoning or tool-call flag at all. Absent is
+/// safe for the three flags read here because nothing refuses or changes a send on them:
+///
+/// - `capability.structured_output`: `broca_provider::structured_output::decide` treats Absent
+///   like null (`catalog_unknown`): the schema is sent unconstrained and the runner validates
+///   the answer when the run ends. The send is not refused.
+/// - `capability.tool_call`: no admission or render path reads it. A send carrying tools is
+///   rendered with its tools whatever the flag says, and the provider accepts or rejects them,
+///   so a row with unstated tool support behaves exactly like one with unstated structured
+///   output: sent, not refused.
+/// - `capability.attachment`: likewise carried on the model spec and read by no admission or
+///   render path.
+///
+/// `capability.reasoning` is NOT read this way; see [`reasoning_fact`].
 fn optional_capability_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -968,6 +1112,32 @@ fn optional_capability_fact(
     } else {
         Ok(CapabilityFlag::Absent)
     }
+}
+
+/// `capability.reasoning`: an omitted fact reads as [`CapabilityFlag::Unknown`], exactly like
+/// an explicit null, never as `Absent`.
+///
+/// The difference matters because `CapabilityFlag::admit` (called by `resolve_frozen`) admits
+/// `Absent` as `false` and freezes `ReasoningPolicy::None`. A reasoning model whose flag
+/// fusiform stopped serving would then run without reasoning and nothing would report it:
+/// "could not tell" would have become a known `false`. As `Unknown`, a send that would reason
+/// (the family's reasoning policy is not `None`) is refused at admission, as it is for null,
+/// and a send that would not reason admits.
+///
+/// The mapping lives here rather than in `admit` because `Absent` as `false` is still the
+/// documented reading for the vendored snapshot catalog. Excluding the row instead would also
+/// lose rows that are servable as they are: the curated decision models (clef, clairic, jev)
+/// state no reasoning flag and are served on families that never reason.
+fn reasoning_fact(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+) -> Result<CapabilityFlag, CatalogError> {
+    Ok(
+        match optional_capability_fact(identity, facts, "capability.reasoning")? {
+            CapabilityFlag::Absent => CapabilityFlag::Unknown,
+            stated => stated,
+        },
+    )
 }
 
 /// `capability.reasoning_options`, served verbatim from models.dev. Unlike the capability flags
@@ -1000,7 +1170,7 @@ fn reasoning_options_fact(
 /// A rate counts as priced when its `state` is `priced` or `stated_zero` (the source states the
 /// price is zero). `unpriced`, a null, or any state this build does not know is unpriced, so an
 /// unfamiliar value refuses a tier rather than offering one routing cannot price. A value that
-/// is neither null nor an object is malformed and refuses the catalog, like every other fact.
+/// is neither null nor an object is malformed and excludes the row, like every other fact.
 fn priced_modes_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -1040,7 +1210,12 @@ fn priced_modes_fact(
 
 /// Read `model.kind`. Absent and null both mean the catalog does not state a kind and decode to
 /// `None`; that is never read as `chat`. A present value of another type is malformed and
-/// refuses the catalog, like every other fact.
+/// excludes this row only (keeping its last-known-good model if one was served), like every
+/// other fact.
+///
+/// The kind changes no other fact's reading: a decision or extraction row that omits the chat
+/// facts decodes them as unstated exactly like any other row (see `optional_capability_fact`,
+/// `reasoning_fact` and `context_fact`).
 fn model_kind_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -1056,6 +1231,23 @@ fn model_kind_fact(
     }
 }
 
+/// Read `limit.context`. Null and absent both mean the window is unknown and decode to `None`;
+/// a present value that is not an unsigned integer excludes the row.
+///
+/// Absent is read like null because `None` already means "unknown" to every consumer, never
+/// "unlimited" or zero (about 120 live rows serve an explicit null today):
+///
+/// - Admission (`context_limit_for_episode` in broca-module-serve) freezes the caller's
+///   `context_limit`, else this value, else `None`; `None` stays unknown in the run config.
+/// - The default output cap (`default_max_output_tokens` in `live.rs`) uses the output limit
+///   as served, or the fixed fallback, when the context is unknown. Nothing is sized from a
+///   window that was never published.
+/// - The pre-send ceiling check (`compaction::view::before_send` in broca-core) cannot compare
+///   against an unknown window and sends; if the provider then refuses for length, that refusal
+///   starts the ceiling ride, carrying the limit the provider stated. Compaction notices and the
+///   setup record omit the window rather than reporting one.
+///
+/// Jev, for one, states no exact context size, so it has no `limit.context`.
 fn context_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -1073,11 +1265,7 @@ fn context_fact(
                     value_kind(value)
                 ),
             }),
-        None => Err(CatalogError::FusiformFact {
-            model: identity.to_string(),
-            fact: "limit.context".to_string(),
-            reason: "fact is absent".to_string(),
-        }),
+        None => Ok(None),
     }
 }
 
@@ -1085,10 +1273,9 @@ fn context_fact(
 /// number: fusiform collapses an upstream zero to null, so a synthesised value here would be a
 /// cap nobody published.
 ///
-/// Absent is tolerated, unlike `limit.context`, because this fact only chooses a default and has
-/// a documented fallback; an LKG written before broca requested the fact carries none, and it
-/// must keep loading rather than refuse the whole catalog. A present value of the wrong type is
-/// still an error, for the same all-or-nothing reason as the capability facts.
+/// Absent is tolerated because this fact only chooses a default and has a documented fallback;
+/// an LKG written before broca requested the fact carries none, and it must keep loading. A
+/// present value of the wrong type is still an error, which excludes the row.
 fn output_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -1252,8 +1439,12 @@ impl CatalogCache {
     pub fn open(lkg_path: impl Into<PathBuf>) -> Self {
         let lkg_path = lkg_path.into();
         let (current, lkg_load_error) = match load_lkg(&lkg_path) {
-            Ok(Some(response)) => match loaded(&response, CatalogSource::LastKnownGood) {
-                Ok(catalog) => (Some(Arc::new(catalog)), None),
+            Ok(Some(response)) => match loaded(&response, CatalogSource::LastKnownGood, None) {
+                Ok(catalog) => {
+                    // Boot has no earlier catalog, so an unusable row here is simply excluded.
+                    catalog.warn_excluded_rows();
+                    (Some(Arc::new(catalog)), None)
+                }
                 Err(error) => (None, Some(error.to_string())),
             },
             Ok(None) => (None, None),
@@ -1493,11 +1684,15 @@ impl CatalogCache {
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
                     || response_carries_model_kinds(&response) != current.carries_model_kinds
                 {
-                    let rebuilt = Arc::new(loaded(&response, CatalogSource::Fusiform)?);
+                    let rebuilt = Arc::new(loaded(
+                        &response,
+                        CatalogSource::Fusiform,
+                        Some(&current.catalog),
+                    )?);
                     if let Some(path) = &self.lkg_path {
                         persist_lkg(path, &response)?;
                     }
-                    *self.current.write().expect("catalog cache lock poisoned") = Some(rebuilt);
+                    self.install(rebuilt);
                     return Ok(());
                 }
 
@@ -1516,13 +1711,20 @@ impl CatalogCache {
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
                     carries_model_kinds: current.carries_model_kinds,
+                    excluded_rows: Arc::clone(&current.excluded_rows),
                 });
-                *self.current.write().expect("catalog cache lock poisoned") = Some(refreshed);
+                self.install(refreshed);
                 return Ok(());
             }
         }
 
-        let next = Arc::new(loaded(&response, CatalogSource::Fusiform)?);
+        // The catalog being replaced, so a row that served before and now arrives malformed
+        // keeps its earlier model instead of disappearing.
+        let next = Arc::new(loaded(
+            &response,
+            CatalogSource::Fusiform,
+            installed.as_ref().map(|current| current.catalog.as_ref()),
+        )?);
         if let Some(current) = installed {
             // Why the version guard above exists at all: `catalog_version` is the only field
             // fusiform documents as safe to hold as a high-water mark, derived as
@@ -1554,8 +1756,14 @@ impl CatalogCache {
         if let Some(path) = &self.lkg_path {
             persist_lkg(path, &response)?;
         }
-        *self.current.write().expect("catalog cache lock poisoned") = Some(next);
+        self.install(next);
         Ok(())
+    }
+
+    /// Publish an accepted catalog and report its excluded rows.
+    fn install(&self, next: Arc<LoadedCatalog>) {
+        next.warn_excluded_rows();
+        *self.current.write().expect("catalog cache lock poisoned") = Some(next);
     }
 
     /// Install a document without touching disk. This is intended for focused tests that prove the
@@ -1566,7 +1774,7 @@ impl CatalogCache {
         response: FusiformCatalogResponse,
         source: CatalogSource,
     ) -> Result<(), CatalogRefreshError> {
-        let next = Arc::new(loaded(&response, source)?);
+        let next = Arc::new(loaded(&response, source, None)?);
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
         Ok(())
     }
@@ -1590,6 +1798,7 @@ impl CatalogCache {
             carries_warm_rates: true,
             // The vendored snapshot serves no `model.kind`.
             carries_model_kinds: false,
+            excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
     }
@@ -1603,6 +1812,8 @@ impl CatalogCache {
             consecutive_refusals: refusals,
             refusal_reason: reason,
             total_refusals: self.total_refusals(),
+            rows_excluded: snapshot.0.excluded_rows.len(),
+            rows_excluded_reason: snapshot.0.excluded_rows.last().map(RowExclusion::describe),
         })
     }
 }
@@ -1621,11 +1832,22 @@ pub struct CatalogHealth {
     /// Refusals since process start, including cleared ones. Zero streak with a non-zero total
     /// is "this occurred and recovered" -- a different fact from "this has never occurred".
     pub total_refusals: u64,
+    /// Present rows the served catalog left out or kept at their previous model because their
+    /// facts could not be used. Not a refusal: the catalog around them refreshed. Zero is the
+    /// healthy reading.
+    pub rows_excluded: usize,
+    /// The last excluded row in identity order, naming the model, the fact and the reason, and
+    /// whether its last-known-good model is still served. `None` when nothing is excluded.
+    pub rows_excluded_reason: Option<String>,
 }
 
+/// Assemble a response into a serving catalog. `previous` is the catalog being replaced (the
+/// installed one on refresh, `None` on boot or in tests); rows that cannot be assembled keep
+/// the model it served for them.
 fn loaded(
     response: &FusiformCatalogResponse,
     source: CatalogSource,
+    previous: Option<&ServingCatalog>,
 ) -> Result<LoadedCatalog, CatalogError> {
     if !response.withheld.is_empty() || !response.uncertain.is_empty() {
         return Err(CatalogError::FusiformQualifiedFacts {
@@ -1633,10 +1855,10 @@ fn loaded(
             uncertain: response.uncertain.len(),
         });
     }
-    let (catalog, model_identities) = ServingCatalog::from_fusiform(&response.models)?;
+    let assembled = ServingCatalog::from_fusiform(&response.models, previous)?;
     Ok(LoadedCatalog {
-        catalog: Arc::new(catalog),
-        model_identities: Arc::new(model_identities),
+        catalog: Arc::new(assembled.catalog),
+        model_identities: Arc::new(assembled.model_identities),
         resolved_at_ms: response.resolved_at_ms,
         catalog_version: response.catalog_version,
         source,
@@ -1644,6 +1866,7 @@ fn loaded(
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
         carries_model_kinds: response_carries_model_kinds(response),
+        excluded_rows: assembled.excluded_rows.into(),
     })
 }
 
@@ -2053,11 +2276,11 @@ mod tests {
                 "capability.structured_output".into(),
                 serde_json::json!("yes"),
             );
-        assert!(ServingCatalog::from_fusiform_with_overlay(
-            &response.models,
-            RuntimeOverlay::default()
-        )
-        .is_err());
+        // A malformed value is still not read as a capability: the row is excluded instead.
+        assert!(loaded_excludes_for_fact(
+            &response,
+            "capability.structured_output"
+        ));
         assert!(FUSIFORM_FACT_PREFIXES.contains(&"capability.structured_output"));
     }
 
@@ -2123,8 +2346,8 @@ mod tests {
         );
 
         let legacy = legacy_catalog(&response).expect("legacy catalog materializes");
-        let compact =
-            loaded(&response, CatalogSource::Fusiform).expect("compact serving index materializes");
+        let compact = loaded(&response, CatalogSource::Fusiform, None)
+            .expect("compact serving index materializes");
         let freeze = |pair: Option<(ProviderSpec, ModelSpec)>| {
             pair.map(|(provider, model)| {
                 resolve_frozen(
@@ -2188,20 +2411,17 @@ mod tests {
         );
     }
 
-    /// A model missing a capability fact fails the whole load rather than defaulting.
+    /// An omitted capability flag or context window loads as unstated rather than refusing
+    /// anything, and an explicit null stays distinct from an omission.
     ///
-    /// FUSI relies on this in their protocol contract, so it is a promise to another repository
-    /// rather than an internal preference. Their earlier claim cited a test over the VENDORED
-    /// snapshot, which today's cutover took off the serving path -- nobody edited it, the road
-    /// moved, and the claim became irrelevant rather than false. This asserts the OUTCOME on the
-    /// path the data actually takes, which no cutover can retire without breaking it.
-    ///
-    /// Fail-closed is the point. Defaulting an absent capability to false would silently stop a
-    /// capable model reasoning, and nothing downstream would report anything: the run would
-    /// simply be worse. Refusing the load is loud, and since fb1356a it is also visible as
-    /// `catalog_refusals` rather than reading as ordinary staleness.
+    /// This used to pin the opposite: an omitted fact refused the whole catalog, so that
+    /// defaulting could never silently change a model. That refused every refresh from
+    /// 2026-10-21 because fusiform's hand-curated decision models (jev, clef, clairic) carry only
+    /// the facts their vendors state. An omission now reads as "not stated", which each consumer
+    /// already handles (see `optional_capability_fact` and `context_fact`), and a row whose fact
+    /// is MALFORMED is excluded on its own and counted on `health.check`.
     #[test]
-    fn a_model_missing_a_capability_fact_fails_the_load_rather_than_defaulting() {
+    fn a_model_missing_a_capability_or_context_fact_loads_it_as_unstated() {
         for fact in [
             "capability.reasoning",
             "capability.attachment",
@@ -2216,23 +2436,30 @@ mod tests {
             model.remove(fact);
 
             let cache = CatalogCache::empty();
-            let error = cache
+            cache
                 .refresh(response)
-                .expect_err("a model missing a served fact must not load");
-            let text = error.to_string();
-            assert!(
-                text.contains(fact) && text.contains("claude-sonnet-4-5"),
-                "the refusal must name the fact and the model so it can be acted on, got: {text}"
-            );
-            assert!(
-                cache.snapshot().is_err(),
-                "a refused load must leave nothing installed for {fact}"
-            );
+                .unwrap_or_else(|error| panic!("omitted {fact} must not refuse: {error}"));
+            let snapshot = cache.snapshot().expect("installed");
+            let (_, model) = snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap_or_else(|| panic!("omitted {fact} must not exclude the row"));
+            // Reasoning is the one flag a send can refuse on, so its omission reads as
+            // unknown (like null) rather than Absent, which admission would read as false.
+            let (read, expected) = match fact {
+                "capability.reasoning" => (model.capabilities.reasoning, CapabilityFlag::Unknown),
+                "capability.attachment" => (model.capabilities.attachment, CapabilityFlag::Absent),
+                "capability.tool_call" => (model.capabilities.tool_call, CapabilityFlag::Absent),
+                _ => {
+                    assert_eq!(model.limits.context, None, "omitted limit.context");
+                    continue;
+                }
+            };
+            assert_eq!(read, expected, "omitted {fact}");
+            assert_eq!(cache.health(100).unwrap().rows_excluded, 0, "{fact}");
         }
 
-        // An EXPLICIT null is different and must load: it is the producer saying "the upstream
-        // does not state this", which is a fact about knowledge rather than a missing field.
-        // Collapsing the two would discard the distinction CapabilityFlag exists to carry.
+        // An EXPLICIT null is different: it is the producer saying "the upstream does not
+        // state this", which `resolve_frozen` refuses for a send that would reason.
         let mut response = response(100);
         response
             .models
@@ -2242,7 +2469,353 @@ mod tests {
         let cache = CatalogCache::empty();
         cache
             .refresh(response)
-            .expect("an explicit null is a stated unknown, not an absent fact");
+            .expect("an explicit null is a stated unknown");
+        let (_, model) = cache
+            .snapshot()
+            .unwrap()
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(model.capabilities.reasoning, CapabilityFlag::Unknown);
+    }
+
+    /// A present chat row as fusiform serves one, for the per-row isolation tests.
+    fn chat_row(context: u64) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("existence".into(), serde_json::json!("present")),
+            ("limit.context".into(), serde_json::json!(context)),
+            ("capability.attachment".into(), serde_json::json!(true)),
+            ("capability.reasoning".into(), serde_json::json!(true)),
+            ("capability.tool_call".into(), serde_json::json!(true)),
+        ])
+    }
+
+    /// Fusiform's curated rows next to ordinary chat rows, the page shape that refused every
+    /// refresh on 2026-10-21. The refresh succeeds through the real refresh path, the chat rows
+    /// are unchanged, and no curated row is excluded: their unstated facts read as unknown.
+    #[test]
+    fn curated_decision_rows_beside_chat_rows_refresh_without_refusing() {
+        let cache = CatalogCache::empty();
+        cache.refresh(response(100)).expect("first install");
+        let before = cache
+            .snapshot()
+            .unwrap()
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1;
+
+        let mut page = response(200);
+        page.catalog_version += 1;
+        page.models
+            .insert("openai/gpt-chat".into(), chat_row(400_000));
+        for (identity, facts) in curated_rows() {
+            page.models.insert(identity, facts);
+        }
+        cache
+            .refresh(page)
+            .expect("curated rows must not refuse the refresh");
+
+        let health = cache.health(200).unwrap();
+        assert_eq!((health.consecutive_refusals, health.total_refusals), (0, 0));
+        assert_eq!(health.rows_excluded, 0, "{:?}", health.rows_excluded_reason);
+
+        let snapshot = cache.snapshot().unwrap();
+        let after = snapshot
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1;
+        assert_eq!(
+            (
+                after.limits.context,
+                after.capabilities.attachment,
+                after.capabilities.reasoning,
+                after.capabilities.tool_call,
+            ),
+            (
+                before.limits.context,
+                before.capabilities.attachment,
+                before.capabilities.reasoning,
+                before.capabilities.tool_call,
+            ),
+            "a chat row must be unchanged by its curated neighbours"
+        );
+        assert_eq!(snapshot.context_limit("openai", "gpt-chat"), Some(400_000));
+
+        // Broca resolves no wire family for the `typesafe` provider, so jev is listed but not
+        // servable whatever its facts say: it is a known identity, neither served nor excluded.
+        // Its facts are read through the same assembly with a test overlay giving the provider
+        // a family.
+        assert!(!snapshot.contains_model("typesafe", "jev-1.13.0"));
+        let overlay: RuntimeOverlay = serde_json::from_str(
+            r#"{ "patch": { "typesafe": { "wire_family": "openai_chat" } } }"#,
+        )
+        .expect("test overlay parses");
+        let models = curated_rows();
+        let assembled = ServingCatalog::assemble_with_overlay(&models, overlay, None)
+            .expect("curated rows assemble");
+        assert!(
+            assembled.excluded_rows.is_empty(),
+            "{:?}",
+            assembled.excluded_rows
+        );
+        let (_, jev) = assembled
+            .catalog
+            .model_for_serving("typesafe", "jev-1.13.0")
+            .expect("jev assembles");
+        assert_eq!(jev.limits.context, None, "jev states no context window");
+        assert_eq!(jev.capabilities.attachment, CapabilityFlag::Absent);
+        assert_eq!(jev.capabilities.reasoning, CapabilityFlag::Unknown);
+        assert_eq!(jev.capabilities.tool_call, CapabilityFlag::Absent);
+        for model in ["@cf/cloudflare/clef", "@cf/cloudflare/clairic"] {
+            let (provider, row) = snapshot
+                .model_for_serving("cloudflare-workers-ai", model)
+                .unwrap_or_else(|| panic!("{model} is served"));
+            assert_eq!(row.limits.context, Some(65_536), "{model}");
+            assert_eq!(row.capabilities.attachment, CapabilityFlag::Known(true));
+            assert_eq!(row.capabilities.reasoning, CapabilityFlag::Unknown);
+            assert_eq!(row.capabilities.tool_call, CapabilityFlag::Absent);
+            // An unstated reasoning flag refuses only a send that would reason; this family
+            // never reasons, so the curated row still admits.
+            let frozen = resolve_frozen(
+                &provider,
+                &row,
+                4_096,
+                renderer_version_for(provider.wire_family),
+            )
+            .unwrap_or_else(|error| panic!("{model} must admit: {error}"));
+            assert_eq!(
+                frozen.reasoning,
+                broca_provider::policy::ReasoningPolicy::None
+            );
+        }
+    }
+
+    /// A reasoning row whose `capability.reasoning` fusiform stops serving is refused for a send
+    /// that would reason, the same as an explicit null, rather than running without reasoning.
+    ///
+    /// Read as `Absent`, admission would freeze `ReasoningPolicy::None` and the model would
+    /// silently stop reasoning: "could not tell" would have become a known `false`.
+    #[test]
+    fn a_reasoning_row_that_loses_its_flag_refuses_a_reasoning_send() {
+        let cache = CatalogCache::empty();
+        cache.refresh(response(100)).expect("first install");
+        let (provider, model) = cache
+            .snapshot()
+            .unwrap()
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .expect("served");
+        let frozen = resolve_frozen(
+            &provider,
+            &model,
+            4_096,
+            renderer_version_for(provider.wire_family),
+        )
+        .expect("a stated reasoning model admits");
+        assert_ne!(
+            frozen.reasoning,
+            broca_provider::policy::ReasoningPolicy::None,
+            "the fixture family must reason, or the refusal below proves nothing"
+        );
+
+        let mut page = response(200);
+        page.catalog_version += 1;
+        page.models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .expect("fixture row")
+            .remove("capability.reasoning");
+        cache
+            .refresh(page)
+            .expect("an omitted flag does not refuse");
+        let (provider, model) = cache
+            .snapshot()
+            .unwrap()
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .expect("still served");
+        assert_eq!(model.capabilities.reasoning, CapabilityFlag::Unknown);
+        let refused = resolve_frozen(
+            &provider,
+            &model,
+            4_096,
+            renderer_version_for(provider.wire_family),
+        );
+        assert!(
+            matches!(&refused, Err(error) if error.capability == "reasoning"),
+            "a reasoning send must be refused, not run without reasoning: {:?}",
+            refused.map(|frozen| frozen.reasoning)
+        );
+    }
+
+    /// A row the installed catalog served keeps its previous model when it arrives malformed,
+    /// and the refresh around it still succeeds and is not counted as a refusal.
+    #[test]
+    fn a_served_row_that_arrives_malformed_keeps_its_previous_model() {
+        let cache = CatalogCache::empty();
+        cache.refresh(response(100)).expect("first install");
+
+        let mut page = response(200);
+        page.catalog_version += 1;
+        page.models
+            .insert("openai/gpt-chat".into(), chat_row(400_000));
+        let row = page
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .expect("fixture row");
+        // The window changes too, so serving it would show the malformed row was half-read.
+        row.insert("limit.context".into(), serde_json::json!(1_000));
+        row.insert("capability.tool_call".into(), serde_json::json!("yes"));
+        cache
+            .refresh(page.clone())
+            .expect("one malformed row must not refuse the refresh");
+
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(snapshot.resolved_at_ms(), 200, "the refresh installed");
+        assert_eq!(snapshot.context_limit("openai", "gpt-chat"), Some(400_000));
+        let (_, kept) = snapshot
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .expect("the previously served row keeps serving");
+        assert_eq!(kept.limits.context, Some(200_000), "the PREVIOUS model");
+        assert_eq!(kept.capabilities.tool_call, CapabilityFlag::Known(true));
+
+        let health = cache.health(200).unwrap();
+        assert_eq!((health.consecutive_refusals, health.total_refusals), (0, 0));
+        assert_eq!(health.rows_excluded, 1);
+        let reason = health.rows_excluded_reason.expect("a reason");
+        assert!(
+            reason.contains("claude-sonnet-4-5")
+                && reason.contains("capability.tool_call")
+                && reason.contains("last-known-good"),
+            "{reason}"
+        );
+
+        // Still malformed on the next refresh: the kept model is kept again, not lost.
+        let mut next = page;
+        next.catalog_version += 1;
+        next.resolved_at_ms = 300;
+        cache.refresh(next).expect("still not a refusal");
+        let (_, kept) = cache
+            .snapshot()
+            .unwrap()
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .expect("kept across refreshes");
+        assert_eq!(kept.limits.context, Some(200_000));
+    }
+
+    /// A row never served before that arrives malformed is left out, with one WARN naming the
+    /// model, the fact and the reason, and the health count; everything else serves.
+    #[test]
+    fn a_never_seen_malformed_row_is_excluded_with_a_warn_and_the_counter() {
+        let cache = CatalogCache::empty();
+        cache.refresh(response(100)).expect("first install");
+
+        let mut page = response(200);
+        page.catalog_version += 1;
+        let mut bad = chat_row(128_000);
+        bad.insert("limit.context".into(), serde_json::json!("128k"));
+        page.models.insert("openai/never-seen".into(), bad);
+        page.models
+            .insert("openai/gpt-chat".into(), chat_row(400_000));
+
+        let capture = broca_test_support::LogCapture::new();
+        capture
+            .in_scope(|| cache.refresh(page))
+            .expect("a malformed new row must not refuse the refresh");
+
+        let snapshot = cache.snapshot().unwrap();
+        assert!(!snapshot.contains_model("openai", "never-seen"));
+        assert!(snapshot.contains_model("openai", "gpt-chat"));
+        assert!(snapshot.contains_model("anthropic", "claude-sonnet-4-5"));
+
+        let warns: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::WARN && event.target == "catalog")
+            .collect();
+        assert_eq!(warns.len(), 1, "one WARN per excluded row: {warns:?}");
+        let warn = &warns[0];
+        assert_eq!(warn.fields["model"], "openai/never-seen");
+        assert_eq!(warn.fields["fact"], "limit.context");
+        assert!(warn.fields["reason"].contains("expected unsigned integer"));
+        assert_eq!(warn.fields["last_known_good_kept"], "false");
+
+        let health = cache.health(200).unwrap();
+        assert_eq!(
+            (health.consecutive_refusals, health.total_refusals),
+            (0, 0),
+            "a refresh with exclusions is not a refusal"
+        );
+        assert_eq!(health.rows_excluded, 1);
+        assert!(health
+            .rows_excluded_reason
+            .is_some_and(|reason| reason.contains("never-seen") && reason.contains("not served")));
+    }
+
+    /// An identity that does not split into provider and model excludes only that row.
+    #[test]
+    fn an_identity_that_does_not_split_excludes_only_its_row() {
+        let mut page = response(100);
+        page.models.insert("no-provider".into(), chat_row(1_000));
+        let cache = CatalogCache::empty();
+        cache
+            .refresh(page)
+            .expect("one bad identity must not refuse");
+        let health = cache.health(100).unwrap();
+        assert_eq!(health.rows_excluded, 1);
+        assert!(health
+            .rows_excluded_reason
+            .is_some_and(|reason| reason.contains("no-provider") && reason.contains("identity")));
+        assert!(cache
+            .snapshot()
+            .unwrap()
+            .contains_model("anthropic", "claude-sonnet-4-5"));
+    }
+
+    /// Problems with the DOCUMENT still refuse the whole refresh even when a row is excluded,
+    /// and an excluded row counts as a known identity: losing it later is a vanished identity.
+    #[test]
+    fn document_level_problems_still_refuse_beside_an_excluded_row() {
+        let cache = CatalogCache::empty();
+        let mut first = response(100);
+        let mut bad = chat_row(1_000);
+        bad.insert("capability.reasoning".into(), serde_json::json!(1));
+        first.models.insert("openai/bad".into(), bad);
+        cache.refresh(first.clone()).expect("first install");
+        assert_eq!(cache.health(100).unwrap().rows_excluded, 1);
+
+        // Truncation: the response drops the excluded row's identity.
+        let mut truncated = first.clone();
+        truncated.catalog_version += 1;
+        truncated.resolved_at_ms = 200;
+        truncated.models.remove("openai/bad");
+        assert!(
+            matches!(
+                cache.refresh(truncated).expect_err("a vanished identity refuses"),
+                CatalogRefreshError::Incomplete { ref sample, .. } if sample == "openai/bad"
+            ),
+            "an excluded row must still count as a known identity"
+        );
+
+        // A vanished ordinary identity, with the bad row still present.
+        let mut vanished = first.clone();
+        vanished.catalog_version += 2;
+        vanished.models.remove("anthropic/claude-retired");
+        assert!(matches!(
+            cache.refresh(vanished).expect_err("refused"),
+            CatalogRefreshError::Incomplete { .. }
+        ));
+
+        // Qualified facts.
+        let mut qualified = first;
+        qualified.catalog_version += 3;
+        qualified
+            .withheld
+            .push(serde_json::json!({"fact": "limit.context"}));
+        assert!(matches!(
+            cache.refresh(qualified).expect_err("refused"),
+            CatalogRefreshError::Catalog(CatalogError::FusiformQualifiedFacts { .. })
+        ));
+
+        let health = cache.health(300).unwrap();
+        assert_eq!(health.total_refusals, 3);
+        assert_eq!(cache.snapshot().unwrap().resolved_at_ms(), 100);
     }
 
     /// The refusal names the instant the response resolved to, because that is what says WHO
@@ -2620,9 +3193,9 @@ mod tests {
     /// resolvable by their full catalog id.
     ///
     /// The rows carry only what their source publishes: Clef and Clairic have no reasoning or
-    /// tool-call flag, and TypeSafe's Jev has no context window either. Under the chat-row
-    /// contract each of those absences refuses the WHOLE catalog, so before non-chat rows were
-    /// decoded leniently this refresh was refused and the daemon kept its old catalog.
+    /// tool-call flag, and TypeSafe's Jev has no context window either. When an omitted fact
+    /// refused the whole catalog, this refresh was refused and the daemon kept its old catalog;
+    /// now those omissions decode as unstated and no curated row is excluded.
     ///
     /// Identities split at the FIRST `/`: `cloudflare-workers-ai/@cf/cloudflare/clef` is
     /// provider `cloudflare-workers-ai`, model `@cf/cloudflare/clef`.
@@ -2651,6 +3224,11 @@ mod tests {
             .expect("a page carrying curated System One rows must be accepted, not refused");
         let after = cache.snapshot().expect("installed");
         assert_eq!(after.catalog_version(), live.catalog_version + 1);
+        assert!(
+            after.0.excluded_rows.is_empty(),
+            "{:?}",
+            after.0.excluded_rows
+        );
         assert!(
             !after.shares_index_with(&before),
             "the new page was materialized"
@@ -2684,7 +3262,8 @@ mod tests {
             assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
             assert_eq!(model.limits.context, Some(65_536));
             assert_eq!(model.capabilities.attachment, CapabilityFlag::Known(true));
-            assert_eq!(model.capabilities.reasoning, CapabilityFlag::Absent);
+            // An omitted reasoning flag is unknown, like null; see `reasoning_fact`.
+            assert_eq!(model.capabilities.reasoning, CapabilityFlag::Unknown);
             assert_eq!(model.capabilities.tool_call, CapabilityFlag::Absent);
             assert_eq!(
                 after
@@ -2706,10 +3285,11 @@ mod tests {
     }
 
     /// `model.kind` decodes to `Some(kind)` when stated and `None` when absent or null; a value
-    /// of another type refuses the catalog. Only a stated non-chat kind relaxes the chat facts:
-    /// a row stating `chat`, or stating nothing, must still carry every one of them.
+    /// of another type excludes only its row. The kind changes no other fact's reading: a row
+    /// stating `chat` that omits a chat fact decodes it as unstated exactly like any other row,
+    /// and a malformed fact on a non-chat row excludes that row like any other.
     #[test]
-    fn model_kind_is_stated_or_absent_and_only_a_non_chat_kind_relaxes_chat_facts() {
+    fn model_kind_is_stated_or_absent_and_a_malformed_kind_excludes_only_its_row() {
         for (fact, expected) in [
             (None, None),
             (Some(Value::Null), None),
@@ -2740,31 +3320,48 @@ mod tests {
             .get_mut("anthropic/claude-sonnet-4-5")
             .unwrap()
             .insert("model.kind".into(), serde_json::json!(1));
-        assert!(loaded_err_names_fact(&page, "model.kind"));
+        assert!(loaded_excludes_for_fact(&page, "model.kind"));
+        let served = loaded(&page, CatalogSource::Fusiform, None).expect("one bad kind loads");
+        assert!(!served
+            .catalog
+            .contains_model("anthropic", "claude-sonnet-4-5"));
 
-        for fact in [
-            "capability.reasoning",
-            "capability.tool_call",
-            "limit.context",
+        for (fact, read) in [
+            (
+                "capability.reasoning",
+                (|model: &ModelSpec| model.capabilities.reasoning == CapabilityFlag::Unknown)
+                    as fn(&ModelSpec) -> bool,
+            ),
+            ("capability.tool_call", |model| {
+                model.capabilities.tool_call == CapabilityFlag::Absent
+            }),
+            ("limit.context", |model| model.limits.context.is_none()),
         ] {
             let mut page = response(10);
             let row = page.models.get_mut("anthropic/claude-sonnet-4-5").unwrap();
             row.insert("model.kind".into(), serde_json::json!("chat"));
             row.remove(fact);
+            let served = loaded(&page, CatalogSource::Fusiform, None)
+                .unwrap_or_else(|error| panic!("a chat row missing {fact} loads: {error}"));
+            assert!(served.excluded_rows.is_empty(), "{fact}");
+            let (_, model) = served
+                .catalog
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap_or_else(|| panic!("a chat row missing {fact} is served"));
             assert!(
-                loaded_err_names_fact(&page, fact),
-                "a stated chat row missing {fact} must refuse the load"
+                read(&model),
+                "a chat row missing {fact} reads it as unstated"
             );
         }
 
-        // A malformed fact a non-chat row does carry is still refused.
+        // A malformed fact a non-chat row does carry excludes that row.
         let mut rows = curated_rows();
         rows.get_mut("cloudflare-workers-ai/@cf/cloudflare/clef")
             .unwrap()
             .insert("capability.tool_call".into(), serde_json::json!("yes"));
         let mut page = curated_response(1);
         page.models = rows;
-        assert!(loaded_err_names_fact(&page, "capability.tool_call"));
+        assert!(loaded_excludes_for_fact(&page, "capability.tool_call"));
 
         // The kind survives the prefix filter the poll asks fusiform to apply.
         let mut filtered = curated_response(1);
@@ -2775,7 +3372,7 @@ mod tests {
                     .any(|prefix| fact.starts_with(prefix))
             });
         }
-        let served = loaded(&filtered, CatalogSource::Fusiform).expect("filtered rows load");
+        let served = loaded(&filtered, CatalogSource::Fusiform, None).expect("filtered rows load");
         assert_eq!(
             CatalogSnapshot(Arc::new(served))
                 .model_kind("cloudflare-workers-ai", "@cf/cloudflare/clef")
@@ -2935,7 +3532,7 @@ mod tests {
         let response: FusiformCatalogResponse =
             serde_json::from_value(serde_json::to_value(&response).expect("serialize"))
                 .expect("decode");
-        let loaded = loaded(&response, CatalogSource::Fusiform).expect("loads");
+        let loaded = loaded(&response, CatalogSource::Fusiform, None).expect("loads");
         let model = |id: &str| {
             loaded
                 .catalog
@@ -2953,14 +3550,14 @@ mod tests {
             .get_mut("anthropic/known-output")
             .expect("row")
             .insert("limit.output".into(), serde_json::json!("64000"));
-        assert!(loaded_err_names_fact(&malformed, "limit.output"));
+        assert!(loaded_excludes_for_fact(&malformed, "limit.output"));
     }
 
-    fn loaded_err_names_fact(response: &FusiformCatalogResponse, fact: &str) -> bool {
-        matches!(
-            loaded(response, CatalogSource::Fusiform),
-            Err(CatalogError::FusiformFact { fact: found, .. }) if found == fact
-        )
+    /// Whether loading `response` succeeds and excludes some row because of `fact`. A malformed
+    /// fact excludes its own row rather than refusing the catalog.
+    fn loaded_excludes_for_fact(response: &FusiformCatalogResponse, fact: &str) -> bool {
+        loaded(response, CatalogSource::Fusiform, None)
+            .is_ok_and(|loaded| loaded.excluded_rows.iter().any(|row| row.fact == fact))
     }
 
     /// The poll's prefix list must request `limit.output`, or no output limit ever arrives and
@@ -2982,7 +3579,7 @@ mod tests {
                     .any(|prefix| fact.starts_with(prefix))
             });
         }
-        let served = loaded(&full, CatalogSource::Fusiform).expect("filtered response loads");
+        let served = loaded(&full, CatalogSource::Fusiform, None).expect("filtered response loads");
         assert_eq!(
             served
                 .catalog
