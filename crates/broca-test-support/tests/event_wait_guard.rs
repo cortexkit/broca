@@ -33,7 +33,7 @@ const EXCEPTIONS: &[(&str, &str, &str)] = &[
     ("crates/broca-module-serve/tests/it/seal_line_is_filterable_e2e.rs", "start", "Daemon connection-file publication before a session exists"),
     ("crates/broca-module-serve/tests/it/seal_line_is_filterable_e2e.rs", "wait_for_module_live", "Module registration before a session exists"),
     ("crates/broca-module-serve/tests/it/single_turn_module_e2e.rs", "start_with_env_and_aft_modules", "Daemon connection-file publication before a session exists"),
-    ("crates/broca-module-serve/tests/it/single_turn_module_e2e.rs", "start_on_port", "HTTP mock port publication, no session persistence"),
+    ("crates/broca-module-serve/tests/it/single_turn_module_e2e.rs", "start", "HTTP mock port publication, no session persistence"),
     ("crates/broca-module-serve/tests/llm_runner_conformance.rs", "start", "Daemon connection-file publication before a session exists"),
     ("crates/broca-module-serve/tests/llm_runner_conformance.rs", "connection", "Stand-in HELLO nonce publication before a session exists"),
     ("crates/broca-module-serve/tests/llm_runner_conformance.rs", "describe_diagnostics_follow_each_call_across_two_routes_on_one_worker", "role.describe dispatch logging does not open a session"),

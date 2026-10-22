@@ -306,11 +306,13 @@ impl Drop for AiMock {
 }
 
 impl AiMock {
+    /// Boot aimock on a port the kernel picks and read the real address from its stdout.
+    ///
+    /// aimock's CLI passes `--port 0` straight to Node's `server.listen`, so 0 really is an
+    /// ephemeral port. There is deliberately no way to ask for a fixed port: a fixed port is
+    /// one some unrelated local app can already hold, and the rig then fails for a reason that
+    /// has nothing to do with the code under test.
     async fn start(tag: &str, fixtures_json: &str) -> Option<AiMock> {
-        Self::start_on_port(tag, fixtures_json, 0).await
-    }
-
-    async fn start_on_port(tag: &str, fixtures_json: &str, port: u16) -> Option<AiMock> {
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-mod-aimock-{}-{tag}", std::process::id()));
         broca_test_support::remove_rig_dir(&dir);
@@ -329,7 +331,7 @@ impl AiMock {
             .arg("--fixtures")
             .arg(&fixture_path)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--host")
             .arg("127.0.0.1")
             .kill_on_drop(true)
@@ -370,16 +372,15 @@ impl AiMock {
             _ => {
                 broca_test_support::kill_and_reap(&mut child);
                 eprintln!("{}", broca_test_support::rig_process_logs(&dir, "aimock"));
+                let cause = aimock_port_conflict(&dir)
+                    .unwrap_or_else(|| "aimock never reported a listening port".to_string());
                 if aimock_required() {
                     let why = required_because().unwrap_or("unknown");
-                    panic!(
-                        "single_turn_module_e2e: aimock never reported a listening port \
-                         (REQUIRED by {why})"
-                    );
+                    panic!("single_turn_module_e2e: {cause} (REQUIRED by {why})");
                 }
                 eprintln!(
-                    "SKIP single_turn_module_e2e: aimock never reported a listening port. This \
-                     reports `ok` -- set BROCA_REQUIRE_AIMOCK=1 to make it a failure instead."
+                    "SKIP single_turn_module_e2e: {cause}. This reports `ok` -- set \
+                     BROCA_REQUIRE_AIMOCK=1 to make it a failure instead."
                 );
                 return None;
             }
@@ -390,6 +391,23 @@ impl AiMock {
             dir,
         })
     }
+}
+
+/// Name the cause when aimock exited because its listen address was already taken.
+///
+/// Node reports that on stderr as `Error: listen EADDRINUSE: address already in use
+/// 127.0.0.1:1337`. Quoting the address in the panic saves the reader opening the log.
+fn aimock_port_conflict(dir: &std::path::Path) -> Option<String> {
+    let stderr = std::fs::read_to_string(dir.join("aimock.stderr.log")).ok()?;
+    let line = stderr.lines().find(|line| line.contains("EADDRINUSE"))?;
+    let address = line
+        .split_once("address already in use")
+        .map_or(line, |(_, address)| address)
+        .trim();
+    Some(format!(
+        "aimock could not listen on {address}: EADDRINUSE, another process already holds \
+         that port"
+    ))
 }
 
 fn parse_listening_addr(line: &str) -> Option<String> {
@@ -508,6 +526,25 @@ struct VaultSeed {
     order: VaultSeedOrder,
 }
 
+/// Where the rig sends one provider's traffic instead of its catalog endpoint.
+///
+/// Both variants use the module's operator endpoint override (`providers.<id>.base_url` in the
+/// file named by `BROCA_CONFIG_PATH`), never `BROCA_PROVIDER_BASE_URL`: that mock override
+/// skips credential resolution, and the arms using these routes exist to exercise it.
+// Only the unix-gated vault arms construct a route; elsewhere the enum is matched but unbuilt.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy)]
+enum ProviderRoute<'a> {
+    /// Meta and Anthropic go to a capture server; the URL is its `http://host:port/v1` base.
+    MetaCapture(&'a str),
+    /// `atomic-chat` goes to aimock; the URL is aimock's bare `http://host:port` base.
+    ///
+    /// The shipped catalog points `atomic-chat` at `127.0.0.1:1337`, a port real desktop apps
+    /// also listen on. Routing it to aimock's own ephemeral port keeps the rig independent of
+    /// whatever else is running on the machine.
+    AtomicChat(&'a str),
+}
+
 /// The real subc-core daemon supervising the broca module + the fake-aft tool provider.
 struct Daemon {
     child: RefCell<broca_test_support::RigChild>,
@@ -602,11 +639,22 @@ impl Daemon {
         Self::start_with_vault(tag, credential_id, VaultSeedOrder::InvalidateThenMint, None).await
     }
 
-    /// Boot the rig with a real credentials vault holding one LIVE credential.
+    /// Boot the rig with a real credentials vault holding one LIVE credential, with
+    /// `atomic-chat` traffic sent to the aimock at `aimock_base_url`.
     // Only the unix-gated provider-401 arm uses this: it needs make_vault_unavailable.
     #[cfg(unix)]
-    async fn start_with_live_vault_credential(tag: &str, credential_id: &str) -> Option<Daemon> {
-        Self::start_with_vault(tag, credential_id, VaultSeedOrder::PutThenMint, None).await
+    async fn start_with_live_vault_credential(
+        tag: &str,
+        credential_id: &str,
+        aimock_base_url: &str,
+    ) -> Option<Daemon> {
+        Self::start_with_vault(
+            tag,
+            credential_id,
+            VaultSeedOrder::PutThenMint,
+            Some(ProviderRoute::AtomicChat(aimock_base_url)),
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -619,7 +667,7 @@ impl Daemon {
             tag,
             credential_id,
             VaultSeedOrder::PutThenMint,
-            Some(provider_base_url),
+            Some(ProviderRoute::MetaCapture(provider_base_url)),
         )
         .await
     }
@@ -628,7 +676,7 @@ impl Daemon {
         tag: &str,
         credential_id: &str,
         order: VaultSeedOrder,
-        provider_base_url: Option<&str>,
+        provider_route: Option<ProviderRoute<'_>>,
     ) -> Option<Daemon> {
         let claustrum = claustrum_bin();
         let ck_auth = ck_auth_bin();
@@ -673,7 +721,7 @@ impl Daemon {
                 credential_id: credential_id.to_string(),
                 order,
             }),
-            provider_base_url,
+            provider_route,
         )
         .await
     }
@@ -685,7 +733,7 @@ impl Daemon {
         aft_env: &[(&str, &str)],
         aft_modules: &[(&str, &str)],
         vault_seed: Option<VaultSeed>,
-        provider_base_url: Option<&str>,
+        provider_route: Option<ProviderRoute<'_>>,
     ) -> Option<Daemon> {
         // A test process running under subc supervision inherits that daemon's
         // attestation env (SUBC_MODULE_ID / SUBC_LAUNCH_NONCE); presenting it to THIS
@@ -773,10 +821,10 @@ impl Daemon {
                 serde_json::from_str(include_str!("../fixtures/fusiform-lkg-minimal.json"))
                     .expect("the checked-in minimal fusiform LKG is valid JSON");
             if seed.order == VaultSeedOrder::PutThenMint {
-                // `atomic-chat` is a shipped catalog overlay whose endpoint is the loopback
-                // address used by the live-vault 401 arm. Adding only the model fact here keeps
-                // `BROCA_PROVIDER_BASE_URL` unset, because that mock override deliberately skips
-                // credential resolution and would make the cache proof vacuous.
+                // `atomic-chat` is a shipped catalog overlay that the live-vault 401 arm routes
+                // to aimock through `ProviderRoute::AtomicChat`. Adding only the model fact here
+                // keeps `BROCA_PROVIDER_BASE_URL` unset, because that mock override deliberately
+                // skips credential resolution and would make the cache proof vacuous.
                 lkg["models"]["atomic-chat/cache-eviction-probe"] = json!({
                     "capability.attachment": false,
                     "capability.reasoning": false,
@@ -785,7 +833,7 @@ impl Daemon {
                     "limit.context": 8192
                 });
             }
-            if provider_base_url.is_some() {
+            if matches!(provider_route, Some(ProviderRoute::MetaCapture(_))) {
                 lkg["models"]["meta/muse-spark-1.1"] = json!({
                     "capability.attachment": false,
                     "capability.reasoning": true,
@@ -850,21 +898,26 @@ impl Daemon {
         for (key, value) in broca_env {
             config["modules"]["broca"]["env"][*key] = json!(value);
         }
-        if let Some(base_url) = provider_base_url {
-            let override_path = dir.join("meta-provider-overrides.jsonc");
+        if let Some(route) = provider_route {
+            let providers = match route {
+                // Anthropic points at the same capture host; its family appends
+                // `/v1/messages` itself, so it takes the host without the `/v1` suffix.
+                ProviderRoute::MetaCapture(base_url) => json!({
+                    "meta": {"base_url": base_url},
+                    "anthropic": {"base_url": base_url.trim_end_matches("/v1")}
+                }),
+                // The catalog base for this OpenAI-Chat provider ends in `/v1`, and aimock
+                // serves `/v1/chat/completions`, so the override keeps that suffix.
+                ProviderRoute::AtomicChat(aimock_base_url) => json!({
+                    "atomic-chat": {"base_url": format!("{aimock_base_url}/v1")}
+                }),
+            };
+            let override_path = dir.join("provider-overrides.jsonc");
             setup(
-                "write Meta provider URL override",
+                "write provider URL override",
                 std::fs::write(
                     &override_path,
-                    // Anthropic points at the same capture host; its family appends
-                    // `/v1/messages` itself, so it takes the host without the `/v1` suffix.
-                    serde_json::to_vec(&json!({
-                        "providers": {
-                            "meta": {"base_url": base_url},
-                            "anthropic": {"base_url": base_url.trim_end_matches("/v1")}
-                        }
-                    }))
-                    .unwrap(),
+                    serde_json::to_vec(&json!({ "providers": providers })).unwrap(),
                 )
                 .ok(),
             )?;
@@ -920,7 +973,7 @@ impl Daemon {
             // exist: an explicitly named missing file is refused so a typo cannot start
             // cleanly and route every provider to API keys. The rig writes an isolated file
             // containing only the defaults the test intends to exercise.
-            let method_defaults = if provider_base_url.is_some() {
+            let method_defaults = if matches!(provider_route, Some(ProviderRoute::MetaCapture(_))) {
                 json!({"defaults": {"meta": "oauth", "anthropic": "oauth"}})
             } else {
                 json!({"defaults": {}})
@@ -2576,6 +2629,33 @@ async fn a_dead_credential_pauses_the_run_durably() {
     );
 }
 
+/// The loopback address the shipped catalog overlay gives the `atomic-chat` provider.
+#[cfg(unix)]
+const ATOMIC_CHAT_CATALOG_ADDR: &str = "127.0.0.1:1337";
+
+/// Make sure something is listening on [`ATOMIC_CHAT_CATALOG_ADDR`] for as long as the
+/// returned guard lives.
+///
+/// Returns the listener when this test bound the port, or `None` when another process
+/// already holds it, which leaves the port just as occupied.
+#[cfg(unix)]
+fn occupy_atomic_chat_catalog_port() -> Option<std::net::TcpListener> {
+    match std::net::TcpListener::bind(ATOMIC_CHAT_CATALOG_ADDR) {
+        Ok(listener) => Some(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "single_turn_module_e2e: {ATOMIC_CHAT_CATALOG_ADDR} is already held by another \
+                 process; the 401 arm runs with it occupied either way"
+            );
+            None
+        }
+        Err(error) => panic!(
+            "single_turn_module_e2e: cannot occupy {ATOMIC_CHAT_CATALOG_ADDR} to prove the rig \
+             does not depend on it: {error}"
+        ),
+    }
+}
+
 #[cfg(unix)]
 const VAULT_REJECTION_FIXTURES: &str = r#"{
   "fixtures": [
@@ -2607,18 +2687,31 @@ const VAULT_REJECTION_FIXTURES: &str = r#"{
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_cache() {
-    let aimock = AiMock::start_on_port("vault-provider-401", VAULT_REJECTION_FIXTURES, 1337).await;
+    // The shipped catalog points `atomic-chat` at this loopback port, and real desktop apps
+    // listen on it too. Keep it occupied for the whole test -- by this listener when it is free,
+    // by whatever already holds it otherwise -- so the arm passes only when aimock boots on its
+    // own port and the provider route really reaches it. When this test binds the port, its
+    // listener never accepts, so a request that strays there hangs into the run timeout instead
+    // of receiving aimock's 401; when another process owns it, that process decides the reply,
+    // which is still not aimock's 401.
+    let _catalog_port = occupy_atomic_chat_catalog_port();
+    let aimock = AiMock::start("vault-provider-401", VAULT_REJECTION_FIXTURES).await;
     if aimock.is_none() && vault_required() {
         panic!(
-            "single_turn_module_e2e: aimock did not start on the atomic-chat catalog port, but \
-             this run is REQUIRED by BROCA_REQUIRE_VAULT"
+            "single_turn_module_e2e: aimock did not start, but this run is REQUIRED by \
+             BROCA_REQUIRE_VAULT"
         );
     }
-    let Some(_aimock) = aimock else {
+    let Some(aimock) = aimock else {
         return;
     };
     let Some(daemon) = required_vault_daemon(
-        Daemon::start_with_live_vault_credential("vault-provider-401", "apikey:atomic-chat").await,
+        Daemon::start_with_live_vault_credential(
+            "vault-provider-401",
+            "apikey:atomic-chat",
+            &aimock.base_url,
+        )
+        .await,
     ) else {
         return;
     };
