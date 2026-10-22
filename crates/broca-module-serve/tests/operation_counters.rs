@@ -38,6 +38,8 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "spend.delta",
     "vault.audit",
     "session.subscribe",
+    // Served only on routes opened for the classifier role, and counted like the others.
+    "classify.run",
 ];
 
 #[derive(Clone, Debug)]

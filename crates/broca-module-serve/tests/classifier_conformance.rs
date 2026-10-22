@@ -193,7 +193,7 @@ async fn start_rig(name: &str) -> Option<Rig> {
         "classifier-conformance-{name}-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    broca_test_support::remove_rig_dir(&root);
     let (config_home, runtime_dir, data_home, home) = (
         root.join("config"),
         root.join("runtime"),
