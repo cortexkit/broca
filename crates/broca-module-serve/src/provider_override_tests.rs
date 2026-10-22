@@ -864,6 +864,97 @@ async fn withdrawn_mode_rate_resumes_with_the_frozen_service_tier() {
     assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
 }
 
+/// A `session.send` naming a catalog model whose stated `model.kind` is not `chat` is refused
+/// while the executor resolves the provider, before RunStarted, as a permanent configuration
+/// error naming the model and its kind (`open_failed`, class `permanent`, on the wire). A chat
+/// row with no stated kind in the same catalog resolves exactly as before.
+#[tokio::test]
+async fn a_non_chat_catalog_model_is_refused_at_admission() {
+    if !run_catalog_drift_child("a_non_chat_catalog_model_is_refused_at_admission") {
+        return;
+    }
+    // A chat row with no `model.kind`, beside fusiform's served Clef row.
+    let mut response = broca_catalog::FusiformCatalogResponse {
+        source: "test".into(),
+        resolved_at_ms: 0,
+        catalog_version: 1,
+        models: Default::default(),
+        withheld: vec![],
+        uncertain: vec![],
+    };
+    let tier_row = serde_json::json!({
+        "existence": "present",
+        "limit.context": 200000,
+        "capability.attachment": false,
+        "capability.reasoning": false,
+        "capability.tool_call": true,
+    });
+    response.models.insert(
+        "anthropic/resume-tier".into(),
+        serde_json::from_value(tier_row).unwrap(),
+    );
+    response.models.insert(
+        "cloudflare-workers-ai/@cf/cloudflare/clef".into(),
+        serde_json::from_value(serde_json::json!({
+            "capability.attachment": true,
+            "existence": "present",
+            "limit.context": 65536,
+            "model.kind": "decision",
+            "rate.input": {"currency": "USD", "exponent": 9, "state": "priced",
+                           "unit_provenance": {"kind": "stated"}, "units": 240000000},
+            "rate.output": {"state": "stated_zero"},
+        }))
+        .unwrap(),
+    );
+    let cache = Arc::new(broca_catalog::CatalogCache::empty());
+    cache
+        .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
+        .unwrap();
+    broca_catalog::install_global_catalog_cache(cache);
+
+    let auth = AuthResolution {
+        mode: AuthMode::Bearer("test-key".into()),
+        pause: None,
+        selection: None,
+        method: Some(AuthMethod::ApiKey),
+        project_id: None,
+        account_id: None,
+        record_version: None,
+        in_run_refresh: None,
+    };
+    let resolve = |model: &str| {
+        resolve_provider_for_episode(
+            model,
+            None,
+            None,
+            &auth,
+            &broca_catalog::live::ResolveOptions {
+                auth_method: Some(AuthMethod::ApiKey),
+                ..Default::default()
+            },
+            broca_provider::build_provider_http_client(),
+            broca_catalog::live::EpisodeRenderConfig::default(),
+        )
+    };
+    let error = match resolve("cloudflare-workers-ai/@cf/cloudflare/clef") {
+        Err(error) => error,
+        Ok(_) => panic!("a decision model must not resolve for a chat send"),
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("'cloudflare-workers-ai/@cf/cloudflare/clef'")
+            && message.contains("decision model"),
+        "{message}"
+    );
+    let run_error = RunError::from(error);
+    assert!(matches!(run_error, RunError::Config(_)), "{run_error}");
+    assert_eq!(
+        run_error.admission_error_class(),
+        broca_protocol::ErrorClass::Permanent
+    );
+    resolve("anthropic/resume-tier").expect("a chat row with no stated kind still resolves");
+}
+
 /// Install a one-model catalog whose only varying fact is its models.dev `reasoning_options`.
 fn install_variant_revision(reasoning_options: serde_json::Value) {
     let json = serde_json::json!({"anthropic": {

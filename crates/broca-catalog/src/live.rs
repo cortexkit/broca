@@ -347,6 +347,29 @@ impl std::fmt::Display for ResolutionError {
     }
 }
 impl std::error::Error for ResolutionError {}
+
+/// Refuse a catalog model whose stated `model.kind` is not `chat`.
+///
+/// A decision or extraction model (for example Cloudflare's `@cf/cloudflare/clef`) answers a
+/// typed schema, not a conversation, so `session.send` must not render a chat request to it.
+/// The refusal is a [`ResolutionError::Config`], the same permanent pre-admission refusal a
+/// withdrawn or unknown model gets: it surfaces as `open_failed` with class `permanent`, and
+/// nothing durable is written. A model with no stated kind admits exactly as before; absence is
+/// not a claim that the model is not chat.
+pub fn refuse_non_chat_model(
+    catalog: &crate::CatalogSnapshot,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<(), ResolutionError> {
+    match catalog.model_kind(provider_id, model_id) {
+        Some(kind) if kind != crate::runtime::MODEL_KIND_CHAT => Err(format!(
+            "catalog model '{provider_id}/{model_id}' is a {kind} model (model.kind \
+             \"{kind}\"), not a chat model; session.send serves only chat models"
+        )
+        .into()),
+        _ => Ok(()),
+    }
+}
 impl From<ResolutionError> for broca_core::RunError {
     fn from(value: ResolutionError) -> Self {
         match value {
@@ -948,6 +971,7 @@ fn resolve_provider_inner(
             "catalog model '{provider_id}/{model_id}' was withdrawn upstream; choose a different model for this episode"
         ).into());
     }
+    refuse_non_chat_model(&catalog, provider_id, model_id)?;
 
     // Mode 2b: an AUTH METHOD selected a wire family that OVERRIDES the catalog provider's
     // (Google Antigravity → google-codeassist, OpenAI ChatGPT → openai-responses-chatgpt).
@@ -1910,6 +1934,70 @@ mod tests {
              or the provider is pending — not yet catalog-served; pass a base_url to reach it \
              as an openai-compatible endpoint)"
         );
+    }
+
+    /// The chat-send gate reads `model.kind`: a stated kind other than `chat` is refused as a
+    /// permanent configuration error naming the model and its kind; a stated `chat` and an
+    /// absent kind both admit.
+    #[test]
+    fn a_stated_non_chat_model_kind_is_refused_for_chat_sends() {
+        let chat_row = |kind: Option<&str>| {
+            let mut row = serde_json::json!({
+                "existence": "present",
+                "limit.context": 200000,
+                "capability.attachment": false,
+                "capability.reasoning": false,
+                "capability.tool_call": true,
+            });
+            if let Some(kind) = kind {
+                row["model.kind"] = serde_json::json!(kind);
+            }
+            row
+        };
+        let response: crate::FusiformCatalogResponse = serde_json::from_value(serde_json::json!({
+            "source": "test",
+            "resolved_at_ms": 0,
+            "catalog_version": 1,
+            "models": {
+                "anthropic/unstated": chat_row(None),
+                "anthropic/stated-chat": chat_row(Some("chat")),
+                "anthropic/embedder": chat_row(Some("embedding")),
+                "cloudflare-workers-ai/@cf/cloudflare/clef": {
+                    "existence": "present",
+                    "model.kind": "decision",
+                    "limit.context": 65536,
+                    "capability.attachment": true,
+                },
+            },
+        }))
+        .expect("test response");
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(response, crate::CatalogSource::Fusiform)
+            .expect("installs");
+        let catalog = cache.snapshot().expect("installed");
+
+        let refused =
+            |provider: &str, model: &str| match refuse_non_chat_model(&catalog, provider, model) {
+                Err(ResolutionError::Config(message)) => message,
+                other => panic!("{provider}/{model} must be refused as Config, got {other:?}"),
+            };
+        assert_eq!(
+            refused("cloudflare-workers-ai", "@cf/cloudflare/clef"),
+            "catalog model 'cloudflare-workers-ai/@cf/cloudflare/clef' is a decision model \
+             (model.kind \"decision\"), not a chat model; session.send serves only chat models"
+        );
+        let embedder = refused("anthropic", "embedder");
+        assert!(embedder.contains("'anthropic/embedder'") && embedder.contains("embedding"));
+        let class =
+            broca_core::RunError::from(ResolutionError::Config(embedder)).admission_error_class();
+        assert_eq!(class, broca_protocol::ErrorClass::Permanent);
+
+        refuse_non_chat_model(&catalog, "anthropic", "stated-chat").expect("chat admits");
+        refuse_non_chat_model(&catalog, "anthropic", "unstated")
+            .expect("an absent kind admits exactly as before");
+        refuse_non_chat_model(&catalog, "anthropic", "not-listed")
+            .expect("an unlisted model is left to resolution's own refusal");
     }
 
     /// Resolve an id on the ChatGPT override path the way the serve layer does, with no

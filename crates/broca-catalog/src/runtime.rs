@@ -33,8 +33,14 @@ use crate::{Catalog, CatalogError, OVERLAY};
 /// The rate prefixes fetch base and context-bracket input, output, cache-read, and cache-write
 /// prices for cache maintenance, plus input/output mode prices for accepting sends. A missing
 /// mode rate is never replaced by a base rate; warming deliberately ignores mode prices.
+///
+/// `model.kind` says what a model does when fusiform states it (`chat`, or a decision or
+/// extraction model such as Cloudflare's System One rows). `session.send` serves chat only, so
+/// it refuses a model whose stated kind is anything else; an absent kind is not stated, never a
+/// claim of chat, and admits as before.
 pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "existence",
+    "model.kind",
     "limit.context",
     "limit.output",
     "capability.attachment",
@@ -52,6 +58,8 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
 const MODE_RATE_INPUT_PREFIX: &str = "rate.input.mode.";
 /// Prefix of a per-model output rate for one upstream mode, e.g. `rate.output.mode.fast`.
 const MODE_RATE_OUTPUT_PREFIX: &str = "rate.output.mode.";
+/// The `model.kind` value of a chat model, the only kind `session.send` admits.
+pub(crate) const MODEL_KIND_CHAT: &str = "chat";
 
 /// The successful `catalog.get` response persisted as the last-known-good document.
 ///
@@ -109,6 +117,19 @@ struct LoadedCatalog {
     /// A poll requesting prices must replace an equal-version last-known-good catalog snapshot
     /// that was fetched without prices.
     carries_warm_rates: bool,
+    /// Whether any row of the source document carried `model.kind`. Same reason as
+    /// `carries_output_limits`: an LKG fetched before broca requested the kind has the same
+    /// version as the next poll and no kinds, and reusing its index would keep admitting a
+    /// non-chat model to `session.send` until fusiform happened to mint a new version.
+    carries_model_kinds: bool,
+}
+
+/// Whether a response's model rows carry `model.kind`. Stops at the first row that has it.
+fn response_carries_model_kinds(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key("model.kind"))
 }
 
 /// Whether a response's model rows carry any mode rate. Stops at the first one.
@@ -172,6 +193,9 @@ struct ServingModel {
     /// not listed; see `priced_modes_fact`.
     priced_modes: Vec<String>,
     wire_family: Option<WireFamilyId>,
+    /// `model.kind` as served: `Some(kind)` when fusiform states one, `None` when it is absent
+    /// or null. `None` means the catalog does not say, never that the model is a chat model.
+    kind: Option<String>,
 }
 
 impl Default for ServingModel {
@@ -188,6 +212,7 @@ impl Default for ServingModel {
             reasoning_options: ReasoningOptions::Unstated,
             priced_modes: Vec::new(),
             wire_family: None,
+            kind: None,
         }
     }
 }
@@ -212,6 +237,8 @@ impl ServingModel {
             // that needs one.
             priced_modes: Vec::new(),
             wire_family: (model_family != provider_family).then_some(model_family),
+            // The vendored models.dev snapshot has no `model.kind`.
+            kind: None,
         }
     }
 
@@ -336,6 +363,16 @@ impl CatalogSnapshot {
         self.0.catalog.model_for_serving(provider_id, model_id)
     }
 
+    /// The model's `model.kind`: `Some(kind)` when the catalog states one, `None` when it does
+    /// not or the model is not in the serving index. `None` is "not stated"; a caller must not
+    /// read it as `chat`.
+    pub fn model_kind(&self, provider_id: &str, model_id: &str) -> Option<String> {
+        self.0
+            .catalog
+            .provider_and_model(provider_id, model_id)
+            .and_then(|(_, model)| model.kind.clone())
+    }
+
     /// Whether fusiform explicitly reports this identity as withdrawn.
     pub fn is_withdrawn(&self, provider_id: &str, model_id: &str) -> bool {
         self.0.catalog.is_withdrawn(provider_id, model_id)
@@ -403,14 +440,35 @@ impl ServingCatalog {
                             .or_default()
                             .insert(model_id.clone());
                     } else {
+                        let kind = model_kind_fact(identity, facts)?;
+                        // A row whose stated kind is not chat (a decision or extraction model)
+                        // can never be admitted by `session.send`, and fusiform's curated rows for
+                        // such models carry only the facts their source publishes: no reasoning
+                        // or tool-call flag, sometimes no context window. Requiring the chat
+                        // facts there would let one such row refuse the whole catalog, so they
+                        // decode as not stated. Rows without a stated non-chat kind keep the
+                        // strict chat contract described on `capability_fact`.
+                        let chat_row = kind.as_deref().is_none_or(|kind| kind == MODEL_KIND_CHAT);
+                        let flag = |fact: &'static str| {
+                            if chat_row {
+                                capability_fact(identity, facts, fact)
+                            } else {
+                                optional_capability_fact(identity, facts, fact)
+                            }
+                        };
+                        let context_limit = if chat_row || facts.contains_key("limit.context") {
+                            context_fact(identity, facts)?
+                        } else {
+                            None
+                        };
                         let mut model = ServingModel {
                             display_name: String::new(),
                             cost: warm_cost_fact(facts),
-                            context_limit: context_fact(identity, facts)?,
+                            context_limit,
                             output_limit: output_fact(identity, facts)?,
-                            attachment: capability_fact(identity, facts, "capability.attachment")?,
-                            reasoning: capability_fact(identity, facts, "capability.reasoning")?,
-                            tool_call: capability_fact(identity, facts, "capability.tool_call")?,
+                            attachment: flag("capability.attachment")?,
+                            reasoning: flag("capability.reasoning")?,
+                            tool_call: flag("capability.tool_call")?,
                             structured_output: optional_capability_fact(
                                 identity,
                                 facts,
@@ -419,6 +477,7 @@ impl ServingCatalog {
                             reasoning_options: reasoning_options_fact(identity, facts)?,
                             priced_modes: priced_modes_fact(identity, facts)?,
                             wire_family: None,
+                            kind,
                         };
                         if let Some(patch) = overlay.model_patch(&provider_id, &model_id) {
                             patch.apply(&mut model);
@@ -979,6 +1038,24 @@ fn priced_modes_fact(
     Ok(priced)
 }
 
+/// Read `model.kind`. Absent and null both mean the catalog does not state a kind and decode to
+/// `None`; that is never read as `chat`. A present value of another type is malformed and
+/// refuses the catalog, like every other fact.
+fn model_kind_fact(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+) -> Result<Option<String>, CatalogError> {
+    match facts.get("model.kind") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(kind)) => Ok(Some(kind.clone())),
+        Some(value) => Err(CatalogError::FusiformFact {
+            model: identity.to_string(),
+            fact: "model.kind".to_string(),
+            reason: format!("expected string or null, found {}", value_kind(value)),
+        }),
+    }
+}
+
 fn context_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
@@ -1414,6 +1491,7 @@ impl CatalogCache {
                 if response_carries_output_limits(&response) != current.carries_output_limits
                     || response_carries_mode_rates(&response) != current.carries_mode_rates
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
+                    || response_carries_model_kinds(&response) != current.carries_model_kinds
                 {
                     let rebuilt = Arc::new(loaded(&response, CatalogSource::Fusiform)?);
                     if let Some(path) = &self.lkg_path {
@@ -1437,6 +1515,7 @@ impl CatalogCache {
                     carries_output_limits: current.carries_output_limits,
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
+                    carries_model_kinds: current.carries_model_kinds,
                 });
                 *self.current.write().expect("catalog cache lock poisoned") = Some(refreshed);
                 return Ok(());
@@ -1509,6 +1588,8 @@ impl CatalogCache {
             carries_output_limits: true,
             carries_mode_rates: false,
             carries_warm_rates: true,
+            // The vendored snapshot serves no `model.kind`.
+            carries_model_kinds: false,
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
     }
@@ -1562,6 +1643,7 @@ fn loaded(
         carries_output_limits: response_carries_output_limits(response),
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
+        carries_model_kinds: response_carries_model_kinds(response),
     })
 }
 
@@ -1830,8 +1912,18 @@ fn response_carries_warm_rates(response: &FusiformCatalogResponse) -> bool {
 
 /// Rates are independent optional facts. An unfamiliar state, currency, or malformed amount
 /// makes that price unavailable for maintenance, without preventing ordinary model admission.
+///
+/// `stated_zero` with no amount (`{"state":"stated_zero"}`, how fusiform serves "output tokens
+/// are free") is a known price of zero, not a missing one. With an amount it must still be a
+/// USD zero, so a stated zero carrying non-zero units stays unavailable.
 fn warm_rate(value: Option<&Value>) -> Option<f64> {
     let rate = value?.as_object()?;
+    if rate.get("state").and_then(Value::as_str) == Some("stated_zero")
+        && !rate.contains_key("units")
+        && !rate.contains_key("exponent")
+    {
+        return Some(0.0);
+    }
     if rate.get("currency")?.as_str()? != "USD"
         || !matches!(rate.get("state")?.as_str()?, "priced" | "stated_zero")
     {
@@ -2454,6 +2546,269 @@ mod tests {
             ("rate.cache_read.mode.fast".into(), priced_rate(450_000_000)),
         ]);
         assert_eq!(warm_cost_fact(&facts), CostSchedule::default());
+    }
+
+    /// fusiform serves a free output side as `{"state":"stated_zero"}` with no currency, units
+    /// or exponent. That is a known price of zero, and reading it as "no price" would make cache
+    /// maintenance refuse a model whose cost is fully published. A stated zero that does carry
+    /// an amount must still be a USD zero.
+    #[test]
+    fn an_amountless_stated_zero_rate_is_a_known_zero_price() {
+        assert_eq!(
+            warm_rate(Some(&serde_json::json!({"state": "stated_zero"}))),
+            Some(0.0)
+        );
+        for value in [
+            serde_json::json!({"state":"stated_zero","currency":"USD","exponent":9,"units":1}),
+            serde_json::json!({"state":"stated_zero","units":1}),
+            serde_json::json!({"state":"stated_zero","exponent":9}),
+            serde_json::json!({"state":"unpriced"}),
+        ] {
+            assert_eq!(warm_rate(Some(&value)), None, "{value}");
+        }
+
+        // The same reading through the catalog, on fusiform's served Clef row.
+        let cache = CatalogCache::empty();
+        cache
+            .refresh(curated_response(1))
+            .expect("curated rows load");
+        let schedule = cache
+            .snapshot()
+            .expect("installed")
+            .warm_cost_schedule("cloudflare-workers-ai", "@cf/cloudflare/clef")
+            .expect("clef is served");
+        assert_eq!(
+            schedule.output,
+            Some(0.0),
+            "a free output side is priced at zero"
+        );
+        assert_eq!(schedule.input, Some(0.24));
+    }
+
+    /// fusiform's served pages for its curated System One rows, vendored byte-for-byte from
+    /// fusiform 69a15bb `crates/fusiform-module/fixtures/served-payloads.json` (cases "a curated
+    /// decision model", "a curated extraction model" and "a provider served only through
+    /// curated rows"). Each case is one `catalog.get` page; this merges their model rows.
+    fn curated_rows() -> BTreeMap<String, BTreeMap<String, Value>> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/fusiform-served-curated-system-one.json"
+        ))
+        .expect("vendored curated fixture parses");
+        let mut rows = BTreeMap::new();
+        for case in fixture.as_object().expect("named cases").values() {
+            let page: FusiformCatalogResponse = serde_json::from_value(case["response"].clone())
+                .expect("a served curated page decodes as a catalog response");
+            rows.extend(page.models);
+        }
+        assert_eq!(rows.len(), 3, "clef, clairic and jev");
+        rows
+    }
+
+    fn curated_response(catalog_version: i64) -> FusiformCatalogResponse {
+        FusiformCatalogResponse {
+            source: "models.dev".into(),
+            resolved_at_ms: 1,
+            catalog_version,
+            models: curated_rows(),
+            withheld: Vec::new(),
+            uncertain: Vec::new(),
+        }
+    }
+
+    /// Placing fusiform's curated decision and extraction rows in a page of ordinary chat rows
+    /// must not refuse the refresh, must not move any chat row, and must make the new ids
+    /// resolvable by their full catalog id.
+    ///
+    /// The rows carry only what their source publishes: Clef and Clairic have no reasoning or
+    /// tool-call flag, and TypeSafe's Jev has no context window either. Under the chat-row
+    /// contract each of those absences refuses the WHOLE catalog, so before non-chat rows were
+    /// decoded leniently this refresh was refused and the daemon kept its old catalog.
+    ///
+    /// Identities split at the FIRST `/`: `cloudflare-workers-ai/@cf/cloudflare/clef` is
+    /// provider `cloudflare-workers-ai`, model `@cf/cloudflare/clef`.
+    #[test]
+    fn curated_system_one_rows_refresh_beside_chat_rows_without_moving_them() {
+        let live: FusiformCatalogResponse = serde_json::from_str(include_str!(
+            "../tests/fixtures/fusiform_catalog_get_live.json"
+        ))
+        .expect("captured live fusiform response must deserialize");
+        let cache = CatalogCache::empty();
+        cache
+            .refresh(live.clone())
+            .expect("the live chat catalog loads");
+        let before = cache.snapshot().expect("installed");
+
+        let mut next = live.clone();
+        next.catalog_version += 1;
+        next.models.extend(curated_rows());
+        assert_eq!(
+            next.models.len(),
+            live.models.len() + 3,
+            "the curated ids are new"
+        );
+        cache
+            .refresh(next)
+            .expect("a page carrying curated System One rows must be accepted, not refused");
+        let after = cache.snapshot().expect("installed");
+        assert_eq!(after.catalog_version(), live.catalog_version + 1);
+        assert!(
+            !after.shares_index_with(&before),
+            "the new page was materialized"
+        );
+
+        let mut compared = 0usize;
+        for identity in live.models.keys() {
+            let (provider_id, model_id) = identity.split_once('/').expect("catalog id");
+            assert_eq!(
+                after.model_for_serving(provider_id, model_id),
+                before.model_for_serving(provider_id, model_id),
+                "chat row {identity} moved"
+            );
+            assert_eq!(
+                after.is_withdrawn(provider_id, model_id),
+                before.is_withdrawn(provider_id, model_id)
+            );
+            assert_eq!(after.model_kind(provider_id, model_id), None);
+            compared += 1;
+        }
+        assert_eq!(compared, 6_328, "every chat row was compared");
+
+        for (model_id, kind) in [
+            ("@cf/cloudflare/clef", "decision"),
+            ("@cf/cloudflare/clairic", "extraction"),
+        ] {
+            let (provider, model) = after
+                .model_for_serving("cloudflare-workers-ai", model_id)
+                .unwrap_or_else(|| panic!("{model_id} resolves by its full catalog id"));
+            assert_eq!(model.id, model_id, "the model part keeps its slashes");
+            assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
+            assert_eq!(model.limits.context, Some(65_536));
+            assert_eq!(model.capabilities.attachment, CapabilityFlag::Known(true));
+            assert_eq!(model.capabilities.reasoning, CapabilityFlag::Absent);
+            assert_eq!(model.capabilities.tool_call, CapabilityFlag::Absent);
+            assert_eq!(
+                after
+                    .model_kind("cloudflare-workers-ai", model_id)
+                    .as_deref(),
+                Some(kind)
+            );
+        }
+        // A split anywhere but the first slash names nothing.
+        assert!(!after.contains_model("cloudflare-workers-ai/@cf", "cloudflare/clef"));
+        assert!(!after.contains_model("cloudflare-workers-ai/@cf/cloudflare", "clef"));
+
+        // TypeSafe has no wire-family pin, so like every unpinned provider it is pending: its
+        // row is accepted and kept as an identity, but not served.
+        assert!(!after.contains_provider("typesafe"));
+        assert!(!after.contains_model("typesafe", "jev-1.13.0"));
+        assert!(!after.is_withdrawn("typesafe", "jev-1.13.0"));
+        assert!(after.0.model_identities.contains("typesafe/jev-1.13.0"));
+    }
+
+    /// `model.kind` decodes to `Some(kind)` when stated and `None` when absent or null; a value
+    /// of another type refuses the catalog. Only a stated non-chat kind relaxes the chat facts:
+    /// a row stating `chat`, or stating nothing, must still carry every one of them.
+    #[test]
+    fn model_kind_is_stated_or_absent_and_only_a_non_chat_kind_relaxes_chat_facts() {
+        for (fact, expected) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(serde_json::json!("chat")), Some("chat")),
+            (Some(serde_json::json!("decision")), Some("decision")),
+        ] {
+            let mut page = response(10);
+            if let Some(fact) = fact.clone() {
+                page.models
+                    .get_mut("anthropic/claude-sonnet-4-5")
+                    .unwrap()
+                    .insert("model.kind".into(), fact);
+            }
+            let cache = CatalogCache::empty();
+            cache.refresh(page).expect("loads");
+            assert_eq!(
+                cache
+                    .snapshot()
+                    .unwrap()
+                    .model_kind("anthropic", "claude-sonnet-4-5")
+                    .as_deref(),
+                expected,
+                "{fact:?}"
+            );
+        }
+        let mut page = response(10);
+        page.models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert("model.kind".into(), serde_json::json!(1));
+        assert!(loaded_err_names_fact(&page, "model.kind"));
+
+        for fact in [
+            "capability.reasoning",
+            "capability.tool_call",
+            "limit.context",
+        ] {
+            let mut page = response(10);
+            let row = page.models.get_mut("anthropic/claude-sonnet-4-5").unwrap();
+            row.insert("model.kind".into(), serde_json::json!("chat"));
+            row.remove(fact);
+            assert!(
+                loaded_err_names_fact(&page, fact),
+                "a stated chat row missing {fact} must refuse the load"
+            );
+        }
+
+        // A malformed fact a non-chat row does carry is still refused.
+        let mut rows = curated_rows();
+        rows.get_mut("cloudflare-workers-ai/@cf/cloudflare/clef")
+            .unwrap()
+            .insert("capability.tool_call".into(), serde_json::json!("yes"));
+        let mut page = curated_response(1);
+        page.models = rows;
+        assert!(loaded_err_names_fact(&page, "capability.tool_call"));
+
+        // The kind survives the prefix filter the poll asks fusiform to apply.
+        let mut filtered = curated_response(1);
+        for facts in filtered.models.values_mut() {
+            facts.retain(|fact, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| fact.starts_with(prefix))
+            });
+        }
+        let served = loaded(&filtered, CatalogSource::Fusiform).expect("filtered rows load");
+        assert_eq!(
+            CatalogSnapshot(Arc::new(served))
+                .model_kind("cloudflare-workers-ai", "@cf/cloudflare/clef")
+                .as_deref(),
+            Some("decision")
+        );
+    }
+
+    #[test]
+    fn an_equal_version_poll_that_newly_carries_model_kinds_rebuilds_the_index() {
+        let cache = CatalogCache::empty();
+        let first = response(100);
+        let version = first.catalog_version;
+        cache.refresh(first).expect("install");
+        let before = cache.snapshot().expect("installed");
+        assert_eq!(before.model_kind("anthropic", "claude-sonnet-4-5"), None);
+
+        let mut upgraded = response(200);
+        upgraded.catalog_version = version;
+        upgraded
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .expect("fixture row")
+            .insert("model.kind".into(), serde_json::json!("decision"));
+        cache.refresh(upgraded).expect("same-version refresh");
+        let after = cache.snapshot().expect("installed");
+        assert!(!before.shares_index_with(&after));
+        assert_eq!(
+            after
+                .model_kind("anthropic", "claude-sonnet-4-5")
+                .as_deref(),
+            Some("decision")
+        );
     }
 
     fn priced_rate(units: u64) -> Value {
