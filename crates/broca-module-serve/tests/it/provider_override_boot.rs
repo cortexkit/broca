@@ -121,8 +121,11 @@ fn a_missing_named_config_file_refuses_boot() {
     .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
+    // The boot error reaches stderr Debug-formatted, which doubles every backslash in a
+    // Windows path, so match the file name rather than the full path.
+    let file_name = missing.file_name().unwrap().to_string_lossy();
     assert!(
-        error.contains("BROCA_CONFIG_PATH") && error.contains(&missing.display().to_string()),
+        error.contains("BROCA_CONFIG_PATH") && error.contains(file_name.as_ref()),
         "a missing named config file must refuse boot by name: {error}"
     );
     let _ = std::fs::remove_dir_all(&data_home);
