@@ -1720,6 +1720,14 @@ async fn handle_control_request(
                 // happened. The pair is what discriminates: streak 0 with total non-zero says
                 // "occurred and recovered", which is when to go read the producer's poll history.
                 metrics["catalog_refusals_total"] = serde_json::json!(catalog.total_refusals);
+                // Rows of the served catalog left out (or kept at their previous model) because
+                // one of their facts could not be used. A successful refresh with exclusions is
+                // not a refusal, so neither counter above moves; this count is where one bad row
+                // shows, and a sudden large count means an upstream fault spoiling many rows.
+                // Emitted at zero like the counters above; the reason is null when none.
+                metrics["catalog_rows_excluded"] = serde_json::json!(catalog.rows_excluded);
+                metrics["catalog_rows_excluded_reason"] =
+                    serde_json::json!(catalog.rows_excluded_reason);
             }
             if vault.last_error_ms > 0 {
                 metrics["last_vault_error_ms"] = serde_json::json!(vault.last_error_ms);

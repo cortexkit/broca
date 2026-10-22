@@ -2787,6 +2787,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // one half of a two-field adoption and was blind to the other.
         "catalog_refusals",
         "catalog_refusals_total",
+        // Present rows of the served catalog that could not be used and were left out or kept
+        // at their previous model. A healthy catalog reads 0 with a null reason; a bad row
+        // shows here rather than as a refusal, because the rest of the catalog still refreshed.
+        "catalog_rows_excluded",
+        "catalog_rows_excluded_reason",
         // The charge-basis table new facts are resolved against, as the facts carry it, and
         // how many local override rows make it up. A deployment with no override reads
         // "none" and 0; an override swap check compares these instead of scraping logs.
@@ -2880,6 +2885,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["catalog_source"], serde_json::json!("lkg"));
     assert_eq!(metrics["catalog_refusals"], serde_json::json!(0));
     assert_eq!(metrics["catalog_refusals_total"], serde_json::json!(0));
+    assert_eq!(metrics["catalog_rows_excluded"], serde_json::json!(0));
+    assert_eq!(
+        metrics["catalog_rows_excluded_reason"],
+        serde_json::Value::Null
+    );
     assert_eq!(metrics["charge_basis_overrides"], serde_json::json!("none"));
     assert_eq!(metrics["charge_basis_override_rows"], serde_json::json!(0));
     // Zero is the healthy reading: this rig's provider reports no transformations, and any

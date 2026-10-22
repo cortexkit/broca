@@ -17593,8 +17593,8 @@ target = "--lib"
 test_file = "crates/broca-catalog/src/runtime.rs"
 expect_red = ["runtime::tests::structured_output_fact_maps_to_a_three_state_capability"]
 file = "crates/broca-catalog/src/runtime.rs"
-old = '''                                "capability.structured_output",'''
-new = '''                                "capability.structured_outputs", // NON-VACUITY BREAK: read the wrong fact.'''
+old = '''            "capability.structured_output",'''
+new = '''            "capability.structured_outputs", // NON-VACUITY BREAK: read the wrong fact.'''
 
 [[control]]
 id = "structured-output-anthropic-never-forces"
@@ -22911,3 +22911,56 @@ new = """    // NON-VACUITY BREAK: load every session's WAL before emitting any.
     }
     for (records, run_ids) in loaded {
         for run_id in &run_ids {"""
+
+[[control]]
+id = "catalog-one-unusable-row-does-not-refuse-the-refresh"
+guards = "A present fusiform row with an unusable fact is excluded on its own; the rest of the catalog still refreshes"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = [
+  "runtime::tests::a_never_seen_malformed_row_is_excluded_with_a_warn_and_the_counter",
+  "runtime::tests::a_served_row_that_arrives_malformed_keeps_its_previous_model",
+  "runtime::tests::document_level_problems_still_refuse_beside_an_excluded_row",
+  "runtime::tests::a_served_null_output_limit_decodes_to_none_not_zero",
+  "runtime::tests::structured_output_fact_maps_to_a_three_state_capability",
+]
+file = "crates/broca-catalog/src/runtime.rs"
+old = "                        match serving_model_from_facts(identity, facts) {"
+new = "                        match Ok::<_, CatalogError>(serving_model_from_facts(identity, facts)?) { // NON-VACUITY BREAK: one bad row refuses the whole catalog."
+
+[[control]]
+id = "catalog-malformed-served-row-keeps-its-previous-model"
+guards = "A row the installed catalog served keeps its previous model when it arrives malformed, rather than disappearing"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::a_served_row_that_arrives_malformed_keeps_its_previous_model"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = "                                if let Some(model) = kept {"
+new = "                                if let Some(model) = kept.filter(|_| false) { // NON-VACUITY BREAK: drop the previous model."
+
+[[control]]
+id = "catalog-absent-reasoning-reads-as-unknown"
+guards = "An omitted fusiform capability.reasoning reads as unknown like null, so a send that would reason is refused instead of running without reasoning"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = [
+  "runtime::tests::a_reasoning_row_that_loses_its_flag_refuses_a_reasoning_send",
+  "runtime::tests::a_model_missing_a_capability_or_context_fact_loads_it_as_unstated",
+  "runtime::tests::curated_decision_rows_beside_chat_rows_refresh_without_refusing",
+  "runtime::tests::curated_system_one_rows_refresh_beside_chat_rows_without_moving_them",
+]
+file = "crates/broca-catalog/src/runtime.rs"
+old = "            CapabilityFlag::Absent => CapabilityFlag::Unknown,"
+new = "            CapabilityFlag::Absent => CapabilityFlag::Absent, // NON-VACUITY BREAK: absent reasoning admits as false again."
