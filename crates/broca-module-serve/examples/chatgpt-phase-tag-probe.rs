@@ -468,7 +468,10 @@ struct Answer {
 
 impl Answer {
     fn accepted(&self) -> bool {
-        self.status == Some(200) && self.error.is_none() && self.finished
+        // The ChatGPT backend serves Responses over a websocket, whose successful upgrade is
+        // HTTP 101; the HTTPS fallback answers 200. Either is a success when the response
+        // finished without an error.
+        matches!(self.status, Some(200) | Some(101)) && self.error.is_none() && self.finished
     }
 
     fn cached(&self) -> u64 {
@@ -953,18 +956,18 @@ async fn live(model: &str, variant: Option<&str>, gap: Duration) -> Result<i32, 
         tagged_next_cached.unwrap_or(0),
     );
     if control_cached == 0 {
-        println!("VERDICT: ACCEPTED; CACHE INCONCLUSIVE: tagged requests returned 200, but the control's next turn read no cache, so there is nothing to compare.");
+        println!("VERDICT: ACCEPTED; CACHE INCONCLUSIVE: tagged requests succeeded, but the control's next turn read no cache, so there is nothing to compare.");
         return Ok(2);
     }
     let share = tagged_cached as f64 / control_cached as f64;
     if share >= COMPARABLE_CACHE_SHARE {
         println!(
-            "VERDICT: ACCEPTED: tagged requests returned 200 like the control; next-turn cache read tagged/control = {tagged_cached}/{control_cached} ({share:.2})."
+            "VERDICT: ACCEPTED: tagged requests succeeded like the control; next-turn cache read tagged/control = {tagged_cached}/{control_cached} ({share:.2})."
         );
         Ok(0)
     } else {
         println!(
-            "VERDICT: CACHE DIVERGED: tagged requests returned 200, but next-turn cache read tagged/control = {tagged_cached}/{control_cached} ({share:.2}) is below {COMPARABLE_CACHE_SHARE}."
+            "VERDICT: CACHE DIVERGED: tagged requests succeeded, but next-turn cache read tagged/control = {tagged_cached}/{control_cached} ({share:.2}) is below {COMPARABLE_CACHE_SHARE}."
         );
         Ok(4)
     }
