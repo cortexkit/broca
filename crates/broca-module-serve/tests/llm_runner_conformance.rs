@@ -164,6 +164,9 @@ struct Armed {
 struct Shared {
     #[cfg(feature = "test-clock")]
     mc_historian: std::sync::atomic::AtomicBool,
+    /// The `mid` of every message a `session.read` answered, keyed by the message's JSON: broca
+    /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
+    read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
@@ -1618,6 +1621,14 @@ impl RunnerRoute for BrocaRoute {
                 if let Some(run_id) = &polled_run {
                     self.observe_run_result(run_id, &value["result"]).await;
                 }
+                if method == "session.read" {
+                    let mut mids = self.subject.shared.read_mids.lock().unwrap();
+                    for entry in value["result"]["messages"].as_array().into_iter().flatten() {
+                        if let Some(mid) = entry["mid"].as_str() {
+                            mids.insert(entry["message"].to_string(), mid.to_owned());
+                        }
+                    }
+                }
                 Ok(Reply::Response(value["result"].clone()))
             }
             Err(error) => Ok(Reply::Error(error_body(&error))),
@@ -1894,22 +1905,43 @@ impl LlmRunnerSubject for BrocaSubject {
         tools: &[&str],
     ) -> Option<Map<String, Value>> {
         let mut fields = self.send_fields(session, first);
-        fields.insert(
-            "tools".into(),
-            Value::Array(
-                tools
-                    .iter()
-                    .map(|name| {
-                        json!({
-                            "name": name,
-                            "description": "Answers each call with its scripted result.",
-                            "input_schema": {"type": "object"},
-                            "module": TOOL_MODULE,
+        if first && tools.is_empty() && !compaction::known_session(&self.shared, session) {
+            // A tool-free session runs under a real plan that offers no tools. The plan
+            // replaces `system`, so its system-text item carries the session marker the
+            // scripted model identifies the session by.
+            let composition = json!({"providers":[{"provider":TOOL_MODULE,"tools":[]}],
+                "step_transform_items":[]});
+            fields.insert("tools".into(), Value::Null);
+            fields.insert("system".into(), Value::Null);
+            fields.insert(
+                "plan".into(),
+                json!({
+                    "tool_items":[],
+                    "system_text_items":[{"provider":TOOL_MODULE,"preset":"conformance",
+                        "params":{"session":session}}],
+                    "step_transform_items":[],
+                    "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+                    "composition":composition,
+                }),
+            );
+        } else {
+            fields.insert(
+                "tools".into(),
+                Value::Array(
+                    tools
+                        .iter()
+                        .map(|name| {
+                            json!({
+                                "name": name,
+                                "description": "Answers each call with its scripted result.",
+                                "input_schema": {"type": "object"},
+                                "module": TOOL_MODULE,
+                            })
                         })
-                    })
-                    .collect(),
-            ),
-        );
+                        .collect(),
+                ),
+            );
+        }
         // The session's route support picks the catalog row its model resolves against: the
         // rows `seed_structured_output_catalog` writes under the `xai` provider, using explicit
         // per-model Chat pins because Chat is the protocol the scripted model speaks.
@@ -1991,6 +2023,26 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .copied()
             .unwrap_or(0)
+    }
+
+    /// A read message's top-level parts, keyed as broca keys them: `<mid>#<index>`, the `mid`
+    /// being the one the read that served the message gave it.
+    fn read_parts(&self, message: &Value) -> Vec<(String, Value)> {
+        let mid = self
+            .shared
+            .read_mids
+            .lock()
+            .unwrap()
+            .get(&message.to_string())
+            .cloned()
+            .unwrap_or_else(|| "unread".into());
+        message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, part)| (format!("{mid}#{index}"), part.clone()))
+            .collect()
     }
 
     /// An image-only tool result. Broca keeps no image bytes: its tool plane maps the image to

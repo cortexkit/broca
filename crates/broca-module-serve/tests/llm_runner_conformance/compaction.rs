@@ -881,9 +881,35 @@ pub(super) fn catalog(request: &Value) -> Value {
     let composition = &args["composition"];
     let digest = cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap();
     let schema = json!({"type":"object"});
-    json!({"generation":"1","catalog_digest":"conformance","composition_digest":digest,
-        "tools":[{"name":SCRIPTED_TOOL,"schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
-            "semantics":1,"capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema}]})
+    // The scripted tool, unless the composition gives this provider no tools (a tool-free
+    // plan, which asks only for the system text below).
+    let tool_free = composition["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["provider"] == super::TOOL_MODULE)
+        .is_some_and(|entry| entry["tools"].as_array().is_some_and(Vec::is_empty));
+    let tools = if tool_free {
+        json!([])
+    } else {
+        json!([{"name":SCRIPTED_TOOL,"schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
+            "semantics":1,"capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema}])
+    };
+    let mut answer = json!({"generation":"1","catalog_digest":"conformance",
+        "composition_digest":digest,"tools":tools});
+    // A plan's system-text item names its session, so the system prompt carries the session
+    // marker the scripted model identifies the session by when the plan replaces `system`.
+    if let Some(session) = args["system_text"]["params"]["session"].as_str() {
+        let text = format!("{}{session}", super::SESSION_MARKER);
+        answer["system_text"] = json!({
+            "text": text,
+            "item_digest": cortexkit_role_tool_provider::catalog::system_text_digest(&text),
+            "preflight_digest": "conformance",
+            "composition_digest": digest,
+            "tool_names": if tool_free { json!([]) } else { json!([SCRIPTED_TOOL]) },
+        });
+    }
+    answer
 }
 
 #[test]
