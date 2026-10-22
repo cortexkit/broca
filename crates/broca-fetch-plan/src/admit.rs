@@ -376,6 +376,15 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    fn refused_field(&self) -> Option<&str> {
+        match self {
+            Self::Refused { code, detail, .. } | Self::ProviderRefused { code, detail, .. } => {
+                cortexkit_role_step_transform_provider::errors::refused_field(code, detail.as_ref())
+            }
+            Self::UnknownModule | Self::Lost(_) => None,
+        }
+    }
+
     /// Build a provider refusal after removing control characters from the diagnostic text and
     /// limiting it to 512 UTF-8 bytes.
     pub fn provider_refused(
@@ -919,22 +928,9 @@ pub async fn admit(
                         serde_error_kind(&error),
                     ))),
                 },
-                // The provider no longer knows the item's preset: the plan is stale.
-                Err(FetchError::Refused {
-                    code,
-                    detail,
-                    retryable,
-                }) if cortexkit_role_step_transform_provider::errors::refused_field(
-                    &code,
-                    detail.as_ref(),
-                ) == Some("preset") =>
-                {
-                    let miss = FetchMiss::from_error(FetchError::Refused {
-                        code,
-                        detail,
-                        retryable,
-                    });
-                    DeclarationOutcome::RefusedPreset(miss)
+                // A provider that no longer knows the item's preset makes the plan stale.
+                Err(error) if error.refused_field() == Some("preset") => {
+                    DeclarationOutcome::RefusedPreset(FetchMiss::from_error(error))
                 }
                 Err(error) => DeclarationOutcome::Unanswered(FetchMiss::from_error(error)),
             }
@@ -1584,6 +1580,38 @@ mod tests {
                 "field": "step_transform_items[0].preset",
                 "retryable": false,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_refused_declared_preset_stays_plan_stale() {
+        let plan = plan_with_declaration("magic-context");
+        let fetcher = ScriptedFetcher {
+            catalog_result: Ok(Value::Null),
+            declaration_result: Err(FetchError::provider_refused(
+                "invalid_params".into(),
+                Some(json!({"field": "preset"})),
+                "the declaration preset is no longer available",
+                false,
+            )),
+        };
+        let refusal = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/tmp/log-test", "runner", "preset-stale"),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the provider no longer knows the planned preset");
+
+        assert_eq!(refusal.code(), "plan_stale");
+        assert_eq!(
+            refusal.detail(),
+            json!({"differences":[{
+                "kind":"preset_missing",
+                "provider":"magic-context",
+                "preset":"worker"
+            }]})
         );
     }
 
