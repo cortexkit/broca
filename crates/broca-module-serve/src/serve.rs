@@ -2771,6 +2771,9 @@ where
             send_req.request.principal = bind.principal;
             send_req.request.scope = bind.scope;
             send_req.plan = plan;
+            let refusal_session_ref = send_req.session.session.clone();
+            let refusal_send_id = send_req.send_id.clone();
+            let refusal_delivery_mode = send_req.delivery.as_str();
             match handler.send(send_req).await {
                 Ok(resp) => {
                     let (result, delivered) = match resp {
@@ -2828,7 +2831,15 @@ where
                     };
                     send_json_response(writer, ver, channel, epoch, corr, &reply).await
                 }
-                Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
+                Err(error) => {
+                    log_refused_send(
+                        &refusal_session_ref,
+                        refusal_send_id.as_deref(),
+                        refusal_delivery_mode,
+                        &error,
+                    );
+                    send_serve_error(writer, ver, channel, epoch, corr, &error).await
+                }
             }
         }
         OP_IMPORT => {
@@ -3654,6 +3665,102 @@ async fn send_json_response<T: serde::Serialize>(
     )
     .map_err(|e| ServeIoError(e.to_string()))?;
     send(writer, frame).await
+}
+
+fn refused_send_code(error: &ServeError) -> String {
+    match error {
+        ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
+        ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
+        ServeError::SessionMoving { .. } => "session_moving".into(),
+        ServeError::SessionMoved { .. } => "session_moved".into(),
+        ServeError::Expired { .. } => broca_module::retention::EXPIRED.into(),
+        ServeError::RetentionInvalid(_) | ServeError::InvalidParams { .. } => {
+            broca_wire::INVALID_PARAMS.into()
+        }
+        ServeError::VariantUnsupported(_) => "variant_unsupported".into(),
+        ServeError::SessionHeld(_) => "session_held".into(),
+        ServeError::Open(_, _) => "open_failed".into(),
+        ServeError::HistoryUnreachable { .. } => broca_wire::HISTORY_UNREACHABLE.into(),
+        ServeError::ReplyTooLarge(_) => broca_wire::REPLY_TOO_LARGE.into(),
+        ServeError::RetainedSessionTooLarge { .. } => "retained_session_too_large".into(),
+        ServeError::SessionTooLarge { .. } => "session_too_large".into(),
+        ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER.into(),
+        ServeError::SendRetracted { .. } => "send_retracted".into(),
+        ServeError::SendEnded { .. } => "send_ended".into(),
+        ServeError::DeliveryRefused { code, .. } => (*code).into(),
+        ServeError::TemplatePartGone { .. } => {
+            cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE.into()
+        }
+        ServeError::SendIdReuse { .. } => "send_id_reuse".into(),
+        ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient".into(),
+        ServeError::BaselineRequired => "baseline_required".into(),
+        ServeError::CapUnavailable(_) => "cap_unavailable".into(),
+        ServeError::BudgetDenied { .. } => "budget_denied".into(),
+        ServeError::Import(_) => "import_rejected".into(),
+        ServeError::ImportIdReuse => "import_id_reuse".into(),
+        ServeError::ImportBusy => "import_busy".into(),
+        ServeError::LineageChanged { .. } => broca_wire::LINEAGE_CHANGED.into(),
+        ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID.into(),
+        ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN.into(),
+        ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. } => {
+            scope_error_bytes(error)
+                .ok()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                .and_then(|body| body.get("code")?.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "scope_refused".into())
+        }
+        ServeError::PlanRefused(refusal) => refusal.code().into(),
+        ServeError::AccountSelectionRefused(refusal) => refusal.routing_code.clone(),
+        ServeError::WarmRefused(refusal) => refusal.code.clone(),
+        ServeError::RunPaused(_) => "run_paused".into(),
+        ServeError::PreUserUnavailable { .. } => broca_module::serve::PRE_USER_UNAVAILABLE.into(),
+    }
+}
+
+fn shared_class_name(class: broca_protocol::ErrorClass) -> &'static str {
+    match class.shared_class() {
+        broca_protocol::ErrorClass::Transient => "transient",
+        broca_protocol::ErrorClass::Permanent => "permanent",
+        broca_protocol::ErrorClass::Auth => "auth_required",
+        broca_protocol::ErrorClass::ContextOverflow => "context_overflow",
+        broca_protocol::ErrorClass::ProviderUnavailable => unreachable!(
+            "shared_class maps provider-local unavailable to the shared transient class"
+        ),
+    }
+}
+
+fn refused_send_class(error: &ServeError) -> &'static str {
+    match error {
+        ServeError::Open(_, Some(class)) => shared_class_name(*class),
+        ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
+        ServeError::Transient(_)
+        | ServeError::TagsAwaitSetup
+        | ServeError::SessionMoving { .. }
+        | ServeError::SessionMoved { .. }
+        | ServeError::SessionHeld(_)
+        | ServeError::ScopeFreezeBusy { .. }
+        | ServeError::ImportBusy => "transient",
+        _ => "permanent",
+    }
+}
+
+fn log_refused_send(
+    session_ref: &str,
+    send_id: Option<&str>,
+    delivery_mode: &str,
+    error: &ServeError,
+) {
+    let refusal_code = refused_send_code(error);
+    let class = refused_send_class(error);
+    tracing::info!(
+        target: "session.send",
+        session_ref,
+        send_id = send_id.unwrap_or(""),
+        delivery_mode,
+        refusal_code = %refusal_code,
+        class,
+        "session.send refused"
+    );
 }
 
 async fn send_serve_error(
@@ -4618,6 +4725,37 @@ mod tests {
         assert_eq!(log.fields["actor_opened"], "true");
         assert_eq!(log.fields["elapsed_us"], "17");
         assert_eq!(log.fields["message"], "served management request");
+    }
+
+    #[test]
+    fn refused_session_send_logs_identity_code_and_class_without_error_text() {
+        use tracing_subscriber::prelude::*;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info,session.send=info"))
+            .with(RequestLogCapture(events.clone()));
+        let error = ServeError::DeliveryRefused {
+            code: "idle_start_not_granted",
+            message: "private prompt and argument content".into(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_refused_send("session-ref-7", Some("send-9"), "steer", &error);
+        });
+
+        let logs = events.lock().unwrap().clone();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let log = &logs[0];
+        assert_eq!(log.target, "session.send");
+        assert_eq!(log.level, tracing::Level::INFO);
+        assert_eq!(log.fields["session_ref"], "session-ref-7");
+        assert_eq!(log.fields["send_id"], "send-9");
+        assert_eq!(log.fields["delivery_mode"], "steer");
+        assert_eq!(log.fields["refusal_code"], "idle_start_not_granted");
+        assert_eq!(log.fields["class"], "permanent");
+        assert_eq!(log.fields["message"], "session.send refused");
+        assert!(!format!("{:?}", log.fields).contains("private prompt and argument content"));
     }
 
     #[test]
