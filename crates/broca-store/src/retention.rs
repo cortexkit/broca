@@ -272,6 +272,30 @@ impl SqliteStore {
         self.upsert_retention_lineage_with_withdrawals(lineage, runs, &[])
     }
 
+    /// Attach one admitted run's row to its session's live retained lineage without replaying
+    /// the WAL. The session actor calls this at admission because its bounded retention sync
+    /// may skip projecting run rows when the WAL is long or the lineage summary is already
+    /// current. The row changes only while it has no lineage and the live, unexpired lineage
+    /// row for the same session exists, so a forever or expired lineage is never stamped.
+    /// Like every retained run row, its title is cleared. Returns whether the row changed.
+    pub fn stamp_retained_run_lineage(
+        &self,
+        run_id: &str,
+        session: &BindIdentity,
+        lineage_id: &str,
+    ) -> Result<bool, StoreError> {
+        let session_json = serde_json::to_string(session)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE run_index SET lineage_id=?3, title=NULL
+              WHERE run_id=?1 AND session=?2 AND lineage_id IS NULL
+                AND EXISTS(SELECT 1 FROM retention_lineage
+                           WHERE lineage_id=?3 AND session=?4 AND expired_at_ms IS NULL)",
+            params![run_id, session_json, lineage_id, Self::key(session)],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Expiry accounting and identity-only withdrawal export commit before content deletion.
     pub fn upsert_retention_lineage_with_withdrawals(
         &self,
@@ -489,6 +513,86 @@ mod tests {
         assert!(
             steps < 200,
             "lineage lookup walked unrelated runs: {steps} VM steps"
+        );
+    }
+
+    #[test]
+    fn admission_stamp_attaches_only_live_retained_lineages_and_clears_titles() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let live = BindIdentity::new("/p", "h", "live");
+        let gone = BindIdentity::new("/p", "h", "gone");
+        let forever = BindIdentity::new("/p", "h", "forever");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO retention_lineage VALUES
+                    ('live', ?1, 1, 0, 1, 0, NULL), ('gone', ?2, 1, 0, NULL, 0, 2)",
+                params![SqliteStore::key(&live), SqliteStore::key(&gone)],
+            )
+            .unwrap();
+        }
+        for (run, session) in [
+            ("later", &live),
+            ("owned", &live),
+            ("expired", &gone),
+            ("forever", &forever),
+        ] {
+            store
+                .index_run_active(&RunIndexRow {
+                    run_id: run.into(),
+                    session: session.clone(),
+                    submission_id: None,
+                    request_identity_digest: None,
+                    state: RunIndexState::Active,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: Some("title".into()),
+                    withdrawals_owed: false,
+                })
+                .unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE run_index SET lineage_id='other' WHERE run_id='owned'",
+                [],
+            )
+            .unwrap();
+        let stamp = |run: &str, session: &BindIdentity, lineage: &str| {
+            store
+                .stamp_retained_run_lineage(run, session, lineage)
+                .unwrap()
+        };
+        assert!(stamp("later", &live, "live"));
+        // Each refusal names the property that keeps the row unchanged.
+        assert!(!stamp("later", &live, "live"), "already stamped");
+        assert!(!stamp("owned", &live, "live"), "another lineage owns it");
+        assert!(!stamp("expired", &gone, "gone"), "lineage already expired");
+        assert!(
+            !stamp("forever", &forever, "live"),
+            "not that lineage's session"
+        );
+        assert!(
+            !stamp("forever", &forever, "forever"),
+            "no retained lineage"
+        );
+        let row = |run: &str| store.lookup_run_retention(run).unwrap().unwrap().lineage_id;
+        assert_eq!(row("later").as_deref(), Some("live"));
+        assert_eq!(row("owned").as_deref(), Some("other"));
+        assert_eq!(row("expired"), None);
+        assert_eq!(row("forever"), None);
+        assert_eq!(store.lookup_run("later").unwrap().unwrap().title, None);
+        assert_eq!(
+            store
+                .lookup_run("forever")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("title")
         );
     }
 

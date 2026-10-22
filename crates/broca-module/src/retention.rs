@@ -26,6 +26,16 @@ pub trait RetentionIndex: Send + Sync {
     fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String>;
     fn run(&self, id: &str) -> Result<Option<RunRetention>, String>;
     fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String>;
+    /// Give an admitted run's row its live retained lineage without replaying the WAL.
+    /// Backends without run accounting have no run row to stamp.
+    fn stamp_run_lineage(
+        &self,
+        _run_id: &str,
+        _session: &BindIdentity,
+        _lineage_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
         Ok(None)
     }
@@ -133,6 +143,15 @@ impl RetentionIndex for SqliteStore {
     }
     fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String> {
         self.upsert_retention_lineage(row, runs)
+            .map_err(|e| e.to_string())
+    }
+    fn stamp_run_lineage(
+        &self,
+        run_id: &str,
+        session: &BindIdentity,
+        lineage_id: &str,
+    ) -> Result<bool, String> {
+        self.stamp_retained_run_lineage(run_id, session, lineage_id)
             .map_err(|e| e.to_string())
     }
 }
