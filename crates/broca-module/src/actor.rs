@@ -10763,31 +10763,38 @@ mod tests {
         );
 
         wal_store.set_fail_reads(false);
-        let mut drained = false;
-        for _ in 0..80 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        // Bounded by the shared hang guard, not a fixed window: on a loaded runner the actor's
+        // next attempt can come later than two seconds, and that is not the defect this test
+        // looks for. Work that never drains still fails here, with the last records seen.
+        let healed_at = std::time::Instant::now();
+        broca_test_support::wait_until("queued work to drain after WAL reads recover", || {
             let records: Vec<_> = wal_store
                 .read_records(&key)
                 .expect("healed WAL read")
                 .into_iter()
                 .map(|framed| framed.record)
                 .collect();
-            if broca_core::pending_submissions(&records).is_empty()
-                && records.iter().any(|record| {
-                    matches!(
-                        record,
-                        WalRecord::RunStarted {
-                            submission_id: Some(id),
-                            ..
-                        } if id.0 == "sub-queued"
-                    )
-                })
-            {
-                drained = true;
-                break;
-            }
-        }
-        assert!(drained, "queued work must drain after WAL reads recover");
+            let started = records.iter().any(|record| {
+                matches!(
+                    record,
+                    WalRecord::RunStarted {
+                        submission_id: Some(id),
+                        ..
+                    } if id.0 == "sub-queued"
+                )
+            });
+            let result = if broca_core::pending_submissions(&records).is_empty() && started {
+                Ok(())
+            } else {
+                Err(broca_test_support::record_kinds(&records))
+            };
+            std::future::ready(result)
+        })
+        .await;
+        eprintln!(
+            "queued work drained {:?} after reads recovered",
+            healed_at.elapsed()
+        );
 
         for _ in 0..40 {
             if registry.slot_state(&key).is_none() {
