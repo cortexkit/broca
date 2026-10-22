@@ -622,6 +622,8 @@ pub struct EpisodeRenderConfig<'a> {
     /// Restore Go's model-specific Qwen and DeepSeek Chat Completions quirks on resume.
     pub opencode_go_qwen_thinking: Option<bool>,
     pub opencode_go_deepseek_thinking: Option<bool>,
+    /// On resume, restore whether OpenCode Go's Kimi K2.6 route rejects 24-hour prompt-cache hints.
+    pub opencode_go_long_cache_retention_unsupported: Option<bool>,
     /// Freshly derived or restored Code Assist identity. If the episode's frozen config
     /// recorded no identity, keep it absent so a resume reproduces the original bytes.
     pub codeassist_identity: Option<&'a broca_provider::wire::CodeAssistIdentity>,
@@ -754,6 +756,9 @@ impl EpisodeRenderConfig<'_> {
         }
         if let Some(recorded) = self.opencode_go_deepseek_thinking {
             config.opencode_go_deepseek_thinking = recorded;
+        }
+        if let Some(recorded) = self.opencode_go_long_cache_retention_unsupported {
+            config.opencode_go_long_cache_retention_unsupported = recorded;
         }
         if config.family_id == WireFamilyId::GoogleCodeAssist {
             config.codeassist_identity = self.codeassist_identity.cloned();
@@ -980,6 +985,8 @@ fn resolve_provider_inner(
         opencode_go_reasoning_signature: episode_render.opencode_go_reasoning_signature,
         opencode_go_qwen_thinking: episode_render.opencode_go_qwen_thinking,
         opencode_go_deepseek_thinking: episode_render.opencode_go_deepseek_thinking,
+        opencode_go_long_cache_retention_unsupported: episode_render
+            .opencode_go_long_cache_retention_unsupported,
         codeassist_identity: episode_render.codeassist_identity,
         base_url: episode_render
             .base_url
@@ -1258,6 +1265,13 @@ fn resolve_provider_inner(
         if episode_render.reasoning_echo.is_none() && model_id.starts_with("deepseek-v4") {
             // DeepSeek V4 also requires each prior assistant turn's reasoning_content.
             frozen.reasoning_echo = Some(broca_provider::policy::ReasoningEchoPolicy::DEEPSEEK);
+        }
+        if episode_render
+            .opencode_go_long_cache_retention_unsupported
+            .is_none()
+            && model_id == "kimi-k2.6"
+        {
+            frozen.opencode_go_long_cache_retention_unsupported = true;
         }
     }
     let frozen = episode_render.apply(frozen);
@@ -2051,6 +2065,23 @@ mod tests {
         let deepseek_config = deepseek.provider.render_config_blob();
         assert_eq!(deepseek_config["opencode_go_deepseek_thinking"], true);
         assert!(deepseek_config.get("reasoning_echo").is_some());
+
+        let kimi = resolve_catalog_episode_with_client(
+            "opencode-go/kimi-k2.6",
+            Some(2_048),
+            &AuthMode::None,
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                opencode_go_session_id: Some(&session_id),
+                ..Default::default()
+            },
+        )
+        .expect("the Go Kimi compatibility model resolves");
+        assert_eq!(
+            kimi.provider.render_config_blob()["opencode_go_long_cache_retention_unsupported"],
+            true
+        );
 
         let resumed = resolve_catalog_episode_with_client(
             "opencode-go/gpt-6-luna",

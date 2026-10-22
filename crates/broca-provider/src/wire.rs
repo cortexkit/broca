@@ -254,6 +254,9 @@ pub struct FrozenRenderConfig {
     /// this flag and retain their prior body.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub opencode_go_deepseek_thinking: bool,
+    /// Whether Go's Kimi K2.6 route rejects 24-hour OpenAI prompt-cache hints.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opencode_go_long_cache_retention_unsupported: bool,
 }
 
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.

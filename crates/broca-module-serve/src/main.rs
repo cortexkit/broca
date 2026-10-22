@@ -2273,6 +2273,14 @@ mod executor {
             .unwrap_or(false)
     }
 
+    fn frozen_opencode_go_long_cache_retention_unsupported(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("opencode_go_long_cache_retention_unsupported")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     fn frozen_opencode_go_reasoning_signature(config: &broca_wal::RunConfig) -> bool {
         config
             .frozen_render_config
@@ -3948,6 +3956,15 @@ mod executor {
                                 && job.req.model.provider_module_id.as_str() == "opencode-go"
                         })
                         .map(|prior| frozen_opencode_go_deepseek_thinking(&prior.config)),
+                    opencode_go_long_cache_retention_unsupported: prior_run
+                        .as_ref()
+                        .filter(|_| {
+                            !fresh_episode
+                                && job.req.model.provider_module_id.as_str() == "opencode-go"
+                        })
+                        .map(|prior| {
+                            frozen_opencode_go_long_cache_retention_unsupported(&prior.config)
+                        }),
                     codeassist_identity: codeassist_identity.as_ref(),
                     chatgpt_wire: chatgpt_wire.as_ref(),
                     // Only the host and the output cap are restored. Re-resolve other catalog

@@ -339,6 +339,31 @@ mod tests {
     }
 
     #[test]
+    fn go_kimi_k2_6_omits_unsupported_long_cache_hints() {
+        let mut go = openai_chat_frozen_config("kimi-k2.6");
+        go.opencode_go_long_cache_retention_unsupported = true;
+        go.cache = Some(crate::wire::CachePolicy {
+            version: 1,
+            class: crate::wire::CacheClass::Hints {
+                cache_key: "test-cache-key".into(),
+                retention: Some("24h".into()),
+            },
+        });
+        let body: Value =
+            serde_json::from_slice(&OpenAiChat.render(&go, &CallOptions::new(Vec::new()))).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+
+        let mut ordinary = openai_chat_frozen_config("kimi-k2.6");
+        ordinary.cache = go.cache;
+        let ordinary_body: Value =
+            serde_json::from_slice(&OpenAiChat.render(&ordinary, &CallOptions::new(Vec::new())))
+                .unwrap();
+        assert_eq!(ordinary_body["prompt_cache_key"], "test-cache-key");
+        assert_eq!(ordinary_body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
     fn non_go_requests_keep_their_existing_header_sets() {
         let mut options = CallOptions::new(Vec::new());
         options.step_context = Some(StepContext {

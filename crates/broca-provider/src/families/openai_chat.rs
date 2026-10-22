@@ -208,6 +208,10 @@ fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
     else {
         return;
     };
+    // On OpenCode Go's Kimi K2.6 route, omit the 24-hour prompt-cache hint and its cache key.
+    if frozen.opencode_go_long_cache_retention_unsupported && retention.as_deref() == Some("24h") {
+        return;
+    }
     body["prompt_cache_key"] = Value::String(cache_key.clone());
     if let Some(retention) = retention {
         body["prompt_cache_retention"] = Value::String(

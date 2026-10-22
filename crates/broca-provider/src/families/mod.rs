@@ -618,6 +618,7 @@ pub fn resolve_frozen(
         opencode_go_reasoning_signature: false,
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
+        opencode_go_long_cache_retention_unsupported: false,
     })
 }
 
@@ -684,6 +685,7 @@ fn frozen_from_family_defaults(
         opencode_go_reasoning_signature: false,
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
+        opencode_go_long_cache_retention_unsupported: false,
     }
 }
 
@@ -769,7 +771,7 @@ pub fn apply_anthropic_apikey_quirks(frozen: &mut FrozenRenderConfig) {
 /// request shape — a change means a resume can't reproduce the original bytes.
 /// v2: render `CallOptions.generation` (`temperature`, `top_p`, `stop`).
 /// v3: request streaming usage with `stream_options.include_usage`.
-/// v5: apply OpenCode Go's reasoning-signature, Qwen, and DeepSeek Chat body quirks.
+/// v5: apply OpenCode Go's reasoning-signature, Qwen, DeepSeek, and Kimi K2.6 cache body quirks.
 pub const OPENAI_CHAT_RENDERER_VERSION: u32 = 5;
 
 /// Build the frozen render config for a standard OpenAI `/chat/completions` model:
