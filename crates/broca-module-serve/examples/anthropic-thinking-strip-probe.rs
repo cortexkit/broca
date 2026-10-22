@@ -15,8 +15,9 @@
 //!    budget-style thinking (`{"type":"enabled","budget_tokens":1024}`), the older mode.
 //!
 //! Run `cargo run --locked -p broca-module-serve --example anthropic-thinking-strip-probe --
-//! [--dry-run]`. The live run makes at most four requests to `claude-opus-5-5` on the
-//! `oauth:anthropic` dev-tools handle. `--dry-run` sends nothing and prints each request's
+//! [--dry-run] [--model <catalog model id>]`. The model defaults to `claude-opus-5-5`; pass the
+//! id without the `anthropic/` prefix, for example `claude-sonnet-5-5`. The live run makes at most
+//! five requests to that model on the `oauth:anthropic` dev-tools handle. `--dry-run` sends nothing and prints each request's
 //! rendered shape, including its `thinking` member, without credentials. The token is never
 //! printed: provider error messages are scrubbed of it before they are shown.
 
@@ -37,8 +38,13 @@ use broca_provider::{spec::WireFamilyId, wire::ClaudeCodePersona};
 use serde_json::{json, Value};
 
 const CREDENTIAL_ID: &str = "oauth:anthropic";
-const MODEL: &str = "anthropic/claude-opus-5-5";
-const MODEL_ID: &str = "claude-opus-5-5";
+const DEFAULT_MODEL_ID: &str = "claude-opus-5-5";
+/// The probed model's id without the provider prefix, set once from `--model` before any request.
+static MODEL_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn model_id() -> &'static str {
+    MODEL_ID.get().map_or(DEFAULT_MODEL_ID, String::as_str)
+}
 /// The catalog effort variant that turns thinking on. The model's catalog offers no variant that
 /// turns thinking off, and with no variant broca's default renders thinking enabled, so the
 /// thinking-off step freezes an explicit variant whose `thinking` is `{"type":"disabled"}`.
@@ -83,20 +89,31 @@ fn file_tool() -> Tool {
     }
 }
 
+/// Set by `--tool-first`: a seed that asks for the tool call before any answer, for models (such
+/// as Haiku 5.5) that answer the arithmetic seed directly instead of calling the tool.
+static TOOL_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn seed_text() -> String {
+    if TOOL_FIRST.get().copied().unwrap_or(false) {
+        format!(
+            "You cannot answer without the file. Think briefly about why, then call {TOOL} with path sample.txt. Do not write the answer until the tool result arrives."
+        )
+    } else {
+        format!(
+            "Before anything else, think step by step: which of 391, 437 and 493 is prime, and what is 17 * 23 minus that prime? Then write one short sentence with the result and call {TOOL} exactly once with path sample.txt. Do not finish until the tool result arrives."
+        )
+    }
+}
+
 fn seed_prompt() -> Vec<Message> {
     vec![
         Message::new(
             Role::System,
-            vec![ContentBlock::Text { text: fixed_prefix() }],
-        ),
-        Message::new(
-            Role::User,
             vec![ContentBlock::Text {
-                text: format!(
-                    "Before anything else, think step by step: which of 391, 437 and 493 is prime, and what is 17 * 23 minus that prime? Then write one short sentence with the result and call {TOOL} exactly once with path sample.txt. Do not finish until the tool result arrives."
-                ),
+                text: fixed_prefix(),
             }],
         ),
+        Message::new(Role::User, vec![ContentBlock::Text { text: seed_text() }]),
     ]
 }
 
@@ -153,7 +170,7 @@ fn tool_loop(seed: &Answer, strip_thinking: bool) -> CallOptions {
         .collect();
     prompt.push(Message::assistant_from(
         content,
-        ModelHandle::new("anthropic", MODEL_ID),
+        ModelHandle::new("anthropic", model_id()),
     ));
     prompt.push(Message::new(Role::Tool, tool_results(&seed.content)));
     with_tools(prompt, ToolChoice::None)
@@ -196,7 +213,7 @@ fn resolve_provider(
         ..ResolveOptions::default()
     };
     resolve_catalog_episode_with_client(
-        MODEL,
+        &format!("anthropic/{}", model_id()),
         Some(2048),
         &AuthMode::Secret(token.to_owned()),
         &options,
@@ -301,13 +318,18 @@ async fn send(
 
 fn print_result(label: &str, answer: &Answer) {
     print!(
-        "{label}: HTTP {} input={} cache_read={} reply_thinking_blocks={}",
+        "{label}: HTTP {} input={} cache_read={} reply_thinking_blocks={} reply_tool_use={}",
         answer
             .status
             .map_or_else(|| "none".into(), |status| status.to_string()),
         answer.input_tokens,
         answer.cache_read,
-        signed_thinking_count(&answer.content)
+        signed_thinking_count(&answer.content),
+        answer
+            .content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+            .count()
     );
     if let Some((kind, message)) = &answer.error {
         print!(" error_type={kind} error_message={message:?}");
@@ -345,11 +367,22 @@ async fn load_auth() -> Result<(String, Option<String>), Box<dyn std::error::Err
 }
 
 async fn run() -> Result<String, Box<dyn std::error::Error>> {
-    let dry = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [flag] if flag == "--dry-run" => true,
-        _ => return Err("usage: anthropic-thinking-strip-probe [--dry-run]".into()),
-    };
+    let usage = "usage: anthropic-thinking-strip-probe [--dry-run] [--model <id>] [--tool-first]";
+    let mut dry = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dry-run" if !dry => dry = true,
+            "--tool-first" if TOOL_FIRST.get().is_none() => {
+                TOOL_FIRST.set(true).map_err(|_| usage)?;
+            }
+            "--model" if MODEL_ID.get().is_none() => {
+                let id = args.next().ok_or(usage)?;
+                MODEL_ID.set(id).map_err(|_| usage)?;
+            }
+            _ => return Err(usage.into()),
+        }
+    }
     let thinking_disabled = broca_provider::variant::FrozenVariant {
         name: "probe-thinking-disabled".into(),
         request: broca_provider::variant::VariantRequest::Anthropic {
@@ -506,7 +539,8 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
     print_result("strip_thinking_budget", &strip_budget);
 
     Ok(format!(
-        "model {MODEL_ID}: control accepted={}; every thinking block removed: adaptive thinking accepted={}, thinking disabled accepted={}, budget thinking accepted={}.",
+        "model {}: control accepted={}; every thinking block removed: adaptive thinking accepted={}, thinking disabled accepted={}, budget thinking accepted={}.",
+        model_id(),
         accepted(&control),
         accepted(&strip_on),
         accepted(&strip_off),
